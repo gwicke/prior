@@ -23,15 +23,16 @@ session layer are reused unchanged.
 | Phase | Scope | Why |
 | --- | --- | --- |
 | **1 (the fix)** | Single file. `{path, edits:"<aider blob>"}` → normalize to canonical `{path, edits:[{oldText,newText}]}`. Flat schema, no `anyOf`. | Directly kills the nested-array mangling with minimal surface. Reuses `edit_file` + `render_batch` + display + storage verbatim. |
-| **2 (gated)** | Multi-file: path-per-block, path-per-edit canonical (`edits:[{path,oldText,newText}]`), per-file partial application. | Only worth it if telemetry shows the model routinely wanting cross-file batches. Bigger blast radius; see Phase 2 below. |
+| **2 (gated)** | Multi-file blobs accepted and **split per file**. The canonical form does *not* move: it stays pi's single-`path` `{path, edits:[{oldText,newText}]}`, one stored call per file. | Only worth it if telemetry shows the model routinely wanting cross-file batches. pi cannot express a multi-file call at all, so "one call per file" *is* the pi-compatible shape, not a deviation from it. See Phase 2 below. |
 
-Rationale for gating Phase 2 (see also "Diminishing returns"): the backend is
-**all-or-nothing** (`src/tools.rs` — no edits applied if any block fails), so a
-call of `N` blocks succeeds with roughly `(1-p)^N`. Large multi-file batches are
-heavily penalized and a single mismatch discards the whole call. Multi-file adds
-the most complexity (path-per-edit canonical migration, cross-file atomicity,
-partial-failure reporting) for the least reliability gain, and it does **not**
-address the actual failure (JSON mangling). Single-file text edits do.
+Rationale for gating Phase 2: the backend is **all-or-nothing** (`src/tools.rs` —
+no edits applied if any block fails), so a call of `N` blocks succeeds with
+roughly `(1-p)^N`; large batches are heavily penalized and one mismatch discards
+the whole call. Multi-file does **not** address the actual failure (JSON
+mangling) — single-file text edits do. The gate is measurable with no new
+instrumentation: the rejection is a fixed literal in `merge_path`
+(`blob.rs:367`) that survives verbatim into the persisted tool result, so a grep
+over existing session JSONL counts every model that wanted a cross-file batch.
 
 ---
 
@@ -116,6 +117,10 @@ data integrity:
 - **`path` absent, headers absent** → error ("no path").
 - **`path` absent, headers differ** → error: *"multi-file edits are not
   supported in this form; make one `edit` call per file."* (Bridges to Phase 2.)
+- **`path` present, *some* blocks have a header and some do not** → each header
+  is checked against `path` like any other; a differing one is the conflict
+  error. This is the case a naive multi-file split silently gets wrong — see
+  Phase 2.
 
 Why not "reject paths entirely": models trained on Aider will emit them, and
 failing every such call is hostile — it defeats the purpose of borrowing a
@@ -336,11 +341,16 @@ accepted cost of pi-compat.
 ### Pi compatibility and the egress points
 
 pi's canonical `edit` call is `{path, edits:[{oldText,newText}]}` — an *array* of
-`oldText`/`newText` entries (multi-entry). picocode's canonical in-memory form
-already matches this (`normalize_args_in_place` folds legacy `old`/`new` into the
-array). So "pi compatibility" here means one concrete thing: **every model form
-(the new Aider text blob, the legacy array, or a legacy `old`/`new`) must be
-written to disk as that array**, or pi cannot read the file.
+`oldText`/`newText` entries (multi-entry), under a **single** `path`
+(`packages/coding-agent/src/core/tools/edit.ts`; there is no per-edit `path`, and
+`applyEditsToNormalizedContent` writes one file per call). picocode's canonical
+in-memory form already matches this (`normalize_args_in_place` folds legacy
+`old`/`new` into the array). So "pi compatibility" here means one concrete
+thing: **every model form (the new Aider text blob, the legacy array, or a
+legacy `old`/`new`) must be written to disk as that array**, or pi cannot read
+the file. The single-`path` part is load-bearing for multi-file: pi cannot
+represent a cross-file batch at all, which is why Phase 2 splits into per-file
+calls instead of adopting a path-per-edit canonical form.
 
 Two clarifications that matter:
 
@@ -521,35 +531,202 @@ transient, there is no session or pi-format migration.
 
 ## Phase 2 — multi-file (gated)
 
-Only if telemetry shows demand (e.g. count runs of consecutive single-file
-`edit` calls targeting different paths as a proxy for wanting one call).
+Gated on the grep described under *Two-phase scope* — count the persisted
+`multi-file edits are not supported` rejections before building any of this.
 
-### Changes beyond Phase 1
+### Audit against HEAD
 
-- **Canonical shape migrates** to path-per-edit:
-  `edits:[{path, oldText, newText}]`. Output path, failure envelope, and
-  storage normalizer must all learn it; the single-path top-level `path`
-  becomes optional/absent when paths live per-edit.
-- **Parser** allows a header per block, mapping each block to its own path;
-  blocks may repeat or omit a path (decide reuse-last vs. mandatory — see
-  below).
-- **Backend** generalizes to `edit_files(groups: PathMap<Vec<EditOp>>)`:
-  validate **everything** first (across files), then apply per file.
-- **Failure/atomicity policy** must be chosen:
-  - keep global all-or-nothing (simplest, but a large batch rarely lands), or
-  - per-file atomic with partial success + per-file reporting (Aider-like).
-  The all-or-nothing penalty is the whole reason large batches are risky, so
-  Phase 2 likely *requires* partial-apply to be worth shipping.
-- **Failure item labels**: extend `BatchItem` with an optional path so
-  multi-file messages read `edit #2 (src/bar.rs): …`.
+The original plan does not survive contact with the code. Four findings:
 
-### Open Phase 2 questions
+1. **The canonical-shape migration must be dropped — it would break the pi
+   compatibility this whole document is built on.** pi's `edit` schema is
+   `{path: string, edits: Array<{oldText, newText}>}`: **one `path` per call**,
+   no per-edit path (`packages/coding-agent/src/core/tools/edit.ts`, checked
+   against `main`). `edits:[{path,oldText,newText}]` is not a shape pi can read
+   or render, so migrating to it would trade a pi-compatible single-file form
+   for an incompatible multi-file one. pi's own prompt guidance agrees — *"When
+   changing multiple separate locations in one file, use one edit call with
+   multiple entries in `edits[]` instead of multiple edit calls"* — so
+   **path-per-call is the pi-compatible multi-file shape**, not a workaround for
+   one. The canonical form does not move; the largest Phase 2 item is gone.
+2. **The parser work is already done.** `ParsedEdit` carries its own `header`,
+   `parse_blocks` sets `multi_file`, and `blockedit::group_by_file(parsed,
+   fallback) -> Vec<FileBatch>` is exactly the split this section describes, in
+   first-seen order, with a tested consumer (`bsed apply -i`). "Parser allows a
+   header per block; blocks may repeat or omit a path" is implemented — and its
+   answer to the open question below is already coded.
+3. **`group_by_file` is not a drop-in for `merge_path`; the difference is a
+   wrong-file-write hazard.** `merge_path` is strict-on-conflict;
+   `group_by_file` is header-authoritative — a header wins and `path` only fills
+   gaps. So a blob whose first block says `a.rs`, whose second block has no
+   header, sent with `path: "b.rs"` is **today a loud `path mismatch` error**, but
+   under a naive `group_by_file` split becomes **two batches, `a.rs` and
+   `b.rs`** (verified). That is precisely the silent wrong-file write
+   `merge_path` exists to prevent, so the split must run the conflict check
+   first — cheapest as a `merge_path` variant that keeps the policy and relaxes
+   only its `multi_file` arm.
+4. **`group_by_file` keys on the raw header string, not the normalized path.**
+   `path: "./a.rs"` with a header `a.rs` yields *two* batches for one file,
+   where `merge_path`'s `same_path` (`resolve_normalized`) collapses them
+   (verified). Two all-or-nothing applies and two stored calls for one file.
+   The split key must be the normalized path.
 
-- Reuse-last path vs. mandatory per-block path. (Aider reuses; mandatory avoids
-  a silent-retarget hazard when a prose line precedes a block.)
-- Cross-file atomicity: best-effort vs. stage-all-then-flush.
-- Whether to migrate persisted sessions once, or keep the legacy array shape
-  parseable indefinitely.
+### Three pipelines, not two
+
+Multi-file touches three separate paths, and only the first is the tool:
+
+| | assistant `edit` call | tool result | source |
+| --- | --- | --- | --- |
+| **execution** | 1 call | 1 aggregated envelope | `EditFile::call` |
+| **in-turn model context** | 1 × multi-file blob | 1 aggregated | rig's live history → `on_completion_call` |
+| **stored + post-reload** | N × single-path | N per-file | `append_message` → JSONL → `extract_messages` |
+
+`append_message` writes the session file and the index; it does not touch rig's
+live `history`. `on_completion_call` (`agent.rs:1794`) reads that live history
+(`AgentRunStep::CallModel { history }`, `streaming.rs:610`), which holds the
+model's **raw** assistant message and the tool results. `blob_edit_tool_calls`
+(`agent.rs:1197`) only rewrites `AssistantContent::ToolCall`, and
+`array_to_blob_value` returns a blob string unchanged because `edits` is not an
+array. So **the model sees exactly the one multi-file blob it emitted, in-turn
+and forever within that turn** — verified.
+
+**This is the trap in the obvious plan.** Splitting only at persist is the single
+option where the two views of one session disagree: the panel, the model and
+`--log-messages` all say one call, while the file says three, and a reload
+silently rewrites the model's own history underneath it. A model that trusts its
+context less after a reload is a worse outcome than either alternative. So the
+model-facing split is not optional garnish on the storage split — it is what
+makes the storage split safe.
+
+The corollary is cheap. `on_completion_call` receives the **whole** history, so
+the assistant call and its matching `Message::User` tool-result batch are in one
+pass and ids pair directly. The persist site gets the same two sides in two
+separate `append_message` calls with no shared state, which is why determinism
+is a correctness requirement *there* and merely good hygiene in the model hook.
+One transform, two call sites, and the per-file content is the same envelope
+either way.
+
+### Two independent axes (not the retired A/B/C strategies)
+
+pi compatibility is a *storage* property, not an execution one, so "accept the
+blob" and "let pi read the session" are separate changes that can be gated on
+separate evidence:
+
+| | Today | Change |
+| --- | --- | --- |
+| **execution** | `merge_path` rejects; the model retries, or had already emitted parallel per-file calls (rig dispatches those; costs nothing) | accept the blob, split per file in `EditFile::call` |
+| **storage** | one raw multi-file call; pi cannot read the file | split at persist into N canonical single-path calls |
+
+Either can ship alone, and each is small. The storage axis presupposes the
+execution one — a call that is rejected never produces the per-file results the
+splitter consumes — but the execution axis alone is already a strict improvement
+over the status quo.
+
+### Execution axis
+
+- **Atomicity — resolve all files, then write the ones that resolved.** The two
+  original bullets ("validate everything first across files" vs. "per-file
+  atomic with partial success") contradict; this is the reconciliation.
+  `apply_to_text` is pure over text, so every file can be resolved in memory
+  before anything is written. That reports every problem in one round trip, and
+  — because sandbox checks (`get_path_with`) and reads also happen in the first
+  pass — a path outside the sandbox or a missing file is found *before* any
+  write, not after. That is `bsed`'s per-file policy minus its one weakness (it
+  writes as it goes). Global all-or-nothing stays available as a one-line change
+  to the write step, but is the wrong default for a many-file refactor, where
+  one stale file blocking the rest is exactly what `doc/bsed.md` §7.2 exists to
+  reject.
+- **Per-file IO errors fold into the report, never `Err`.** `edit_file` returns
+  `Err` for a missing file, a non-UTF-8 read and a sandbox denial; one of those
+  must not abort the remaining files.
+- **Result shape**: `BatchItem` gains `path: Option<String>` so failures read
+  `edit #2 (src/bar.rs): …`. `output.rs` needs **no change** —
+  `display_tool_result` matches on the presence of `ui_view` + `model_view`
+  (`output.rs:2169`), so an aggregate envelope with those same keys renders
+  through the existing branch. The original "output path must learn it" is
+  wrong.
+- The "all blocks need to be within the same file" sentence exists twice,
+  byte-identical, in the tool `description()` and the `edits` parameter
+  description (`tools.rs:203` and `tools.rs:240`). Both change; lift it to one
+  `const` while there or the next edit drifts.
+
+### Storage axis
+
+- **Per-file structured result** — one result must become N paired
+  `toolResult` messages (providers reject unpaired tool-call ids). The aggregate
+  envelope carries a `files` array alongside `ui_view`/`model_view`; that array
+  is what the splitter reads.
+- **Split at persist**, in `append_message`: the assistant `edit` tool call
+  becomes N calls, and the matching tool-result message becomes N results. These
+  are two independent `append_message` calls on the turn transcript
+  (`agent.rs:696`) with no shared state, so they agree only because
+  **determinism is a correctness requirement, not a cache nicety** — both derive
+  ids from the original id plus the file index, never from a counter or a clock.
+- **No new API for the per-file canonical value**: `render_blob` +
+  `canonicalize_edit_value` already produce it, and `array_to_blob_value`
+  inverts it idempotently (verified). `render_blob` drops the `:LINE` anchors,
+  which is correct here — anchors are transient and the canonical array has never
+  carried them.
+- **This repairs compaction for free.** `collect_touched_files`
+  (`session.rs:194`) reads `arguments.path` per `edit` call, so a multi-file blob
+  stored raw contributes at most its top-level `path` and every header-only file
+  is missing from the compaction summary. N stored calls fix it with no code.
+- **`on_completion_call` is the second call site, not a bystander.** An earlier
+  draft of this note claimed it "needs nothing", on the grounds that
+  `blob_edit_tool_calls` derives the model-facing form from the stored canonical
+  args. That is true only of the *reload* direction, and it misses the in-turn
+  direction entirely — see *Three pipelines* above. The hook must apply the same
+  split, in the same pass, over the assistant call and the matching tool-result
+  batch, or the live view and the stored view of one session disagree. It is the
+  easier of the two sites: one function call, both sides in scope, ids paired by
+  inspection rather than by convention. Composition is
+  `split(blob(strip(history)))` — split after blobing, so the transform sees the
+  shape it is documented to accept, and idempotent either way (a history of
+  single-file calls has `multi_file == false` and passes through).
+- **Rejoining is the alternative worth weighing.** If N calls mid-turn is judged
+  too much of a lie to the model's own emission, the deterministic inverse
+  exists: group the synthetic calls by their id suffix in the same transform and
+  re-render one multi-file blob, applied at *both* sites so the model sees one
+  call and the file holds N. Do not apply the split at persist and skip the
+  model hook — that combination is the inconsistency, not a policy.
+
+### Display: unchanged by the above, and wrong today
+
+Splitting inside the tool does not change the live panel, because
+`on_tool_call` canonicalizes before `display_tool_call` and a multi-file blob
+*cannot* canonicalize. `get_preview` therefore receives `{path,
+edits:"<blob>"}`; its `edit` branch reads `edits` as an array (miss), then the
+legacy `old`/`new` fields (miss, both empty), and calls `edit_preview` with one
+empty op — an empty diff plus a bogus `[1]` range, since `content.find("")` is
+`Some(0)`. The panel reads `edit b.rs [1]` with nothing under it, for a call
+that failed. So "output path only ever sees the canonical array" holds for every
+shape *except* the one this section is about. Cheapest correct fix: when `edits`
+is a string that does not resolve to one file, print the label with no range and
+no diff.
+
+### Files
+
+`crates/blockedit/src/blob.rs` (conflict-checking split, normalized key),
+`diagnose.rs` (`BatchItem.path`, aggregate envelope), `wire.rs` (`EditArgs`
+gains multiple files), `src/tools.rs` (loop, folded IO errors, deduplicated
+description), `src/session/session.rs` (persist-time split), `src/output.rs`
+(get_preview fix only). `src/edit_blocks.rs` is a re-export shim over the crate —
+edit the crate, not the shim.
+
+### Open questions (reduced)
+
+- ~~Reuse-last vs. mandatory per-block path~~ → **reuse-last**, already
+  implemented in `group_by_file` (a header beats the fallback; header-less
+  blocks fall back; neither is an error). Aider reuses, and the prose-line hazard
+  is already covered: `header_candidate` requires a whitespace-free token.
+- ~~Cross-file atomicity~~ → resolve-all, write-what-resolved.
+- ~~Migrate persisted sessions~~ → **no migration**: the canonical form does not
+  change, and every form the parser produces already has a legacy reader
+  (`canonicalize_edit_value`, `EditArgs::from_wire`).
+- **Open**: N blobs or one rejoined blob in model history?
+- **Open**: cap on files per call? The single-file form caps blocks not at all,
+  but a header-per-file blob makes an unbounded fan-out reachable from one
+  string argument.
 
 ---
 
@@ -587,7 +764,10 @@ Only if telemetry shows demand (e.g. count runs of consecutive single-file
 
 - `src/edit_blocks.rs` (new): `parse_blocks`, `merge_path`, `render_blob`,
   `canonicalize_edit_value` (→ array, best-effort), `array_to_blob_value`
-  (→ blob). Unit-tested.
+  (→ blob). Unit-tested. *Since moved: the file is now a re-export shim over
+  `crates/blockedit/src/{blob,wire,resolve,apply,diagnose,path}.rs`, so the
+  `src/edit_blocks::*` paths named throughout this document still resolve but
+  the code lives in the crate.*
 - `src/tools.rs`: `EditArgs` reduced to `{path, edits: Vec<EditOp>}` with a
   manual `Deserialize` (`from_wire`) selecting the variant from the raw JSON;
   hand-written flat `parameters()` (no `anyOf`).
@@ -634,62 +814,75 @@ success-string location hint. Green.
 
 ## Notes / follow ups
 
-Each idea below is evaluated against the current code (findings verified
-against rig rev `1c2f440` and a live probe of `edit_file`). Status: design
-discussion only — nothing here is implemented.
+Each idea below is evaluated against the current code (findings verified against
+rig rev `1c2f440`, a live probe of `edit_file`, and probe tests against the
+`blockedit` crate). Status is per item, as marked.
 
-### 1. Multi-file batches split into single-file batches (needs investigation)
+### 1. Multi-file batches split into single-file batches — investigated
 
-**Idea**: accept a multi-file blob, split into per-file batches *before*
-execution → per-file failure domain, preserved pi session compatibility; open
-question is whether the split is surprising to agents.
+**Idea**: accept a multi-file blob, split into per-file batches before
+execution → per-file failure domain, preserved pi session compatibility.
 
-**How does multi-file fail today?** `merge_path` rejects it
-("make one `edit` call per file"), surfaced as a tool error. The model then
-retries — one extra round trip, unless it had *pre-emptively* emitted several
-parallel `edit` calls in the same response (rig dispatches parallel tool
-calls; this path already works and costs nothing). On the persistence side the
-failed call is stored as the raw blob string (it cannot canonicalize to
-single-path `{path, edits:[…]}`), so **pi compatibility for multi-file is
-already degraded today** — any implementation is a strict improvement over the
-status quo, but the note's "preserves pi session compatibility" only holds for
-splitting that produces *separate stored calls*.
+**Status: investigated; the design is written up under *Phase 2* above.** This
+note is kept for the findings that do not belong there.
 
-**Three strategies, with the hook-surface constraint that rules some out:**
+**Status quo, re-verified.** `merge_path` rejects a multi-file blob
+(`blob.rs:367`), `EditArgs::from_wire` wraps it as a self-correcting argument
+error, and the model retries — one extra round trip unless it had
+*pre-emptively* emitted several parallel `edit` calls in the same response (rig
+dispatches parallel tool calls; that path already works and costs nothing). On
+the persistence side the call is stored as the raw blob string, because
+`canonicalize_edit_value` returns a multi-file blob unchanged (verified), so
+**pi compatibility for multi-file is already degraded today**. Any
+implementation is a strict improvement.
 
-| | A: split inside the tool | B: split into N stored tool calls | C: status quo (reject; model self-splits) |
-|---|---|---|---|
-| Failure domain | per file (needs explicit per-file partial apply; result must say which files landed, else atomicity is silently changed from all-or-nothing) | per call (= per file), natural | per call |
-| Stored / pi form | one call, multi-file args → raw blob (same degrade as today) | N canonical single-path calls → true pi compat | raw blob + error |
-| Agent-visible | one call, one (aggregated) result — no surprise | N synthetic calls with synthesized ids/results — the "surprising" case | model's own N calls (no surprise) |
-| Feasibility now | straightforward (`EditFile::call` groups by path, loops `edit_file`) | **no pre-dispatch hook exists** in rig `1c2f440`: `ToolCallAction` is `{Run, Rewrite, Skip, Stop}` (rewrites *one* call's args, never expands the call list), `on_completion_response`/`on_model_turn_finished` are observe/retry/stop only. The only path is post-hoc history surgery at `on_completion_call` (which already replaces the full history) + `append_message`, rewriting 1 call + 1 result into N paired calls + N results | nothing to build |
+**The three strategies are not rivals.** A (split inside the tool) changes the
+*execution* axis; B (split into N stored calls) changes the *storage* axis; C is
+both. Treating them as alternatives — as this note originally did — hid two
+things: that pi compatibility is a storage property, and that accepting the blob
+and letting pi read the session can ship independently and be gated on different
+evidence. The A/B/C table is retired; see *Two independent axes* and *Three
+pipelines* in Phase 2.
 
-Key mechanics for B, if pursued:
+**The hook-surface constraint stands.** No rig `1c2f440` hook can expand one
+assistant message into N before dispatch: `ToolCallAction` is `{Run, Rewrite,
+Skip, Stop}` (it rewrites *one* call's arguments, never the call list),
+`ToolResultAction` is `{Keep, Rewrite, Stop}` (presentation, not structure), and
+`on_completion_response` / `on_model_turn_finished` observe, retry or stop only.
+Verified. So a multi-file call is necessarily *one* call to the dispatcher and
+one result on the wire — the split is a boundary transform, applied either when
+the turn's messages are persisted (`append_message`) or when the request is built
+(`on_completion_call`), and the two are genuinely different moments.
 
-- The rewrite must be **deterministic** (original id + file index → synthetic
-  ids) — it runs on *every* completion call, and non-deterministic history
-  rewrites would churn the prompt-cache prefix. Same bar the blob↔array
-  transform already meets.
-- The tool result must be **structured per-file** so it can be split into N
-  paired tool-result messages (each tool_call id needs its own result message;
-  providers reject unpaired ids).
-- Display vs. stored divergence already has precedent (blob args shown, array
-  persisted), but 1 displayed call → 3 stored calls is a bigger gap; live
-  display shows the model's call while the transcript shows N.
+**They have to be both.** An earlier draft of this note reasoned that
+`append_message` alone sufficed, because the model-facing history is derived
+from the stored canonical args. That is true only after a reload, and it misses
+the in-turn direction: rig's live `history` is not what `append_message`
+writes, so a persist-only split leaves the model looking at one multi-file blob
+while the file says three. See Phase 2, *Three pipelines*.
 
-**Semantics change to accept explicitly**: splitting converts
-all-or-nothing-per-call into partial-across-files. For a cross-file refactor
-the model may *want* atomicity; splitting silently voids that intent. The
-result string must enumerate per-file outcomes so the model knows exactly
-what landed — otherwise it may assume the whole batch applied.
+**Determinism is a correctness requirement at persist, and only hygiene in the
+model hook.** The assistant-call split and the tool-result split are two
+independent `append_message` calls with no shared state, so at that boundary
+they agree only because both derive synthetic ids from the original id plus the
+file index. `on_completion_call` holds both sides in one pass and pairs by
+inspection — but it runs on *every* completion call, so the transform is
+deterministic there too, which is what keeps the prompt-cache prefix stable.
 
-**Recommendation**: measure first, per the doc's gating philosophy — count
-how often models actually emit multi-file blobs (vs. following the error and
-emitting parallel calls). If rare, C already works and A's complexity is
-unwarranted. If common, A is the cheap 80% (failure domain + no round trip,
-pi stays status-quo-degraded); B is the only strategy that delivers the
-note's pi-compat promise but needs the surgery above — worth it only if
-pi-side rendering of multi-file sessions matters.
+**The "surprising to agents" question answers itself against the wrong baseline.**
+pi cannot represent a cross-file batch at all and its own prompt guidance steers
+per-file, so a model following pi's habits emits per-file calls. Once the split
+reaches the model hook, the model would then *see* N per-file calls where it
+emitted one — which is either the nudge we want or an avoidable divergence, and
+the deterministic rejoin decides it (Phase 2, *Storage axis*). A tool call
+becoming several is not surprising where the alternative is a hard error, and it
+is not surprising at all if the same session then reloads as N calls, which is
+the consistency that actually costs something to get wrong.
+
+**One thing both A and B leave unfixed**, and worth not forgetting: live display.
+`on_tool_call` canonicalizes, and a multi-file blob cannot canonicalize, so the
+panel renders an empty diff and a bogus `[1]` range today. Splitting the
+execution does not fix it. See Phase 2, *Display*.
 
 ### 2. Ratio-based anchor tolerance ✅ *implemented*
 
@@ -859,4 +1052,19 @@ corruption is now a loud `overlapping`/`all-claimed` failure).
 ### Suggested order — completed
 
 1. ✅ **3 + 2** (implemented in [`f05d078`](https://github.com/gwicke/picocode/commit/f05d078)) — the skew rule and claim-based resolver are live; 653 tests pass.
-2. **1** — multi-file batches: still gated on telemetry. Strategy A (split inside the tool) is cheap and keeps the status-quo pi degradation; strategy B (split into N stored calls) would deliver true pi-compat but requires post-hoc history surgery at `on_completion_call` + deterministic synthetic ids; both ruled by the telemetry gate.
+2. **1** — multi-file: still gated, but the gate is now free to measure (grep the
+   persisted `multi-file edits are not supported` rejections) and the design is
+   done. Two independent changes behind that gate, in dependency order:
+   1. **execution** — accept the blob and split per file in `EditFile::call`,
+      with a conflict-checking `group_by_file` (raw `group_by_file` would turn
+      today's loud `path mismatch` into a silent wrong-file write) and
+      resolve-all-then-write-what-resolved.
+   2. **storage + model-facing** — one split transform applied at *both* egresses
+      that see the call: `append_message` (N canonical single-path calls on disk,
+      so pi can read the file, which also repairs compaction's touched-files
+      list) and `on_completion_call` (N calls in-turn, so the live view and the
+      reloaded view of one session agree). Persist-only is the one option to
+      avoid: it makes the same session read as one call mid-turn and three after
+      a reload.
+
+   No canonical-form migration and no session migration. See *Phase 2*.
