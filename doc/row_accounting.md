@@ -559,10 +559,37 @@ never reached. `cursor_row()` writes those bytes, which is why it is the one
 no frame is live, since the bytes are then just the cursor park, so it is right
 at every one of its thirteen call sites.
 
-Not yet done, deliberately: `frame_anchor` and `live.frame_top_row` still exist
-and still carry the bookkeeping, so `plan_apply` still takes an `anchor` and
-still computes `top`/`delta` — none of it is used for addressing, and
-`no_apply_addresses_a_row` is what keeps that true. A3.2 removes them.
+#### A3.2 — no row in the API either (done)
+
+A3.1 removed the address from the *bytes*; `Output::frame_anchor` and
+`draw_frame`'s anchor parameter are gone, so the *API* has no row either. A
+caller used to name a row, and all it could do with it was contradict the
+block's own position — which is what the drift class was, and why
+`no_apply_addresses_a_row` could assert the bytes but not the call shape.
+`plan_apply` now reads the position from the cache.
+
+The tests are the part worth recording. They used to say "put the block at row
+5" by passing `5`; they now say it with `cursor_to(&mut cache, 5, th)`, which is
+`note_lines` — the mechanism production actually uses, since that is how the
+cursor gets to a row. A test-only setter would have been less faithful and one
+more way for the suite to describe a world the program does not live in.
+
+`live.frame_top_row` **stays**, and it is worth being precise about why, because
+the drift argument would otherwise take it too: it is the tracked cursor row
+that row accounting compares against a real terminal (B2's screen-truth tests),
+and it is the one row `reanchor` still addresses. Neither is the frame
+*placing* itself.
+
+Two pieces of dead code the removal exposed, both caught by clippy rather than
+by me: `QuietOutput` held a `show_reasoning` handle for the spinner and now has
+no state at all, and `status_line` took a `level` that every caller passed
+`None` (the agent carries no thinking level).
+
+One thing that removal made me suspicious of, and is fine: `show_reasoning =
+disabled` really does suppress the reasoning text, in
+`ConsoleOutput::stream_thinking`. The trait doc's "already gated upstream" is
+accurate — the gate that mattered is still there, and the one the spinner
+shared was only ever about the spinner.
 
 
 **Performance.** In bytes and in latency this is close to a wash, and the
