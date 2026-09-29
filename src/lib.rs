@@ -16,6 +16,7 @@ pub mod path_complete;
 pub mod path_util;
 pub mod prompt_complete;
 pub mod repl;
+pub mod row_count;
 pub mod sandbox_state;
 pub mod session;
 pub mod settings;

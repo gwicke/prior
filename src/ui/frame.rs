@@ -55,7 +55,7 @@ pub(crate) enum Element {
     },
     /// Dim horizontal rule spanning the full terminal width.
     Divider,
-    /// Pre-painted overlay rows (from `paint_plan`), windowed around the
+    /// Pre-painted overlay rows (from `paint_overlay`), windowed around the
     /// selection `focus`. Rows must be single-line and are padded to
     /// `term_w` at render time.
     Overlay { rows: Vec<String>, focus: usize },
@@ -376,6 +376,14 @@ impl DrawCache {
             screen_bottom: term_h.max(1),
             live: None,
         }
+    }
+
+    /// The tracked cursor row (1-based), for the host's row-accounting tests:
+    /// they compare it against where a terminal emulator puts the cursor after
+    /// replaying the same bytes (row_accounting §6 B2).
+    #[cfg(test)]
+    pub(crate) fn tracked_row(&self) -> usize {
+        self.caret.0
     }
 
     /// Where the next frame belongs (plan §5.1): the intact frame's top row if

@@ -297,18 +297,6 @@ impl PicoAgent for CodeAgent {
         let mut cancelled_history: Option<Vec<Message>> = None;
         let mut aborted = false;
         self.output.begin_response();
-        // When reasoning/thinking is enabled, hold the assistant answer back and
-        // flush it only at the turn boundary. This guarantees that reasoning
-        // arriving *after* the answer (an occasional OpenRouter streaming order)
-        // is still shown above it instead of leaking below. See `output.rs`
-        // `answer_held` / `flush_held_answer`.
-        let _reasoning_expected = self
-            .thinking_level
-            .as_deref()
-            .and_then(|s| s.parse::<thinking::ThinkingLevel>().ok())
-            .map(|l| l != thinking::ThinkingLevel::Off)
-            .unwrap_or(false);
-        // self.output.set_answer_hold(reasoning_expected);
         loop {
             tokio::select! {
                 item = stream.next() => {
@@ -1336,7 +1324,6 @@ pub struct CodeAgent {
     /// when `<Esc>` is pressed; the streaming loop selects on `notified()`
     /// instead of polling with a sleep.
     cancel_notify: Arc<tokio::sync::Notify>,
-    thinking_level: Option<String>,
     reasoning_in_context: crate::settings::ReasoningInContextMode,
     /// Optional path to JSONL file for logging raw messages sent/received.
     /// Passed as `Some(Arc<MessageLogger>)` to `LoggingHook` if set.
@@ -1527,7 +1514,6 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.persona_name,
                 config.user_cancel.clone(),
                 config.cancel_notify.clone(),
-                config.thinking_level.clone(),
                 config.reasoning_in_context,
                 message_logger,
             ))
@@ -2480,7 +2466,6 @@ fn render_turn(output: &dyn Output, turn: &ConversationTurn, leading_separator: 
 
     output.display_separator();
     output.begin_response();
-    output.set_answer_hold(false);
 
     let seg_count = turn.segments.len();
     for (seg_idx, segment) in turn.segments.iter().enumerate() {
@@ -4242,7 +4227,6 @@ impl CodeAgent {
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
         cancel_notify: Arc<tokio::sync::Notify>,
-        thinking_level: Option<String>,
         reasoning_in_context: crate::settings::ReasoningInContextMode,
         message_logger: Option<Arc<MessageLogger>>,
     ) -> Self {
@@ -4256,7 +4240,6 @@ impl CodeAgent {
             persona_name,
             user_cancel,
             cancel_notify,
-            thinking_level,
             reasoning_in_context,
             message_logger,
             usage: Mutex::new(SessionUsage::default()),
@@ -4371,6 +4354,93 @@ pub(crate) fn test_session_with_entries(
 
 #[cfg(test)]
 mod tests {
+    // B3a: live vs replay (row_accounting_b3.md §1). The two paths drive the
+    // same Output methods, so they should paint the same bytes; today they do
+    // not, because `begin_response` picks the buffered path whenever stdout is
+    // not a tty — which is every test — and the buffered path frames the output
+    // differently. B3c deletes the branch and this test becomes the gate that
+    // keeps them identical.
+    use super::*;
+    use crate::output::ConsoleOutput;
+    use serial_test::serial;
+
+    /// One turn: reasoning, an answer, a tool round, then a second answer.
+    fn two_segment_turn() -> ConversationTurn {
+        ConversationTurn {
+            user_text: "what is the answer?".into(),
+            segments: vec![
+                AssistantSegment {
+                    thinking: vec!["Weighing the options.".into()],
+                    text: vec!["Let me check.".into()],
+                    tool_calls: vec![(
+                        "c1".into(),
+                        "Bash".into(),
+                        serde_json::json!({"command": "echo hi"}),
+                    )],
+                    tool_results: vec![("c1".into(), "hi\n".into())],
+                },
+                AssistantSegment {
+                    thinking: vec![],
+                    text: vec!["The answer is 42.".into()],
+                    tool_calls: vec![],
+                    tool_results: vec![],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn replay_paints_what_the_live_path_paints() {
+        let turn = two_segment_turn();
+        let reasoning = crate::settings::default_show_reasoning_handle();
+        *reasoning.lock().unwrap() = crate::settings::ShowReasoning::Content;
+
+        // The live path, exactly as the streaming loop drives it. Reasoning is
+        // asked onto the captured stream so the comparison sees it (a test's
+        // stdout is not a terminal, and without this it would be routed to
+        // stderr by both sides and the test would prove nothing).
+        let mut live = ConsoleOutput::new(reasoning.clone());
+        live.reasoning_on_stderr = false;
+        live.begin_capture();
+        live.begin_response();
+        for thinking in &turn.segments[0].thinking {
+            live.stream_thinking(thinking);
+        }
+        for text in &turn.segments[0].text {
+            live.stream_text(text);
+        }
+        live.end_response_segment();
+        live.display_tool_call("Bash", &serde_json::json!({"command": "echo hi"}));
+        live.display_tool_result("hi\n");
+        live.end_response_segment();
+        for text in &turn.segments[1].text {
+            live.stream_text(text);
+        }
+        live.end_response();
+        let live_bytes = live.end_capture();
+
+        // The same turn through replay. `render_turn` draws the user prompt and
+        // a separator around the response, so the live output should be the
+        // *tail* of what replay paints — byte for byte, reasoning included.
+        let mut replay = ConsoleOutput::new(reasoning);
+        replay.reasoning_on_stderr = false;
+        replay.begin_capture();
+        render_turn(&replay, &turn, false);
+        let replay_bytes = replay.end_capture();
+
+        let live_text = String::from_utf8_lossy(&live_bytes).to_string();
+        let replay_text = String::from_utf8_lossy(&replay_bytes).to_string();
+        assert!(
+            replay_text.ends_with(&live_text),
+            "replay did not end with the live output.\n--- live ---\n{live_text:?}\n--- replay ---\n{replay_text:?}"
+        );
+        assert!(
+            replay_text.contains("Weighing the options"),
+            "replay lost the reasoning; the two render paths diverged again"
+        );
+    }
+
     use rig_core::message::Reasoning;
 
     use super::TurnPersistence;
@@ -6469,7 +6539,6 @@ mod tests {
         fn stream_thinking(&self, _d: &str) {}
         fn end_response_segment(&self) {}
         fn end_response(&self) {}
-        fn set_answer_hold(&self, _h: bool) {}
         fn display_tool_call(&self, _n: &str, _a: &JsonValue) {}
         fn display_tool_result(&self, _r: &str) {}
         fn get_user_input(&self) -> String {

@@ -5,6 +5,7 @@ use unicode_width::UnicodeWidthChar;
 
 /// One visible character plus any ANSI escape sequences that precede it.
 /// `w` is the character's visible width (escapes have width 0).
+#[derive(Clone)]
 struct Atom {
     esc: String,
     ch: char,
@@ -229,9 +230,95 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Split `text` into lines of at most `width` display columns **without
+/// changing any character** — every space survives, so column-aligned text
+/// (table cells, the engine's own help headers) keeps its alignment.
+///
+/// This is the counterpart to [`wrap`], which reflows prose and collapses
+/// runs of whitespace. The painter needs both behaviours but must not choose
+/// between them per line: an overlay row is either laid-out text (split it)
+/// or prose (wrap it), and the painter does not know which it holds. So the
+/// painter splits, and the engine — which knows its content — keeps doing the
+/// word-level wrapping when it is warranted.
+///
+/// Each logical line (`\n`-separated) is split independently; blank lines
+/// are preserved. A line that already fits is returned unchanged, escapes
+/// included. An over-long line is cut at `width` visible columns, hard: a
+/// word longer than the line is cut mid-word rather than reflowed, and a
+/// space that lands on the boundary simply ends the line it is in.
+pub fn split_to_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    for logical in text.split('\n') {
+        if logical.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let logical_atoms = atoms(logical);
+        if total_width(&logical_atoms) <= width {
+            out.push(render(&logical_atoms));
+            continue;
+        }
+        let mut chunk: Vec<Atom> = Vec::new();
+        let mut chunk_w = 0;
+        for a in &logical_atoms {
+            if chunk_w + a.w > width && chunk_w > 0 {
+                out.push(render(&chunk));
+                chunk = Vec::new();
+                chunk_w = 0;
+            }
+            chunk.push(a.clone());
+            chunk_w += a.w;
+        }
+        out.push(render(&chunk));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_preserves_every_space() {
+        // `wrap` would collapse this to "10 last 10 turns"; the split must not.
+        assert_eq!(
+            split_to_width("  10      last 10 turns", 30),
+            vec!["  10      last 10 turns"]
+        );
+    }
+
+    #[test]
+    fn split_leaves_a_fitting_line_untouched() {
+        assert_eq!(split_to_width("a  b", 10), vec!["a  b"]);
+    }
+
+    #[test]
+    fn split_cuts_at_width_preserving_content() {
+        let text = "abcdefghijklmno";
+        let parts = split_to_width(text, 5);
+        assert_eq!(parts, vec!["abcde", "fghij", "klmno"]);
+        // Nothing lost, nothing reordered: the concatenation is the input.
+        assert_eq!(parts.concat(), text);
+    }
+
+    #[test]
+    fn split_breaks_after_a_boundary_space() {
+        // "aaa bbb" cut at 4: the space lands on the boundary, so the first
+        // line takes it and "bbb" starts the next.
+        assert_eq!(split_to_width("aaa bbb", 4), vec!["aaa ", "bbb"]);
+    }
+
+    #[test]
+    fn split_keeps_blank_lines() {
+        assert_eq!(split_to_width("a\n\nb", 10), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn split_measures_display_width_not_chars() {
+        // Three wide chars are 6 columns: 5 per line means 2 then 1.
+        assert_eq!(split_to_width("日本語", 5), vec!["日本", "語"]);
+    }
 
     #[test]
     fn wraps_at_width() {
