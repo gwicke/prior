@@ -29,7 +29,6 @@
   - sorting on string columns: case insensitive by default?
   - fuzzy matching: `test data` very different result from `test_data` -
     surprising
-- [ ] per-turn /thinking overrides, esp. at end of turn message
 
 - [x] UI Draw v2 — unified frame composition (REPL + menus + dialogs)
       See: ./doc/ui_draw_v2.md
@@ -41,6 +40,9 @@
       - [x] P5: retire overlay_lines, fold next_input_row/clear_rows_to into apply
       - [ ] Cleanups / follow-ups
 - [ ] doc/editor_cleanup.md - generalize editor integration
-- [ ] safe sed wrapper producing edit input - generic?
+- [ ] tools: safe sed wrapper producing edit input - generic / separate crate?
+  - [ ] research: identify patterns to support, existing similar tooling
 - [ ] tree view: lowest indent for longest "master" branch
-- [ ] temperature support: model level only? move thinking level to model too?
+- [ ] model parameter revisit / expansion
+  - [ ] temperature support: model level only? move thinking level to model too?
+  - [ ] per-turn /thinking overrides, esp. at end of turn message
