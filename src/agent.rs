@@ -4317,7 +4317,7 @@ pub fn status_line(
     // The dot cell is not negotiable, and the bar's width is its whole contract —
     // it is written full-width, so one column too many wraps, and the wrap is the
     // one row movement the status path does not report.
-    let dot_cols = dot_cell(width).1;
+    let dot_cols = dot_cell(width).2;
     let avail = width.saturating_sub(dot_cols);
     // The separator costs columns only while there *is* a group to separate from.
     // It is re-read rather than cached, because a group that drops to empty must
@@ -4407,20 +4407,29 @@ const DOT_IDLE: &str = STATUS_FG;
 const DOT: &str = "\u{25cf}";
 const DOT_AIR: &str = " ";
 
-/// The air that leads the bar on a row `width` columns wide, and the dot's
-/// total width (air plus glyph).
+/// The air that leads the bar and the air that follows it, plus the dot's total
+/// width (lead + glyph + gap).
 ///
-/// A terminal narrower than the pair gets the bare dot: the bar's width is its
-/// contract (a bar wider than the row wraps, and the wrap is the one row
-/// movement the status path has to report), so the cell gives way, not the
-/// invariant.
-fn dot_cell(width: usize) -> (&'static str, usize) {
-    if width >= 2 {
-        (DOT_AIR, 2)
-    } else if width >= 1 {
-        ("", 1)
-    } else {
-        ("", 0)
+/// **Three** pieces, not one, and the trailing one is the reason: the text is
+/// right-aligned, so the padding between the dot and the summary is whatever is
+/// left over — which on a bar that is nearly full is *nothing*, and the summary
+/// then reads as part of the dot's cell. A guaranteed gap column costs nothing
+/// when there is padding anyway and is the whole difference when there is not.
+///
+/// The dot's colour goes between the lead and the glyph, which is why the cell
+/// cannot be one string (see [`DOT`]). The gap comes *after* the glyph and
+/// before the text's own foreground, so it is painted in the bar's colour like
+/// the rest of the row — a space has no foreground to get wrong.
+///
+/// A terminal narrower than the cell gives way rather than wrapping it: the
+/// bar's width is its contract, and a bar wider than the row wraps, and the
+/// wrap is the one row movement the status path has to report.
+fn dot_cell(width: usize) -> (&'static str, &'static str, usize) {
+    match width {
+        0 => ("", "", 0),
+        1 => ("", "", 1),
+        2 => ("", DOT_AIR, 2),
+        _ => (DOT_AIR, DOT_AIR, 3),
     }
 }
 
@@ -4440,16 +4449,15 @@ fn dot_cell(width: usize) -> (&'static str, usize) {
 /// reasoning stream either.)
 fn status_bar(text: &str, width: usize, streaming: bool) -> String {
     let dot = if streaming { DOT_STREAMING } else { DOT_IDLE };
-    let (air, dot_cols) = dot_cell(width);
+    let (air, gap, dot_cols) = dot_cell(width);
     let pad = width
         .saturating_sub(dot_cols)
         .saturating_sub(crate::row_count::display_width_ansi(text));
-    // Air, then the dot's colour, then the glyph, then the text's own
-    // foreground: the colour has to bracket the glyph exactly, and the text's
-    // has to follow it because `38;5;245m` and the dot's colour are the same
-    // attribute slot.
+    // Air, the dot's colour, the glyph, a gap, then the text's own foreground:
+    // the colour has to bracket the glyph exactly, and the text's has to follow
+    // it because `38;5;245m` and the dot's colour are the same attribute slot.
     format!(
-        "{STATUS_RESET}{STATUS_BG}{air}{dot}{DOT}{STATUS_FG}{}{text}{STATUS_RESET}",
+        "{STATUS_RESET}{STATUS_BG}{air}{dot}{DOT}{gap}{STATUS_FG}{}{text}{STATUS_RESET}",
         " ".repeat(pad)
     )
 }
@@ -4491,6 +4499,34 @@ mod status_line_tests {
             model,
             thinking,
             context_tokens,
+        }
+    }
+
+    /// The dot never touches the text: there is always a column of air after it.
+    ///
+    /// The text is right-aligned, so the gap is whatever padding is left over —
+    /// which on a nearly-full bar is nothing, and the summary then reads as part
+    /// of the dot's cell. This is the case that needs the guaranteed column, and
+    /// it is invisible at any width where there happens to be padding.
+    #[test]
+    fn the_dot_always_has_a_column_of_air_after_it() {
+        // Widths chosen to leave the text exactly filling the row: at each of
+        // these the padding computes to zero, so only the gap column separates
+        // the dot from the text.
+        let text = "run the command | llamacpp:test";
+        for extra in 0..6_usize {
+            let w = text.chars().count() + 2 + extra;
+            let s = status_line(None, None, model("llamacpp", "test", None, 0), w, true);
+            let visible = crate::output::strip_ansi(&s);
+            assert_eq!(display(&s), w, "width {w}: one row: {visible:?}");
+            assert!(
+                visible.contains("\u{25cf} "),
+                "width {w}: a space must follow the dot: {visible:?}"
+            );
+            assert!(
+                !visible.contains("\u{25cf}r"),
+                "width {w}: the dot must not abut the text: {visible:?}"
+            );
         }
     }
 
