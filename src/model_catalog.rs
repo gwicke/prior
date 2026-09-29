@@ -1095,6 +1095,25 @@ pub fn lookup(provider: &str, model: &str) -> Option<ModelEntry> {
     })
 }
 
+/// The catalog entry for a `provider:model` id, with the stored per-model
+/// metadata overrides applied.
+///
+/// The one place the two sources are combined (doc/model_settings_v2.md A.3):
+/// `stored` wins where set, the catalog fills every field it leaves `None`.
+/// Shared by the `/model` header, `/stat` and the editor prefill so none of
+/// them can describe a model differently from the others.
+pub fn resolved_entry(
+    qualified_id: &str,
+    stored: Option<&crate::model_settings::ModelSettings>,
+) -> Option<ModelEntry> {
+    let (provider, model) = qualified_id.split_once(':')?;
+    let mut entry = lookup(provider, model)?;
+    if let Some(settings) = stored {
+        settings.apply_to_entry(&mut entry);
+    }
+    Some(entry)
+}
+
 /// The reasoning efforts this model accepts, for backend effort remapping and
 /// for the disclosure in `/reasoning` (doc/model_settings_v2.md A.4).
 ///
