@@ -204,28 +204,22 @@ fn apply(args: &[String]) -> Result<String, Failure> {
             other => path = Some(PathBuf::from(other)),
         }
     }
-    // Blocks arrive on stdin, so the file must be named; there is no second
-    // stream to read it from.
-    let target = match path {
-        Some(p) if p == PathBuf::from("-") || p == PathBuf::from("") => None,
+    // Blocks arrive on stdin, so a file named on the command line wins and the
+    // blob's own header is the fallback -- the same precedence as the `edit`
+    // tool's `path` argument. Parse first, because the header is where the
+    // fallback comes from.
+    let named = match path {
+        Some(p) if p.as_os_str().is_empty() || p == PathBuf::from("-") => None,
         Some(p) => Some(p),
         None => None,
     };
     let blob = read_stdin()?;
-    let text = match &target {
-        Some(p) => std::fs::read_to_string(p)
-            .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?,
-        // With no file, the header line inside the blob names it.
-        None => String::new(),
-    };
-
-    // A blob with no filename header still applies, as long as the caller named
-    // the file; that is the same contract as the `edit` tool.
     let parsed = blockedit::parse_blocks(&blob).map_err(|e| Failure::User(e.to_string()))?;
-    let (resolved, edits): (PathBuf, Vec<EditOp>) = match (target.clone(), parsed.path) {
-        (Some(p), Some(h)) if p == Path::new(&h) => (p, to_ops(parsed.edits)),
-        (Some(p), _) => (p, to_ops(parsed.edits)),
-        (None, Some(h)) => (PathBuf::from(h), to_ops(parsed.edits)),
+
+    let resolved: PathBuf = match (named, parsed.path.clone()) {
+        (Some(p), Some(h)) if same_file(&p, &h) => p,
+        (Some(p), _) => p,
+        (None, Some(h)) => PathBuf::from(h),
         (None, None) => {
             return Err(Failure::User(
                 "no file to apply to: pass a path, or include a filename line above the first \
@@ -234,22 +228,36 @@ fn apply(args: &[String]) -> Result<String, Failure> {
             ))
         }
     };
+    let edits: Vec<EditOp> = to_ops(parsed.edits);
+    let text = std::fs::read_to_string(&resolved)
+        .map_err(|e| Failure::Internal(format!("{}: {e}", resolved.display())))?;
 
     let applied = match blockedit::apply_to_text(&text, &edits) {
         ApplyOutcome::Applied { text, .. } => text,
         ApplyOutcome::Failed { report } => return Err(Failure::User(report)),
     };
 
-    if in_place && target.is_some() {
+    if in_place {
         std::fs::write(&resolved, &applied)
             .map_err(|e| Failure::Internal(format!("{}: {e}", resolved.display())))?;
         Ok(format!(
-            "{}",
+            "{}\n",
             blockedit::success_note(&edits, &[], &resolved.display().to_string())
         ))
     } else {
         Ok(applied)
     }
+}
+
+/// Compare a command-line path with a header path the way the blob parser
+/// does, so `./src/x.rs` and `src/x.rs` agree.
+fn same_file(a: &Path, b: &str) -> bool {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(_) => return a == Path::new(b),
+    };
+    blockedit::path::resolve_normalized(&a.to_string_lossy(), &cwd)
+        == blockedit::path::resolve_normalized(b, &cwd)
 }
 
 fn to_ops(edits: Vec<blockedit::ParsedEdit>) -> Vec<EditOp> {
