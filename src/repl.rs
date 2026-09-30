@@ -655,6 +655,24 @@ impl Repl {
         // Repo handle: refresh in case the loop replaced its local Option
         // (clone-shared Arc cache — same listing state either way).
         app_state.set_repo(ctx.repo.clone());
+        // The prompt-side bar's **data**, pushed rather than rendered: this
+        // module no longer builds the row, `Output::compose_area` does, from
+        // whatever is stored here (ui_draw_v2 §5.1.1).
+        //
+        // Pushed once per cycle from the same `ctx` the overlays read, so the
+        // prompt-side bar and the mid-turn one cannot name different sessions —
+        // and pushed before the first paint, because the very first prompt runs
+        // before any turn has set a status, and an unset one draws no bar at all.
+        output.set_status(&crate::agent::status_text(
+            ctx.session_name.as_deref(),
+            ctx.session_first_message.as_deref(),
+            crate::agent::BarModel {
+                provider: &ctx.provider,
+                model: &ctx.model,
+                thinking: ctx.reasoning_level.as_deref(),
+                context_tokens: ctx.context_tokens,
+            },
+        ));
         let mut editor = LineEditor::new();
         // Seed the editor with a prefill string if one was provided. Used by
         // `/session <id> resume` to surface the resumed session's stored model
@@ -722,28 +740,18 @@ impl Repl {
         let redraw =
             |editor: &LineEditor, overlay: &[String], focus: usize, dims: (usize, usize)| {
                 let dims = (dims.0.max(1), dims.1.max(1));
-                // Grey: no turn is in flight while the input is open, and that is now a fact
-                // about the bar's *state* rather than an argument at a call site —
-                // the same `status_bar` renders the mid-turn bar green, so the
-                // two cannot drift apart.
-                let bar = crate::output::status_bar(
-                    &crate::agent::status_text(
-                        ctx.session_name.as_deref(),
-                        ctx.session_first_message.as_deref(),
-                        crate::agent::BarModel {
-                            provider: &ctx.provider,
-                            model: &ctx.model,
-                            thinking: ctx.reasoning_level.as_deref(),
-                            context_tokens: ctx.context_tokens,
-                        },
-                    ),
-                    dims.0,
-                    false,
-                );
+                // The REPL supplies only what changes: the input, and the menu when one
+                // is open. The status row is `compose_area`'s to resolve — it is made of
+                // `status_text` and `streaming`, which are this output's facts and not
+                // something this module may reason about — and so is the divider that
+                // separates the menu from the input above it (ui_draw_v2 §5.1.1).
+                let layout = editor.layout(dims.0, prompt);
+                let input = Element::input(layout, prompt.to_string());
+                let overlay =
+                    (!overlay.is_empty()).then(|| Element::overlay(overlay.to_vec(), focus));
+                let items = output.compose_area(Some(input), overlay, dims.0);
                 // Composition here, division there: `draw_elements` is the one place the
                 // pipeline runs, so this can no longer build a `Frame` by hand.
-                let items =
-                    Self::compose_elements(editor, prompt, Some(&bar), overlay, focus, dims.0);
                 let applied = output.draw_elements(items, ApplyPolicy::Frame, dims);
                 painted_size.set(applied);
             };
@@ -1246,28 +1254,17 @@ impl Repl {
         }
     }
 
-    /// Compose the REPL's element list (plan §3, pure): `[Status?, Input]`, or
-    /// `[Status?, Input, Divider, Overlay]` while `overlay` shows.
+    /// Test-only twin of [`crate::output::Output::compose_area`]: the same
+    /// composition, with the status row arriving as a literal `&str` so a test
+    /// can assert against bytes it wrote rather than against a rendered bar.
     ///
-    /// **Composition only** — no `allocate`, no `render`, and therefore no
-    /// budget. The row division happens in [`Output::draw_elements`], which is
-    /// the one place the pure pipeline runs (ui_draw_v2 §5.1.1); handing a
-    /// `Frame` out of here would mean two places deciding how the terminal's
-    /// rows are split, which is exactly what `ui.rs`'s dialog builder used to do.
-    /// Overflow beyond the live-region budget of ⌈2/3·term_h⌉ is windowed there
-    /// and, if the frame does not fit below its anchor, scrolled in by
-    /// `plan_apply`.
-    ///
-    /// There is deliberately **no `term_h` parameter**: that budget is the
-    /// tail's to apply, not this function's to decide. A caller handing one in
-    /// would be a caller knowing something it shouldn't.
-    ///
-    /// `focus` is the overlay's windowing index (the pre-computed visual row of
-    /// the selection); `term_w` is the width the layout is measured for — the
-    /// same value `draw_elements` applies it with.
-    ///
-    /// Shared by `read_input`'s `redraw` closure and the vt100 tests, so both
-    /// drive the exact bytes production emits (ui_draw_v2 P0/P3).
+    /// The `#[cfg(test)]` is the point, not a formality. Production reaches the
+    /// area through `compose_area` and nothing else, so there is exactly one
+    /// composer for anything that ships (ui_draw_v2 §5.1.1). What the two share
+    /// is [`crate::output::area_body`] — the rule that a menu brings a separator
+    /// — which leaves the status row as the only difference, and it is the one
+    /// difference a test needs to be able to make.
+    #[cfg(test)]
     pub(crate) fn compose_elements(
         editor: &LineEditor,
         prompt: &str,
@@ -1278,25 +1275,14 @@ impl Repl {
     ) -> Vec<Element> {
         let term_w = term_w.max(1);
         let layout = editor.layout(term_w, prompt);
-        let mut elements = Vec::new();
-        // The status line takes the **divider's row**, above the input — which is
-        // what makes it permanent and what makes it safe.
-        //
-        // Being in the frame is the whole trick. A bar written as content would
-        // need a relative erase at submit, and by then the cursor has moved into
-        // the frame region below it, so the erase would land on the wrong rows.
-        // Here the frame's own union clear takes it, at the one moment the cursor
-        // is where the frame says it is. And it is redrawn per keystroke by the
-        // same partial row-diff, so the figures are never stale.
+        let input = Element::input(layout, prompt.to_string());
+        let overlay = (!overlay.is_empty()).then(|| Element::overlay(overlay.to_vec(), focus));
+        let mut items: Vec<Element> = Vec::new();
         if let Some(bar) = status {
-            elements.push(Element::lines(vec![bar.to_string()]));
+            items.push(Element::lines(vec![bar.to_string()]));
         }
-        elements.push(Element::input(layout, prompt.to_string()));
-        if !overlay.is_empty() {
-            elements.push(Element::divider());
-            elements.push(Element::overlay(overlay.to_vec(), focus));
-        }
-        elements
+        items.extend(crate::output::area_body(Some(input), overlay));
+        items
     }
 
     /// Compose *and* render, for tests that drive `plan_apply` directly and have

@@ -691,12 +691,21 @@ then it is the only way to keep `Output` (which `AgentConfig` exposes) clean.
 
 #### 5.1.1 One pipeline, one composer
 
-`draw_frame` shares the *apply* half, but the `allocate`+`render` half is duplicated
-today: `Repl::compose_frame` runs it, and so does `ui.rs::confirm`'s frame builder,
-which hand-assembles `[Divider?, Overlay]` and calls `allocate`+`render` itself
+`draw_frame` shares the *apply* half, but the `allocate`+`render` half *was*
+duplicated: `Repl::compose_frame` ran it, and `ui.rs::confirm`'s frame builder
+hand-assembled `[Divider?, Overlay]` and called `allocate`+`render` itself
 (ui.rs:184). A third is arriving with §4.5 — the content path, re-rendering the area
 per chunk. Two pieces, then: one **tail** that every frame goes through, and one
 **composer** that decides what the area is made of.
+
+**Status: both landed.** The tail is `Output::draw_elements` — items → allocate →
+render → `plan_apply` → write, and `ui::confirm` goes through it rather than
+hand-rolling, so a second place deciding how the terminal's rows are split is gone.
+The composer is `Output::compose_area` + `Output::status_row`, with the
+`[Input?, Divider?, Overlay?]` rule in `area_body`. `Repl::compose_elements`
+survives only as the `#[cfg(test)]` twin that takes the status as a literal — and
+`Repl::compose_frame` only because a test still needs allocate+render without the
+write — so production reaches the area through one composer and nothing else.
 
 ```rust
 // The shared tail: items → allocate → render → plan_apply → write. Nothing
@@ -742,7 +751,7 @@ mismatch becomes a stale cache rather than something to clamp away.
 
 ### 5.2 REPL (`read_input`)
 
-`redraw` becomes: `out.compose_area(Some(input), overlay)` → `draw_elements(...)` —
+`redraw` becomes: `out.compose_area(Some(input), overlay, term_w)` → `draw_elements(...)` —
 the compose/allocate/render tail is no longer this module's (§5.1.1). The `input_row`
 local and `prev_term_h` `Cell` are retired; `frame_anchor()` replaces `next_input_row`'s
 scroll tracking (the cache holds the post-scroll top). The REPL always applies an
@@ -751,8 +760,19 @@ when content streams under the next turn.
 
 The compose list gains the **status row**, which the REPL no longer builds: `compose_area`
 prepends it, because it reads `status_text` and `streaming`, which only this layer may
-know (§5.1.1). So `redraw` supplies `input`, `divider` and `overlay` and gets back a
-composition whose first item it does not own.
+know (§5.1.1). So `redraw` supplies `input` and `overlay` and gets back a composition
+whose first item it does not own — and the divider is the composer's too, since "a menu
+brings a separator" is a rule rather than a caller's choice. `term_w` is the one thing
+the composer takes besides those two: the status row has to be fitted for the same
+width the frame renders at, and width is composition, not budget.
+
+> **The data is still the REPL's; the row is not.** `read_input` pushes a `StatusText`
+> built from `ctx` via `set_status`, once per cycle, before the first paint. Without
+> that push the frame bar would read whatever the last turn's `set_status` left — and
+> the very first prompt, which runs before any turn has started, would read an unset
+> status and draw no bar at all (an unset status is *off*, and `status_row` returns
+> `None` for off rather than an empty full-width row). What moved out is the rendering:
+> width, the streaming dot, and the off-rule are `status_row`'s.
 
 > **Superseded by §4.5.** The empty-input frame and the
 > `plan_clear_live_frame` that retires it are exactly what P1/P2 remove: the area

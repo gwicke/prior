@@ -31,6 +31,29 @@ pub enum Confirmation {
     Always,
 }
 
+/// The area below the status row: `[Input?, Divider?, Overlay?]`.
+///
+/// The *rule*, stated once, for two callers that must not be able to disagree
+/// about it: [`Output::compose_area`] (production) and the `#[cfg(test)]` frame
+/// builder in `repl.rs`. That twin exists only to let a test hand a status
+/// through as a literal string — production cannot reach it — so the only thing
+/// the two genuinely differ on is where the status row *came from*; how the rest
+/// of the area is laid out is this function's and only this function's
+/// (ui_draw_v2 §5.1.1).
+///
+/// `overlay` is `None` when there is no menu: a separator with nothing below it
+/// is a rule nobody wanted, and the empty overlay case has no element to draw
+/// either.
+pub(crate) fn area_body(input: Option<Element>, overlay: Option<Element>) -> Vec<Element> {
+    let mut items = Vec::new();
+    items.extend(input);
+    if overlay.is_some() {
+        items.push(Element::divider());
+    }
+    items.extend(overlay);
+    items
+}
+
 pub trait Output: Send + Sync {
     fn display_text(&self, text: &str);
     /// Render a model *response* as markdown. Defaults to `display_text` so
@@ -165,6 +188,62 @@ pub trait Output: Send + Sync {
         crossterm::terminal::size()
             .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
             .unwrap_or((80, 24))
+    }
+
+    /// The one composer for the *area* (ui_draw_v2 §5.1.1):
+    /// `[Status?, Input?, Divider?, Overlay?]`.
+    ///
+    /// **Impure, deliberately and uniquely.** This is the only place allowed to
+    /// read state the pure phases must not see — the status row is resolved
+    /// here, from [`Self::status_row`], because `status_text` and `streaming`
+    /// are facts about this output rather than about a frame. Resolving it in
+    /// `render` instead is exactly the trap the `Element::Status` idea fell
+    /// into: the render would stop being a function of the items.
+    ///
+    /// Callers supply only what changes: the input between turns, the overlay
+    /// when a menu is open. Neither the status row nor the divider that
+    /// separates an overlay from what is above it is a caller's to build — that
+    /// is the whole of what makes this the *one* composer rather than a
+    /// convention (§5.1.1).
+    ///
+    /// `term_w` is the width the status row is fitted for, and it is the same
+    /// value [`Self::draw_elements`] renders the frame at, so the bar can never
+    /// be sized for a different terminal than the rows around it. It is the one
+    /// parameter the doc's sketch omits: width is composition, not budget, and
+    /// budget is what that sketch was being careful not to pass.
+    ///
+    /// The status row takes the **divider's row**, above the input — which is
+    /// what makes it permanent and what makes it safe. Being in the frame is
+    /// the whole trick: a bar written as content would need a relative erase at
+    /// submit, and by then the cursor has moved into the frame region below it,
+    /// so the erase would land on the wrong rows. Here the frame's own union
+    /// clear takes it, at the one moment the cursor is where the frame says it
+    /// is — and the partial row-diff redraws it per keystroke, so the figures
+    /// are never stale.
+    fn compose_area(
+        &self,
+        input: Option<Element>,
+        overlay: Option<Element>,
+        term_w: usize,
+    ) -> Vec<Element> {
+        let mut items = Vec::new();
+        if let Some(row) = self.status_row(term_w) {
+            items.push(row);
+        }
+        items.extend(area_body(input, overlay));
+        items
+    }
+
+    /// The status row, resolved at compose time: one `Element`, `must ==
+    /// might == 1`.
+    ///
+    /// Default `None` — an output with no screen has no bar to show, which is
+    /// also what every non-console output wants from [`Self::compose_area`]:
+    /// the input and the overlay, and nothing standing in for a readout.
+    /// `ConsoleOutput` is the one that overrides it, and it is the one that
+    /// holds `status_text` and `streaming`.
+    fn status_row(&self, _term_w: usize) -> Option<Element> {
+        None
     }
 
     /// Draw a composed UI frame (ui_draw_v2 §5.1) with its top row at absolute
@@ -1576,12 +1655,8 @@ impl ConsoleOutput {
     ///   input, a dialog), and the prompt-side status is a frame concern.
     fn paint_status(&self) {
         let stored = self.status_text.lock().unwrap().clone();
-        // **Off** is tested on the stored content, not the rendered bar — the bar
-        // is a full-width row, so it is never empty even when there is nothing to
-        // say, and testing *it* would paint a blank bar where the status is
-        // supposed to be off.
-        if (stored.name.is_empty() && stored.group.is_empty()) || !self.stream_tail.at_line_start()
-        {
+        // `is_off` is the stored-content test (see it for why it isn't the bar).
+        if stored.is_off() || !self.stream_tail.at_line_start() {
             return;
         }
         let text = status_bar(
@@ -1891,6 +1966,22 @@ pub struct StatusText {
     pub name: String,
     /// The model group, in the order a narrow terminal should give it up.
     pub group: Vec<String>,
+}
+
+impl StatusText {
+    /// Whether there is a bar to draw at all: both fields empty means off.
+    ///
+    /// Tested on the **stored content**, never on the rendered bar — a rendered
+    /// bar is a full-width row, so it is never empty even when there is nothing
+    /// to say, and testing *it* would paint a blank bar where the status is
+    /// supposed to be off.
+    ///
+    /// One definition for both paths that need it: [`ConsoleOutput::paint_status`]
+    /// (content) and [`Output::status_row`] (frame). Two answers to "is there a
+    /// status?" is how the two bars end up disagreeing about their own existence.
+    pub(crate) fn is_off(&self) -> bool {
+        self.name.is_empty() && self.group.is_empty()
+    }
 }
 
 /// What separates the name from the model group, and the width it costs.
@@ -2852,6 +2943,26 @@ impl Output for ConsoleOutput {
         self.begin_capture_inner();
     }
 
+    /// The frame path's bar, from the same two facts the content path's is
+    /// (see [`Self::paint_status`]).
+    ///
+    /// `streaming` is read here rather than passed in as `false` by whoever
+    /// composes: whether a turn is running is a fact about this output, and a
+    /// literal at a call site is a claim that can go stale — which is how the
+    /// two bars could ever have rendered the same turn differently.
+    ///
+    /// `None` when the status is off, for the same reason `paint_status`
+    /// returns early: there is no bar to show, and an off status must not
+    /// become an empty full-width row.
+    fn status_row(&self, term_w: usize) -> Option<Element> {
+        let stored = self.status_text.lock().unwrap().clone();
+        if stored.is_off() {
+            return None;
+        }
+        let streaming = self.streaming.load(std::sync::atomic::Ordering::Relaxed);
+        Some(Element::lines(vec![status_bar(&stored, term_w, streaming)]))
+    }
+
     /// Remember the status line to paint after each content block; see
     /// [`ConsoleOutput::paint_status`] for the three conditions that decide
     /// whether it actually goes out.
@@ -3028,6 +3139,119 @@ mod tests {
         assert!(
             !out.streaming.load(std::sync::atomic::Ordering::Relaxed),
             "and the flag went back down"
+        );
+    }
+
+    /// The rows a composed list would paint, without touching a terminal.
+    ///
+    /// Extents alone cannot identify a row: the status and the divider are both
+    /// `must == might == 1`, so a test about *what* the composer produced has to
+    /// look at the bytes rather than the budgets.
+    fn compose_rows(items: &[Element], term_w: usize) -> Vec<String> {
+        let extents: Vec<Extent> = items.iter().map(Element::extent).collect();
+        let heights = allocate(&extents, live_budget(24));
+        let frame = render(items, &heights, term_w);
+        frame
+            .extents
+            .iter()
+            .map(|r| frame.buf[r.start..r.end].to_string())
+            .collect()
+    }
+
+    /// The composer supplies only what changes: the input, and the menu when one
+    /// is open. The status row and the divider are its own to resolve, because a
+    /// caller that could add either would make it a second place deciding what
+    /// the area is made of (ui_draw_v2 §5.1.1).
+    #[test]
+    #[serial]
+    fn compose_area_resolves_every_row_it_owns() {
+        let (out, _reasoning) = capturing_output(60);
+        out.set_status(&bar_of("[bar]"));
+        let input = || {
+            Element::input(
+                crate::repl::LineEditor::new().layout(60, "> "),
+                "> ".to_string(),
+            )
+        };
+
+        // Nothing supplied: the status alone, and it is first.
+        assert_eq!(compose_rows(&out.compose_area(None, None, 60), 60).len(), 1);
+
+        // Input only: no separator, because a separator is for a menu.
+        let rows = compose_rows(&out.compose_area(Some(input()), None, 60), 60);
+        assert_eq!(rows.len(), 2, "status then input: {rows:?}");
+
+        // Both: the divider arrives *with* the overlay, not from the caller.
+        let overlay = Element::overlay(vec!["row".to_string()], 0);
+        let rows = compose_rows(&out.compose_area(Some(input()), Some(overlay), 60), 60);
+        assert_eq!(rows.len(), 4, "status, input, divider, overlay: {rows:?}");
+        assert!(
+            rows[0].contains("\x1b[48;5;237m"),
+            "row 0 is the status bar: {:?}",
+            rows[0]
+        );
+        assert!(rows[1].contains("> "), "row 1 is the input: {:?}", rows[1]);
+        assert!(rows[2].contains('─'), "row 2 is the divider: {:?}", rows[2]);
+        assert!(rows[3].contains("row"), "row 3 is the menu: {:?}", rows[3]);
+    }
+
+    /// The frame bar's dot is read from `streaming` at compose time rather than
+    /// handed in as `false` by whoever composed, so the frame path and the
+    /// content path cannot render the same turn differently. Asserted on the
+    /// rendered bytes: a flag nobody reads would still pass a flag check.
+    #[test]
+    #[serial]
+    fn compose_area_reads_streaming_rather_than_being_told_it() {
+        let (out, _reasoning) = capturing_output(60);
+        out.set_status(&bar_of("[bar]"));
+        let idle = compose_rows(&out.compose_area(None, None, 60), 60);
+        assert!(
+            !idle[0].contains(DOT_STREAMING),
+            "no turn in flight, so the frame bar is idle: {:?}",
+            idle[0]
+        );
+
+        out.begin_capture();
+        out.begin_response();
+        let _ = out.end_capture();
+        let during = compose_rows(&out.compose_area(None, None, 60), 60);
+        assert!(
+            during[0].contains(DOT_STREAMING),
+            "mid-turn the frame bar goes green: {:?}",
+            during[0]
+        );
+
+        out.begin_capture();
+        out.end_response();
+        let _ = out.end_capture();
+    }
+
+    /// A status with nothing to say draws no row, and an output with no screen
+    /// never gets one. Both go through `is_off`/the default `status_row` — the
+    /// same answers the content path uses, so the two bars cannot disagree
+    /// about whether they exist.
+    #[test]
+    #[serial]
+    fn compose_area_drops_a_status_that_has_nothing_to_say() {
+        let (out, _reasoning) = capturing_output(60);
+        assert!(
+            out.compose_area(None, None, 60).is_empty(),
+            "never set: there is no bar to show"
+        );
+        out.set_status(&StatusText {
+            name: String::new(),
+            group: Vec::new(),
+        });
+        assert!(
+            out.compose_area(None, None, 60).is_empty(),
+            "explicitly off: there is no bar to show"
+        );
+        out.set_status(&bar_of("[bar]"));
+        assert_eq!(out.compose_area(None, None, 60).len(), 1, "on: a bar");
+
+        assert!(
+            NoOutput.compose_area(None, None, 60).is_empty(),
+            "an output with no screen composes no status"
         );
     }
 
