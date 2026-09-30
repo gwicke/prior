@@ -46,6 +46,12 @@ PREVIEW (never writes; the default):
     -t, --trailing <N>          Unchanged lines to add after a change (default 0)
         --no-grow               Do not extend blocks to a balanced bracket
     -b, --budget <BYTES>        Preview budget, single-file mode only (default 51200)
+    -u, --unified              Emit a unified diff instead of blocks, for reading
+                                in a pager. A diff cannot be applied by anything:
+                                drop -u for blocks the `edit` tool takes. The
+                                hunk context falls back to 2 when neither -c nor
+                                -t is given, since a diff has no anchor and no
+                                context is a diff you have to open the file to read
     -h, --help
     -n, --quiet                 Suppress automatic printing (ignored; preview only)
     SCRIPT                      If no -e/-f given, first non-option is the script
@@ -64,10 +70,28 @@ EXAMPLES:
     bsed 's/old/new/' src/x.rs
     bsed -e 's/old/new/' -p src/x.rs
     bsed -f script.sed src/x.rs
+    bsed -u 's/old/new/' src/x.rs | less
     bsed -r -p src 's/old/new/' > blocks.txt
     bsed apply -i < blocks.txt
     bsed apply src/x.rs < blocks.txt | diff src/x.rs -
 ";
+
+/// Which of the two renderings to use, and with how much context.
+#[derive(Clone, Copy)]
+struct Mode {
+    /// A unified diff for a person, rather than blocks for `edit`.
+    unified: bool,
+    /// Unchanged lines each side of a diff hunk. Only consulted when `unified`.
+    ///
+    /// Blocks default to zero because their reader is a program that wants the
+    /// smallest correct payload, and a block is anchored so it needs no room. A
+    /// diff has no anchor and its reader is a person, so a hunk with no context
+    /// is a diff you have to open the file to read. `-u` therefore falls back to
+    /// `udiff::DEFAULT_CONTEXT` when the caller asked for neither `-c` nor `-t`
+    /// -- the same value picocode's in-panel edit preview uses. Asking for either
+    /// overrides it, so neither flag is ever silently ignored.
+    diff_context: usize,
+}
 
 /// What a successful run produced, split by where it has to go.
 ///
@@ -245,13 +269,16 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut recursive = false;
     let mut globs: Vec<String> = Vec::new();
-    let mut context: usize = 0;
+    // Option, not a plain 0: `-c 0` is a real request for no context and
+    // must not be mistaken for "not given", which `-u` reads differently.
+    let mut context: Option<usize> = None;
     let mut trailing: Option<usize> = None;
     let mut grow = true;
     let mut budget = Options::default().max_preview_bytes;
     let mut script_parts: Vec<String> = Vec::new();
     let mut only_positional = false;
     let mut saw_e_or_f = false;
+    let mut unified = false;
 
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
@@ -280,10 +307,11 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
             "-p" | "--path" => paths.push(PathBuf::from(need(it.next(), "-p")?)),
             "-r" | "--recursive" => recursive = true,
             "-g" | "--glob" => globs.push(need(it.next(), "-g")?.to_string()),
-            "-c" | "--context" => context = need_num(it.next(), "-c")?,
+            "-c" | "--context" => context = Some(need_num(it.next(), "-c")?),
             "-t" | "--trailing" => trailing = Some(need_num(it.next(), "-t")?),
             "-b" | "--budget" => budget = need_num(it.next(), "-b")?,
             "--no-grow" => grow = false,
+            "-u" | "--unified" => unified = true,
             "-n" | "--quiet" => {
                 // Accepted for sed compatibility; preview ignores it
             }
@@ -326,10 +354,19 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
     };
 
     let ctx = Context {
-        leading: context,
+        leading: context.unwrap_or(0),
         trailing: trailing.unwrap_or(0),
         grow,
         growth_cap: 20,
+    };
+    let mode = Mode {
+        unified,
+        // `-u` only borrows the context flags; with neither given it uses the
+        // diff default rather than the block default of 0. See `Mode`.
+        diff_context: match (context, trailing) {
+            (None, None) => blockedit::udiff::DEFAULT_CONTEXT,
+            (c, t) => c.unwrap_or(0).max(t.unwrap_or(0)),
+        },
     };
 
     // Handle single file or multiple files
@@ -337,7 +374,7 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
         let p = &input_files[0];
         if p == Path::new("-") {
             let text = read_stdin()?;
-            return single(&text, "(stdin)", &script, ctx, budget);
+            return one_file(&text, "(stdin)", &script, ctx, budget, mode);
         }
         if p.is_dir() {
             if !recursive {
@@ -347,7 +384,7 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
                     p.display()
                 )));
             }
-            return recursive_preview(p, &script, ctx, &globs);
+            return recursive_preview(p, &script, ctx, &globs, mode);
         }
         if !globs.is_empty() {
             return Err(Failure::Usage(
@@ -356,10 +393,10 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
         }
         let text = std::fs::read_to_string(p)
             .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
-        single(&text, &p.display().to_string(), &script, ctx, budget)
+        one_file(&text, &p.display().to_string(), &script, ctx, budget, mode)
     } else if recursive && input_files.len() == 1 && input_files[0].is_dir() {
         // Single directory with -r
-        recursive_preview(&input_files[0], &script, ctx, &globs)
+        recursive_preview(&input_files[0], &script, ctx, &globs, mode)
     } else if recursive {
         // Multiple files with -r: treat each as a root to walk
         // (This is a simplification; typically -r takes one directory)
@@ -376,7 +413,7 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
         for p in &input_files {
             let shown = if p == Path::new("-") {
                 let text = read_stdin()?;
-                single(&text, "(stdin)", &script, ctx, budget)?
+                one_file(&text, "(stdin)", &script, ctx, budget, mode)?
             } else if p.is_dir() {
                 return Err(Failure::Usage(format!(
                     "{} is a directory. Use -r to preview recursively.",
@@ -385,7 +422,7 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
             } else {
                 let text = std::fs::read_to_string(p)
                     .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
-                single(&text, &p.display().to_string(), &script, ctx, budget)?
+                one_file(&text, &p.display().to_string(), &script, ctx, budget, mode)?
             };
             if !out.payload.is_empty() && !shown.payload.is_empty() {
                 out.payload.push('\n');
@@ -395,6 +432,70 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
         }
         Ok(out)
     }
+}
+
+/// One file, in whichever of the two output modes was asked for.
+///
+/// Both modes run the same script through the same engine, so they cannot
+/// disagree about what sed would write -- only about how the change is shown.
+/// The split exists because the two have different readers: blocks are pasted
+/// into `edit`, a diff is read in a pager.
+fn one_file(
+    text: &str,
+    shown: &str,
+    expressions: &str,
+    ctx: Context,
+    budget: usize,
+    mode: Mode,
+) -> Result<Out, Failure> {
+    if mode.unified {
+        diff_one(text, shown, expressions, mode.diff_context)
+    } else {
+        single(text, shown, expressions, ctx, budget)
+    }
+}
+
+/// One file as a unified diff, for `-u`.
+///
+/// This is the mode that is *only* read. The output is a real unified diff --
+/// `---`/`+++` headers and `@@` hunk markers, the shape `patch` and every diff
+/// tool reads -- because the `path:LINE` header that carries the file name in a
+/// block has no equivalent outside the block format, and a multi-file run would
+/// otherwise have no way to say which file a hunk came from.
+///
+/// The context is the caller's `-c`/`-t`, and it is the only knob that applies:
+/// a diff has no budget, since there are no blocks to drop, and a truncated
+/// diff is a diff that lies about what it skipped.
+fn diff_one(
+    text: &str,
+    shown: &str,
+    expressions: &str,
+    diff_context: usize,
+) -> Result<Out, Failure> {
+    let (new, n) =
+        crate::preview_new(text, shown, expressions).map_err(|e| Failure::User(e.to_string()))?;
+    let d = blockedit::udiff::unified(text, &new, shown, diff_context);
+    if d.is_empty() {
+        return Ok(Out {
+            payload: String::new(),
+            status: format!(
+                "sed diff: no lines matched — {shown} is unchanged by these {} expression{}.\n",
+                n,
+                if n == 1 { "" } else { "s" }
+            ),
+        });
+    }
+    let hunks = d.matches("\n@@").count() + usize::from(d.starts_with("@@"));
+    Ok(Out {
+        status: format!(
+            "sed diff: {shown} — {hunks} hunk{} from {} expression{}. A diff is for reading; \
+             drop -u for blocks the `edit` tool can apply.\n",
+            if hunks == 1 { "" } else { "s" },
+            n,
+            if n == 1 { "" } else { "s" }
+        ),
+        payload: format!("{d}\n"),
+    })
 }
 
 /// One file, with the agent-facing preview budget applied.
@@ -450,6 +551,7 @@ fn recursive_preview(
     expressions: &str,
     ctx: Context,
     globs: &[String],
+    mode: Mode,
 ) -> Result<Out, Failure> {
     // Same matcher and the same semantics as picocode's `find` tool: the pattern
     // is matched against the path *relative to the walk root*, so a recursive
@@ -504,12 +606,39 @@ fn recursive_preview(
             skipped += 1; // binary or unreadable
             continue;
         };
-        let p = match crate::preview_text(&text, &f.display().to_string(), expressions, opts) {
+        let shown = f.display().to_string();
+        if mode.unified {
+            // A diff is built straight from the two versions of the file, so
+            // there is no block budget and no "could not be expressed" case to
+            // report: a file either differs or it does not.
+            let (new, _) = match crate::preview_new(&text, &shown, expressions) {
+                Ok(v) => v,
+                Err(crate::Error::CarriageReturn(_)) => {
+                    crlf.push(shown);
+                    continue;
+                }
+                Err(e) => return Err(Failure::User(e.to_string())),
+            };
+            let d = blockedit::udiff::unified(&text, &new, &shown, mode.diff_context);
+            if d.is_empty() {
+                continue;
+            }
+            // Blank line between files, so a reader (or `patch`) can tell one
+            // file's hunks from the next.
+            if !blob.is_empty() {
+                blob.push('\n');
+            }
+            blob.push_str(&d);
+            blob.push('\n');
+            changed_files += 1;
+            continue;
+        }
+        let p = match crate::preview_text(&text, &shown, expressions, opts) {
             Ok(p) => p,
             // One refused file must not sink the tree, but it must be named:
             // silence here would read as "that file needed no change".
             Err(crate::Error::CarriageReturn(_)) => {
-                crlf.push(f.display().to_string());
+                crlf.push(shown);
                 continue;
             }
             Err(e) => return Err(Failure::User(e.to_string())),
@@ -520,7 +649,7 @@ fn recursive_preview(
         if let Some(why) = p.blocked {
             // One unrepresentable file must not sink the tree, but it must be
             // named: silence here would read as "that file needed no change".
-            blocked.push((f.display().to_string(), why));
+            blocked.push((shown, why));
             continue;
         }
         let b = p.blob;
@@ -567,18 +696,30 @@ fn recursive_preview(
         });
     }
 
-    let mut out = format!(
-        "sed preview: {changed_files} of {} file(s) under {} changed, {blocks} block(s) \
-         total. Review the blocks below, then apply them with `bsed apply -i`.\n",
-        files.len(),
-        root.display(),
-    );
+    let mut out = if mode.unified {
+        // A diff cannot be applied by anything, so the summary must not invite
+        // it to be. `blocks` is 0 in this mode by construction.
+        format!(
+            "sed diff: {changed_files} of {} file(s) under {} changed. A diff is for reading; \
+             drop -u for blocks `bsed apply -i` can write.\n",
+            files.len(),
+            root.display(),
+        )
+    } else {
+        format!(
+            "sed preview: {changed_files} of {} file(s) under {} changed, {blocks} block(s) \
+             total. Review the blocks below, then apply them with `bsed apply -i`.\n",
+            files.len(),
+            root.display(),
+        )
+    };
     if skipped > 0 {
         out.push_str(&format!(
             "NOTE: {skipped} file(s) skipped (not UTF-8 text).\n"
         ));
     }
-    if !blocked.is_empty() {
+    // Nothing can be "unexpressible as blocks" in a mode that emits none.
+    if !mode.unified && !blocked.is_empty() {
         out.push_str(&format!(
             "NOTE: {} file(s) matched but cannot be expressed as appliable blocks, and are \
              NOT in the output:\n",

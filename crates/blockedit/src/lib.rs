@@ -27,6 +27,7 @@ pub mod path;
 pub mod resolve;
 pub mod tool_errors;
 pub mod types;
+pub mod udiff;
 pub mod wire;
 
 pub use apply::{apply_to_file, apply_to_text, success_note, ApplyOutcome};

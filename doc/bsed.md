@@ -649,6 +649,50 @@ The agent is unaffected: the sandbox capture uses `stderr_to_stdout`, so the mod
 still reads the banner and the "pass them to `edit`" instruction ahead of the
 blocks, exactly as before.
 
+### 7.1b `-u`: a unified diff instead of blocks
+
+Blocks and a diff answer the same question — what would this script change —
+for readers with nothing in common. A block is pasted into `edit`; a diff is read
+in a pager. `-u` switches which one is emitted, and nothing else: the same script
+through the same engine, so the two modes cannot disagree about what sed would
+write.
+
+```
+$ bsed -u 's/old_name/new_name/' -p src/x.rs
+--- src/x.rs
++++ src/x.rs
+@@ -1,5 +1,5 @@
+ fn main() {
+     let old_name = 1;
+-    let old_name = 2;
++    let new_name = 2;
+ }
+```
+
+It is a real unified diff: `---`/`+++` headers and `@@` hunks, which is what
+`patch` and every diff tool reads. That is the reason it is not picocode's
+in-panel edit preview (`refined_diff_lines` in `src/output.rs`): that one is a *display*
+format, with no file headers at all, a space after each `-`/`+` so the terminal
+panel can align columns, and a 60-line cap because it is about to be drawn in a
+scrollback. None of that survives a redirect, and a multi-file run has no other
+way to say which file a hunk came from. The two share the diff — Myers via
+`similar`, and a line split that keeps a `
+` as content — and nothing else.
+
+Two things follow from it being for a person:
+
+* **Context falls back to 2, not 0.** Blocks default to zero because their
+  reader is a program wanting the smallest correct payload, and a block is
+  anchored so it needs no room. A diff has no anchor, and a hunk with no context
+  is a diff you have to open the file to read. `-c`/`-t` override, and `-c 0` is
+  honoured as a real request for none.
+* **No budget, and no "could not be expressed" case.** There are no blocks to
+  drop, and a diff that silently omitted a file would be lying about the change.
+  A CRLF file is still refused, as everywhere else.
+
+The status line says `sed diff:` and points at `-u` rather than `bsed apply -i`,
+since nothing can apply a diff.
+
 ### 7.2 Apply is atomic *per file*
 
 This is the one place the design changed under contact with a real use case. The

@@ -169,6 +169,108 @@ fn an_unknown_option_is_still_refused() {
     assert!(err.contains("USAGE"), "{err}");
 }
 
+/// `-u` emits a unified diff: file headers, hunk markers, real `-`/`+` lines.
+/// No anchor, no `@@@OLD`, nothing the `edit` tool could take.
+#[test]
+fn unified_emits_a_unified_diff() {
+    let d = tempfile::tempdir().unwrap();
+    write(
+        &d.path().to_path_buf(),
+        "a.rs",
+        "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
+    );
+    let o = run_in(
+        d.path(),
+        None,
+        &["-u", "-p", "a.rs", "2s/let x = 1;/let x = 42;/"],
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("--- a.rs\n"), "{out}");
+    assert!(out.contains("+++ a.rs\n"), "{out}");
+    assert!(out.contains("@@ -"), "{out}");
+    assert!(out.contains("-    let x = 1;"), "{out}");
+    assert!(out.contains("+    let x = 42;"), "{out}");
+    assert!(!out.contains("@@@OLD"), "{out}");
+    // Status still goes to stderr, and must not tell the reader to apply it.
+    let err = stderr(&o);
+    assert!(err.contains("drop -u"), "{err}");
+    assert!(!err.contains("apply them"), "{err}");
+}
+
+/// A diff's reader is a person, so it gets context even though blocks no longer
+/// do. `-c 0` is an explicit request and is honoured.
+#[test]
+fn unified_has_context_by_default_and_honours_c_zero() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "a.rs", "a\nb\nc\nd\ne\nf\n");
+    let s = "3s/c/C/";
+    let def = stdout(&run_in(d.path(), None, &["-u", "-p", "a.rs", s]));
+    assert!(
+        def.contains("\n a\n") && def.contains("\n d\n"),
+        "default: {def}"
+    );
+    let none = stdout(&run_in(d.path(), None, &["-u", "-c", "0", "-p", "a.rs", s]));
+    assert!(
+        !none.contains("\n a\n") && !none.contains("\n d\n"),
+        "-c 0: {none}"
+    );
+    // ...and blocks are unaffected either way: still no context by default.
+    // Blocks are untouched by `-u`'s context default: no trailing padding is
+    // asked for, so the block is the change plus whatever the diff grouped in.
+    let blocks = stdout(&run_in(d.path(), None, &["-p", "a.rs", s]));
+    assert!(blocks.starts_with("a.rs:3\n@@@OLD\nc\n"), "{blocks}");
+    assert!(
+        !blocks.contains("\nb\n"),
+        "leading context appeared: {blocks}"
+    );
+}
+
+/// More than one file needs the `---`/`+++` headers, since a diff has no
+/// `path:LINE` anchor to say which file a hunk came from.
+#[test]
+fn unified_separates_files_in_a_recursive_run() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "one.rs", "a\nb\n");
+    write(&d.path().to_path_buf(), "two.rs", "b\nc\n");
+    let o = run_in(d.path(), None, &["-u", "-r", "-p", ".", "s/b/B/"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    // The label is the same path string the block headers use, `./` prefix and
+    // all, so the two modes name a file identically.
+    assert!(out.contains("--- ./one.rs\n"), "{out}");
+    assert!(out.contains("--- ./two.rs\n"), "{out}");
+    // Files are ordered, and a blank line separates them.
+    let a = out.find("--- ./one.rs").unwrap();
+    let b = out.find("--- ./two.rs").unwrap();
+    assert!(a < b, "{out}");
+    assert!(
+        out.contains("B\n\n--- ./two.rs"),
+        "no blank line between: {out}"
+    );
+}
+
+/// Nothing changed is still exit 0 and an empty stdout, whichever mode.
+#[test]
+fn unified_with_no_change_is_silent() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "a.rs", "a\n");
+    let o = run_in(d.path(), None, &["-u", "-p", "a.rs", "s/zzz/yyy/"]);
+    assert_eq!(code(&o), 0);
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
+    assert!(stderr(&o).contains("no lines matched"), "{}", stderr(&o));
+}
+
+/// CRLF is refused in this mode too, rather than diffed into something wrong.
+#[test]
+fn unified_refuses_a_crlf_file() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "crlf.txt", "a\r\nb\r\n");
+    let o = run_in(d.path(), None, &["-u", "-p", "crlf.txt", "s/b/B/"]);
+    assert_eq!(code(&o), 2);
+    assert!(stderr(&o).contains("carriage returns"), "{}", stderr(&o));
+}
+
 /// `preview` used to be the subcommand. The word is gone, but saying so beats
 /// letting it be read as a script and failing on the quotes in the next one.
 #[test]
