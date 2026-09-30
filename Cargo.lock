@@ -341,12 +341,12 @@ dependencies = [
 [[package]]
 name = "codewandler-markdown-stream"
 version = "0.2.1"
-source = "git+https://github.com/gwicke/codewandler-markdown?rev=c4f3b0760b21ff90e48ebf1312fea0fac21eb12b#c4f3b0760b21ff90e48ebf1312fea0fac21eb12b"
+source = "git+https://github.com/gwicke/codewandler-markdown?branch=main#c4f3b0760b21ff90e48ebf1312fea0fac21eb12b"
 
 [[package]]
 name = "codewandler-markdown-terminal"
 version = "0.2.1"
-source = "git+https://github.com/gwicke/codewandler-markdown?rev=c4f3b0760b21ff90e48ebf1312fea0fac21eb12b#c4f3b0760b21ff90e48ebf1312fea0fac21eb12b"
+source = "git+https://github.com/gwicke/codewandler-markdown?branch=main#c4f3b0760b21ff90e48ebf1312fea0fac21eb12b"
 dependencies = [
  "codewandler-markdown-stream",
  "unicode-width 0.2.2",
@@ -2319,7 +2319,7 @@ dependencies = [
 [[package]]
 name = "sed-rs"
 version = "2.0.0"
-source = "git+file:///home/gabriel/src/sed-rs?branch=main#64de64fd18b36b008697f76a20be14e0658401bc"
+source = "git+https://github.com/gwicke/sed-rs.git?branch=main#64de64fd18b36b008697f76a20be14e0658401bc"
 dependencies = [
  "clap",
  "regex",
