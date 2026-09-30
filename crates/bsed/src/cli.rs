@@ -27,38 +27,45 @@ const USAGE: &str = "\
 bsed — block-edit sed
 
 USAGE:
-    bsed preview [OPTIONS] <expressions>
+    bsed preview [OPTIONS]... [SCRIPT] [FILE]...
     bsed apply   [OPTIONS] [FILE]
 
 PREVIEW (never writes; the default):
-    -p, --path <PATH>     File to preview, or a directory with -r
-    -r, --recursive       Walk a directory (.gitignore-aware, hidden files
-                          skipped) and preview every file, emitting one blob
-                          with a header per file. No budget: a human is reading
-                          this, not a model.
-    -g, --glob <PATTERN>  With -r, only files whose path relative to the root
-                          matches. Repeatable, and any match wins. Same
-                          semantics as the `find` tool, so use **/*.rs for a
-                          recursive match.
-    -c, --context <N>     Unchanged lines each side; trailing is always at
-                          least 2 (default 0)
-    -t, --trailing <N>    Minimum unchanged lines after a change (default 2)
-        --no-grow         Do not extend blocks to a balanced bracket
-    -b, --budget <BYTES>  Preview budget, single-file mode only (default 51200)
+    -e, --expression <SCRIPT>   Add the script to the commands to execute
+    -f, --file <SCRIPT_FILE>    Add the contents of script-file to the commands
+    -p, --path <PATH>           File to preview, or a directory with -r
+    -r, --recursive             Walk a directory (.gitignore-aware, hidden files
+                                skipped) and preview every file, emitting one blob
+                                with a header per file. No budget: a human is reading
+                                this, not a model.
+    -g, --glob <PATTERN>        With -r, only files whose path relative to the root
+                                matches. Repeatable, and any match wins. Same
+                                semantics as the `find` tool, so use **/*.rs for a
+                                recursive match.
+    -c, --context <N>           Unchanged lines each side; trailing is always at
+                                least 2 (default 0)
+    -t, --trailing <N>          Minimum unchanged lines after a change (default 2)
+        --no-grow               Do not extend blocks to a balanced bracket
+    -b, --budget <BYTES>        Preview budget, single-file mode only (default 51200)
     -h, --help
+    -n, --quiet                 Suppress automatic printing (ignored; preview only)
+    SCRIPT                      If no -e/-f given, first non-option is the script
+    FILE...                     Input files (default: stdin if no files given)
 
 APPLY (writes):
-    -p, --path <PATH>     File to edit (default: the FILE argument, else -)
-    -i, --in-place        Write the file; without it the result goes to stdout.
-                          Required for a multi-file blob.
+    -p, --path <PATH>           File to edit (default: the FILE argument, else -)
+    -i, --in-place              Write the file; without it the result goes to stdout.
+                                Required for a multi-file blob.
     A blob may span files. Each file is applied independently -- a file whose
     blocks do not resolve is reported and left alone, and the others still go
     through. The failed blocks are echoed back so they can be fixed and
     re-piped.
 
 EXAMPLES:
-    bsed preview '177s/edits: EditInput,/edits: serde_json::Value,/' -p src/x.rs
-    bsed preview -r -p src 's/EditInput/serde_json::Value/g' > blocks.txt
+    bsed preview -e 's/old/new/' -p src/x.rs
+    bsed preview 's/old/new/' src/x.rs
+    bsed preview -f script.sed src/x.rs
+    bsed preview -r -p src 's/old/new/' > blocks.txt
     bsed apply -i < blocks.txt
     bsed apply src/x.rs < blocks.txt | diff src/x.rs -
 ";
@@ -191,63 +198,86 @@ fn run(args: &[String]) -> Result<String, Failure> {
 }
 
 fn preview(args: &[String]) -> Result<String, Failure> {
-    let mut path: Option<PathBuf> = None;
+    let mut paths: Vec<PathBuf> = Vec::new();
     let mut recursive = false;
     let mut globs: Vec<String> = Vec::new();
     let mut context: usize = 0;
     let mut trailing: Option<usize> = None;
     let mut grow = true;
     let mut budget = Options::default().max_preview_bytes;
-    let mut script: Vec<String> = Vec::new();
+    let mut script_parts: Vec<String> = Vec::new();
     let mut only_positional = false;
+    let mut saw_e_or_f = false;
 
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         if only_positional {
-            script.push(a.clone());
+            // After --, everything is a file
+            paths.push(PathBuf::from(a.clone()));
             continue;
         }
         match a.as_str() {
             "--" => only_positional = true,
             "-h" | "--help" => return Ok(USAGE.to_string()),
             "--version" | "-V" => return Ok(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))),
-            "-p" | "--path" => path = Some(PathBuf::from(need(it.next(), "-p")?)),
+            "-e" | "--expression" => {
+                saw_e_or_f = true;
+                script_parts.push(need(it.next(), "-e")?.to_string());
+            }
+            "-f" | "--file" => {
+                saw_e_or_f = true;
+                let script_file = need(it.next(), "-f")?;
+                let content = std::fs::read_to_string(script_file)
+                    .map_err(|e| Failure::Internal(format!("{script_file}: {e}")))?;
+                script_parts.push(content);
+            }
+            "-p" | "--path" => paths.push(PathBuf::from(need(it.next(), "-p")?)),
             "-r" | "--recursive" => recursive = true,
             "-g" | "--glob" => globs.push(need(it.next(), "-g")?.to_string()),
             "-c" | "--context" => context = need_num(it.next(), "-c")?,
             "-t" | "--trailing" => trailing = Some(need_num(it.next(), "-t")?),
             "-b" | "--budget" => budget = need_num(it.next(), "-b")?,
             "--no-grow" => grow = false,
+            "-n" | "--quiet" => {
+                // Accepted for sed compatibility; preview ignores it
+            }
             other if other.len() > 1 && other.starts_with('-') => {
                 return Err(Failure::Usage(format!("unknown option `{other}`")));
             }
-            other => script.push(other.to_string()),
+            other => {
+                // First non-option is the script (if no -e/-f), rest are files
+                if !saw_e_or_f && script_parts.is_empty() {
+                    script_parts.push(other.to_string());
+                } else {
+                    paths.push(PathBuf::from(other));
+                }
+            }
         }
     }
 
-    // Expressions come from the command line when given, else from stdin; the
-    // file comes from -p, else from stdin. Both from stdin is ambiguous, so it
-    // is a usage error rather than a guess.
-    let (expressions, from_stdin_script) = if script.is_empty() {
-        // Nothing on the command line: take the script from stdin, but not on a
-        // terminal, where that just looks like a hang.
+    // Build the script from -e/-f or the first positional
+    let script = if script_parts.is_empty() {
+        // No script on command line: read from stdin
         if std::io::stdin().is_terminal() {
             return Err(Failure::Usage(
-                "no sed expressions given. Usage: bsed preview -p FILE 's/a/b/'".into(),
+                "no sed script given. Usage: bsed preview [-e SCRIPT] [-f FILE] [FILE...]".into(),
             ));
         }
-        (read_stdin()?, true)
+        read_stdin()?
     } else {
-        (script.join("\n"), false)
+        script_parts.join("\n")
     };
-    if expressions.trim().is_empty() {
-        return Err(Failure::Usage("no sed expressions given".into()));
+    if script.trim().is_empty() {
+        return Err(Failure::Usage("no sed script given".into()));
     }
-    if path.is_none() && from_stdin_script {
-        return Err(Failure::Usage(
-            "with expressions on stdin, name the file: bsed preview -p FILE < expressions".into(),
-        ));
-    }
+
+    // Determine input files: -p arguments, then positional files, then stdin
+    let input_files = if paths.is_empty() {
+        // No -p and no positional files: read from stdin
+        vec![PathBuf::from("-")]
+    } else {
+        paths
+    };
 
     let ctx = Context {
         leading: context,
@@ -256,39 +286,62 @@ fn preview(args: &[String]) -> Result<String, Failure> {
         growth_cap: 20,
     };
 
-    let Some(p) = path.as_ref() else {
-        // No `-p` at all: the file arrives on stdin (`cat f.rs | bsed preview
-        // 's/x/y/'`), which cannot be recursive.
-        let text = read_stdin()?;
-        return single(&text, "(stdin)", &expressions, ctx, budget);
-    };
-    if p == Path::new("-") {
-        let text = read_stdin()?;
-        return single(&text, "(stdin)", &expressions, ctx, budget);
-    }
-    if p.is_dir() {
-        if !recursive {
-            return Err(Failure::Usage(format!(
-                "{} is a directory. Use `bsed preview -r -p {}` to preview every file under it.",
-                p.display(),
-                p.display()
-            )));
+    // Handle single file or multiple files
+    if input_files.len() == 1 && !recursive {
+        let p = &input_files[0];
+        if p == Path::new("-") {
+            let text = read_stdin()?;
+            return single(&text, "(stdin)", &script, ctx, budget);
         }
-        return recursive_preview(p, &expressions, ctx, &globs);
-    }
-    if recursive {
+        if p.is_dir() {
+            if !recursive {
+                return Err(Failure::Usage(format!(
+                    "{} is a directory. Use `bsed preview -r -p {}` to preview every file under it.",
+                    p.display(),
+                    p.display()
+                )));
+            }
+            return recursive_preview(p, &script, ctx, &globs);
+        }
+        if !globs.is_empty() {
+            return Err(Failure::Usage(
+                "--glob only applies with --recursive".into(),
+            ));
+        }
+        let text = std::fs::read_to_string(p)
+            .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
+        single(&text, &p.display().to_string(), &script, ctx, budget)
+    } else if recursive && input_files.len() == 1 && input_files[0].is_dir() {
+        // Single directory with -r
+        recursive_preview(&input_files[0], &script, ctx, &globs)
+    } else if recursive {
+        // Multiple files with -r: treat each as a root to walk
+        // (This is a simplification; typically -r takes one directory)
         return Err(Failure::Usage(
-            "--recursive needs a directory; -p named a file".into(),
+            "--recursive expects a single directory".into(),
         ));
+    } else {
+        // Multiple files: preview each and concatenate
+        let mut combined = String::new();
+        for p in &input_files {
+            if p == Path::new("-") {
+                let text = read_stdin()?;
+                let result = single(&text, "(stdin)", &script, ctx, budget)?;
+                combined.push_str(&result);
+            } else if p.is_dir() {
+                return Err(Failure::Usage(format!(
+                    "{} is a directory. Use -r to preview recursively.",
+                    p.display()
+                )));
+            } else {
+                let text = std::fs::read_to_string(p)
+                    .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
+                let result = single(&text, &p.display().to_string(), &script, ctx, budget)?;
+                combined.push_str(&result);
+            }
+        }
+        Ok(combined)
     }
-    if !globs.is_empty() {
-        return Err(Failure::Usage(
-            "--glob only applies with --recursive".into(),
-        ));
-    }
-    let text = std::fs::read_to_string(p)
-        .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
-    single(&text, &p.display().to_string(), &expressions, ctx, budget)
 }
 
 /// One file, with the agent-facing preview budget applied.

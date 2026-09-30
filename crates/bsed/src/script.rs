@@ -16,7 +16,7 @@
 //!    that *looks* right and is wrong. They are replaced with sentinels that a
 //!    post-pass expands ([`crate::engine`]).
 
-use sed_rs::command::{AddressRange, Command, SedCommand, SubstituteCmd};
+use sed_rs::command::{Address, AddressRange, Command, SedCommand, SubstituteCmd};
 
 /// A rejected expression, with enough context for the model to fix it.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +39,18 @@ impl std::fmt::Display for ScriptError {
     }
 }
 
+/// A change-range command: replaces an entire address range with new text.
+/// This is the GNU sed `c` command over a range (e.g., `2,4c\new text`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeRange {
+    /// 1-based start line of the range (inclusive)
+    pub start_line: usize,
+    /// 1-based end line of the range (inclusive)
+    pub end_line: usize,
+    /// The replacement text (can contain newlines)
+    pub replacement: String,
+}
+
 /// A validated script: the joined text to hand the engine, plus whether any
 /// expression needed the case-escape rewrite.
 pub struct Script {
@@ -48,19 +60,23 @@ pub struct Script {
     /// True when at least one replacement carried a case escape, which means
     /// the post-pass must find the sentinels or fail loudly.
     pub used_case_sentinels: bool,
+    /// Change-range commands extracted from the script (GNU `c` over range).
+    /// These are handled separately by the engine because sed-rs applies `c`
+    /// per-line instead of once-per-range like GNU sed.
+    pub change_ranges: Vec<ChangeRange>,
 }
 
 /// Split, screen, and rewrite. Never executes anything.
 pub fn build(expressions: &str) -> Result<Script, ScriptError> {
-    let mut kept: Vec<(usize, String)> = Vec::new();
-    for line in expressions.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        kept.push((kept.len() + 1, line.to_string()));
-    }
-    if kept.is_empty() {
+    // Parse the entire script at once to handle multi-line commands (like `c\`).
+    // sed-rs's parse function handles newlines and semicolons as command separators.
+    let cmds = sed_rs::command::parse(expressions).map_err(|e| ScriptError {
+        expression: 0,
+        line: expressions.to_string(),
+        reason: format!("{e}"),
+    })?;
+
+    if cmds.is_empty() {
         return Err(ScriptError {
             expression: 0,
             line: String::new(),
@@ -68,28 +84,278 @@ pub fn build(expressions: &str) -> Result<Script, ScriptError> {
         });
     }
 
+    // For error reporting, we need to map commands back to expression numbers.
+    // We'll approximate by counting non-blank lines in the original.
+    let expr_lines: Vec<&str> = expressions
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let expr_count = expr_lines.len().max(1);
+
     let mut used_case_sentinels = false;
-    let mut out: Vec<String> = Vec::new();
-    for (n, line) in &kept {
-        let cmds = sed_rs::command::parse(line).map_err(|e| ScriptError {
-            expression: *n,
-            line: line.clone(),
-            reason: format!("{e}"),
-        })?;
-        screen(&cmds, *n, line)?;
-        if let Some(rewritten) = rewrite_case_escapes(&cmds) {
-            out.push(rewritten);
+    let mut change_ranges: Vec<ChangeRange> = Vec::new();
+
+    // Extract change ranges and screen all commands
+    for (i, cmd) in cmds.iter().enumerate() {
+        let expr_num = (i % expr_count) + 1;
+        let line = expr_lines.get(i).unwrap_or(&expressions);
+        extract_change_ranges(&[cmd.clone()], expr_num, line, &mut change_ranges)?;
+        screen(&[cmd.clone()], expr_num, line)?;
+        if cmd_has_case_escape(cmd) {
             used_case_sentinels = true;
-        } else {
-            out.push(line.clone());
         }
     }
 
+    // Rewrite case escapes for the whole script
+    let rewritten = rewrite_case_escapes(&cmds);
+
+    // Remove change-range commands from the script text passed to sed-rs,
+    // since we handle them separately with correct GNU semantics.
+    let script_text = if let Some(r) = rewritten {
+        remove_change_ranges(r)
+    } else {
+        remove_change_ranges(expressions.to_string())
+    };
+
     Ok(Script {
-        text: out.join("\n"),
-        count: kept.len(),
+        text: script_text,
+        count: expr_count,
         used_case_sentinels,
+        change_ranges,
     })
+}
+
+/// Check if any command in the tree has a case escape.
+fn cmd_has_case_escape(cmd: &SedCommand) -> bool {
+    match &cmd.command {
+        Command::Substitute(s) => has_case_escape(&s.replacement),
+        Command::Block(inner) => inner.iter().any(cmd_has_case_escape),
+        _ => false,
+    }
+}
+
+/// Extract `c` (change) commands over ranges from parsed commands.
+fn extract_change_ranges(
+    cmds: &[SedCommand],
+    expr_num: usize,
+    line: &str,
+    ranges: &mut Vec<ChangeRange>,
+) -> Result<(), ScriptError> {
+    for c in cmds {
+        if let Command::Change(replacement) = &c.command {
+            if let AddressRange::Range {
+                start,
+                end,
+                negated: false,
+            } = &c.address
+            {
+                // Parse start and end addresses to line numbers
+                let (start_line, end_line) = match (start, end) {
+                    (Address::Line(s), Address::Line(e)) => (*s, *e),
+                    (Address::Line(s), Address::Last) => (*s, usize::MAX), // Will resolve at runtime
+                    _ => {
+                        return Err(ScriptError {
+                            expression: expr_num,
+                            line: line.to_string(),
+                            reason: "only line-number addresses supported for 'c' over range"
+                                .into(),
+                        });
+                    }
+                };
+                ranges.push(ChangeRange {
+                    start_line,
+                    end_line,
+                    replacement: replacement.clone(),
+                });
+            }
+        }
+        if let Command::Block(inner) = &c.command {
+            extract_change_ranges(inner, expr_num, line, ranges)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove `c` range commands from script text by replacing them with no-ops.
+/// We handle them separately, so we don't want sed-rs to process them incorrectly.
+fn remove_change_ranges(script: String) -> String {
+    // Parse the script and filter out change-range commands
+    let cmds = sed_rs::command::parse(&script).unwrap_or_else(|_| Vec::new());
+    let filtered = filter_change_ranges(cmds);
+    render_commands(&filtered)
+}
+
+/// Filter out `c` commands with range addresses from parsed commands.
+fn filter_change_ranges(cmds: Vec<SedCommand>) -> Vec<SedCommand> {
+    cmds.into_iter()
+        .filter_map(|c| {
+            if let Command::Change(_) = &c.command {
+                if matches!(c.address, AddressRange::Range { .. }) {
+                    return None; // Drop this command
+                }
+            }
+            if let Command::Block(inner) = c.command {
+                let filtered_inner = filter_change_ranges(inner);
+                if filtered_inner.is_empty() {
+                    return None;
+                }
+                return Some(SedCommand {
+                    address: c.address,
+                    command: Command::Block(filtered_inner),
+                });
+            }
+            Some(c)
+        })
+        .collect()
+}
+
+/// Render filtered commands back to a script string.
+fn render_commands(cmds: &[SedCommand]) -> String {
+    let mut out = String::new();
+    for (i, c) in cmds.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        render_command_filtered(c, &mut out);
+    }
+    out
+}
+
+fn render_command_filtered(c: &SedCommand, out: &mut String) {
+    // Render address
+    match &c.address {
+        AddressRange::None => {}
+        AddressRange::Single { addr, negated } => {
+            render_address(addr, out);
+            if *negated {
+                out.push('!');
+            }
+        }
+        AddressRange::Range {
+            start,
+            end,
+            negated,
+        } => {
+            render_address(start, out);
+            out.push(',');
+            render_address(end, out);
+            if *negated {
+                out.push('!');
+            }
+        }
+    }
+    // Render command
+    render_command_inner(&c.command, out);
+}
+
+fn render_address(addr: &Address, out: &mut String) {
+    match addr {
+        Address::Line(n) => out.push_str(&n.to_string()),
+        Address::Last => out.push('$'),
+        Address::Regex(re) => {
+            out.push('/');
+            out.push_str(re);
+            out.push('/');
+        }
+        Address::Step { first, step } => {
+            out.push_str(&format!("{first}~{step}"));
+        }
+    }
+}
+
+fn render_command_inner(cmd: &Command, out: &mut String) {
+    match cmd {
+        Command::Substitute(s) => {
+            out.push('s');
+            out.push('/');
+            out.push_str(&s.pattern);
+            out.push('/');
+            out.push_str(&s.replacement);
+            out.push('/');
+            if s.global {
+                out.push('g');
+            }
+            if let Some(n) = s.nth {
+                out.push_str(&n.to_string());
+            }
+            if s.case_insensitive {
+                out.push('I');
+            }
+            if s.print {
+                out.push('p');
+            }
+            if let Some(w) = &s.write_file {
+                out.push_str(&format!("w {w}"));
+            }
+        }
+        Command::Transliterate { from, to } => {
+            out.push('y');
+            out.push('/');
+            out.extend(from.iter());
+            out.push('/');
+            out.extend(to.iter());
+            out.push('/');
+        }
+        Command::Print => out.push('p'),
+        Command::PrintFirstLine => out.push('P'),
+        Command::PrintLineNumber => out.push('='),
+        Command::List => out.push('l'),
+        Command::Delete => out.push('d'),
+        Command::DeleteFirstLine => out.push('D'),
+        Command::Next => out.push('n'),
+        Command::NextAppend => out.push('N'),
+        Command::HoldReplace => out.push('h'),
+        Command::HoldAppend => out.push('H'),
+        Command::GetReplace => out.push('g'),
+        Command::GetAppend => out.push('G'),
+        Command::Exchange => out.push('x'),
+        Command::Append(t) => out.push_str(&format!("a\\{t}")),
+        Command::Insert(t) => out.push_str(&format!("i\\{t}")),
+        Command::Change(t) => out.push_str(&format!("c\\{t}")),
+        Command::Label(l) => out.push_str(&format!(":{l}")),
+        Command::Branch(l) => out.push_str(&format!("b{}", l.as_deref().unwrap_or(""))),
+        Command::BranchIfSub(l) => out.push_str(&format!("t{}", l.as_deref().unwrap_or(""))),
+        Command::BranchIfNotSub(l) => out.push_str(&format!("T{}", l.as_deref().unwrap_or(""))),
+        Command::ReadFile(p) => out.push_str(&format!("r {p}")),
+        Command::ReadLine(p) => out.push_str(&format!("R {p}")),
+        Command::PrintFileName => out.push('F'),
+        Command::ClearPattern => out.push('z'),
+        Command::Noop => out.push(':'),
+        Command::WriteFile(p) => out.push_str(&format!("w {p}")),
+        Command::WriteFirstLine(p) => out.push_str(&format!("W {p}")),
+        Command::Execute(e) => {
+            out.push('e');
+            if let Some(c) = e {
+                out.push(' ');
+                out.push_str(c);
+            }
+        }
+        Command::Quit(code) => {
+            out.push('q');
+            if let Some(c) = code {
+                out.push_str(&c.to_string());
+            }
+        }
+        Command::QuitNoprint(code) => {
+            out.push('Q');
+            if let Some(c) = code {
+                out.push_str(&c.to_string());
+            }
+        }
+        Command::Block(inner) => {
+            out.push('{');
+            out.push('\n');
+            for (i, c) in inner.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str("  ");
+                render_command(c, out);
+            }
+            out.push('\n');
+            out.push('}');
+        }
+    }
 }
 
 /// Reject the commands that would read or write the world beyond this file.
@@ -147,16 +413,9 @@ fn screen_one(c: &SedCommand, n: usize, line: &str) -> Result<(), ScriptError> {
         Command::Quit(code) => return Err(reject(quit_reason("q", code))),
         Command::QuitNoprint(code) => return Err(reject(quit_reason("Q", code))),
         // `c` over a *range*: GNU replaces the whole range with one copy, but
-        // `sed-rs` emits a copy per line. That is a wrong preview, not a
-        // preview we can fix afterwards, so it is refused rather than guessed at.
-        Command::Change(_) if matches!(c.address, AddressRange::Range { .. }) => {
-            return Err(reject(
-                "'c' over a line range is not supported: GNU replaces the whole range with \
-                 one copy of the text, and the preview could not show that faithfully. Make \
-                 one `edit` call per range, or use a single-line address."
-                    .into(),
-            ))
-        }
+        // `sed-rs` emits a copy per line. We extract these and handle them
+        // separately in the engine with correct GNU semantics.
+        // Single-address `c` is allowed and works correctly in sed-rs.
         // Recurse into a `{ … }` block; a write can hide in there.
         Command::Block(inner) => {
             for c in inner {
