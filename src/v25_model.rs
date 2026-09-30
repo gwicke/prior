@@ -699,7 +699,15 @@ impl ModelActionNode {
         }
     }
 
-    /// Persist the active model's live params as its stored defaults.
+    /// Persist a model's live params as its stored defaults.
+    ///
+    /// The source is the session's per-model memory, not `app.params()`, so
+    /// `save` works for any model *used* this session rather than only the one
+    /// running now: a → b → a restores a's runtime values, and this is how the
+    /// user makes them durable without re-activating a first. For the current
+    /// model the two are the same value by the A.6 invariant, so this widens
+    /// the set of models `save` accepts and changes nothing for the one that
+    /// was already accepted.
     ///
     /// Starts from the stored record rather than a fresh one, so `save` cannot
     /// wipe a metadata override the user set through Ctrl-E — it owns the three
@@ -708,12 +716,11 @@ impl ModelActionNode {
         let Some(app) = self.store.as_ref() else {
             return SubmitResult::Handled;
         };
-        if app.model() != model {
+        let Some(live) = app.model_param(model) else {
             return SubmitResult::Done(Some(format!(
-                "{model} is not the active model — there are no live settings to save"
+                "{model} has not been used in this session, so it has no live settings to save"
             )));
-        }
-        let live = app.params();
+        };
         // Only what differs from the built-in default: reasoning is never
         // `None` (it seeds from the global) so it is always written, while
         // temperature and top_p are written only when set, leaving a model the
@@ -1272,17 +1279,18 @@ mod tests {
         assert_eq!(stored.context_length, Some(4096), "metadata untouched");
     }
 
-    /// There are no live params for a model that is not running, and saying so
-    /// beats writing an empty record.
+    /// A model never used this session has no live params, and saying so beats
+    /// writing an empty record. The message names the fix, since the cause is
+    /// no longer "it isn't the active model" — activating it is.
     #[test]
-    fn save_on_an_inactive_model_explains_itself() {
+    fn save_on_an_unvisited_model_explains_itself() {
         let app_state = test_app_state();
         app_state.set_model("anthropic:not-this-one");
         let mut node = ModelActionNode::save(app_state.clone(), 1);
         let pa = PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " ");
         match futures::executor::block_on(node.submit(1, &pa)) {
             SubmitResult::Done(Some(msg)) => {
-                assert!(msg.contains("not the active model"), "{msg}");
+                assert!(msg.contains("has not been used in this session"), "{msg}");
             }
             _ => panic!("expected Done with an explanation"),
         }
@@ -1291,6 +1299,40 @@ mod tests {
                 .model_settings(TEST_MODEL)
                 .is_none(),
             "nothing must be written for a model with no live settings"
+        );
+    }
+
+    /// A model that was used earlier in the session is saveable while another
+    /// model is running: the source is the session's per-model memory, so
+    /// a → b → a's runtime values can be made durable without re-activating a.
+    #[test]
+    fn save_works_for_a_model_visited_earlier_in_the_session() {
+        let app_state = test_app_state();
+        // Use the model, change it, then move on to another.
+        app_state.set_model(TEST_MODEL);
+        app_state.activate_model_params(TEST_MODEL);
+        app_state.set_param(|p| p.temperature = Some(0.35));
+        app_state.set_model("anthropic:not-this-one");
+        assert_ne!(
+            app_state.model(),
+            TEST_MODEL,
+            "precondition: it is not current"
+        );
+
+        let mut node = ModelActionNode::save(app_state.clone(), 1);
+        let pa = PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " ");
+        assert!(matches!(
+            futures::executor::block_on(node.submit(1, &pa)),
+            SubmitResult::Done(..)
+        ));
+        let stored = settings_store(&app_state)
+            .model_settings(TEST_MODEL)
+            .cloned()
+            .expect("a model visited earlier must be saveable");
+        assert_eq!(
+            stored.temperature,
+            Some(0.35),
+            "the values it was running with, not the current model's"
         );
     }
 

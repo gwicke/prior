@@ -369,6 +369,18 @@ temperature = 0.8
     the price of "the model file is authoritative once it exists".
   - A **per-turn override never counts as "modified"** — it is stripped and
     reverted at end of turn, so it can neither be saved nor survive a switch.
+  - **Which models `save` accepts:** any model *used* this session, not only
+    the one running now. The source is `model_param_map[id]` — the A.6
+    per-model memory — rather than `config.params`, so a → b → a's runtime
+    values can be made durable without re-activating a first. For the current
+    model the two are the same value by the invariant, so this widens the set
+    without changing any existing behavior. A model never used this session has
+    no live params to save and says so.
+  - *Consequence, intended:* `save` on a model that was visited but never
+    changed materializes the global's current level into that model's record
+    (the `reasoning`-always-written rule above). Pinning today's global is what
+    `save` means, but it is worth knowing a no-op-looking `save` is not a
+    byte-level no-op.
 
 ## A.6 Runtime state
 
@@ -480,7 +492,8 @@ edits of a model's params are the global `/reasoning`, `/temperature`,
 - `save` is only offered when the node is the **live** one (`live.is_some()`);
   under `/set default_model` the same `ModelNode` is reused (`v25_set.rs:160`),
   where "activate" means "set as default model" and saving live params is
-  meaningless.
+  meaningless. On the live node it accepts any model *used* this session, not
+  only the current one (see A.5).
 - The model's `header()` renders: display name, OpenRouter description, ctx /
   $/M in / $/M out / coding / intelligence / agentic, `supported efforts: …`
   when known, whether temperature/top_p are supported, and the **current**

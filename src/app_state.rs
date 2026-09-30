@@ -273,6 +273,13 @@ impl AppState {
         self.set_param(|p| p.reasoning = level);
     }
 
+    /// The live params of `id` as of its last visit this session, or `None` if
+    /// it has never been activated. What `save` writes from — see
+    /// [`Self::activate_model_params`].
+    pub fn model_param(&self, id: &str) -> Option<crate::params::ModelParams> {
+        self.state.lock().model_param_map.get(id).copied()
+    }
+
     /// Make `id` the current model and give it its live params.
     ///
     /// Load-or-seed, per field, never per record (doc/model_settings_v2.md A.6):
