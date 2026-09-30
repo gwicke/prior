@@ -73,7 +73,13 @@ fn get_path_with(path: &str, is_write: bool) -> Result<PathBuf, ToolError> {
         return policy
             .check(&host, is_write)
             .map(|_| host)
-            .map_err(ToolError::Generic);
+            .map_err(|denied| {
+                // Show the caller the path *it* supplied — already an in-sandbox
+                // path, so it can act on it without needing to know the remap
+                // table. The host form is the operator's datum and never goes in
+                // this string; see `doc/path_leak_risks.md`.
+                ToolError::Generic(denied.model_message(path))
+            });
     }
 
     validate_path(&base, path)
@@ -2457,6 +2463,45 @@ mod edit_file_tests {
             .await
             .unwrap()
             .contains("walk();"));
+    }
+
+    /// A policy denial must report the path the model supplied, never the host
+    /// path it resolves to. Under a remapping binding the two differ, and the
+    /// model can only act on the former — if it is handed the host path it has
+    /// no way to name it back. Pins the *wiring* in `get_path_with`, not just
+    /// the rendering on `PolicyDenied`. See `doc/path_leak_risks.md`.
+    #[tokio::test]
+    #[serial]
+    async fn a_denied_path_reports_the_supplied_path_not_the_host_one() {
+        let _tmpdir = tmpdir_inside_repo();
+        let _cwd = CwdGuard::new();
+
+        // Read-only binding, and we attempt a write -> denied with a remap in
+        // play, so the two path forms are genuinely different strings.
+        let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/deny-scratch");
+        set_sandbox(Some(sandbox_with(
+            vec![BindPath::Remap {
+                from: host.to_string_lossy().to_string(),
+                to: "/scratch".to_string(),
+            }],
+            vec![],
+            Some(30),
+        )));
+
+        let err = write_file("/scratch/f.txt".to_string(), "x".to_string())
+            .await
+            .expect_err("writing under an ro binding must be denied")
+            .to_string();
+
+        assert!(
+            err.contains("/scratch/f.txt"),
+            "message should echo the supplied path: {err}"
+        );
+        assert!(
+            !err.contains("deny-scratch"),
+            "message leaked the host path: {err}"
+        );
+        assert!(err.contains("read-only"), "reason lost: {err}");
     }
 
     /// `grep` crosses into the namespace like `sed` does, so it needs the
