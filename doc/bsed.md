@@ -101,9 +101,10 @@ Tool name `sed`, registered **only when `bsed` is found on `$PATH`** (§9).
   ignored. NUL bytes are rejected up front (they cannot cross an argv boundary).
 * `context` — integer or numeric string, same shape as `ReadLimit`
   (`src/config.rs:100`), because harnesses stringify numbers. Default **1**;
-  clamped to `[0, 20]`. Effective padding is `leading = context`,
-  `trailing = max(context, 1)`, so an unadorned call gets one line each side. A
-  `bsed` caller sets the two sides independently with `-c N` / `-t N`. See §4.1.
+  clamped to `[0, 20]`. **Symmetric**, the way `grep -C` is: `leading =
+  trailing = context`, so an unadorned call gets one line each side. A `bsed`
+  caller can ask for asymmetric context with `-t N`, which adds N *extra* lines
+  after. See §4.1.
 * Returns the block blob on stdout and a one-line banner on stderr (§7.1a).
   Never writes.
   Not wrapped in `guard()` — it is a read-only preview.
@@ -117,14 +118,27 @@ the number of **unchanged** lines of the original file carried *into each emitte
 block*, inside `OLD` and `NEW`. Only regions that actually changed are ever
 emitted; `context` pads each one.
 
-**The default is 1, on both sides.** `leading = context`, `trailing =
-max(context, 1)`, so an unadorned call gets one unchanged line before and after.
-Symmetry is the point: an asymmetric default gives the *following* line a special
-role, and that is one more thing to hold in one's head about what a block will
-contain. One line each way covers the common shapes — the line a call opens on,
-the line a block closes on — and the balance-growth pass (§4.6) still extends a
-block to its closing bracket when the construct runs further. `-c 0` / `-t 0` take
-it away again.
+**`context` is symmetric, and defaults to 1.** `leading = trailing = context`,
+so an unadorned call gets one unchanged line before and after — the same
+question `grep -C` asks. Symmetry is the point: an asymmetric default gives the
+*following* line a special role, and that is one more thing to hold in one's head
+about what a block will contain. One line each way covers the common shapes — the
+line a call opens on, the line a block closes on — and the balance-growth pass
+(§4.6) still extends a block to its closing bracket when the construct runs
+further.
+
+Asymmetric context is still available, on the binary, as `-t N` for N *extra*
+lines after what `-c` already gave:
+
+```text
+  bsed -c 1            's/x/y/' f.rs     1 before, 1 after
+  bsed -c 3            's/x/y/' f.rs     3 before, 3 after
+  bsed -c 1 -t 3       's/x/y/' f.rs     1 before, 4 after
+```
+
+The agent tool exposes only the symmetric form, since `context` there means one
+number and a model asking for "more context" does not mean "more after" in
+particular.
 
 This was not always so, and the argument for the 2-line tail it replaced is worth
 keeping, because it is the reason `context` exists at all. The tail turned a
@@ -686,11 +700,10 @@ way to say which file a hunk came from. The two share the diff — Myers via
 
 Two things follow from it being for a person:
 
-* **Context falls back to 2, not 0.** Blocks default to zero because their
-  reader is a program wanting the smallest correct payload, and a block is
-  anchored so it needs no room. A diff has no anchor, and a hunk with no context
-  is a diff you have to open the file to read. `-c`/`-t` override, and `-c 0` is
-  honoured as a real request for none.
+* **Context is the same as for blocks.** A hunk takes `-c` plus `-t` and is
+  symmetric, because a hunk has one context setting rather than a before and an
+  after. The trailing bonus widens it rather than being dropped, so a reader who
+  asked for more room gets it either way.
 * **No budget, and no "could not be expressed" case.** There are no blocks to
   drop, and a diff that silently omitted a file would be lying about the change.
   A CRLF file is still refused, as everywhere else.
@@ -940,7 +953,7 @@ Resolved since (reasoning in §7):
 | 12 | Budget in `-r` mode | **none** — a human is reading it, and silent truncation is the worst outcome | §7.1 |
 | 13 | How do you see which replacements did not apply? | the **failed blocks are echoed back**, with paths and anchors, ready to re-pipe | §7.2 |
 | 14 | Trailing context by default? | **dropped to 0** — every block is anchored from the file just read, so the 2-line tail only bought slack against a stale anchor, at a third of the budget on every change | §4.1 |
-| 15 | …then what about an asymmetric 0/0? | **1 each side** — symmetry is easier to reason about than an asymmetric default, and 0 buys nothing since the blocks are anchored | §4.1 |
+| 15 | …then what about an asymmetric 0/0? | **1 each side, and `-c` is the symmetric one**, like `grep -C`. `-t` becomes a *bonus* after, for when the continuation is after the change | §4.1 |
 
 Still open — small tuning decisions, not architecture:
 

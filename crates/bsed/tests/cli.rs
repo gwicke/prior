@@ -321,6 +321,71 @@ fn recursive_preview_walks_the_tree_and_reports_counts() {
     assert!(err.contains("not UTF-8"), "{err}");
 }
 
+/// `-c N` is symmetric context, the way `grep -C` is, and `-t N` is a bonus
+/// *after* on top of it. Measured off the anchor and the block length, on a file
+/// long enough that the diff's own minimum grouping does not decide the shape.
+#[test]
+fn context_is_symmetric_and_trailing_is_a_bonus() {
+    let d = tempfile::tempdir().unwrap();
+    let big: String = (1..=20).map(|i| format!("L{i}\n")).collect();
+    write(&d.path().to_path_buf(), "big.txt", &big);
+    let s = "10s/L10/CHANGED/";
+
+    // Returns (leading, trailing) as the block actually came out.
+    let span = |args: &[&str]| -> (usize, usize) {
+        let o = run_in(d.path(), None, args);
+        assert_eq!(code(&o), 0, "{args:?}: {}", stderr(&o));
+        let out = stdout(&o);
+        let anchor: usize = out
+            .lines()
+            .next()
+            .unwrap()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let old: Vec<&str> = out
+            .split("@@@OLD\n")
+            .nth(1)
+            .unwrap()
+            .split("\n@@@NEW")
+            .next()
+            .unwrap()
+            .lines()
+            .collect();
+        (10 - anchor, old.len() - 1 - (10 - anchor))
+    };
+
+    let p = &d.path().join("big.txt").display().to_string();
+    let args = |extra: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        v.extend(["-p".into(), p.clone(), s.into()]);
+        v
+    };
+    let span_of = |extra: &[&str]| {
+        let v = args(extra);
+        let refs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+        span(&refs)
+    };
+
+    assert_eq!(span_of(&["-c", "1"]), (1, 1), "-c is symmetric");
+    assert_eq!(span_of(&["-c", "2"]), (2, 2), "-c is symmetric");
+    assert_eq!(
+        span_of(&["-c", "1", "-t", "3"]),
+        (1, 4),
+        "-t is a bonus after"
+    );
+    assert_eq!(span_of(&["-c", "2", "-t", "2"]), (2, 4), "-t adds to -c");
+    assert_eq!(
+        span_of(&["-c", "0", "-t", "4"]),
+        (0, 4),
+        "-t works without -c"
+    );
+    // No flags at all is one line each side, the same as an explicit `-c 1`.
+    assert_eq!(span_of(&[]), span_of(&["-c", "1"]), "default matches -c 1");
+}
+
 /// A file with no final newline, previewed then applied, against GNU sed. The
 /// terminator is absent only while the input's last line is still the output's,
 /// which is subtle enough that the block shape alone is not evidence.

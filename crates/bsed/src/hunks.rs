@@ -38,19 +38,21 @@ pub struct Block {
 pub struct Context {
     /// Unchanged lines to include before the change.
     ///
-    /// Defaults to 1, and `trailing` matches it, so a change carries one line
-    /// either side by default.
+    /// The symmetric half: the caller asks for N lines of context and gets N
+    /// here. Defaults to 1.
     pub leading: usize,
     /// Unchanged lines to include after the change.
     ///
-    /// Used to default to 2, giving a one-line change a three-line `OLD` and so a
-    /// ±1 anchor tolerance against a file that shifted between preview and
-    /// apply. That slack only ever mattered for a *stale* anchor, which is a
-    /// workflow problem — apply the blob in one `edit` call — rather than a
-    /// preview one, and it cost a third of the budget on every change. It was
-    /// dropped to 0, then brought back to 1 to match `leading` so the two sides
-    /// are the same number. The growth pass still reaches a closing bracket
-    /// further than one line away.
+    /// Normally the same as `leading`, so the caller asks once. The CLI adds a
+    /// *bonus* on top (`-t N`, trailing context past what `-c` already gave) for
+    /// the case where a change's continuation is after it and not before.
+    ///
+    /// This used to default to 2 — a one-line change became a three-line `OLD`,
+    /// which bought a ±1 anchor tolerance against a file that shifted between
+    /// preview and apply. That slack only ever mattered for a *stale* anchor,
+    /// which is a workflow problem (apply the blob in one `edit` call) rather
+    /// than a preview one, and it cost a third of the budget on every change.
+    /// The growth pass still reaches a closing bracket further than one line.
     pub trailing: usize,
     /// Whether to grow a block until its brackets balance.
     pub grow: bool,

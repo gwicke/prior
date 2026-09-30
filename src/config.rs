@@ -739,18 +739,22 @@ impl From<SandboxMaxOutputBytes> for Option<usize> {
 /// `crate::config::EditStartLine` call sites.
 pub use blockedit::EditStartLine;
 
-/// How many unchanged lines the `sed` preview attaches **before** each change.
+/// How many unchanged lines the `sed` preview attaches around each change.
 ///
-/// Defaults to 1, and the preview adds 1 after as well, so a change arrives with
-/// one line of context on each side. Symmetry is the point: an asymmetric default
-/// is one more thing for a model to reason about, and it made the *following*
-/// line the only place a continuation was visible. One line each way is enough
-/// for the common shapes — the line a call opens on, the line a block closes on —
-/// and the balance-growth pass still extends a block to its closing bracket when
-/// the construct runs further.
+/// Symmetric, and the same reading `grep -C` has: N lines before and N after.
+/// Defaults to 1, so a change arrives with one line of context on each side.
+/// Symmetry is the point — an asymmetric default gives the *following* line a
+/// special role, which is one more thing to hold in one's head about what a
+/// block will contain, and it made the trailing line the only place a
+/// continuation was visible. One line each way covers the common shapes, the
+/// line a call opens on and the line a block closes on, and the balance-growth
+/// pass still extends a block to its closing bracket when the construct runs
+/// further.
 ///
-/// Set 0 for the bare change, or higher for a wider look. Both sides move
-/// together, so a value of 3 gives three lines before and three after.
+/// Set 0 for the bare change, or higher for a wider look; the two sides always
+/// move together. Asymmetric context is available on the `bsed` binary as
+/// `-t N`, which adds N *extra* lines after — the `sed` tool exposes only the
+/// symmetric form.
 ///
 /// Accepts an integer or a numeric string, like [`ReadOffset`], because weak
 /// tool-call harnesses stringify numbers often enough that rejecting `"2"` would
