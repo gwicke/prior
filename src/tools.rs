@@ -420,12 +420,29 @@ pub async fn sed_preview(
              Install it with `cargo install --path .` (it ships alongside picocode)."
         )));
     }
-    // Same policy as `edit`: the path is resolved and bounds-checked here, and
-    // handed to the child as a cwd-relative path so the sandbox sees the same
-    // file the model named.
-    let resolved = get_path_with(&path, true)?;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| resolved.clone());
-    let rel = relativize_path(&resolved, &cwd);
+    // The path is bounds-checked against the sandbox policy, and the *check*
+    // is on the host path — but the path handed to the child must be the
+    // **in-sandbox** one. `bsed` runs inside the namespace, where a remapped
+    // binding lives at its in-sandbox location, not its host location. With
+    // `rw = [{from: "/home/me/scratch", to: "/tmp"}]`, the model names
+    // `/tmp/f.txt`; that resolves to the host path `/home/me/scratch/f.txt`,
+    // which does not exist inside the namespace (only `/tmp` is bound there).
+    // Handing the host path to `bsed` therefore pointed it at a file that was
+    // never there, and the tool failed on a perfectly valid path.
+    //
+    // This is why `sed` cannot follow `edit`'s shape: `edit` does its own IO
+    // in this process, so the host path is exactly right for it and it only
+    // uses the sandbox path for display. `sed` shells *out* into the
+    // namespace, so the two paths have to be kept distinct — check against the
+    // host one, hand over the in-sandbox one.
+    //
+    // The bounds check stays on the host path: under an active policy
+    // `get_sandbox_path` only resolves and never enforces coverage or mode, so
+    // the two calls are complementary — one authorises, the other reads.
+    let _authorised = get_path_with(&path, true)?;
+    let sandbox_path = get_sandbox_path(&path)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| sandbox_path.clone());
+    let rel = relativize_path(&sandbox_path, &cwd);
 
     let cfg = sandbox_config();
     let cfg = cfg.as_ref().as_ref().cloned().unwrap_or_default();
@@ -526,8 +543,9 @@ pub async fn glob_files(pattern: String, path: String) -> Result<String, ToolErr
 )]
 pub async fn grep_text(pattern: String, path: String) -> Result<String, ToolError> {
     // Validate the search root against the active path policy (or cwd bounds);
-    // ripgrep itself runs confined inside a read-only sandbox.
-    let resolved = get_path(&path)?;
+    // ripgrep itself runs confined inside a read-only sandbox. The policy
+    // check is on the host path — see below for why rg gets the other one.
+    let _authorised = get_path(&path)?;
 
     // Pre-relativize the search root so ripgrep's `--with-filename` output
     // comes back in the portable, token-friendly form. We deliberately do
@@ -536,8 +554,23 @@ pub async fn grep_text(pattern: String, path: String) -> Result<String, ToolErro
     // user actually searched for. ripgrep echoes the exact path it was
     // given, so as long as we feed it a relative form, the filename
     // column stays relative.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| resolved.clone());
-    let rg_path = relativize_path(&resolved, &cwd);
+    //
+    // `get_path` returns the **host** path, and that is the right path for
+    // this process to walk — but ripgrep does not run in this process, it
+    // runs *inside* the namespace (below, `run_sandboxed_ro`). Under a
+    // remapping binding the two views disagree: with
+    // `rw = [{from: "/home/me/scratch", to: "/tmp"}]`, the host path of
+    // `/tmp/f.txt` is `/home/me/scratch/f.txt`, and that path is not bound
+    // inside the namespace, so rg reports "No such file or directory" for a
+    // file that plainly exists. Feed it the path as the namespace sees it.
+    // See `sed_preview`, which crosses the same boundary the same way.
+    //
+    // The bounds check still runs on the host path: when a policy is active
+    // `get_sandbox_path` only resolves and never enforces coverage or mode,
+    // so the two calls are complementary — one authorises, the other reads.
+    let sandbox_path = get_sandbox_path(&path)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| sandbox_path.clone());
+    let rg_path = relativize_path(&sandbox_path, &cwd);
 
     let cfg = sandbox_config();
     let cfg = cfg.as_ref().as_ref().cloned().unwrap_or_default();
@@ -1655,7 +1688,7 @@ mod sandbox_tests {
     use crate::config::{BindPath, EnvMode, EnvPolicy, SandboxConfig};
     use serial_test::serial;
 
-    fn bwrap_on_path() -> bool {
+    pub(crate) fn bwrap_on_path() -> bool {
         std::process::Command::new("which")
             .arg("bwrap")
             .stdout(std::process::Stdio::null())
@@ -1665,7 +1698,7 @@ mod sandbox_tests {
             .unwrap_or(false)
     }
 
-    fn sandbox_with(
+    pub(crate) fn sandbox_with(
         ro: Vec<BindPath>,
         rw: Vec<BindPath>,
         timeout_secs: Option<u64>,
@@ -2271,7 +2304,9 @@ mod edit_file_tests {
     //! set up a sandbox (so the test stays fast and runs anywhere); the
     //! relevant code path bypasses the sandbox when none is configured.
 
+    use super::sandbox_tests::{bwrap_on_path, sandbox_with};
     use super::*;
+    use crate::config::BindPath;
     use crate::edit_match::looks_like_edit_failure;
     use serde_json::Value;
     use serial_test::serial;
@@ -2422,6 +2457,90 @@ mod edit_file_tests {
             .await
             .unwrap()
             .contains("walk();"));
+    }
+
+    /// `grep` crosses into the namespace like `sed` does, so it needs the
+    /// in-sandbox path too. Reproduced on a real config:
+    /// `rg: /home/me/tmp/agents/f.txt: No such file or directory` for a file
+    /// that plainly exists at the path the model named (`/tmp/f.txt`).
+    #[tokio::test]
+    #[serial]
+    async fn grep_works_on_a_path_that_is_only_visible_in_sandbox() {
+        let _tmpdir = tmpdir_inside_repo();
+        if !bwrap_on_path() {
+            return;
+        }
+        let _cwd = CwdGuard::new();
+
+        let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/grep-scratch");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("f.txt"), "alpha needle beta\n").unwrap();
+
+        set_sandbox(Some(sandbox_with(
+            vec![],
+            vec![BindPath::Remap {
+                from: host.to_string_lossy().to_string(),
+                to: "/scratch".to_string(),
+            }],
+            Some(30),
+        )));
+
+        let out = grep_text("needle".into(), "/scratch/f.txt".into())
+            .await
+            .expect("grep on a remapped path");
+        assert!(out.contains("needle"), "{out}");
+        assert!(
+            !out.contains("No such file"),
+            "ripgrep was handed a host path: {out}"
+        );
+    }
+
+    /// A path the model can see *only* at its in-sandbox location must work.
+    ///
+    /// Regression: `sed` resolved the path to its **host** location and handed
+    /// that to `bsed`, which runs inside the namespace. With a remapping
+    /// binding (`from: <host dir>, to: /tmp`) the host path is not bound inside
+    /// the sandbox at all, so a perfectly valid `/tmp/f.txt` failed as if the
+    /// file did not exist. The check is against the host path; the path handed
+    /// over must be the in-sandbox one.
+    #[tokio::test]
+    #[serial]
+    async fn sed_preview_works_on_a_path_that_is_only_visible_in_sandbox() {
+        let _tmpdir = tmpdir_inside_repo();
+        if !bwrap_on_path() {
+            return;
+        }
+        let _cwd = CwdGuard::new();
+
+        // A host directory that is NOT itself bound; only its *sandbox*
+        // location (/scratch) is.
+        let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/sed-scratch");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("f.txt"), "alpha\nbeta\n").unwrap();
+
+        set_sandbox(Some(sandbox_with(
+            vec![],
+            vec![BindPath::Remap {
+                from: host.to_string_lossy().to_string(),
+                to: "/scratch".to_string(),
+            }],
+            Some(30),
+        )));
+
+        // The model names the sandbox path — the only one it can see.
+        let out = sed_preview(
+            "/scratch/f.txt".into(),
+            "s/alpha/ALPHA/".into(),
+            ContextLines(0),
+        )
+        .await
+        .expect("preview on a remapped path");
+        assert!(out.contains("ALPHA"), "{out}");
+        // The file is untouched, and still at its host location.
+        assert_eq!(
+            std::fs::read_to_string(host.join("f.txt")).unwrap(),
+            "alpha\nbeta\n"
+        );
     }
 
     #[tokio::test]
