@@ -1,6 +1,6 @@
 # Batch Editing v2 — Aider-style text edits
 
-*Status: Phase 1 implemented. W1–W4 done — multi-file editing is accepted, split per file, applied and reported with per-file failure granularity, and an unreadable file no longer aborts the call. W5 wording and W7–W8 remain.*
+*Status: Phase 1 implemented. W1–W4 and W7 done — multi-file editing is accepted, split per file, applied and reported with per-file failure granularity, an unreadable file no longer aborts the call, and the model now sees N per-file calls and results. W5 wording and W8 remain.*
 
 ## Motivation
 
@@ -1107,9 +1107,33 @@ which the rename had to address anyway, since the model-facing field moved and
 *Tests:* a multi-file blob renders a label with no `[1]`; a resolvable blob and
 a single-file blob are unchanged.
 
-**W7 — the model-facing site (`src/agent.rs`).** Add the split transform; call
-it in `on_completion_call` as `split(blob(strip(history)))`, after the existing
-`blob_edit_tool_calls`.
+**W7 — the model-facing site (`src/agent.rs`) — DONE.** `split_multi_file_
+edit_calls`, called in `on_completion_call` as `split(blob(strip(history)))`:
+N per-file calls and N per-file results, with ids derived as `{orig}~f{i}n{n}`.
+
+Three details that are load-bearing, not incidental:
+
+1. **Ids are derived, never minted.** The persist path (W8) splits in a
+   *different* pass over *different* messages, and both must independently
+   arrive at the same id for the same file; re-applying must also be a no-op
+   rather than re-derive a fresh random id and break correlation with an
+   already-stored result. `~` is not a character any provider issues, so a
+   derived id cannot collide with a real one — which is what licenses the
+   synthetic calls carrying no `provider`.
+2. **`provider` and `signature` are cleared.** Anthropic's wire requires
+   `tool_result.tool_use_id` to equal a `tool_use.id` the provider issued, and
+   `wire_call_id()` returns `provider` when present. N synthetic messages
+   claiming one original provider id would be **unmatchable** — a 400, not a
+   cosmetic issue. `None` means rig mints rig's own handle, and that is what
+   travels.
+3. **Both halves must be present.** A call whose result has not arrived yet
+   (mid-turn) is left whole rather than split, so a partially-saved history
+   never shows a call with a dangling result. This is why the transform runs
+   over the whole history in one pass and matches call-to-result by id, not by
+   position.
+
+The split is **idempotent by construction**: re-running finds only single-file
+calls (the synthetic ones) and non-array results, and leaves the history alone.
 
 **`on_tool_result` needs no change, and that is load-bearing — see *The result
 must survive to history* below.** The tempting shortcut is to rewrite the

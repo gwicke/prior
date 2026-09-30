@@ -28,8 +28,11 @@ use rig_agent::completion::{Chat, CompletionError, PromptError};
 use rig_agent::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
 use rig_agent::tool::ToolContext;
 use rig_core::client::CompletionClient;
+use std::collections::HashMap;
+
 use rig_core::message::{
-    AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolResultContent, UserContent,
+    AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolCallId, ToolFunction,
+    ToolResult, ToolResultContent, UserContent,
 };
 use rig_core::providers::{
     anthropic, azure, chatgpt, cohere, copilot, deepseek, doubleword, gemini, groq, huggingface,
@@ -1223,6 +1226,214 @@ fn blob_edit_tool_calls(messages: Vec<Message>) -> Vec<Message> {
         .collect()
 }
 
+/// The text of a tool result, as the model sees it.
+fn tool_result_text(tr: &ToolResult) -> Option<String> {
+    let joined = tr
+        .content
+        .iter()
+        .filter_map(|rc| match rc {
+            ToolResultContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// The id of file `i` of `n` in a split of `orig`.
+///
+/// Derived, never minted: the two split sites (this one, and the persist path)
+/// must produce the *same* id for the same (orig, file), and a second
+/// application must be a no-op rather than re-derive a fresh one. The `~` is
+/// not a character any provider issues, so a derived id can never collide with
+/// a real one — which is also why the synthetic calls carry no `provider`.
+fn split_id(orig: &ToolCallId, i: usize, n: usize) -> ToolCallId {
+    ToolCallId::new(format!("{orig}~f{i}n{n}")).expect("a derived id is never empty")
+}
+
+/// The per-file halves of one multi-file `edit` call and its result.
+///
+/// `per_file` is one blob per file (the synthetic call arguments);
+/// `results` is one result string per file. Both are in the same first-seen
+/// order, because the result array is built in the same order the files were
+/// applied — so a synthetic call and its result pair up by index.
+struct SplitEditCall {
+    per_file: Vec<String>,
+    results: Vec<String>,
+}
+
+/// Split one multi-file `edit` call's `blocks` argument into one blob per file,
+/// or `None` if the call is not a well-formed multi-file blob (single-file,
+/// unparseable, or beyond `MAX_FILES_PER_CALL` — all of which the tool itself
+/// handles and reports).
+fn per_file_blocks(args: &serde_json::Value) -> Option<Vec<String>> {
+    let parsed = blockedit::parse_blocks(blockedit::blob_text(args)?).ok()?;
+    let files = blockedit::split_by_file(parsed).ok()?;
+    (files.len() > 1).then(|| {
+        files
+            .iter()
+            .map(|f| blockedit::render_blob(&f.path, &f.edits))
+            .collect()
+    })
+}
+
+/// Split a multi-file `edit` call and its result into per-file halves.
+///
+/// Returns `None` unless *both* halves are present, multi-file, and the same
+/// length: a call with no array result (mid-turn, or a call that errored before
+/// producing one) and a single-file call are left exactly as they are, so a
+/// partially-saved history never renders a split with a dangling result. The
+/// length check is a belt-and-braces guard — the two are built from the same
+/// file list, so a mismatch would mean a corrupt array, and dropping the whole
+/// call to the original single form is the safe reading of that.
+fn split_edit_call_and_result(args: &serde_json::Value, result: &str) -> Option<SplitEditCall> {
+    let per_file = per_file_blocks(args)?;
+    let results: Vec<String> = blockedit::parse_file_results(result)?
+        .iter()
+        .map(|f| match &f.result {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .collect();
+    (per_file.len() == results.len()).then_some(SplitEditCall { per_file, results })
+}
+
+/// The note shown in place of one multi-file call, so the model is not left
+/// wondering why it is looking at N calls it did not make.
+fn split_note(n: usize) -> String {
+    format!(
+        "Note: the edit call above edited {n} files. It is shown here as {n} \
+         per-file calls with one result each, so each file's outcome is \
+         attributed to a file."
+    )
+}
+
+/// Rewrite a multi-file `edit` call and its result into per-file calls and
+/// per-file results, so the model sees one file per call — the shape it would
+/// have produced by calling the tool N times, and the shape a reloaded session
+/// replays (the persist half of this, W8, writes the same per-file form).
+///
+/// This is a **view** transform on the request history. It must not alter what
+/// is stored: the per-file result array is the durable record, and rewriting it
+/// here would leave the session unsplittable. See doc/batch_editing_v2.md,
+/// "The result must survive to history" — the reason `on_tool_result` is left
+/// alone.
+///
+/// Idempotent by construction: re-applying finds only single-file calls (the
+/// synthetic ones) and non-array results, and leaves the history alone.
+fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message> {
+    // The call (assistant message) and its result (a user message) are
+    // different messages, and the result follows the call, so build the whole
+    // plan before rebuilding any message.
+    let mut results: HashMap<ToolCallId, String> = HashMap::new();
+    for m in &messages {
+        let Message::User { content } = m else {
+            continue;
+        };
+        for c in content {
+            if let UserContent::ToolResult(tr) = c {
+                if let Some(text) = tool_result_text(tr) {
+                    results.insert(tr.call.clone(), text);
+                }
+            }
+        }
+    }
+
+    let mut plan: HashMap<ToolCallId, SplitEditCall> = HashMap::new();
+    for m in &messages {
+        let Message::Assistant { content, .. } = m else {
+            continue;
+        };
+        for c in content {
+            let AssistantContent::ToolCall(tc) = c else {
+                continue;
+            };
+            if tc.function.name != "edit" {
+                continue;
+            }
+            if let Some(result) = results.get(&tc.id) {
+                if let Some(split) = split_edit_call_and_result(&tc.function.arguments, result) {
+                    plan.insert(tc.id.clone(), split);
+                }
+            }
+        }
+    }
+    if plan.is_empty() {
+        return messages;
+    }
+
+    // Rebuild. Every synthetic message clears `provider` and `signature`: the
+    // provider issued one id and one signature, and Anthropic's wire requires
+    // `tool_result.tool_use_id` to equal a `tool_use.id` it issued — N
+    // messages claiming the original provider id would be unmatchable.
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for m in messages {
+        match m {
+            Message::Assistant { id, content } => {
+                let mut new_content = Vec::with_capacity(content.len());
+                for c in content {
+                    let AssistantContent::ToolCall(tc) = &c else {
+                        new_content.push(c);
+                        continue;
+                    };
+                    let Some(split) = plan.get(&tc.id) else {
+                        new_content.push(c);
+                        continue;
+                    };
+                    let n = split.per_file.len();
+                    for (i, blocks) in split.per_file.iter().enumerate() {
+                        new_content.push(AssistantContent::ToolCall(rig_core::message::ToolCall {
+                            id: split_id(&tc.id, i, n),
+                            provider: None,
+                            function: ToolFunction::new(
+                                "edit".into(),
+                                serde_json::json!({ "blocks": blocks }),
+                            ),
+                            signature: None,
+                            additional_params: None,
+                        }));
+                    }
+                }
+                out.push(Message::Assistant {
+                    id,
+                    content: new_content,
+                });
+            }
+            Message::User { content } => {
+                let mut new_content = Vec::with_capacity(content.len());
+                for c in content {
+                    let UserContent::ToolResult(tr) = &c else {
+                        new_content.push(c);
+                        continue;
+                    };
+                    let Some(split) = plan.get(&tr.call) else {
+                        new_content.push(c);
+                        continue;
+                    };
+                    let n = split.per_file.len();
+                    // The note rides with the results it explains, as leading
+                    // text in the same user message — not a message of its own,
+                    // which would perturb the turn structure.
+                    new_content.push(UserContent::Text(Text::new(split_note(n))));
+                    for (i, result) in split.results.iter().enumerate() {
+                        new_content.push(UserContent::ToolResult(ToolResult {
+                            call: split_id(&tr.call, i, n),
+                            provider: None,
+                            name: tr.name.clone(),
+                            content: vec![ToolResultContent::text(result.clone())],
+                        }));
+                    }
+                }
+                out.push(Message::User {
+                    content: new_content,
+                });
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// No-op in rig ≥1c2f440: `ToolResult::call` (rig's correlation handle) is
 /// always present — minted at the provider boundary when the provider
 /// issued no id — so the old cross-provider `call_id` normalisation is
@@ -1835,7 +2046,7 @@ impl AgentHook for LoggingHook {
             &self.provider,
             &self.model,
         );
-        let history = blob_edit_tool_calls(stripped_history);
+        let history = split_multi_file_edit_calls(blob_edit_tool_calls(stripped_history));
 
         // `--log-messages`: capture the exact context sent to the model on this
         // call — the (stripped, block-form) history plus the current prompt —
@@ -5432,6 +5643,183 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // A call-time error the model sees is passed through as-is.
         let call_err = "the tool failed";
         assert_eq!(model_facing_tool_text("edit", call_err), None);
+    }
+
+    /// A three-file call plus its array result, as the stored history holds it.
+    fn multi_file_history() -> Vec<Message> {
+        let blocks = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
+                      b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END\n\n\
+                      c.rs\n@@@OLD\nq\n@@@NEW\nQ\n@@@END";
+        let result = blockedit::render_file_results(&[
+            blockedit::FileResult {
+                path: "a.rs".into(),
+                result: serde_json::json!("Replaced 1 block(s) in ./a.rs"),
+            },
+            blockedit::FileResult {
+                path: "b.rs".into(),
+                result: serde_json::json!({
+                    "ui_view": "edit failed: nope", "model_view": "long diff"
+                }),
+            },
+            blockedit::FileResult {
+                path: "c.rs".into(),
+                result: serde_json::json!("Replaced 1 block(s) in ./c.rs"),
+            },
+        ]);
+        vec![
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                    id: ToolCallId::new("t1").unwrap(),
+                    provider: None,
+                    function: ToolFunction::new(
+                        "edit".into(),
+                        serde_json::json!({ "blocks": blocks }),
+                    ),
+                    signature: None,
+                    additional_params: None,
+                })],
+            },
+            Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: ToolCallId::new("t1").unwrap(),
+                    provider: None,
+                    name: "edit".into(),
+                    content: vec![ToolResultContent::text(result)],
+                })],
+            },
+        ]
+    }
+
+    fn tool_calls_of(m: &Message) -> Vec<rig_core::message::ToolCall> {
+        let Message::Assistant { content, .. } = m else {
+            panic!("expected an assistant message")
+        };
+        content
+            .iter()
+            .filter_map(|c| match c {
+                AssistantContent::ToolCall(tc) => Some(tc.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn results_of(m: &Message) -> Vec<(String, String)> {
+        let Message::User { content } = m else {
+            panic!("expected a user message")
+        };
+        content
+            .iter()
+            .filter_map(|c| match c {
+                UserContent::ToolResult(tr) => Some((
+                    tr.call.to_string(),
+                    tool_result_text(tr).unwrap_or_default(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_multi_file_call_becomes_n_per_file_calls_and_results() {
+        let out = split_multi_file_edit_calls(multi_file_history());
+
+        // Three calls, each naming exactly one file.
+        let calls = tool_calls_of(&out[0]);
+        assert_eq!(calls.len(), 3, "{:?}", calls);
+        for (i, name) in ["a.rs", "b.rs", "c.rs"].iter().enumerate() {
+            let args = &calls[i].function.arguments;
+            assert_eq!(calls[i].function.name, "edit");
+            let blocks = args.get("blocks").and_then(|v| v.as_str()).unwrap();
+            assert!(blocks.contains(name), "call {i} must name {name}: {blocks}");
+            assert_eq!(
+                blocks.matches("@@@OLD").count(),
+                1,
+                "call {i} must carry one file only: {blocks}"
+            );
+            // The id is derived, not minted, so both split sites agree.
+            assert_eq!(calls[i].id.to_string(), format!("t1~f{i}n3"));
+            // A synthesized call has no provider id or signature: Anthropic
+            // keys tool_result on the id it issued, and N copies of one would
+            // be unmatchable.
+            assert!(calls[i].provider.is_none());
+            assert!(calls[i].signature.is_none());
+        }
+
+        // Three results, one per call, paired by that same derived id.
+        let results = results_of(&out[1]);
+        assert_eq!(results.len(), 3, "{:?}", results);
+        assert_eq!(results[0].0, "t1~f0n3");
+        assert_eq!(results[1].0, "t1~f1n3");
+        assert_eq!(results[2].0, "t1~f2n3");
+        assert!(results[0].1.contains("Replaced 1 block(s) in ./a.rs"));
+        // A failing file keeps its full envelope: the model reads model_view.
+        assert!(results[1].1.contains("long diff"), "{}", results[1].1);
+        assert!(results[2].1.contains("./c.rs"));
+    }
+
+    #[test]
+    fn a_split_explains_itself_in_one_note_carrying_no_aggregate() {
+        let out = split_multi_file_edit_calls(multi_file_history());
+        let Message::User { content } = &out[1] else {
+            panic!("expected a user message")
+        };
+        let notes: Vec<&Text> = content
+            .iter()
+            .filter_map(|c| match c {
+                UserContent::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 1, "exactly one note per split: {content:?}");
+        let n = notes[0].text.as_str();
+        assert!(n.contains('3'), "the note must name the file count: {n}");
+        // The note rides inside the results' message, not as its own.
+        assert_eq!(content[0], UserContent::Text(Text::new(n.to_string())));
+    }
+
+    #[test]
+    fn splitting_twice_changes_nothing() {
+        let once = split_multi_file_edit_calls(multi_file_history());
+        let twice = split_multi_file_edit_calls(once.clone());
+        assert_eq!(once, twice, "the transform must be idempotent");
+    }
+
+    #[test]
+    fn a_single_file_call_is_left_byte_identical() {
+        let call = Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: ToolCallId::new("s1").unwrap(),
+                provider: None,
+                function: ToolFunction::new(
+                    "edit".into(),
+                    serde_json::json!({"blocks": "solo.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END"}),
+                ),
+                signature: None,
+                additional_params: None,
+            })],
+        };
+        let result = Message::User {
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: ToolCallId::new("s1").unwrap(),
+                provider: None,
+                name: "edit".into(),
+                content: vec![ToolResultContent::text("Replaced 1 block(s) in ./solo.rs")],
+            })],
+        };
+        let hist = vec![call, result];
+        let out = split_multi_file_edit_calls(hist.clone());
+        assert_eq!(out, hist, "a single-file call must be untouched");
+    }
+
+    #[test]
+    fn a_call_with_no_result_yet_is_not_split() {
+        // Mid-turn: the model made the call, the result has not come back.
+        // Splitting now would show a call with a dangling result.
+        let pending = vec![multi_file_history().remove(0)];
+        let out = split_multi_file_edit_calls(pending.clone());
+        assert_eq!(out, pending, "a call without its result stays whole");
     }
 
     #[test]
