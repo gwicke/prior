@@ -102,10 +102,12 @@ fn a_crlf_file_does_not_sink_a_recursive_preview() {
     // The LF file was still previewed...
     assert!(out.contains("ok.txt:2"), "{out}");
     assert!(out.contains("@@@NEW"), "{out}");
-    // ...and the CRLF one is named with the reason, not folded into the count.
-    assert!(out.contains("crlf.txt"), "{out}");
-    assert!(out.contains("CRLF"), "{out}");
-    assert!(!out.contains("crlf.txt:2"), "{out}");
+    // ...and the CRLF one is named with the reason, in the status, not folded
+    // into the payload or into a count.
+    let err = stderr(&o);
+    assert!(err.contains("crlf.txt"), "{err}");
+    assert!(err.contains("CRLF"), "{err}");
+    assert!(!out.contains("crlf.txt"), "{out}");
 }
 
 /// A tree that is *only* refused files must not report "no lines matched" and
@@ -116,11 +118,13 @@ fn a_tree_of_only_crlf_files_says_why() {
     std::fs::write(d.path().join("crlf.txt"), "a\r\nb\r\n").unwrap();
     let o = run_in(d.path(), None, &["-r", "-p", ".", "s/b/B/"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    let out = stdout(&o);
-    assert!(out.contains("no lines matched"), "{out}");
-    // ...but it also says which file matched and was skipped, and why.
-    assert!(out.contains("crlf.txt"), "{out}");
-    assert!(out.contains("CRLF"), "{out}");
+    let err = stderr(&o);
+    assert!(err.contains("no lines matched"), "{err}");
+    // ...but it also says which file matched and was skipped, and why. Nothing
+    // went to stdout: there was nothing to preview.
+    assert!(err.contains("crlf.txt"), "{err}");
+    assert!(err.contains("CRLF"), "{err}");
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
 }
 
 /// Previewing is the default mode: no subcommand word is needed, and the script
@@ -183,15 +187,53 @@ fn recursive_preview_walks_the_tree_and_reports_counts() {
     let d = tree();
     let o = run_in(d.path(), None, &["-r", "-p", ".", "s/old_name/new_name/g"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // The blocks are the payload, and nothing else is: this is what a redirect
+    // to a file now captures.
     let out = stdout(&o);
-    assert!(out.contains("2 of "), "{out}"); // two files changed
     assert!(out.contains("one.rs:2"), "{out}");
     assert!(out.contains("sub/two.rs:2"), "{out}");
-    // .gitignore is respected without needing a git repo, and non-text is
-    // counted rather than fatal.
-    assert!(!out.contains("skip.rs"), "{out}");
-    assert!(!out.contains("dep.rs"), "{out}");
-    assert!(out.contains("not UTF-8"), "{out}");
+    assert!(
+        !out.contains("sed preview:"),
+        "status leaked into the payload: {out}"
+    );
+
+    // The summary and the notes are about the payload, so they are on stderr.
+    let err = stderr(&o);
+    assert!(err.contains("2 of "), "{err}"); // two files changed
+                                             // .gitignore is respected without needing a git repo, and non-text is
+                                             // counted rather than fatal.
+    assert!(!err.contains("skip.rs"), "{err}");
+    assert!(!err.contains("dep.rs"), "{err}");
+    assert!(err.contains("not UTF-8"), "{err}");
+}
+
+/// stdout is the payload and stderr is the commentary, so a redirect to a file
+/// yields a file the `edit` tool can take as its `blocks` argument verbatim --
+/// no leading sentence, no trailing notes.
+#[test]
+fn a_redirected_preview_is_only_the_blocks() {
+    let d = tree();
+    let o = run_in(d.path(), None, &["-r", "-p", ".", "s/old_name/new_name/g"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    let parsed = blockedit::parse_blocks(&out).expect("payload parses as blocks");
+    assert_eq!(parsed.edits.len(), 2, "{out}");
+    for line in out.lines() {
+        assert!(
+            !line.starts_with("sed preview:") && !line.starts_with("NOTE:"),
+            "status line in the payload: {line}"
+        );
+    }
+    // The same for a single file, where the banner used to lead the blob.
+    let o = run_in(d.path(), None, &["-p", "one.rs", "s/old_name/new_name/g"]);
+    let out = stdout(&o);
+    assert!(out.starts_with("one.rs:"), "{out}");
+    assert!(
+        out.lines().next().unwrap().contains(':'),
+        "header first: {out}"
+    );
+    blockedit::parse_blocks(&out).expect("payload parses as blocks");
+    assert!(!out.contains("sed preview:"), "{out}");
 }
 
 #[test]
@@ -199,7 +241,10 @@ fn recursive_preview_with_no_matches_says_so() {
     let d = tree();
     let o = run_in(d.path(), None, &["-r", "-p", ".", "s/zzz/yyy/g"]);
     assert_eq!(code(&o), 0);
-    assert!(stdout(&o).contains("no lines matched"), "{}", stdout(&o));
+    assert!(stderr(&o).contains("no lines matched"), "{}", stderr(&o));
+    // A successful run that found nothing writes no file content, so a redirect
+    // gives an empty file rather than one holding the explanation.
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
 }
 
 #[test]
@@ -356,7 +401,10 @@ fn glob_narrows_the_recursive_walk() {
         &["-r", "-g", "**/*.py", "-p", ".", "s/old_name/new_name/g"],
     );
     assert_eq!(code(&o), 0);
-    assert!(stdout(&o).contains("no lines matched"), "{}", stdout(&o));
+    // "no lines matched" is a status line, and nothing matched so there is no
+    // payload for it to describe.
+    assert!(stderr(&o).contains("no lines matched"), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
 }
 
 #[test]
@@ -392,8 +440,12 @@ fn a_file_containing_block_markers_is_refused_not_mangled() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
     assert!(out.contains("plain.rs:1"), "{out}");
-    assert!(out.contains("self.rs"), "the bad file must be named: {out}");
     assert!(!out.contains("@@@OLD\nold"), "{out}");
+    // Naming the file that could not be previewed is a status line, so it is
+    // on stderr -- and it must be *somewhere*, or the run reads as if that file
+    // simply needed no change.
+    let err = stderr(&o);
+    assert!(err.contains("self.rs"), "the bad file must be named: {err}");
 }
 
 /// The point of the report being a valid blocks file: after fixing the block,

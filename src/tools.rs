@@ -487,7 +487,12 @@ pub async fn sed_preview(
     )
     .await?;
 
-    // `bsed` writes its error text to stderr, which is merged into stdout above.
+    // The capture merges the child's stderr into stdout, which is what keeps the
+    // banner here. `bsed` puts the blocks on stdout and everything about them --
+    // the banner, the "N of M files changed" line, the NOTEs -- on stderr, so a
+    // shell user gets a clean pipeable blob while the model still reads the
+    // summary and the "pass them to `edit`" instruction ahead of the blocks.
+    //
     // Exit 2 is the caller's problem (a refused expression, an unappliable
     // block) and is returned as a normal result so the model can read and fix it;
     // anything else is ours.

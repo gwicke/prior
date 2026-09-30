@@ -104,7 +104,8 @@ Tool name `sed`, registered **only when `bsed` is found on `$PATH`** (§9).
   clamped to `[0, 20]`. Effective padding is `leading = context`,
   `trailing = 0`. A `bsed` caller asks for trailing context with `-t N`; the
   agent tool does not, and the default is 0 on both sides. See §4.1.
-* Returns a string: a one-line banner, then the block blob (§7). Never writes.
+* Returns the block blob on stdout and a one-line banner on stderr (§7.1a).
+  Never writes.
   Not wrapped in `guard()` — it is a read-only preview.
 
 ## 4. Producing the preview
@@ -616,7 +617,37 @@ way to write files, and a second writer is exactly what this design removes.
   recursive match is written `**/*.rs`, not `*.rs`.
 * **The banner** reports files, not blocks: `2 of 4 file(s) under src changed,
   3 block(s) total`, plus a note when files were skipped or when a file matched
-  but could not be expressed as blocks (§7.4).
+  but could not be expressed as blocks (§7.4). It goes to stderr, along with
+  every NOTE, so stdout stays a pipeable blob.
+
+### 7.1a stdout is the payload, stderr is the commentary
+
+Every successful run splits in two. **stdout carries the payload and nothing
+else** — the block blob, nothing more. **stderr carries everything about it**: the
+banner, the "N of M file(s) changed" summary, and every NOTE. Errors and usage
+were already on stderr.
+
+The reason is that the payload has a consumer. `bsed ... > blocks.txt` has to
+produce a file the `edit` tool accepts as its `blocks` argument verbatim, and
+`bsed ... | less` has to show the change rather than a paragraph above it. Both
+used to get a banner and a trail of NOTEs wedged into the middle of the stream —
+tolerated, because the blob parser ignores a prose line that is not a bare token
+(`crates/bsed/src/blocks.rs`), which is exactly why it went unnoticed. The split
+makes the file correct rather than merely parseable.
+
+A run that changes nothing writes an **empty** stdout and explains itself on
+stderr, still exiting `0`: the expression was fine, the file simply matched
+nothing. A file whose blocks could not be expressed is named in a stderr NOTE,
+so a redirect never produces a file that looks complete.
+
+`apply` is deliberately the exception and keeps one stream. Its report is written
+as a *valid blocks file* — prose and blocks interleaved, so the failures can be
+edited and re-piped — and tearing it in two would stop the blocks from parsing
+on their own (§7.2).
+
+The agent is unaffected: the sandbox capture uses `stderr_to_stdout`, so the model
+still reads the banner and the "pass them to `edit`" instruction ahead of the
+blocks, exactly as before.
 
 ### 7.2 Apply is atomic *per file*
 

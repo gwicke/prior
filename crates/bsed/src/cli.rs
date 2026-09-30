@@ -69,14 +69,46 @@ EXAMPLES:
     bsed apply src/x.rs < blocks.txt | diff src/x.rs -
 ";
 
+/// What a successful run produced, split by where it has to go.
+///
+/// The split is the whole point: stdout is the *payload* and nothing else, so
+/// `bsed ... > blocks.txt` leaves a file with the blocks in it and no
+/// commentary, and `bsed ... | less` shows the diff rather than a summary line
+/// above it. The banner, the "N of M files changed" line, and every NOTE go to
+/// stderr, which a pipe throws away and a terminal shows.
+///
+/// `apply` is the exception and keeps one stream. Its report is deliberately
+/// written as a valid blocks file -- the prose and the blocks interleaved, so it
+/// can be edited and re-piped -- so it cannot be torn in two without losing that.
+struct Out {
+    payload: String,
+    status: String,
+}
+
+impl Out {
+    /// Everything in the payload, nothing in the status. For `apply`, whose
+    /// report has to stay one piece.
+    fn all(payload: String) -> Out {
+        Out {
+            payload,
+            status: String::new(),
+        }
+    }
+}
+
 /// Entry point shared by the standalone binary and picocode's shim, so both
 /// resolve the same arguments the same way.
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(out) => {
-            if !out.is_empty() {
-                emit(&out);
+            // Status first: on a terminal the summary belongs above the blocks,
+            // and stdout may be buffered where stderr is not.
+            if !out.status.is_empty() {
+                eprint!("{}", out.status);
+            }
+            if !out.payload.is_empty() {
+                emit(&out.payload);
             }
             ExitCode::SUCCESS
         }
@@ -188,14 +220,16 @@ enum Failure {
 /// lead, the script may come from `-e`, `-f` or a positional, and an option that
 /// exists in neither mode is still rejected — by the parser that knows the
 /// options, with the same message and the same usage text.
-fn run(args: &[String]) -> Result<String, Failure> {
+fn run(args: &[String]) -> Result<Out, Failure> {
     match args.first().map(String::as_str) {
         // No arguments at all: print usage rather than block forever waiting for
         // expressions on stdin, which is what `bsed` on its own used to do.
-        None => Ok(USAGE.to_string()),
+        None => Ok(Out::all(USAGE.to_string())),
         Some("apply") => apply(&args[1..]),
-        Some("-h") | Some("--help") | Some("help") => Ok(USAGE.to_string()),
-        Some("--version") | Some("-V") => Ok(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))),
+        Some("-h") | Some("--help") | Some("help") => Ok(Out::all(USAGE.to_string())),
+        Some("--version") | Some("-V") => {
+            Ok(Out::all(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))))
+        }
         // `preview` was a subcommand once. Left here so the muscle memory lands
         // on the reason rather than on a parse error about the word itself.
         Some("preview") => Err(Failure::Usage(
@@ -207,7 +241,7 @@ fn run(args: &[String]) -> Result<String, Failure> {
     }
 }
 
-fn preview(args: &[String]) -> Result<String, Failure> {
+fn preview(args: &[String]) -> Result<Out, Failure> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut recursive = false;
     let mut globs: Vec<String> = Vec::new();
@@ -228,8 +262,10 @@ fn preview(args: &[String]) -> Result<String, Failure> {
         }
         match a.as_str() {
             "--" => only_positional = true,
-            "-h" | "--help" => return Ok(USAGE.to_string()),
-            "--version" | "-V" => return Ok(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))),
+            "-h" | "--help" => return Ok(Out::all(USAGE.to_string())),
+            "--version" | "-V" => {
+                return Ok(Out::all(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))))
+            }
             "-e" | "--expression" => {
                 saw_e_or_f = true;
                 script_parts.push(need(it.next(), "-e")?.to_string());
@@ -331,13 +367,16 @@ fn preview(args: &[String]) -> Result<String, Failure> {
             "--recursive expects a single directory".into(),
         ));
     } else {
-        // Multiple files: preview each and concatenate
-        let mut combined = String::new();
+        // Multiple files: preview each, and keep the two streams apart as we go
+        // so the payloads concatenate into one pipeable blob.
+        let mut out = Out {
+            payload: String::new(),
+            status: String::new(),
+        };
         for p in &input_files {
-            if p == Path::new("-") {
+            let shown = if p == Path::new("-") {
                 let text = read_stdin()?;
-                let result = single(&text, "(stdin)", &script, ctx, budget)?;
-                combined.push_str(&result);
+                single(&text, "(stdin)", &script, ctx, budget)?
             } else if p.is_dir() {
                 return Err(Failure::Usage(format!(
                     "{} is a directory. Use -r to preview recursively.",
@@ -346,11 +385,15 @@ fn preview(args: &[String]) -> Result<String, Failure> {
             } else {
                 let text = std::fs::read_to_string(p)
                     .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
-                let result = single(&text, &p.display().to_string(), &script, ctx, budget)?;
-                combined.push_str(&result);
+                single(&text, &p.display().to_string(), &script, ctx, budget)?
+            };
+            if !out.payload.is_empty() && !shown.payload.is_empty() {
+                out.payload.push('\n');
             }
+            out.payload.push_str(&shown.payload);
+            out.status.push_str(&shown.status);
         }
-        Ok(combined)
+        Ok(out)
     }
 }
 
@@ -361,7 +404,7 @@ fn single(
     expressions: &str,
     ctx: Context,
     budget: usize,
-) -> Result<String, Failure> {
+) -> Result<Out, Failure> {
     let opts = Options {
         context: ctx,
         max_preview_bytes: budget,
@@ -376,9 +419,24 @@ fn single(
         )));
     }
     if p.blob.is_empty() {
-        return Ok(format!("{}\n", p.banner));
+        return Ok(Out {
+            status: format!("{}\n", p.banner),
+            payload: String::new(),
+        });
     }
-    Ok(format!("{}\n{}\n", p.banner, p.blob))
+    // The banner is a status line about the payload, not part of it. It used to
+    // lead the blob, which the `edit` tool's parser tolerates -- a header is a
+    // whitespace-free token and a prose line is not -- but it meant
+    // `bsed ... > blocks.txt` wrote a file that opened with a sentence.
+    let mut payload = p.blob;
+    // `render` strips the blob's trailing newline so the payload round-trips as
+    // typed; put one back, since a text file that ends mid-line is its own
+    // surprise for whatever reads it next.
+    payload.push('\n');
+    Ok(Out {
+        status: format!("{}\n", p.banner),
+        payload,
+    })
 }
 
 /// Preview every file under `root`, emitting one blob with a header per file.
@@ -392,7 +450,7 @@ fn recursive_preview(
     expressions: &str,
     ctx: Context,
     globs: &[String],
-) -> Result<String, Failure> {
+) -> Result<Out, Failure> {
     // Same matcher and the same semantics as picocode's `find` tool: the pattern
     // is matched against the path *relative to the walk root*, so a recursive
     // match is written `**/*.rs`.
@@ -498,7 +556,15 @@ fn recursive_preview(
         if !crlf.is_empty() {
             out.push_str(&crlf_report(&crlf));
         }
-        return Ok(out);
+        // Nothing to preview, so there is no payload and stdout stays empty --
+        // a reader is left with the explanation on stderr and no file on disk
+        // that looks like it was written. Note that a run with nothing to show
+        // still exits 0: the expression was fine, the file simply matched
+        // nothing, which is an answer rather than a failure.
+        return Ok(Out {
+            payload: String::new(),
+            status: out,
+        });
     }
 
     let mut out = format!(
@@ -525,9 +591,14 @@ fn recursive_preview(
     if !crlf.is_empty() {
         out.push_str(&crlf_report(&crlf));
     }
-    out.push_str(&blob);
-    out.push('\n');
-    Ok(out)
+    // The summary and every NOTE are about the blob, so they go with the
+    // terminal rather than into it. `bsed -r ... > blocks.txt` now writes blocks.
+    let mut payload = blob;
+    payload.push('\n');
+    Ok(Out {
+        payload,
+        status: out,
+    })
 }
 
 /// Name the files that were refused for CRLF, and what to do about them.
@@ -587,13 +658,13 @@ fn read_stdin() -> Result<String, Failure> {
     Ok(buf)
 }
 
-fn apply(args: &[String]) -> Result<String, Failure> {
+fn apply(args: &[String]) -> Result<Out, Failure> {
     let mut path: Option<PathBuf> = None;
     let mut in_place = false;
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "-h" | "--help" => return Ok(USAGE.to_string()),
+            "-h" | "--help" => return Ok(Out::all(USAGE.to_string())),
             "-p" | "--path" => path = Some(PathBuf::from(need(it.next(), "-p")?)),
             "-i" | "--in-place" => in_place = true,
             other if other.starts_with('-') => {
@@ -733,10 +804,13 @@ fn apply(args: &[String]) -> Result<String, Failure> {
             .map_err(|e| Failure::Internal(format!("{}: {e}", path)))?;
         let edits: Vec<EditOp> = blockedit::to_ops(&batches[0].edits);
         if let ApplyOutcome::Applied { text, .. } = blockedit::apply_to_text(&text, &edits) {
-            return Ok(text);
+            return Ok(Out::all(text));
         }
     }
-    Ok(out)
+    // `apply` keeps one stream on purpose: its report is written as a valid
+    // blocks file so it can be edited and re-piped, and tearing the prose off
+    // would stop the blocks from parsing on their own.
+    Ok(Out::all(out))
 }
 
 /// Turn the JSON failure report into one human-readable line.
