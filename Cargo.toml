@@ -109,3 +109,10 @@ rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features =
 [patch.crates-io]
 codewandler-markdown-terminal = { git = "https://github.com/gwicke/codewandler-markdown", rev = "c4f3b0760b21ff90e48ebf1312fea0fac21eb12b" }
 codewandler-markdown-stream = { git = "https://github.com/gwicke/codewandler-markdown", rev = "c4f3b0760b21ff90e48ebf1312fea0fac21eb12b" }
+# TEMPORARY: tracks the local checkout of the sed-rs fork while the upstream PR
+# for `a`/`i`/`c` text whitespace is open. `sed-rs` 2.0.0 drops leading
+# whitespace from the text of a backslash-introduced `a`/`i`/`c`, which makes a
+# `bsed` preview of indented inserted text wrong in a way that is invisible
+# until applied. Delete this line once the PR lands and a released `sed-rs`
+# carries the fix; see crates/bsed/src/script.rs (`expand_text_escapes`).
+sed-rs = { git = "file:///home/gabriel/src/sed-rs", branch = "main" }

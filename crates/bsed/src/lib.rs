@@ -416,6 +416,18 @@ mod tests {
             r"3i\ninserted",
             r"2c\treplaced",
             r"7,8c\nreplaced",
+            // Indentation in inserted text. The backslash is what makes the
+            // whitespace content rather than a separator, so these are the cases
+            // that come back dedented if the text argument is trimmed.
+            r"2a\    deep",
+            r"2a\  two spaces",
+            r"2a\ one space",
+            r"2a\	tabbed",
+            r"4i\    deep",
+            r"2c\    deep",
+            r"7,8c\    deep",
+            // ...and the backslash-less form is the opposite: the run separates.
+            r"2a    shallow",
         ];
         for script in cases {
             // GNU sed is the reference; skip the case if it is not GNU or the
