@@ -56,8 +56,11 @@ impl ReasoningLevel {
     }
 
     /// Position on the internal ladder. Used to pick the closest supported
-    /// effort without ever exceeding what the user asked for.
-    fn rank(self) -> u8 {
+    /// effort without ever exceeding what the user asked for, and to tell a
+    /// genuine remap from a mere spelling difference (our `med`, their
+    /// `medium`) — hence public: the per-turn override path reports the first
+    /// and must not report the second.
+    pub fn rank(self) -> u8 {
         match self {
             ReasoningLevel::Off => 0,
             ReasoningLevel::Low => 1,

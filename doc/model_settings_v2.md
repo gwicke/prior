@@ -878,11 +878,71 @@ constructor** or a **real settings file** — a test that hand-builds a store wi
 hid. One test covers the whole chain from a written `settings.toml` through
 `Config::load` → `from_agent_config` → `AppState::new` → seeding.
 
-**P6 — per-turn overrides.** `turn_overrides::split`; `PicoAgent::prompt`
-signature change; the `Submit`-arm wiring; warnings. *Tests:* parser table
-(strip / no-strip / partial block / invalid value / duplicate / only-overrides);
-history raw vs session stripped, end-to-end through `run_interactive`; a retry
-re-applying the override; a steering dispatch not re-applying it.
+**P6 — per-turn overrides.** **Done (2026-09-30).** `turn_overrides::split`;
+`PicoAgent::prompt` gains the params to send; the `Submit`-arm wiring; warnings.
+*Tests:* 16 on the grammar and value handling, 6 on the request path, 4 on the
+remap note.
+
+**P6 addendum — four things the implementation settled.**
+- **The override is a value in a parameter, not a mutation.** `prompt` takes
+  `&ModelParams` — the live params with this turn's overrides applied — so
+  nothing is mutated and there is nothing to restore. That is what makes it
+  non-sticky by construction: an aborted turn, a crash, or a synthetic
+  re-prompt cannot leave one behind. Steering resets the params explicitly
+  (`turn_params = app_state.params()`), since an override belongs to the user's
+  dispatch, not to the model's corrective feedback.
+- **`request_additional_params` is now the single composition**, called by both
+  `create_agent` and the per-request path. The per-request path *replaces* the
+  baked value (`replace_additional_params`, not `merge_`): merging would leave
+  a stale key behind on anthropic's `thinking` block — an old `budget_tokens`
+  beside a new `type`. Recomposing rather than patching is also what keeps the
+  openrouter branch's provider preference on override turns. A test asserts the
+  two paths agree for identical params, since the whole scheme rests on it.
+- **A `/reasoning` override is not remapped in the parser or in
+  `effective_params`.** The remap stays in `additional_params`, the one place
+  that knows the provider's spelling and the model's effort table. What the REPL
+  does is *report* the move, comparing **ranks** so a spelling difference (our
+  `med`, their `medium`) is not announced as a downgrade. `reasoning_remap_note`
+  is split out for testing against a support table with no catalog cache
+  involved, the same reason `model_catalog::support_for_entry` is.
+- **A.10's API sketch was wrong in one respect and I nearly "fixed" it wrongly.**
+  It says to chain `.merge_additional_params` onto the `stream_prompt` request.
+  That method does not exist on `CompletionRequest` — it lives on
+  `PromptRequestBuilder`, and reaches `StreamingPromptRequest` through a
+  macro-generated forwarder, which a `grep "pub fn"` cannot see. I first
+  concluded the API was missing and reached for the wrong request type; the
+  setters (`temperature`, `without_temperature`, `replace_additional_params`,
+  `without_additional_params`) were there all along on the type already in use.
+  The merge-vs-replace concern was still right, and `replace_` is what ships.
+
+**P6 addendum — where the doc was right and I nearly argued otherwise.** The
+empty-prompt guard is where §A.10 puts it, and it does have to precede
+`ensure_session`: `input.is_empty()` runs on the raw line *before* extraction, so
+an overrides-only prompt needs its own check, and placing it after would create
+a session for a turn that never runs.
+
+**P6 addendum — one shared validator.** `v25_number_param::parse_value` is now a
+free function used by both the menu nodes and the override parser, so a value
+`/temperature` accepts can never be rejected by the parser and a range change
+lands in both at once.
+
+**P6 addendum — what is deliberately not done.** The override is not journaled
+and does not appear in `/stat` or the status bar; a per-turn value is not a
+model default and reporting it as one would be a lie. And the stripped text is
+what is persisted and counted for context, while `line_history` keeps the raw
+line, so recall shows the user what they actually typed.
+
+**Remaining after P6.** Nothing in the plan is left unbuilt, but two things were
+left untested and are worth knowing about: the end-to-end path through
+`run_interactive` (strip → persist → send), and the retry behaviour, which is
+reasoned about in the comments above rather than asserted by a test. Both need a
+mock turn to observe the request, which the e2e harness has and the lib tests
+do not.
+
+**Open question for the next piece of work.** A.8 lists menu surface that P6
+does not address — whether `/stat` and the status bar should mention that the
+current turn carries overrides at all. My inclination is no (see above), but it
+is a UX call rather than a correctness one, and it is not yet decided.
 
 **Risks**
 
