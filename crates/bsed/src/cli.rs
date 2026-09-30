@@ -42,9 +42,8 @@ PREVIEW (never writes; the default):
                                 matches. Repeatable, and any match wins. Same
                                 semantics as the `find` tool, so use **/*.rs for a
                                 recursive match.
-    -c, --context <N>           Unchanged lines each side; trailing is always at
-                                least 2 (default 0)
-    -t, --trailing <N>          Minimum unchanged lines after a change (default 2)
+    -c, --context <N>           Unchanged lines to add before each change (default 0)
+    -t, --trailing <N>          Unchanged lines to add after a change (default 0)
         --no-grow               Do not extend blocks to a balanced bracket
     -b, --budget <BYTES>        Preview budget, single-file mode only (default 51200)
     -h, --help
@@ -281,7 +280,7 @@ fn preview(args: &[String]) -> Result<String, Failure> {
 
     let ctx = Context {
         leading: context,
-        trailing: trailing.unwrap_or(2),
+        trailing: trailing.unwrap_or(0),
         grow,
         growth_cap: 20,
     };

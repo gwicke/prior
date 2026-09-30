@@ -38,7 +38,15 @@ pub struct Block {
 pub struct Context {
     /// Unchanged lines to include before the change.
     pub leading: usize,
-    /// Minimum unchanged lines to include after the change.
+    /// Unchanged lines to include after the change.
+    ///
+    /// Off by default: a block carries the change plus whatever the balance
+    /// growth reaches, and its `path:LINE` anchor is computed from the file just
+    /// read, so a preview is applicable without padding to widen it. It used to
+    /// default to 2 so a one-line change became a three-line `OLD` and picked up
+    /// a ±1 anchor tolerance against a file that shifted between preview and
+    /// apply. Every block is anchored, so the whole batch applies from one `edit`
+    /// call regardless; padding costs a third of the budget on every change.
     pub trailing: usize,
     /// Whether to grow a block until its brackets balance.
     pub grow: bool,
@@ -50,7 +58,7 @@ impl Default for Context {
     fn default() -> Self {
         Context {
             leading: 0,
-            trailing: 2,
+            trailing: 0,
             grow: true,
             growth_cap: 20,
         }
@@ -183,24 +191,27 @@ pub fn build(old: &str, new: &str, ctx: Context) -> Hunks {
 
         let mut old_text = join(&old_lines, old_start, old_end);
         let new_text = join(&new_lines, new_start, new_end);
-        // A block that deletes the last line has to take the terminator with it.
+        // A block with nothing on the new side has to take the newline that
+        // follows it.
         //
-        // Everywhere else the newline that ends a block's last line is left in
-        // the text, outside the replaced span, and does the job: a non-empty new
-        // side is terminated by it, and a block that stops short of EOF is
-        // followed by it. But a block whose new side is empty has nothing to be
-        // terminated, so at EOF the only terminator is the file's own — and if it
-        // is not part of the replaced span it survives as a blank line.
+        // Everywhere else that newline is left in the text, outside the replaced
+        // span, and does the job: a non-empty new side is terminated by it. But
+        // a block that deletes has nothing to terminate, so the newline outlives
+        // the line it used to end and becomes a blank line. `$d` on "a\nb\nc\n"
+        // replaced "c" with "" and left "a\nb\n\n" behind — applied cleanly, and
+        // still not what sed wrote.
         //
-        // So `$d` on "a\nb\nc\n" replaced "c" with "" and left "a\nb\n\n" behind:
-        // the block applied cleanly and still produced a file GNU would not have
-        // written. Carrying the terminator in the old text removes the line.
+        // The terminator exists unless the block ends at a last line that never
+        // had one, which is the `old_end < old_lines.len() || old_ends_nl` guard.
         //
-        // The `new_end == new_start` guard is what keeps this narrow. A
-        // replacement of the last line, old "d" new "D", is already correct
-        // without it — the leftover newline terminates the "D" — so those blocks
-        // keep the shape they have always had.
-        if new_end == new_start && old_end == old_lines.len() && old_ends_nl {
+        // This was found at EOF first, where it is reachable with trailing
+        // context off, but it is not an EOF rule: with `trailing: 0` a deletion
+        // in the middle of a file leaves the same blank line whenever the diff
+        // did not absorb the following line into the block, which it does not
+        // always do. The guard on the empty new side keeps a replacement out of
+        // it — old "d" new "D" is already correct, since the leftover newline
+        // terminates the "D".
+        if new_end == new_start && (old_end < old_lines.len() || old_ends_nl) {
             old_text.push('\n');
         }
         // Only report a mid-construct block when *the change itself* is
@@ -332,8 +343,11 @@ mod tests {
         let new = FILE.replace("    // trailing\n", "");
         let h = build(FILE, &new, ctx0());
         assert_eq!(h.blocks.len(), 1);
-        assert_eq!(h.blocks[0].old_text, "    // trailing");
+        // The trailing newline comes along, or it is left behind as a blank line.
+        assert_eq!(h.blocks[0].old_text, "    // trailing\n");
         assert_eq!(h.blocks[0].new_text, "");
+        let applied = FILE.replacen(&h.blocks[0].old_text, &h.blocks[0].new_text, 1);
+        assert_eq!(applied, new);
     }
 
     /// Deleting the last line has to take the terminator with it, or the block
@@ -376,14 +390,22 @@ mod tests {
         assert_eq!(h.blocks[0].new_text, "C");
     }
 
-    /// A block that stops short of EOF never needs the terminator, because the
-    /// newline that ends its last line is still in the text after it.
+    /// An interior deletion needs the terminator just as much as one at EOF.
+    /// With nothing after it in the block, the newline that ended the deleted
+    /// line would otherwise stay behind as a blank line — and with `trailing: 0`
+    /// there is no context to absorb it, so this is the shape a plain `2d` gets.
     #[test]
-    fn an_interior_deletion_keeps_its_shape() {
-        let h = build("a\nb\nc\n", "a\nc\n", ctx0());
+    fn an_interior_deletion_takes_its_terminator_too() {
+        let before = "a\nb\nc\n";
+        let after = "a\nc\n";
+        let h = build(before, after, ctx0());
         assert_eq!(h.blocks.len(), 1);
-        assert_eq!(h.blocks[0].old_text, "b");
+        // Only when the diff left the new side empty; if it absorbed the
+        // following line, that line is what carries the terminator instead.
+        assert_eq!(h.blocks[0].old_text, "b\n");
         assert_eq!(h.blocks[0].new_text, "");
+        let applied = before.replacen(&h.blocks[0].old_text, &h.blocks[0].new_text, 1);
+        assert_eq!(applied, after);
     }
 
     #[test]

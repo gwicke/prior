@@ -467,8 +467,6 @@ pub async fn sed_preview(
         "preview".into(),
         "-c".into(),
         context.clamped().to_string(),
-        "-t".into(),
-        SAFE_SED_TRAILING.to_string(),
         "-b".into(),
         SED_PREVIEW_BUDGET.to_string(),
         "-p".into(),
@@ -496,13 +494,6 @@ pub async fn sed_preview(
         ))),
     }
 }
-
-/// Unchanged lines the `sed` preview always adds *after* a change.
-///
-/// Two is deliberate: it lifts a one-line change to a three-line `OLD`, which
-/// is what buys the `edit` tool a ±1 anchor tolerance instead of zero. See
-/// `doc/bsed.md` §4.1.
-const SAFE_SED_TRAILING: &str = "2";
 
 #[rig_tool(
     name = "find",

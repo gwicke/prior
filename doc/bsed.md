@@ -102,31 +102,41 @@ Tool name `sed`, registered **only when `bsed` is found on `$PATH`** (§9).
 * `context` — integer or numeric string, same shape as `ReadLimit`
   (`src/config.rs:100`), because harnesses stringify numbers. Default **0**;
   clamped to `[0, 20]`. Effective padding is `leading = context`,
-  `trailing = max(context, 2)` — a free 2-line tail, symmetric on request. See
-  §4.1.
+  `trailing = 0`. A `bsed` caller asks for trailing context with `-t N`; the
+  agent tool does not, and the default is 0 on both sides. See §4.1.
 * Returns a string: a one-line banner, then the block blob (§7). Never writes.
   Not wrapped in `guard()` — it is a read-only preview.
 
 ## 4. Producing the preview
 
-### 4.1 What `context` is, and why the default is 0
+### 4.1 What `context` is, and why both defaults are 0
 
 **`context` is not "print N lines around the match"** (that is `grep -C`). It is
 the number of **unchanged** lines of the original file carried *into each emitted
 block*, inside `OLD` and `NEW`. Only regions that actually changed are ever
 emitted; `context` pads each one.
 
-**The rule is asymmetric by default and symmetric on request:**
-`leading = context`, `trailing = max(context, TAIL)`, `TAIL = 2`
-(`[tool_config.sed].trailing_context`). `context` defaults to **0**, so an
-unadorned call gets 0 lines before and 2 after; asking for `context: n` sets both
-sides to `n`, with the trailing value acting as a floor. Rationale: the *following*
-lines are where a change most often continues, and a 2-line tail turns a 1-line
-`OLD` into a 3-line one, which lifts `anchor_tolerance` from 0 to 1 (below) —
-cheap insurance against a stale anchor. It also covers the smallest multi-line
-call shape (`compute(` / `a,` / `b,`). It does not *close* the construct, but it
-signals that a multi-line statement is in play, which should trigger a
-`context: 4` re-run or the balance-growth pass (§4.6).
+**Both defaults are 0.** `leading = context`, `trailing = 0`; a caller wanting a
+tail asks for it with `-t N`. An unadorned call therefore gets only the changed
+lines, plus whatever the balance-growth pass (§4.6) reaches.
+
+This was not always so, and the argument for the 2-line tail it replaced is worth
+keeping, because it is the reason `context` exists at all. The tail turned a
+1-line `OLD` into a 3-line one, which lifted `anchor_tolerance` from 0 to 1 (see
+below) — insurance against a file that shifted between preview and apply. It also
+covered the smallest multi-line call shape (`compute(` / `a,` / `b,`), signalling
+that a multi-line statement was in play.
+
+It was dropped because every block already carries a `path:LINE` anchor computed
+from the file `bsed` just read, so an unshifted file needs no tolerance at all;
+the slack only ever mattered for a *stale* anchor, which is a workflow problem
+(apply the whole blob in one `edit` call) rather than a preview one. Meanwhile the
+tail cost a third of the 50 KB budget (§5.5) on every single-line change, and the
+growth pass already reaches the closing bracket when one is nearby. Dropping it
+does make a 1-line block have exactly zero slack, so a batch applied after an
+unrelated edit can still be refused — correctly, with "anchor out of tolerance" —
+and re-previewing is the answer. That trade is deliberate: fewer blocks fit in the
+budget, and the same information is available on request.
 
 **Line anchoring is what makes small blocks viable — that is the entire reason
 the blocks are anchored.** Reading `edit`'s anchored pass (Pass 1,
@@ -156,12 +166,11 @@ What `context` then buys is three things, none of which is "makes the edit apply
    if the file shifted between preview and apply — the model applied an earlier
    batch first, or something else touched the file — the 40-duplicate case fails
    the skew rule outright (`d2 = 1 < 3 × d1` for any `d1 ≥ 1`) and `edit` reports
-   "anchor out of tolerance". Correct behaviour, but a wasted round-trip. The
-   default 2-line tail largely closes this: a 1-line change becomes a 3-line `OLD`
-   and gets ±1 of tolerance for the price of two lines of the file the model was
-   going to read anyway. The remaining workflow rule (which the banner should
-   state) is: apply the whole blob in **one** `edit` call, and re-preview before
-   any follow-up batch.
+   "anchor out of tolerance". Correct behaviour, but a wasted round-trip. With
+   both defaults 0 this is the case to expect: a 1-line block has no slack at all.
+   The rule that avoids it is the same either way — apply the whole blob in **one**
+   `edit` call, and re-preview before any follow-up batch — and a caller who wants
+   the insurance can ask for a tail with `-t 2`, which restores ±1.
 2. **Legibility of the preview** — `run(); → walk();` alone does not show the
    enclosing `if count > 0 {`. Largely free via §4.6 (the TUI panel renders a
    context-rich diff; only the *model* payload is terse), so there is no reason to
@@ -173,8 +182,8 @@ What `context` then buys is three things, none of which is "makes the edit apply
 
 Cost when used: blocks grow, so the 50 KB preview budget (§5.5) is consumed
 faster, and hunks within `2*context` merge into one larger block (harmless —
-`similar` guarantees they cannot overlap). With `context: 0` the only growth is
-the 2-line tail, clamped so it can never reach the next block (§4.5, rule 8).
+`similar` guarantees they cannot overlap). With both defaults 0 the only growth
+is the balance pass, clamped so it can never reach the next block (§4.5, rule 8).
 
 ### 4.2 Pipeline (inside `bsed`)
 
@@ -850,19 +859,17 @@ Resolved since (reasoning in §7):
 | 11 | Scope of atomicity for a tree | **per file**: a stale file is reported and skipped, the rest apply | §7.2 |
 | 12 | Budget in `-r` mode | **none** — a human is reading it, and silent truncation is the worst outcome | §7.1 |
 | 13 | How do you see which replacements did not apply? | the **failed blocks are echoed back**, with paths and anchors, ready to re-pipe | §7.2 |
+| 14 | Trailing context by default? | **none** — `trailing: 0`, on both the CLI and the agent tool. Every block is anchored from the file just read, so the tail only bought slack against a stale anchor, at a third of the budget on every change | §4.1 |
 
 Still open — small tuning decisions, not architecture:
 
-1. **`TAIL` value.** Is 2 right for `[tool_config.sed].trailing_context`? 2 buys
-   a ±1 anchor tolerance (§4.1) and covers the 3-line call shape; 1 is cheaper; 3
-   starts covering 4-line calls at a real token cost on every single-line change.
-2. **Growth cap.** How many lines may a grown block add before we give up and emit
+1. **Growth cap.** How many lines may a grown block add before we give up and emit
    the banner hint instead? 40 was the sketch value; 20 is probably the honest one
    for code review.
-3. **Angle brackets.** Keep the "count `<` only if a `>` appears within the cap"
+2. **Angle brackets.** Keep the "count `<` only if a `>` appears within the cap"
    guard, or drop `<`/`>` from balancing entirely? Dropping is safer but stops
    `Vec<T>` and `HashMap<K, V>` in a changed line from triggering growth.
-4. **`bsed apply` in v1** or with `replace -r` later? `apply` is the piece a shell
+3. **`bsed apply` in v1** or with `replace -r` later? `apply` is the piece a shell
    user reaches for first, but it is not available until `blockedit` is extracted.
 
 ## 13. Deferred

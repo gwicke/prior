@@ -524,6 +524,12 @@ mod tests {
             "1,2!d",
             "1,9d",
             "8,9d",
+            // ...and the same for a deletion that just is not at the end. With
+            // no trailing context to absorb the newline, and the diff not
+            // always pairing the following line into the block, an interior
+            // deletion leaves a blank line too.
+            "6,7d",
+            "2d",
         ];
         for script in cases {
             // GNU sed is the reference; skip the case if it is not GNU or the
