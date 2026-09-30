@@ -2373,6 +2373,190 @@ mod tests {
         );
     }
 
+    /// A 40-column replay of `bytes`, as trimmed screen rows.
+    fn screen_rows(bytes: &[u8]) -> Vec<String> {
+        let onlcr: Vec<u8> = bytes
+            .iter()
+            .flat_map(|&b| {
+                if b == b'\n' {
+                    vec![b'\r', b'\n']
+                } else {
+                    vec![b]
+                }
+            })
+            .collect();
+        let mut p = vt100::Parser::new(24, 40, 1000);
+        p.process(&onlcr);
+        (0..24)
+            .map(|r| {
+                (0..40)
+                    .map(|c| {
+                        p.screen()
+                            .cell(r as u16, c as u16)
+                            .and_then(|x| x.contents().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A `ConsoleOutput` carrying a status, plus the redraw `emit_commit`
+    /// expects: compose the area and draw it, the way `read_input` does.
+    fn commit_harness() -> (crate::output::ConsoleOutput, LineEditor) {
+        let reasoning = crate::settings::default_show_reasoning_handle();
+        crate::repl::TERMINAL_WIDTH.store(40, Ordering::SeqCst);
+        let out = crate::output::ConsoleOutput::new(reasoning);
+        out.set_status(&crate::agent::status_text(
+            Some("sess"),
+            None,
+            crate::agent::BarModel {
+                provider: "llamacpp",
+                model: "test",
+                thinking: None,
+                context_tokens: 0,
+            },
+        ));
+        (out, LineEditor::new())
+    }
+
+    fn redraw_fn(
+        out: &crate::output::ConsoleOutput,
+    ) -> impl Fn(&LineEditor, &[String], usize, (usize, usize)) + '_ {
+        move |editor: &LineEditor, overlay: &[String], sel: usize, dims: (usize, usize)| {
+            let layout = editor.layout(dims.0, "> ");
+            let input = Element::input(layout, "> ".to_string());
+            let ov = (!overlay.is_empty()).then(|| Element::overlay(overlay.to_vec(), sel));
+            out.draw_elements(Some(input), ov, ApplyPolicy::Frame, dims);
+        }
+    }
+
+    /// Two committed prompts render as two rule-pairs with **no blank row
+    /// between them**.
+    ///
+    /// The transcript is `rule, line, rule` for each commit, and the two groups
+    /// butt together — a blank there reads as a third, empty event. The row
+    /// count is what makes this fragile: the area is re-drawn under each commit
+    /// (its status and input rows), and if the re-draw's position leaves a row
+    /// of air, the next commit's opening rule lands below it.
+    #[test]
+    #[serial_test::serial]
+    fn two_committed_prompts_render_without_a_blank_between_their_rules() {
+        let (out, mut editor) = commit_harness();
+        let mut history = History {
+            entries: Vec::new(),
+            file: None,
+        };
+        let redraw = redraw_fn(&out);
+
+        out.begin_capture();
+        for line in [
+            "/model xiaomimimo:mimo-v2.6-flash activate",
+            "/reasoning high",
+        ] {
+            Repl::emit_commit(
+                &out,
+                &mut editor,
+                &redraw,
+                0,
+                (40, 24),
+                line,
+                "",
+                &mut history,
+            );
+        }
+        let rows = screen_rows(&out.end_capture());
+
+        let rule = rows.iter().position(|r| r.starts_with('\u{2500}'));
+        let first = rule.expect("the first rule is on screen");
+        let second = rows
+            .iter()
+            .enumerate()
+            .skip(first + 1)
+            .find(|(_, r)| r.starts_with('\u{2500}'))
+            .map(|(i, _)| i)
+            .expect("a rule below the first committed line");
+        // rule(1st), line, rule(2nd) … rule(3rd): rules at `first`, `second`,
+        // and the third pair's own opening rule must follow `second` directly.
+        let third = rows
+            .iter()
+            .enumerate()
+            .skip(second + 1)
+            .find(|(_, r)| r.starts_with('\u{2500}'))
+            .map(|(i, _)| i)
+            .expect("the next group's opening rule");
+        assert_eq!(
+            third,
+            second + 1,
+            "no blank row between the two rule groups: {:?}",
+            &rows[first..=third + 1]
+        );
+    }
+
+    /// A committed prompt following turn content keeps **both** its rules.
+    ///
+    /// The upper one is the one that goes missing: the turn's content ends on
+    /// its own trailing blank, and the commit's opening rule has to land on the
+    /// row directly after it rather than be absorbed into the gap.
+    #[test]
+    #[serial_test::serial]
+    fn a_committed_prompt_after_turn_content_keeps_its_upper_rule() {
+        let (out, mut editor) = commit_harness();
+        let mut history = History {
+            entries: Vec::new(),
+            file: None,
+        };
+        let redraw = redraw_fn(&out);
+
+        out.begin_capture();
+        // Turn content the way a real turn leaves it: output ending in a blank.
+        out.display_plain("git status output line\nmore output\n");
+        Repl::emit_commit(
+            &out,
+            &mut editor,
+            &redraw,
+            0,
+            (40, 24),
+            "Great, nice work! Please commit your changes.",
+            "",
+            &mut history,
+        );
+        let rows = screen_rows(&out.end_capture());
+
+        let line = rows
+            .iter()
+            .position(|r| r.contains("Great, nice work"))
+            .expect("the committed prompt is on screen");
+        assert!(
+            rows[line - 1].starts_with('\u{2500}'),
+            "a rule directly above the prompt: {:?}",
+            &rows[line - 3..=line + 3]
+        );
+        // …and the blank above *that* is the turn's own trailing blank, not a
+        // second one the commit opened.
+        assert!(
+            rows[line - 2].trim().is_empty() && !rows[line - 3].trim().is_empty(),
+            "the turn's content, one blank, then the rule: {:?}",
+            &rows[line - 3..=line + 5]
+        );
+        // The prompt wraps at this width, so the closing rule is "somewhere
+        // below", not "the next row" — find it rather than assume.
+        let closing = rows
+            .iter()
+            .enumerate()
+            .skip(line + 1)
+            .find(|(_, r)| r.starts_with('\u{2500}'))
+            .map(|(i, _)| i)
+            .expect("the rule below the committed prompt");
+        assert!(
+            rows[closing - 1].contains("nges.") || rows[closing - 1].contains("commit"),
+            "the rule follows the prompt's last row: {:?}",
+            &rows[line..=closing]
+        );
+    }
+
     // ------------------------------------------------------------------
     // Batch slash driver (`Repl::batch_slash`) — the non-REPL input path
     // (quiet / piped stdin): a complete line commits through the v2.5

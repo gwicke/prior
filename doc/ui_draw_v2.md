@@ -1,6 +1,8 @@
 # UI Draw v2 — unified frame composition for REPL, menus & dialogs
 
-**Status:** Design settled — implemented (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 ✅, P5 ✅).
+**Status:** Design settled — implemented (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 ✅, P5 ✅;
+§4.5 P1/P2 ✅ in the API fold, P3–P6 not started). One end-to-end layout
+assertion is off by one row — see §5.2.
 Post-implementation follow-ups (§9): 7 done, 3 open, 1 accepted limitation —
 audited 2026-09-28, recommended order at the end of §9.
 **Supersedes:** the ad-hoc dialog renderer in `src/ui.rs`, the `redraw` closure in `src/repl.rs`
@@ -842,11 +844,23 @@ renders at, and width is composition, not budget.
 > `None` for off rather than an empty full-width row). What moved out is the rendering:
 > width, the streaming dot, and the off-rule are `status_row`'s.
 
-> **Superseded by §4.5.** The empty-input frame and the
-> `plan_clear_live_frame` that retires it are exactly what P1/P2 remove: the area
-> is meant to stay live across the turn, and the fold — not the frame boundary —
-> is what content writes stop at. The composition above is right; the retirement
-> is not.
+> **Superseded by §4.5, now landed.** The empty-input frame and the
+> `plan_clear_live_frame` that retired it are gone: the area stays live across
+> the turn, and the fold — not the frame boundary — is what content writes stop
+> at. `plan_consume` walks to the fold and the content takes those rows over;
+> `plan_reposition` puts the area back underneath. `plan_clear_live_frame` is
+> deleted.
+>
+> **Known gap:** `end_to_end_input_mode_layout` reports **two** blank rows
+> between a turn's last content and the status row, where it asserts one. The
+> area is otherwise byte-correct in isolation — a unit-level replay that drives
+> the same sequence (bottom-pinned frame, tool panel, repeated
+> consume/reposition cycles, `end_response`, the post-turn redraw, and content
+> long enough to scroll) produces exactly one blank. So the extra row is not in
+> the consume/reposition path itself; the untested difference is the
+> `cursor_row()` re-anchor `read_input` runs on re-entry (`repl.rs:643`), which
+> emits an absolute `CUP` and drops `live` between the turn and the final redraw.
+> Not yet root-caused; see the commit message.
 
 `next_input_row` / `clear_rows_to` folded into the apply implementation (P3); their
 meaningful unit tests moved to `ui::frame::apply_tests`, the byte-mechanics ones
