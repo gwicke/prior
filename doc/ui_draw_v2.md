@@ -38,7 +38,7 @@ without an input segment".
 | Budget | Live region ≤ **2/3 of terminal height**; top 1/3 guaranteed scrollback |
 | Full apply | **Scroll-then-paint**: LF scroll by `delta` from the bottom row (never `CSI S` — it deletes rows instead of pushing scrollback), then absolute writes |
 | Partial apply | Row-diff repaint when `delta == 0 ∧ top == live.frame_top_row ∧ term size (w, h) unchanged` |
-| Clear policy | Full apply: clear the union of the old frame region (scroll-shifted) and the rows below the new frame, floored at `min(term_h, screen_bottom)`. Partial apply: row-diff + shrink remainder only. Append: no region clear (reserved for §4.5's chunked writes). **General invariant (P4):** a Frame apply clears the rows below the frame, so any later append-only render (and any row-diff) lands in already-clean space and never re-clears it |
+| Clear policy | Full apply: clear the union of the old frame region (scroll-shifted) and the rows below the new frame, floored at `min(term_h, screen_bottom)`. Partial apply: row-diff + shrink remainder only. Append: no region clear (reserved for §4.5's chunked writes). **General invariant (P4):** a Frame apply clears the rows below the frame, so any later append-only render (and any row-diff) lands in already-clean space and never re-clears it. **To be restated by §4.5 P1:** with the area live across a turn, content *consumes* the area's rows instead of landing below them, so the invariant becomes "content writes stop at the fold; the area's rows are re-emitted, not erased". That is a change to a settled decision and wants its own commit and test |
 | Buffer | Flat `String` + per-screen-row extents `Vec<Range<usize>>` |
 | Caret | Absolute `(row, col)` in the cache (row authoritative, col best-effort); frame-relative `(row_idx, display_col)` inside `Frame`; applied with `CUP` + `CHA` (`\x1b[{col}G`) |
 | Draw state | `DrawCache { caret, screen_bottom, live: Option<LiveFrame> }` in `ConsoleOutput`; all writers maintain it before returning |
@@ -177,7 +177,7 @@ derived as `frame_top_row + frame.caret.row`; never stored twice. `frame_anchor(
 | `$EDITOR` wrapper (`run_editor`: Ctrl-E prompt edit, compaction draft edit) | `cursor_row()` (DSR) after exit → `caret`; `live = None` |
 | Resize | `cursor_row()` (DSR) re-anchor; `live = None` |
 | Ctrl-Z resume | `cursor_row()` (DSR) re-anchor; `live = None` |
-| Dialog entry (`ui::confirm`) | `cursor_row()` (DSR) re-anchor — mid-turn the tracked caret does not follow streamed content; `live = None`. Afterwards the dialog itself maintains the cache through `draw_frame` |
+| Dialog entry (`ui::confirm`) | `cursor_row()` (DSR) re-anchor; `live = None`. Afterwards the dialog itself maintains the cache through `draw_frame`. (The reason used to be "the tracked caret does not follow streamed content" — false since the streaming writers started counting, see #10. Kept as a cheap confirmation on a path where a wrong anchor strands the dialog; §4.5 P5 revisits it.) |
 
 `live = None` forces the full path on the next apply. Any uncertainty → clear it.
 
@@ -252,19 +252,187 @@ Row diff (not dirty flags) is the starting point — it catches input-growth shi
 cross-element reflows that per-element flags miss; cost is negligible against I/O.
 Dirty spans from `spans` are a later refinement if profiling demands it.
 
-### 4.5 Contraction and fixed bottom elements (future)
+### 4.5 The fold: one composed, relatively-drawn area below the content
 
-The `Append` policy re-consumes the space *below* a block down to the terminal
-bottom — the "contraction" mirror of the overlay/menu "expansion" of the bottom
-drawing area. The natural generalization for a status line or a persistent input
-line is to **compose those fixed parts into the same screen update** rather than
-writing them ad hoc: a policy per chunk — **no-clear** on the content/scrollback
-chunks, **clear** on the no-content chunks — with the fixed bottom elements
-establishing the lower bound the cursor may write to (i.e. how far the screen is
-scrolled back up before the non-scrollback elements are redrawn). Not needed for
-P3/P4; recorded so the frame model grows in this direction instead of accumulating
-side channels.
+**Status: the direction, not a future phase.** The drivers are in-turn input
+(typing during a turn) and menu operation during a turn. Both are impossible
+today for one reason, and this section is about that reason.
 
+#### 4.5.1 Terminology: the fold
+
+The **fold** is the boundary between scrollback and the bottom drawing area: the
+topmost row of the non-scrollback region. Everything at or below the fold is
+*the area*, and everything above it is *content*.
+
+The fold is **not** a fixed row and the area is **not** pinned to the terminal
+bottom. The area sits immediately below the content, and content pushes it
+down; when a menu opens the fold moves *up* (expansion) and when it closes the
+area descends back into the space it freed (contraction). Rows below the area
+are ordinary empty screen. An earlier draft of this section called the area
+"pinned", which is wrong: pinning would mean the content region is a constant
+`th - h` rows, which is a *different* design with a different cost (see OQ3).
+
+#### 4.5.2 What "fully-relative" means here, precisely
+
+Two readings, and the difference decides how much is achievable:
+
+- **(a) No absolute addressing while we own the screen.** Every content write,
+  every area apply, and every fold move is relative (`CR`, `EL`, `CUU`, `CUD`,
+  `LF`) and no `CUP` is emitted between the start of a turn and its end. **This
+  is achievable and is the target.**
+- (b) No `CUP` ever, including after a foreign writer. **Not achievable** while
+  `$EDITOR` (Ctrl-E, compaction drafts) and Ctrl-Z resume exist: a cache cannot
+  know where a foreign writer left the cursor, and the only alternative is a
+  full-screen repaint that itself needs to know the scroll offset — i.e. the same
+  query by another name. OQ1 asks which reading is wanted.
+
+So the honest end state is (a): absolute addressing survives only in
+foreign-writer recovery, where it is *information the cache does not have*
+rather than an architectural gap.
+
+#### 4.5.3 What blocks it today
+
+Three facts, all of which are consequences of one decision:
+
+1. **The area is retired by the first content write of a turn.** The REPL applies
+   an empty-input frame before returning (`redraw(&LineEditor::new(), …)` on the
+   submit path), and `with_content_writer`'s `plan_clear_live_frame` then erases
+   it and sets `live = None`. For the rest of the turn there is no area at all.
+2. **Content and a live area therefore never coexist.** The only production
+   `draw_frame` callers are the REPL's `redraw` and `ui::confirm`, and the
+   latter blocks. So §4.5's no-clear content policy has had nothing to operate
+   on: `plan_clear_live_frame` returns empty for essentially every write of a
+   turn.
+3. **The status bar is a content line, not an area row.** `paint_status` /
+   `clear_status` / `StatusSpot` and the gap logic (`row_accounting` §3.5) exist
+   *only* because there is no area during a turn. The bar is painted at the
+   content's live edge, erased by the next content write, and jumps to the
+   content's edge at submit. That jump is not a bug in the drawing — it is the
+   area being replaced by the content's own bottom edge — but it is a symptom of
+   the area not existing.
+
+#### 4.5.4 Target invariants
+
+Each is checkable, and each is what a phase below establishes.
+
+- **I1 — One owner.** At every instant exactly one component composes the area.
+- **I2 — Content never writes inside the area.** Every content byte lands at or
+  above the fold. The area's rows are never clobbered by content.
+- **I3 — The fold is derived, not remembered.** It is a function of the tracked
+  caret, the area's height and `term_h` — never a separate counter.
+- **I4 — Steady state is relative.** Between a turn starting and ending, no
+  `CUP` is emitted (4.5.2 (a)).
+- **I5 — The area is never blank mid-turn.** Today the input region is erased at
+  submit and rebuilt later; on a fast stream that is a visible flash. I5 says
+  the area is continuously valid or is deliberately, visibly replaced.
+- **I6 — Scrollback stays contiguous.** Scrolling back shows content with no
+  gaps and no area rows interleaved.
+
+#### 4.5.5 Phases
+
+Each phase is separately reviewable and separately verifiable. P1 and P2 are
+prerequisites for in-turn input; P3 and P4 are the features themselves; P5 is
+the payoff.
+
+**P1 — Contraction: the area establishes the content's lower bound.**
+`with_content_writer` stops retiring the area. Content is written from the fold
+downward, the terminal scrolls as the write reaches the bottom, and the area is
+re-emitted once at its new fold — a `Frame` apply with a known delta, which is
+what `plan_append`'s shape already anticipates. `ConsoleOutput` re-emits
+`cache.live.frame` (it already caches the last applied frame), which is the
+concrete form of "compose those fixed parts into the same screen update".
+- Establishes I2, I3, I6.
+- Verify: the post-turn screen is byte-identical to today's (the transcript does
+  not move), plus a new vt100 case where a multi-chunk stream never leaves the
+  area blank (I5).
+- Risk: this is where **P4** (the clear policy invariant) has to be restated.
+  Today "a Frame apply clears the rows below the frame, so any later append lands
+  in clean space" is what makes appends safe. With the area live, content
+  *consumes* the area's rows rather than landing below them, so the invariant
+  becomes "content writes stop at the fold; the area's rows are re-emitted, not
+  erased". That is a change to a settled decision (see the P4 row in §2) and
+  wants its own commit and its own test.
+
+**P2 — The area survives the turn; the bar becomes a permanent row.**
+The REPL stops applying an empty-input frame to retire, and the content path
+stops clearing. The status bar moves from a content transient to
+`Element::Lines` in the area composition, and its dot is driven by real turn
+state (grey at the prompt, green in flight) — which is what makes the two states
+mean something, and it removes the jump. `StatusSpot`, `clear_status`,
+`paint_status`'s cursor-hide/dim dance and the §3.5 gap logic all become dead and
+are deleted; `row_accounting`'s gap tests go with them (or are restated as "the
+area's first row is preceded by a blank", which is the surviving requirement).
+- Establishes I1, I4, I5.
+- Verify: the dot flips on the *same row* with no second bar anywhere; a
+  resize mid-turn re-flows the area; `plan_clear_live_frame` has no production
+  callers and is removed.
+
+**P3 — In-turn input.** The read loop runs during the turn and the input row is
+live. This is the phase that needs I1 most: the streaming path and the read loop
+both want the area. The resolution is that the read loop is the area's sole
+composer and the content path writes *above* the fold and asks for a re-emit
+through that same path (P1's mechanism), rather than the two applying
+independently.
+- Establishes I1 under concurrency.
+- Verify: keys typed during a turn reach the editor; `<Esc>` still cancels the
+  turn (today it is handled by the in-flight reader thread, not the frame);
+  the area's row diff is correct under arbitrary interleaving of chunks and keys
+  — this wants a test that drives both from one thread with a deterministic
+  schedule, not a pty race.
+- OQ2 decides what Enter *means* during a turn (queue a follow-up, or something
+  else), which changes the editor's state machine but not the drawing.
+
+**P4 — Menus in-turn.** The overlay joins the same area composition, so the fold
+moves up on open and down on close while content keeps streaming above it. The
+fold's movement is a scroll, and the area's rows above the new fold are consumed
+by the content exactly as in P1.
+- Verify: open and close a menu mid-turn; the content above the fold is
+  contiguous afterwards; the area's budget accounting (`live_budget`) includes
+  the bar's row, so a tall pop-up gets one row less to work with.
+
+**P5 — Retire the DSRs that are no longer load-bearing.** With the fold
+maintained across turns and every content write counted (done: #10), two
+re-anchors stop being load-bearing: `ui::confirm`'s (its stated reason — that
+streaming does not track rows — is already false) and possibly `read_input`'s
+entry one, if the fold survives the turn boundary so the caret never needs
+re-establishing between turns. The foreign-writer re-anchors (Ctrl-Z, `$EDITOR`
+exit, resize) stay under any reading; see OQ1.
+- Verify: removing each is a separate commit, each with the suite green and a
+  note on what now covers it. Note that `confirm_raw_mode` asserts *behaviour*
+  (which option was chosen) and not the dialog's row, so "the suite is green" is
+  not evidence for the `ui::confirm` removal — that one needs a positional
+  assertion first.
+
+#### 4.5.6 Not in scope
+
+- **The area being pinned to the bottom row.** See 4.5.1 and OQ3.
+- **Per-row backgrounds in the area** (`row_bgs`, dropped in P5) — unrelated.
+- **Scrollback rewriting.** The area is chrome and never enters the scrollback;
+  I6 says the *content* stays contiguous, not that the area is preserved.
+
+#### 4.5.7 Open questions
+
+- **OQ1 — Which reading of "fully-relative"?** (a) steady state, accepting
+  `CUP` in foreign-writer recovery (recommended: achievable, and the remaining
+  `CUP`s are honest about missing information), or (b) never, which requires
+  dropping `$EDITOR`/Ctrl-Z or accepting a repaint that needs the same query.
+- **OQ2 — In-turn input semantics.** Does Enter *queue* a follow-up for after
+  the current turn, or is a different gesture needed? Is `<Esc>` still
+  "cancel the turn", or does it become "focus the input"? And should the input
+  row be live from the moment the turn starts, or only after the first chunk?
+- **OQ3 — The cost of a non-pinned fold.** With the area below the content, the
+  content region is `th - h` rows *only when the area is at the bottom*. When
+  space below is free (a collapsed menu), the area sits mid-screen and the rows
+  beneath it are empty. Is that the intent — content filling the screen, area
+  following it down — or should the area instead sit at the bottom whenever
+  there is room (which is the "pinned" reading this section rejected)?
+- **OQ4 — Mid-turn dialogs.** `ui::confirm` is currently its own frame that
+  replaces the area entirely. With in-turn input, does a confirmation dialog
+  *replace* the area (the input row disappears) or *compose above* it (the input
+  row stays visible)? And does a dialog's fold interact with a concurrently
+  streaming turn, or does it block as it does today?
+
+---
 ---
 
 ## 5. Wiring
@@ -317,6 +485,12 @@ scroll tracking (the cache holds the post-scroll top). The REPL always applies a
 empty-input frame before returning (as today's submit paths do), so no frame is live
 when content streams under the next turn.
 
+> **Superseded by §4.5.** The empty-input frame and the
+> `plan_clear_live_frame` that retires it are exactly what P1/P2 remove: the area
+> is meant to stay live across the turn, and the fold — not the frame boundary —
+> is what content writes stop at. The composition above is right; the retirement
+> is not.
+
 `next_input_row` / `clear_rows_to` folded into the apply implementation (P3); their
 meaningful unit tests moved to `ui::frame::apply_tests`, the byte-mechanics ones
 dropped with the helpers.
@@ -327,8 +501,13 @@ Compose `[Divider?, Overlay]` — the divider is a `ConfirmSpec.divider` flag: m
 dialogs (tool approval, compaction review) want a separation from the streamed output
 above them; REPL-context dialogs pass `false` (scrollback already carries a separator
 above the input region). Allocate, render, apply. The entry `cursor_row()` DSR is kept:
-mid-turn the tracked caret does not follow streamed content, so `frame_anchor()` alone
-would point into the stream; after that the dialog anchors via `frame_anchor()`, and if
+it used to be kept because mid-turn the tracked caret did not follow streamed content,
+so `frame_anchor()` alone would point into the stream — that reason is **false** now
+(#10: the streaming writers count from the bytes they emit, checked against a vt100
+replay). It is kept as a cheap confirmation on a path where a wrong anchor strands the
+dialog over the output, and because the confirm suite asserts *behaviour* rather than
+the dialog's row, so "green" is not evidence either way. §4.5 P5 revisits it.
+After the DSR the dialog anchors via `frame_anchor()`, and if
 it does not fit below, `delta` scrolls it into the live region. Key loop stays; each
 key re-composes (cheap) and re-applies (partial). A resize re-composes at the new size
 (full repaint; the dialog keeps its top).
@@ -426,7 +605,8 @@ the first two were latent bugs that pre-date ui_draw_v2 — both since fixed.
 **Audit 2026-09-28** (after the editor cleanups, with the v2.5 engine now
 driving every `/` command in the REPL): #1–#3 re-verified done, pins still
 green; #5, #7, #9 and #11 audited and then **fixed** the same day (see below).
-#4, #6 and #10 are still open — each carries a re-check with file/line
+#4 is still open; #6 and #10 were on this list and are **done** (see their entries
+below and in §4.2). Each carries a re-check with file/line
 evidence, what a fix involves, and a verdict. #8 stays an accepted limitation.
 A recommended order for what remains is at the end of the section.
 
@@ -517,29 +697,20 @@ A recommended order for what remains is at the end of the section.
    no host re-splits a painted string into a row count that can disagree with
    the screen.
 
-6. **`display_text` line counts can drift.** The count comes from
-   `wrap(text)` while the bytes include the `⏺ ` prefix and
-   `termimad::inline` output — which is the only reason the DoneError path
-   re-anchors (DSR) after `display_text`. Accurate accounting would let that
-   DSR go.
-   **Still open** (audited 2026-09-28), at `output.rs:1558`
-   (`wrap(text, term_width()).len() + …`) with the compensating DSR at
-   `repl.rs:770` (`V25Frame::DoneError` → `display_text` → `cursor_row()`) —
-   so the claim above still holds exactly. Three drift sources, not one: the
-   2-column `⏺ ` prefix is never counted; `wrap` counts *chars*, while the
-   terminal wraps on *display columns* (CJK/emoji undercount); and
-   `termimad::inline` rewrites the text (markers out, styling in) before it
-   reaches the terminal. Fix: measure what was written — render the message
-   into a local `String` first (`⏺ ` + `termimad::inline(text)`), derive the
-   row count from *that* buffer with the display-width helper already in the
-   tree (`strip_ansi` + `display_width`, as `display_plain` uses) at
-   `term_width() - 2`, then write it. Deletes the DSR. Pin with a
-   width-boundary case (a message of exactly `term_width - 2` columns must
-   count 1 row) and a wide-char case.
-   **Verdict: worth doing** — small, local, and it removes a DSR round trip
-   from a real (if rare) path.
-
-### Known limitations
+6. **`display_text` line counts can drift.** *Substantially fixed; the
+   compensating DSR remains.* The count used to come from
+   `wrap(text)` while the bytes include the `⏺ ` prefix and `termimad::inline`
+   output — three drift sources: the 2-column `⏺ ` prefix never counted, `wrap`
+   counting *chars* where the terminal wraps on *display columns* (CJK/emoji
+   undercount), and `inline` rewriting the text before it reaches the terminal.
+   `display_text` now measures the bytes it emits, through the same
+   `RowCounter` every other content write uses, and
+   `display_text_row_is_measured_not_predicted` pins it against a vt100 replay
+   with a message that exactly fills the width and one a column wider.
+   The DSR after the DoneError `display_text` (`repl.rs` → `display_text` →
+   `cursor_row()`) is still there, but no longer as a correction — it is
+   insurance on an error path, and its comment now says so. §4.5 P5 revisits
+   whether it is still needed once the fold survives the turn.
 
 7. **`paint_plan` under-buffers multi-line plans on large terminals**
    (found while porting the P5 tests; lives in `slashdot_menu`, not the draw
@@ -659,14 +830,18 @@ A recommended order for what remains is at the end of the section.
 All four re-checked 2026-09-28: still deferred, still test-only users, allows
 still targeted (no blanket `allow(dead_code)` came back).
 
-- **`Element::Lines`** — §3.2's fixed-row element carries a targeted
-  `#[allow(dead_code)]`: commit lines go through `display_plain` today (both
-  `emit_commit` and the new `batch_commit`); the §4.5 fixed-bottom/status-line
-  composition is its first production user. Blocked on #10.
+- **`Element::Lines`** — no longer deferred: the prompt-side status bar is its
+  first production user (`compose_frame` puts it in the divider's row, above the
+  input, so the frame's own union clear takes it at submit). The `#[allow(dead_code)]`
+  on the variant can go once the mid-turn bar moves here too — §4.5 P2.
 - **`Frame::spans`** — §4.4's dirty-span refinement; the row diff is
   deliberately the sole reader until profiling asks for more.
-- **`ApplyPolicy::Append`** — built and vt100-tested in P2, no production
-  user yet; reserved for §4.5's chunked writes (no-clear on content chunks).
+- **`ApplyPolicy::Append`** — built and vt100-tested in P2, no production user
+  yet. It is the *commit-line* append today (`plan_append` writes the rows at the
+  anchor and retires the frame), which is not what §4.5 needs: P1 wants the area
+  re-emitted at a new fold after a content chunk. Whether that is the same
+  function with a different clear policy, or a second one, is an open detail of
+  P1.
 - **Per-row backgrounds (`row_bgs`)** — dropped with `overlay_lines` in P5;
   if per-row tinting is ever wanted it belongs in `RenderPlan` (engine
   side), not in the painter.
@@ -686,19 +861,23 @@ still targeted (no blanket `allow(dead_code)` came back).
   and manual testing has since confirmed it.
 - **Streaming still doesn't track rows** (`stream_text`/`stream_thinking`
   bypass `note_lines`), so the cache's `caret` drifts mid-turn. That is why
-  dialogs and `read_input` keep an entry DSR. Anything that wants a
-  mid-turn `frame_anchor()` with no DSR (e.g. a live status line drawn
-  while streaming) needs row accounting in the streaming writers first.
-  *(Now tracked as #10, with a fix sketch.)*
+  dialogs and `read_input` keep an entry DSR. *(Historical: this was #10, and it
+  is **done** — the streaming writers count from the bytes they emit, checked
+  against a vt100 replay by `streamed_answer_is_counted` /
+  `streamed_thinking_is_counted`. The DSRs stayed, for the reasons §4.2 now
+  records. §4.5 is the remaining work, and it was never gated on this.)*
 
 ### Recommended order (audit 2026-09-28)
 
 #5, #7, #9 and #11 are done. What remains, in order:
 
-1. **#6 — `display_text` row accounting.** Small and local; removes a DSR.
-2. **#10 — streaming row accounting.** Only when a feature needs it; it is
-   the gate on §4.5 and on a live status line.
-3. **#4 — explicit confirm subject.** Bundle with any of the above; on its
+1. **§4.5 P1 → P2** — contraction, then the area surviving the turn. This is the
+   live work: it is what in-turn input and in-turn menus are waiting on, and it
+   retires the transient-bar mechanism rather than adding to it.
+   #6 (`display_text` accounting) and #10 (streaming accounting) were both long
+   assumed to be this section's gate. Both are done; what remains is the P4 clear
+   invariant (4.5.5) and the four open questions in 4.5.7.
+2. **#4 — explicit confirm subject.** Bundle with any of the above; on its
    own it only buys a quieter line.
 
 One theme across the fixed ones: every fix moved a piece of knowledge to
