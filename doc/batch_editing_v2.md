@@ -1,6 +1,6 @@
 # Batch Editing v2 — Aider-style text edits
 
-*Status: Phase 1 implemented. Phase 2 gated on observed demand.*
+*Status: Phase 1 implemented. W1 (multi-file path policy) implemented, no caller yet. Phase 2 gated on observed demand.*
 
 ## Motivation
 
@@ -174,14 +174,17 @@ familiarity win with no integrity hazard.
 The rules above are the **single-file** policy and stay exactly as they are.
 A blob that spans files is governed differently, and strictly:
 
-- **`path` is not required.** It is one file; a multi-file blob carries N
-  paths. Requiring a top-level `path` for a call about three files would be
-  asking for a value that cannot be correct.
+- **`path` must not be supplied.** It is one file; a multi-file blob carries N
+  paths, and a top-level `path` cannot be right for all of them. It is also no
+  longer needed — a single value cannot answer an N-file question, so requiring
+  it would be asking for something that cannot be correct. The block form
+  should not carry `path` at all (see *Decisions*); what a single-edit call
+  needs it for is the OpenAI form, which is where it now lives.
 - **Every block must carry its own header.** No defaulting — not to the
   `path` argument, not to the previous block. A block without a header is an
   error naming it.
-- If a `path` argument *is* supplied alongside a multi-file blob, it must
-  agree with every header, under the same `same_path` comparison as above.
+- A `path` argument alongside a multi-file blob is **ignored, not reconciled.**
+  It is not a second source of truth to be checked against N headers.
 
 Why no defaulting, which is stricter than the single-file rule: the
 single-file fallback is safe because there is only one candidate — `path` can
@@ -243,6 +246,9 @@ pub struct ParsedEdit {
     pub new_text: String,
     pub start_line: Option<u64>,  // from a `path:LINE` header
     pub header: Option<String>,   // this block's own file, if it named one
+    /// The line above `@@@OLD` that was *not* taken as a header, when there
+    /// was one. Lets the multi-file error quote back what the model wrote.
+    pub rejected_header: Option<String>,
 }
 pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError>;
 ```
@@ -827,12 +833,10 @@ Everything new lives in `blockedit` (pure, testable, shared with `bsed`); the
 ```rust
 // blob.rs — the path policy for splitting
 /// Split a parsed blob into per-file batches under the *multi-file* path
-/// policy: `json_path` is optional, and **every** block must carry its own
-/// header — there is no defaulting. A `json_path` that is present must agree
-/// with every header. A single-file blob is not this function's business; it
-/// still goes through `merge_path`.
-pub fn split_by_file(json_path: Option<&str>, parsed: ParsedBlocks)
-    -> Result<Vec<FileBatch>, String>;
+/// policy: **every** block must carry its own header — there is no
+/// defaulting, and no `path` argument is consulted at all. A single-file blob
+/// is not this function's business; it still goes through `merge_path`.
+pub fn split_by_file(parsed: ParsedBlocks) -> Result<Vec<FileBatch>, String>;
 
 /// `{"path": p, "edits": [{oldText, newText}, …]}` for one file — the exact
 /// value that must land on disk. Anchors are dropped (transient).
@@ -915,17 +919,16 @@ on repeated turns.
 
 Each is independently shippable and independently revertible.
 
-**W1 — the path policy (`blockedit/src/blob.rs`).** Add `split_by_file`
-alongside `group_by_file` and leave `group_by_file` alone: `bsed apply -i`
+**W1 — the path policy (`blockedit/src/blob.rs`). — DONE.** `split_by_file` is
+implemented alongside `group_by_file`, which is left alone: `bsed apply -i`
 already ships against it, and re-basing it on a different policy would change a
 released binary's behaviour for no gain. `split_by_file`, in order:
 
 1. **every** block must have a header — no defaulting to the `path` argument
    and no reuse-last. A block without one is an error naming its index, not a
    block silently attributed to whatever came before;
-2. if a `path` argument is present, it must `same_path` **every** header (the
-   existing `resolve_normalized` comparison, so `./a.rs` and `a.rs` agree); a
-   disagreement is an error, never a silent re-target;
+2. **the `path` argument is not consulted at all** — see *Decisions* below. The
+   headers are authoritative;
 3. group by the **normalized** path in first-seen order, returning
    `FileBatch.path` as first-spelled so the model still sees its own spelling;
 4. reject the whole call if the group count exceeds `MAX_FILES_PER_CALL` — after
@@ -937,26 +940,42 @@ close. The single-file blob still goes through `merge_path` and still defaults
 freely — there is only one candidate, so a default cannot be wrong.
 
 *Do not cite `group_by_file`'s own comment as precedent.* The comment at
-`crates/bsed/src/cli.rs:500` says a file named on the command line wins and
-headers are the fallback, and calls that "the same precedence as the `edit`
-tool's `path` argument" — both halves are wrong today: `group_by_file` does
+`crates/bsed/src/cli.rs:500` said a file named on the command line wins and
+headers are the fallback, and called that "the same precedence as the `edit`
+tool's `path` argument" — both halves were wrong: `group_by_file` does
 `edit.header.or(fallback)`, so the **header** wins, and the `edit` tool has no
-precedence at all, it has `merge_path`'s strict-on-conflict. Fixing that comment
-is a one-line drive-by in W1; `split_by_file` implements neither precedence, and
-that is the point.
+precedence at all. **That comment is fixed** as the W1 drive-by, and now names
+`split_by_file`'s no-fallback rule so the two cannot be conflated again.
 
 *Invariants:*
-- a blob that `merge_path` rejects today is still rejected — `path: "b.rs"` plus
-  a header `a.rs` plus one header-less block errors; it does not become two files;
-- the header-less block is rejected *even when the `path` argument would have
-  named it* — that is the no-defaulting rule, and it is the case `group_by_file`
-  gets wrong;
+- a header-less block is rejected, and never becomes a second file — the exact
+  blob `group_by_file` turns into two batches;
 - `./a.rs` and `a.rs` are **one** batch, not two;
-- a header-less blob that is not multi-file is untouched — `merge_path` owns it.
+- the batch path is the **first spelling**, not the normalized one;
+- a header-less blob that is not multi-file is untouched — `merge_path` owns it;
+- the cap counts **files**, not blocks: many blocks for one file is not a
+  fan-out and is not capped.
 
-*Tests:* each of the four rules; all three hazards above as named regressions;
-first-seen ordering; exactly 32 files ok / 33 rejected; `path` absent with every
-header present is accepted.
+*Tests:* the four rules; the `group_by_file` hazard as a named regression;
+first-seen ordering; exactly 32 files ok / 33 rejected; the cap counting files
+not blocks; `merge_path`'s own behaviour untouched.
+
+*Two fixes found while implementing, both pre-existing:*
+- **`group_by_file` named the wrong block.** Its error used
+  `order.len() + 1` — the *group* count, not the block index — so three blocks
+  naming `a.rs` followed by a header-less block reported "block 2" for block 4,
+  pointing the model at a block that was fine. Now enumerated; pinned by
+  `the_error_names_the_offending_block_not_the_group_count`.
+- **A header-less block could not say *why*.** `header_candidate` requires a
+  whitespace-free token, so a real filename containing a space (`my notes.rs`)
+  silently produced a header-less block — and with `path` no longer consulted
+  there was no way out but a message telling the model to add the line it had
+  already added. `ParsedEdit` now carries `rejected_header` (the line above
+  `@@@OLD` that was not taken as a header, when there was one) and the error
+  quotes it back, splitting the two causes: a multi-word line is reported as
+  possibly-a-spaced-path and routed to the single-edit form, a single token as
+  a wrong path. This is the P1 lesson applied one level down — name the
+  malformation rather than report an absence.
 
 **W2 — the tool's Args (`blockedit/src/wire.rs`).** `EditArgs { files }`.
 `from_wire` routes the block-string shape through `split_by_file`, and wraps the
@@ -1064,12 +1083,20 @@ added on top; if the model-facing split turns out to confuse models, the
 deterministic rejoin is a small change *inside the same function* rather than an
 undo.
 
-**W5 and W6 have already landed**, ahead of the gate and independently of it —
-they came in with the `blocks` rename, which touched the same two call sites
-the split needs. So the remaining work is W1–W4 and W7–W8, and the only item
-still open in W5 is the *wording* of `BLOCK_POLICY` once multi-file ships. The
-rename itself is already deployed and ungated, because it removes a wire shape
-rather than adding one.
+**W1, W5 and W6 have already landed.** W5 and W6 came in with the `blocks`
+rename, which touched the same two call sites the split needs. W1 landed next, as
+a pure path policy with no caller: `split_by_file` is implemented and tested, but
+nothing routes to it yet — `from_wire` still goes through `merge_path` and still
+rejects a multi-file blob. So multi-file editing is **not** available to a model
+at this commit; W2 is what makes it so, and the remaining work is W2–W4 and
+W7–W8. The only item still open in W5 is the *wording* of `BLOCK_POLICY` once
+multi-file ships. The rename itself is already deployed and ungated, because it
+removes a wire shape rather than adding one.
+
+W1 landing first is deliberate: it is pure, it touches no wire shape, and it puts
+the strict policy — plus the two error messages — under test before anything can
+call them. It is also revertible on its own, which matters more than usual here
+because it is the piece that could silently re-target a file if it were wrong.
 
 ### Risks
 
@@ -1090,17 +1117,18 @@ rather than adding one.
   defaulted). Aider reuses, and `group_by_file` implements reuse-last — but
   reuse-last is only safe while there is one candidate file, and a multi-file
   blob is exactly the case where there are not. Every block carries its own
-  header; `path` is optional and must agree with all of them. See *Path handling
-  (multi-file, Phase 2)*. The prose-line hazard is separately covered, because
-  `header_candidate` only accepts a whitespace-free token.
+  header, and `path` is **not consulted at all** (see *Decisions*). See *Path
+  handling (multi-file, Phase 2)*. The prose-line hazard is separately covered,
+  because `header_candidate` only accepts a whitespace-free token — and is now
+  *diagnosed* rather than merely avoided, via `ParsedEdit.rejected_header`.
 - ~~Cross-file atomicity~~ → resolve-all, write-what-resolved.
 - ~~Migrate persisted sessions~~ → **no migration**: the canonical form does not
   change, and every form the parser produces already has a legacy reader
   (`canonicalize_edit_value`, `EditArgs::from_wire`).
-- **Open, confirm before W1**: `MAX_FILES_PER_CALL = 32`. Proposed because a
-  cross-file refactor fits comfortably under it and the work is bounded; the
-  single-file form caps blocks not at all, so there is no existing precedent to
-  copy.
+- ~~`MAX_FILES_PER_CALL`~~ → **32, shipped in W1**. A cross-file refactor fits
+  comfortably under it and the work is bounded; the single-file form caps blocks
+  not at all, so there was no existing precedent to copy. The cap counts
+  *files*, not blocks.
 - **Open, decide at W7**: N blobs or one rejoined blob in model history. The
   split ships N; the rejoin is the follow-up if measurement says otherwise.
 
@@ -1126,6 +1154,18 @@ rather than adding one.
 - **Multi-file paths**: every block names its own file; **no defaulting** to
   `path` or to the previous block. A single-file blob still defaults freely,
   because there is only one candidate and a default cannot be wrong.
+- **`path` in the block form**: MUST NOT be supplied when the blob spans files,
+  and SHOULD NOT be supplied for block editing at all — **block paths are
+  authoritative**, so `split_by_file` never reads the argument. `path` is the
+  OpenAI single-edit form's file argument and nothing else. This *strikes* the
+  earlier plan to require a `path` argument to `same_path`-agree with every
+  header: a blob that already names its files has answered the question, and a
+  redundant argument reconciled against N headers is a second source of truth
+  that can only ever conflict. There is no defaulting *and* no reconciliation,
+  so nothing in this path can be silently re-targeted.
+- **Line numbers**: strongly encouraged on every block (`path:LINE`). They are
+  the matching aid for repeated text, and free to supply when the model has just
+  read or grepped the file.
 - **Blob rendering**: the path appears once, as a header line above the first
   block, with no `:LINE` suffix. For a single-file blob the text path may be
   omitted entirely (the `path` argument then supplies it); for a **multi-file**
@@ -1144,7 +1184,35 @@ rather than adding one.
   syntax by example — a picocode-authored, deterministic string, never a rewrite
   of the model's own args.
 
-## Implementation status (Phase 1 — done)
+## Implementation status (W1 — the multi-file path policy — done)
+
+- `blockedit::blob::split_by_file`: the four rules below, no caller yet.
+  `MAX_FILES_PER_CALL = 32`; grouping is keyed on the normalized path while
+  `FileBatch.path` keeps the first spelling. `group_by_file` is untouched apart
+  from the block-index fix, and `bsed` is unaffected.
+- **Every block names its own file.** No defaulting to the `path` argument and
+  no reuse-last. `split_by_file` takes no `path` at all, so there is no code
+  path by which a redundant argument could re-target a file. The
+  agreement-with-every-header rule from the original plan is **struck**: block
+  paths are authoritative and `path` is not reconciled against them.
+- **The missing-file error names the block, quotes back what was written, and
+  never offers `path`.** A bare "names no file" would tell the model to add a
+  line it may already have added, so `ParsedEdit.rejected_header` carries the
+  line that was *not* taken as a header. The two causes are distinguished: a
+  multi-word line is reported as possibly-a-spaced-path (unaddressable by a
+  header) and routed to the single-edit form; a single token is reported as a
+  wrong path. This is the P1 lesson — name the malformation, do not report an
+  absence — applied one level down.
+- **Two pre-existing bugs fixed on the way through**, both now pinned by tests:
+  `group_by_file` reported the *group* count where it meant the block index, and
+  a filename containing a space was silently unrepresentable with no way out.
+- The `bsed` comment drive-by is done: `crates/bsed/src/cli.rs:500` no longer
+  claims its precedence matches the `edit` tool's, and now names
+  `split_by_file`'s no-fallback rule.
+
+**Not available yet.** Nothing routes to `split_by_file`; `from_wire` still
+calls `merge_path`, which still rejects a multi-file blob. W2 is the commit that
+makes multi-file reachable by a model.
 
 - `src/edit_blocks.rs` (new): `parse_blocks`, `merge_path`, `render_blob`,
   `canonicalize_edit_value` (→ array, best-effort), `array_to_blob_value`
@@ -1508,14 +1576,16 @@ corruption is now a loud `overlapping`/`all-claimed` failure).
 ### Suggested order — completed
 
 1. ✅ **3 + 2** (implemented in [`f05d078`](https://github.com/gwicke/picocode/commit/f05d078)) — the skew rule and claim-based resolver are live; 653 tests pass.
-2. **1** — multi-file: gated on the grep over persisted rejections, with the
-   design and the work breakdown done (W1–W8, *Phase 2*). Ship as two commits:
-   1. **W1–W6 (execution)** — accept the blob and apply it per file,
-      resolve-all then write-what-resolved, with a conflict-checking
-      `split_by_file` (raw `group_by_file` would turn today's loud
-      `path mismatch` into a silent wrong-file write). Self-contained; reverted
-      by one guard in `from_wire`. W5 and W6 are display/copy fixes that stand
-      alone and should land early.
+2. **1** — multi-file: the gate is still unmeasured (no session corpus was
+   reachable to run the grep), with the design and the work breakdown done
+   (W1–W8, *Phase 2*). **W1 has landed** — the strict `split_by_file` path
+   policy, plus the `group_by_file` block-index fix and the `rejected_header`
+   diagnosis, all with no caller yet. What remains ships as two commits:
+   1. **W2–W4 (execution)** — route the block form through `split_by_file`,
+      then apply per file: resolve-all, write-what-resolved, with a per-file
+      failure envelope. W1 is the policy half and is already in; W2–W4 are the
+      half that makes a model able to reach it. Self-contained; reverted by one
+      guard in `from_wire`.
    2. **W7–W8 (storage + model-facing)** — one split transform at *both*
       egresses that see the call: `append_message` (N canonical single-path
       calls on disk, so pi can read the file, which also repairs compaction's
