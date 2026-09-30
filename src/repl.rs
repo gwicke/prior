@@ -539,6 +539,46 @@ impl Element {
         let might = layout.row_count.max(1);
         Element::new(1, might, InputItem { layout, prompt })
     }
+
+    /// An input that occupies **no rows at all** — the mid-turn case.
+    ///
+    /// An input row with nothing in it reads as "type here", and while a turn is
+    /// running there is nothing to submit, so the row is a claim the screen
+    /// cannot back up. Between turns it is the opposite: it is what tells the
+    /// reader where input goes, so [`Self::input`] keeps it. The REPL is live
+    /// either way (OQ2) — the frame is composed and applied on every keystroke;
+    /// it simply has no row to draw until something is typed.
+    ///
+    /// `must == might == 0`, so the allocator serves it nothing and
+    /// `InputItem::render_at(0, _)` returns the empty `Rendered`. The choice is
+    /// made here rather than inferred inside the element, because "is a turn
+    /// running" is the output's fact (`streaming`), not the frame layer's.
+    pub(crate) fn input_hidden(layout: Layout, prompt: String) -> Self {
+        Element::new(0, 0, InputItem { layout, prompt })
+    }
+}
+
+/// The input element for one compose, and the R1 rule in one place.
+///
+/// Mid-turn an empty input is **no row at all**; between turns it is the resting
+/// row that says where to type; anything typed is an ordinary input either way.
+/// [`Element::input_hidden`] has the reasoning.
+///
+/// Shared by the REPL's redraw and the test harness rather than written twice —
+/// a copy would drift, and then the tests would pin a rule that production does
+/// not follow.
+pub(crate) fn input_element(
+    editor: &LineEditor,
+    prompt: &str,
+    streaming: bool,
+    term_w: usize,
+) -> Element {
+    let layout = editor.layout(term_w, prompt);
+    if streaming && editor.text().is_empty() {
+        Element::input_hidden(layout, prompt.to_string())
+    } else {
+        Element::input(layout, prompt.to_string())
+    }
 }
 
 /// Editor content: the prompt on row 0, the wrapped buffer below it.
@@ -745,8 +785,7 @@ impl Repl {
                 // `status_text` and `streaming`, which are this output's facts and not
                 // something this module may reason about — and so is the divider that
                 // separates the menu from the input above it (ui_draw_v2 §5.1.1).
-                let layout = editor.layout(dims.0, prompt);
-                let input = Element::input(layout, prompt.to_string());
+                let input = input_element(editor, prompt, output.is_streaming(), dims.0);
                 let overlay =
                     (!overlay.is_empty()).then(|| Element::overlay(overlay.to_vec(), focus));
                 // Composition *and* division are the tail's now: pieces move in
@@ -2426,8 +2465,7 @@ mod tests {
         out: &crate::output::ConsoleOutput,
     ) -> impl Fn(&LineEditor, &[String], usize, (usize, usize)) + '_ {
         move |editor: &LineEditor, overlay: &[String], sel: usize, dims: (usize, usize)| {
-            let layout = editor.layout(dims.0, "> ");
-            let input = Element::input(layout, "> ".to_string());
+            let input = input_element(editor, "> ", out.is_streaming(), dims.0);
             let ov = (!overlay.is_empty()).then(|| Element::overlay(overlay.to_vec(), sel));
             out.draw_elements(Some(input), ov, ApplyPolicy::Frame, dims);
         }
@@ -4126,5 +4164,58 @@ mod tests {
         let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 0, 20);
         assert_eq!(c, 20, "must use full budget");
         assert_eq!(s, 0, "starts at 0");
+    }
+
+    /// **R1: the input is a row between turns and no row at all mid-turn.**
+    ///
+    /// The contract has three cases, and the third is the one that keeps it from
+    /// being "never draw the input": between turns an empty buffer still shows
+    /// its row, because that row is what tells the reader where to type.
+    ///
+    /// Asserted through [`input_element`] rather than through a composed frame,
+    /// because this is a property of the element's `(must, might)` and a test
+    /// that replayed bytes to find it would pass just as well with the frame
+    /// layer accidentally padding the gap back in.
+    #[test]
+    fn an_empty_input_is_a_row_between_turns_and_none_mid_turn() {
+        let empty = LineEditor::new();
+
+        // Between turns: the resting row, `must == 1`.
+        let e = input_element(&empty, "> ", false, 60);
+        assert_eq!(
+            (e.must, e.might),
+            (1, 1),
+            "an idle REPL keeps its prompt row — it is where input goes"
+        );
+
+        // Mid-turn, still empty: nothing to submit, so no row and no claim.
+        let e = input_element(&empty, "> ", true, 60);
+        assert_eq!(
+            (e.must, e.might),
+            (0, 0),
+            "an empty input mid-turn is not a row"
+        );
+
+        // Mid-turn with something typed: an ordinary input again, and `must` is
+        // the caret's row so it can never be squeezed away entirely.
+        let mut typed = LineEditor::new();
+        typed.set("hello");
+        let e = input_element(&typed, "> ", true, 60);
+        assert_eq!(
+            (e.must, e.might),
+            (1, 1),
+            "typed input is drawn mid-turn: the row appears on the first keystroke"
+        );
+
+        // And through the real pipeline, a zero-row element really yields a zero-row
+        // frame — otherwise `must == might == 0` would only be a claim.
+        use crate::ui::frame::{allocate, live_budget, render};
+        let height = |streaming: bool| {
+            let e = input_element(&empty, "> ", streaming, 60);
+            let heights = allocate(&[e.extent()], live_budget(24));
+            render(&[e], &heights, 60).height()
+        };
+        assert_eq!(height(true), 0, "a hidden input paints no row at all");
+        assert_eq!(height(false), 1, "a resting input paints its row");
     }
 }

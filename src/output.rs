@@ -147,6 +147,20 @@ pub trait Output: Send + Sync {
     ///
     /// Default no-op: outputs with no cursor to write at have no status line.
     fn set_status(&self, _text: &StatusText) {}
+
+    /// Is a turn running right now?
+    ///
+    /// The composer needs this to decide whether an empty input is a row (the
+    /// resting prompt, between turns) or no row at all (mid-turn, where there is
+    /// nothing to submit). `streaming` is already this output's fact — the
+    /// status row's dot is resolved from the same flag — so the phase is read
+    /// here rather than plumbed in from the caller.
+    ///
+    /// Default `false`: an output with no streaming phase has only the resting
+    /// case, and so always shows its input row.
+    fn is_streaming(&self) -> bool {
+        false
+    }
     fn display_header(
         &self,
         provider: &str,
@@ -2958,6 +2972,10 @@ impl Output for ConsoleOutput {
     /// whether it actually goes out.
     fn set_status(&self, text: &StatusText) {
         *self.status_text.lock().unwrap() = text.clone();
+    }
+
+    fn is_streaming(&self) -> bool {
+        self.streaming.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn end_capture(&self) -> Vec<u8> {
