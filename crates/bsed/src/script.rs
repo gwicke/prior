@@ -368,14 +368,13 @@ fn render_command_inner(cmd: &Command, out: &mut String) {
 /// The rendered form is re-parsed before it reaches the engine, so a newline
 /// inside the text has to be written as a backslash continuation: a bare one
 /// would read as the end of the text argument and silently drop the line.
+///
+/// Leading whitespace needs no help: after the backslash that introduces the
+/// text it is content, and the parser keeps it. (Before the `sed-rs` fix in the
+/// workspace patch, the parser ate one space or tab here and the text had to be
+/// padded to survive the round trip.)
 fn render_text_command(cmd: char, text: &str) -> String {
-    let mut body = expand_text_escapes(text).replace('\n', "\\\n");
-    // `sed-rs` skips exactly one space or tab between the backslash and the text,
-    // so text that *begins* with one would come back with it missing. Spend a
-    // space of our own on that skip to keep the caller's leading whitespace.
-    if body.starts_with(' ') || body.starts_with('\t') {
-        body.insert(0, ' ');
-    }
+    let body = expand_text_escapes(text).replace('\n', "\\\n");
     format!("{cmd}\\{body}")
 }
 
@@ -395,13 +394,6 @@ fn render_text_command(cmd: char, text: &str) -> String {
 /// Note this is *not* how `s///` replacements work: those go through the engine,
 /// which decodes them itself. Only the text commands are copied verbatim, so only
 /// they need rewriting here.
-///
-/// Known gap, predating this: `sed-rs` drops one space or tab between the `a`/`i`/
-/// `c` and its text while parsing, where GNU keeps it. So `2a\ indented` previews
-/// as `indented`. Recovering it would mean re-reading the raw expression text
-/// rather than trusting the parsed text, which is a larger change than this
-/// rewrite; leading whitespace is far better signalled with `\t` or `\x20`,
-/// which round-trip correctly.
 fn expand_text_escapes(text: &str) -> String {
     if !text.contains('\\') {
         return text.to_string();
@@ -906,13 +898,13 @@ mod text_escape_tests {
         assert_eq!(render_text_command('a', "one\ntwo"), "a\\one\\\ntwo");
     }
 
-    /// `sed-rs` eats one space or tab after the backslash, so leading
-    /// whitespace needs a sacrificial space in front of it.
+    /// Leading whitespace is content after the backslash that introduces the
+    /// text, so it must be emitted as written -- no padding, no trimming.
     #[test]
-    fn leading_whitespace_is_protected_from_the_reparse() {
-        assert_eq!(render_text_command('a', " lead"), "a\\  lead");
-        assert_eq!(render_text_command('a', "\tlead"), "a\\ \tlead");
-        // ...but only when there is some.
+    fn leading_whitespace_survives_the_reparse() {
+        assert_eq!(render_text_command('a', " lead"), "a\\ lead");
+        assert_eq!(render_text_command('a', "   deep"), "a\\   deep");
+        assert_eq!(render_text_command('a', "\tlead"), "a\\\tlead");
         assert_eq!(render_text_command('a', "lead"), "a\\lead");
     }
 }

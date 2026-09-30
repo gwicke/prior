@@ -88,6 +88,9 @@ pub struct Hunks {
 pub fn build(old: &str, new: &str, ctx: Context) -> Hunks {
     let old_lines: Vec<&str> = old.lines().collect();
     let new_lines: Vec<&str> = new.lines().collect();
+    // Whether the original terminates its last line. A block that deletes the
+    // last line has to carry that terminator into its own text — see below.
+    let old_ends_nl = old.ends_with('\n');
 
     // 1. Raw hunks, in file order, with **no** context baked in.
     //
@@ -178,8 +181,28 @@ pub fn build(old: &str, new: &str, ctx: Context) -> Hunks {
             }
         }
 
-        let old_text = join(&old_lines, old_start, old_end);
+        let mut old_text = join(&old_lines, old_start, old_end);
         let new_text = join(&new_lines, new_start, new_end);
+        // A block that deletes the last line has to take the terminator with it.
+        //
+        // Everywhere else the newline that ends a block's last line is left in
+        // the text, outside the replaced span, and does the job: a non-empty new
+        // side is terminated by it, and a block that stops short of EOF is
+        // followed by it. But a block whose new side is empty has nothing to be
+        // terminated, so at EOF the only terminator is the file's own — and if it
+        // is not part of the replaced span it survives as a blank line.
+        //
+        // So `$d` on "a\nb\nc\n" replaced "c" with "" and left "a\nb\n\n" behind:
+        // the block applied cleanly and still produced a file GNU would not have
+        // written. Carrying the terminator in the old text removes the line.
+        //
+        // The `new_end == new_start` guard is what keeps this narrow. A
+        // replacement of the last line, old "d" new "D", is already correct
+        // without it — the leftover newline terminates the "D" — so those blocks
+        // keep the shape they have always had.
+        if new_end == new_start && old_end == old_lines.len() && old_ends_nl {
+            old_text.push('\n');
+        }
         // Only report a mid-construct block when *the change itself* is
         // unbalanced — i.e. growth ran and could not reach the closer (capped,
         // or blocked by the next hunk). A block that merely ends inside a brace
@@ -207,7 +230,19 @@ fn changed(g: &[similar::DiffOp]) -> impl Iterator<Item = &similar::DiffOp> {
 
 /// `similar` groups, reduced to the line spans we need.
 fn grouped(old: &str, new: &str, leading: usize) -> Vec<Raw> {
-    let diff = TextDiff::from_lines(old, new);
+    // Diff the line slices rather than the text, so the indices below are
+    // indices into *these* lines. `TextDiff::from_lines` tokenises with its own
+    // rule, and the two do not agree: it breaks a line at a bare `\r`, while
+    // `str::lines()` — which produced the arrays every span here is used to
+    // index — breaks only at `\n`. So a carriage return in the middle of a line
+    // (what `s/x/CR\0a/` leaves behind) made it count more lines than there are
+    // and hand back a `new_range` past the end of the text. The block then
+    // covered one line of OLD against two of NEW, and applying it duplicated a
+    // line. Passing the slices makes the diff and the spans agree by
+    // construction.
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let diff = TextDiff::from_slices(&old_lines, &new_lines);
     diff.grouped_ops(leading)
         .iter()
         .filter_map(|g| {
@@ -298,6 +333,56 @@ mod tests {
         let h = build(FILE, &new, ctx0());
         assert_eq!(h.blocks.len(), 1);
         assert_eq!(h.blocks[0].old_text, "    // trailing");
+        assert_eq!(h.blocks[0].new_text, "");
+    }
+
+    /// Deleting the last line has to take the terminator with it, or the block
+    /// leaves a blank line where the line used to be. The block still *applies*,
+    /// so nothing complains — the file is just quietly not what sed wrote.
+    #[test]
+    fn deleting_the_last_line_carries_the_terminator() {
+        let before = "a\nb\nc\n";
+        let after = "a\nb\n";
+        let h = build(before, after, ctx0());
+        assert_eq!(h.blocks.len(), 1);
+        assert_eq!(h.blocks[0].old_text, "c\n");
+        assert_eq!(h.blocks[0].new_text, "");
+        // The point of the block: replacing its span reproduces the sed output.
+        let applied = before.replacen(&h.blocks[0].old_text, &h.blocks[0].new_text, 1);
+        assert_eq!(applied, after);
+    }
+
+    /// A file that does not end in a newline has no terminator to carry, so
+    /// nothing is added to the block's old text.
+    ///
+    /// Only that is asserted, not where the span starts. Which lines the diff
+    /// chooses to pair up here depends on how the diff is tokenized, and pinning
+    /// it would test the tokenizer rather than this rule.
+    #[test]
+    fn deleting_an_unterminated_last_line_adds_nothing() {
+        let h = build("a\nb\nc", "a\nb\n", ctx0());
+        assert!(!h.blocks[0].old_text.ends_with('\n'), "{:?}", h.blocks[0]);
+        assert!(h.blocks[0].old_text.contains('c'), "{:?}", h.blocks[0]);
+        assert_eq!(h.blocks[0].new_text, "");
+    }
+
+    /// Replacing the last line is already correct without a terminator: the
+    /// newline after the old line stays in the text and terminates the new one.
+    /// These blocks must keep that shape.
+    #[test]
+    fn replacing_the_last_line_is_unchanged_by_the_fix() {
+        let h = build("a\nb\nc\n", "a\nb\nC\n", ctx0());
+        assert_eq!(h.blocks[0].old_text, "c");
+        assert_eq!(h.blocks[0].new_text, "C");
+    }
+
+    /// A block that stops short of EOF never needs the terminator, because the
+    /// newline that ends its last line is still in the text after it.
+    #[test]
+    fn an_interior_deletion_keeps_its_shape() {
+        let h = build("a\nb\nc\n", "a\nc\n", ctx0());
+        assert_eq!(h.blocks.len(), 1);
+        assert_eq!(h.blocks[0].old_text, "b");
         assert_eq!(h.blocks[0].new_text, "");
     }
 
@@ -489,6 +574,45 @@ mod tests {
     fn identical_text_yields_no_blocks() {
         let h = build(FILE, FILE, ctx0());
         assert!(h.blocks.is_empty());
+    }
+
+    /// A carriage return in the middle of a line is one line to `str::lines()`
+    /// and two to `similar`, so the diff used to report a span that reached past
+    /// the end of the text. The block then covered one line of OLD against two
+    /// of NEW, which applied cleanly and duplicated a line.
+    #[test]
+    fn carriage_return_inside_a_line_does_not_misalign() {
+        let before = "l1\nrun\nl3\nrun\nl5\n";
+        let after = "l1\nrun\nCR\rl3\nrun\nl5\n";
+        let h = build(before, after, ctx0());
+        assert_eq!(h.blocks.len(), 1, "{:?}", h.blocks);
+        // One line in, one line out: the spans have to agree in length.
+        assert_eq!(h.blocks[0].old_text, "l3");
+        assert_eq!(h.blocks[0].new_text, "CR\rl3");
+        let applied = before.replacen(&h.blocks[0].old_text, &h.blocks[0].new_text, 1);
+        assert_eq!(applied, after);
+    }
+
+    /// The same miscount reached further than one block: with trailing context
+    /// the OLD side lost it, so the context lines were dropped from the applied
+    /// result even though they are in the file.
+    #[test]
+    fn carriage_return_keeps_the_trailing_context() {
+        let before = "l1\nrun\nl3\nrun\nl5\n";
+        let after = "l1\nrun\nCR\rl3\nrun\nl5\n";
+        let h = build(
+            before,
+            after,
+            Context {
+                leading: 0,
+                trailing: 2,
+                grow: false,
+                growth_cap: 20,
+            },
+        );
+        let b = &h.blocks[0];
+        assert_eq!(b.old_text, "l3\nrun\nl5", "{b:?}");
+        assert_eq!(b.new_text, "CR\rl3\nrun\nl5", "{b:?}");
     }
 
     #[test]

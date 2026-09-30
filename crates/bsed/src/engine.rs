@@ -49,6 +49,13 @@ pub fn run(
     }
     // `sed-rs` terminates the last line unconditionally. Put back what the file
     // actually had, so "no change" stays "no change".
+    //
+    // Known divergence, predating this: GNU re-terminates when the input's last
+    // line stops being the output's last one -- deleted by `$d`, or pushed up by
+    // `$a`. This cannot tell those apart from a rewrite of that line, which GNU
+    // leaves unterminated, so it keeps the file's own style in all of them. The
+    // error is one trailing newline on a file that had none, and it errs toward
+    // leaving the file as the author wrote it.
     if !input.ends_with('\n') && out.ends_with('\n') {
         out.pop();
     }
