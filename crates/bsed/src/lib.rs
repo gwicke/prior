@@ -428,6 +428,12 @@ mod tests {
             r"7,8c\    deep",
             // ...and the backslash-less form is the opposite: the run separates.
             r"2a    shallow",
+            // A carriage return inside a line, from the replacement. The diff
+            // counted it as a line break that the spans did not, so the block
+            // covered one line of OLD against two of NEW and applying it
+            // duplicated a line. A CR on its own is a line ending and worked.
+            r"3s/let y = 2;/CR\rlet y = 2;/",
+            r"5s/run/\r/",
         ];
         for script in cases {
             // GNU sed is the reference; skip the case if it is not GNU or the
