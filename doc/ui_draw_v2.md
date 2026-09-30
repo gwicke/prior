@@ -71,8 +71,10 @@ apply(f, anchor, pol) → escapes → stdout, update cache    [impure]
 struct Extent { must: usize, might: usize }
 
 enum Element {
-    /// Prompt + editor content. `must` = 1 (or min visible), `might` = layout height.
-    Input { layout: Layout, prompt: String, caret: (usize, usize) },
+    /// Prompt + editor content. `must` = 1 (or min visible), `might` = layout
+    /// height. The caret is *derived*, not stored: `layout.cursor_row` /
+    /// `layout.cursor_col`.
+    Input { layout: Layout, prompt: String },
     /// Dim horizontal rule. must == might == 1.
     Divider,
     /// Pre-painted overlay rows (from `paint_overlay`), focus row for windowing.
@@ -86,6 +88,132 @@ enum Element {
 it would take with unlimited space. Allocation gives each element `must`, then distributes
 surplus up to `might` (same shape as the existing `compute_space_budget`, generalized from
 2 to N elements).
+
+#### 3.2.1 How the two passes decide
+
+`allocate` is one early return and two rounds:
+
+```
+if sum(might) <= budget { return might }          // no pressure: everyone is served
+fill(heights, musts, budget)                      // pass 1: floors
+fill(heights, mights, budget − granted)           // pass 2: surplus toward wants
+```
+
+`fill` distributes the pool in **even shares per round**, with unused shares falling back
+into the pool for the next round, and hands out one row each in element order when the
+pool is smaller than the number of claimants.
+
+Two consequences worth writing down rather than re-deriving:
+
+- **There is no priority.** Nothing declares "the menu yields to the input": under
+  pressure they compete on even shares, and the only ordering anywhere is that
+  `share == 0` tie-break. It works out today because the overlay's `might` (~2/3·term_h)
+  dwarfs the input's (1–3). If deliberate yielding is ever wanted — the input owns the
+  caret — it is not expressible; it would mean lowering another element's `might` first,
+  i.e. a second pass, which is the complexity `window` exists to avoid.
+- **`Lines` never competes.** Its `must == might == rows.len()`, so it is fully served by
+  pass 1 regardless of what else is asking. That is what `must` is *for*, and it is why the
+  status row can be added without the composition having to protect it.
+
+In `src/ui/frame.rs`, production code matches on the variants in exactly **two** places —
+`extent()` and `render()`. Everything else (`Frame`, `spans`, `allocate`, all of `plan_*`)
+works in rows and byte ranges and is variant-agnostic. (Other modules *construct* variants;
+none pattern-matches one.)
+
+#### 3.2.2 The squeeze policy is in the wrong layer
+
+`render` hardcodes *how an element fits when it is squeezed*:
+
+| element | policy when squeezed | whose knowledge |
+|---|---|---|
+| `Input` | `window(n, cursor_row, h, INPUT_CONTEXT_ROWS = 3)` | the editor's |
+| `Overlay` | `window(n, focus, h, h / 2)` | the menu's |
+| `Divider` | 0 or 1 | neither |
+| `Lines` | `rows.iter().take(h)` | — |
+
+Two findings:
+
+- **`Lines` has no notion of focus.** `take(h)` keeps the *front* and drops the rest, so
+  the row the reader was looking at can be the one cut. It does not bite today — `Lines`'
+  planned users are the status row (one row) and commit lines (append-only), both
+  focus-free — but the variant's doc claims the opposite ("truncated from the top"), so
+  code and doc disagree about *which* end is cut, and about which should be.
+- **`INPUT_CONTEXT_ROWS` and `h / 2` are opinions living in `frame.rs`.** The editor knows
+  it wants three rows of context; the menu knows it wants half its budget above its focus.
+
+The general form: **the enum invites the frame layer to accumulate squeeze knowledge that
+its callers already hold**, and every new element kind adds another arm to a `match` in a
+module that should only know about rows and byte ranges.
+
+#### 3.2.3 The item splits into (data, polymorphic render)
+
+The requirement that constrains any replacement:
+
+> `allocate` needs `must`/`might` for **every** item before it renders **any** of them
+> (§3.1's two passes). So the sizing declaration must be *data* on the item, and only the
+> rendering may be polymorphic.
+
+```rust
+struct Item {
+    must: usize,
+    might: usize,
+    render: Box<dyn RenderAt + Send + Sync>,
+}
+
+/// Height in, rows out. `term_w` is a parameter, not a dependency — §3.1's
+/// "no terminal dependency" still holds.
+trait RenderAt {
+    fn render_at(&self, h: usize, term_w: usize) -> Rendered;
+}
+
+struct Rendered {
+    rows: Vec<String>,
+    /// Frame-relative (row, col), 0-based. Only the input carries one; every
+    /// other item returns `None`.
+    caret: Option<(usize, usize)>,
+}
+```
+
+The caret is why the return type grows: today `render`'s `Input` arm sets `Frame.caret`
+directly. Under polymorphism there is no arm, so each item answers for itself and items
+with no caret return `None`.
+
+Three ways to carry the render half:
+
+| | enum (today) | `Arc<dyn Fn(usize) -> Rendered>` | trait object |
+|---|---|---|---|
+| squeeze policy | in `frame.rs` ✗ | with the owner ✓ | with the owner ✓ |
+| new kind | edit both `match`es | drop in ✓ | drop in ✓ |
+| exhaustiveness | compile error ✓ | none — silent | none — silent |
+| sizing + render kept in step | one `match` | **two independent fields that can disagree** | one `impl` ✓ |
+| storage | `Send` ✓ | needs `'static` + `Send + Sync` | needs `'static` + `Send + Sync` |
+
+On storage: the last two rows are **equal**, and `Box` suffices for either — an item is
+owned by exactly one composition at a time and is only ever moved (§5.1.1). `Arc` would
+be needed only if a composition were shared across owners, which nothing does.
+
+**Chosen: a trait.** It buys everything the closure buys — policy back with its owner, no
+`match` in `frame.rs` — while keeping the sizing and the rendering in one `impl`, so
+`must`/`might` cannot drift from what `render_at` will actually produce. Both require the
+item to own what it captures: `Output: Send + Sync` and `draw: Mutex<DrawCache>` rule out
+any borrow of a caller's editor, which is the same rule the element list already follows
+(the REPL builds a fresh one per keystroke and moves it).
+
+Not urgent. Four kinds cover the whole frame stack (§4.5: status, input, menu, divider)
+and nothing in §4.5 needs a fifth. Do it *with* the status row rather than before it,
+because the status row is the first item whose squeeze policy belongs to someone other
+than `frame.rs`.
+
+#### 3.2.4 What does not change
+
+- **`allocate`** — both passes, even shares, the `musts`-first floor. It never looked at
+  a variant.
+- **`window(n, focus, budget, prefer_context)`** — unchanged; only *whose*
+  `prefer_context` it is changes.
+- **`Frame`, `spans`, and all of `plan_*`** — rows and byte ranges only.
+- **Purity.** `render` is still `(items, heights, term_w) -> Frame` with no terminal
+  dependency; `h` and `term_w` arrive as parameters, exactly as §3.1's `render(alloc)`
+  says.
 
 ### 3.3 Frame
 
@@ -561,14 +689,70 @@ The signature names `Frame`/`ApplyPolicy`, so those types are `pub` and the
 alongside `slashdot_menu`, at which point the surface is public anyway; until
 then it is the only way to keep `Output` (which `AgentConfig` exposes) clean.
 
+#### 5.1.1 One pipeline, one composer
+
+`draw_frame` shares the *apply* half, but the `allocate`+`render` half is duplicated
+today: `Repl::compose_frame` runs it, and so does `ui.rs::confirm`'s frame builder,
+which hand-assembles `[Divider?, Overlay]` and calls `allocate`+`render` itself
+(ui.rs:184). A third is arriving with §4.5 — the content path, re-rendering the area
+per chunk. Two pieces, then: one **tail** that every frame goes through, and one
+**composer** that decides what the area is made of.
+
+```rust
+// The shared tail: items → allocate → render → plan_apply → write. Nothing
+// else runs the pure pipeline, so there is one place where §9 #3's "one
+// source for both phases" has to be true.
+fn draw_elements(&self, items: Vec<Item>, policy: ApplyPolicy, dims: (usize, usize)) -> (usize, usize);
+
+// The one composer for the *area*. Impure: this is the only place allowed to
+// read state the pure phases must not see.
+fn compose_area(&self, input: Option<Item>, overlay: Option<Item>) -> Vec<Item> {
+    let mut items = vec![/* the status row */];   // always
+    items.extend(input);                          // between turns only
+    items.extend(overlay);                        // when a menu is open
+    items
+}
+```
+
+Three call sites, and what each is:
+
+| caller | items | then |
+|---|---|---|
+| `read_input`, per keystroke | `compose_area(Some(input), Some(overlay))` — both **moved** in; the REPL rebuilds them next keystroke, so nothing is preserved by copying | `draw_elements` |
+| `with_content_writer`, per chunk | `compose_area(None, None)` → the status alone | `render` → `plan_reposition` |
+| `ui::confirm` | its own `[Divider?, Overlay]`, **no status** — a dialog is not the area (§5.3) | `draw_elements` |
+
+The dialog keeps its own composition because §5.3 treats it as a separate surface. What it
+gains is that it stops hand-rolling the pipeline; that is a duplicate *decision* (§4.5's
+"one place composes") versus a second *site* running `allocate`+`render`, which is
+duplicated code.
+
+**The status row is `Lines`-shaped, not a new kind**: `status_bar(...)` returns a `String`
+at compose time, so the item is `must = might = 1`. It is resolved here because compose is
+the only phase that may read `status_text` and `streaming` — putting that in `render`
+would break §3.1's purity, which is the trap the `Element::Status` idea fell into.
+
+**The terminal size is one fact, owned by the drawing layer.** Items flow up; the budget
+flows down from `dims`. The REPL keeps reading it for two things that are *not*
+composition — windowing the menu (`paint_overlay`, done before anything crosses, which is
+what keeps bulk data out) and resize detection (`painted_size`). For that second one,
+`draw_elements` still takes `dims` as the REPL's *belief* and returns the size it actually
+painted; today those are the same value passed through, so nothing changes, but a
+mismatch becomes a stale cache rather than something to clamp away.
+
 ### 5.2 REPL (`read_input`)
 
-`redraw` becomes: compose `[Input, Divider, Overlay?]` → allocate → render →
-`out.draw_frame(frame, out.frame_anchor(), ApplyPolicy::Frame)`. The `input_row` local
-and `prev_term_h` `Cell` are retired; `frame_anchor()` replaces `next_input_row`'s
+`redraw` becomes: `out.compose_area(Some(input), overlay)` → `draw_elements(...)` —
+the compose/allocate/render tail is no longer this module's (§5.1.1). The `input_row`
+local and `prev_term_h` `Cell` are retired; `frame_anchor()` replaces `next_input_row`'s
 scroll tracking (the cache holds the post-scroll top). The REPL always applies an
 empty-input frame before returning (as today's submit paths do), so no frame is live
 when content streams under the next turn.
+
+The compose list gains the **status row**, which the REPL no longer builds: `compose_area`
+prepends it, because it reads `status_text` and `streaming`, which only this layer may
+know (§5.1.1). So `redraw` supplies `input`, `divider` and `overlay` and gets back a
+composition whose first item it does not own.
 
 > **Superseded by §4.5.** The empty-input frame and the
 > `plan_clear_live_frame` that retires it are exactly what P1/P2 remove: the area
