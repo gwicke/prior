@@ -963,6 +963,127 @@ fn classify_stream_error(e: &StreamingError) -> crate::PicocodeError {
     classify_completion_error(ce)
 }
 
+/// Reduce a provider's error body to one line a human can act on.
+///
+/// Providers disagree on the envelope, so every shape in the wild is tried in
+/// order of how much it actually says:
+///
+/// - `{"error": {"message": …, "param": …}}` — OpenAI, Anthropic, OpenRouter,
+///   Groq. `param` is appended when present, because for a rejected
+///   `temperature` it is the field name the user needs and nothing else in the
+///   body may repeat it.
+/// - `{"error": "…"}` / `{"message": …}` / `{"detail": …}` — flatter servers,
+///   and FastAPI-shaped validation errors (`detail` is an array there, so its
+///   items are joined).
+/// - a bare non-JSON body, whitespace-collapsed.
+///
+/// Returns `None` when the body is empty, is not text at all, or is pure
+/// structure with no message — better a bare status than `; {}`.
+///
+/// This is the only substitute for information the catalog does not publish.
+/// A model that advertises no default temperature still tells us its real
+/// range here, in the rejection itself, which is why this matters more than
+/// any client-side guess.
+fn provider_error_detail(body: Option<&str>) -> crate::ErrorDetail {
+    const MAX: usize = 300;
+    let Some(raw) = body else {
+        return crate::ErrorDetail(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return crate::ErrorDetail(None);
+    }
+    let text = match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(v) => message_from_json(&v).unwrap_or_default(),
+        Err(_) => trimmed.to_string(),
+    };
+    let one_line = collapse_whitespace(&text);
+    if one_line.is_empty() {
+        return crate::ErrorDetail(None);
+    }
+    let clipped = if one_line.chars().count() > MAX {
+        let head: String = one_line.chars().take(MAX).collect();
+        format!("{head}…")
+    } else {
+        one_line
+    };
+    crate::ErrorDetail(Some(clipped))
+}
+
+/// Pull the human-facing message out of a parsed error body, plus the offending
+/// field when the provider names one.
+fn message_from_json(v: &serde_json::Value) -> Option<String> {
+    // The common case: an `error` that is either a string or an object with a
+    // `message` (and often a `param`/`field` naming the rejected input).
+    let err = v.get("error");
+    let (msg, param) = match err {
+        Some(serde_json::Value::String(s)) => (Some(s.clone()), None),
+        Some(serde_json::Value::Object(o)) => (
+            o.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string),
+            o.get("param")
+                .or_else(|| o.get("field"))
+                .or_else(|| o.get("parameter"))
+                .and_then(|p| p.as_str())
+                .map(str::to_string),
+        ),
+        _ => (None, None),
+    };
+    let msg = msg
+        .or_else(|| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| v.get("detail").map(json_detail_to_string))?;
+    // Only worth naming the field when the message does not already say it.
+    match param {
+        Some(p) if !msg.contains(&p) => Some(format!("{msg} (field: {p})")),
+        _ => Some(msg),
+    }
+}
+
+/// FastAPI-style `detail`, which is either a string or an array of objects with
+/// `msg` and `loc`.
+fn json_detail_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                let msg = item
+                    .get("msg")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("invalid");
+                match item.get("loc").and_then(|l| l.as_array()) {
+                    Some(loc) if !loc.is_empty() => {
+                        let path = loc
+                            .iter()
+                            .filter_map(|p| p.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        if path.is_empty() {
+                            msg.to_string()
+                        } else {
+                            format!("{path}: {msg}")
+                        }
+                    }
+                    _ => msg.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+        other => other.to_string(),
+    }
+}
+
+/// Collapse every run of whitespace to a single space, so a multi-line JSON
+/// string or a wrapped HTML error page still renders as one report line.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Classify a `CompletionError` into a structured `PicocodeError`.
 ///
 /// Exposed for unit tests; `classify_stream_error` is the production
@@ -988,12 +1109,22 @@ pub(crate) fn classify_completion_error(ce: &CompletionError) -> crate::Picocode
                     // OpenRouter and most providers use for rate limits).
                     s.parse::<u64>().ok()
                 });
+            // The body is the provider's own account of what it rejected. rig
+            // keeps it verbatim on the error, so there is no reason to show the
+            // user a status code and nothing else.
+            let detail = provider_error_detail(ce.provider_response_body());
             return match code {
                 401 | 403 => LlmAuth { status: code },
                 402 => LlmBilling { status: code },
                 429 => LlmRateLimited { retry_after_secs },
-                500..=599 => LlmUpstream { status: code },
-                400..=499 => LlmClient { status: code },
+                500..=599 => LlmUpstream {
+                    status: code,
+                    detail,
+                },
+                400..=499 => LlmClient {
+                    status: code,
+                    detail,
+                },
                 // 1xx/3xx are not errors at the transport layer; treat as
                 // generic.
                 _ => Other(ce.to_string()),
@@ -1051,16 +1182,30 @@ fn detect_response_error(msg: &str) -> Option<crate::PicocodeError> {
     // `None`); strip the prefix if present.
     let body = msg.strip_prefix("ProviderResponseError: ").unwrap_or(msg);
     if let Some(code) = extract_openrouter_error_code(body) {
+        // Same body, same detail as the status-based path above: an error
+        // envelope inside a 200 OK response carries the provider's explanation
+        // just as a real 4xx does.
+        let detail = provider_error_detail(Some(body));
         match code {
             429 => {
                 return Some(LlmRateLimited {
                     retry_after_secs: None,
                 })
             }
-            500..=599 => return Some(LlmUpstream { status: code }),
+            500..=599 => {
+                return Some(LlmUpstream {
+                    status: code,
+                    detail,
+                })
+            }
             401 | 403 => return Some(LlmAuth { status: code }),
             402 => return Some(LlmBilling { status: code }),
-            400..=499 => return Some(LlmClient { status: code }),
+            400..=499 => {
+                return Some(LlmClient {
+                    status: code,
+                    detail,
+                })
+            }
             _ => return None,
         }
     }
@@ -5395,14 +5540,27 @@ fn compact_tokens(n: u64) -> String {
     }
 }
 
+/// The `/stat` lines for a session.
+///
+/// `stored` is the model's per-model record and `live` its current params;
+/// both are `None`/empty when unavailable. Together they make this the place
+/// you look when a request is rejected: the provider's error names the limit it
+/// enforced, and these say what was actually sent and what the resolved
+/// context window is — the two facts needed to see why.
 pub fn session_stats_lines(
     provider: &str,
     model: &str,
     usage: SessionUsage,
     session: Option<SessionStatsInfo>,
     context_tokens: u64,
+    stored: Option<&crate::model_settings::ModelSettings>,
+    live: &crate::params::ModelParams,
 ) -> Vec<String> {
-    let entry = model_catalog::lookup(provider, model);
+    // The *resolved* view, not the raw catalog entry: a Ctrl-E'd
+    // `context_length` override is what the app actually enforces, so quoting
+    // OpenRouter's published number here would contradict the `/model` header
+    // on the same fact with nothing to explain the difference.
+    let entry = model_catalog::resolved_entry(&format!("{provider}:{model}"), stored);
     let ctx_len = entry.as_ref().and_then(|e| e.context_length);
 
     let mut lines: Vec<String> = Vec::new();
@@ -5435,6 +5593,23 @@ pub fn session_stats_lines(
 
     // ── model section ───────────────────────────────────────────────────
     lines.push(format!("model: {}:{}", provider, model));
+
+    // What this turn is actually sending. A rejected `temperature` is only
+    // diagnosable with both halves: the provider names the limit, this says
+    // what was sent against it. Absent fields read "provider default" rather
+    // than being omitted, so their absence is itself the information.
+    let num = |v: Option<f64>| match v {
+        Some(n) => crate::v25_number_param::fmt_value(n),
+        None => "provider default".to_string(),
+    };
+    lines.push(format!(
+        "  reasoning: {}   temperature: {}   top_p: {}",
+        live.reasoning
+            .map(|l| l.as_str().to_string())
+            .unwrap_or_else(|| "off".to_string()),
+        num(live.temperature),
+        num(live.top_p),
+    ));
 
     // Context window limit.
     match ctx_len {
@@ -8082,7 +8257,10 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             50
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmUpstream { status: 502 }),
+            super::retry_budget(&PicocodeError::LlmUpstream {
+                status: 502,
+                detail: Default::default(),
+            }),
             50
         );
         assert_eq!(
@@ -8110,7 +8288,10 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             0
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmClient { status: 400 }),
+            super::retry_budget(&PicocodeError::LlmClient {
+                status: 400,
+                detail: Default::default(),
+            }),
             0
         );
         assert_eq!(
@@ -8201,7 +8382,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         ));
         let classified = super::classify_completion_error(&ce);
         match classified {
-            PicocodeError::LlmUpstream { status } => {
+            PicocodeError::LlmUpstream { status, .. } => {
                 assert_eq!(status, 502);
                 assert!(classified.is_auto_retryable());
                 assert_eq!(classified.retry_after_secs(), None);
@@ -8263,7 +8444,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let err = CompletionError::ResponseError(envelope.to_string());
         let classified = super::classify_completion_error(&err);
         match classified {
-            PicocodeError::LlmUpstream { status } => {
+            PicocodeError::LlmUpstream { status, .. } => {
                 assert_eq!(status, 502);
                 assert!(classified.is_auto_retryable());
             }
@@ -8317,7 +8498,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         ));
         let classified = super::classify_completion_error(&ce);
         match classified {
-            PicocodeError::LlmUpstream { status } => {
+            PicocodeError::LlmUpstream { status, .. } => {
                 assert_eq!(status, 502);
                 assert!(classified.is_auto_retryable());
             }
@@ -8758,6 +8939,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             usage,
             Some(info),
             42_000,
+            None,
+            &Default::default(),
         );
 
         // The first three lines are the new "session:" section.
@@ -8800,6 +8983,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             SessionUsage::default(),
             None,
             0,
+            None,
+            &Default::default(),
         );
 
         // Without a repo / session metadata the panel still renders both
@@ -8963,6 +9148,202 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         );
         assert!(plan_rebuild(&applied, &target, None).is_some());
     }
+    // ---- /stat: the resolved view, and what this turn sends ----
+
+    /// A Ctrl-E'd `context_length` is what the app enforces, so `/stat` must
+    /// quote it. Reading the raw catalog here made this contradict the
+    /// `/model` header on the same fact with nothing to explain the difference.
+    #[test]
+    fn stat_quotes_a_stored_context_length_not_the_catalogs() {
+        let override_len = 4_096u64;
+        let stored = crate::model_settings::ModelSettings {
+            context_length: Some(override_len),
+            ..Default::default()
+        };
+        let lines = session_stats_lines(
+            "openrouter",
+            "some/model",
+            SessionUsage::default(),
+            None,
+            0,
+            Some(&stored),
+            &Default::default(),
+        );
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains(&format!("{override_len} tokens")),
+            "the override must win: {joined}"
+        );
+    }
+
+    /// A model the catalog does not cover still has a record, and the record is
+    /// the user's own statement about it. Quoting "unknown" there would make
+    /// every Ctrl-E override on an uncatalogued model invisible.
+    #[test]
+    fn stat_uses_a_stored_record_for_a_model_the_catalog_lacks() {
+        let stored = crate::model_settings::ModelSettings {
+            context_length: Some(8_192),
+            ..Default::default()
+        };
+        let lines = session_stats_lines(
+            "openrouter",
+            "vendor/uncatalogued",
+            SessionUsage::default(),
+            None,
+            0,
+            Some(&stored),
+            &Default::default(),
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("8192 tokens"), "{joined}");
+    }
+
+    /// The diagnostic pairing: when a 400 says `temperature must be <= 1`, the
+    /// only way to act is to see what was sent. Absent fields say "provider
+    /// default" — their absence is the information, so they are not omitted.
+    #[test]
+    fn stat_reports_the_params_this_turn_sends() {
+        let live = crate::params::ModelParams {
+            reasoning: Some(crate::params::ReasoningLevel::High),
+            temperature: Some(1.5),
+            top_p: None,
+        };
+        let lines = session_stats_lines(
+            "anthropic",
+            "claude-sonnet-4",
+            SessionUsage::default(),
+            None,
+            0,
+            None,
+            &live,
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("reasoning: high"), "{joined}");
+        assert!(joined.contains("temperature: 1.5"), "{joined}");
+        assert!(joined.contains("top_p: provider default"), "{joined}");
+    }
+
+    // ---- provider error detail: the 400's own account of what it rejected ----
+
+    fn detail_of(body: &str) -> Option<String> {
+        provider_error_detail(Some(body)).0
+    }
+
+    /// The case that motivated all of this: a rejected `temperature`. The
+    /// catalog publishes no default for some models, so the 400 is the only
+    /// place the real limit appears.
+    #[test]
+    fn an_openai_shaped_rejection_is_read() {
+        let d = detail_of(
+            r#"{"error":{"message":"temperature must be <= 1.0","type":"invalid_request_error","param":"temperature"}}"#,
+        )
+        .unwrap();
+        assert!(d.contains("temperature must be <= 1.0"), "{d}");
+        // The message already names the field, so `param` is not repeated —
+        // "… <= 1.0 (field: temperature)" would be noise.
+        assert!(!d.contains("field:"), "{d}");
+    }
+
+    /// Where the provider names the field but the message does not, the field
+    /// *is* appended. For a rejection about a value, which knob was rejected is
+    /// the part the user cannot infer from the message alone.
+    #[test]
+    fn the_offending_field_is_appended_when_the_message_omits_it() {
+        let d =
+            detail_of(r#"{"error":{"message":"must be <= 1.0","param":"temperature"}}"#).unwrap();
+        assert!(d.contains("field: temperature"), "{d}");
+    }
+
+    #[test]
+    fn an_anthropic_shaped_rejection_is_read() {
+        let d = detail_of(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 64000 > 32000"}}"#,
+        )
+        .unwrap();
+        assert!(d.contains("64000 > 32000"), "{d}");
+    }
+
+    /// A flat `{"error": "..."}` — several self-hosted servers answer this way.
+    #[test]
+    fn a_flat_error_string_is_read() {
+        assert_eq!(
+            detail_of(r#"{"error":"model is overloaded"}"#).as_deref(),
+            Some("model is overloaded")
+        );
+    }
+
+    #[test]
+    fn a_toplevel_message_is_read() {
+        assert_eq!(
+            detail_of(r#"{"message":"unknown model"}"#).as_deref(),
+            Some("unknown model")
+        );
+    }
+
+    /// FastAPI validation: `detail` is an array, and `loc` is the path to the
+    /// offending field. This is the shape a self-hosted vLLM-style server sends.
+    #[test]
+    fn a_fastapi_validation_array_is_read() {
+        let d = detail_of(
+            r#"{"detail":[{"loc":["body","temperature"],"msg":"ensure this value is <= 1","type":"value_error"}]}"#,
+        )
+        .unwrap();
+        assert!(d.contains("body.temperature"), "{d}");
+        assert!(d.contains("<= 1"), "{d}");
+    }
+
+    /// Not every body is JSON. An HTML error page or a bare sentence must still
+    /// reach the user rather than being discarded as unparseable.
+    #[test]
+    fn a_non_json_body_is_still_reported() {
+        assert_eq!(
+            detail_of("upstream connect error\nor disconnect").as_deref(),
+            Some("upstream connect error or disconnect")
+        );
+    }
+
+    /// Structure with no message anywhere is not a diagnostic; better a bare
+    /// status than `; {"foo":1}`.
+    #[test]
+    fn a_body_with_no_message_yields_nothing() {
+        assert_eq!(detail_of(r#"{"foo":1,"bar":2}"#), None);
+        assert_eq!(detail_of("   "), None);
+        assert_eq!(provider_error_detail(None).0, None);
+    }
+
+    /// The detail lands in the rendered error, which is where the user sees it.
+    /// A `None` must leave the message byte-identical to before, with no
+    /// dangling separator.
+    #[test]
+    fn the_detail_is_rendered_as_a_suffix() {
+        let with = PicocodeError::LlmClient {
+            status: 400,
+            detail: crate::ErrorDetail(Some("temperature must be <= 1.0".into())),
+        };
+        assert_eq!(
+            with.to_string(),
+            "Provider rejected the request (HTTP 400); temperature must be <= 1.0."
+        );
+        let without = PicocodeError::LlmClient {
+            status: 400,
+            detail: Default::default(),
+        };
+        assert_eq!(
+            without.to_string(),
+            "Provider rejected the request (HTTP 400)."
+        );
+    }
+
+    /// A long or multi-line body must not flood the turn: one clipped line.
+    #[test]
+    fn a_huge_body_is_clipped_to_one_line() {
+        let body = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(5000));
+        let d = detail_of(&body).unwrap();
+        assert!(d.chars().count() <= 301, "{}", d.chars().count());
+        assert!(d.ends_with('…'), "{d}");
+        assert!(!d.contains('\n'), "must be a single line");
+    }
+
     // ---- per-turn overrides: the request path (doc/model_settings_v2.md A.10) ----
 
     fn store_with(default_reasoning: &str) -> crate::settings::SettingsStore {

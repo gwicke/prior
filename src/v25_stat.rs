@@ -70,6 +70,10 @@ impl SlashDotNode for StatNode {
             usage,
             session_info,
             self.app_state.context_tokens(),
+            self.app_state
+                .with_settings(|s| s.model_settings(&format!("{provider}:{model}")).cloned())
+                .as_ref(),
+            &self.app_state.params(),
         )
     }
 

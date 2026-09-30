@@ -57,6 +57,25 @@ pub use rig_core::providers;
 pub use agent::{create_agent, load_agents_md, run_interactive, AgentConfig, CodeAgent, PicoAgent};
 pub use output::{Confirmation, ConsoleOutput, LogOutput, NoOutput, Output, QuietOutput};
 
+/// A provider's own explanation of a failure, reduced to one readable line.
+///
+/// A newtype rather than a bare `Option<String>` so `Display` can render the
+/// separator itself: the `#[error(...)]` attributes interpolate the suffix
+/// unconditionally, and `Option` has no useful `Display`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ErrorDetail(pub Option<String>);
+
+impl std::fmt::Display for ErrorDetail {
+    /// Empty for `None`, so `(HTTP 400)` reads correctly when the body carried
+    /// nothing actionable rather than trailing a bare `; `.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(d) => write!(f, "; {d}"),
+            None => Ok(()),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum PicocodeError {
     #[error("IO error: {0}")]
@@ -107,19 +126,34 @@ pub enum PicocodeError {
     },
 
     /// Provider returned a 5xx. Transient by default — the REPL re-prompts once.
-    #[error("Upstream provider error (HTTP {status}.)")]
+    ///
+    /// Carries a detail for the same reason as [`Self::LlmClient`]: "model is
+    /// overloaded" and "upstream is out of capacity" are both things the user
+    /// can act on, and both arrive in the body rather than the status.
+    // The period was inside the parens (`(HTTP {status}.)`), a long-standing
+    // typo; `{detail}` now sits before it so the no-detail case still renders
+    // exactly as it did.
+    #[error("Upstream provider error (HTTP {status}){detail}.")]
     LlmUpstream {
         /// HTTP status code reported by the provider.
         status: u16,
+        /// The provider's explanation, as for [`Self::LlmUpstream`].
+        detail: ErrorDetail,
     },
 
     /// Provider returned a 4xx other than 401/402/403/429. Likely a malformed
-    /// request — retrying won't help, but we surface the status so the user
-    /// can see what was rejected.
-    #[error("Provider rejected the request (HTTP {status}).")]
+    /// request — retrying won't help, so the provider's own explanation of
+    /// *what* it rejected is carried alongside the status: for a 400 that is
+    /// the whole diagnostic, and a bare status code sends the user guessing.
+    /// The catalog cannot substitute for this — a model's published
+    /// `supported_parameters` is advisory and often silent, so a rejected
+    /// value is learned from the 400, not predicted from metadata.
+    #[error("Provider rejected the request (HTTP {status}){detail}.")]
     LlmClient {
         /// HTTP status code reported by the provider.
         status: u16,
+        /// The provider's explanation, as for [`Self::LlmUpstream`].
+        detail: ErrorDetail,
     },
 
     /// Transport-level failure with no captured HTTP status: connection

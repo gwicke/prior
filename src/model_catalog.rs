@@ -1107,11 +1107,26 @@ pub fn resolved_entry(
     stored: Option<&crate::model_settings::ModelSettings>,
 ) -> Option<ModelEntry> {
     let (provider, model) = qualified_id.split_once(':')?;
-    let mut entry = lookup(provider, model)?;
-    if let Some(settings) = stored {
-        settings.apply_to_entry(&mut entry);
+    match lookup(provider, model) {
+        Some(mut entry) => {
+            if let Some(settings) = stored {
+                settings.apply_to_entry(&mut entry);
+            }
+            Some(entry)
+        }
+        // The catalog does not cover this model, but a stored record still
+        // states facts about it — and those are the ones the user wrote
+        // themselves. Returning `None` here would throw them away, so a model
+        // OpenRouter has not published would silently lose every Ctrl-E
+        // override. The record alone, overlaid onto an empty entry, is the
+        // resolved answer: worse than a full catalog entry, never worse than
+        // nothing.
+        None => stored.map(|settings| {
+            let mut entry = ModelEntry::default();
+            settings.apply_to_entry(&mut entry);
+            entry
+        }),
     }
-    Some(entry)
 }
 
 /// The reasoning efforts this model accepts, for backend effort remapping and
