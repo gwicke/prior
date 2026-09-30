@@ -983,6 +983,36 @@ Each phase: green build + `cargo test` + `cargo fmt`.
 P0 is not optional: it converts the existing carefully-tuned tests from "a copy of the
 emit logic" into a real safety net for P2–P3.
 
+#### Open before the §5.2 change (bottom-edge placement)
+
+The §5.2 diagnosis is settled; the change itself is not started. Three things
+have to land with it, and none of them is optional:
+
+1. **A regression test in the regime that distinguishes the two designs.**
+   Blocking. Every existing scenario fills the screen — the steady state, where
+   §4's reserved and unreserved designs are observationally identical, which is
+   precisely why `end_to_end_input_mode_layout` could not arbitrate the LF
+   arithmetic. The test has to hold the area **mid-screen**: a long, low-output
+   turn, or an area that changes height. In progress.
+2. **Does `CR` clear the wrap-pending state?** The proposed placement emits
+   `\r` + N newlines unconditionally, which is position-independent only if it
+   is. `frame.rs` already documents wrap-pending after a full-width row and
+   suppresses `EL` for it. Pin this with a vt100 replay rather than assuming it
+   — the whole no-descend design rests on this one question.
+3. **What draws the area when the content fills to the last row?** With
+   bottom-edge placement gone the area follows the content and the scroll is the
+   terminal's, unmodelled. The old `delta` was doing explicit work there. It is
+   not yet established that nothing is needed.
+
+Two more notes that are easy to lose:
+
+- The four `NOT the model` banners added in `ui::frame.rs` (§5.2) come out in
+  the same commit that makes them true.
+- **A green suite is not a sufficient signal for this change.** Cutting the LFs
+  turned `end_to_end_input_mode_layout` green while silently dropping both
+  `Error:` lines from the 429-retry scenario — the content was emitted and never
+  reached the screen, and nothing asserted against it. Until there is an
+  assertion covering that content, check it by eye.
 ---
 
 ## 7. Risks & mitigations

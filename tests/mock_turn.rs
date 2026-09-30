@@ -243,7 +243,21 @@ fn wait_for(bytes: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) -> boo
 /// Returns the raw byte stream for analysis. When `thinking` is set, the agent
 /// runs with `default_reasoning_level = "high"` (answer-hold / reasoning path).
 fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
-    run_turn_typing(scenario, label, thinking, "run the command")
+    run_turn_typing(scenario, label, thinking, "run the command", ROWS)
+}
+
+/// As [`run_turn`], but the `DSR` reply puts the input row at `dsr_row` instead
+/// of the last screen row, so the area starts **mid-screen** with rows below it
+/// free.
+///
+/// **That is the only regime that distinguishes the two designs** (`ui_draw_v2`
+/// §4): a reserved area sits at the screen's last row from the first prompt,
+/// while this one starts under the greeter and is pushed down by content. In
+/// the steady state — a turn long enough to fill the screen — the two converge
+/// and every screen looks identical, which is why `end_to_end_input_mode_layout`
+/// could not arbitrate the placement arithmetic.
+fn run_turn_at(scenario: u32, label: &str, dsr_row: u16) -> Vec<u8> {
+    run_turn_typing(scenario, label, false, "run the command", dsr_row)
 }
 
 /// As [`run_turn`], but types `typed` instead of a prompt.
@@ -262,7 +276,13 @@ fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
 /// drilled row, not from the buffer. `emit_commit`'s bracketing is therefore
 /// pinned by a unit test in `repl.rs` instead, at the level the contract lives
 /// at.
-fn run_turn_typing(scenario: u32, label: &str, thinking: bool, typed: &str) -> Vec<u8> {
+fn run_turn_typing(
+    scenario: u32,
+    label: &str,
+    thinking: bool,
+    typed: &str,
+    dsr_row: u16,
+) -> Vec<u8> {
     let llm = MockLlm::start(scenario);
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -313,7 +333,7 @@ fn run_turn_typing(scenario: u32, label: &str, thinking: bool, typed: &str) -> V
     // Answer picocode's cursor-position query (DSR `ESC[6n`) so `cursor_row()`
     // does not swallow our typed bytes while scanning stdin for the reply.
     // Same handshake as tests/render_scroll.rs.
-    let _ = writer.write_all(format!("\x1b[{};1R", ROWS).as_bytes());
+    let _ = writer.write_all(format!("\x1b[{dsr_row};1R").as_bytes());
     let _ = writer.flush();
     thread::sleep(Duration::from_millis(150));
     // Submit a prompt (Enter submits the typed line in the REPL).
@@ -614,6 +634,91 @@ fn the_status_line_keeps_one_blank_row_above_it() {
 /// and it is worth keeping in the same shape (one screen-based count per
 /// scenario) because it is the thing that regresses when a block's trailing blank
 /// goes missing.
+
+/// **The area follows the content; it is not parked at the screen's bottom.**
+///
+/// Every other layout test here drives a turn that fills the screen, which is
+/// the *steady state* — and `ui_draw_v2` §4 notes that a reserved area and an
+/// unreserved one look identical there. So none of them can tell the two designs
+/// apart, which is exactly why `end_to_end_input_mode_layout` settled the LF
+/// arithmetic in the wrong direction instead of catching it.
+///
+/// This one starts the input row mid-screen (`dsr_row`) and emits a turn short
+/// enough that the area never reaches the bottom, so the two designs diverge and
+/// the assertions below are falsifiable.
+///
+/// The gap *count* is deliberately not asserted. One blank row before the bar
+/// is a spacing decision that §5.2 has still to make explicit; what is settled
+/// is that the area is **immediately** below the content rather than at the
+/// screen's edge. Asserting adjacency (and not the gap) keeps this test honest
+/// while that decision is open.
+#[test]
+fn the_area_follows_the_content_rather_than_the_screen_bottom() {
+    // Mid-screen, with `ROWS / 2` rows left beneath the area — more than the
+    // turn below will ever push it down.
+    let dsr = ROWS / 2;
+
+    // **Control.** The same turn with the input row at the *last* screen row.
+    // Under a reserved area that is where it belongs; under this one it belongs
+    // wherever the content left it. Both runs emit identical content, so any
+    // difference in where the area lands is the design, not the data — and if
+    // this control ever stopped landing at the bottom, the `dsr` parameter would
+    // have gone dead and every assertion below would be vacuous.
+    let pinned = screen_rows(&run_turn_at(0, "control-bottom", ROWS));
+    let pinned_bar = pinned
+        .iter()
+        .position(|r| is_status_row(r))
+        .expect("the status bar should be on screen");
+    assert_eq!(
+        pinned_bar as isize,
+        pinned.len() as isize - 2,
+        "control: with the input row at the last screen row the area should land \
+         there, filling the screen; bar={pinned_bar} Screen:\n{pinned:?}"
+    );
+
+    let data = run_turn_at(0, "mid-screen-area", dsr);
+    let rows = screen_rows(&data);
+
+    // The area is `[status bar, input]`, so the bar is its first row and the
+    // input is the one below it — which is blank here, since the prompt was
+    // submitted. Finding "the last non-empty row" would find the bar itself.
+    let bar = rows
+        .iter()
+        .position(|r| is_status_row(r))
+        .expect("the status bar should be on screen");
+    let area_below = bar + 2;
+
+    // The load-bearing assertion: **rows beneath the area are ordinary empty
+    // screen.** A reserved area would be flush at the last row from the first
+    // prompt, so this fails immediately under that design and passes under this
+    // one — which is what makes it the fence the other tests could not be.
+    assert!(
+        area_below + 1 < rows.len(),
+        "the area should NOT be flush at the screen bottom — that is the reserved \
+         design, which this test exists to falsify; bar={bar} Screen:\n{rows:?}"
+    );
+    assert!(
+        rows[area_below..].iter().all(|r| r.trim().is_empty()),
+        "every row below the area should be ordinary empty screen, not more of the \
+         area; bar={bar} Screen:\n{rows:?}"
+    );
+
+    // Adjacency: the transcript's last row is the last non-empty one *above* the
+    // bar. A reserved area would show the whole remainder of the screen blank
+    // here, growing with every chunk of content.
+    let transcript_last = rows[..bar]
+        .iter()
+        .rposition(|r| !r.trim().is_empty())
+        .expect("some content above the area");
+    let gap = bar as isize - transcript_last as isize - 1;
+    assert!(
+        (1..=2).contains(&gap),
+        "the area should sit just below the content (gap 1–2 rows), not at the \
+         screen's edge; gap={gap} bar={bar} transcript_last={transcript_last} \
+         Screen:\n{rows:?}"
+    );
+}
+
 #[test]
 fn end_to_end_input_mode_layout() {
     // Scenario 0: text + tool + final text answer (the user's example).
