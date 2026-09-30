@@ -1,13 +1,13 @@
 //! The `bsed` command line.
 //!
-//! Two subcommands, one library:
+//! One subcommand, and the default mode needs no word to reach it:
 //!
 //! ```text
-//! bsed preview [-c N] [-p PATH] <expressions>   # print the block blob (default)
-//! bsed apply   [-p PATH] [-i] [FILE]           # read blocks from stdin, apply, write
+//! bsed [OPTIONS] [SCRIPT] [FILE]...   # print the block blob (the default)
+//! bsed apply [-p PATH] [-i] [FILE]    # read blocks from stdin, apply, write
 //! ```
 //!
-//! `preview` never writes and is what picocode runs (inside a read-only
+//! Previewing never writes and is what picocode runs (inside a read-only
 //! sandbox). `apply` is for humans at a shell, and without `-i` it writes the
 //! result to stdout, so `bsed apply f.rs < blocks.txt | diff f.rs -` is a review
 //! loop that cannot damage anything.
@@ -27,8 +27,8 @@ const USAGE: &str = "\
 bsed — block-edit sed
 
 USAGE:
-    bsed preview [OPTIONS]... [SCRIPT] [FILE]...
-    bsed apply   [OPTIONS] [FILE]
+    bsed [OPTIONS]... [SCRIPT] [FILE]...
+    bsed apply [OPTIONS] [FILE]
 
 PREVIEW (never writes; the default):
     -e, --expression <SCRIPT>   Add the script to the commands to execute
@@ -61,10 +61,10 @@ APPLY (writes):
     re-piped.
 
 EXAMPLES:
-    bsed preview -e 's/old/new/' -p src/x.rs
-    bsed preview 's/old/new/' src/x.rs
-    bsed preview -f script.sed src/x.rs
-    bsed preview -r -p src 's/old/new/' > blocks.txt
+    bsed 's/old/new/' src/x.rs
+    bsed -e 's/old/new/' -p src/x.rs
+    bsed -f script.sed src/x.rs
+    bsed -r -p src 's/old/new/' > blocks.txt
     bsed apply -i < blocks.txt
     bsed apply src/x.rs < blocks.txt | diff src/x.rs -
 ";
@@ -177,21 +177,32 @@ enum Failure {
     Internal(String),
 }
 
+/// Pick the mode. `apply` is the only subcommand; everything else previews,
+/// which is what the name is for.
+///
+/// The dispatcher stays this thin on purpose. It used to reject a leading flag
+/// with "unknown option", on the reasoning that a flag cannot be an expression —
+/// true, but it left `bsed -p f.rs 's/a/b/'` unusable even though that is exactly
+/// what `sed` accepts, and what picocode's `sed` tool wants to run. Handing every
+/// non-`apply` argument list to the preview parser instead means options may
+/// lead, the script may come from `-e`, `-f` or a positional, and an option that
+/// exists in neither mode is still rejected — by the parser that knows the
+/// options, with the same message and the same usage text.
 fn run(args: &[String]) -> Result<String, Failure> {
     match args.first().map(String::as_str) {
         // No arguments at all: print usage rather than block forever waiting for
         // expressions on stdin, which is what `bsed` on its own used to do.
         None => Ok(USAGE.to_string()),
-        Some("preview") => preview(&args[1..]),
         Some("apply") => apply(&args[1..]),
         Some("-h") | Some("--help") | Some("help") => Ok(USAGE.to_string()),
         Some("--version") | Some("-V") => Ok(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))),
-        // A leading flag cannot be an expression, so it is a usage error.
-        Some(other) if other.len() > 1 && other.starts_with('-') => {
-            Err(Failure::Usage(format!("unknown option `{other}`")))
-        }
-        // Otherwise the first word is an expression: `bsed 's/x/y/' -p f.rs`
-        // is the form people actually type.
+        // `preview` was a subcommand once. Left here so the muscle memory lands
+        // on the reason rather than on a parse error about the word itself.
+        Some("preview") => Err(Failure::Usage(
+            "there is no `preview` subcommand — previewing is what `bsed` does by default. \
+             Drop the word: `bsed 's/a/b/' f.rs`."
+                .into(),
+        )),
         Some(_) => preview(args),
     }
 }
@@ -259,7 +270,7 @@ fn preview(args: &[String]) -> Result<String, Failure> {
         // No script on command line: read from stdin
         if std::io::stdin().is_terminal() {
             return Err(Failure::Usage(
-                "no sed script given. Usage: bsed preview [-e SCRIPT] [-f FILE] [FILE...]".into(),
+                "no sed script given. Usage: bsed [-e SCRIPT] [-f FILE] [FILE]...".into(),
             ));
         }
         read_stdin()?
@@ -295,7 +306,7 @@ fn preview(args: &[String]) -> Result<String, Failure> {
         if p.is_dir() {
             if !recursive {
                 return Err(Failure::Usage(format!(
-                    "{} is a directory. Use `bsed preview -r -p {}` to preview every file under it.",
+                    "{} is a directory. Use `bsed -r -p {}` to preview every file under it.",
                     p.display(),
                     p.display()
                 )));

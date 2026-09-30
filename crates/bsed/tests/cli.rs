@@ -67,7 +67,7 @@ fn tree() -> tempfile::TempDir {
 #[test]
 fn a_directory_without_recursive_is_a_usage_error() {
     let d = tree();
-    let o = run_in(d.path(), None, &["preview", "-p", ".", "s/a/b/"]);
+    let o = run_in(d.path(), None, &["-p", ".", "s/a/b/"]);
     assert_eq!(code(&o), 2);
     assert!(stderr(&o).contains("--recursive"), "{}", stderr(&o));
 }
@@ -76,7 +76,7 @@ fn a_directory_without_recursive_is_a_usage_error() {
 fn a_crlf_file_is_refused_with_a_reason() {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("crlf.txt"), "a\r\nb\r\n").unwrap();
-    let o = run_in(d.path(), None, &["preview", "s/b/B/", "crlf.txt"]);
+    let o = run_in(d.path(), None, &["s/b/B/", "crlf.txt"]);
     assert_eq!(code(&o), 2);
     let err = stderr(&o);
     assert!(err.contains("carriage returns"), "{err}");
@@ -96,7 +96,7 @@ fn a_crlf_file_does_not_sink_a_recursive_preview() {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("crlf.txt"), "a\r\nb\r\n").unwrap();
     std::fs::write(d.path().join("ok.txt"), "a\nb\n").unwrap();
-    let o = run_in(d.path(), None, &["preview", "-r", "-p", ".", "s/b/B/"]);
+    let o = run_in(d.path(), None, &["-r", "-p", ".", "s/b/B/"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
     // The LF file was still previewed...
@@ -114,7 +114,7 @@ fn a_crlf_file_does_not_sink_a_recursive_preview() {
 fn a_tree_of_only_crlf_files_says_why() {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("crlf.txt"), "a\r\nb\r\n").unwrap();
-    let o = run_in(d.path(), None, &["preview", "-r", "-p", ".", "s/b/B/"]);
+    let o = run_in(d.path(), None, &["-r", "-p", ".", "s/b/B/"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
     assert!(out.contains("no lines matched"), "{out}");
@@ -123,14 +123,65 @@ fn a_tree_of_only_crlf_files_says_why() {
     assert!(out.contains("CRLF"), "{out}");
 }
 
+/// Previewing is the default mode: no subcommand word is needed, and the script
+/// may come first or from `-e`.
+#[test]
+fn previewing_needs_no_subcommand() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "a.rs", "one\ntwo\n");
+    for args in [
+        &["s/one/1/", "a.rs"][..],
+        &["s/one/1/", "-p", "a.rs"][..],
+        &["-c", "0", "-p", "a.rs", "s/one/1/"][..],
+        &["-e", "s/one/1/", "-p", "a.rs"][..],
+    ] {
+        let o = run_in(d.path(), None, args);
+        assert_eq!(code(&o), 0, "{args:?}: {}", stderr(&o));
+        assert!(stdout(&o).contains("a.rs:1"), "{args:?}: {}", stdout(&o));
+    }
+}
+
+/// A leading option used to be rejected on the grounds that a flag cannot be an
+/// expression. That left the `sed` tool's own invocation unusable; options may
+/// lead now, the way `sed` accepts them.
+#[test]
+fn an_option_may_lead_the_command_line() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "a.rs", "one\ntwo\n");
+    let o = run_in(d.path(), None, &["-c", "1", "-p", "a.rs", "s/one/1/"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("a.rs:1"), "{}", stdout(&o));
+}
+
+/// An option that exists in neither mode is still an error, with the usage
+/// text -- the preview parser is what knows the options, so it is what reports.
+#[test]
+fn an_unknown_option_is_still_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let o = run_in(d.path(), None, &["-z", "a.rs"]);
+    assert_eq!(code(&o), 2);
+    let err = stderr(&o);
+    assert!(err.contains("unknown option `-z`"), "{err}");
+    assert!(err.contains("USAGE"), "{err}");
+}
+
+/// `preview` used to be the subcommand. The word is gone, but saying so beats
+/// letting it be read as a script and failing on the quotes in the next one.
+#[test]
+fn the_old_preview_subcommand_says_what_changed() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "a.rs", "one\n");
+    let o = run_in(d.path(), None, &["preview", "s/one/1/", "-p", "a.rs"]);
+    assert_eq!(code(&o), 2);
+    let err = stderr(&o);
+    assert!(err.contains("no `preview` subcommand"), "{err}");
+    assert!(err.contains("bsed 's/a/b/' f.rs"), "{err}");
+}
+
 #[test]
 fn recursive_preview_walks_the_tree_and_reports_counts() {
     let d = tree();
-    let o = run_in(
-        d.path(),
-        None,
-        &["preview", "-r", "-p", ".", "s/old_name/new_name/g"],
-    );
+    let o = run_in(d.path(), None, &["-r", "-p", ".", "s/old_name/new_name/g"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
     assert!(out.contains("2 of "), "{out}"); // two files changed
@@ -146,7 +197,7 @@ fn recursive_preview_walks_the_tree_and_reports_counts() {
 #[test]
 fn recursive_preview_with_no_matches_says_so() {
     let d = tree();
-    let o = run_in(d.path(), None, &["preview", "-r", "-p", ".", "s/zzz/yyy/g"]);
+    let o = run_in(d.path(), None, &["-r", "-p", ".", "s/zzz/yyy/g"]);
     assert_eq!(code(&o), 0);
     assert!(stdout(&o).contains("no lines matched"), "{}", stdout(&o));
 }
@@ -158,7 +209,7 @@ fn recursive_apply_is_atomic_per_file_and_echoes_the_failures() {
     let blocks = stdout(&run_in(
         &root,
         None,
-        &["preview", "-r", "-p", ".", "s/old_name/new_name/g"],
+        &["-r", "-p", ".", "s/old_name/new_name/g"],
     ));
 
     // Move one file on after the preview, so its block no longer matches.
@@ -201,7 +252,7 @@ fn a_multi_file_blob_needs_in_place() {
     let blocks = stdout(&run_in(
         &root,
         None,
-        &["preview", "-r", "-p", ".", "s/old_name/new_name/g"],
+        &["-r", "-p", ".", "s/old_name/new_name/g"],
     ));
     let o = run_in(&root, Some(&blocks), &["apply"]);
     assert_eq!(code(&o), 2);
@@ -220,7 +271,7 @@ fn single_file_apply_without_in_place_prints_and_does_not_write() {
     let blocks = stdout(&run_in(
         &root,
         None,
-        &["preview", "-p", "a.rs", "s/old_name/new_name/g"],
+        &["-p", "a.rs", "s/old_name/new_name/g"],
     ));
     let o = run_in(&root, Some(&blocks), &["apply", "a.rs"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -236,7 +287,7 @@ fn a_refused_expression_exits_two_and_writes_nothing() {
     let root = d.path().to_path_buf();
     write(&root, "a.rs", "one\n");
     for script in ["1w /tmp/bsed-should-not-exist", "1e touch /tmp/x", "1q"] {
-        let o = run_in(&root, None, &["preview", "-p", "a.rs", script]);
+        let o = run_in(&root, None, &["-p", "a.rs", script]);
         assert_eq!(code(&o), 2, "{script}");
         assert!(
             stderr(&o).contains("never writes")
@@ -269,7 +320,7 @@ fn recursive_preview_then_apply_reproduces_sed_over_the_tree() {
         reference.insert(rel.to_string(), before.replace("old_name", "new_name"));
     }
 
-    let blocks = stdout(&run_in(&root, None, &["preview", "-r", "-p", ".", script]));
+    let blocks = stdout(&run_in(&root, None, &["-r", "-p", ".", script]));
     let o = run_in(&root, Some(&blocks), &["apply", "-i"]);
     assert_eq!(code(&o), 0, "{}", stdout(&o));
 
@@ -293,15 +344,7 @@ fn glob_narrows_the_recursive_walk() {
     let o = run_in(
         &root,
         None,
-        &[
-            "preview",
-            "-r",
-            "-g",
-            "**/*.rs",
-            "-p",
-            ".",
-            "s/old_name/new_name/g",
-        ],
+        &["-r", "-g", "**/*.rs", "-p", ".", "s/old_name/new_name/g"],
     );
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(stdout(&o).contains("one.rs:2"), "{}", stdout(&o));
@@ -310,15 +353,7 @@ fn glob_narrows_the_recursive_walk() {
     let o = run_in(
         &root,
         None,
-        &[
-            "preview",
-            "-r",
-            "-g",
-            "**/*.py",
-            "-p",
-            ".",
-            "s/old_name/new_name/g",
-        ],
+        &["-r", "-g", "**/*.py", "-p", ".", "s/old_name/new_name/g"],
     );
     assert_eq!(code(&o), 0);
     assert!(stdout(&o).contains("no lines matched"), "{}", stdout(&o));
@@ -327,11 +362,7 @@ fn glob_narrows_the_recursive_walk() {
 #[test]
 fn glob_without_recursive_is_a_usage_error() {
     let d = tree();
-    let o = run_in(
-        d.path(),
-        None,
-        &["preview", "-g", "*.rs", "-p", "one.rs", "s/a/b/"],
-    );
+    let o = run_in(d.path(), None, &["-g", "*.rs", "-p", "one.rs", "s/a/b/"]);
     assert_eq!(code(&o), 2);
     assert!(stderr(&o).contains("--glob"), "{}", stderr(&o));
 }
@@ -350,14 +381,14 @@ fn a_file_containing_block_markers_is_refused_not_mangled() {
     );
     write(&root, "plain.rs", "let old = 1;\n");
 
-    let o = run_in(&root, None, &["preview", "-p", "self.rs", "s/old/new/g"]);
+    let o = run_in(&root, None, &["-p", "self.rs", "s/old/new/g"]);
     assert_eq!(code(&o), 2);
     let err = stderr(&o);
     assert!(err.contains("appliable blocks"), "{err}");
     assert!(err.contains("@@@NEW"), "{err}");
 
     // Recursively, the un-representable file is named and the other still works.
-    let o = run_in(&root, None, &["preview", "-r", "-p", ".", "s/old/new/g"]);
+    let o = run_in(&root, None, &["-r", "-p", ".", "s/old/new/g"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
     assert!(out.contains("plain.rs:1"), "{out}");
@@ -374,7 +405,7 @@ fn the_failure_report_is_itself_a_repipable_blocks_file() {
     let blocks = stdout(&run_in(
         &root,
         None,
-        &["preview", "-r", "-p", ".", "s/old_name/new_name/g"],
+        &["-r", "-p", ".", "s/old_name/new_name/g"],
     ));
     // Retire one file's content so its block cannot apply.
     write(&root, "one.rs", "fn a() {\n    let CHANGED = 1;\n}\n");
@@ -425,7 +456,7 @@ fn a_terminal_run_spools_the_output_to_a_file() {
 
     let bin = env!("CARGO_BIN_EXE_bsed");
     let mut cmd = CommandBuilder::new(bin);
-    cmd.args(["preview", "-r", "-p", ".", "s/old_name/new_name/g"]);
+    cmd.args(["-r", "-p", ".", "s/old_name/new_name/g"]);
     cmd.cwd(&root);
     cmd.env("BSED_SPOOL_DIR", spool_dir.path());
 
@@ -476,7 +507,7 @@ fn a_terminal_run_spools_the_output_to_a_file() {
     // A piped run leaves none behind.
     let mut c2 = Command::new(bin);
     c2.current_dir(&root)
-        .args(["preview", "-r", "-p", ".", "s/old_name/new_name/g"])
+        .args(["-r", "-p", ".", "s/old_name/new_name/g"])
         .env("BSED_SPOOL_DIR", spool_dir.path())
         .stdout(std::process::Stdio::piped());
     c2.output().expect("piped preview");

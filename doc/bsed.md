@@ -31,7 +31,7 @@ s/const MAG_VAR_THRESH_LOW: f32 = 2.0;/const MAG_VAR_THRESH_LOW: f32 = 5.0;/
 The idea: **sed becomes advisory.** The model formulates GNU sed expressions, gets
 back a reviewable, line-anchored `@@@OLD`/`@@@NEW`/`@@@END` preview, and applies
 (all or part of) it through the existing `edit` tool — already anchor-aware,
-uniqueness-checked, overlap-checked, all-or-nothing. `bsed preview` never writes.
+uniqueness-checked, overlap-checked, all-or-nothing. Previewing never writes.
 If the preview is wrong, nothing was lost.
 
 This is not "sed that is safer at writing". It is a **sed-to-block-edit
@@ -73,7 +73,7 @@ uncommitted work":
 3. **Read-only bwrap namespace** — the same machinery `rg`/grep uses
    (`run_sandboxed_ro`, `src/tools.rs:1256`): cwd ro-bound, `/tmp` a scratch
    tmpfs, `--unshare-net`, `--cap-drop ALL`, `--die-with-parent`, memory cap,
-   120 s default timeout. The agent only ever runs `bsed preview` there.
+   120 s default timeout. The agent only ever previews there.
 
 `bsed` is genuinely useful standalone (`bsed apply` from a shell, later
 `replace -r` recursive search/replace), which is what makes extracting the block
@@ -393,13 +393,13 @@ that is *not* a new enum variant (a panic in a pathological regex, an
   misconfiguration degrades to "deny-list still holds".
 
 So: keep all three layers. The deny-list is not redundant with the sandbox — it
-is what makes `bsed preview` safe when a *human* runs it outside any sandbox, and
+is what makes a preview safe when a *human* runs it outside any sandbox, and
 it produces a good error message instead of an opaque `sed: can't read` from
 inside a namespace.
 
 ### 5.3 Layer 3 — read-only sandbox
 
-`bsed preview` runs via `run_sandboxed_ro(argv, cfg, timeout)` (`src/tools.rs:1256`),
+A preview runs via `run_sandboxed_ro(argv, cfg, timeout)` (`src/tools.rs:1256`),
 identical to the grep/`rg` path:
 
 * argv only, never a shell; the model never supplies a subcommand, a flag name, or
@@ -571,8 +571,8 @@ which is also GNU's per-command scoping.
 ## 7. `bsed` — the standalone tool
 
 ```
-bsed preview [-c N] [-p PATH] <expressions>   # print the block blob (default)
-bsed preview -r -p DIR <expressions>          # walk a tree, one blob for all of it
+bsed [-c N] [-p PATH] <expressions>   # print the block blob (the default)
+bsed -r -p DIR <expressions>          # walk a tree, one blob for all of it
 bsed apply  [-p PATH] [-i] [FILE]             # read a blob from stdin, apply
 bsed --version                                # "bsed 0.1.0" (probe + handshake)
 ```
@@ -591,7 +591,7 @@ bsed --version                                # "bsed 0.1.0" (probe + handshake)
 ### 7.1 The recursive flow
 
 ```
-bsed preview -r -p src 's/foo/bar/g' > blocks.txt   # review
+bsed -r -p src 's/foo/bar/g' > blocks.txt   # review
 bsed apply -i < blocks.txt                          # commit it
 ```
 
@@ -672,7 +672,7 @@ pointer would be noise. `BSED_SPOOL_DIR` overrides the location.
 
 ### 7.3 A file that cannot be expressed as blocks
 
-Previewing a file that is *itself* a blocks file (`bsed preview -r > blocks.txt`
+Previewing a file that is *itself* a blocks file (`bsed -r > blocks.txt`
 is a normal thing to do, and then previewing `blocks.txt`) puts literal
 `@@@NEW` lines inside a block, because that is what the file contains. The blob
 format cannot express it: those lines are structure, not content.
@@ -765,7 +765,7 @@ no behaviour change, and it de-risks the crate work.
 | Where | Change |
 | --- | --- |
 | `Cargo.toml` | `members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/bsed"]`; `blockedit = { path = … }`. add `bsed` as a dep, purely for the `bsed` shim binary (§7). |
-| `src/tools.rs` | `#[rig_tool(name = "sed", required(path, expressions))] async fn sed_preview(path, expressions, context: ContextLines)`: `get_path` → relativize → argv `["bsed","preview","-c",n,"-p",rel,"-e",expressions]` → `run_sandboxed_ro_with_status` (new, §5.3) with an explicit cap → map exit 2 to `Ok(message)`, 1 to `Err`. New `ContextLines` in `src/config.rs` cloned from `ReadLimit`. |
+| `src/tools.rs` | `#[rig_tool(name = "sed", required(path, expressions))] async fn sed_preview(path, expressions, context: ContextLines)`: `get_path` → relativize → argv `["bsed",expressions,"-c",n,"-b",budget,"-p",rel]` → `run_sandboxed_ro_with_status` (new, §5.3) with an explicit cap → map exit 2 to `Ok(message)`, 1 to `Err`. New `ContextLines` in `src/config.rs` cloned from `ReadLimit`. |
 | `src/tools.rs` | `bsed_available()` probe (`LazyLock<bool>` = `Command::new("bsed").arg("--version").status().is_ok()`), mirroring `is_executable` in `src/main.rs:97`. |
 | `src/agent.rs:1967` | register conditionally: `if bsed_available() { builder = builder.tool(SedPreview) }` — same conditional-advertisement shape as `guard(..., yolo, …)` for the mutating tools. |
 | `src/agent.rs:1923` | prompt: replace the "avoid sed … snapshot commit first" sentence with "use `sed` to preview bulk line changes — it never writes; review the returned blocks and apply them with `edit`." Only append the `sed` bullet when the tool is registered. |
@@ -884,7 +884,7 @@ Still open — small tuning decisions, not architecture:
   a session-storage question rather than a matching one.
 * Publishing `bsed` to crates.io, so `cargo install bsed` works without a
   git checkout.
-* A `--json` output mode for `bsed preview`, for tooling that wants the blocks
+* A `--json` output mode, for tooling that wants the blocks
   without parsing the blob text.
 
 ## 14. Where the implementation corrected this document
