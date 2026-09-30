@@ -3622,6 +3622,14 @@ pub async fn run_interactive(
     // flags); the loop's local `config` remains the applied layer that
     // converges to it. Settings move in as the one durable copy.
     let app_state = AppState::new(config.clone(), settings, repo.clone());
+    // Load-or-seed the initial model's live params from its stored record, then
+    // pull them back into the applied layer. Seeding before `ensure_session`
+    // below is what puts the right level in the session header, and copying
+    // them into `config` means the first agent is built once with the final
+    // values instead of being rebuilt on the first cycle to catch up.
+    let initial_model = config.qualified_model_id();
+    app_state.activate_model_params(&initial_model);
+    config.params = app_state.params();
     // First session — created up front so the `/session` overlay can mark
     // it from the start (the file itself is written lazily on the first
     // `append_message`, so no empty session is created for a user who

@@ -398,6 +398,12 @@ impl SettingsStore {
             .and_then(|p| crate::persona::get_persona(p));
         // `None` (key absent) and an explicit "off" are the same effective
         // state; both mean "no reasoning requested".
+        //
+        // NOT a live writer: only tests call `apply_to_config`, and the live
+        // path seeds via `AppState::activate_model_params` instead. If this
+        // were ever wired into the running config it would be a bug — it
+        // takes reasoning from the *global*, stomping whatever the model's own
+        // record (or a runtime `/reasoning`) resolved to.
         cfg.params.reasoning = self
             .default_reasoning_level
             .clone()
