@@ -190,13 +190,15 @@ pub struct TextPreview {
     pub blocked: Option<String>,
 }
 
-/// The same preview over text already in hand.
-pub fn preview_text(
+/// The text `expressions` turns `original` into, with the screened script.
+///
+/// The first half of a preview, and on its own enough for `--unified`: a diff
+/// needs the two versions of the file, not the blocks built between them.
+fn sed_output(
     original: &str,
     shown_path: &str,
     expressions: &str,
-    opts: Options,
-) -> Result<TextPreview, Error> {
+) -> Result<(script::Script, String), Error> {
     if has_carriage_return(original) {
         return Err(Error::CarriageReturn(shown_path.to_string()));
     }
@@ -208,6 +210,32 @@ pub fn preview_text(
         &scr.change_ranges,
     )
     .map_err(|e| Error::Engine(e.0))?;
+    Ok((scr, new))
+}
+
+/// `expressions` applied to `original`, for a caller that wants to diff the
+/// result rather than receive blocks.
+///
+/// Screening, the CRLF refusal, and the engine are the same path a block
+/// preview takes; only the rendering afterwards differs, so a `-u` run and a
+/// block run of the same script cannot disagree about what sed would write.
+pub fn preview_new(
+    original: &str,
+    shown_path: &str,
+    expressions: &str,
+) -> Result<(String, usize), Error> {
+    let (scr, new) = sed_output(original, shown_path, expressions)?;
+    Ok((new, scr.count))
+}
+
+/// The same preview over text already in hand.
+pub fn preview_text(
+    original: &str,
+    shown_path: &str,
+    expressions: &str,
+    opts: Options,
+) -> Result<TextPreview, Error> {
+    let (scr, new) = sed_output(original, shown_path, expressions)?;
 
     let h = hunks::build(original, &new, opts.context);
     let mut p = Preview {
@@ -524,6 +552,12 @@ mod tests {
             "1,2!d",
             "1,9d",
             "8,9d",
+            // ...and the same for a deletion that just is not at the end. With
+            // no trailing context to absorb the newline, and the diff not
+            // always pairing the following line into the block, an interior
+            // deletion leaves a blank line too.
+            "6,7d",
+            "2d",
         ];
         for script in cases {
             // GNU sed is the reference; skip the case if it is not GNU or the

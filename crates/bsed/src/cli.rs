@@ -1,13 +1,13 @@
 //! The `bsed` command line.
 //!
-//! Two subcommands, one library:
+//! One subcommand, and the default mode needs no word to reach it:
 //!
 //! ```text
-//! bsed preview [-c N] [-p PATH] <expressions>   # print the block blob (default)
-//! bsed apply   [-p PATH] [-i] [FILE]           # read blocks from stdin, apply, write
+//! bsed [OPTIONS] [SCRIPT] [FILE]...   # print the block blob (the default)
+//! bsed apply [-p PATH] [-i] [FILE]    # read blocks from stdin, apply, write
 //! ```
 //!
-//! `preview` never writes and is what picocode runs (inside a read-only
+//! Previewing never writes and is what picocode runs (inside a read-only
 //! sandbox). `apply` is for humans at a shell, and without `-i` it writes the
 //! result to stdout, so `bsed apply f.rs < blocks.txt | diff f.rs -` is a review
 //! loop that cannot damage anything.
@@ -27,8 +27,8 @@ const USAGE: &str = "\
 bsed — block-edit sed
 
 USAGE:
-    bsed preview [OPTIONS]... [SCRIPT] [FILE]...
-    bsed apply   [OPTIONS] [FILE]
+    bsed [OPTIONS]... [SCRIPT] [FILE]...
+    bsed apply [OPTIONS] [FILE]
 
 PREVIEW (never writes; the default):
     -e, --expression <SCRIPT>   Add the script to the commands to execute
@@ -42,11 +42,16 @@ PREVIEW (never writes; the default):
                                 matches. Repeatable, and any match wins. Same
                                 semantics as the `find` tool, so use **/*.rs for a
                                 recursive match.
-    -c, --context <N>           Unchanged lines each side; trailing is always at
-                                least 2 (default 0)
-    -t, --trailing <N>          Minimum unchanged lines after a change (default 2)
+    -c, --context <N>           Unchanged lines to add before each change (default 0)
+    -t, --trailing <N>          Unchanged lines to add after a change (default 0)
         --no-grow               Do not extend blocks to a balanced bracket
     -b, --budget <BYTES>        Preview budget, single-file mode only (default 51200)
+    -u, --unified              Emit a unified diff instead of blocks, for reading
+                                in a pager. A diff cannot be applied by anything:
+                                drop -u for blocks the `edit` tool takes. The
+                                hunk context falls back to 2 when neither -c nor
+                                -t is given, since a diff has no anchor and no
+                                context is a diff you have to open the file to read
     -h, --help
     -n, --quiet                 Suppress automatic printing (ignored; preview only)
     SCRIPT                      If no -e/-f given, first non-option is the script
@@ -62,13 +67,58 @@ APPLY (writes):
     re-piped.
 
 EXAMPLES:
-    bsed preview -e 's/old/new/' -p src/x.rs
-    bsed preview 's/old/new/' src/x.rs
-    bsed preview -f script.sed src/x.rs
-    bsed preview -r -p src 's/old/new/' > blocks.txt
+    bsed 's/old/new/' src/x.rs
+    bsed -e 's/old/new/' -p src/x.rs
+    bsed -f script.sed src/x.rs
+    bsed -u 's/old/new/' src/x.rs | less
+    bsed -r -p src 's/old/new/' > blocks.txt
     bsed apply -i < blocks.txt
     bsed apply src/x.rs < blocks.txt | diff src/x.rs -
 ";
+
+/// Which of the two renderings to use, and with how much context.
+#[derive(Clone, Copy)]
+struct Mode {
+    /// A unified diff for a person, rather than blocks for `edit`.
+    unified: bool,
+    /// Unchanged lines each side of a diff hunk. Only consulted when `unified`.
+    ///
+    /// Blocks default to zero because their reader is a program that wants the
+    /// smallest correct payload, and a block is anchored so it needs no room. A
+    /// diff has no anchor and its reader is a person, so a hunk with no context
+    /// is a diff you have to open the file to read. `-u` therefore falls back to
+    /// `udiff::DEFAULT_CONTEXT` when the caller asked for neither `-c` nor `-t`
+    /// -- the same value picocode's in-panel edit preview uses. Asking for either
+    /// overrides it, so neither flag is ever silently ignored.
+    diff_context: usize,
+}
+
+/// What a successful run produced, split by where it has to go.
+///
+/// The split is the whole point: stdout is the *payload* and nothing else, so
+/// `bsed ... > blocks.txt` leaves a file with the blocks in it and no
+/// commentary, and `bsed ... | less` shows the diff rather than a summary line
+/// above it. The banner, the "N of M files changed" line, and every NOTE go to
+/// stderr, which a pipe throws away and a terminal shows.
+///
+/// `apply` is the exception and keeps one stream. Its report is deliberately
+/// written as a valid blocks file -- the prose and the blocks interleaved, so it
+/// can be edited and re-piped -- so it cannot be torn in two without losing that.
+struct Out {
+    payload: String,
+    status: String,
+}
+
+impl Out {
+    /// Everything in the payload, nothing in the status. For `apply`, whose
+    /// report has to stay one piece.
+    fn all(payload: String) -> Out {
+        Out {
+            payload,
+            status: String::new(),
+        }
+    }
+}
 
 /// Entry point shared by the standalone binary and picocode's shim, so both
 /// resolve the same arguments the same way.
@@ -76,8 +126,13 @@ pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(out) => {
-            if !out.is_empty() {
-                emit(&out);
+            // Status first: on a terminal the summary belongs above the blocks,
+            // and stdout may be buffered where stderr is not.
+            if !out.status.is_empty() {
+                eprint!("{}", out.status);
+            }
+            if !out.payload.is_empty() {
+                emit(&out.payload);
             }
             ExitCode::SUCCESS
         }
@@ -178,36 +233,52 @@ enum Failure {
     Internal(String),
 }
 
-fn run(args: &[String]) -> Result<String, Failure> {
+/// Pick the mode. `apply` is the only subcommand; everything else previews,
+/// which is what the name is for.
+///
+/// The dispatcher stays this thin on purpose. It used to reject a leading flag
+/// with "unknown option", on the reasoning that a flag cannot be an expression —
+/// true, but it left `bsed -p f.rs 's/a/b/'` unusable even though that is exactly
+/// what `sed` accepts, and what picocode's `sed` tool wants to run. Handing every
+/// non-`apply` argument list to the preview parser instead means options may
+/// lead, the script may come from `-e`, `-f` or a positional, and an option that
+/// exists in neither mode is still rejected — by the parser that knows the
+/// options, with the same message and the same usage text.
+fn run(args: &[String]) -> Result<Out, Failure> {
     match args.first().map(String::as_str) {
         // No arguments at all: print usage rather than block forever waiting for
         // expressions on stdin, which is what `bsed` on its own used to do.
-        None => Ok(USAGE.to_string()),
-        Some("preview") => preview(&args[1..]),
+        None => Ok(Out::all(USAGE.to_string())),
         Some("apply") => apply(&args[1..]),
-        Some("-h") | Some("--help") | Some("help") => Ok(USAGE.to_string()),
-        Some("--version") | Some("-V") => Ok(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))),
-        // A leading flag cannot be an expression, so it is a usage error.
-        Some(other) if other.len() > 1 && other.starts_with('-') => {
-            Err(Failure::Usage(format!("unknown option `{other}`")))
+        Some("-h") | Some("--help") | Some("help") => Ok(Out::all(USAGE.to_string())),
+        Some("--version") | Some("-V") => {
+            Ok(Out::all(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))))
         }
-        // Otherwise the first word is an expression: `bsed 's/x/y/' -p f.rs`
-        // is the form people actually type.
+        // `preview` was a subcommand once. Left here so the muscle memory lands
+        // on the reason rather than on a parse error about the word itself.
+        Some("preview") => Err(Failure::Usage(
+            "there is no `preview` subcommand — previewing is what `bsed` does by default. \
+             Drop the word: `bsed 's/a/b/' f.rs`."
+                .into(),
+        )),
         Some(_) => preview(args),
     }
 }
 
-fn preview(args: &[String]) -> Result<String, Failure> {
+fn preview(args: &[String]) -> Result<Out, Failure> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut recursive = false;
     let mut globs: Vec<String> = Vec::new();
-    let mut context: usize = 0;
+    // Option, not a plain 0: `-c 0` is a real request for no context and
+    // must not be mistaken for "not given", which `-u` reads differently.
+    let mut context: Option<usize> = None;
     let mut trailing: Option<usize> = None;
     let mut grow = true;
     let mut budget = Options::default().max_preview_bytes;
     let mut script_parts: Vec<String> = Vec::new();
     let mut only_positional = false;
     let mut saw_e_or_f = false;
+    let mut unified = false;
 
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
@@ -218,8 +289,10 @@ fn preview(args: &[String]) -> Result<String, Failure> {
         }
         match a.as_str() {
             "--" => only_positional = true,
-            "-h" | "--help" => return Ok(USAGE.to_string()),
-            "--version" | "-V" => return Ok(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))),
+            "-h" | "--help" => return Ok(Out::all(USAGE.to_string())),
+            "--version" | "-V" => {
+                return Ok(Out::all(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))))
+            }
             "-e" | "--expression" => {
                 saw_e_or_f = true;
                 script_parts.push(need(it.next(), "-e")?.to_string());
@@ -234,10 +307,11 @@ fn preview(args: &[String]) -> Result<String, Failure> {
             "-p" | "--path" => paths.push(PathBuf::from(need(it.next(), "-p")?)),
             "-r" | "--recursive" => recursive = true,
             "-g" | "--glob" => globs.push(need(it.next(), "-g")?.to_string()),
-            "-c" | "--context" => context = need_num(it.next(), "-c")?,
+            "-c" | "--context" => context = Some(need_num(it.next(), "-c")?),
             "-t" | "--trailing" => trailing = Some(need_num(it.next(), "-t")?),
             "-b" | "--budget" => budget = need_num(it.next(), "-b")?,
             "--no-grow" => grow = false,
+            "-u" | "--unified" => unified = true,
             "-n" | "--quiet" => {
                 // Accepted for sed compatibility; preview ignores it
             }
@@ -260,7 +334,7 @@ fn preview(args: &[String]) -> Result<String, Failure> {
         // No script on command line: read from stdin
         if std::io::stdin().is_terminal() {
             return Err(Failure::Usage(
-                "no sed script given. Usage: bsed preview [-e SCRIPT] [-f FILE] [FILE...]".into(),
+                "no sed script given. Usage: bsed [-e SCRIPT] [-f FILE] [FILE]...".into(),
             ));
         }
         read_stdin()?
@@ -280,10 +354,19 @@ fn preview(args: &[String]) -> Result<String, Failure> {
     };
 
     let ctx = Context {
-        leading: context,
-        trailing: trailing.unwrap_or(2),
+        leading: context.unwrap_or(0),
+        trailing: trailing.unwrap_or(0),
         grow,
         growth_cap: 20,
+    };
+    let mode = Mode {
+        unified,
+        // `-u` only borrows the context flags; with neither given it uses the
+        // diff default rather than the block default of 0. See `Mode`.
+        diff_context: match (context, trailing) {
+            (None, None) => blockedit::udiff::DEFAULT_CONTEXT,
+            (c, t) => c.unwrap_or(0).max(t.unwrap_or(0)),
+        },
     };
 
     // Handle single file or multiple files
@@ -291,17 +374,17 @@ fn preview(args: &[String]) -> Result<String, Failure> {
         let p = &input_files[0];
         if p == Path::new("-") {
             let text = read_stdin()?;
-            return single(&text, "(stdin)", &script, ctx, budget);
+            return one_file(&text, "(stdin)", &script, ctx, budget, mode);
         }
         if p.is_dir() {
             if !recursive {
                 return Err(Failure::Usage(format!(
-                    "{} is a directory. Use `bsed preview -r -p {}` to preview every file under it.",
+                    "{} is a directory. Use `bsed -r -p {}` to preview every file under it.",
                     p.display(),
                     p.display()
                 )));
             }
-            return recursive_preview(p, &script, ctx, &globs);
+            return recursive_preview(p, &script, ctx, &globs, mode);
         }
         if !globs.is_empty() {
             return Err(Failure::Usage(
@@ -310,10 +393,10 @@ fn preview(args: &[String]) -> Result<String, Failure> {
         }
         let text = std::fs::read_to_string(p)
             .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
-        single(&text, &p.display().to_string(), &script, ctx, budget)
+        one_file(&text, &p.display().to_string(), &script, ctx, budget, mode)
     } else if recursive && input_files.len() == 1 && input_files[0].is_dir() {
         // Single directory with -r
-        recursive_preview(&input_files[0], &script, ctx, &globs)
+        recursive_preview(&input_files[0], &script, ctx, &globs, mode)
     } else if recursive {
         // Multiple files with -r: treat each as a root to walk
         // (This is a simplification; typically -r takes one directory)
@@ -321,13 +404,16 @@ fn preview(args: &[String]) -> Result<String, Failure> {
             "--recursive expects a single directory".into(),
         ));
     } else {
-        // Multiple files: preview each and concatenate
-        let mut combined = String::new();
+        // Multiple files: preview each, and keep the two streams apart as we go
+        // so the payloads concatenate into one pipeable blob.
+        let mut out = Out {
+            payload: String::new(),
+            status: String::new(),
+        };
         for p in &input_files {
-            if p == Path::new("-") {
+            let shown = if p == Path::new("-") {
                 let text = read_stdin()?;
-                let result = single(&text, "(stdin)", &script, ctx, budget)?;
-                combined.push_str(&result);
+                one_file(&text, "(stdin)", &script, ctx, budget, mode)?
             } else if p.is_dir() {
                 return Err(Failure::Usage(format!(
                     "{} is a directory. Use -r to preview recursively.",
@@ -336,12 +422,80 @@ fn preview(args: &[String]) -> Result<String, Failure> {
             } else {
                 let text = std::fs::read_to_string(p)
                     .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
-                let result = single(&text, &p.display().to_string(), &script, ctx, budget)?;
-                combined.push_str(&result);
+                one_file(&text, &p.display().to_string(), &script, ctx, budget, mode)?
+            };
+            if !out.payload.is_empty() && !shown.payload.is_empty() {
+                out.payload.push('\n');
             }
+            out.payload.push_str(&shown.payload);
+            out.status.push_str(&shown.status);
         }
-        Ok(combined)
+        Ok(out)
     }
+}
+
+/// One file, in whichever of the two output modes was asked for.
+///
+/// Both modes run the same script through the same engine, so they cannot
+/// disagree about what sed would write -- only about how the change is shown.
+/// The split exists because the two have different readers: blocks are pasted
+/// into `edit`, a diff is read in a pager.
+fn one_file(
+    text: &str,
+    shown: &str,
+    expressions: &str,
+    ctx: Context,
+    budget: usize,
+    mode: Mode,
+) -> Result<Out, Failure> {
+    if mode.unified {
+        diff_one(text, shown, expressions, mode.diff_context)
+    } else {
+        single(text, shown, expressions, ctx, budget)
+    }
+}
+
+/// One file as a unified diff, for `-u`.
+///
+/// This is the mode that is *only* read. The output is a real unified diff --
+/// `---`/`+++` headers and `@@` hunk markers, the shape `patch` and every diff
+/// tool reads -- because the `path:LINE` header that carries the file name in a
+/// block has no equivalent outside the block format, and a multi-file run would
+/// otherwise have no way to say which file a hunk came from.
+///
+/// The context is the caller's `-c`/`-t`, and it is the only knob that applies:
+/// a diff has no budget, since there are no blocks to drop, and a truncated
+/// diff is a diff that lies about what it skipped.
+fn diff_one(
+    text: &str,
+    shown: &str,
+    expressions: &str,
+    diff_context: usize,
+) -> Result<Out, Failure> {
+    let (new, n) =
+        crate::preview_new(text, shown, expressions).map_err(|e| Failure::User(e.to_string()))?;
+    let d = blockedit::udiff::unified(text, &new, shown, diff_context);
+    if d.is_empty() {
+        return Ok(Out {
+            payload: String::new(),
+            status: format!(
+                "sed diff: no lines matched — {shown} is unchanged by these {} expression{}.\n",
+                n,
+                if n == 1 { "" } else { "s" }
+            ),
+        });
+    }
+    let hunks = d.matches("\n@@").count() + usize::from(d.starts_with("@@"));
+    Ok(Out {
+        status: format!(
+            "sed diff: {shown} — {hunks} hunk{} from {} expression{}. A diff is for reading; \
+             drop -u for blocks the `edit` tool can apply.\n",
+            if hunks == 1 { "" } else { "s" },
+            n,
+            if n == 1 { "" } else { "s" }
+        ),
+        payload: format!("{d}\n"),
+    })
 }
 
 /// One file, with the agent-facing preview budget applied.
@@ -351,7 +505,7 @@ fn single(
     expressions: &str,
     ctx: Context,
     budget: usize,
-) -> Result<String, Failure> {
+) -> Result<Out, Failure> {
     let opts = Options {
         context: ctx,
         max_preview_bytes: budget,
@@ -366,9 +520,24 @@ fn single(
         )));
     }
     if p.blob.is_empty() {
-        return Ok(format!("{}\n", p.banner));
+        return Ok(Out {
+            status: format!("{}\n", p.banner),
+            payload: String::new(),
+        });
     }
-    Ok(format!("{}\n{}\n", p.banner, p.blob))
+    // The banner is a status line about the payload, not part of it. It used to
+    // lead the blob, which the `edit` tool's parser tolerates -- a header is a
+    // whitespace-free token and a prose line is not -- but it meant
+    // `bsed ... > blocks.txt` wrote a file that opened with a sentence.
+    let mut payload = p.blob;
+    // `render` strips the blob's trailing newline so the payload round-trips as
+    // typed; put one back, since a text file that ends mid-line is its own
+    // surprise for whatever reads it next.
+    payload.push('\n');
+    Ok(Out {
+        status: format!("{}\n", p.banner),
+        payload,
+    })
 }
 
 /// Preview every file under `root`, emitting one blob with a header per file.
@@ -382,7 +551,8 @@ fn recursive_preview(
     expressions: &str,
     ctx: Context,
     globs: &[String],
-) -> Result<String, Failure> {
+    mode: Mode,
+) -> Result<Out, Failure> {
     // Same matcher and the same semantics as picocode's `find` tool: the pattern
     // is matched against the path *relative to the walk root*, so a recursive
     // match is written `**/*.rs`.
@@ -436,12 +606,39 @@ fn recursive_preview(
             skipped += 1; // binary or unreadable
             continue;
         };
-        let p = match crate::preview_text(&text, &f.display().to_string(), expressions, opts) {
+        let shown = f.display().to_string();
+        if mode.unified {
+            // A diff is built straight from the two versions of the file, so
+            // there is no block budget and no "could not be expressed" case to
+            // report: a file either differs or it does not.
+            let (new, _) = match crate::preview_new(&text, &shown, expressions) {
+                Ok(v) => v,
+                Err(crate::Error::CarriageReturn(_)) => {
+                    crlf.push(shown);
+                    continue;
+                }
+                Err(e) => return Err(Failure::User(e.to_string())),
+            };
+            let d = blockedit::udiff::unified(&text, &new, &shown, mode.diff_context);
+            if d.is_empty() {
+                continue;
+            }
+            // Blank line between files, so a reader (or `patch`) can tell one
+            // file's hunks from the next.
+            if !blob.is_empty() {
+                blob.push('\n');
+            }
+            blob.push_str(&d);
+            blob.push('\n');
+            changed_files += 1;
+            continue;
+        }
+        let p = match crate::preview_text(&text, &shown, expressions, opts) {
             Ok(p) => p,
             // One refused file must not sink the tree, but it must be named:
             // silence here would read as "that file needed no change".
             Err(crate::Error::CarriageReturn(_)) => {
-                crlf.push(f.display().to_string());
+                crlf.push(shown);
                 continue;
             }
             Err(e) => return Err(Failure::User(e.to_string())),
@@ -452,7 +649,7 @@ fn recursive_preview(
         if let Some(why) = p.blocked {
             // One unrepresentable file must not sink the tree, but it must be
             // named: silence here would read as "that file needed no change".
-            blocked.push((f.display().to_string(), why));
+            blocked.push((shown, why));
             continue;
         }
         let b = p.blob;
@@ -488,21 +685,41 @@ fn recursive_preview(
         if !crlf.is_empty() {
             out.push_str(&crlf_report(&crlf));
         }
-        return Ok(out);
+        // Nothing to preview, so there is no payload and stdout stays empty --
+        // a reader is left with the explanation on stderr and no file on disk
+        // that looks like it was written. Note that a run with nothing to show
+        // still exits 0: the expression was fine, the file simply matched
+        // nothing, which is an answer rather than a failure.
+        return Ok(Out {
+            payload: String::new(),
+            status: out,
+        });
     }
 
-    let mut out = format!(
-        "sed preview: {changed_files} of {} file(s) under {} changed, {blocks} block(s) \
-         total. Review the blocks below, then apply them with `bsed apply -i`.\n",
-        files.len(),
-        root.display(),
-    );
+    let mut out = if mode.unified {
+        // A diff cannot be applied by anything, so the summary must not invite
+        // it to be. `blocks` is 0 in this mode by construction.
+        format!(
+            "sed diff: {changed_files} of {} file(s) under {} changed. A diff is for reading; \
+             drop -u for blocks `bsed apply -i` can write.\n",
+            files.len(),
+            root.display(),
+        )
+    } else {
+        format!(
+            "sed preview: {changed_files} of {} file(s) under {} changed, {blocks} block(s) \
+             total. Review the blocks below, then apply them with `bsed apply -i`.\n",
+            files.len(),
+            root.display(),
+        )
+    };
     if skipped > 0 {
         out.push_str(&format!(
             "NOTE: {skipped} file(s) skipped (not UTF-8 text).\n"
         ));
     }
-    if !blocked.is_empty() {
+    // Nothing can be "unexpressible as blocks" in a mode that emits none.
+    if !mode.unified && !blocked.is_empty() {
         out.push_str(&format!(
             "NOTE: {} file(s) matched but cannot be expressed as appliable blocks, and are \
              NOT in the output:\n",
@@ -515,9 +732,14 @@ fn recursive_preview(
     if !crlf.is_empty() {
         out.push_str(&crlf_report(&crlf));
     }
-    out.push_str(&blob);
-    out.push('\n');
-    Ok(out)
+    // The summary and every NOTE are about the blob, so they go with the
+    // terminal rather than into it. `bsed -r ... > blocks.txt` now writes blocks.
+    let mut payload = blob;
+    payload.push('\n');
+    Ok(Out {
+        payload,
+        status: out,
+    })
 }
 
 /// Name the files that were refused for CRLF, and what to do about them.
@@ -577,13 +799,13 @@ fn read_stdin() -> Result<String, Failure> {
     Ok(buf)
 }
 
-fn apply(args: &[String]) -> Result<String, Failure> {
+fn apply(args: &[String]) -> Result<Out, Failure> {
     let mut path: Option<PathBuf> = None;
     let mut in_place = false;
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "-h" | "--help" => return Ok(USAGE.to_string()),
+            "-h" | "--help" => return Ok(Out::all(USAGE.to_string())),
             "-p" | "--path" => path = Some(PathBuf::from(need(it.next(), "-p")?)),
             "-i" | "--in-place" => in_place = true,
             other if other.starts_with('-') => {
@@ -723,10 +945,13 @@ fn apply(args: &[String]) -> Result<String, Failure> {
             .map_err(|e| Failure::Internal(format!("{}: {e}", path)))?;
         let edits: Vec<EditOp> = blockedit::to_ops(&batches[0].edits);
         if let ApplyOutcome::Applied { text, .. } = blockedit::apply_to_text(&text, &edits) {
-            return Ok(text);
+            return Ok(Out::all(text));
         }
     }
-    Ok(out)
+    // `apply` keeps one stream on purpose: its report is written as a valid
+    // blocks file so it can be edited and re-piped, and tearing the prose off
+    // would stop the blocks from parsing on their own.
+    Ok(Out::all(out))
 }
 
 /// Turn the JSON failure report into one human-readable line.

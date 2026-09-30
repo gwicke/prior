@@ -411,8 +411,10 @@ const BSED_BIN: &str = "bsed";
     description = "Preview what GNU sed expressions would change in a file, as editable blocks. \
 This tool NEVER writes the file: it returns the change as @@@OLD / @@@NEW blocks, each \
 anchored to a line with a `path:LINE` header. Review them, then pass them to the `edit` tool \
-as its `blocks` argument to apply. One expression per line, GNU sed syntax (s///, d, a, c, y///, \
-addresses, ranges). `w`, `e` and `q` are refused: use the `edit` or `bash` tools for those.",
+as its `blocks` argument to apply. One expression per line, GNU sed syntax (s///, d, a, i, c, \
+y///, addresses, ranges) — `c` works over an address range, replacing it with one copy of the \
+text. `w`, `e` and `q` are refused: use the `edit` or `bash` tools for those. Files with CRLF \
+line endings are refused; convert them to LF first.",
     required(path, expressions)
 )]
 pub async fn sed_preview(
@@ -462,18 +464,19 @@ pub async fn sed_preview(
              Install it with `cargo install --path .` (it ships alongside picocode)."
         ))
     })?;
+    // The script leads, then the flags. `bsed` now takes options anywhere, but
+    // this ordering is what every version of it accepts -- a leading flag was
+    // rejected until the `preview` subcommand went away -- and it is the form
+    // the usage text leads with, so the two cannot drift.
     let argv = vec![
         bin.to_string_lossy().to_string(),
-        "preview".into(),
+        expressions,
         "-c".into(),
         context.clamped().to_string(),
-        "-t".into(),
-        SAFE_SED_TRAILING.to_string(),
         "-b".into(),
         SED_PREVIEW_BUDGET.to_string(),
         "-p".into(),
         rel,
-        expressions,
     ];
     let (raw, code) = run_sandboxed_ro_status(
         &argv,
@@ -484,7 +487,12 @@ pub async fn sed_preview(
     )
     .await?;
 
-    // `bsed` writes its error text to stderr, which is merged into stdout above.
+    // The capture merges the child's stderr into stdout, which is what keeps the
+    // banner here. `bsed` puts the blocks on stdout and everything about them --
+    // the banner, the "N of M files changed" line, the NOTEs -- on stderr, so a
+    // shell user gets a clean pipeable blob while the model still reads the
+    // summary and the "pass them to `edit`" instruction ahead of the blocks.
+    //
     // Exit 2 is the caller's problem (a refused expression, an unappliable
     // block) and is returned as a normal result so the model can read and fix it;
     // anything else is ours.
@@ -496,13 +504,6 @@ pub async fn sed_preview(
         ))),
     }
 }
-
-/// Unchanged lines the `sed` preview always adds *after* a change.
-///
-/// Two is deliberate: it lifts a one-line change to a three-line `OLD`, which
-/// is what buys the `edit` tool a ±1 anchor tolerance instead of zero. See
-/// `doc/bsed.md` §4.1.
-const SAFE_SED_TRAILING: &str = "2";
 
 #[rig_tool(
     name = "find",

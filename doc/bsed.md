@@ -31,7 +31,7 @@ s/const MAG_VAR_THRESH_LOW: f32 = 2.0;/const MAG_VAR_THRESH_LOW: f32 = 5.0;/
 The idea: **sed becomes advisory.** The model formulates GNU sed expressions, gets
 back a reviewable, line-anchored `@@@OLD`/`@@@NEW`/`@@@END` preview, and applies
 (all or part of) it through the existing `edit` tool — already anchor-aware,
-uniqueness-checked, overlap-checked, all-or-nothing. `bsed preview` never writes.
+uniqueness-checked, overlap-checked, all-or-nothing. Previewing never writes.
 If the preview is wrong, nothing was lost.
 
 This is not "sed that is safer at writing". It is a **sed-to-block-edit
@@ -73,7 +73,7 @@ uncommitted work":
 3. **Read-only bwrap namespace** — the same machinery `rg`/grep uses
    (`run_sandboxed_ro`, `src/tools.rs:1256`): cwd ro-bound, `/tmp` a scratch
    tmpfs, `--unshare-net`, `--cap-drop ALL`, `--die-with-parent`, memory cap,
-   120 s default timeout. The agent only ever runs `bsed preview` there.
+   120 s default timeout. The agent only ever previews there.
 
 `bsed` is genuinely useful standalone (`bsed apply` from a shell, later
 `replace -r` recursive search/replace), which is what makes extracting the block
@@ -102,31 +102,42 @@ Tool name `sed`, registered **only when `bsed` is found on `$PATH`** (§9).
 * `context` — integer or numeric string, same shape as `ReadLimit`
   (`src/config.rs:100`), because harnesses stringify numbers. Default **0**;
   clamped to `[0, 20]`. Effective padding is `leading = context`,
-  `trailing = max(context, 2)` — a free 2-line tail, symmetric on request. See
-  §4.1.
-* Returns a string: a one-line banner, then the block blob (§7). Never writes.
+  `trailing = 0`. A `bsed` caller asks for trailing context with `-t N`; the
+  agent tool does not, and the default is 0 on both sides. See §4.1.
+* Returns the block blob on stdout and a one-line banner on stderr (§7.1a).
+  Never writes.
   Not wrapped in `guard()` — it is a read-only preview.
 
 ## 4. Producing the preview
 
-### 4.1 What `context` is, and why the default is 0
+### 4.1 What `context` is, and why both defaults are 0
 
 **`context` is not "print N lines around the match"** (that is `grep -C`). It is
 the number of **unchanged** lines of the original file carried *into each emitted
 block*, inside `OLD` and `NEW`. Only regions that actually changed are ever
 emitted; `context` pads each one.
 
-**The rule is asymmetric by default and symmetric on request:**
-`leading = context`, `trailing = max(context, TAIL)`, `TAIL = 2`
-(`[tool_config.sed].trailing_context`). `context` defaults to **0**, so an
-unadorned call gets 0 lines before and 2 after; asking for `context: n` sets both
-sides to `n`, with the trailing value acting as a floor. Rationale: the *following*
-lines are where a change most often continues, and a 2-line tail turns a 1-line
-`OLD` into a 3-line one, which lifts `anchor_tolerance` from 0 to 1 (below) —
-cheap insurance against a stale anchor. It also covers the smallest multi-line
-call shape (`compute(` / `a,` / `b,`). It does not *close* the construct, but it
-signals that a multi-line statement is in play, which should trigger a
-`context: 4` re-run or the balance-growth pass (§4.6).
+**Both defaults are 0.** `leading = context`, `trailing = 0`; a caller wanting a
+tail asks for it with `-t N`. An unadorned call therefore gets only the changed
+lines, plus whatever the balance-growth pass (§4.6) reaches.
+
+This was not always so, and the argument for the 2-line tail it replaced is worth
+keeping, because it is the reason `context` exists at all. The tail turned a
+1-line `OLD` into a 3-line one, which lifted `anchor_tolerance` from 0 to 1 (see
+below) — insurance against a file that shifted between preview and apply. It also
+covered the smallest multi-line call shape (`compute(` / `a,` / `b,`), signalling
+that a multi-line statement was in play.
+
+It was dropped because every block already carries a `path:LINE` anchor computed
+from the file `bsed` just read, so an unshifted file needs no tolerance at all;
+the slack only ever mattered for a *stale* anchor, which is a workflow problem
+(apply the whole blob in one `edit` call) rather than a preview one. Meanwhile the
+tail cost a third of the 50 KB budget (§5.5) on every single-line change, and the
+growth pass already reaches the closing bracket when one is nearby. Dropping it
+does make a 1-line block have exactly zero slack, so a batch applied after an
+unrelated edit can still be refused — correctly, with "anchor out of tolerance" —
+and re-previewing is the answer. That trade is deliberate: fewer blocks fit in the
+budget, and the same information is available on request.
 
 **Line anchoring is what makes small blocks viable — that is the entire reason
 the blocks are anchored.** Reading `edit`'s anchored pass (Pass 1,
@@ -156,12 +167,11 @@ What `context` then buys is three things, none of which is "makes the edit apply
    if the file shifted between preview and apply — the model applied an earlier
    batch first, or something else touched the file — the 40-duplicate case fails
    the skew rule outright (`d2 = 1 < 3 × d1` for any `d1 ≥ 1`) and `edit` reports
-   "anchor out of tolerance". Correct behaviour, but a wasted round-trip. The
-   default 2-line tail largely closes this: a 1-line change becomes a 3-line `OLD`
-   and gets ±1 of tolerance for the price of two lines of the file the model was
-   going to read anyway. The remaining workflow rule (which the banner should
-   state) is: apply the whole blob in **one** `edit` call, and re-preview before
-   any follow-up batch.
+   "anchor out of tolerance". Correct behaviour, but a wasted round-trip. With
+   both defaults 0 this is the case to expect: a 1-line block has no slack at all.
+   The rule that avoids it is the same either way — apply the whole blob in **one**
+   `edit` call, and re-preview before any follow-up batch — and a caller who wants
+   the insurance can ask for a tail with `-t 2`, which restores ±1.
 2. **Legibility of the preview** — `run(); → walk();` alone does not show the
    enclosing `if count > 0 {`. Largely free via §4.6 (the TUI panel renders a
    context-rich diff; only the *model* payload is terse), so there is no reason to
@@ -173,8 +183,8 @@ What `context` then buys is three things, none of which is "makes the edit apply
 
 Cost when used: blocks grow, so the 50 KB preview budget (§5.5) is consumed
 faster, and hunks within `2*context` merge into one larger block (harmless —
-`similar` guarantees they cannot overlap). With `context: 0` the only growth is
-the 2-line tail, clamped so it can never reach the next block (§4.5, rule 8).
+`similar` guarantees they cannot overlap). With both defaults 0 the only growth
+is the balance pass, clamped so it can never reach the next block (§4.5, rule 8).
 
 ### 4.2 Pipeline (inside `bsed`)
 
@@ -384,13 +394,13 @@ that is *not* a new enum variant (a panic in a pathological regex, an
   misconfiguration degrades to "deny-list still holds".
 
 So: keep all three layers. The deny-list is not redundant with the sandbox — it
-is what makes `bsed preview` safe when a *human* runs it outside any sandbox, and
+is what makes a preview safe when a *human* runs it outside any sandbox, and
 it produces a good error message instead of an opaque `sed: can't read` from
 inside a namespace.
 
 ### 5.3 Layer 3 — read-only sandbox
 
-`bsed preview` runs via `run_sandboxed_ro(argv, cfg, timeout)` (`src/tools.rs:1256`),
+A preview runs via `run_sandboxed_ro(argv, cfg, timeout)` (`src/tools.rs:1256`),
 identical to the grep/`rg` path:
 
 * argv only, never a shell; the model never supplies a subcommand, a flag name, or
@@ -562,8 +572,8 @@ which is also GNU's per-command scoping.
 ## 7. `bsed` — the standalone tool
 
 ```
-bsed preview [-c N] [-p PATH] <expressions>   # print the block blob (default)
-bsed preview -r -p DIR <expressions>          # walk a tree, one blob for all of it
+bsed [-c N] [-p PATH] <expressions>   # print the block blob (the default)
+bsed -r -p DIR <expressions>          # walk a tree, one blob for all of it
 bsed apply  [-p PATH] [-i] [FILE]             # read a blob from stdin, apply
 bsed --version                                # "bsed 0.1.0" (probe + handshake)
 ```
@@ -582,7 +592,7 @@ bsed --version                                # "bsed 0.1.0" (probe + handshake)
 ### 7.1 The recursive flow
 
 ```
-bsed preview -r -p src 's/foo/bar/g' > blocks.txt   # review
+bsed -r -p src 's/foo/bar/g' > blocks.txt   # review
 bsed apply -i < blocks.txt                          # commit it
 ```
 
@@ -607,7 +617,81 @@ way to write files, and a second writer is exactly what this design removes.
   recursive match is written `**/*.rs`, not `*.rs`.
 * **The banner** reports files, not blocks: `2 of 4 file(s) under src changed,
   3 block(s) total`, plus a note when files were skipped or when a file matched
-  but could not be expressed as blocks (§7.4).
+  but could not be expressed as blocks (§7.4). It goes to stderr, along with
+  every NOTE, so stdout stays a pipeable blob.
+
+### 7.1a stdout is the payload, stderr is the commentary
+
+Every successful run splits in two. **stdout carries the payload and nothing
+else** — the block blob, nothing more. **stderr carries everything about it**: the
+banner, the "N of M file(s) changed" summary, and every NOTE. Errors and usage
+were already on stderr.
+
+The reason is that the payload has a consumer. `bsed ... > blocks.txt` has to
+produce a file the `edit` tool accepts as its `blocks` argument verbatim, and
+`bsed ... | less` has to show the change rather than a paragraph above it. Both
+used to get a banner and a trail of NOTEs wedged into the middle of the stream —
+tolerated, because the blob parser ignores a prose line that is not a bare token
+(`crates/bsed/src/blocks.rs`), which is exactly why it went unnoticed. The split
+makes the file correct rather than merely parseable.
+
+A run that changes nothing writes an **empty** stdout and explains itself on
+stderr, still exiting `0`: the expression was fine, the file simply matched
+nothing. A file whose blocks could not be expressed is named in a stderr NOTE,
+so a redirect never produces a file that looks complete.
+
+`apply` is deliberately the exception and keeps one stream. Its report is written
+as a *valid blocks file* — prose and blocks interleaved, so the failures can be
+edited and re-piped — and tearing it in two would stop the blocks from parsing
+on their own (§7.2).
+
+The agent is unaffected: the sandbox capture uses `stderr_to_stdout`, so the model
+still reads the banner and the "pass them to `edit`" instruction ahead of the
+blocks, exactly as before.
+
+### 7.1b `-u`: a unified diff instead of blocks
+
+Blocks and a diff answer the same question — what would this script change —
+for readers with nothing in common. A block is pasted into `edit`; a diff is read
+in a pager. `-u` switches which one is emitted, and nothing else: the same script
+through the same engine, so the two modes cannot disagree about what sed would
+write.
+
+```
+$ bsed -u 's/old_name/new_name/' -p src/x.rs
+--- src/x.rs
++++ src/x.rs
+@@ -1,5 +1,5 @@
+ fn main() {
+     let old_name = 1;
+-    let old_name = 2;
++    let new_name = 2;
+ }
+```
+
+It is a real unified diff: `---`/`+++` headers and `@@` hunks, which is what
+`patch` and every diff tool reads. That is the reason it is not picocode's
+in-panel edit preview (`refined_diff_lines` in `src/output.rs`): that one is a *display*
+format, with no file headers at all, a space after each `-`/`+` so the terminal
+panel can align columns, and a 60-line cap because it is about to be drawn in a
+scrollback. None of that survives a redirect, and a multi-file run has no other
+way to say which file a hunk came from. The two share the diff — Myers via
+`similar`, and a line split that keeps a `
+` as content — and nothing else.
+
+Two things follow from it being for a person:
+
+* **Context falls back to 2, not 0.** Blocks default to zero because their
+  reader is a program wanting the smallest correct payload, and a block is
+  anchored so it needs no room. A diff has no anchor, and a hunk with no context
+  is a diff you have to open the file to read. `-c`/`-t` override, and `-c 0` is
+  honoured as a real request for none.
+* **No budget, and no "could not be expressed" case.** There are no blocks to
+  drop, and a diff that silently omitted a file would be lying about the change.
+  A CRLF file is still refused, as everywhere else.
+
+The status line says `sed diff:` and points at `-u` rather than `bsed apply -i`,
+since nothing can apply a diff.
 
 ### 7.2 Apply is atomic *per file*
 
@@ -663,7 +747,7 @@ pointer would be noise. `BSED_SPOOL_DIR` overrides the location.
 
 ### 7.3 A file that cannot be expressed as blocks
 
-Previewing a file that is *itself* a blocks file (`bsed preview -r > blocks.txt`
+Previewing a file that is *itself* a blocks file (`bsed -r > blocks.txt`
 is a normal thing to do, and then previewing `blocks.txt`) puts literal
 `@@@NEW` lines inside a block, because that is what the file contains. The blob
 format cannot express it: those lines are structure, not content.
@@ -756,7 +840,7 @@ no behaviour change, and it de-risks the crate work.
 | Where | Change |
 | --- | --- |
 | `Cargo.toml` | `members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/bsed"]`; `blockedit = { path = … }`. add `bsed` as a dep, purely for the `bsed` shim binary (§7). |
-| `src/tools.rs` | `#[rig_tool(name = "sed", required(path, expressions))] async fn sed_preview(path, expressions, context: ContextLines)`: `get_path` → relativize → argv `["bsed","preview","-c",n,"-p",rel,"-e",expressions]` → `run_sandboxed_ro_with_status` (new, §5.3) with an explicit cap → map exit 2 to `Ok(message)`, 1 to `Err`. New `ContextLines` in `src/config.rs` cloned from `ReadLimit`. |
+| `src/tools.rs` | `#[rig_tool(name = "sed", required(path, expressions))] async fn sed_preview(path, expressions, context: ContextLines)`: `get_path` → relativize → argv `["bsed",expressions,"-c",n,"-b",budget,"-p",rel]` → `run_sandboxed_ro_with_status` (new, §5.3) with an explicit cap → map exit 2 to `Ok(message)`, 1 to `Err`. New `ContextLines` in `src/config.rs` cloned from `ReadLimit`. |
 | `src/tools.rs` | `bsed_available()` probe (`LazyLock<bool>` = `Command::new("bsed").arg("--version").status().is_ok()`), mirroring `is_executable` in `src/main.rs:97`. |
 | `src/agent.rs:1967` | register conditionally: `if bsed_available() { builder = builder.tool(SedPreview) }` — same conditional-advertisement shape as `guard(..., yolo, …)` for the mutating tools. |
 | `src/agent.rs:1923` | prompt: replace the "avoid sed … snapshot commit first" sentence with "use `sed` to preview bulk line changes — it never writes; review the returned blocks and apply them with `edit`." Only append the `sed` bullet when the tool is registered. |
@@ -850,19 +934,17 @@ Resolved since (reasoning in §7):
 | 11 | Scope of atomicity for a tree | **per file**: a stale file is reported and skipped, the rest apply | §7.2 |
 | 12 | Budget in `-r` mode | **none** — a human is reading it, and silent truncation is the worst outcome | §7.1 |
 | 13 | How do you see which replacements did not apply? | the **failed blocks are echoed back**, with paths and anchors, ready to re-pipe | §7.2 |
+| 14 | Trailing context by default? | **none** — `trailing: 0`, on both the CLI and the agent tool. Every block is anchored from the file just read, so the tail only bought slack against a stale anchor, at a third of the budget on every change | §4.1 |
 
 Still open — small tuning decisions, not architecture:
 
-1. **`TAIL` value.** Is 2 right for `[tool_config.sed].trailing_context`? 2 buys
-   a ±1 anchor tolerance (§4.1) and covers the 3-line call shape; 1 is cheaper; 3
-   starts covering 4-line calls at a real token cost on every single-line change.
-2. **Growth cap.** How many lines may a grown block add before we give up and emit
+1. **Growth cap.** How many lines may a grown block add before we give up and emit
    the banner hint instead? 40 was the sketch value; 20 is probably the honest one
    for code review.
-3. **Angle brackets.** Keep the "count `<` only if a `>` appears within the cap"
+2. **Angle brackets.** Keep the "count `<` only if a `>` appears within the cap"
    guard, or drop `<`/`>` from balancing entirely? Dropping is safer but stops
    `Vec<T>` and `HashMap<K, V>` in a changed line from triggering growth.
-4. **`bsed apply` in v1** or with `replace -r` later? `apply` is the piece a shell
+3. **`bsed apply` in v1** or with `replace -r` later? `apply` is the piece a shell
    user reaches for first, but it is not available until `blockedit` is extracted.
 
 ## 13. Deferred
@@ -877,7 +959,7 @@ Still open — small tuning decisions, not architecture:
   a session-storage question rather than a matching one.
 * Publishing `bsed` to crates.io, so `cargo install bsed` works without a
   git checkout.
-* A `--json` output mode for `bsed preview`, for tooling that wants the blocks
+* A `--json` output mode, for tooling that wants the blocks
   without parsing the blob text.
 
 ## 14. Where the implementation corrected this document

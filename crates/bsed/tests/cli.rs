@@ -67,7 +67,7 @@ fn tree() -> tempfile::TempDir {
 #[test]
 fn a_directory_without_recursive_is_a_usage_error() {
     let d = tree();
-    let o = run_in(d.path(), None, &["preview", "-p", ".", "s/a/b/"]);
+    let o = run_in(d.path(), None, &["-p", ".", "s/a/b/"]);
     assert_eq!(code(&o), 2);
     assert!(stderr(&o).contains("--recursive"), "{}", stderr(&o));
 }
@@ -76,7 +76,7 @@ fn a_directory_without_recursive_is_a_usage_error() {
 fn a_crlf_file_is_refused_with_a_reason() {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("crlf.txt"), "a\r\nb\r\n").unwrap();
-    let o = run_in(d.path(), None, &["preview", "s/b/B/", "crlf.txt"]);
+    let o = run_in(d.path(), None, &["s/b/B/", "crlf.txt"]);
     assert_eq!(code(&o), 2);
     let err = stderr(&o);
     assert!(err.contains("carriage returns"), "{err}");
@@ -96,16 +96,18 @@ fn a_crlf_file_does_not_sink_a_recursive_preview() {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("crlf.txt"), "a\r\nb\r\n").unwrap();
     std::fs::write(d.path().join("ok.txt"), "a\nb\n").unwrap();
-    let o = run_in(d.path(), None, &["preview", "-r", "-p", ".", "s/b/B/"]);
+    let o = run_in(d.path(), None, &["-r", "-p", ".", "s/b/B/"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
     // The LF file was still previewed...
     assert!(out.contains("ok.txt:2"), "{out}");
     assert!(out.contains("@@@NEW"), "{out}");
-    // ...and the CRLF one is named with the reason, not folded into the count.
-    assert!(out.contains("crlf.txt"), "{out}");
-    assert!(out.contains("CRLF"), "{out}");
-    assert!(!out.contains("crlf.txt:2"), "{out}");
+    // ...and the CRLF one is named with the reason, in the status, not folded
+    // into the payload or into a count.
+    let err = stderr(&o);
+    assert!(err.contains("crlf.txt"), "{err}");
+    assert!(err.contains("CRLF"), "{err}");
+    assert!(!out.contains("crlf.txt"), "{out}");
 }
 
 /// A tree that is *only* refused files must not report "no lines matched" and
@@ -114,41 +116,237 @@ fn a_crlf_file_does_not_sink_a_recursive_preview() {
 fn a_tree_of_only_crlf_files_says_why() {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("crlf.txt"), "a\r\nb\r\n").unwrap();
-    let o = run_in(d.path(), None, &["preview", "-r", "-p", ".", "s/b/B/"]);
+    let o = run_in(d.path(), None, &["-r", "-p", ".", "s/b/B/"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("no lines matched"), "{err}");
+    // ...but it also says which file matched and was skipped, and why. Nothing
+    // went to stdout: there was nothing to preview.
+    assert!(err.contains("crlf.txt"), "{err}");
+    assert!(err.contains("CRLF"), "{err}");
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
+}
+
+/// Previewing is the default mode: no subcommand word is needed, and the script
+/// may come first or from `-e`.
+#[test]
+fn previewing_needs_no_subcommand() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "a.rs", "one\ntwo\n");
+    for args in [
+        &["s/one/1/", "a.rs"][..],
+        &["s/one/1/", "-p", "a.rs"][..],
+        &["-c", "0", "-p", "a.rs", "s/one/1/"][..],
+        &["-e", "s/one/1/", "-p", "a.rs"][..],
+    ] {
+        let o = run_in(d.path(), None, args);
+        assert_eq!(code(&o), 0, "{args:?}: {}", stderr(&o));
+        assert!(stdout(&o).contains("a.rs:1"), "{args:?}: {}", stdout(&o));
+    }
+}
+
+/// A leading option used to be rejected on the grounds that a flag cannot be an
+/// expression. That left the `sed` tool's own invocation unusable; options may
+/// lead now, the way `sed` accepts them.
+#[test]
+fn an_option_may_lead_the_command_line() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "a.rs", "one\ntwo\n");
+    let o = run_in(d.path(), None, &["-c", "1", "-p", "a.rs", "s/one/1/"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("a.rs:1"), "{}", stdout(&o));
+}
+
+/// An option that exists in neither mode is still an error, with the usage
+/// text -- the preview parser is what knows the options, so it is what reports.
+#[test]
+fn an_unknown_option_is_still_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let o = run_in(d.path(), None, &["-z", "a.rs"]);
+    assert_eq!(code(&o), 2);
+    let err = stderr(&o);
+    assert!(err.contains("unknown option `-z`"), "{err}");
+    assert!(err.contains("USAGE"), "{err}");
+}
+
+/// `-u` emits a unified diff: file headers, hunk markers, real `-`/`+` lines.
+/// No anchor, no `@@@OLD`, nothing the `edit` tool could take.
+#[test]
+fn unified_emits_a_unified_diff() {
+    let d = tempfile::tempdir().unwrap();
+    write(
+        &d.path().to_path_buf(),
+        "a.rs",
+        "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
+    );
+    let o = run_in(
+        d.path(),
+        None,
+        &["-u", "-p", "a.rs", "2s/let x = 1;/let x = 42;/"],
+    );
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
-    assert!(out.contains("no lines matched"), "{out}");
-    // ...but it also says which file matched and was skipped, and why.
-    assert!(out.contains("crlf.txt"), "{out}");
-    assert!(out.contains("CRLF"), "{out}");
+    assert!(out.contains("--- a.rs\n"), "{out}");
+    assert!(out.contains("+++ a.rs\n"), "{out}");
+    assert!(out.contains("@@ -"), "{out}");
+    assert!(out.contains("-    let x = 1;"), "{out}");
+    assert!(out.contains("+    let x = 42;"), "{out}");
+    assert!(!out.contains("@@@OLD"), "{out}");
+    // Status still goes to stderr, and must not tell the reader to apply it.
+    let err = stderr(&o);
+    assert!(err.contains("drop -u"), "{err}");
+    assert!(!err.contains("apply them"), "{err}");
+}
+
+/// A diff's reader is a person, so it gets context even though blocks no longer
+/// do. `-c 0` is an explicit request and is honoured.
+#[test]
+fn unified_has_context_by_default_and_honours_c_zero() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "a.rs", "a\nb\nc\nd\ne\nf\n");
+    let s = "3s/c/C/";
+    let def = stdout(&run_in(d.path(), None, &["-u", "-p", "a.rs", s]));
+    assert!(
+        def.contains("\n a\n") && def.contains("\n d\n"),
+        "default: {def}"
+    );
+    let none = stdout(&run_in(d.path(), None, &["-u", "-c", "0", "-p", "a.rs", s]));
+    assert!(
+        !none.contains("\n a\n") && !none.contains("\n d\n"),
+        "-c 0: {none}"
+    );
+    // ...and blocks are unaffected either way: still no context by default.
+    // Blocks are untouched by `-u`'s context default: no trailing padding is
+    // asked for, so the block is the change plus whatever the diff grouped in.
+    let blocks = stdout(&run_in(d.path(), None, &["-p", "a.rs", s]));
+    assert!(blocks.starts_with("a.rs:3\n@@@OLD\nc\n"), "{blocks}");
+    assert!(
+        !blocks.contains("\nb\n"),
+        "leading context appeared: {blocks}"
+    );
+}
+
+/// More than one file needs the `---`/`+++` headers, since a diff has no
+/// `path:LINE` anchor to say which file a hunk came from.
+#[test]
+fn unified_separates_files_in_a_recursive_run() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "one.rs", "a\nb\n");
+    write(&d.path().to_path_buf(), "two.rs", "b\nc\n");
+    let o = run_in(d.path(), None, &["-u", "-r", "-p", ".", "s/b/B/"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    // The label is the same path string the block headers use, `./` prefix and
+    // all, so the two modes name a file identically.
+    assert!(out.contains("--- ./one.rs\n"), "{out}");
+    assert!(out.contains("--- ./two.rs\n"), "{out}");
+    // Files are ordered, and a blank line separates them.
+    let a = out.find("--- ./one.rs").unwrap();
+    let b = out.find("--- ./two.rs").unwrap();
+    assert!(a < b, "{out}");
+    assert!(
+        out.contains("B\n\n--- ./two.rs"),
+        "no blank line between: {out}"
+    );
+}
+
+/// Nothing changed is still exit 0 and an empty stdout, whichever mode.
+#[test]
+fn unified_with_no_change_is_silent() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "a.rs", "a\n");
+    let o = run_in(d.path(), None, &["-u", "-p", "a.rs", "s/zzz/yyy/"]);
+    assert_eq!(code(&o), 0);
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
+    assert!(stderr(&o).contains("no lines matched"), "{}", stderr(&o));
+}
+
+/// CRLF is refused in this mode too, rather than diffed into something wrong.
+#[test]
+fn unified_refuses_a_crlf_file() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "crlf.txt", "a\r\nb\r\n");
+    let o = run_in(d.path(), None, &["-u", "-p", "crlf.txt", "s/b/B/"]);
+    assert_eq!(code(&o), 2);
+    assert!(stderr(&o).contains("carriage returns"), "{}", stderr(&o));
+}
+
+/// `preview` used to be the subcommand. The word is gone, but saying so beats
+/// letting it be read as a script and failing on the quotes in the next one.
+#[test]
+fn the_old_preview_subcommand_says_what_changed() {
+    let d = tempfile::tempdir().unwrap();
+    write(&d.path().to_path_buf(), "a.rs", "one\n");
+    let o = run_in(d.path(), None, &["preview", "s/one/1/", "-p", "a.rs"]);
+    assert_eq!(code(&o), 2);
+    let err = stderr(&o);
+    assert!(err.contains("no `preview` subcommand"), "{err}");
+    assert!(err.contains("bsed 's/a/b/' f.rs"), "{err}");
 }
 
 #[test]
 fn recursive_preview_walks_the_tree_and_reports_counts() {
     let d = tree();
-    let o = run_in(
-        d.path(),
-        None,
-        &["preview", "-r", "-p", ".", "s/old_name/new_name/g"],
-    );
+    let o = run_in(d.path(), None, &["-r", "-p", ".", "s/old_name/new_name/g"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // The blocks are the payload, and nothing else is: this is what a redirect
+    // to a file now captures.
     let out = stdout(&o);
-    assert!(out.contains("2 of "), "{out}"); // two files changed
     assert!(out.contains("one.rs:2"), "{out}");
     assert!(out.contains("sub/two.rs:2"), "{out}");
-    // .gitignore is respected without needing a git repo, and non-text is
-    // counted rather than fatal.
-    assert!(!out.contains("skip.rs"), "{out}");
-    assert!(!out.contains("dep.rs"), "{out}");
-    assert!(out.contains("not UTF-8"), "{out}");
+    assert!(
+        !out.contains("sed preview:"),
+        "status leaked into the payload: {out}"
+    );
+
+    // The summary and the notes are about the payload, so they are on stderr.
+    let err = stderr(&o);
+    assert!(err.contains("2 of "), "{err}"); // two files changed
+                                             // .gitignore is respected without needing a git repo, and non-text is
+                                             // counted rather than fatal.
+    assert!(!err.contains("skip.rs"), "{err}");
+    assert!(!err.contains("dep.rs"), "{err}");
+    assert!(err.contains("not UTF-8"), "{err}");
+}
+
+/// stdout is the payload and stderr is the commentary, so a redirect to a file
+/// yields a file the `edit` tool can take as its `blocks` argument verbatim --
+/// no leading sentence, no trailing notes.
+#[test]
+fn a_redirected_preview_is_only_the_blocks() {
+    let d = tree();
+    let o = run_in(d.path(), None, &["-r", "-p", ".", "s/old_name/new_name/g"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    let parsed = blockedit::parse_blocks(&out).expect("payload parses as blocks");
+    assert_eq!(parsed.edits.len(), 2, "{out}");
+    for line in out.lines() {
+        assert!(
+            !line.starts_with("sed preview:") && !line.starts_with("NOTE:"),
+            "status line in the payload: {line}"
+        );
+    }
+    // The same for a single file, where the banner used to lead the blob.
+    let o = run_in(d.path(), None, &["-p", "one.rs", "s/old_name/new_name/g"]);
+    let out = stdout(&o);
+    assert!(out.starts_with("one.rs:"), "{out}");
+    assert!(
+        out.lines().next().unwrap().contains(':'),
+        "header first: {out}"
+    );
+    blockedit::parse_blocks(&out).expect("payload parses as blocks");
+    assert!(!out.contains("sed preview:"), "{out}");
 }
 
 #[test]
 fn recursive_preview_with_no_matches_says_so() {
     let d = tree();
-    let o = run_in(d.path(), None, &["preview", "-r", "-p", ".", "s/zzz/yyy/g"]);
+    let o = run_in(d.path(), None, &["-r", "-p", ".", "s/zzz/yyy/g"]);
     assert_eq!(code(&o), 0);
-    assert!(stdout(&o).contains("no lines matched"), "{}", stdout(&o));
+    assert!(stderr(&o).contains("no lines matched"), "{}", stderr(&o));
+    // A successful run that found nothing writes no file content, so a redirect
+    // gives an empty file rather than one holding the explanation.
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
 }
 
 #[test]
@@ -158,7 +356,7 @@ fn recursive_apply_is_atomic_per_file_and_echoes_the_failures() {
     let blocks = stdout(&run_in(
         &root,
         None,
-        &["preview", "-r", "-p", ".", "s/old_name/new_name/g"],
+        &["-r", "-p", ".", "s/old_name/new_name/g"],
     ));
 
     // Move one file on after the preview, so its block no longer matches.
@@ -201,7 +399,7 @@ fn a_multi_file_blob_needs_in_place() {
     let blocks = stdout(&run_in(
         &root,
         None,
-        &["preview", "-r", "-p", ".", "s/old_name/new_name/g"],
+        &["-r", "-p", ".", "s/old_name/new_name/g"],
     ));
     let o = run_in(&root, Some(&blocks), &["apply"]);
     assert_eq!(code(&o), 2);
@@ -220,7 +418,7 @@ fn single_file_apply_without_in_place_prints_and_does_not_write() {
     let blocks = stdout(&run_in(
         &root,
         None,
-        &["preview", "-p", "a.rs", "s/old_name/new_name/g"],
+        &["-p", "a.rs", "s/old_name/new_name/g"],
     ));
     let o = run_in(&root, Some(&blocks), &["apply", "a.rs"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -236,7 +434,7 @@ fn a_refused_expression_exits_two_and_writes_nothing() {
     let root = d.path().to_path_buf();
     write(&root, "a.rs", "one\n");
     for script in ["1w /tmp/bsed-should-not-exist", "1e touch /tmp/x", "1q"] {
-        let o = run_in(&root, None, &["preview", "-p", "a.rs", script]);
+        let o = run_in(&root, None, &["-p", "a.rs", script]);
         assert_eq!(code(&o), 2, "{script}");
         assert!(
             stderr(&o).contains("never writes")
@@ -269,7 +467,7 @@ fn recursive_preview_then_apply_reproduces_sed_over_the_tree() {
         reference.insert(rel.to_string(), before.replace("old_name", "new_name"));
     }
 
-    let blocks = stdout(&run_in(&root, None, &["preview", "-r", "-p", ".", script]));
+    let blocks = stdout(&run_in(&root, None, &["-r", "-p", ".", script]));
     let o = run_in(&root, Some(&blocks), &["apply", "-i"]);
     assert_eq!(code(&o), 0, "{}", stdout(&o));
 
@@ -293,15 +491,7 @@ fn glob_narrows_the_recursive_walk() {
     let o = run_in(
         &root,
         None,
-        &[
-            "preview",
-            "-r",
-            "-g",
-            "**/*.rs",
-            "-p",
-            ".",
-            "s/old_name/new_name/g",
-        ],
+        &["-r", "-g", "**/*.rs", "-p", ".", "s/old_name/new_name/g"],
     );
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(stdout(&o).contains("one.rs:2"), "{}", stdout(&o));
@@ -310,28 +500,19 @@ fn glob_narrows_the_recursive_walk() {
     let o = run_in(
         &root,
         None,
-        &[
-            "preview",
-            "-r",
-            "-g",
-            "**/*.py",
-            "-p",
-            ".",
-            "s/old_name/new_name/g",
-        ],
+        &["-r", "-g", "**/*.py", "-p", ".", "s/old_name/new_name/g"],
     );
     assert_eq!(code(&o), 0);
-    assert!(stdout(&o).contains("no lines matched"), "{}", stdout(&o));
+    // "no lines matched" is a status line, and nothing matched so there is no
+    // payload for it to describe.
+    assert!(stderr(&o).contains("no lines matched"), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
 }
 
 #[test]
 fn glob_without_recursive_is_a_usage_error() {
     let d = tree();
-    let o = run_in(
-        d.path(),
-        None,
-        &["preview", "-g", "*.rs", "-p", "one.rs", "s/a/b/"],
-    );
+    let o = run_in(d.path(), None, &["-g", "*.rs", "-p", "one.rs", "s/a/b/"]);
     assert_eq!(code(&o), 2);
     assert!(stderr(&o).contains("--glob"), "{}", stderr(&o));
 }
@@ -350,19 +531,23 @@ fn a_file_containing_block_markers_is_refused_not_mangled() {
     );
     write(&root, "plain.rs", "let old = 1;\n");
 
-    let o = run_in(&root, None, &["preview", "-p", "self.rs", "s/old/new/g"]);
+    let o = run_in(&root, None, &["-p", "self.rs", "s/old/new/g"]);
     assert_eq!(code(&o), 2);
     let err = stderr(&o);
     assert!(err.contains("appliable blocks"), "{err}");
     assert!(err.contains("@@@NEW"), "{err}");
 
     // Recursively, the un-representable file is named and the other still works.
-    let o = run_in(&root, None, &["preview", "-r", "-p", ".", "s/old/new/g"]);
+    let o = run_in(&root, None, &["-r", "-p", ".", "s/old/new/g"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
     assert!(out.contains("plain.rs:1"), "{out}");
-    assert!(out.contains("self.rs"), "the bad file must be named: {out}");
     assert!(!out.contains("@@@OLD\nold"), "{out}");
+    // Naming the file that could not be previewed is a status line, so it is
+    // on stderr -- and it must be *somewhere*, or the run reads as if that file
+    // simply needed no change.
+    let err = stderr(&o);
+    assert!(err.contains("self.rs"), "the bad file must be named: {err}");
 }
 
 /// The point of the report being a valid blocks file: after fixing the block,
@@ -374,7 +559,7 @@ fn the_failure_report_is_itself_a_repipable_blocks_file() {
     let blocks = stdout(&run_in(
         &root,
         None,
-        &["preview", "-r", "-p", ".", "s/old_name/new_name/g"],
+        &["-r", "-p", ".", "s/old_name/new_name/g"],
     ));
     // Retire one file's content so its block cannot apply.
     write(&root, "one.rs", "fn a() {\n    let CHANGED = 1;\n}\n");
@@ -425,7 +610,7 @@ fn a_terminal_run_spools_the_output_to_a_file() {
 
     let bin = env!("CARGO_BIN_EXE_bsed");
     let mut cmd = CommandBuilder::new(bin);
-    cmd.args(["preview", "-r", "-p", ".", "s/old_name/new_name/g"]);
+    cmd.args(["-r", "-p", ".", "s/old_name/new_name/g"]);
     cmd.cwd(&root);
     cmd.env("BSED_SPOOL_DIR", spool_dir.path());
 
@@ -476,7 +661,7 @@ fn a_terminal_run_spools_the_output_to_a_file() {
     // A piped run leaves none behind.
     let mut c2 = Command::new(bin);
     c2.current_dir(&root)
-        .args(["preview", "-r", "-p", ".", "s/old_name/new_name/g"])
+        .args(["-r", "-p", ".", "s/old_name/new_name/g"])
         .env("BSED_SPOOL_DIR", spool_dir.path())
         .stdout(std::process::Stdio::piped());
     c2.output().expect("piped preview");
