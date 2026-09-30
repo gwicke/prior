@@ -3,6 +3,7 @@
   model never runs `sed -i` on uncommitted work. Design, decisions and the
   corrections the build forced in ./doc/bsed.md. Block-edit core extracted to
   `crates/blockedit`; the tool runs in `crates/bsed` + `src/bin/bsed.rs`.
+  - c\ over range support: c\ - text - Replace (change) lines with text.
 - [x] bash tool error return: report error code
 - [x] restore model on `/session <id> resume` (now via pre-fill, not silent)
 - [x] Compaction unification (Phase 7)
