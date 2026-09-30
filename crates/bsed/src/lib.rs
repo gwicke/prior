@@ -428,6 +428,13 @@ mod tests {
             r"7,8c\    deep",
             // ...and the backslash-less form is the opposite: the run separates.
             r"2a    shallow",
+            // Deleting through the end of the file. The last line's terminator
+            // has to go with it, and a block that fails to take it still applies
+            // cleanly while leaving a blank line behind.
+            "$d",
+            "1,2!d",
+            "1,9d",
+            "8,9d",
         ];
         for script in cases {
             // GNU sed is the reference; skip the case if it is not GNU or the
