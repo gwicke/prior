@@ -434,6 +434,13 @@ mod tests {
             // duplicated a line. A CR on its own is a line ending and worked.
             r"3s/let y = 2;/CR\rlet y = 2;/",
             r"5s/run/\r/",
+            // Deleting through the end of the file. The last line's terminator
+            // has to go with it, and a block that fails to take it still applies
+            // cleanly while leaving a blank line behind.
+            "$d",
+            "1,2!d",
+            "1,9d",
+            "8,9d",
         ];
         for script in cases {
             // GNU sed is the reference; skip the case if it is not GNU or the
