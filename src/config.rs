@@ -1220,6 +1220,58 @@ pub struct PathPolicy {
     root: PathBuf,
 }
 
+/// Why a [`PathPolicy::check`] call was denied.
+///
+/// Path-free on purpose: the *reason* is safe to show anyone, and only the
+/// caller knows which path form the audience wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyDeniedKind {
+    /// Not covered by any binding.
+    NotCovered,
+    /// Covered, but by a read-only binding and a write was requested.
+    ReadOnly,
+}
+
+impl PolicyDeniedKind {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NotCovered => "path is not within a permitted binding",
+            Self::ReadOnly => "path is read-only (binding is ro)",
+        }
+    }
+}
+
+/// A denial from [`PathPolicy::check`].
+///
+/// Carries the host path **separately** from the reason, because the two
+/// audiences want different forms of it and collapsing them into one string is
+/// what leaked. The model must be shown the path it supplied — an in-sandbox
+/// path it can act on — while the operator diagnosing a misconfigured binding
+/// wants the absolute host path. See `doc/path_leak_risks.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDenied {
+    pub kind: PolicyDeniedKind,
+    /// The resolved **host** path. Never put this in a message a model can
+    /// read; it is data for callers that have an operator-facing sink.
+    pub host_path: PathBuf,
+}
+
+impl PolicyDenied {
+    /// Model-facing: `supplied` is the path exactly as the caller asked for it.
+    /// Contains no host path, so it is safe to expose once tool errors stop
+    /// being redacted.
+    pub fn model_message(&self, supplied: &str) -> String {
+        format!("{}: {supplied}", self.kind.reason())
+    }
+
+    /// Operator-facing: keeps the absolute host path, which is what makes a
+    /// misconfigured binding diagnosable — that path is the one that *would*
+    /// have matched a binding.
+    pub fn operator_message(&self) -> String {
+        format!("{}: {}", self.kind.reason(), self.host_path.display())
+    }
+}
+
 impl PathPolicy {
     /// Rewrite an agent-visible path to its host location (via the remap
     /// table), then resolve it against the root and normalize components.
@@ -1247,8 +1299,21 @@ impl PathPolicy {
 
     /// Check that `host_path` (already resolved against the root) is covered by
     /// a binding and, if `write`, that the covering binding is `rw`.
-    /// Returns `Ok(())` or a denial reason.
-    pub fn check(&self, host_path: &Path, write: bool) -> std::result::Result<(), String> {
+    ///
+    /// Returns `Ok(())` or a [`PolicyDenied`] carrying the host path as *data*
+    /// rather than baked into a sentence. This used to return
+    /// `format!("…: {host_path}")`, which put a host path into a string that
+    /// one day reaches the model: under a remapping binding the model asks for
+    /// `/tmp/f.txt` and would be told `/home/me/tmp/agents/f.txt` — a path it
+    /// cannot name back to us, so it would keep retrying with it. Splitting
+    /// reason from path lets the caller render the form each audience needs
+    /// (`PolicyDenied::model_message` / `operator_message`).
+    ///
+    /// The operator loses nothing by this: `check`'s result becomes a
+    /// `ToolError`, which rig redacts to the kind's default text before it is
+    /// displayed, so the host path was never reaching anyone — not the model,
+    /// not the scrollback.
+    pub fn check(&self, host_path: &Path, write: bool) -> std::result::Result<(), PolicyDenied> {
         // Find the most specific (longest-prefix) covering binding.
         let mut best: Option<&ResolvedBind> = None;
         for b in &self.binds {
@@ -1259,24 +1324,13 @@ impl PathPolicy {
                 }
             }
         }
-        // NOTE: error messages here intentionally keep the absolute path
-        // (`host_path.display()`). Sandbox-policy violations are rare and
-        // usually point at user-config mistakes — the absolute form is the
-        // useful one to see when reading scrollback. The model/tool
-        // response-relativization pass deliberately does NOT rewrite
-        // messages produced by `PathPolicy::check` to keep this code path
-        // untouched (it's a security boundary).
-        let bind = best.ok_or_else(|| {
-            format!(
-                "path is not within a permitted binding: {}",
-                host_path.display()
-            )
-        })?;
+        let denied = |kind| PolicyDenied {
+            kind,
+            host_path: host_path.to_path_buf(),
+        };
+        let bind = best.ok_or_else(|| denied(PolicyDeniedKind::NotCovered))?;
         if write && !bind.mode.is_writable() {
-            return Err(format!(
-                "path is read-only (binding is ro): {}",
-                host_path.display()
-            ));
+            return Err(denied(PolicyDeniedKind::ReadOnly));
         }
         Ok(())
     }
@@ -1514,6 +1568,58 @@ mod tests {
                 from: "~/.cargo".to_string(),
                 to: "/opt/cargo".to_string(),
             }]
+        );
+    }
+
+    /// A denial must carry the host path as *data* and keep it out of the
+    /// model-facing sentence. With a remapping binding the two forms differ,
+    /// so this is the case that would leak. See `doc/path_leak_risks.md`.
+    #[test]
+    fn a_denial_keeps_the_host_path_out_of_the_model_message() {
+        let cfg = SandboxConfig {
+            ro: vec![BindPath::Remap {
+                from: "/home/me/tmp/agents".to_string(),
+                to: "/tmp".to_string(),
+            }],
+            ..Default::default()
+        };
+        let policy = resolve_path_policy(&cfg, Path::new("/work"), None).expect("policy is active");
+
+        // Writing under a read-only binding: denied, and the remap applies, so
+        // the host path (`/home/me/...`) and the supplied path (`/tmp/...`)
+        // are genuinely different strings.
+        let supplied = "/tmp/f.txt";
+        let host = policy.resolve(supplied);
+        assert_ne!(host, Path::new(supplied), "test needs a real remap");
+        let denied = policy.check(&host, true).unwrap_err();
+        assert_eq!(denied.host_path, host);
+
+        let model = denied.model_message(supplied);
+        assert!(
+            model.contains(supplied),
+            "model should be shown the path it supplied: {model}"
+        );
+        assert!(
+            !model.contains("/home/me"),
+            "model message leaked a host path: {model}"
+        );
+
+        let operator = denied.operator_message();
+        assert!(
+            operator.contains("/home/me"),
+            "operator should still get the host path: {operator}"
+        );
+        // The reason survives in both, so the message stays diagnosable.
+        assert!(model.contains("read-only"), "{model}");
+        assert!(operator.contains("read-only"), "{operator}");
+
+        // Not covered by any binding at all: same split, no path fallback to
+        // a string built from `host_path`.
+        let uncovered = "/var/data/f.txt";
+        let denied = policy.check(&policy.resolve(uncovered), false).unwrap_err();
+        assert_eq!(
+            denied.model_message(uncovered),
+            format!("path is not within a permitted binding: {uncovered}")
         );
     }
 
