@@ -1,6 +1,6 @@
 # Batch Editing v2 — Aider-style text edits
 
-*Status: Phase 1 implemented. W1–W2 done — multi-file editing is accepted, split per file, and applied with per-file failure granularity. W3–W4 and W7–W8 remain.*
+*Status: Phase 1 implemented. W1–W4, W7 and W8 done — multi-file editing is accepted, split per file, applied and reported with per-file failure granularity, an unreadable file no longer aborts the call, the model sees N per-file calls and results, and a saved session stores N pi-canonical single-path calls with matching results. W5 wording remains, deliberately deferred.*
 
 ## Motivation
 
@@ -860,18 +860,20 @@ pub const MAX_FILES_PER_CALL: usize = 32;
 pub struct EditArgs { pub files: Vec<FileEdit> }
 pub struct FileEdit  { pub path: String, pub edits: Vec<EditOp> }
 
-// diagnose.rs — the multi-file result envelope
-pub struct BatchItem      { pub edit_index: usize, pub path: Option<String>, pub failure: EditFailure }
-pub struct FileOutcome    { pub path: String, pub shown: String, pub blocks: usize,
-                            pub applied: bool, pub note: Option<String>, pub report: Option<String> }
-pub struct MultiFileOutcome { pub ui_view: String, pub model_view: String, pub files: Vec<FileOutcome> }
+// diagnose.rs — the multi-file result: a bare array, no wrapper
+/// One file's entry. `result` is that file's single-file result verbatim:
+/// a success-note string, or a `{ui_view, model_view}` failure envelope.
+/// Serializes to a bare `[{path, result}, …]` — see *W3* for why there is no
+/// aggregate wrapper and no top-level `ui_view`.
+pub struct FileResult { pub path: String, pub result: serde_json::Value }
+pub fn render_file_results(files: &[FileResult]) -> String;  // bare JSON array
+pub fn parse_file_results(result: &str) -> Option<Vec<FileResult>>;  // display split
 ```
 
-`MultiFileOutcome` serializes to `{ui_view, model_view, files}`. Those first two
-keys are exactly what `display_tool_result` matches on, so the UI keeps
-rendering the short view and never leaks file text into scrollback; `files` is
-additive and is what the split transform reads. `looks_like_edit_failure`
-returns true unchanged.
+The array is what `display_tool_result` splits into per-file batches, and what
+W7/W8 read to produce the N per-file calls and results. `BatchItem.path` from
+the original sketch is unnecessary: each element's `path` carries the file, so
+`FileResult` supersedes it.
 
 `EditArgs.files` is length 1 for the single-edit shape (inherently
 single-file), so the tool has one loop and no shape special-case beyond
@@ -895,9 +897,9 @@ It rewrites two things, and must find them independently:
 - **the call** — an `edit` tool call whose arguments are a blob that splits into
   more than one file becomes N calls, arguments `split_canonical_values(&args)[i]`,
   ids `split_id(&orig, i, n)`;
-- **its result** — a `ToolResult` whose text parses as a `MultiFileOutcome`
-  becomes N results, ids taken by index, each carrying that one file's own text
-  (its `note` or its `report`).
+- **its result** — a `ToolResult` whose text parses as the per-file array
+  becomes N results, ids taken by index, each carrying that entry's own `result`
+  verbatim (its success note, or its `{ui_view, model_view}` envelope).
 
 The result side pairs by *index*, not by re-deriving the grouping: the envelope
 already carries the files in the order the call was split. That is what lets the
@@ -1017,32 +1019,68 @@ match leaves the others written.
   call's problems in one round trip instead of one file per trip. Until W4, a
   multi-file call is applied file-by-file and each file's own report is returned.
 
-**W3 — the envelope (`blockedit/src/diagnose.rs`).** `BatchItem.path`,
-`FileOutcome`, `MultiFileOutcome`, and a builder that renders `ui_view` as a
-count line and `model_view` as one section per file (`--- src/bar.rs (2 of 3
-applied) ---` + that file's report).
+**W3 — the result shape (`blockedit/src/diagnose.rs` + `src/output.rs`) — DONE.**
+The multi-file result is a **bare JSON array of per-file results**, one entry per
+file, each `result` being that file's single-file result *verbatim* (a success
+note string, or a `{ui_view, model_view}` failure envelope):
 
-*Tests:* single failure → `ui_view` is that file's own summary (today's
-behaviour); mixed → count-only; all-passed → still an envelope with
-`ui_view`/`model_view` present so the display branch is unchanged; every file
-appears in `model_view`; `looks_like_edit_failure` true.
+```json
+[ {"path": "src/a.rs", "result": "Replaced 1 block(s) in ./a.rs"},
+  {"path": "src/b.rs", "result": {"ui_view": "edit failed: …", "model_view": "…"}} ]
+```
 
-**W4 — plan/commit (`src/tools.rs`).** Split `edit_file` into
-`plan_file(path, edits) -> PlannedFile` (**never** `Err`; every IO, sandbox and
-non-UTF-8 failure folds into the outcome as a string) and
-`commit_file(&PlannedFile)`. Then `edit_file` is exactly `plan` + `commit`, so
-the single-file path is unchanged by construction, and `tools::edit_file_tests`
-stays green untouched. The new driver `edit_files(Vec<FileEdit>)`:
-1. `plan` every file — sandbox checks and reads all happen here, so a path
-   outside the sandbox or a missing file is discovered **before any write**;
-2. `commit` only the applied ones;
-3. return a bare `success_note` when there is exactly one file (today's string,
-   byte-identical), the envelope otherwise.
+There is **no aggregate wrapper and no top-level `ui_view`**. The earlier
+`MultiFileOutcome { ui_view, model_view, files }` sketch is withdrawn: the
+summary line had nowhere to go, because every durable representation (model
+history via W7, disk via W8) is per-file, and a "2 of 3 applied" roll-up
+exists only in front of two readers that both want per-file detail. `path` is
+the one field the array must add, because a result inside an array is no longer
+sitting beside the assistant call's `path` argument — that association existed
+only on the wire. Everything else is the existing single-file result reused.
 
-*Tests:* two files both apply; one fails and the other still applies, and the
-report names both; a file outside the sandbox fails without blocking the rest
-and without any write having happened; a missing file likewise; success notes
-name each file's own matched lines.
+*Display (`src/output.rs`).* `display_tool_result` gains an array branch: when
+the result is a JSON array of `{path, result}`, it renders each file as its own
+batch under a path label, reusing the existing per-result rendering (the
+`ui_view` branch for a failure, the text branch for a success note). This makes
+the live panel and a reloaded session — which stores per-file results — agree
+that the report is per-file. The array branch must be checked **before** the
+existing `Value::Array`-of-strings fall-through, which would otherwise stringify
+each object.
+
+*Not changed:* `on_tool_result`. See *The result must survive to history*.
+
+*Tests:* the array shape round-trips; `display_tool_result` on the array renders
+one labelled batch per file and no aggregate line; a failure entry renders its
+`ui_view` and a success entry its note; a single-file call is byte-identical to
+today (bare string / bare envelope, never a one-element array); the array branch
+does not swallow an array-of-strings result from another tool.
+
+**W4 — plan/commit — DROPPED, and its goal met by the `edit_files` loop.**
+
+The original plan split `edit_file` into `plan_file` (never `Err`; every IO,
+sandbox and non-UTF-8 failure folded into the outcome as a string) and
+`commit_file`, so a driver could plan every file and commit only the resolved
+ones. **That split is withdrawn**: with a by-file failure policy it buys nothing
+observable. Per-file all-or-nothing already lives inside `edit_file`; reads and
+sandbox checks already precede that file's write; and "resolve all, then write"
+only differs from "write as you go" for *global* all-or-nothing, which is
+rejected above as the wrong default. It would have cost a `PlannedFile` type, a
+function boundary, and the invariant that the single-file path stays
+unchanged — to reproduce, in more code, the per-file outcome the W3 array
+already is.
+
+What it was actually for — a per-file failure being **data, not control flow** —
+is now a fold in the existing loop: a file that cannot be resolved, read, or
+written becomes that file's `{path, result}` entry (naming the path) and the loop
+continues, so the model gets every file's outcome in one round trip. Before this,
+the `?` in the loop aborted the whole call and discarded the other files'
+reports, reducing a 3-file call to a bare `the tool failed`.
+
+*Tests:* two files both apply; one fails to match and the other still applies,
+and the report names both; **a missing (or unreadable, or sandbox-denied) file
+folds into its own entry naming the path, the other files still apply, and the
+array always has exactly one entry per file**; success notes name each file's
+own matched lines.
 
 **W5 — the tool contract (`src/tools.rs`). — the de-dup is DONE; the copy is not.**
 The rename already lifted the syntax and the policy sentence into `BLOCK_SYNTAX`
@@ -1069,27 +1107,114 @@ which the rename had to address anyway, since the model-facing field moved and
 *Tests:* a multi-file blob renders a label with no `[1]`; a resolvable blob and
 a single-file blob are unchanged.
 
-**W7 — the model-facing site (`src/agent.rs`).** Add the split transform; call
-it in `on_completion_call` as `split(blob(strip(history)))`, after the existing
-`blob_edit_tool_calls`. `on_tool_result` needs no change: the envelope carries
-no arg-error prefix, so `model_facing_tool_text` returns `None` and the raw
-envelope survives to the history.
+**W7 — the model-facing site (`src/agent.rs`) — DONE.** `split_multi_file_
+edit_calls`, called in `on_completion_call` as `split(blob(strip(history)))`:
+N per-file calls and N per-file results, with ids derived as `{orig}~f{i}n{n}`.
+
+Three details that are load-bearing, not incidental:
+
+1. **Ids are derived, never minted.** The persist path (W8) splits in a
+   *different* pass over *different* messages, and both must independently
+   arrive at the same id for the same file; re-applying must also be a no-op
+   rather than re-derive a fresh random id and break correlation with an
+   already-stored result. `~` is not a character any provider issues, so a
+   derived id cannot collide with a real one — which is what licenses the
+   synthetic calls carrying no `provider`.
+2. **`provider` and `signature` are cleared.** Anthropic's wire requires
+   `tool_result.tool_use_id` to equal a `tool_use.id` the provider issued, and
+   `wire_call_id()` returns `provider` when present. N synthetic messages
+   claiming one original provider id would be **unmatchable** — a 400, not a
+   cosmetic issue. `None` means rig mints rig's own handle, and that is what
+   travels.
+3. **Both halves must be present.** A call whose result has not arrived yet
+   (mid-turn) is left whole rather than split, so a partially-saved history
+   never shows a call with a dangling result. This is why the transform runs
+   over the whole history in one pass and matches call-to-result by id, not by
+   position.
+
+The split is **idempotent by construction**: re-running finds only single-file
+calls (the synthetic ones) and non-array results, and leaves the history alone.
+
+**`on_tool_result` needs no change, and that is load-bearing — see *The result
+must survive to history* below.** The tempting shortcut is to rewrite the
+multi-file array into one aggregate message at `on_tool_result` (the model
+emitted one call, so give it one result) and let the per-file form appear only
+in storage. That **cannot** work: a `ToolResultAction::Rewrite` is not a
+transient in-turn view, it *replaces the tool result permanently in history*,
+so the array is gone before the split transform — or `append_message` — ever
+sees it. The comment this replaces ("the envelope carries no arg-error prefix,
+so the raw envelope survives to the history") was not incidental; it recorded
+the exact property the storage axis depends on. The aggregate therefore lives
+*inside* W7's split (a one-line note that the group is N per-file results),
+not in a competing `on_tool_result` rewrite. See *The result must survive to
+history* for the rig code pointers.
 
 *Tests:* an in-turn multi-file call becomes N calls + N results with matching
 ids; `provider`/`signature` are `None` on every synthesized message; a
 second application is a no-op; a history with no multi-file call is
 byte-identical (identity).
 
-**W8 — the persist site (`src/session/session.rs`).** `canonicalize_edit_tool_calls`
-gains a sibling for the call side; a second sibling handles the result side.
-Both stay **within one message** — an assistant message with N tool calls is
-still one session entry, and a `Message::User` with N results is still one entry
-— so `append_message`'s signature and its return type do not change.
+**W8 — the persist site (`src/session/session.rs`) — DONE.**
+`canonicalize_edit_tool_calls` gains the split, and `split_edit_tool_results` is
+its result-side sibling. Both stay **within one message**, so
+`append_message`'s signature and return type do not change.
 
-*Tests:* the JSONL written for a multi-file blob is N pi-canonical single-path
-tool calls; the matching toolResult entries are N with the same ids; reloading
-and re-persisting is a no-op; a single-file call is byte-identical to today;
-`collect_touched_files` now yields every file, not just the top-level `path`.
+**Split *before* canonicalize, and that order is the whole mechanism.**
+`canonicalize_edit_value` only rewrites a *single*-file blob — it deliberately
+stores a multi-file one raw, "until the storage axis splits it". Splitting first
+means each per-file call canonicalizes to the ordinary `{path, edits}` shape, so
+the on-disk JSONL is N pi-canonical single-path tool calls and **nothing
+downstream needs to know multi-file editing exists** — including
+`collect_touched_files`, which keeps reading `arguments.path` and now yields
+every file simply because there is one call per file. (The original sketch
+called for teaching it to read `files[]`; that work evaporates.)
+
+The two halves are separate messages appended in separate calls and never see
+each other, so their agreement comes only from `split_id` being **one shared
+function** — now `crate::edit_blocks::split_id`, used by both this file and the
+model-facing transform in `agent.rs`. That is the reason it was moved out of
+`agent.rs` rather than duplicated.
+
+*Tests:* the on-disk JSONL holds N pi-canonical single-path calls and N results
+whose `toolCallId`s match them exactly (read back from the raw file, since the
+persisted shape is the contract); a reloaded session's context agrees with disk;
+a single-file call is canonicalized but never split and keeps its id; a
+plain-text (argument-error) result and an array result from another tool are
+both left whole.
+
+### The result must survive to history
+
+The single most load-bearing constraint in Phase 2, and the easiest to break by
+accident. **The tool's result string must reach `on_completion_call` (W7) and
+`append_message` (W8) intact.** Both split the multi-file array; if anything
+replaces it first, the split has nothing to read and pi compatibility is lost.
+
+The trap is that rig offers an obvious, tempting place to put a friendlier
+message — `on_tool_result` → `ToolResultAction::Rewrite` — and it looks like a
+transient "what the model sees this round." **It is not.** A rewrite replaces
+the result *permanently in history*:
+
+| what | where (rig rev `1c2f440`, `crates/rig-agent/src/agent/`) | what it does |
+| --- | --- | --- |
+| `ToolResultAction::Rewrite` | `hook.rs` — "Replace the effective presentation sent to the model" | the replacement becomes the `ToolCallOutcome.content` |
+| how it lands | `runner.rs:743` — `Rewrite(replacement) => … tool_result_output(id, …, replacement)` | the history entry is built from `replacement`, **not** `exec.output()` |
+| proof | `runner.rs` test `rewrite_result_is_delivered_verbatim_not_reparsed` — asserts the tool's own output `!tool_result_text_in_history(..)` and the replacement *is* in history | the original never reaches the model |
+| also | `runner.rs` test `rewrite_result_does_not_mask_the_structured_outcome` | a rewrite changes what the *model* sees, not classification — so the bytes in history are the rewrite |
+
+Consequence: rewriting the array to an aggregate at `on_tool_result` would erase
+it before W7/W8 read it. The model would be happy for exactly one round, and
+the session would be permanently un-splittable — the opposite of the goal.
+This is why `on_tool_result` "needs no change" is a *requirement*, not an
+oversight, and why the anti-confusion affordance belongs **inside** W7's split
+(a leading note that the single call became N per-file results) rather than in
+a rewrite that competes with the data.
+
+*Corollary for the two rewrites in `model_facing_tool_text`*, which now decides
+the model-facing text for two unrelated reasons: the arg-error one **strips
+ceremony** (`tool_errors.rs:1-23` — a weak model's self-correction measurably
+degrades behind the wrappers), while a future multi-file one would **add
+structure**. They are opposite jobs; do not "unify" them. (Today only the
+strip applies — the array is left alone so it survives.)
 
 ### Test matrix
 
@@ -1097,7 +1222,7 @@ and re-persisting is a no-op; a single-file call is byte-identical to today;
 | --- | --- | --- |
 | split policy | `blockedit` unit | 4 rules; header-less block rejected even with `path` set; `./a.rs`+`a.rs` → 1 batch; `path` conflict → error; ordering; 32/33 cap |
 | wire | `blockedit` unit | 2 shapes; multi-file → N; single-file unchanged; `edits` array rejected; `blocks` as array unrecognised |
-| envelope | `blockedit` unit | 1 failure / mixed / all-passed; `looks_like_edit_failure` |
+| result shape | `blockedit` unit | array round-trips; per-file `result` verbatim; single-file unchanged |
 | tool e2e | `tools::edit_args_wire_tests` (reuse `CwdGuard`, `#[serial]`) | 2 files apply; partial; sandbox denial; missing file; notes per file |
 | display | `output` unit | no `[1]`, no diff; canonicalizable unchanged |
 | model hook | `agent` unit | N calls + N results, ids paired, identity fields cleared, idempotent, identity without |
@@ -1623,9 +1748,9 @@ corruption is now a loud `overlapping`/`all-claimed` failure).
    diagnosis, all with no caller yet. What remains ships as two commits:
    1. **W1–W2 (execution) — DONE.** Multi-file blobs are accepted, split per
       file, and applied with per-file failure granularity. What remains is
-      **W3–W4**: the aggregated `MultiFileOutcome` envelope, and
-      resolve-all-then-write-what-resolved so one round trip reports every
-      file's problem. Reverted by one guard in `from_wire`.
+      **W3–W4 are also now in**: the per-file result array, its display split,
+      and the per-file fold for an unreadable file, so one round trip reports
+      every file's outcome. Reverted by one guard in `from_wire`.
       **Extended past the original W2 scope**: strictness is now uniform rather
       than multi-file-only, which also removed `merge_path` from the block path
       entirely and forced `render_blob` to head every block. Both were

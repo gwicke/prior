@@ -2230,7 +2230,13 @@ mod tests {
     ///
     /// What is asserted is the *order and kind* of the three writes, which is
     /// the whole contract: `display_separator`, `display_plain`, `display_separator`.
+    // `#[serial]`: this test pins the process-global `TERMINAL_WIDTH`, and the
+    // `output` tests pin it to their own widths through `capturing_output`. Two
+    // tests that write the same global must not run concurrently, or one
+    // renders at the other's width and reports a phantom row-accounting
+    // failure. (Parallel-only: the whole suite passes under `--test-threads=1`.)
     #[test]
+    #[serial_test::serial]
     fn a_committed_line_is_written_between_two_rules() {
         let reasoning = crate::settings::default_show_reasoning_handle();
         crate::repl::TERMINAL_WIDTH.store(80, std::sync::atomic::Ordering::SeqCst);

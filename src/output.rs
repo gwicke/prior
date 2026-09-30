@@ -2175,6 +2175,35 @@ impl Output for ConsoleOutput {
     /// ends the block with it, which is the knowledge the `last_was_tool` flag
     /// used to carry, stated by the block that has it.
     fn display_tool_result(&self, result: &str) {
+        // A multi-file `edit` result is a bare JSON array of `{path, result}`,
+        // one per file, each `result` that file's single-file result verbatim.
+        // Render it as one batch per file so the live panel and a reloaded
+        // session (which stores per-file results) agree the report is
+        // per-file. This branch is checked *before* the `Value::Array`-of-
+        // strings fall-through below, which would stringify each object.
+        if let Some(files) = blockedit::parse_file_results(result) {
+            let color = std::io::stdout().is_terminal();
+            for fr in files {
+                // Each file under its own label, so a failure is attributable
+                // to the file it belongs to (the failure envelope carries no
+                // path of its own).
+                let label = highlight_code_fg(&format!("edit {}", fr.path), "bash", color);
+                self.paint_panel(&label, true);
+                // Reuse the per-result rendering: a failure shows its short
+                // `ui_view` (never the `model_view` diff), a success shows its
+                // note.
+                if let Some(ui) = fr.result.get("ui_view").and_then(|x| x.as_str()) {
+                    self.tool_panel(ui, true, true);
+                } else if let Some(note) = fr.result.as_str() {
+                    for line in note.lines() {
+                        self.tool_panel(line, false, true);
+                    }
+                }
+            }
+            self.end_tool_block();
+            return;
+        }
+
         // Edit-tool failures are emitted as a structured JSON object with
         // separate `ui_view` (short, no file text) and `model_view` (rich,
         // with diff). The UI must render only the short view so we don't
@@ -4552,6 +4581,38 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         let c = out.end_capture_inner();
         let c = strip_ansi(&String::from_utf8_lossy(&c));
         eprintln!("=== Case C (tool + trailing thinking) ===\n{:?}", c);
+    }
+
+    #[test]
+    fn a_multi_file_result_renders_one_batch_per_file() {
+        // The multi-file result is a bare array; it must render as one labelled
+        // batch per file — a failure's short ui_view and a success's note — with
+        // no aggregate line and no model_view diff leaking into scrollback.
+        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        out.begin_capture_inner();
+        out.display_tool_result(
+            r#"[{"path":"src/a.rs","result":"Replaced 1 block(s) in ./a.rs"},
+                {"path":"src/b.rs","result":{"ui_view":"edit failed: nope","model_view":"SECRET DIFF"}}]"#,
+        );
+        let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture_inner()));
+        assert!(d.contains("edit src/a.rs"), "{d}");
+        assert!(d.contains("Replaced 1 block(s) in ./a.rs"), "{d}");
+        assert!(d.contains("edit src/b.rs"), "{d}");
+        assert!(d.contains("edit failed: nope"), "{d}");
+        assert!(!d.contains("SECRET DIFF"), "model_view must not leak: {d}");
+        // No aggregate roll-up line.
+        assert!(!d.contains("2 of"), "{d}");
+    }
+
+    #[test]
+    fn an_array_of_plain_strings_is_not_a_multi_file_result() {
+        // Another tool's list must keep its existing rendering; the multi-file
+        // branch must not swallow it.
+        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        out.begin_capture_inner();
+        out.display_tool_result(r#"["alpha","beta"]"#);
+        let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture_inner()));
+        assert!(d.contains("alpha") && d.contains("beta"), "{d}");
     }
 
     #[test]

@@ -583,6 +583,62 @@ pub fn looks_like_edit_failure(result: &str) -> bool {
     v.get("ui_view").is_some() && v.get("model_view").is_some()
 }
 
+/// One file's entry in a multi-file `edit` result.
+///
+/// `result` is that file's **single-file** result verbatim: a success-note
+/// string, or a `{ui_view, model_view}` failure envelope. Reusing the existing
+/// result is the point — a per-file report needs no new vocabulary, and a file
+/// the model called alone and a file inside a batch are reported identically.
+///
+/// `path` is the one field the array must add. A result inside an array is no
+/// longer sitting beside the assistant call's `path` argument; that association
+/// existed only on the wire, and the failure envelope does not carry it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FileResult {
+    pub path: String,
+    /// Verbatim single-file result: a JSON string (success) or object
+    /// (failure envelope). Held as a `Value` so the two shapes round-trip
+    /// without re-encoding.
+    pub result: serde_json::Value,
+}
+
+/// Build a multi-file result from per-file `(path, result)` pairs.
+///
+/// This is a **bare JSON array**, `[{path, result}, …]` — deliberately not
+/// wrapped in an object and carrying **no top-level `ui_view`**. Every durable
+/// representation of a multi-file call is per-file (model history via W7, disk
+/// via W8), so an aggregate roll-up has nowhere durable to live, and the two
+/// readers that do see it in flight both want per-file detail. The array is the
+/// transport between the tool and those two boundaries.
+///
+/// It must reach `on_completion_call` and `append_message` **intact**; see the
+/// "result must survive to history" section of `doc/batch_editing_v2.md` for why
+/// rewriting it earlier is not a shortcut.
+pub fn render_file_results(files: &[FileResult]) -> String {
+    serde_json::to_string(files).expect("FileResult is always serializable")
+}
+
+/// Recognize a multi-file result and read it back, for the display split.
+///
+/// Returns `None` for anything that is not an array of `{path, result}` — in
+/// particular `None` for an array of plain strings, which other tools emit and
+/// which the caller renders by its own existing rule.
+pub fn parse_file_results(result: &str) -> Option<Vec<FileResult>> {
+    let v: serde_json::Value = serde_json::from_str(result).ok()?;
+    let arr = v.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    arr.iter()
+        .map(|e| {
+            Some(FileResult {
+                path: e.get("path")?.as_str()?.to_string(),
+                result: e.get("result")?.clone(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +719,46 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["ui_view"], "short");
         assert_eq!(v["model_view"], "long with diff");
+    }
+
+    #[test]
+    fn the_multi_file_result_is_a_bare_array_of_per_file_results() {
+        // No wrapper, no top-level ui_view: the array IS the result.
+        let files = vec![
+            FileResult {
+                path: "src/a.rs".into(),
+                result: serde_json::json!("Replaced 1 block(s) in ./a.rs"),
+            },
+            FileResult {
+                path: "src/b.rs".into(),
+                result: serde_json::json!({"ui_view": "edit failed: x", "model_view": "y"}),
+            },
+        ];
+        let out = render_file_results(&files);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.is_array(), "must be a bare array: {out}");
+        assert_eq!(v.as_array().unwrap().len(), 2);
+        assert!(v.get("ui_view").is_none(), "no aggregate view: {out}");
+        // Each per-file result is the existing shape, verbatim.
+        assert_eq!(
+            v[0]["result"],
+            serde_json::json!("Replaced 1 block(s) in ./a.rs")
+        );
+        assert_eq!(v[1]["result"]["ui_view"], "edit failed: x");
+        // Round-trips.
+        assert_eq!(parse_file_results(&out).unwrap(), files);
+    }
+
+    #[test]
+    fn parse_file_results_rejects_other_shapes() {
+        // A single-file envelope is not a multi-file result.
+        assert!(parse_file_results(r#"{"ui_view":"a","model_view":"b"}"#).is_none());
+        // An array of plain strings is another tool's list, not ours.
+        assert!(parse_file_results(r#"["a","b"]"#).is_none());
+        // An empty array is not a report.
+        assert!(parse_file_results("[]").is_none());
+        // Non-JSON.
+        assert!(parse_file_results("Replaced 1 block(s) in ./a.rs").is_none());
     }
 
     #[test]
