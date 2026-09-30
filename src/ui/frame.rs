@@ -697,6 +697,40 @@ fn plan_append(cache: &mut DrawCache, frame: &Frame, anchor: usize, th: usize) -
     s
 }
 
+/// Consume (§4.5 P1): a content write is about to start where the frame is.
+/// Walk the caret up to the frame's first row and take the frame, **without
+/// erasing it** — the content's own bytes overwrite those rows, and the frame
+/// comes back below the content via [`plan_reposition`].
+///
+/// Returns the walk and the frame to re-emit, or `None` when no frame was live.
+/// `None` is the state of a whole turn today, which is why the clear this
+/// replaces was almost always a no-op (§4.5.3).
+///
+/// **`CR` is part of the contract, not a detail.** `CUU` preserves the column and
+/// the frame's caret is out at the *input's* column, so without an explicit `CR`
+/// the content would start a prompt-width to the right. Today that is masked: the
+/// transient status bar's own clear ends in a `CR`, so a turn's first content
+/// write lands at column 0 by accident. A frame that carries its own bar row has
+/// no such accident available, which is one of the reasons the bar has to move
+/// into the frame before the wiring can be trusted.
+// Test-only for now, like `plan_reposition`: `with_content_writer` calls both
+// when the content path stops retiring the area, and the bar question that
+// decision forces is answered first. Targeted allow, per this module's
+// convention for test-only users.
+#[allow(dead_code)]
+pub(crate) fn plan_consume(cache: &mut DrawCache) -> Option<(String, Frame)> {
+    let live = cache.live.take()?;
+    let (caret_row, _) = frame_caret(&live.frame);
+    let mut s = String::new();
+    cuu(&mut s, caret_row);
+    s.push('\r');
+    // The frame is no longer intact on screen — `live = None` above — but its
+    // rows are about to be overwritten rather than erased, which is the whole
+    // difference from `plan_clear_live_frame`.
+    cache.caret = (live.frame_top_row, 0);
+    Some((s, live.frame))
+}
+
 /// Reposition apply (§4.5 P1): the frame's top row has moved **down**, because
 /// content was written over the rows it used to occupy, and those rows now hold
 /// content that must not be erased.
@@ -1679,6 +1713,99 @@ mod apply_tests {
             rows[10], "",
             "and the row below the new frame is blank: {rows:?}"
         );
+    }
+
+    /// §4.5 P1: consume leaves the cursor at the frame's first row, **column
+    /// 0**, and leaves the frame's own rows alone.
+    ///
+    /// The column is the substance. `CUU` preserves it, the frame's caret is out
+    /// at the input's column, and the content about to be written would start a
+    /// prompt-width to the right. Today that is masked by the transient bar's
+    /// trailing `CR`; this makes it the plan's own postcondition.
+    #[test]
+    fn consume_walks_to_the_frame_top_at_column_zero_and_erases_nothing() {
+        let mut cache = DrawCache::new(24);
+        let mut e = LineEditor::new();
+        e.insert_str("hi there");
+        let layout = e.layout(20, "> ");
+        let h = layout.row_count.max(1);
+        let f = render(
+            &[Element::Input {
+                layout,
+                prompt: "> ".into(),
+            }],
+            &[h],
+            20,
+        );
+        cursor_to(&mut cache, 5, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s);
+        // The caret is on the input row, out at the prompt's width.
+        // The caret is out in the input, not at column 0 — which is the whole
+        // reason the walk needs its own `CR`. The exact column is the layout's
+        // business (prompt marker + buffer), so assert the property.
+        assert_eq!(cache.caret.0, 5, "the frame's caret row: {:?}", cache.caret);
+        assert!(
+            cache.caret.1 > 1,
+            "and a column out in the input, which is why consume needs a `CR`: {:?}",
+            cache.caret
+        );
+        let before = screen(&p, 24, 20);
+        assert_eq!(before[4], "> hi there");
+
+        let (walk, taken) = plan_consume(&mut cache).expect("a live frame");
+        assert_eq!(taken.height(), f.height(), "the same frame comes back");
+        assert!(!walk.contains(EL), "nothing is erased: {walk:?}");
+        feed(&mut p, &walk);
+        assert_eq!(
+            p.screen().cursor_position(),
+            (4, 0),
+            "the fold, at column 0 — not the input's column"
+        );
+        assert_eq!(screen(&p, 24, 20), before, "the frame is still on screen");
+        assert!(cache.live.is_none(), "it is no longer intact");
+    }
+
+    /// The whole of a turn today: no frame live, so there is nothing to consume
+    /// and no walk to emit. This is why the clear `plan_consume` replaces was
+    /// almost always a no-op, and it is the shape P1's wiring has to tolerate.
+    #[test]
+    fn consume_is_a_no_op_with_no_frame_live() {
+        let mut cache = DrawCache::new(24);
+        cursor_to(&mut cache, 9, 24);
+        assert!(plan_consume(&mut cache).is_none());
+        assert_eq!(cache.caret, (9, 0), "the caret is untouched");
+    }
+
+    /// Consume then reposition, with content in between: the round trip the
+    /// content path performs, with the content written by hand so the test says
+    /// what it is standing in for.
+    #[test]
+    fn consume_then_content_then_reposition_puts_the_frame_back_below() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["bar", "> "], 20);
+        cursor_to(&mut cache, 5, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s);
+
+        let (walk, taken) = plan_consume(&mut cache).expect("a live frame");
+        feed(&mut p, &walk);
+        // Two content rows, written at the fold — the bytes overwrite the frame.
+        feed(&mut p, "one\r\ntwo\r\n");
+        cache.caret = (cache.caret.0 + 2, 0);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(rows[4], "one", "the content landed on the frame: {rows:?}");
+
+        let s = plan_reposition(&mut cache, &taken, 20, 24);
+        feed(&mut p, &s);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(rows[4], "one", "the content survives: {rows:?}");
+        assert_eq!(rows[5], "two");
+        assert_eq!(rows[6], "bar", "and the frame is back below it: {rows:?}");
+        assert_eq!(rows[7], ">");
+        assert_eq!(cache.live.as_ref().unwrap().frame_top_row, 7);
     }
 
     #[test]
