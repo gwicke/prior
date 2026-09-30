@@ -65,6 +65,17 @@ pub struct ParsedEdit {
     /// in [`parse_blocks`] only *validates* headers, it does not keep them. The
     /// anchor is split off `header`; this is the path part. Not persisted.
     pub header: Option<String>,
+    /// The line directly above this block's `@@@OLD` that was **not** taken
+    /// as a header, when there was one and it was not empty.
+    ///
+    /// A header must be a single whitespace-free token, so a model that wrote
+    /// prose, or a real path containing a space, silently produces a
+    /// header-less block. That is unreportable from `header` alone (`None`
+    /// either way), and reporting a bare absence is the failure P1 was written
+    /// against — the caller has no way to learn *what it wrote* in the slot the
+    /// error is about. Kept so the multi-file policy can quote it back. Not
+    /// persisted.
+    pub rejected_header: Option<String>,
 }
 
 /// Result of parsing a blob.
@@ -244,6 +255,10 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         // what participates in the (per-file) agreement check.
         let mut header_anchor: Option<u64> = None;
         let mut header_path: Option<String> = None;
+        // The line this block's header would have been, when there was one and
+        // it was not a usable header. Kept only to be quoted back in an error:
+        // prose and a path-with-a-space are indistinguishable from `None`.
+        let mut rejected_header: Option<String> = None;
         if i > 0 {
             if let Some(h) = header_candidate(&lines[i - 1]) {
                 let (path_part, anchor) = split_line_anchor(&h);
@@ -252,6 +267,14 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
                 header_path = Some(path_part.clone());
                 if !distinct_headers.iter().any(|d| same_path(d, &path_part)) {
                     distinct_headers.push(path_part);
+                }
+            } else {
+                // A marker is never a header candidate — an adjacent block
+                // has the previous `@@@END` sitting in this slot, and
+                // reporting that as a rejected header would be nonsense.
+                let prev = lines[i - 1].trim();
+                if !prev.is_empty() && !prev.starts_with("```") && marker_of(prev).is_none() {
+                    rejected_header = Some(prev.to_string());
                 }
             }
         }
@@ -333,6 +356,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
             new_text,
             start_line: header_anchor,
             header: header_path,
+            rejected_header,
         });
 
         i = k + 1;
@@ -550,6 +574,7 @@ pub fn array_to_blob_value(args: &Value) -> Value {
                 .to_string(),
             start_line: None,
             header: None,
+            rejected_header: None,
         })
         .collect();
     let blob = render_blob(path, &parsed);
@@ -576,6 +601,7 @@ mod tests {
             new_text: new.to_string(),
             start_line: None,
             header: None,
+            rejected_header: None,
         }
     }
 
@@ -1036,6 +1062,16 @@ mod tests {
     }
 
     #[test]
+    fn an_adjacent_marker_is_not_recorded_as_a_rejected_header() {
+        // The previous block's `@@@END` sits in the header slot of an adjacent
+        // block. Recording it would make the missing-file error quote a marker
+        // back as if the model had written a bad header.
+        let text = "@@@OLD\na\n@@@NEW\nA\n@@@END\n@@@OLD\nb\n@@@NEW\nB\n@@@END";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.edits[1].rejected_header, None);
+    }
+
+    #[test]
     fn multi_block_second_gets_blank_line_separator() {
         // Blank lines between blocks are not swallowed into the next OLD text.
         let text = "src/x.rs\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n@@@OLD\nb\n@@@NEW\nB\n@@@END";
@@ -1102,14 +1138,14 @@ pub fn group_by_file(
     let mut batches: std::collections::HashMap<String, Vec<ParsedEdit>> =
         std::collections::HashMap::new();
 
-    for edit in parsed.edits {
+    for (idx, edit) in parsed.edits.into_iter().enumerate() {
         let path = match edit.header.as_deref().or(fallback) {
             Some(p) if !p.is_empty() => p.to_string(),
             _ => {
                 return Err(format!(
                     "block {idx} names no file: set the `path` argument, or put a filename line \
                      above every `@@@OLD`",
-                    idx = order.len() + 1
+                    idx = idx + 1
                 ))
             }
         };
@@ -1126,6 +1162,124 @@ pub fn group_by_file(
             FileBatch { path, edits }
         })
         .collect())
+}
+
+/// Upper bound on files in one call. Beyond it the blob is rejected whole,
+/// before any file is touched.
+///
+/// This bounds the work a single string argument can fan out into. The
+/// single-file form caps *blocks* not at all, so there is no precedent to copy
+/// here; 32 is chosen because a cross-file refactor fits under it comfortably
+/// and the bound is about boundedness, not about taste.
+pub const MAX_FILES_PER_CALL: usize = 32;
+
+/// The path each block names, keyed for grouping, in first-seen order.
+///
+/// `split_by_file` is the *multi-file* path policy, and it is deliberately
+/// stricter than [`group_by_file`] and than [`merge_path`]:
+///
+/// 1. **Every** block must carry its own header. No defaulting — not to the
+///    `path` argument, not to the previous block. A header-less block in a
+///    blob that spans files has two or more plausible homes, and any rule that
+///    picks one is guessing at a write. An error costs one round trip.
+/// 2. The `path` argument is *not consulted at all*. The headers are
+///    authoritative: a call that names its files in the blob has already
+///    answered the question, and reconciling a redundant `path` against N
+///    headers is a second, conflicting source of truth. (`path` remains the
+///    single-edit form's file argument; see the tool's `description()`.)
+/// 3. Grouping is keyed on the **normalized** path, so `./a.rs` and `a.rs`
+///    are one file and one batch — two all-or-nothing applies for one file
+///    would be a bug, not a feature.
+/// 4. More than [`MAX_FILES_PER_CALL`] distinct files is rejected whole.
+///
+/// Unlike `merge_path` there is no fallback: a single-file blob still goes
+/// through `merge_path` and still defaults freely, because there is only one
+/// candidate and a default cannot be wrong. That is also why this function is
+/// not a drop-in for `group_by_file` — see the hazards its own tests pin.
+pub fn split_by_file(parsed: ParsedBlocks) -> Result<Vec<FileBatch>, String> {
+    if parsed.edits.is_empty() {
+        return Err("no edit blocks found".to_string());
+    }
+
+    let mut order: Vec<String> = Vec::new();
+    let mut batches: std::collections::HashMap<String, Vec<ParsedEdit>> =
+        std::collections::HashMap::new();
+
+    for (i, edit) in parsed.edits.into_iter().enumerate() {
+        let spelled = match edit.header.as_deref() {
+            Some(h) if !h.is_empty() => h.to_string(),
+            _ => return Err(no_file_error(i + 1, edit.rejected_header.as_deref())),
+        };
+        // Key on the normalized form; report and store the first spelling.
+        let key = normalized_key(&spelled);
+        if !batches.contains_key(&key) {
+            order.push(spelled);
+        }
+        batches.entry(key).or_default().push(edit);
+    }
+
+    if order.len() > MAX_FILES_PER_CALL {
+        return Err(format!(
+            "this edit names {} files; the limit is {MAX_FILES_PER_CALL}. Split it into \
+             several `edit` calls",
+            order.len()
+        ));
+    }
+
+    Ok(order
+        .into_iter()
+        .map(|path| {
+            let edits = batches.remove(&normalized_key(&path)).unwrap_or_default();
+            FileBatch { path, edits }
+        })
+        .collect())
+}
+
+/// The grouping key for a spelled path: the normalized form when a cwd is
+/// available, so equivalent spellings collapse; the spelling itself otherwise.
+///
+/// Mirrors [`same_path`]'s fallback, so grouping and agreement can never
+/// disagree about what "the same file" means.
+fn normalized_key(path: &str) -> String {
+    match std::env::current_dir() {
+        Ok(cwd) => crate::path::resolve_normalized(path, &cwd)
+            .to_string_lossy()
+            .into_owned(),
+        Err(_) => path.to_string(),
+    }
+}
+
+/// A block that named no file, in a blob that spans files.
+///
+/// Named by index, quoted back what was actually in the header slot when there
+/// was something there, and fixed by the one edit that repairs it. The `path`
+/// argument is deliberately *not* offered as a fix: this blob already spans
+/// files, so a single `path` cannot name the missing block's file, and
+/// defaulting it is the wrong-file write this policy exists to prevent.
+fn no_file_error(idx: usize, rejected: Option<&str>) -> String {
+    let shape = "\n  src/foo.rs:12\n  @@@OLD\n  ...\n  @@@NEW\n  ...\n  @@@END";
+    let msg = match rejected {
+        // Quoting the line back is the whole point: a bare "names no file"
+        // tells the model to add a line it may already have added. The two
+        // causes need different fixes, so they are named separately.
+        Some(line) if line.split_whitespace().count() > 1 => format!(
+            "block {idx} of a multi-file edit names no file: the line above its `@@@OLD` \
+             marker is `{line}`, which is not a header. A header is one path token with no \
+             spaces. If that is a real filename containing a space, this block form cannot \
+             address it — edit that file with the single-edit fields (path + oldText + \
+             newText) instead.{shape}"
+        ),
+        Some(line) => format!(
+            "block {idx} of a multi-file edit names no file: the line above its `@@@OLD` \
+             marker is `{line}`, which is not a path. Replace it with a path to the file this \
+             block edits, like the other blocks.{shape}"
+        ),
+        None => format!(
+            "block {idx} of a multi-file edit names no file. Put a filename line above its \
+             `@@@OLD` marker, like the other blocks:{shape}"
+        ),
+    };
+    msg
 }
 
 #[cfg(test)]
@@ -1173,5 +1327,224 @@ mod group_tests {
         let text = "@@@OLD\nx\n@@@NEW\nX\n@@@END";
         let err = group_by_file(parse(text), None).unwrap_err();
         assert!(err.contains("names no file"), "{err}");
+    }
+
+    #[test]
+    fn the_error_names_the_offending_block_not_the_group_count() {
+        // Blocks 1-3 all name `a.rs`, so there is one *group*; the header-less
+        // block is block 4. Counting groups reported "block 2", pointing the
+        // model at a block that is fine.
+        let text = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
+                    a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
+                    a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
+                    @@@OLD\ny\n@@@NEW\nY\n@@@END";
+        let err = group_by_file(parse(text), None).unwrap_err();
+        assert!(err.contains("block 4"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn parse(text: &str) -> ParsedBlocks {
+        parse_blocks(text).unwrap()
+    }
+
+    /// A blob whose blocks each name their own file, as `split_by_file` requires.
+    fn blob(spec: &[(&str, &str)]) -> ParsedBlocks {
+        let mut text = String::new();
+        for (path, body) in spec {
+            text.push_str(path);
+            text.push('\n');
+            text.push_str(SEARCH_MARKER);
+            text.push('\n');
+            text.push_str(body);
+            text.push('\n');
+            text.push_str(DIVIDER);
+            text.push('\n');
+            text.push_str("new");
+            text.push('\n');
+            text.push_str(REPLACE_MARKER);
+            text.push('\n');
+            text.push('\n');
+        }
+        parse(&text)
+    }
+
+    #[test]
+    fn splits_into_one_batch_per_file_in_first_seen_order() {
+        let g = split_by_file(blob(&[("b.rs", "1"), ("a.rs", "2"), ("b.rs", "3")])).unwrap();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].path, "b.rs");
+        assert_eq!(g[0].edits.len(), 2);
+        assert_eq!(g[1].path, "a.rs");
+        assert_eq!(g[1].edits.len(), 1);
+    }
+
+    #[test]
+    fn a_single_file_blob_is_one_batch() {
+        let g = split_by_file(blob(&[("src/a.rs", "1"), ("src/a.rs", "2")])).unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].path, "src/a.rs");
+        assert_eq!(g[0].edits.len(), 2);
+    }
+
+    // -- rule 1: every block names its own file, with no defaulting ---------
+
+    #[test]
+    fn a_header_less_block_is_an_error_even_when_other_blocks_are_named() {
+        // The hazard `group_by_file` has and this must not: a header-less
+        // block silently attributed to whatever came before (or to `path`).
+        let text = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
+        let err = split_by_file(parse(text)).unwrap_err();
+        assert!(err.contains("block 2"), "{err}");
+    }
+
+    #[test]
+    fn the_missing_file_error_names_the_index_and_shows_the_shape() {
+        // The self-correcting style: name the one problem, show the one
+        // accepted shape, and do not offer a fix that would be wrong here.
+        let text = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
+        let err = split_by_file(parse(text)).unwrap_err();
+        assert!(
+            err.contains("block 2 of a multi-file edit names no file"),
+            "{err}"
+        );
+        assert!(err.contains(SEARCH_MARKER), "must show the shape: {err}");
+        assert!(err.contains("src/foo.rs:12"), "must show a header: {err}");
+        assert!(
+            !err.contains("`path` argument"),
+            "must not offer `path` as the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn the_missing_file_error_never_offers_the_path_argument() {
+        // `path` cannot name the missing block's file in a blob that spans
+        // files, so suggesting it would send the model in a circle.
+        let err = no_file_error(3, None);
+        assert!(err.contains("block 3"), "{err}");
+        assert!(!err.contains("`path` argument"), "{err}");
+    }
+
+    #[test]
+    fn a_rejected_header_line_is_quoted_back() {
+        // The model wrote *something* in the header slot. Saying only "names
+        // no file" tells it to add a line it already added; quoting the line
+        // is what makes the error actionable.
+        let err = no_file_error(2, Some("Update the parser."));
+        assert!(err.contains("`Update the parser.`"), "{err}");
+        // A single whitespace-free token is a *wrong path*, not a spaced one.
+        let err = no_file_error(2, Some("src/typo.rs"));
+        assert!(err.contains("which is not a path"), "{err}");
+        assert!(!err.contains("no spaces"), "{err}");
+    }
+
+    #[test]
+    fn a_multi_word_line_is_reported_as_a_possible_spaced_path() {
+        // Ambiguous by nature — prose and a spaced filename look the same —
+        // so the message covers both and routes the unrepresentable case to
+        // the form that can express it.
+        let err = no_file_error(1, Some("my notes.rs:4"));
+        assert!(err.contains("no spaces"), "{err}");
+        assert!(err.contains("oldText"), "{err}");
+    }
+
+    #[test]
+    fn a_path_with_a_space_is_reported_and_routed_to_the_single_edit_form() {
+        // A header must be one whitespace-free token, so a real filename with
+        // a space cannot be expressed this way. With no `path` argument to
+        // fall back on, the single-edit fields are the only way through.
+        let text = "my notes.rs:4\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
+                    src/b.rs:3\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
+        let err = split_by_file(parse(text)).unwrap_err();
+        assert!(err.contains("`my notes.rs:4`"), "{err}");
+        assert!(err.contains("oldText"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_blob_is_an_error() {
+        assert!(split_by_file(ParsedBlocks {
+            path: None,
+            multi_file: true,
+            edits: vec![],
+        })
+        .is_err());
+    }
+
+    // -- rule 2: headers are authoritative; `path` is never consulted ------
+
+    #[test]
+    fn block_paths_are_authoritative_and_the_path_argument_is_not_consulted() {
+        // The function takes no `path` at all, so there is no code path by
+        // which a redundant argument could re-target a file.
+        let g = split_by_file(blob(&[("a.rs", "1"), ("b.rs", "2")])).unwrap();
+        assert_eq!(
+            g.iter().map(|b| b.path.as_str()).collect::<Vec<_>>(),
+            vec!["a.rs", "b.rs"]
+        );
+    }
+
+    // -- rule 3: grouping keys on the normalized path ----------------------
+
+    #[test]
+    fn equivalent_spellings_are_one_batch() {
+        // `group_by_file` keys on the raw string, so this is two batches and
+        // two applies for one file — the bug the keying rule closes.
+        let g = split_by_file(blob(&[("./a.rs", "1"), ("a.rs", "2")])).unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].edits.len(), 2);
+        // Reported with the first spelling the model used.
+        assert_eq!(g[0].path, "./a.rs");
+    }
+
+    #[test]
+    fn the_batch_path_is_the_first_spelling_not_the_normalized_one() {
+        let g = split_by_file(blob(&[("./a.rs", "1")])).unwrap();
+        assert_eq!(g[0].path, "./a.rs");
+    }
+
+    // -- rule 4: the fan-out cap -------------------------------------------
+
+    #[test]
+    fn exactly_the_cap_is_accepted_and_one_more_is_rejected() {
+        let at_cap: Vec<(String, &str)> = (0..MAX_FILES_PER_CALL)
+            .map(|i| (format!("f{i}.rs"), "x"))
+            .collect();
+        let spec: Vec<(&str, &str)> = at_cap.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+        assert_eq!(
+            split_by_file(blob(&spec)).unwrap().len(),
+            MAX_FILES_PER_CALL
+        );
+
+        let over: Vec<(String, &str)> = (0..=MAX_FILES_PER_CALL)
+            .map(|i| (format!("f{i}.rs"), "x"))
+            .collect();
+        let spec: Vec<(&str, &str)> = over.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+        let err = split_by_file(blob(&spec)).unwrap_err();
+        assert!(
+            err.contains(&format!("the limit is {MAX_FILES_PER_CALL}")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_cap_counts_files_not_blocks() {
+        // Many blocks, one file: not a fan-out, so not capped.
+        let spec: Vec<(&str, &str)> = (0..MAX_FILES_PER_CALL + 5).map(|_| ("a.rs", "x")).collect();
+        let g = split_by_file(blob(&spec)).unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].edits.len(), MAX_FILES_PER_CALL + 5);
+    }
+
+    // -- the hazard this whole function exists to avoid -------------------
+
+    #[test]
+    fn a_header_less_block_never_becomes_a_second_file() {
+        // `group_by_file` with a `path` fallback turns exactly this blob into
+        // two batches. Here it is one error, and no file is implied.
+        let text = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
+        assert!(split_by_file(parse(text)).is_err());
     }
 }

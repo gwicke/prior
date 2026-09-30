@@ -497,10 +497,13 @@ fn apply(args: &[String]) -> Result<String, Failure> {
             other => path = Some(PathBuf::from(other)),
         }
     }
-    // Blocks arrive on stdin, so a file named on the command line wins and the
-    // blob's own headers are the fallback -- the same precedence as the `edit`
-    // tool's `path` argument. Parse first, because the headers are where the
-    // fallback comes from and because a blob may span many files.
+    // Blocks arrive on stdin. This is `group_by_file`, which is
+    // *header-authoritative*: a block that names its own file uses that name,
+    // and a file named on the command line only fills the gaps left by blocks
+    // with no header. (The `edit` tool has no such fallback — its
+    // `split_by_file` requires every block to name its own file — so do not
+    // read this precedence as the tool's.) Parse first, because the headers are
+    // where the fallback comes from and because a blob may span many files.
     let named = match path {
         Some(p) if p.as_os_str().is_empty() || p == PathBuf::from("-") => None,
         Some(p) => Some(p),

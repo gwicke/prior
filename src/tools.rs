@@ -20,6 +20,7 @@ use crate::path_util::relativize_path;
 pub use blockedit::wire::{EditArgs, MAX_ECHOED_ARGS};
 // The advertised blob field is spelled by the same const the parser reads, so the
 // schema and `EditArgs::from_wire` cannot drift into naming two different fields.
+#[allow(unused)]
 use blockedit::blob::{BLOCKS_FIELD, LEGACY_BLOCKS_FIELD};
 use blockedit::ApplyOutcome;
 pub use blockedit::{apply_to_text, EditOp};
