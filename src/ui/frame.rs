@@ -591,6 +591,9 @@ fn plan_full(cache: &mut DrawCache, frame: &Frame, top: usize, tw: usize, th: us
         None => 0,
     };
 
+    // **NOT the model — see `ui_draw_v2` §4/§4.5.7.** The area is not
+    // placed against the screen's last row; it sits below the content and is
+    // pushed down by it. This descend-to-fit belongs to the pending replacement.
     // 2. Make room for the block and land on its last row. `h-1` bare LFs do
     //    both: an LF at the bottom row scrolls, anywhere else it moves down
     //    one. So the block's last row is the cursor's row afterwards, and
@@ -781,6 +784,10 @@ pub(crate) fn plan_consume(cache: &mut DrawCache) -> Option<(String, Frame)> {
     // input's caret — so without it the erase would clear what lies *past* the
     // prompt and leave the prompt itself standing, which is exactly the tail a
     // short content line would then inherit.
+    //
+    // Also see `ui_draw_v2` §5.2: this erases all `h` rows every write, but rows are
+    // padded to `term_w`, so a content write already overwrites them. It is only
+    // needed when the area *shrank*, and then just for `old_h - new_h` rows.
     if h > 0 {
         let cur = caret_row.min(h - 1);
         cud(&mut s, h - 1 - cur);
@@ -829,6 +836,12 @@ pub(crate) fn plan_reposition(
     let delta = (anchor + h).saturating_sub(1).saturating_sub(th);
     let top = anchor.saturating_sub(delta).max(1);
     let mut s = String::new();
+    // **NOT the model — see `ui_draw_v2` §4/§4.5.7 and the §5.2 known gap.**
+    // The area is *not* placed by its bottom edge: it sits immediately below
+    // the content and the content pushes it down, so it should paint forward
+    // from a fresh row and never descend. What follows anchors the block to
+    // the screen's last row instead — the common CLI idiom, but not this one.
+    // Kept until the replacement lands; do not read it as the design.
     // Make room and land on the block's last row. `h-1` bare LFs do both: an LF
     // at the bottom row scrolls, anywhere else it moves down one. So exactly
     // `delta` of them reach scrollback and the block fits even when the tracked
@@ -1761,6 +1774,10 @@ mod apply_tests {
         );
     }
 
+    /// **NOT the model — see `ui_draw_v2` §4/§4.5.7.** This pins the area to
+    /// the screen's last row, which the design explicitly rules out: the area
+    /// follows the content and only *appears* to sit at the bottom once the
+    /// screen is full. Renaming/reworking this test is part of the §5.2 change.
     /// The frame has to fit: when the content has pushed it past the bottom
     /// row, the same LFs scroll and the frame lands flush at the bottom.
     #[test]

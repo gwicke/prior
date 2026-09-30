@@ -852,42 +852,71 @@ renders at, and width is composition, not budget.
 > deleted.
 >
 > **Known gap:** `end_to_end_input_mode_layout` reports **two** blank rows
-> between a turn's last content and the status row, where it asserts one. Root
-> cause is now localized but **not fixed** — the notes below are what the
-> investigation established, so the next attempt does not repeat it.
+> between a turn's last content and the status row, where it asserts one. Not
+> fixed. What follows is the diagnosis and the proposed change; it supersedes an
+> earlier note in this file that blamed the `cursor_row()` re-anchor, which is
+> innocent.
 >
-> The extra row is a **scroll-accounting** bug in `plan_reposition`, not the
-> consume/reposition path. Three facts, all measured on a vt100 replay of the
-> real binary rather than reasoned about:
+> **The cause is that `plan_reposition` places the area by its bottom edge,
+> which §4 and §4.5.7 rule out.** The model is settled: the area sits
+> immediately below the content and content pushes it down; nothing is reserved;
+> the rows beneath it are ordinary empty screen. The implementation instead
+> descends `h-1` rows, paints the area **bottom-up**, and derives a `top` from
+> the tracked cursor against the screen's last row — i.e. it anchors the area to
+> the bottom of the screen. `plan_full` does the same.
 >
-> 1. The frame is **bottom-pinned** throughout a turn (`top` is `th - h + 1` on
->    every reposition), and `plan_consume` moves the cursor to the frame's top
->    row before each content write. So each chunk is written *into the frame's
->    own rows*, and the block only clears them because `plan_reposition` scrolls.
->    The `h-1` bare LFs are load-bearing, not slack: they are the scroll that
->    lifts the transcript clear of the frame. Reducing them fixes scenario 0 and
->    **silently erases the transcript** in the 429-retry scenario (scenario 3)
->    — the error lines are emitted and never reach the screen.
-> 2. The LF count and the block's row are coupled, which is the thing the naive
->    fix misses. With `L` LFs, the paint loop (which walks *up* `h-1` from the
->    cursor) puts the block at `[anchor + L - h + 1, anchor + L]`, so it lands on
->    `[top, top + h - 1]` only when `L = h - 1 - delta`. `L = h - 1` therefore
->    paints the block `delta` rows past the bottom edge and relies on its own
->    LF scroll to pull it back — the two errors cancel only by accident.
-> 3. The variable that decides this is **`DrawCache::caret`**, and
->    `note_lines` clamps it at `term_h`. That clamp discards exactly the
->    information needed: once the transcript reaches the bottom, every further
->    content row increments the *logical* row but the tracked one sticks at
->    `term_h`, so `delta` cannot tell one row of overflow from two.
+> That is the shape of the bug, and it explains why fixing it has resisted a
+> formula. Measuring the byte stream of the real binary, three things hold:
 >
-> Un-clamping `note_lines` (the tracked row becomes logical, scrollback
-> included; every screen-row use already clamps at the call site) and driving
-> the LF count from the unclamped row makes scenario 0 and scenario 3 both pass
-> — and then moves the mid-turn bar one row low, because the same count also has
-> to place the block *below* the transcript when it is mid-screen rather than
-> bottom-pinned. **The formula has to satisfy both regimes at once** and the
-> `max(h-1, scrolled)` combination tried here satisfies neither. That is the
-> open question; everything before it is settled.
+> 1. **`plan_consume` and `plan_reposition` use different vertical primitives for
+>    the same move.** `plan_consume` descends with `CUD` (`CSI n B`, relative);
+>    `plan_reposition` descends with bare `LF`. They agree everywhere except the
+>    screen's last row, where `CUD` does nothing and `LF` **scrolls**. So a
+>    single number — the LF count — means "advance the cursor" in one regime and
+>    "scroll the transcript" in the other. That is the whole sensitivity.
+> 2. **Cutting the LFs does not work**, which is why the arithmetic kept
+>    failing. The content write is *into the area's own rows* (consume moves the
+>    cursor there first), so the area's LFs are the scroll that lifts the
+>    transcript back out. Reducing them makes the area paint over its own
+>    transcript: the 429-retry scenario's two `Error:` lines are emitted and
+>    never reach the screen, and no assertion catches it, because that content is
+>    simply absent.
+> 3. **`note_lines` clamps the tracked row at `term_h`,** discarding exactly the
+>    quantity the placement needs. Once the transcript reaches the last row the
+>    *logical* row keeps growing while the tracked one sticks, so no value
+>    derived from `caret` can distinguish one row of overflow from two. Attempts
+>    to compensate in the LF count (un-clamping `caret`, then `max(h-1,
+>    scrolled)`) satisfy one regime and break the other, because the same count
+>    also has to seat the area *below* the transcript when it is mid-screen.
+>
+> **Proposed change** — remove the bottom-edge placement rather than re-tune it.
+>
+> - **The area paints forward from a fresh row; it does not descend.** After
+>   the content write, emit `\r` + the newlines for the rows just written + the
+>   policy gap, then paint row 0, row 1, … in order. No `top`, no `delta`, no
+>   `CUU`, no bottom-up pass — which retires the `CUD`/`LF` asymmetry above,
+>   because no vertical motion is left to be ambiguous about at the screen edge.
+> - **Spacing is the UI's, forced explicitly.** `\r\n` is well-defined from any
+>   cursor position — `CR` cancels the wrap-pending state left by a full-width
+>   row — so the UI never has to ask where the content left the cursor, and the
+>   content contract needs no trailing newline. (Forcing one there would make it
+>   impossible to render content to the last row, which is the whole point of
+>   this change.) The gap count becomes the deliberate value
+>   `end_to_end_input_mode_layout` asserts, rather than a residue of scroll
+>   arithmetic.
+> - **Wipe only what the write will not overwrite.** Frame rows are padded to
+>   `term_w` (`pad_row`), so a content write already overwrites them wholesale.
+>   The `EL` loop in `plan_consume` is redundant except when the area *shrank*,
+>   and then only for `old_h - new_h` rows at the top — the delta, not `h` rows
+>   every write.
+>
+> This is also why the test could not arbitrate the arithmetic: scenario 0 is a
+> short turn that fills the screen, which is the **steady state**, and §4 notes
+> that the reserved and unreserved designs converge there and differ only *before*
+> the screen fills. A regression test for this change has to keep the area
+> mid-screen — a long, low-output turn, or an area that changed height — since
+> that is the only regime where the two differ. Until then the gap is expected
+> to close from this change, and is not to be re-investigated as arithmetic.
 
 `next_input_row` / `clear_rows_to` folded into the apply implementation (P3); their
 meaningful unit tests moved to `ui::frame::apply_tests`, the byte-mechanics ones
