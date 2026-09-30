@@ -1107,6 +1107,54 @@ which the rename had to address anyway, since the model-facing field moved and
 *Tests:* a multi-file blob renders a label with no `[1]`; a resolvable blob and
 a single-file blob are unchanged.
 
+### The view layer has one unit: the call-result pair
+
+**A multi-file batch must render byte-for-byte as N single-file batches would.**
+This is not a preference: the session file already stores N per-file calls and N
+per-file results (W8), so a view that showed anything else would be showing a
+shape nothing else in the system holds.
+
+*What the view layer actually receives.* It does not receive "calls" and
+"results" as separate streams that could be grouped however it likes — rig
+fires them as **pairs**. `run_single_tool` (rig `runner.rs:605`) calls
+`resolve_tool_call` at ~635 and `on_tool_result` at 720: the call and its result
+are raised inside one function, once per tool. So the render unit is the pair,
+and between pairs the order does not matter — each pair is a self-delimiting
+block (`boundary()` above, label, diff, note, `end_tool_block()` below), so
+concatenating them in any order yields the same bytes.
+
+*What that rules out.* A multi-file call is one hook event and its array result
+a second, so the tempting shape — render all N labels and diffs at the call
+event, then all N notes at the result event — produces **two contiguous runs**
+instead of N blocks. That is the shape that would have looked wrong. The pair
+has to be kept whole, which means the call half must wait for the result half.
+
+*The mechanism* (`src/output.rs`):
+
+| where | what |
+| --- | --- |
+| `display_tool_call` | stashes `last_tool`, and for a multi-file `edit` **returns without rendering** — the pair is incomplete |
+| `multi_file_blobs` / `per_file_blocks` | per-file call arguments, in first-seen order, each a complete single-file argument value |
+| `display_tool_result` | reads the stashed args back, pairs them with the array's entries by index, and for each pair calls `render_call_panel` then `render_result_panel` |
+| `render_call_panel` | the call half: `boundary()`, label, trailing diff lines |
+| `render_result_panel` | the result half: envelope/`sed`/note, ending in `end_tool_block()` |
+| `multi_file_pairs` | the pairing; a length mismatch degrades to rendering the result alone rather than guessing |
+
+`render_call_panel` and `render_result_panel` are the *same* functions a
+single-file call goes through — there is no second code path, which is what
+makes the invariant structural rather than a property someone must remember to
+maintain. The only multi-file-specific logic is deciding to defer.
+
+Pairing is by index, from the same file list in first-seen order, which is the
+same derivation the W7 and W8 splits use. A result replayed with no call in
+context falls back to per-file result panels with a path label — the diff is
+gone because the call half is gone, but the report stays per file.
+
+*Tests:* `a_multi_file_batch_renders_identically_to_n_single_file_batches`
+renders both shapes into a capture buffer and asserts the strings are **equal**,
+then asserts the shared rendering really is the single-file one (label, `@@`
+hunk, per-file note, once each).
+
 **W7 — the model-facing site (`src/agent.rs`) — DONE.** `split_multi_file_
 edit_calls`, called in `on_completion_call` as `split(blob(strip(history)))`:
 N per-file calls and N per-file results, with ids derived as `{orig}~f{i}n{n}`.
