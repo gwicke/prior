@@ -2629,10 +2629,24 @@ mod tests {
     /// pinned so the expected geometry does not depend on the test runner's
     /// terminal. Height is not pinned (the clamp in `note_lines` needs a real
     /// terminal size), so the cases stay well under one screen.
+    ///
+    /// The reasoning routing is pinned too, and for the same reason: a capture
+    /// harness that inherits `!stdout().is_terminal()` sends reasoning to
+    /// *stderr* whenever the runner's stdout is a pipe, so the test sees nothing
+    /// and concludes "reasoning was dropped" — when in fact it was diverted.
+    /// Under a runner that hands the binary a tty the same value is `false`, the
+    /// reasoning lands in the capture, and a test that assumed the pipe case
+    /// fails for a reason that has nothing to do with the code. A capturing
+    /// harness should capture everything the code might write, so this pins the
+    /// answer to the question every test in this file is asking.
+    ///
+    /// The one test whose subject *is* the routing names both values itself.
     fn capturing_output(width: u16) -> (ConsoleOutput, crate::settings::ShowReasoningHandle) {
         crate::repl::TERMINAL_WIDTH.store(width as usize, std::sync::atomic::Ordering::SeqCst);
         let reasoning = crate::settings::default_show_reasoning_handle();
-        (ConsoleOutput::new(reasoning.clone()), reasoning)
+        let mut out = ConsoleOutput::new(reasoning.clone());
+        out.reasoning_on_stderr = false;
+        (out, reasoning)
     }
 
     /// Tracked cursor row of `out` (0-based, as the screen reports it).
@@ -2848,16 +2862,14 @@ mod tests {
     fn run_script(steps: &[Step], chunk: Chunking) -> Vec<u8> {
         let (mut out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        // A test's stdout is not a terminal, so reasoning would be routed to
-        // stderr — out of the capture. Ask for it on the captured stream; the
-        // routing itself is what `reasoning_on_stderr` decides, and it is
-        // exercised by `reasoning_goes_to_stderr_without_a_terminal`.
+        // Reasoning on the captured stream. `capturing_output` already pins
+        // this, so the line is redundant — kept because a replay test that
+        // silently stopped seeing reasoning would look like a spacing bug, and
+        // the pin is exactly the kind of thing a future edit drops as
+        // "obviously already handled". The routing itself is the subject of
+        // `reasoning_is_routed_by_the_output_layer`, which names both values.
         out.reasoning_on_stderr = false;
         out.begin_capture();
-        // Forced, because a test's stdout is not a tty and `begin_response`
-        // would take the buffered path — which is why no replay test has ever
-        // exercised the incremental renderer, and where this morning's spacing
-        // bug lived. B3c removes the branch and this line with it.
         out.begin_response();
         for step in steps {
             match step {
@@ -2999,15 +3011,27 @@ mod tests {
     /// §4.1 of the plan: reasoning is routed at the output layer, so a
     /// consumer of `picocode "q" | cat` can drop it, and the render path does
     /// not fork on whether there is a terminal.
+    ///
+    /// Both halves set `reasoning_on_stderr` **explicitly**, because that flag is
+    /// the routing and inheriting it would make the test assert the *runner's*
+    /// terminal rather than the code. It did exactly that: a test binary's stdout
+    /// is usually a pipe, so "no terminal" was taken to be ambiently true, and
+    /// under a runner that hands the binary a tty the first half failed with
+    /// "reasoning must not reach stdout without a terminal" — the flag had been
+    /// `false` because there *was* a terminal, exactly as the flag is supposed to
+    /// say. The harness now pins the flag for every other test in the file
+    /// (`capturing_output`); the two values are named here because they are this
+    /// test's subject.
     #[test]
     #[serial]
     fn reasoning_is_routed_by_the_output_layer() {
         let script = [Step::Think("Weighing the options.\n\n"), Step::ResponseEnd];
 
-        // No terminal (the default for a test): reasoning leaves stdout — it
-        // shows up on the test runner's stderr, which is the divert working.
+        // Diverted: reasoning leaves stdout — it shows up on the test runner's
+        // stderr instead, which is what makes `2>/dev/null` work for a consumer.
         let (mut out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
+        out.reasoning_on_stderr = true;
         out.begin_capture();
         out.begin_response();
         feed(&out, script[0], Chunking::Whole);
@@ -3015,10 +3039,10 @@ mod tests {
         let piped = out.end_capture();
         assert!(
             !String::from_utf8_lossy(&piped).contains("Weighing the options"),
-            "reasoning must not reach stdout without a terminal"
+            "reasoning must not reach stdout when it is routed to stderr"
         );
 
-        // With a terminal: it is on the screen, and counted like any content.
+        // On the screen: the other side of the same decision.
         let (mut out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
         out.reasoning_on_stderr = false;
