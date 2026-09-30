@@ -197,6 +197,9 @@ pub fn preview_text(
     expressions: &str,
     opts: Options,
 ) -> Result<TextPreview, Error> {
+    if has_carriage_return(original) {
+        return Err(Error::CarriageReturn(shown_path.to_string()));
+    }
     let scr = script::build(expressions).map_err(Error::Script)?;
     let new = engine::run(
         &scr.text,
@@ -240,6 +243,9 @@ pub enum Error {
     Engine(String),
     /// The diff is real but cannot be expressed as an appliable block set.
     Blocked(String),
+    /// The file has carriage returns this tool cannot represent faithfully.
+    /// Carries the path to name in the message.
+    CarriageReturn(String),
     Io(String),
 }
 
@@ -249,9 +255,34 @@ impl std::fmt::Display for Error {
             Error::Script(e) => write!(f, "{e}"),
             Error::Engine(e) => write!(f, "{e}"),
             Error::Blocked(e) => write!(f, "{e}"),
+            Error::CarriageReturn(path) => write!(
+                f,
+                "{path} has carriage returns this tool cannot carry. A CRLF file loses its \
+                 line endings before the change is worked out, so the preview would describe a \
+                 different file and no block would apply back. Convert the file to LF and try \
+                 again, or edit it with a tool that preserves line endings."
+            ),
             Error::Io(e) => write!(f, "{e}"),
         }
     }
+}
+
+/// Whether `text` has a carriage return this tool cannot represent.
+///
+/// Two positions matter, and they fail differently:
+///
+/// * Before a newline — a CRLF line ending. The engine strips the `\r` as it
+///   reads, so a CRLF file reaches the diff as a different file and every line
+///   looks edited. This is the case worth catching early, since the resulting
+///   blocks apply to nothing.
+/// * At the very end, with no newline to pair it. The block format drops a `\r
+///   that sits directly before a line break, and the renderer always ends a
+///   block with one, so a block whose text ends in `\r` cannot round-trip.
+///
+/// A `\r` anywhere else is ordinary content: `str::lines()` and the block
+/// format both keep it, and the preview is exact.
+fn has_carriage_return(text: &str) -> bool {
+    text.as_bytes().windows(2).any(|w| w == b"\r\n") || text.ends_with('\r')
 }
 
 impl std::error::Error for Error {}
@@ -300,6 +331,58 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("never writes"), "{msg}");
         assert!(msg.contains("expression 1"), "{msg}");
+    }
+
+    /// A CRLF file is refused rather than previewed. The engine strips the `\r`
+    /// as it reads, so what reached the diff was a different file: every line
+    /// looked edited, and the blocks that came back named `old_text` in `\n`
+    /// that appears nowhere in the file. They applied to nothing.
+    #[test]
+    fn crlf_is_refused_rather_than_mis_previewed() {
+        let e = preview_text("a\r\nb\r\n", "crlf.txt", "s/b/B/", opts()).unwrap_err();
+        assert!(
+            matches!(e, Error::CarriageReturn(ref p) if p == "crlf.txt"),
+            "{e:?}"
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("crlf.txt"), "{msg}");
+        assert!(msg.contains("Convert the file to LF"), "{msg}");
+    }
+
+    /// A mixed-ending file is the same failure partway through, and no more
+    /// previewable than a wholly-CRLF one.
+    #[test]
+    fn mixed_line_endings_are_refused() {
+        assert!(preview_text("a\r\nb\n", "f.rs", "s/b/B/", opts()).is_err());
+    }
+
+    /// A `\r` at the very end, with no newline to pair it, cannot round-trip
+    /// through the block format either — the renderer ends a block with a
+    /// newline, and the parser drops a `\r` that sits before one.
+    #[test]
+    fn a_trailing_carriage_return_is_refused() {
+        let e = preview_text("a\nb\r", "f.rs", "s/a/A/", opts()).unwrap_err();
+        assert!(matches!(e, Error::CarriageReturn(_)), "{e:?}");
+    }
+
+    /// A `\r` anywhere else is ordinary content: both the line splitter and the
+    /// block format keep it, so the preview is exact and must not be refused.
+    /// The line it sits on is changed here so the block carries it, which is
+    /// where it would have to survive.
+    #[test]
+    fn a_mid_line_carriage_return_is_content_not_an_ending() {
+        let TextPreview { blob, blocked, .. } =
+            preview_text("a\rb\nc\n", "f.rs", "s/a/X/", opts()).unwrap();
+        assert!(blocked.is_none(), "{blocked:?}");
+        assert!(blob.contains("a\rb"), "{blob:?}");
+        assert!(blob.contains("X\rb"), "{blob:?}");
+    }
+
+    /// The same file, once converted, previews as it always should — the check
+    /// is about the bytes, not the file's name.
+    #[test]
+    fn the_lf_equivalent_of_a_crlf_file_previews_normally() {
+        assert!(preview_text("a\nb\n", "f.rs", "s/b/B/", opts()).is_ok());
     }
 
     #[test]

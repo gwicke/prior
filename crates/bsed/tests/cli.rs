@@ -73,6 +73,57 @@ fn a_directory_without_recursive_is_a_usage_error() {
 }
 
 #[test]
+fn a_crlf_file_is_refused_with_a_reason() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("crlf.txt"), "a\r\nb\r\n").unwrap();
+    let o = run_in(d.path(), None, &["preview", "s/b/B/", "crlf.txt"]);
+    assert_eq!(code(&o), 2);
+    let err = stderr(&o);
+    assert!(err.contains("carriage returns"), "{err}");
+    assert!(err.contains("LF"), "{err}");
+    // Nothing was written, and no block was offered that would not apply.
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
+    assert_eq!(
+        std::fs::read_to_string(d.path().join("crlf.txt")).unwrap(),
+        "a\r\nb\r\n"
+    );
+}
+
+/// One refused file must not sink the walk, and it must be named: silence
+/// would read as "that file needed no change".
+#[test]
+fn a_crlf_file_does_not_sink_a_recursive_preview() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("crlf.txt"), "a\r\nb\r\n").unwrap();
+    std::fs::write(d.path().join("ok.txt"), "a\nb\n").unwrap();
+    let o = run_in(d.path(), None, &["preview", "-r", "-p", ".", "s/b/B/"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    // The LF file was still previewed...
+    assert!(out.contains("ok.txt:2"), "{out}");
+    assert!(out.contains("@@@NEW"), "{out}");
+    // ...and the CRLF one is named with the reason, not folded into the count.
+    assert!(out.contains("crlf.txt"), "{out}");
+    assert!(out.contains("CRLF"), "{out}");
+    assert!(!out.contains("crlf.txt:2"), "{out}");
+}
+
+/// A tree that is *only* refused files must not report "no lines matched" and
+/// stop there — the expression did match, the tool declined to look.
+#[test]
+fn a_tree_of_only_crlf_files_says_why() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("crlf.txt"), "a\r\nb\r\n").unwrap();
+    let o = run_in(d.path(), None, &["preview", "-r", "-p", ".", "s/b/B/"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("no lines matched"), "{out}");
+    // ...but it also says which file matched and was skipped, and why.
+    assert!(out.contains("crlf.txt"), "{out}");
+    assert!(out.contains("CRLF"), "{out}");
+}
+
+#[test]
 fn recursive_preview_walks_the_tree_and_reports_counts() {
     let d = tree();
     let o = run_in(

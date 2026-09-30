@@ -426,14 +426,26 @@ fn recursive_preview(
     let mut blocks = 0usize;
     let mut skipped = 0usize;
     let mut blocked: Vec<(String, String)> = Vec::new();
+    // Kept apart from `blocked` because the advice differs. "Re-run on that file
+    // alone" is what rescues a block that cannot be expressed; a CRLF file is
+    // refused either way, so telling the reader to retry it would be a loop.
+    let mut crlf: Vec<String> = Vec::new();
 
     for f in &files {
         let Ok(text) = std::fs::read_to_string(f) else {
             skipped += 1; // binary or unreadable
             continue;
         };
-        let p = crate::preview_text(&text, &f.display().to_string(), expressions, opts)
-            .map_err(|e| Failure::User(e.to_string()))?;
+        let p = match crate::preview_text(&text, &f.display().to_string(), expressions, opts) {
+            Ok(p) => p,
+            // One refused file must not sink the tree, but it must be named:
+            // silence here would read as "that file needed no change".
+            Err(crate::Error::CarriageReturn(_)) => {
+                crlf.push(f.display().to_string());
+                continue;
+            }
+            Err(e) => return Err(Failure::User(e.to_string())),
+        };
         if p.blob.is_empty() {
             continue;
         }
@@ -453,7 +465,7 @@ fn recursive_preview(
     }
 
     if changed_files == 0 {
-        return Ok(format!(
+        let mut out = format!(
             "no lines matched — none of the {} file(s) under {} changed{}{}\n",
             files.len() - skipped,
             root.display(),
@@ -470,7 +482,13 @@ fn recursive_preview(
                     blocked.len()
                 )
             }
-        ));
+        );
+        // "no lines matched" is the wrong sentence when a file did match and was
+        // refused, so the CRLF files are spelled out rather than just counted.
+        if !crlf.is_empty() {
+            out.push_str(&crlf_report(&crlf));
+        }
+        return Ok(out);
     }
 
     let mut out = format!(
@@ -494,9 +512,33 @@ fn recursive_preview(
             out.push_str(&format!("  {path}: {why}\n"));
         }
     }
+    if !crlf.is_empty() {
+        out.push_str(&crlf_report(&crlf));
+    }
     out.push_str(&blob);
     out.push('\n');
     Ok(out)
+}
+
+/// Name the files that were refused for CRLF, and what to do about them.
+///
+/// Separate from the "not expressible as blocks" note because the two need
+/// opposite responses: an unexpressible block may be rescued by re-running on
+/// that file alone, while a CRLF file is refused whatever the script is and
+/// only converting it will help. They are listed whenever any file was skipped
+/// for line endings, not only when the run found nothing at all.
+fn crlf_report(paths: &[String]) -> String {
+    let mut s = format!(
+        "NOTE: {} file(s) use CRLF line endings and were NOT previewed. The line endings \
+         come off before the change is worked out, so a preview would describe a different \
+         file and no block would apply back. Convert {} to LF and re-run.\n",
+        paths.len(),
+        if paths.len() == 1 { "it" } else { "them" }
+    );
+    for p in paths {
+        s.push_str(&format!("  {p}\n"));
+    }
+    s
 }
 
 /// Compile the `--glob` patterns into one allow-list matcher.
