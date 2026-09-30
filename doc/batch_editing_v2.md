@@ -1,6 +1,6 @@
 # Batch Editing v2 — Aider-style text edits
 
-*Status: Phase 1 implemented. W1–W3 done — multi-file editing is accepted, split per file, applied with per-file failure granularity, and reported per file. W4 and W7–W8 remain.*
+*Status: Phase 1 implemented. W1–W4 done — multi-file editing is accepted, split per file, applied and reported with per-file failure granularity, and an unreadable file no longer aborts the call. W5 wording and W7–W8 remain.*
 
 ## Motivation
 
@@ -1055,22 +1055,32 @@ one labelled batch per file and no aggregate line; a failure entry renders its
 today (bare string / bare envelope, never a one-element array); the array branch
 does not swallow an array-of-strings result from another tool.
 
-**W4 — plan/commit (`src/tools.rs`).** Split `edit_file` into
-`plan_file(path, edits) -> PlannedFile` (**never** `Err`; every IO, sandbox and
-non-UTF-8 failure folds into the outcome as a string) and
-`commit_file(&PlannedFile)`. Then `edit_file` is exactly `plan` + `commit`, so
-the single-file path is unchanged by construction, and `tools::edit_file_tests`
-stays green untouched. The new driver `edit_files(Vec<FileEdit>)`:
-1. `plan` every file — sandbox checks and reads all happen here, so a path
-   outside the sandbox or a missing file is discovered **before any write**;
-2. `commit` only the applied ones;
-3. return a bare `success_note` when there is exactly one file (today's string,
-   byte-identical), the envelope otherwise.
+**W4 — plan/commit — DROPPED, and its goal met by the `edit_files` loop.**
 
-*Tests:* two files both apply; one fails and the other still applies, and the
-report names both; a file outside the sandbox fails without blocking the rest
-and without any write having happened; a missing file likewise; success notes
-name each file's own matched lines.
+The original plan split `edit_file` into `plan_file` (never `Err`; every IO,
+sandbox and non-UTF-8 failure folded into the outcome as a string) and
+`commit_file`, so a driver could plan every file and commit only the resolved
+ones. **That split is withdrawn**: with a by-file failure policy it buys nothing
+observable. Per-file all-or-nothing already lives inside `edit_file`; reads and
+sandbox checks already precede that file's write; and "resolve all, then write"
+only differs from "write as you go" for *global* all-or-nothing, which is
+rejected above as the wrong default. It would have cost a `PlannedFile` type, a
+function boundary, and the invariant that the single-file path stays
+unchanged — to reproduce, in more code, the per-file outcome the W3 array
+already is.
+
+What it was actually for — a per-file failure being **data, not control flow** —
+is now a fold in the existing loop: a file that cannot be resolved, read, or
+written becomes that file's `{path, result}` entry (naming the path) and the loop
+continues, so the model gets every file's outcome in one round trip. Before this,
+the `?` in the loop aborted the whole call and discarded the other files'
+reports, reducing a 3-file call to a bare `the tool failed`.
+
+*Tests:* two files both apply; one fails to match and the other still applies,
+and the report names both; **a missing (or unreadable, or sandbox-denied) file
+folds into its own entry naming the path, the other files still apply, and the
+array always has exactly one entry per file**; success notes name each file's
+own matched lines.
 
 **W5 — the tool contract (`src/tools.rs`). — the de-dup is DONE; the copy is not.**
 The rename already lifted the syntax and the policy sentence into `BLOCK_SYNTAX`
@@ -1697,9 +1707,9 @@ corruption is now a loud `overlapping`/`all-claimed` failure).
    diagnosis, all with no caller yet. What remains ships as two commits:
    1. **W1–W2 (execution) — DONE.** Multi-file blobs are accepted, split per
       file, and applied with per-file failure granularity. What remains is
-      **W3–W4**: the per-file result array and its display split, then
-      resolve-all-then-write-what-resolved so one round trip reports every
-      file's problem. Reverted by one guard in `from_wire`.
+      **W3–W4 are also now in**: the per-file result array, its display split,
+      and the per-file fold for an unreadable file, so one round trip reports
+      every file's outcome. Reverted by one guard in `from_wire`.
       **Extended past the original W2 scope**: strictness is now uniform rather
       than multi-file-only, which also removed `merge_path` from the block path
       entirely and forced `render_blob` to head every block. Both were
