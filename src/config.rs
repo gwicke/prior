@@ -739,26 +739,34 @@ impl From<SandboxMaxOutputBytes> for Option<usize> {
 /// `crate::config::EditStartLine` call sites.
 pub use blockedit::EditStartLine;
 
-/// How many unchanged lines the `sed` preview attaches around each change.
+/// How many unchanged lines the `sed` preview attaches **before** each change.
+///
+/// Defaults to 1, and the preview adds 1 after as well, so a change arrives with
+/// one line of context on each side. Symmetry is the point: an asymmetric default
+/// is one more thing for a model to reason about, and it made the *following*
+/// line the only place a continuation was visible. One line each way is enough
+/// for the common shapes — the line a call opens on, the line a block closes on —
+/// and the balance-growth pass still extends a block to its closing bracket when
+/// the construct runs further.
+///
+/// Set 0 for the bare change, or higher for a wider look. Both sides move
+/// together, so a value of 3 gives three lines before and three after.
 ///
 /// Accepts an integer or a numeric string, like [`ReadOffset`], because weak
 /// tool-call harnesses stringify numbers often enough that rejecting `"2"` would
 /// cost more than tolerating it. Clamped to `MAX_CONTEXT` — past that the block
 /// stops being reviewable and starts being the file.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    schemars::JsonSchema,
-    Default,
-    serde::Serialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, serde::Serialize,
 )]
 pub struct ContextLines(pub u16);
+
+impl Default for ContextLines {
+    /// One line each side — see the type's doc.
+    fn default() -> Self {
+        ContextLines(1)
+    }
+}
 
 /// Upper bound on [`ContextLines`].
 pub const MAX_CONTEXT: u16 = 20;
@@ -869,8 +877,9 @@ mod context_lines_tests {
     }
 
     #[test]
-    fn defaults_to_zero() {
-        assert_eq!(ContextLines::default(), ContextLines(0));
+    fn defaults_to_one_line_each_side() {
+        // Symmetric on purpose: see the type's doc.
+        assert_eq!(ContextLines::default(), ContextLines(1));
     }
 }
 

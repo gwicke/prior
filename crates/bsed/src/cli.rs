@@ -42,16 +42,14 @@ PREVIEW (never writes; the default):
                                 matches. Repeatable, and any match wins. Same
                                 semantics as the `find` tool, so use **/*.rs for a
                                 recursive match.
-    -c, --context <N>           Unchanged lines to add before each change (default 0)
-    -t, --trailing <N>          Unchanged lines to add after a change (default 0)
+    -c, --context <N>           Unchanged lines to add before each change (default 1)
+    -t, --trailing <N>          Unchanged lines to add after a change (default 1)
         --no-grow               Do not extend blocks to a balanced bracket
     -b, --budget <BYTES>        Preview budget, single-file mode only (default 51200)
     -u, --unified              Emit a unified diff instead of blocks, for reading
                                 in a pager. A diff cannot be applied by anything:
                                 drop -u for blocks the `edit` tool takes. The
-                                hunk context falls back to 2 when neither -c nor
-                                -t is given, since a diff has no anchor and no
-                                context is a diff you have to open the file to read
+                                hunk takes -c, or -t if -c is absent
     -h, --help
     -n, --quiet                 Suppress automatic printing (ignored; preview only)
     SCRIPT                      If no -e/-f given, first non-option is the script
@@ -83,13 +81,10 @@ struct Mode {
     unified: bool,
     /// Unchanged lines each side of a diff hunk. Only consulted when `unified`.
     ///
-    /// Blocks default to zero because their reader is a program that wants the
-    /// smallest correct payload, and a block is anchored so it needs no room. A
-    /// diff has no anchor and its reader is a person, so a hunk with no context
-    /// is a diff you have to open the file to read. `-u` therefore falls back to
-    /// `udiff::DEFAULT_CONTEXT` when the caller asked for neither `-c` nor `-t`
-    /// -- the same value picocode's in-panel edit preview uses. Asking for either
-    /// overrides it, so neither flag is ever silently ignored.
+    /// A hunk has one context setting rather than a before and an after, so
+    /// this is whichever of `-c`/`-t` the caller gave first, and the default when
+    /// they gave neither. The default matches the block one, so `-u` shows the
+    /// same one-line-each-side window the blocks carry.
     diff_context: usize,
 }
 
@@ -353,20 +348,21 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
         paths
     };
 
+    // One line each side by default, which is what `Context::default` says. The
+    // flags stay independent: `-c 0` and `-t 0` each mean "none on that side".
     let ctx = Context {
-        leading: context.unwrap_or(0),
-        trailing: trailing.unwrap_or(0),
+        leading: context.unwrap_or(1),
+        trailing: trailing.unwrap_or(1),
         grow,
         growth_cap: 20,
     };
     let mode = Mode {
         unified,
-        // `-u` only borrows the context flags; with neither given it uses the
-        // diff default rather than the block default of 0. See `Mode`.
-        diff_context: match (context, trailing) {
-            (None, None) => blockedit::udiff::DEFAULT_CONTEXT,
-            (c, t) => c.unwrap_or(0).max(t.unwrap_or(0)),
-        },
+        // A hunk has one context setting, not a before and an after, so `-u`
+        // reads the first of `-c`/`-t` that was given and ignores the other.
+        // Taking the wider of them instead would make `-c 0` do nothing unless
+        // `-t 0` were passed as well, since `-t` would still default to 1.
+        diff_context: context.or(trailing).unwrap_or(1),
     };
 
     // Handle single file or multiple files

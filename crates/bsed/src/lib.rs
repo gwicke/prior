@@ -491,6 +491,46 @@ mod tests {
         }
     }
 
+    /// A file with no final newline, against a script that does not end in one
+    /// either. GNU's rule is subtle enough to be worth pinning end to end: the
+    /// terminator is absent only while the input's last line is still the
+    /// output's last line.
+    #[test]
+    fn an_unterminated_file_matches_gnu_across_its_cases() {
+        let before = "a\nb\nc";
+        for (script, after) in [
+            ("s/zzz/yyy/", "a\nb\nc"),    // no-op: still the same last line
+            ("s/c/z/", "a\nb\nz"),        // rewritten in place
+            ("1d", "b\nc"),               // moved up, still the last line
+            ("2i\\X", "a\nX\nb\nc"),      // pushed up
+            ("$d", "a\nb\n"),             // gone, so GNU re-terminates
+            ("$a app", "a\nb\nc\napp\n"), // something now follows it
+        ] {
+            let p = preview_text(before, "f.txt", script, opts()).unwrap();
+            let (banner, blob) = (p.banner, p.blob);
+            if blob.is_empty() {
+                assert_eq!(after, before, "{script}: {banner}");
+                continue;
+            }
+            let parsed =
+                blockedit::parse_blocks(&blob).unwrap_or_else(|e| panic!("{script}: {e}\n{blob}"));
+            let edits: Vec<EditOp> = parsed
+                .edits
+                .iter()
+                .map(|e| EditOp {
+                    old_text: e.old_text.clone(),
+                    new_text: e.new_text.clone(),
+                    start_line: e.start_line.map(blockedit::EditStartLine),
+                })
+                .collect();
+            let applied = match blockedit::apply_to_text(before, &edits) {
+                ApplyOutcome::Applied { text, .. } => text,
+                ApplyOutcome::Failed { report, .. } => panic!("{script}: {report}"),
+            };
+            assert_eq!(applied, after, "{script}");
+        }
+    }
+
     #[test]
     fn file_without_trailing_newline_is_unchanged_by_a_no_op() {
         let file = "a\nb";

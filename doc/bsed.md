@@ -100,26 +100,31 @@ Tool name `sed`, registered **only when `bsed` is found on `$PATH`** (§9).
   `326d;327d` on one line and two separate lines are equivalent. Blank lines are
   ignored. NUL bytes are rejected up front (they cannot cross an argv boundary).
 * `context` — integer or numeric string, same shape as `ReadLimit`
-  (`src/config.rs:100`), because harnesses stringify numbers. Default **0**;
+  (`src/config.rs:100`), because harnesses stringify numbers. Default **1**;
   clamped to `[0, 20]`. Effective padding is `leading = context`,
-  `trailing = 0`. A `bsed` caller asks for trailing context with `-t N`; the
-  agent tool does not, and the default is 0 on both sides. See §4.1.
+  `trailing = max(context, 1)`, so an unadorned call gets one line each side. A
+  `bsed` caller sets the two sides independently with `-c N` / `-t N`. See §4.1.
 * Returns the block blob on stdout and a one-line banner on stderr (§7.1a).
   Never writes.
   Not wrapped in `guard()` — it is a read-only preview.
 
 ## 4. Producing the preview
 
-### 4.1 What `context` is, and why both defaults are 0
+### 4.1 What `context` is, and why the default is 1
 
 **`context` is not "print N lines around the match"** (that is `grep -C`). It is
 the number of **unchanged** lines of the original file carried *into each emitted
 block*, inside `OLD` and `NEW`. Only regions that actually changed are ever
 emitted; `context` pads each one.
 
-**Both defaults are 0.** `leading = context`, `trailing = 0`; a caller wanting a
-tail asks for it with `-t N`. An unadorned call therefore gets only the changed
-lines, plus whatever the balance-growth pass (§4.6) reaches.
+**The default is 1, on both sides.** `leading = context`, `trailing =
+max(context, 1)`, so an unadorned call gets one unchanged line before and after.
+Symmetry is the point: an asymmetric default gives the *following* line a special
+role, and that is one more thing to hold in one's head about what a block will
+contain. One line each way covers the common shapes — the line a call opens on,
+the line a block closes on — and the balance-growth pass (§4.6) still extends a
+block to its closing bracket when the construct runs further. `-c 0` / `-t 0` take
+it away again.
 
 This was not always so, and the argument for the 2-line tail it replaced is worth
 keeping, because it is the reason `context` exists at all. The tail turned a
@@ -167,11 +172,10 @@ What `context` then buys is three things, none of which is "makes the edit apply
    if the file shifted between preview and apply — the model applied an earlier
    batch first, or something else touched the file — the 40-duplicate case fails
    the skew rule outright (`d2 = 1 < 3 × d1` for any `d1 ≥ 1`) and `edit` reports
-   "anchor out of tolerance". Correct behaviour, but a wasted round-trip. With
-   both defaults 0 this is the case to expect: a 1-line block has no slack at all.
-   The rule that avoids it is the same either way — apply the whole blob in **one**
+   "anchor out of tolerance". Correct behaviour, but a wasted round-trip. The
+   rule that avoids it is the same either way — apply the whole blob in **one**
    `edit` call, and re-preview before any follow-up batch — and a caller who wants
-   the insurance can ask for a tail with `-t 2`, which restores ±1.
+   the insurance can ask for it with `-c 3` / `-t 3`.
 2. **Legibility of the preview** — `run(); → walk();` alone does not show the
    enclosing `if count > 0 {`. Largely free via §4.6 (the TUI panel renders a
    context-rich diff; only the *model* payload is terse), so there is no reason to
@@ -183,8 +187,9 @@ What `context` then buys is three things, none of which is "makes the edit apply
 
 Cost when used: blocks grow, so the 50 KB preview budget (§5.5) is consumed
 faster, and hunks within `2*context` merge into one larger block (harmless —
-`similar` guarantees they cannot overlap). With both defaults 0 the only growth
-is the balance pass, clamped so it can never reach the next block (§4.5, rule 8).
+`similar` guarantees they cannot overlap). At the default of 1 the growth beyond
+the requested context is only the balance pass, clamped so it can never reach
+the next block (§4.5, rule 8).
 
 ### 4.2 Pipeline (inside `bsed`)
 
@@ -934,7 +939,8 @@ Resolved since (reasoning in §7):
 | 11 | Scope of atomicity for a tree | **per file**: a stale file is reported and skipped, the rest apply | §7.2 |
 | 12 | Budget in `-r` mode | **none** — a human is reading it, and silent truncation is the worst outcome | §7.1 |
 | 13 | How do you see which replacements did not apply? | the **failed blocks are echoed back**, with paths and anchors, ready to re-pipe | §7.2 |
-| 14 | Trailing context by default? | **none** — `trailing: 0`, on both the CLI and the agent tool. Every block is anchored from the file just read, so the tail only bought slack against a stale anchor, at a third of the budget on every change | §4.1 |
+| 14 | Trailing context by default? | **dropped to 0** — every block is anchored from the file just read, so the 2-line tail only bought slack against a stale anchor, at a third of the budget on every change | §4.1 |
+| 15 | …then what about an asymmetric 0/0? | **1 each side** — symmetry is easier to reason about than an asymmetric default, and 0 buys nothing since the blocks are anchored | §4.1 |
 
 Still open — small tuning decisions, not architecture:
 
