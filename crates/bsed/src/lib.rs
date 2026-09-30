@@ -34,6 +34,7 @@ use std::path::Path;
 
 pub use blocks::Rendered;
 pub use hunks::Block;
+pub use script::ChangeRange;
 
 /// Everything the caller can tune.
 #[derive(Debug, Clone, Copy)]
@@ -197,8 +198,13 @@ pub fn preview_text(
     opts: Options,
 ) -> Result<TextPreview, Error> {
     let scr = script::build(expressions).map_err(Error::Script)?;
-    let new = engine::run(&scr.text, original, scr.used_case_sentinels)
-        .map_err(|e| Error::Engine(e.0))?;
+    let new = engine::run(
+        &scr.text,
+        original,
+        scr.used_case_sentinels,
+        &scr.change_ranges,
+    )
+    .map_err(|e| Error::Engine(e.0))?;
 
     let h = hunks::build(original, &new, opts.context);
     let mut p = Preview {

@@ -16,6 +16,8 @@
 //!    expression on a file that lacks a final newline would look like an edit of
 //!    the last line.
 
+use crate::script::ChangeRange;
+
 const CLOSE_C: char = '\u{e003}';
 
 /// Why evaluation failed. Distinct from a rejected script: the script passed
@@ -30,15 +32,71 @@ impl std::fmt::Display for EngineError {
 }
 
 /// Apply `script` to `input`, returning text ready to diff.
-pub fn run(script: &str, input: &str, expect_sentinels: bool) -> Result<String, EngineError> {
+/// Also applies any extracted change-range commands with GNU semantics.
+pub fn run(
+    script: &str,
+    input: &str,
+    expect_sentinels: bool,
+    change_ranges: &[ChangeRange],
+) -> Result<String, EngineError> {
     let mut out = sed_rs::eval(script, input).map_err(|e| EngineError(e.to_string()))?;
     if expect_sentinels {
         out = collapse_case(&out)?;
+    }
+    // Apply change ranges with GNU semantics (replace entire range with one copy)
+    if !change_ranges.is_empty() {
+        out = apply_change_ranges(&out, change_ranges)?;
     }
     // `sed-rs` terminates the last line unconditionally. Put back what the file
     // actually had, so "no change" stays "no change".
     if !input.ends_with('\n') && out.ends_with('\n') {
         out.pop();
+    }
+    Ok(out)
+}
+
+/// Apply change-range commands with GNU sed semantics.
+/// GNU sed: `2,4c\new text` replaces lines 2-4 with ONE copy of "new text".
+fn apply_change_ranges(input: &str, change_ranges: &[ChangeRange]) -> Result<String, EngineError> {
+    let lines: Vec<&str> = input.lines().collect();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line_num = i + 1; // 1-based line number
+        let mut applied = false;
+        for cr in change_ranges {
+            // Handle end_line = usize::MAX (means "to end of file")
+            let end = if cr.end_line == usize::MAX {
+                lines.len()
+            } else {
+                cr.end_line
+            };
+            if line_num >= cr.start_line && line_num <= end {
+                // This line is in the range. Add the replacement once and skip the range.
+                if line_num == cr.start_line {
+                    // Split replacement by newlines and add each as a line
+                    for repl_line in cr.replacement.lines() {
+                        result.push(repl_line);
+                    }
+                }
+                // Skip all lines in this range
+                i = end;
+                applied = true;
+                break;
+            }
+        }
+        if !applied {
+            result.push(lines[i]);
+            i += 1;
+        } else {
+            // i was set to `end` (1-based), which is the 0-based index of the
+            // line AFTER the range. Do not increment further.
+        }
+    }
+    // Join with newlines, preserving trailing newline behavior
+    let mut out = result.join("\n");
+    if input.ends_with('\n') {
+        out.push('\n');
     }
     Ok(out)
 }
@@ -97,17 +155,17 @@ mod tests {
     fn trailing_newline_is_preserved_both_ways() {
         // File without a final newline: output must not gain one, or a no-op
         // would look like an edit of the last line.
-        let out = run("s/a/b/", "x\na", false).unwrap();
+        let out = run("s/a/b/", "x\na", false, &[]).unwrap();
         assert_eq!(out, "x\nb");
         // And a file with one keeps exactly one.
-        let out = run("s/a/b/", "x\na\n", false).unwrap();
+        let out = run("s/a/b/", "x\na\n", false, &[]).unwrap();
         assert_eq!(out, "x\nb\n");
     }
 
     #[test]
     fn no_op_expression_is_byte_identical() {
         let text = "a\nb\nc\n";
-        assert_eq!(run("s/zzz/yyy/", text, false).unwrap(), text);
+        assert_eq!(run("s/zzz/yyy/", text, false, &[]).unwrap(), text);
     }
 
     #[test]
@@ -119,7 +177,7 @@ mod tests {
         // whole reason the rewrite emits segments rather than characters.
         let scr = crate::script::build("s/\\(hi there\\)/\\U\\1/").unwrap();
         assert!(scr.used_case_sentinels);
-        let out = run(&scr.text, "hi there\n", scr.used_case_sentinels).unwrap();
+        let out = run(&scr.text, "hi there\n", scr.used_case_sentinels, &[]).unwrap();
         assert_eq!(out, "HI THERE\n");
     }
 
@@ -127,14 +185,14 @@ mod tests {
     fn sticky_case_escapes_convert_one_character() {
         // \u upper-cases the next character only, then the mode is off.
         let scr = crate::script::build("s/hi/\\uHI there/").unwrap();
-        let out = run(&scr.text, "hi\n", scr.used_case_sentinels).unwrap();
+        let out = run(&scr.text, "hi\n", scr.used_case_sentinels, &[]).unwrap();
         assert_eq!(out, "HI there\n");
     }
 
     #[test]
     fn a_substitution_that_never_matched_is_a_no_op() {
         // No marker in the output is normal: the command simply did not fire.
-        let out = run(r"s/zzz/\U&/", "abc\n", true).unwrap();
+        let out = run(r"s/zzz/\U&/", "abc\n", true, &[]).unwrap();
         assert_eq!(out, "abc\n");
     }
 
@@ -143,7 +201,7 @@ mod tests {
         // A stray closer with no opener — the shape a half-consumed marker
         // leaves behind. Refuse rather than write a private-use codepoint into
         // the user's file.
-        let e = run("a\n\u{e003}stray", "text\n", true).unwrap_err();
+        let e = run("a\n\u{e003}stray", "text\n", true, &[]).unwrap_err();
         assert!(e.0.contains("unbalanced"), "{e}");
     }
 
