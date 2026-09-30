@@ -1,6 +1,6 @@
 # Batch Editing v2 — Aider-style text edits
 
-*Status: Phase 1 implemented. W1–W4 and W7 done — multi-file editing is accepted, split per file, applied and reported with per-file failure granularity, an unreadable file no longer aborts the call, and the model now sees N per-file calls and results. W5 wording and W8 remain.*
+*Status: Phase 1 implemented. W1–W4, W7 and W8 done — multi-file editing is accepted, split per file, applied and reported with per-file failure granularity, an unreadable file no longer aborts the call, the model sees N per-file calls and results, and a saved session stores N pi-canonical single-path calls with matching results. W5 wording remains, deliberately deferred.*
 
 ## Motivation
 
@@ -1154,16 +1154,33 @@ ids; `provider`/`signature` are `None` on every synthesized message; a
 second application is a no-op; a history with no multi-file call is
 byte-identical (identity).
 
-**W8 — the persist site (`src/session/session.rs`).** `canonicalize_edit_tool_calls`
-gains a sibling for the call side; a second sibling handles the result side.
-Both stay **within one message** — an assistant message with N tool calls is
-still one session entry, and a `Message::User` with N results is still one entry
-— so `append_message`'s signature and its return type do not change.
+**W8 — the persist site (`src/session/session.rs`) — DONE.**
+`canonicalize_edit_tool_calls` gains the split, and `split_edit_tool_results` is
+its result-side sibling. Both stay **within one message**, so
+`append_message`'s signature and return type do not change.
 
-*Tests:* the JSONL written for a multi-file blob is N pi-canonical single-path
-tool calls; the matching toolResult entries are N with the same ids; reloading
-and re-persisting is a no-op; a single-file call is byte-identical to today;
-`collect_touched_files` now yields every file, not just the top-level `path`.
+**Split *before* canonicalize, and that order is the whole mechanism.**
+`canonicalize_edit_value` only rewrites a *single*-file blob — it deliberately
+stores a multi-file one raw, "until the storage axis splits it". Splitting first
+means each per-file call canonicalizes to the ordinary `{path, edits}` shape, so
+the on-disk JSONL is N pi-canonical single-path tool calls and **nothing
+downstream needs to know multi-file editing exists** — including
+`collect_touched_files`, which keeps reading `arguments.path` and now yields
+every file simply because there is one call per file. (The original sketch
+called for teaching it to read `files[]`; that work evaporates.)
+
+The two halves are separate messages appended in separate calls and never see
+each other, so their agreement comes only from `split_id` being **one shared
+function** — now `crate::edit_blocks::split_id`, used by both this file and the
+model-facing transform in `agent.rs`. That is the reason it was moved out of
+`agent.rs` rather than duplicated.
+
+*Tests:* the on-disk JSONL holds N pi-canonical single-path calls and N results
+whose `toolCallId`s match them exactly (read back from the raw file, since the
+persisted shape is the contract); a reloaded session's context agrees with disk;
+a single-file call is canonicalized but never split and keeps its id; a
+plain-text (argument-error) result and an array result from another tool are
+both left whole.
 
 ### The result must survive to history
 

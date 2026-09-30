@@ -1240,17 +1240,6 @@ fn tool_result_text(tr: &ToolResult) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
-/// The id of file `i` of `n` in a split of `orig`.
-///
-/// Derived, never minted: the two split sites (this one, and the persist path)
-/// must produce the *same* id for the same (orig, file), and a second
-/// application must be a no-op rather than re-derive a fresh one. The `~` is
-/// not a character any provider issues, so a derived id can never collide with
-/// a real one — which is also why the synthetic calls carry no `provider`.
-fn split_id(orig: &ToolCallId, i: usize, n: usize) -> ToolCallId {
-    ToolCallId::new(format!("{orig}~f{i}n{n}")).expect("a derived id is never empty")
-}
-
 /// The per-file halves of one multi-file `edit` call and its result.
 ///
 /// `per_file` is one blob per file (the synthetic call arguments);
@@ -1260,21 +1249,6 @@ fn split_id(orig: &ToolCallId, i: usize, n: usize) -> ToolCallId {
 struct SplitEditCall {
     per_file: Vec<String>,
     results: Vec<String>,
-}
-
-/// Split one multi-file `edit` call's `blocks` argument into one blob per file,
-/// or `None` if the call is not a well-formed multi-file blob (single-file,
-/// unparseable, or beyond `MAX_FILES_PER_CALL` — all of which the tool itself
-/// handles and reports).
-fn per_file_blocks(args: &serde_json::Value) -> Option<Vec<String>> {
-    let parsed = blockedit::parse_blocks(blockedit::blob_text(args)?).ok()?;
-    let files = blockedit::split_by_file(parsed).ok()?;
-    (files.len() > 1).then(|| {
-        files
-            .iter()
-            .map(|f| blockedit::render_blob(&f.path, &f.edits))
-            .collect()
-    })
 }
 
 /// Split a multi-file `edit` call and its result into per-file halves.
@@ -1287,7 +1261,7 @@ fn per_file_blocks(args: &serde_json::Value) -> Option<Vec<String>> {
 /// file list, so a mismatch would mean a corrupt array, and dropping the whole
 /// call to the original single form is the safe reading of that.
 fn split_edit_call_and_result(args: &serde_json::Value, result: &str) -> Option<SplitEditCall> {
-    let per_file = per_file_blocks(args)?;
+    let per_file = crate::edit_blocks::per_file_blocks(args)?;
     let results: Vec<String> = blockedit::parse_file_results(result)?
         .iter()
         .map(|f| match &f.result {
@@ -1383,7 +1357,7 @@ fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message> {
                     let n = split.per_file.len();
                     for (i, blocks) in split.per_file.iter().enumerate() {
                         new_content.push(AssistantContent::ToolCall(rig_core::message::ToolCall {
-                            id: split_id(&tc.id, i, n),
+                            id: crate::edit_blocks::split_id(&tc.id, i, n),
                             provider: None,
                             function: ToolFunction::new(
                                 "edit".into(),
@@ -1417,7 +1391,7 @@ fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message> {
                     new_content.push(UserContent::Text(Text::new(split_note(n))));
                     for (i, result) in split.results.iter().enumerate() {
                         new_content.push(UserContent::ToolResult(ToolResult {
-                            call: split_id(&tr.call, i, n),
+                            call: crate::edit_blocks::split_id(&tr.call, i, n),
                             provider: None,
                             name: tr.name.clone(),
                             content: vec![ToolResultContent::text(result.clone())],
