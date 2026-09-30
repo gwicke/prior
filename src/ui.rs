@@ -17,7 +17,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crate::output::{Confirmation, Output};
 use crate::slashdot_menu::node_impl::StaticRow;
 use crate::slashdot_menu::render::{paint_overlay, LogicalLine, RenderPlan};
-use crate::ui::frame::{ApplyPolicy, Element, Frame};
+use crate::ui::frame::{pad_row, window, ApplyPolicy, Element, Frame, RenderAt, Rendered};
 use std::rc::Rc;
 
 /// Specification for a confirmation dialog.
@@ -159,6 +159,60 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
             }
             _ => {}
         }
+    }
+}
+
+// --- the overlay element ----------------------------------------------------
+//
+// The pop-up's own element, carrying the pop-up's own squeeze policy: half the
+// allocation above the selection is the *menu's* preference about how much
+// context to show. It used to live in `frame.rs` as `render`'s `h / 2` — where
+// the frame layer had no business holding an opinion about what a menu wants
+// (ui_draw_v2 §3.2.2).
+//
+// It is here rather than in the menu crate because both this module and
+// `repl.rs` build overlays, and neither the menu crate nor `frame.rs` sits
+// below both of them.
+
+impl Element {
+    /// Pre-painted overlay rows (from `paint_overlay`), windowed around the
+    /// selection `focus`. Rows must be single-line and are padded to `term_w`
+    /// at render time.
+    ///
+    /// `must` is 1 only when there is something to show: a composed overlay is
+    /// always meant to be seen, and callers omit the element entirely when
+    /// there is nothing.
+    pub(crate) fn overlay(rows: Vec<String>, focus: usize) -> Self {
+        Element::new(
+            usize::from(!rows.is_empty()),
+            rows.len(),
+            OverlayItem { rows, focus },
+        )
+    }
+}
+
+/// Pre-painted rows, windowed around `focus`.
+struct OverlayItem {
+    rows: Vec<String>,
+    focus: usize,
+}
+
+impl RenderAt for OverlayItem {
+    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+        if h == 0 || self.rows.is_empty() {
+            return Rendered::default();
+        }
+        let start = window(self.rows.len(), self.focus, h, h / 2);
+        let count = h.min(self.rows.len().saturating_sub(start));
+        let mut rows = Vec::with_capacity(count);
+        for r in start..start + count {
+            debug_assert!(
+                !self.rows[r].contains('\n'),
+                "overlay rows are single screen rows"
+            );
+            rows.push(pad_row(&self.rows[r], tw));
+        }
+        Rendered { rows, caret: None }
     }
 }
 

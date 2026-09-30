@@ -18,7 +18,7 @@ use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
 use crate::output::Output;
 use crate::session::SessionTreeNode;
-use crate::ui::frame::{ApplyPolicy, Element};
+use crate::ui::frame::{el_if_short, window, ApplyPolicy, Element, RenderAt, Rendered};
 // Only `compose_frame` — the `#[cfg(test)]` pipeline convenience — needs the
 // rest; naming them unconditionally would trip `unused_imports` on a normal build.
 #[cfg(test)]
@@ -515,6 +515,65 @@ enum V25Frame {
     Continue(crate::slashdot_menu::render::RenderPlan, String),
     DoneSuccess(Option<String>, String),
     DoneError(String, String),
+}
+
+// --- the input element ---------------------------------------------------
+//
+// The editor's own element, carrying the editor's own squeeze policy: how
+// many rows of context to keep above a caret is an opinion about *editing*
+// (ui_draw_v2 §3.2.2). It used to sit in `frame.rs` as `render`'s `Input`
+// arm, where the frame layer could not help but accumulate opinions like it.
+
+/// Rows of context preferred above the caret when an input window must clip
+/// its wrapped height (plan §3.4).
+const INPUT_CONTEXT_ROWS: usize = 3;
+
+impl Element {
+    /// Prompt + editor content. `layout` is the editor's visual layout
+    /// (prompt rendered on row 0); the caret lives at `layout.cursor_row` /
+    /// `layout.cursor_col` — derived, not stored.
+    ///
+    /// `must` is the caret's own row, which is why the input can never be
+    /// squeezed away entirely; wrapping grows `might`.
+    pub(crate) fn input(layout: Layout, prompt: String) -> Self {
+        let might = layout.row_count.max(1);
+        Element::new(1, might, InputItem { layout, prompt })
+    }
+}
+
+/// Editor content: the prompt on row 0, the wrapped buffer below it.
+struct InputItem {
+    layout: Layout,
+    prompt: String,
+}
+
+impl RenderAt for InputItem {
+    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+        if h == 0 {
+            return Rendered::default();
+        }
+        let layout = &self.layout;
+        let n = layout.row_count.max(1);
+        // Three rows above the caret: enough to see the argument you just
+        // edited without losing the caret off the top. This constant is
+        // *why* the impl lives here rather than in the frame layer.
+        let start = window(n, layout.cursor_row, h, INPUT_CONTEXT_ROWS);
+        let count = h.min(n.saturating_sub(start));
+        let mut rows = Vec::with_capacity(count);
+        for r in start..start + count {
+            // The prompt renders on row 0; later rows are content-only.
+            let body: &str = if r == 0 { &self.prompt } else { "" };
+            let text = layout.rows.get(r).map(String::as_str).unwrap_or("");
+            let mut content = String::with_capacity(body.len() + text.len() + 3);
+            content.push_str(body);
+            content.push_str(text);
+            el_if_short(&mut content, tw);
+            rows.push(content);
+        }
+        let caret = (layout.cursor_row >= start && layout.cursor_row < start + count)
+            .then_some((layout.cursor_row - start, layout.cursor_col));
+        Rendered { rows, caret }
+    }
 }
 
 impl Repl {

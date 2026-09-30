@@ -23,13 +23,6 @@ use std::ops::Range;
 
 use crate::slashdot_menu::table::display_width;
 
-/// Rows of context preferred above the caret when an [`Element::input`] window
-/// must clip its wrapped height (plan §3.4).
-///
-/// This is the *editor's* opinion, not the frame layer's — which is why the plan
-/// wants `InputItem` moved out to `repl.rs` and this constant with it (§3.2.2).
-const INPUT_CONTEXT_ROWS: usize = 3;
-
 /// Live-region budget for a terminal of `term_h` rows: the frame may occupy
 /// at most this many rows; the rest of the screen is guaranteed scrollback
 /// (plan §2). Matches the pop-up cap used throughout v2.5 (`⌈2/3·term_h⌉`,
@@ -55,8 +48,11 @@ pub(crate) struct Extent {
 /// polymorphic, and that is the whole point of the shape:
 ///
 /// - `render` cannot accumulate a `match` over element kinds, which is how
-///   squeeze knowledge leaked into this module in the first place (§3.2.2 —
-///   `INPUT_CONTEXT_ROWS` is the editor's opinion, `h / 2` is the menu's);
+///   squeeze knowledge leaked into this module in the first place. The two
+///   opinions that had already leaked are out: `INPUT_CONTEXT_ROWS` now sits in
+///   `repl.rs` beside the editor that holds it, and the overlay's `h / 2` in
+///   `ui.rs` beside the dialog that holds it (§3.2.2). Only `DividerItem` and
+///   `LinesItem`, which have no opinion to express, live here;
 /// - each element holds whatever *it* needs to hold — an `Rc` of its rows, a
 ///   `Layout`, anything — and the frame layer neither knows nor copies it.
 pub struct Element {
@@ -119,36 +115,10 @@ impl Element {
         }
     }
 
-    /// Prompt + editor content. `layout` is the editor's visual layout (prompt
-    /// rendered on row 0); the caret lives at `layout.cursor_row` /
-    /// `layout.cursor_col` — derived, not stored.
-    ///
-    /// `must` is the caret's own row, which is why the input can never be
-    /// squeezed away entirely; wrapping grows `might`.
-    pub(crate) fn input(layout: crate::repl::Layout, prompt: String) -> Self {
-        let might = layout.row_count.max(1);
-        Element::new(1, might, InputItem { layout, prompt })
-    }
-
     /// Dim horizontal rule spanning the full terminal width. All-or-nothing:
     /// a one-row rule that does not fit is a rule nobody wanted.
     pub(crate) fn divider() -> Self {
         Element::new(1, 1, DividerItem)
-    }
-
-    /// Pre-painted overlay rows (from `paint_overlay`), windowed around the
-    /// selection `focus`. Rows must be single-line and are padded to `term_w`
-    /// at render time.
-    ///
-    /// `must` is 1 only when there is something to show: a composed overlay is
-    /// always meant to be seen, and callers omit the element entirely when
-    /// there is nothing.
-    pub(crate) fn overlay(rows: Vec<String>, focus: usize) -> Self {
-        Element::new(
-            usize::from(!rows.is_empty()),
-            rows.len(),
-            OverlayItem { rows, focus },
-        )
     }
 
     /// Fixed text rows (commit lines, future status line). `must == might`, so
@@ -177,47 +147,14 @@ impl Element {
 
 // --- the four kinds ---------------------------------------------------------
 //
-// Each owns its squeeze policy — that is the direction ui_draw_v2 §3.2.2 wants:
-// `INPUT_CONTEXT_ROWS` is the editor's opinion and `h / 2` is the menu's, and
-// they move to `repl.rs` and the menu crate respectively when these types do.
-// What they must not do is go back into `render`.
-
-/// Editor content: the prompt on row 0, the wrapped buffer below it.
-struct InputItem {
-    layout: crate::repl::Layout,
-    prompt: String,
-}
-
-impl RenderAt for InputItem {
-    fn render_at(&self, h: usize, tw: usize) -> Rendered {
-        if h == 0 {
-            return Rendered::default();
-        }
-        let layout = &self.layout;
-        let n = layout.row_count.max(1);
-        let start = window(n, layout.cursor_row, h, INPUT_CONTEXT_ROWS);
-        let count = h.min(n.saturating_sub(start));
-        let mut rows = Vec::with_capacity(count);
-        for r in start..start + count {
-            // The prompt renders on row 0; later rows are content-only.
-            let body: &str = if r == 0 { &self.prompt } else { "" };
-            let text = layout.rows.get(r).map(String::as_str).unwrap_or("");
-            let mut content = String::with_capacity(body.len() + text.len() + 3);
-            content.push_str(body);
-            content.push_str(text);
-            // `EL` only while there is something to erase — after a full-width
-            // row the cursor is wrap-pending and `CSI K` would eat the last
-            // written cell.
-            if display_width(&content) < tw {
-                content.push_str(EL);
-            }
-            rows.push(content);
-        }
-        let caret = (layout.cursor_row >= start && layout.cursor_row < start + count)
-            .then_some((layout.cursor_row - start, layout.cursor_col));
-        Rendered { rows, caret }
-    }
-}
+// The kinds that have **no squeeze policy of their own**.
+//
+// The two that do moved to their owners (ui_draw_v2 §3.2.2): `InputItem` lives
+// in `repl.rs` beside the editor that decides how much context to keep above a
+// caret, and `OverlayItem` in `ui.rs` beside the dialog that decides what
+// "half" means. What must not happen is those two *policies* coming back in
+// here — which is exactly what they were doing while the four arms were inside
+// `render`.
 
 /// A horizontal rule: one row, or none.
 struct DividerItem;
@@ -234,32 +171,6 @@ impl RenderAt for DividerItem {
     }
 }
 
-/// Pre-painted rows, windowed around `focus` with half the allocation as
-/// context above it — the menu's own preference, not the frame layer's.
-struct OverlayItem {
-    rows: Vec<String>,
-    focus: usize,
-}
-
-impl RenderAt for OverlayItem {
-    fn render_at(&self, h: usize, tw: usize) -> Rendered {
-        if h == 0 || self.rows.is_empty() {
-            return Rendered::default();
-        }
-        let start = window(self.rows.len(), self.focus, h, h / 2);
-        let count = h.min(self.rows.len().saturating_sub(start));
-        let mut rows = Vec::with_capacity(count);
-        for r in start..start + count {
-            debug_assert!(
-                !self.rows[r].contains('\n'),
-                "overlay rows are single screen rows"
-            );
-            rows.push(pad_row(&self.rows[r], tw));
-        }
-        Rendered { rows, caret: None }
-    }
-}
-
 /// Fixed rows in reading order — no focus by construction. See
 /// [`Element::lines`] for why that is deliberate.
 struct LinesItem {
@@ -272,9 +183,7 @@ impl RenderAt for LinesItem {
         for row in self.rows.iter().take(h) {
             debug_assert!(!row.contains('\n'), "line rows are single screen rows");
             let mut content = row.clone();
-            if display_width(&content) < tw {
-                content.push_str(EL);
-            }
+            el_if_short(&mut content, tw);
             rows.push(content);
         }
         Rendered { rows, caret: None }
@@ -454,7 +363,10 @@ fn push_row(buf: &mut String, extents: &mut Vec<Range<usize>>, row: &str) {
 /// Pad a pre-painted row to `term_w` visible columns. Padding goes *before*
 /// a trailing reset so styled rows (menu backgrounds) extend to the right
 /// edge; rows already full width are returned unchanged.
-fn pad_row(row: &str, term_w: usize) -> String {
+///
+/// `pub(crate)` because `OverlayItem`'s impl now lives with the dialogs
+/// (`ui.rs`) — the padding is a property of the *row*, not of the element kind.
+pub(crate) fn pad_row(row: &str, term_w: usize) -> String {
     let w = display_width(row);
     if w >= term_w {
         return row.to_string();
@@ -990,6 +902,19 @@ fn frame_caret(frame: &Frame) -> (usize, usize) {
 
 /// `CSI K` — erase from the cursor to the end of the row.
 const EL: &str = "\x1b[K";
+
+/// Append `EL` only while there is something to erase.
+///
+/// After a full-width row the cursor is *wrap-pending*, and `CSI K` would eat
+/// the last written cell — so this is a rule about the terminal rather than
+/// about any particular element, which is why it is shared instead of
+/// duplicated wherever rows are produced. Element impls live outside this
+/// module (`repl.rs`, `ui.rs`) and call it.
+pub(crate) fn el_if_short(content: &mut String, term_w: usize) {
+    if display_width(content) < term_w {
+        content.push_str(EL);
+    }
+}
 
 /// Absolute cursor position, `CSI {row};{col} H`, both 1-based.
 ///
