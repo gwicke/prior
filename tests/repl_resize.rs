@@ -227,6 +227,85 @@ fn vertical_resize_drag_does_not_consume_history() {
     );
 }
 
+/// The area's status row: the only row carrying the **qualified** model id
+/// (`provider:model`). The greeter spells the same model `provider (model)`,
+/// so matching the colon separates the live area from the session header above.
+fn is_status_row(row: &str) -> bool {
+    row.contains("openrouter:")
+}
+
+/// A vertical resize followed by typing must not stack the area.
+///
+/// The keystroke is the repaint trigger — the drag policy is silent — so this is
+/// where a stale frame becomes visible: the redraw re-anchors via DSR and has to
+/// clear the reflowed area instead of stacking a second copy of it.
+///
+/// All three reported symptoms come from this one interaction, and the damage is
+/// progressive, so each round is checked on its own rather than only at the end.
+///
+/// **Currently failing**, and the failure is the report reproduced rather than a
+/// guess: each resize→type cycle adds one blank row above the status row, so
+/// round 2 sits three rows clear of the content above it. The status row itself
+/// is never duplicated in this harness — the two pre-existing resize tests, and
+/// the DSR re-anchor they rely on, still hold. Duplication is reported only when
+/// the input row is on the *last* screen row, which needs a screen-filling
+/// transcript; this harness starts with a short greeter, so the area sits
+/// mid-terminal with room beneath it and there is nothing to overwrite. That
+/// half still needs a repro, and getting one is the next step rather than
+/// assuming the same fix covers it.
+#[test]
+fn vertical_resize_then_type_does_not_stack_the_area() {
+    let mut t = Term::spawn(ROWS, COLS);
+    // Between-turn state: empty input, no menu. `start_with_menu` types `/`,
+    // which grows the frame and changes what has to be cleared.
+    t.pump(Duration::from_millis(1500));
+    assert!(
+        t.rows().iter().any(|r| !r.trim().is_empty()),
+        "no REPL content on screen"
+    );
+
+    for round in 0..3 {
+        // Shrink vertically so the fold is mid-terminal on the next round
+        // instead of sitting on the last row, then type.
+        t.resize(ROWS - 3 - round as u16, COLS);
+        t.pump(Duration::from_millis(250));
+        t.type_bytes(b"-");
+        t.pump(Duration::from_millis(500));
+
+        let rows = t.rows();
+        let bars: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| is_status_row(r))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            bars.len(),
+            1,
+            "round {round}: the status row must appear exactly once, found at {bars:?}: {rows:?}"
+        );
+        let bar = bars[0];
+
+        // No growing run of blanks above it, and the character that was typed
+        // is the input row immediately below.
+        let blanks = rows[..bar]
+            .iter()
+            .rev()
+            .take_while(|r| r.trim().is_empty())
+            .count();
+        assert!(
+            blanks <= 2,
+            "round {round}: {blanks} blank rows above the status row: {rows:?}"
+        );
+        assert_eq!(
+            rows[bar + 1].trim(),
+            "-".repeat(round + 1),
+            "round {round}: the typed characters belong on the row below the status \
+             row, all of them: {rows:?}"
+        );
+    }
+}
+
 #[test]
 fn horizontal_resize_drag_leaves_no_stale_frames() {
     let mut t = Term::spawn(ROWS, 80);
