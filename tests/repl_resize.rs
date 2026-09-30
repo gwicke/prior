@@ -306,6 +306,76 @@ fn vertical_resize_then_type_does_not_stack_the_area() {
     }
 }
 
+/// **Duplicate the area, not just the drift.** The other resize test starts from
+/// a short greeter, so the area lands mid-terminal with room beneath it and a
+/// stale row has nowhere obvious to land. Duplication was reported only with the
+/// input row on the *last* screen row, which needs the content to fill the
+/// screen so the area is pushed there.
+///
+/// Spawning small rather than typing a transcript keeps this a REPL-only test:
+/// under the correct model (`ui_draw_v2` §4) the area sits immediately below the
+/// content, so a terminal too short to hold the content *plus* the area leaves
+/// the area against the last rows on its own. The test asserts that precondition
+/// rather than assuming it, so it cannot pass vacuously. Thirteen rows is not
+/// enough — the area still lands mid-screen there; eight is.
+///
+/// **Passes with and without the reanchor fix, so it does not yet reproduce the
+/// reported duplication.** It is kept as a fence for the bottom-anchored regime,
+/// which nothing else covers. Two leads remain, and neither is guessable from
+/// the report: the duplicate lands in *scrollback*, so whatever produces it also
+/// scrolls, and this harness has too little content to scroll; and
+/// "re-focusing" has no counterpart here — picocode handles no focus event at
+/// all, so it must be the terminal re-emitting something on focus.
+#[test]
+fn vertical_resize_then_type_at_the_screen_bottom_does_not_duplicate() {
+    const SHORT: u16 = 8;
+
+    let mut t = Term::spawn(SHORT, COLS);
+    t.pump(Duration::from_millis(1500));
+
+    // Precondition: the area really is on the last rows. Without this, a pass
+    // would only be saying the mid-screen case still works.
+    let rows = t.rows();
+    let bar = rows
+        .iter()
+        .position(|r| is_status_row(r))
+        .expect("the status row should be on screen");
+    assert_eq!(
+        bar + 2,
+        rows.len(),
+        "precondition: the area should start against the bottom of a {SHORT}-row \
+         terminal, so duplication has somewhere to show up; bar={bar} \
+         Screen:\n{}",
+        rows.join("\n"),
+    );
+
+    for round in 0..3 {
+        // Alternate the direction so both reflow shapes are exercised: growing
+        // pulls content up out of scrollback, shrinking pushes it back down.
+        let height = if round % 2 == 0 { SHORT + 1 } else { SHORT - 1 };
+        t.resize(height, COLS);
+        t.pump(Duration::from_millis(250));
+        t.type_bytes(b"-");
+        t.pump(Duration::from_millis(500));
+
+        let rows = t.rows();
+        let bars: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| is_status_row(r))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            bars.len(),
+            1,
+            "round {round} (height {height}): the status row must appear exactly \
+             once, found at {bars:?}. A stale row left behind by the re-anchor \
+             plus a fresh paint is exactly a duplicate.\nScreen:\n{}",
+            rows.join("\n"),
+        );
+    }
+}
+
 #[test]
 fn horizontal_resize_drag_leaves_no_stale_frames() {
     let mut t = Term::spawn(ROWS, 80);
