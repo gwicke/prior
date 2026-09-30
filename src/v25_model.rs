@@ -764,6 +764,18 @@ impl SlashDotNode for ModelActionNode {
                 };
                 match write(&model) {
                     Ok(()) => {
+                        // Load-or-seed this model's live params. Here, on the
+                        // action, and not inside `set_model`: `/set
+                        // default_model` shares that writer but is not an
+                        // activation, and seeding there would install the
+                        // default model's record as the live params of
+                        // whatever is actually running. Doing it before
+                        // returning also means the loop's `params_changed`
+                        // comparison already sees the final values, so the
+                        // switch costs one rebuild rather than two.
+                        if let Some(app) = self.live.as_ref() {
+                            app.activate_model_params(&model);
+                        }
                         // Journaled at the commit, not on rebuild: the explicit
                         // user action is what is worth recording, and the
                         // helper skips a value the session already holds, so
@@ -1466,5 +1478,48 @@ mod tests {
         let outcome = futures::executor::block_on(node.submit(1, &pa));
         assert!(matches!(outcome, SubmitResult::Done(None)));
         assert_eq!(app_state.model(), TEST_MODEL);
+    }
+
+    /// The whole reported path, through the menu: `/model <id> save` writes the
+    /// record, then a *new* app state activating that model starts at the
+    /// stored level rather than the global's. The second half is the bug —
+    /// before the fix the record was written and never read.
+    #[test]
+    fn saving_then_restarting_seeds_the_stored_level() {
+        // Session 1: activate, set a level, save. The global is set first so
+        // the assertion below is unambiguous — a record that lost to it would
+        // read "low".
+        let app = test_app_state();
+        app.update_settings(|s| {
+            s.default_reasoning_level = Some("low".to_string());
+            Ok(())
+        })
+        .unwrap();
+        app.set_model(TEST_MODEL);
+        app.activate_model_params(TEST_MODEL);
+        app.set_reasoning(Some(crate::params::ReasoningLevel::Max));
+        let mut node = ModelActionNode::save(app.clone(), 1);
+        let pa = PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " ");
+        assert!(matches!(
+            futures::executor::block_on(node.submit(1, &pa)),
+            SubmitResult::Done(..)
+        ));
+        let persisted = app
+            .with_settings(|s| s.model_settings(TEST_MODEL).cloned())
+            .expect("save must have written the record");
+        assert_eq!(
+            persisted.reasoning,
+            Some(crate::params::ReasoningLevel::Max)
+        );
+
+        // Session 2: a fresh app over the same store seeds from that record.
+        let store2 = app.with_settings(|s| s.clone());
+        let app2 = AppState::for_test(store2);
+        app2.activate_model_params(TEST_MODEL);
+        assert_eq!(
+            app2.params().reasoning,
+            Some(crate::params::ReasoningLevel::Max),
+            "a new session must start at the model's stored level, not the global's"
+        );
     }
 }

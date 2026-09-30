@@ -376,36 +376,46 @@ temperature = 0.8
 target `config: AgentConfig`:
 
 ```rust
-/// Live params of the ACTIVE model (mirrors `config.params`; the target
-/// the menu writes, the loop converges `config` onto it).
-pub(crate) params: ModelParams,
 /// Per-model live memory, session-scoped: id -> last live params. Makes
 /// a → b → a restore a's settings.
-pub(crate) model_live: HashMap<String, ModelParams>,
+pub(crate) model_param_map: HashMap<String, ModelParams>,
 ```
+
+There is deliberately **no** separate `params` field. The live params of the
+current model stay in `config.params`, where they already were and where the
+menu and the loop both already read them; the map is the parallel structure that
+remembers them per model. Two copies, one of which pre-existed, rather than
+three. The invariant is `model_param_map[current_id] == config.params`, held by
+construction because every write goes through one private helper
+(`AppState::write_live_params`) that sets both halves — the only two live
+writers are `set_param` (which `/temperature` and `/top_p` both funnel through)
+and `set_reasoning`. A drift here is exactly what made a first cut lose a→b→a.
+
+`model_param_map` starts **empty** even though `config.params` is seeded at
+construction: the caller's first `activate_model_params` is what consults the
+record, and pre-seeding would make it find its own entry and never get there.
 
 with the app-state lock rules honored (one acquisition per public method, no
 file IO under the guard — clone, drop, write):
 
 | method | role |
 |---|---|
-| `model_params() -> ModelParams` | read the live params |
+| `params() -> ModelParams` | read the live params |
 | `set_param(k, v)` / `set_reasoning(l)` | one live field (menu writes) |
-| `model_live(id) -> Option<ModelParams>` | has this model been visited? |
-| `activate_model_params(id)` | first-visit seeding (§A.7) |
+| `activate_model_params(id)` | load-or-seed on activation (§A.7) |
 | `model_settings(id) -> Option<ModelSettings>` | stored record (editor, header) |
-| `put_model_settings(id, &ModelSettings) -> Result<(), String>` | validate + apply in-lock, save outside |
+| `apply_model_settings(id, &ModelSettings)` | record in memory, no write |
+| `update_settings(f)` | mutate the store and persist, write outside the lock |
 
-**Seeding rule** (`activate_model_params`, called by the loop on `model_changed`
-*before* the rebuild comparison) — **per field**, never per record:
+**Seeding rule** (`activate_model_params`) — **per field**, never per record:
 
 ```
-model_live[id] exists?          → use it, done (a → b → a)
+model_param_map[id] exists?          → use it, done (a → b → a)
 else for each field f in {reasoning, temperature, top_p}:
     stored[id].f                → use it
     else global /set default    → reasoning only: default_reasoning_level
     else built-in               → reasoning: off;  temperature/top_p: None
-    and insert the result into model_live[id]
+    and insert the result into model_param_map[id]
 ```
 
 `temperature`/`top_p` have **no `/set` global** (decided: no new global keys)
@@ -425,8 +435,15 @@ them (or runs `save`, which copies live → stored).
 
 In `run_interactive`'s convergence step (`agent.rs:3635`):
 
-1. `model_changed` → `app_state.activate_model_params(&target.qualified_model_id())`
-   (seeding, §A.6) **before** the comparison, so the rebuild sees final values.
+1. Seeding happens **on activation, not here**: the `activate` action node
+   calls `app_state.activate_model_params(&model)` right after `set_model`, and
+   `run_interactive` does the same for the startup model before
+   `ensure_session`. Not in the loop, because the loop snapshots its target at
+   `agent.rs:3800` and compares at `3817` — a seeding call would have to land
+   before the snapshot, where the model is not yet known, or after it, where it
+   is stale, and the switch would cost two rebuilds with the outgoing model's
+   params in between. Not in `set_model` either: `/set default_model` shares
+   that writer but is not an activation.
 2. Rebuild gate: `params_changed = config.params != target.params` joins
    `model_changed || persona_changed` in the same condition; the `target_fp`
    tuple (`agent.rs:3657`) gains `params` so a failed build is not retried every
@@ -786,6 +803,43 @@ both halves of the two-phase commit.
 A real `edited settings` dialog is reachable for the first time: `ModelNode` is
 the first *listing* node to use Ctrl-E, and the engine only added that routing
 in the same upstream commit that introduced the dialog.
+
+**P5.5 — per-model live-param seeding.** **Done (2026-09-30).** Found by
+report: `save` wrote `[models.*].reasoning` correctly, but a new session did not
+start from it. The record had **no reader outside the menu layer** — the header,
+the Ctrl-E prefill and `save` were the only three things that read it. The
+seeding that consumes it was specified in A.6/A.7 but never assigned a phase;
+P1 delivered the `ModelParams` type and the rebuild gate without it.
+
+`State.model_param_map: HashMap<String, ModelParams>`, load-or-seed on
+activation, per field: `model_param_map[id]` → `stored[id].f` → global (reasoning
+only) → built-in. *Tests:* 9 — the reported case, the global fallback, per-field
+seeding, a→b→a restoring runtime values, temperature not leaking across a
+switch, a record edited after a visit not displacing live values, the
+map/live invariant, an empty id, and a save-then-restart round trip through the
+menu.
+
+**P5.5 addendum — the a→b→a hole, and a second defect it uncovered.** The
+seeding rule has two clauses and the obvious implementation only has one: seed
+from the record, and the map is a *cache that goes stale*. `model_param_map`
+is only a correct memory of "what this model is running with" if it is written
+through on **every** live param change, not just at activation — otherwise a
+`/reasoning high` after the seed is forgotten by the next a→b→a. Hence the
+single-writer helper.
+
+Same missing code also meant **params carried across model switches**: set
+`temperature = 0.2` on one model, switch, and the next model ran at `0.2`
+instead of `None`. A.6 calls that out explicitly; there was a test for neither.
+
+Two placement decisions worth recording. Seeding runs on **activation** (the
+action node, and startup) rather than in the loop, because the loop snapshots
+its target at `agent.rs:3800` and compares at `3817` — in the loop, seeding
+lands either before the snapshot (model not yet known) or after it (stale),
+costing two rebuilds with the outgoing model's params in between. And it is not
+in `set_model`, because `/set default_model` shares that writer but is not an
+activation. `settings.rs:401` (`apply_to_config`) would also be a bug if ever
+wired into the live path — it sets `cfg.params.reasoning` from the global,
+stomping the per-model value. It is test-only today; noted in a comment.
 
 **P6 — per-turn overrides.** `turn_overrides::split`; `PicoAgent::prompt`
 signature change; the `Submit`-arm wiring; warnings. *Tests:* parser table

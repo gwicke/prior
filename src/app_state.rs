@@ -35,6 +35,7 @@
 //! The active `Session` object itself is the loop's applied layer; the menu
 //! sees [`SessionSlot`] (`repo` handle + current id) only.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -140,6 +141,19 @@ pub struct State {
     /// (`LiveState` folded in here). The loop converges its applied config
     /// to this at the cycle point. Durable target stays `SettingsStore`.
     pub(crate) config: AgentConfig,
+    /// Per-model live params, session-scoped: id -> the params that model was
+    /// last running with (doc/model_settings_v2.md A.6).
+    ///
+    /// This is what makes a -> b -> a restore a's *runtime* values rather than
+    /// its stored ones. It is the session memory; `config.params` is the live
+    /// value for the current model, and the invariant
+    /// `model_param_map[current_id] == config.params` holds at all times
+    /// because every write goes through [`Self::write_live_params`].
+    ///
+    /// Session-scoped on purpose: a fresh process re-seeds from the stored
+    /// record, so a value changed at runtime is forgotten by a restart, while
+    /// one written by `save` survives.
+    pub(crate) model_param_map: HashMap<String, crate::params::ModelParams>,
     /// The durable-target settings store — the one copy (was `MenuShared`'s
     /// cloned cell).
     pub(crate) settings: SettingsStore,
@@ -187,6 +201,15 @@ impl AppState {
     ) -> Arc<AppState> {
         Arc::new(AppState {
             state: Mutex::new(State {
+                // Empty on purpose. `config.params` arrives seeded from the
+                // global alone, so the caller's first
+                // `activate_model_params` is what consults the per-model
+                // record — pre-seeding here would make it find its own entry
+                // and never reach the store. The invariant
+                // (`model_param_map[current] == config.params`) is established
+                // by that first call, or by the first `set_param`; nothing
+                // reads the map before one of them.
+                model_param_map: HashMap::new(),
                 config,
                 settings,
                 session: SessionSlot {
@@ -239,11 +262,80 @@ impl AppState {
     /// Write one live param. A `None` clears it back to "leave the provider
     /// alone" (doc/model_settings_v2.md A.5).
     pub fn set_param(&self, set: impl FnOnce(&mut crate::params::ModelParams)) {
-        set(&mut self.state.lock().config.params);
+        let mut st = self.state.lock();
+        set(&mut st.config.params);
+        let id = st.config.qualified_model_id();
+        let params = st.config.params;
+        st.model_param_map.insert(id, params);
     }
 
     pub fn set_reasoning(&self, level: Option<crate::params::ReasoningLevel>) {
-        self.state.lock().config.params.reasoning = level;
+        self.set_param(|p| p.reasoning = level);
+    }
+
+    /// Make `id` the current model and give it its live params.
+    ///
+    /// Load-or-seed, per field, never per record (doc/model_settings_v2.md A.6):
+    ///
+    /// ```text
+    /// model_param_map[id] exists?  -> use it (a -> b -> a)
+    /// else per field f:
+    ///     stored[id].f              -> use it
+    ///     else global default       -> reasoning only: default_reasoning_level
+    ///     else built-in             -> reasoning: off; temperature/top_p: None
+    /// ```
+    ///
+    /// Per field, so a record that sets only `reasoning` still gets the
+    /// provider's own temperature rather than inheriting the outgoing model's.
+    /// The built-in is applied to *every* newly loaded model on purpose:
+    /// switching from a model the user set `temperature = 0.2` on to one with
+    /// nothing on file gives the second `None`, not an inherited `0.2`.
+    ///
+    /// Call this on activation, **not** from [`Self::set_model`]:
+    /// `/set default_model` shares that writer but is not an activation, and
+    /// seeding there would install the default model's record as the live
+    /// params of whatever is actually running.
+    pub fn activate_model_params(&self, id: &str) {
+        if id.is_empty() {
+            return;
+        }
+        let mut st = self.state.lock();
+        // First visit this session: the runtime values win, per A.6. A record
+        // edited while the model sits in the map is deliberately NOT re-read.
+        if let Some(memory) = st.model_param_map.get(id).copied() {
+            Self::write_live_params(&mut st, id, memory);
+            return;
+        }
+        let stored = st.settings.model_settings(id).cloned().unwrap_or_default();
+        // `value()` returns the stored string, defaulting to "off" when the
+        // key was never written.
+        let global_reasoning: Option<crate::params::ReasoningLevel> = st
+            .settings
+            .value(crate::settings::SettingKey::DefaultReasoning)
+            .parse()
+            .ok();
+        // Resolved verbatim, not normalized: `/reasoning off` itself writes
+        // `Some(Off)`, so folding that to `None` here would make the seeded
+        // value differ from the one the menu produces, and `params_changed`
+        // would fire a rebuild for a value the user never touched.
+        let seeded = crate::params::ModelParams {
+            reasoning: stored.reasoning.or(global_reasoning),
+            temperature: stored.temperature,
+            top_p: stored.top_p,
+        };
+        Self::write_live_params(&mut st, id, seeded);
+    }
+
+    /// The single writer of the live params: sets `config.params` and records
+    /// the same value under the current model, so
+    /// `model_param_map[current_id] == config.params` cannot drift.
+    ///
+    /// `id` must be the model the params belong to — normally the current one.
+    /// Activation passes the incoming model, which is not yet the current one
+    /// until the caller has set it; see [`Self::activate_model_params`].
+    fn write_live_params(st: &mut State, id: &str, params: crate::params::ModelParams) {
+        st.config.params = params;
+        st.model_param_map.insert(id.to_string(), params);
     }
 
     pub fn persona(&self) -> Option<String> {
@@ -653,5 +745,158 @@ mod tests {
         assert_eq!(app_state.current_session_id(), "sess-1");
         assert_eq!(app_state.context_tokens(), 42_000);
         assert_eq!(app_state.leaf_id().as_deref(), Some("leaf-1"));
+    }
+
+    // ---- per-model live-param seeding (doc/model_settings_v2.md A.6) ----
+
+    use crate::params::ReasoningLevel;
+
+    /// A store with a per-model record, and a global to prove the record wins.
+    fn store_with_model_record(record: crate::model_settings::ModelSettings) -> SettingsStore {
+        let mut s = test_settings();
+        s.default_reasoning_level = Some("low".to_string());
+        s.models.insert("test:model".to_string(), record);
+        s
+    }
+
+    fn seeded_app(record: crate::model_settings::ModelSettings) -> Arc<AppState> {
+        AppState::for_test(store_with_model_record(record))
+    }
+
+    /// The reported bug: `save` wrote `reasoning = "max"`, but a new session
+    /// started at the global's level because nothing ever read the record.
+    #[test]
+    fn a_stored_reasoning_level_seeds_a_new_session() {
+        let app = seeded_app(crate::model_settings::ModelSettings {
+            reasoning: Some(ReasoningLevel::Max),
+            ..Default::default()
+        });
+        app.activate_model_params("test:model");
+        assert_eq!(app.params().reasoning, Some(ReasoningLevel::Max));
+    }
+
+    /// The global is the fallback, not the answer: a model with no record
+    /// takes the global.
+    #[test]
+    fn a_model_with_no_record_falls_back_to_the_global() {
+        let app = seeded_app(crate::model_settings::ModelSettings::default());
+        app.activate_model_params("test:model");
+        assert_eq!(app.params().reasoning, Some(ReasoningLevel::Low));
+    }
+
+    /// Per field, never per record: a record that sets only `reasoning` must
+    /// still get the provider's own temperature, not the outgoing model's.
+    #[test]
+    fn seeding_is_per_field_not_per_record() {
+        // The record sets reasoning and nothing else.
+        let app = seeded_app(crate::model_settings::ModelSettings {
+            reasoning: Some(ReasoningLevel::High),
+            ..Default::default()
+        });
+        app.activate_model_params("test:model");
+        let p = app.params();
+        assert_eq!(p.reasoning, Some(ReasoningLevel::High));
+        assert_eq!(p.temperature, None);
+        assert_eq!(p.top_p, None);
+    }
+
+    /// a -> b -> a restores a's *runtime* values, not its stored ones. This is
+    /// the case the session map exists for: seed from the record, change at
+    /// runtime, switch away, switch back.
+    #[test]
+    fn a_b_a_restores_runtime_values() {
+        let app = seeded_app(crate::model_settings::ModelSettings {
+            reasoning: Some(ReasoningLevel::Med),
+            ..Default::default()
+        });
+        app.activate_model_params("test:model");
+        assert_eq!(app.params().reasoning, Some(ReasoningLevel::Med));
+        // The user changes it at runtime.
+        app.set_reasoning(Some(ReasoningLevel::High));
+        // b: another model, seeded from the global.
+        app.set_model("test:other");
+        app.activate_model_params("test:other");
+        assert_eq!(app.params().reasoning, Some(ReasoningLevel::Low));
+        // Back to a: the runtime `high` wins over the record's `med`.
+        app.set_model("test:model");
+        app.activate_model_params("test:model");
+        assert_eq!(app.params().reasoning, Some(ReasoningLevel::High));
+    }
+
+    /// The built-in applies to *every* newly loaded model, so temperature does
+    /// not follow the user from one model to the next (A.6).
+    #[test]
+    fn temperature_does_not_leak_across_a_switch() {
+        let app = seeded_app(crate::model_settings::ModelSettings::default());
+        app.activate_model_params("test:model");
+        app.set_param(|p| p.temperature = Some(0.2));
+        assert_eq!(app.params().temperature, Some(0.2));
+        app.set_model("test:other");
+        app.activate_model_params("test:other");
+        assert_eq!(
+            app.params().temperature,
+            None,
+            "the outgoing model's 0.2 must not carry over"
+        );
+    }
+
+    /// After a→b→a, the live values win over a record edited in between —
+    /// by design: the record is only consulted on a first visit.
+    #[test]
+    fn a_record_edited_after_a_visit_does_not_displace_the_live_values() {
+        let mut store = store_with_model_record(crate::model_settings::ModelSettings {
+            reasoning: Some(ReasoningLevel::Med),
+            ..Default::default()
+        });
+        let app = AppState::for_test(store.clone());
+        app.activate_model_params("test:model");
+        app.set_reasoning(Some(ReasoningLevel::High));
+        // Edit the record underneath the visited model.
+        store.models.insert(
+            "test:model".to_string(),
+            crate::model_settings::ModelSettings {
+                reasoning: Some(ReasoningLevel::Low),
+                ..Default::default()
+            },
+        );
+        app.set_model("test:other");
+        app.activate_model_params("test:other");
+        app.set_model("test:model");
+        app.activate_model_params("test:model");
+        assert_eq!(app.params().reasoning, Some(ReasoningLevel::High));
+    }
+
+    /// The invariant the whole design rests on: every write records the same
+    /// value under the current model. A drift here is what made the first cut
+    /// lose a->b->a.
+    #[test]
+    fn the_map_and_the_live_params_never_diverge() {
+        let app = seeded_app(crate::model_settings::ModelSettings::default());
+        app.activate_model_params("test:model");
+        app.set_param(|p| {
+            p.temperature = Some(0.7);
+            p.top_p = Some(0.8);
+        });
+        app.set_reasoning(Some(ReasoningLevel::Max));
+        let (live, remembered) = {
+            let st = app.state.lock();
+            (
+                st.config.params,
+                st.model_param_map.get("test:model").copied(),
+            )
+        };
+        assert_eq!(Some(live), remembered);
+        // And a menu write to reasoning goes through the same path.
+        let remembered = app.state.lock().model_param_map["test:model"].reasoning;
+        assert_eq!(Some(ReasoningLevel::Max), remembered);
+    }
+
+    /// A model id with no provider prefix is not activatable; seeding must not
+    /// scribble an entry for it.
+    #[test]
+    fn seeding_ignores_an_empty_model_id() {
+        let app = seeded_app(crate::model_settings::ModelSettings::default());
+        app.activate_model_params("");
+        assert!(app.state.lock().model_param_map.is_empty());
     }
 }
