@@ -330,10 +330,15 @@ Three facts, all of which are consequences of one decision:
 Each is checkable, and each is what a phase below establishes.
 
 - **I1 — One owner.** At every instant exactly one component composes the area.
-- **I2 — Content stops at the fold.** Every content byte lands at or above it.
-  The area's rows are *consumed* by the content that displaces them and then
-  re-emitted, never erased underneath it — which is P1's version of the P4 clear
-  invariant and the thing most likely to regress.
+- **I2 — Content and the area never claim the same row *at rest*.** At the end
+  of every screen update the screen partitions into content above and the area at
+  or below **the fold as of that moment** — and the fold is a *value that moves*,
+  down as content is written and up as the area grows, so this is a statement
+  about a moment, not about a fixed line. Within a content write the area's top
+  rows are transiently overwritten and then re-emitted; that transient is the
+  mechanism, and the partition is restored before the update ends. The thing most
+  likely to regress is the restore: an area that is cleared underneath its own
+  content rather than painted over it.
 - **I3 — The fold is derived, not remembered.** It is a function of the tracked
   caret, the area's height and `term_h` — never a separate counter.
 - **I4 — Steady state is relative.** Between a turn starting and ending, no
@@ -380,7 +385,8 @@ Answers recorded 2026-09-30. They changed the phase list, so 4.5.6 reflects them
 
 Two tracks. **This track is the drawing capability** (P1, P2, P3) and nothing in
 it depends on OQ2. **The input track** (P4) depends on this one being done and on
-OQ2. Each phase is separately reviewable and separately verifiable.
+OQ2. **P5** is the payoff and **P6** is an optional optimisation that gates
+nothing. Each phase is separately reviewable and separately verifiable.
 
 **P1 — Contraction: the area establishes the content's lower bound.**
 `with_content_writer` stops retiring the area. Content is written from the fold
@@ -395,6 +401,50 @@ may erase them. That is neither of the existing two paths — `plan_partial`
 requires an unmoved frame, and `plan_full` erases the old region, which would
 erase the content that just landed there. It is a third case: walk to the new
 top, paint, do not clear above.
+
+**There are two write mechanisms, and which one is in play is the fold's job.**
+This is the part that is easy to get wrong, because the obvious case is the
+*transient* one:
+
+- **Fold moves (screen not full).** Content is written *at* the fold, so it
+  consumes the area's top rows, the fold moves down by the content's row count,
+  and the area is re-emitted at its new position. This is OQ3's "moves gradually
+  toward the bottom", and a reposition is unavoidable — there is nowhere else for
+  the content to go.
+- **Fold stationary (screen full).** The area is already at rows
+  `[th-h+1, th]` and the content region is `[1, th-h]`. Here the re-emit *is*
+  avoidable in principle, but **not by scrolling**: a terminal scroll moves every
+  row up, so it displaces the area just as surely as the content did — the area
+  ends at `[th-h, th-1]` with a blank row beneath, and has to be painted back
+  down. Scrolling cannot preserve the area, because a scroll is not selective.
+
+  What *can* preserve it is a **scroll region** (`DECSTBM`,
+  `CSI top ; bottom r`): set it to the content region `[1, th-h]` and the
+  terminal's own scrolling stays inside it, leaving the area's rows untouched.
+
+  Note what that costs in shape as well as state: the content has to be written
+  *inside* the region, so the write point is the region's **bottom** row
+  (`th-h`), not the fold. The content flows upward because the terminal scrolls,
+  rather than downward because we push it. So the stationary case has a different
+  write point from the moving one, and choosing between them is a real decision
+  rather than an optimisation of a single mechanism. In exchange the fold becomes
+  self-maintaining — the terminal moves the content, not us — and a content chunk
+  costs nothing but its own bytes.
+
+  P1 as scoped does **not** do this: it writes at the fold in both cases, so it
+  has one mechanism and one write point. The scroll region is a separate, later
+  optimisation (P6) rather than a refinement of P1.
+
+  **Deferred, not dismissed** (P6). The saving is real but bounded (one area
+  re-emit per chunk: ~2 rows, a few hundred bytes), and the cost is a *global
+  terminal mode* that every write path must honour: a resize, a full repaint, the
+  dialog path and (later) in-turn input all have to re-issue or reset it, and a
+  path that forgets scrolls the wrong part of the screen — a bug class that is
+  miserable to diagnose from a transcript. Recommend measuring the re-emit cost
+  first; the region does not change I1–I6, so it can land whenever the
+  measurement justifies it. It is written down because P1 will *look* like it is
+  re-emitting something avoidable, and the next reader deserves to know it was
+  considered.
 - Establishes I2, I3, I6, and the "one frame" half of I1.
 - Verify: the post-turn screen is unchanged from today's (the transcript does not
   move), plus a new vt100 case where a multi-chunk stream never leaves the area
@@ -450,6 +500,12 @@ With the fold maintained across turns and every content write counted (done: #10
 Startup and the three foreign-writer sites stay, by OQ1.
 - Verify: each removal is a separate commit with the suite green and a note on
   what now covers it.
+
+**P6 — Scroll region, if the re-emit measures expensive. (Optional.)**
+Set the terminal's scrolling region to the content area so the fold is maintained
+by the terminal in the stationary case, and a content chunk costs only its own
+bytes. Changes the content write point in that case (region bottom, not the fold).
+Only after measuring; see the P1 note above.
 
 #### 4.5.7 Not in scope
 
