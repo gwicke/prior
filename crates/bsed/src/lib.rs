@@ -403,6 +403,19 @@ mod tests {
             "9c\\n    let z = 4;",
             "s/2/2/g",
             "1,3s/;/;/",
+            // Escapes in the text of a/i/c. `sed-rs` copies that text verbatim
+            // where GNU decodes it, so without the rewrite these preview as a
+            // literal `\n` and apply back as the wrong bytes.
+            r"2a\ntwo",
+            r"2a\ttabbed",
+            r"2a\x41",
+            r"2a\o101",
+            r"2a\d065",
+            r"2a\\backslash",
+            r"2a\q",
+            r"3i\ninserted",
+            r"2c\treplaced",
+            r"7,8c\nreplaced",
         ];
         for script in cases {
             // GNU sed is the reference; skip the case if it is not GNU or the

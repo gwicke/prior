@@ -165,7 +165,12 @@ fn extract_change_ranges(
                 ranges.push(ChangeRange {
                     start_line,
                     end_line,
-                    replacement: replacement.clone(),
+                    // GNU expands `\n` and friends in the text of `c`; `sed-rs`
+                    // passes the backslash through literally, so the preview
+                    // would show a literal `\n` where GNU would insert a newline.
+                    // Expand here, where the parsed form is authoritative, so the
+                    // stored range carries the text GNU would actually write.
+                    replacement: expand_text_escapes(replacement),
                 });
             }
         }
@@ -309,9 +314,9 @@ fn render_command_inner(cmd: &Command, out: &mut String) {
         Command::GetReplace => out.push('g'),
         Command::GetAppend => out.push('G'),
         Command::Exchange => out.push('x'),
-        Command::Append(t) => out.push_str(&format!("a\\{t}")),
-        Command::Insert(t) => out.push_str(&format!("i\\{t}")),
-        Command::Change(t) => out.push_str(&format!("c\\{t}")),
+        Command::Append(t) => out.push_str(&render_text_command('a', t)),
+        Command::Insert(t) => out.push_str(&render_text_command('i', t)),
+        Command::Change(t) => out.push_str(&render_text_command('c', t)),
         Command::Label(l) => out.push_str(&format!(":{l}")),
         Command::Branch(l) => out.push_str(&format!("b{}", l.as_deref().unwrap_or(""))),
         Command::BranchIfSub(l) => out.push_str(&format!("t{}", l.as_deref().unwrap_or(""))),
@@ -356,6 +361,142 @@ fn render_command_inner(cmd: &Command, out: &mut String) {
             out.push('}');
         }
     }
+}
+
+/// Render one text command (`a`, `i`, or `c`) back into script text.
+///
+/// The rendered form is re-parsed before it reaches the engine, so a newline
+/// inside the text has to be written as a backslash continuation: a bare one
+/// would read as the end of the text argument and silently drop the line.
+fn render_text_command(cmd: char, text: &str) -> String {
+    let mut body = expand_text_escapes(text).replace('\n', "\\\n");
+    // `sed-rs` skips exactly one space or tab between the backslash and the text,
+    // so text that *begins* with one would come back with it missing. Spend a
+    // space of our own on that skip to keep the caller's leading whitespace.
+    if body.starts_with(' ') || body.starts_with('\t') {
+        body.insert(0, ' ');
+    }
+    format!("{cmd}\\{body}")
+}
+
+/// Expand the backslash escapes GNU honours in the text of `a`, `i`, and `c`.
+///
+/// `sed-rs` copies that text verbatim, so `2a\ntest` would preview as a literal
+/// `\ntest` where GNU writes a newline and then `test`. That is a preview that
+/// looks plausible and is wrong, which is the one failure mode this crate exists
+/// to prevent — so the escapes are resolved here, on the parsed text, before it
+/// reaches the engine.
+///
+/// The set matches GNU's `a`/`i`/`c` text: the C-style single letters, `\xHH`,
+/// `\oNNN`, and `\dNNN`. An unrecognised escape drops the backslash and keeps the
+/// character, so `\q` is `q` — the same as GNU. A backslash already consumed as a
+/// line continuation is a real newline in the parsed text and is left alone.
+///
+/// Note this is *not* how `s///` replacements work: those go through the engine,
+/// which decodes them itself. Only the text commands are copied verbatim, so only
+/// they need rewriting here.
+///
+/// Known gap, predating this: `sed-rs` drops one space or tab between the `a`/`i`/
+/// `c` and its text while parsing, where GNU keeps it. So `2a\ indented` previews
+/// as `indented`. Recovering it would mean re-reading the raw expression text
+/// rather than trusting the parsed text, which is a larger change than this
+/// rewrite; leading whitespace is far better signalled with `\t` or `\x20`,
+/// which round-trip correctly.
+fn expand_text_escapes(text: &str) -> String {
+    if !text.contains('\\') {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '\\' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // A trailing backslash escapes nothing. GNU reads it as a continuation
+        // onto the (empty) next line and writes no backslash, so dropping it
+        // matches; keeping it would put a stray `\` into the file.
+        if i + 1 >= chars.len() {
+            break;
+        }
+        let next = chars[i + 1];
+        let width = match next {
+            'n' => {
+                out.push('\n');
+                2
+            }
+            't' => {
+                out.push('\t');
+                2
+            }
+            'r' => {
+                out.push('\r');
+                2
+            }
+            'a' => {
+                out.push('\x07');
+                2
+            }
+            'f' => {
+                out.push('\x0C');
+                2
+            }
+            'v' => {
+                out.push('\x0B');
+                2
+            }
+            '\\' => {
+                out.push('\\');
+                2
+            }
+            'x' | 'o' | 'd' => {
+                // GNU reads at most two hex digits, or up to three octal/decimal.
+                let (radix, max) = match next {
+                    'x' => (16, 2),
+                    'o' => (8, 3),
+                    _ => (10, 3),
+                };
+                let mut digits = String::new();
+                let mut j = i + 2;
+                while digits.len() < max && j < chars.len() && chars[j].is_digit(radix) {
+                    digits.push(chars[j]);
+                    j += 1;
+                }
+                if digits.is_empty() {
+                    // No digits: GNU keeps the character itself, dropping the
+                    // backslash, as with any other unrecognised escape.
+                    out.push(next);
+                    2
+                } else {
+                    match u32::from_str_radix(&digits, radix)
+                        .ok()
+                        .and_then(char::from_u32)
+                    {
+                        Some(c) => {
+                            out.push(c);
+                            2 + digits.len()
+                        }
+                        // Out of range: GNU leaves the digits as text.
+                        None => {
+                            out.push(next);
+                            out.push_str(&digits);
+                            2 + digits.len()
+                        }
+                    }
+                }
+            }
+            // Unrecognised: drop the backslash, keep the character. A trailing
+            // lone backslash has already been handled by the bounds check above.
+            c => {
+                out.push(c);
+                2
+            }
+        };
+        i += width;
+    }
+    out
 }
 
 /// Reject the commands that would read or write the world beyond this file.
@@ -592,9 +733,9 @@ fn render_fallback(c: &Command, out: &mut String) {
         Command::GetReplace => out.push('g'),
         Command::GetAppend => out.push('G'),
         Command::Exchange => out.push('x'),
-        Command::Append(t) => out.push_str(&format!("a\\{t}")),
-        Command::Insert(t) => out.push_str(&format!("i\\{t}")),
-        Command::Change(t) => out.push_str(&format!("c\\{t}")),
+        Command::Append(t) => out.push_str(&render_text_command('a', t)),
+        Command::Insert(t) => out.push_str(&render_text_command('i', t)),
+        Command::Change(t) => out.push_str(&render_text_command('c', t)),
         Command::Label(l) => out.push_str(&format!(":{l}")),
         Command::Branch(l) => out.push_str(&format!("b{}", l.as_deref().unwrap_or(""))),
         Command::BranchIfSub(l) => out.push_str(&format!("t{}", l.as_deref().unwrap_or(""))),
@@ -715,5 +856,63 @@ fn opener(mode: Mode) -> &'static str {
     match mode {
         Mode::Lower | Mode::OneLower => OPEN_LOWER,
         _ => OPEN_UPPER,
+    }
+}
+
+#[cfg(test)]
+mod text_escape_tests {
+    use super::{expand_text_escapes, render_text_command};
+
+    /// The expansion has to agree with GNU, because the round-trip test in
+    /// `lib.rs` compares against it — but only for the escapes it is meant to
+    /// cover. Anything not listed here is a pass-through.
+    #[test]
+    fn expands_the_escapes_gnu_honours_in_text() {
+        for (input, want) in [
+            (r"two\nlines", "two\nlines"),
+            (r"a\tb", "a\tb"),
+            (r"a\rb", "a\rb"),
+            (r"bell\a", "bell\x07"),
+            (r"ff\f", "ff\x0C"),
+            (r"vt\v", "vt\x0B"),
+            (r"back\\slash", "back\\slash"),
+            (r"\x41", "A"),
+            (r"\o101", "A"),
+            (r"\d065", "A"),
+            // At most two hex digits, three of the others.
+            (r"\x41B", "AB"),
+            (r"\o1011", "A1"),
+            // Unrecognised: the backslash goes, the character stays.
+            (r"\q", "q"),
+            (r"\x", "x"),
+            (r"\xZZ", "xZZ"),
+            // No escapes at all is the common case, and must be untouched.
+            (r"plain text", r"plain text"),
+        ] {
+            assert_eq!(expand_text_escapes(input), want, "input: {input:?}");
+        }
+    }
+
+    /// A lone trailing backslash has no character to escape, so GNU drops it.
+    #[test]
+    fn a_trailing_backslash_is_dropped() {
+        assert_eq!(expand_text_escapes("text\\"), "text");
+    }
+
+    /// A newline in the rendered text must be a continuation, or the re-parse
+    /// reads it as the end of the text argument and loses the line.
+    #[test]
+    fn rendered_newlines_become_continuations() {
+        assert_eq!(render_text_command('a', "one\ntwo"), "a\\one\\\ntwo");
+    }
+
+    /// `sed-rs` eats one space or tab after the backslash, so leading
+    /// whitespace needs a sacrificial space in front of it.
+    #[test]
+    fn leading_whitespace_is_protected_from_the_reparse() {
+        assert_eq!(render_text_command('a', " lead"), "a\\  lead");
+        assert_eq!(render_text_command('a', "\tlead"), "a\\ \tlead");
+        // ...but only when there is some.
+        assert_eq!(render_text_command('a', "lead"), "a\\lead");
     }
 }
