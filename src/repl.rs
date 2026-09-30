@@ -1454,12 +1454,21 @@ impl Repl {
     /// pipeline, after which `display_plain` writes the line at the frame's
     /// caret (plan §5.2).
     ///
-    /// No separator is drawn here. A v2.5 menu commit always leaves the
-    /// `read_input` loop (`MenuDone`), and the next prompt's frame draws its
-    /// own divider, so a rule above the committed line would double it. The
-    /// `sep` parameter that used to choose this is gone: both call sites
-    /// passed `false` once `/set` moved into the menu engine, and the
-    /// `/set`-stays-in-the-loop case it documented no longer exists.
+    /// **The committed line is bracketed by rules** — one above, one below.
+    ///
+    /// This comment used to say the opposite, and the reason it gave has since
+    /// stopped being true: "the next prompt's frame draws its own divider, so a
+    /// rule above the committed line would double it." That divider is gone — the
+    /// input frame is `[Status, Input]` and draws a rule only when an overlay is
+    /// open — so there was nothing left to double, and a committed line sat in
+    /// the transcript as bare text between two answers, easy to read as
+    /// something the model said. A commit is a real event (it changed a setting
+    /// the reader will want to find again after scrolling) and gets the same
+    /// `─────` treatment a turn does.
+    ///
+    /// The status bar follows underneath without being asked for: the commit is
+    /// written at the caret, which pushes the tracked row down, so the next
+    /// frame apply draws the area below what was just written.
     fn emit_commit<F: Fn(&LineEditor, &[String], usize, (usize, usize))>(
         output: &dyn Output,
         editor: &mut LineEditor,
@@ -2207,6 +2216,75 @@ fn history_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A committed line is bracketed by rules: one above, one below, and the
+    /// line between them.
+    ///
+    /// Pinned here rather than through a pty, because a pty cannot reach this
+    /// path: a v2.5 menu commit needs key routing the engine owns, and the
+    /// level of a `/thinking` commit comes from a *drilled row* rather than from
+    /// the typed buffer — so `/thinking high` plus Enter commits nothing and the
+    /// test would be asserting the engine's menu behaviour while claiming to
+    /// cover this. (An earlier pty version of this test "passed" about half the
+    /// time, and its failures were read as build races.)
+    ///
+    /// What is asserted is the *order and kind* of the three writes, which is
+    /// the whole contract: `display_separator`, `display_plain`, `display_separator`.
+    #[test]
+    fn a_committed_line_is_written_between_two_rules() {
+        let reasoning = crate::settings::default_show_reasoning_handle();
+        crate::repl::TERMINAL_WIDTH.store(80, std::sync::atomic::Ordering::SeqCst);
+        let out = crate::output::ConsoleOutput::new(reasoning);
+        let mut editor = LineEditor::new();
+        // Built by hand rather than `History::load()`, which reads the real
+        // history file — a test that depends on the machine's `~/.picocode`, and
+        // `add` would then write to it.
+        let mut history = History {
+            entries: Vec::new(),
+            file: None,
+        };
+        let line = "/thinking high";
+
+        out.begin_capture();
+        // The redraw closure is a no-op: this test is about what `emit_commit`
+        // writes, and the real closure's frame apply is covered by the REPL's
+        // own tests. Passing a real one here would only add a bar row to search.
+        Repl::emit_commit(
+            &out,
+            &mut editor,
+            &|_, _, _, _| {},
+            0,
+            (80, 24),
+            line,
+            "",
+            &mut history,
+        );
+        let bytes = out.end_capture();
+        let text = String::from_utf8_lossy(&bytes);
+
+        let rule = '\u{2500}';
+        let first_rule = text
+            .find(rule)
+            .unwrap_or_else(|| panic!("a rule above the committed line: {text:?}"));
+        let the_line = text
+            .find(line)
+            .unwrap_or_else(|| panic!("the committed line itself: {text:?}"));
+        let second_rule = text[the_line + line.len()..]
+            .find(rule)
+            .map(|i| the_line + line.len() + i)
+            .unwrap_or_else(|| panic!("a rule below the committed line: {text:?}"));
+        assert!(
+            first_rule < the_line && the_line < second_rule,
+            "rule, line, rule — in that order: {text:?}"
+        );
+        // And the editor is re-seeded for the next prompt, so the committed text
+        // is not left in the input row as if it were still being typed.
+        assert_eq!(
+            editor.text(),
+            "",
+            "the input row is cleared for the next prompt"
+        );
+    }
 
     // ------------------------------------------------------------------
     // Batch slash driver (`Repl::batch_slash`) — the non-REPL input path

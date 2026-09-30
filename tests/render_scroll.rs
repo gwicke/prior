@@ -205,18 +205,43 @@ fn popup_scroll_does_not_duplicate_input() {
 
     // Diagnostic assertions on the mid-sequence screen (after `/`).
     if let Some(ref mid) = mid_screen {
-        // The first v2.5 menu item is "> thinking" (cursor on thinking,
-        // since the prompt already shows "/").
-        let mid_thinking = mid.iter().filter(|r| r.starts_with("> thinking")).count();
+        // What matters is that the selection marker is on **exactly one** row,
+        // and that it is the first menu row — not which command that row names.
+        //
+        // This used to assert `> thinking`, and the first item was renamed to
+        // `reasoning` (`8356189`, "Thinking: support `max` …"), so the test failed
+        // on a label change with no behaviour change at all. The label is a
+        // display string and has now moved once; the marker is the contract.
+        let selected: Vec<&String> = mid.iter().filter(|r| r.starts_with("> ")).collect();
         let mid_div = mid.iter().filter(|r| r.starts_with("────")).count();
         eprintln!(
-            "[test] MID(after '/') thinking_count={} divider_lines={}\n{:?}",
-            mid_thinking, mid_div, mid
+            "[test] MID(after '/') selected={} divider_lines={}\n{:?}",
+            selected.len(),
+            mid_div,
+            mid
         );
-        // The first menu entry must be visible exactly once, with a single divider above it.
         assert_eq!(
-            mid_thinking, 1,
-            "MID: expected one '> thinking' menu line; screen={:?}",
+            selected.len(),
+            1,
+            "MID: exactly one selected menu row; screen={:?}",
+            mid
+        );
+        // It is the row right below the divider, i.e. the cursor sits on the
+        // first item — which is what "the pop-up opened on the command the user
+        // typed" looks like on screen.
+        let first_item = mid
+            .iter()
+            .position(|r| r.starts_with("> "))
+            .expect("a selected row");
+        assert!(
+            mid[..first_item].iter().any(|r| r.starts_with("────")),
+            "MID: the selection should be the first item, below the divider; screen={:?}",
+            mid
+        );
+        // And the item is a level list, which is the menu's actual content.
+        assert!(
+            selected[0].contains("off") && selected[0].contains("max"),
+            "MID: the first item should offer the reasoning levels; screen={:?}",
             mid
         );
     }

@@ -248,9 +248,20 @@ fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
 
 /// As [`run_turn`], but types `typed` instead of a prompt.
 ///
-/// A slash command is a different path through the same loop: it commits a line
-/// and never reaches the LLM, so `want` is 0 requests — the transcript has to end
-/// for the assertions to mean anything.
+/// **A slash command is a trap here.** It never reaches the mock, so the
+/// "wait until the mock has served the expected turns" loop below is satisfied
+/// immediately (`want == 0`) and the only thing standing between the capture and
+/// the program is a fixed sleep. A capture taken in that window describes a
+/// screen the program never drew — mid-typing, before Enter was even read.
+///
+/// So a slash-command scenario must not use this: it has to wait for something
+/// the *commit* writes (the typed line itself is no use as a marker, since it
+/// appears in the input row while it is still being keyed). Asserting on a
+/// slash commit through a pty also means driving the v2.5 menu's key routing,
+/// which `/thinking` does not accept as typed text — the level comes from a
+/// drilled row, not from the buffer. `emit_commit`'s bracketing is therefore
+/// pinned by a unit test in `repl.rs` instead, at the level the contract lives
+/// at.
 fn run_turn_typing(scenario: u32, label: &str, thinking: bool, typed: &str) -> Vec<u8> {
     let llm = MockLlm::start(scenario);
     let pty_system = native_pty_system();
@@ -796,39 +807,5 @@ fn the_idle_bar_is_frame_owned_so_submit_leaves_nothing_behind() {
     assert!(
         echo < bar,
         "the echo should sit above the bar, not be overwritten by it: {rows:?}"
-    );
-}
-
-/// A committed slash line is bracketed by rules, with the status bar below it.
-///
-/// `/thinking high` is a real event in the transcript — it changed a setting the
-/// reader will want to find again — and a bare `/thinking high` between two
-/// answers is easy to misread as something the model said. So it gets the same
-/// `─────` treatment a turn does.
-#[test]
-fn a_committed_line_is_bracketed_by_rules_with_the_bar_below() {
-    let bytes = run_turn_typing(2, "commit-thinking", false, "/thinking high");
-    let rows = screen_rows(&bytes);
-    let line = rows
-        .iter()
-        .position(|r| r.contains("/thinking"))
-        .unwrap_or_else(|| panic!("the committed line should be on screen: {rows:?}"));
-    assert!(
-        rows[line - 1].chars().all(|c| c == '─') && rows[line - 1].len() >= 10,
-        "a rule above the committed line: {rows:?}"
-    );
-    assert!(
-        rows[line + 1].chars().all(|c| c == '─') && rows[line + 1].len() >= 10,
-        "and one below it: {rows:?}"
-    );
-    // The bar is the frame's first row, so it lands below whatever the commit
-    // wrote: the ordering is content, then bar, then the prompt.
-    let bar = rows
-        .iter()
-        .position(|r| is_status_row(r))
-        .unwrap_or_else(|| panic!("the bar should be on screen: {rows:?}"));
-    assert!(
-        bar > line + 1,
-        "the bar follows the bracketed line: {rows:?}"
     );
 }
