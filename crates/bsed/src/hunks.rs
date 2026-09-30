@@ -37,16 +37,22 @@ pub struct Block {
 #[derive(Debug, Clone, Copy)]
 pub struct Context {
     /// Unchanged lines to include before the change.
+    ///
+    /// The symmetric half: the caller asks for N lines of context and gets N
+    /// here. Defaults to 1.
     pub leading: usize,
     /// Unchanged lines to include after the change.
     ///
-    /// Off by default: a block carries the change plus whatever the balance
-    /// growth reaches, and its `path:LINE` anchor is computed from the file just
-    /// read, so a preview is applicable without padding to widen it. It used to
-    /// default to 2 so a one-line change became a three-line `OLD` and picked up
-    /// a ±1 anchor tolerance against a file that shifted between preview and
-    /// apply. Every block is anchored, so the whole batch applies from one `edit`
-    /// call regardless; padding costs a third of the budget on every change.
+    /// Normally the same as `leading`, so the caller asks once. The CLI adds a
+    /// *bonus* on top (`-t N`, trailing context past what `-c` already gave) for
+    /// the case where a change's continuation is after it and not before.
+    ///
+    /// This used to default to 2 — a one-line change became a three-line `OLD`,
+    /// which bought a ±1 anchor tolerance against a file that shifted between
+    /// preview and apply. That slack only ever mattered for a *stale* anchor,
+    /// which is a workflow problem (apply the blob in one `edit` call) rather
+    /// than a preview one, and it cost a third of the budget on every change.
+    /// The growth pass still reaches a closing bracket further than one line.
     pub trailing: usize,
     /// Whether to grow a block until its brackets balance.
     pub grow: bool,
@@ -55,10 +61,14 @@ pub struct Context {
 }
 
 impl Default for Context {
+    /// One line each side, so a change arrives with the line above it and the
+    /// line below it. Symmetry is the point: an asymmetric default gives the
+    /// *following* line a special role, and that is one more thing to hold in
+    /// one's head about what a block will contain.
     fn default() -> Self {
         Context {
-            leading: 0,
-            trailing: 0,
+            leading: 1,
+            trailing: 1,
             grow: true,
             growth_cap: 20,
         }
@@ -98,7 +108,10 @@ pub fn build(old: &str, new: &str, ctx: Context) -> Hunks {
     let new_lines: Vec<&str> = new.lines().collect();
     // Whether the original terminates its last line. A block that deletes the
     // last line has to carry that terminator into its own text — see below.
+    // Whether each side terminates its last line. Both matter: see where the
+    // blocks are built.
     let old_ends_nl = old.ends_with('\n');
+    let new_ends_nl = new.ends_with('\n');
 
     // 1. Raw hunks, in file order, with **no** context baked in.
     //
@@ -175,10 +188,20 @@ pub fn build(old: &str, new: &str, ctx: Context) -> Hunks {
             } else if old_start > 0 {
                 // Append at EOF: borrow the line *before* the insertion point.
                 let shift = 1;
+                let mut new_text =
+                    join(&new_lines, new_start.saturating_sub(shift), new_end + shift);
+                // Same rule as a block that reaches the end of an unterminated
+                // file: nothing is left over to end this text, so if the result
+                // is meant to end in a newline it has to carry one. `$a app` on
+                // "a\nb\nc" is the case, and without this the applied result is
+                // one byte short of what GNU writes.
+                if !old_ends_nl && new_ends_nl && new_end + shift >= new_lines.len() {
+                    new_text.push('\n');
+                }
                 out.blocks.push(Block {
                     anchor: old_start,
                     old_text: old_lines[old_start - shift].to_string(),
-                    new_text: join(&new_lines, new_start.saturating_sub(shift), new_end + shift),
+                    new_text,
                 });
                 prev_end = old_start;
                 continue;
@@ -190,7 +213,7 @@ pub fn build(old: &str, new: &str, ctx: Context) -> Hunks {
         }
 
         let mut old_text = join(&old_lines, old_start, old_end);
-        let new_text = join(&new_lines, new_start, new_end);
+        let mut new_text = join(&new_lines, new_start, new_end);
         // A block with nothing on the new side has to take the newline that
         // follows it.
         //
@@ -213,6 +236,25 @@ pub fn build(old: &str, new: &str, ctx: Context) -> Hunks {
         // terminates the "D".
         if new_end == new_start && (old_end < old_lines.len() || old_ends_nl) {
             old_text.push('\n');
+        }
+        // The mirror of that, for a block in a file that does *not* end in a
+        // newline. There the terminator after the block's last line is the
+        // file's own and sits inside the replaced span, so nothing is left over
+        // to end whatever the block becomes -- and if the result is meant to end
+        // in a newline, the block has to supply it.
+        //
+        // `$d` on "a\nb\nc" is the case: sed drops the unterminated last line and
+        // GNU leaves "a\nb\n", so the block's new side is "b" and has to carry
+        // the newline itself. When the file *does* end in one, the leftover
+        // already supplies it and this must not fire, or every replacement of the
+        // last line would grow a second newline.
+        if old_end == old_lines.len()
+            && !old_ends_nl
+            && new_end == new_lines.len()
+            && new_end > new_start
+            && new_ends_nl
+        {
+            new_text.push('\n');
         }
         // Only report a mid-construct block when *the change itself* is
         // unbalanced — i.e. growth ran and could not reach the closer (capped,
@@ -362,6 +404,39 @@ mod tests {
         assert_eq!(h.blocks[0].old_text, "c\n");
         assert_eq!(h.blocks[0].new_text, "");
         // The point of the block: replacing its span reproduces the sed output.
+        let applied = before.replacen(&h.blocks[0].old_text, &h.blocks[0].new_text, 1);
+        assert_eq!(applied, after);
+    }
+
+    /// A file that does not end in a newline has no terminator to carry on its
+    /// last line, so the block has to supply one itself when the result is
+    /// meant to have it. `sed-rs` re-terminates the output, so `$d` on an
+    /// unterminated file produces a newline GNU would also write, and the block
+    /// for it is "b" -> "b\n".
+    ///
+    /// This is the mirror of the rule above, and the two must not overlap: when
+    /// the file *does* end in a newline the terminator is left over from the
+    /// replaced span and already ends the new text, so adding another would
+    /// leave two.
+    #[test]
+    fn a_block_in_an_unterminated_file_carries_the_terminator() {
+        let before = "a\nb\nc";
+        let after = "a\nb\n";
+        let h = build(before, after, Context::default());
+        assert_eq!(h.blocks[0].old_text, "b\nc", "{:?}", h.blocks[0]);
+        assert_eq!(h.blocks[0].new_text, "b\n", "{:?}", h.blocks[0]);
+        let applied = before.replacen(&h.blocks[0].old_text, &h.blocks[0].new_text, 1);
+        assert_eq!(applied, after);
+    }
+
+    /// A file that ends in a newline leaves the terminator over from the
+    /// replaced span, so the new text must *not* grow one of its own.
+    #[test]
+    fn a_terminated_file_does_not_double_the_newline() {
+        let before = "a\nb\nc\n";
+        let after = "a\nb\n";
+        let h = build(before, after, Context::default());
+        assert!(!h.blocks[0].new_text.ends_with('\n'), "{:?}", h.blocks[0]);
         let applied = before.replacen(&h.blocks[0].old_text, &h.blocks[0].new_text, 1);
         assert_eq!(applied, after);
     }

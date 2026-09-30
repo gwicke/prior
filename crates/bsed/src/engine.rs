@@ -47,19 +47,38 @@ pub fn run(
     if !change_ranges.is_empty() {
         out = apply_change_ranges(&out, change_ranges)?;
     }
-    // `sed-rs` terminates the last line unconditionally. Put back what the file
-    // actually had, so "no change" stays "no change".
-    //
-    // Known divergence, predating this: GNU re-terminates when the input's last
-    // line stops being the output's last one -- deleted by `$d`, or pushed up by
-    // `$a`. This cannot tell those apart from a rewrite of that line, which GNU
-    // leaves unterminated, so it keeps the file's own style in all of them. The
-    // error is one trailing newline on a file that had none, and it errs toward
-    // leaving the file as the author wrote it.
-    if !input.ends_with('\n') && out.ends_with('\n') {
+    // `sed-rs` terminates the last line unconditionally; GNU preserves the
+    // absence of one when the input's last line is still the output's last line.
+    // So put back what the file had, and only when that line really is still
+    // there.
+    if !input.ends_with('\n') && out.ends_with('\n') && last_line_survives(input, &out) {
         out.pop();
     }
     Ok(out)
+}
+
+/// Whether the input's last line is still the output's last line.
+///
+/// GNU's rule for the final newline, measured against sed rather than assumed:
+///
+/// ```text
+///   s/zzz/yyy/   in "a\nb\nc"   out "a\nb\nc"    no terminator   (a no-op)
+///   s/c/z/       in "a\nb\nc"   out "a\nb\nz"    no terminator   (rewritten in place)
+///   1d           in "a\nb\nc"   out "b\nc"       no terminator   (still the last line)
+///   2i\ X        in "a\nb\nc"   out "a\nX\nb\nc" no terminator   (pushed up)
+///   $d           in "a\nb\nc"   out "a\nb\n"     terminator      (the last line is gone)
+///   $a app       in "a\nb\nc"   out "a\nb\nc\napp\n" terminator (something follows it)
+/// ```
+///
+/// Equal line counts cover the in-place rewrite, which is the one case where the
+/// last line's *text* changes but the line itself is the same one. Equal last
+/// lines cover everything that only moved. What is left -- fewer lines *and* a
+/// different last line -- is the last line having been removed or displaced, and
+/// that is where GNU re-terminates.
+fn last_line_survives(input: &str, out: &str) -> bool {
+    let in_lines: Vec<&str> = input.lines().collect();
+    let out_lines: Vec<&str> = out.lines().collect();
+    in_lines.len() == out_lines.len() || in_lines.last() == out_lines.last()
 }
 
 /// Apply change-range commands with GNU sed semantics.

@@ -16,7 +16,11 @@
 use similar::TextDiff;
 
 /// Unchanged lines shown on each side of a change.
-pub const DEFAULT_CONTEXT: usize = 2;
+///
+/// A suggestion, not a rule: `unified` takes the context as an argument because
+/// a caller reading a diff in a pager and a caller splitting a block for `edit`
+/// want different amounts of it. `bsed` passes its own context flags through.
+pub const SUGGESTED_CONTEXT: usize = 2;
 
 /// Render `old -> new` as a unified diff under `label`, or `""` if they are equal.
 ///
@@ -56,7 +60,7 @@ mod tests {
             "fn main() {\n    let x = 1;\n}\n",
             "fn main() {\n    let x = 2;\n}\n",
             "src/x.rs",
-            DEFAULT_CONTEXT,
+            SUGGESTED_CONTEXT,
         );
         assert!(d.starts_with("--- src/x.rs\n+++ src/x.rs\n"), "{d}");
         assert!(d.contains("@@ -1,3 +1,3 @@"), "{d}");
@@ -71,7 +75,7 @@ mod tests {
     #[test]
     fn no_change_renders_nothing_at_all() {
         let t = "a\nb\n";
-        assert_eq!(unified(t, t, "f.rs", DEFAULT_CONTEXT), "");
+        assert_eq!(unified(t, t, "f.rs", SUGGESTED_CONTEXT), "");
     }
 
     #[test]
@@ -86,7 +90,7 @@ mod tests {
     /// as one desynchronises the hunk line numbers from the file.
     #[test]
     fn a_carriage_return_does_not_desynchronise_hunk_numbers() {
-        let d = unified("a\rb\nc\n", "a\rb\nC\n", "f", DEFAULT_CONTEXT);
+        let d = unified("a\rb\nc\n", "a\rb\nC\n", "f", SUGGESTED_CONTEXT);
         assert!(d.contains("@@ -1,2 +1,2 @@"), "{d}");
     }
 

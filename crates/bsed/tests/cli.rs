@@ -100,7 +100,7 @@ fn a_crlf_file_does_not_sink_a_recursive_preview() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
     // The LF file was still previewed...
-    assert!(out.contains("ok.txt:2"), "{out}");
+    assert!(out.contains("ok.txt:1"), "{out}");
     assert!(out.contains("@@@NEW"), "{out}");
     // ...and the CRLF one is named with the reason, in the status, not folded
     // into the payload or into a count.
@@ -197,33 +197,43 @@ fn unified_emits_a_unified_diff() {
     assert!(err.contains("drop -u"), "{err}");
     assert!(!err.contains("apply them"), "{err}");
 }
-
-/// A diff's reader is a person, so it gets context even though blocks no longer
-/// do. `-c 0` is an explicit request and is honoured.
+/// A diff takes the wider of `-c` and `-t`, so with the defaults it shows the
+/// same one line each side the blocks do. `-c 0` is an explicit request for none
+/// and is honoured, and a wider request is honoured too.
 #[test]
-fn unified_has_context_by_default_and_honours_c_zero() {
+fn unified_takes_the_context_flags_and_honours_c_zero() {
     let d = tempfile::tempdir().unwrap();
     write(&d.path().to_path_buf(), "a.rs", "a\nb\nc\nd\ne\nf\n");
     let s = "3s/c/C/";
     let def = stdout(&run_in(d.path(), None, &["-u", "-p", "a.rs", s]));
     assert!(
-        def.contains("\n a\n") && def.contains("\n d\n"),
+        def.contains("\n b\n") && def.contains("\n d\n"),
         "default: {def}"
+    );
+    assert!(
+        !def.contains("\n a\n"),
+        "more than one line of context: {def}"
     );
     let none = stdout(&run_in(d.path(), None, &["-u", "-c", "0", "-p", "a.rs", s]));
     assert!(
-        !none.contains("\n a\n") && !none.contains("\n d\n"),
+        !none.contains("\n b\n") && !none.contains("\n d\n"),
         "-c 0: {none}"
     );
-    // ...and blocks are unaffected either way: still no context by default.
-    // Blocks are untouched by `-u`'s context default: no trailing padding is
-    // asked for, so the block is the change plus whatever the diff grouped in.
-    let blocks = stdout(&run_in(d.path(), None, &["-p", "a.rs", s]));
-    assert!(blocks.starts_with("a.rs:3\n@@@OLD\nc\n"), "{blocks}");
+    let wide = stdout(&run_in(d.path(), None, &["-u", "-c", "3", "-p", "a.rs", s]));
     assert!(
-        !blocks.contains("\nb\n"),
-        "leading context appeared: {blocks}"
+        wide.contains("\n a\n") && wide.contains("\n e\n"),
+        "-c 3: {wide}"
     );
+    // Blocks carry the same window by default, and `-c 0` takes it away.
+    let blocks = stdout(&run_in(d.path(), None, &["-p", "a.rs", s]));
+    assert!(blocks.starts_with("a.rs:2\n@@@OLD\nb\nc\n"), "{blocks}");
+    assert!(blocks.contains("\nd\n"), "no trailing context: {blocks}");
+    let bare = stdout(&run_in(
+        d.path(),
+        None,
+        &["-c", "0", "-t", "0", "-p", "a.rs", s],
+    ));
+    assert!(bare.starts_with("a.rs:3\n@@@OLD\nc\n"), "{bare}");
 }
 
 /// More than one file needs the `---`/`+++` headers, since a diff has no
@@ -292,8 +302,10 @@ fn recursive_preview_walks_the_tree_and_reports_counts() {
     // The blocks are the payload, and nothing else is: this is what a redirect
     // to a file now captures.
     let out = stdout(&o);
-    assert!(out.contains("one.rs:2"), "{out}");
-    assert!(out.contains("sub/two.rs:2"), "{out}");
+    // One line of leading context by default, so a change on line 2 anchors
+    // its block at line 1.
+    assert!(out.contains("one.rs:1"), "{out}");
+    assert!(out.contains("sub/two.rs:1"), "{out}");
     assert!(
         !out.contains("sed preview:"),
         "status leaked into the payload: {out}"
@@ -307,6 +319,100 @@ fn recursive_preview_walks_the_tree_and_reports_counts() {
     assert!(!err.contains("skip.rs"), "{err}");
     assert!(!err.contains("dep.rs"), "{err}");
     assert!(err.contains("not UTF-8"), "{err}");
+}
+
+/// `-c N` is symmetric context, the way `grep -C` is, and `-t N` is a bonus
+/// *after* on top of it. Measured off the anchor and the block length, on a file
+/// long enough that the diff's own minimum grouping does not decide the shape.
+#[test]
+fn context_is_symmetric_and_trailing_is_a_bonus() {
+    let d = tempfile::tempdir().unwrap();
+    let big: String = (1..=20).map(|i| format!("L{i}\n")).collect();
+    write(&d.path().to_path_buf(), "big.txt", &big);
+    let s = "10s/L10/CHANGED/";
+
+    // Returns (leading, trailing) as the block actually came out.
+    let span = |args: &[&str]| -> (usize, usize) {
+        let o = run_in(d.path(), None, args);
+        assert_eq!(code(&o), 0, "{args:?}: {}", stderr(&o));
+        let out = stdout(&o);
+        let anchor: usize = out
+            .lines()
+            .next()
+            .unwrap()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let old: Vec<&str> = out
+            .split("@@@OLD\n")
+            .nth(1)
+            .unwrap()
+            .split("\n@@@NEW")
+            .next()
+            .unwrap()
+            .lines()
+            .collect();
+        (10 - anchor, old.len() - 1 - (10 - anchor))
+    };
+
+    let p = &d.path().join("big.txt").display().to_string();
+    let args = |extra: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        v.extend(["-p".into(), p.clone(), s.into()]);
+        v
+    };
+    let span_of = |extra: &[&str]| {
+        let v = args(extra);
+        let refs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+        span(&refs)
+    };
+
+    assert_eq!(span_of(&["-c", "1"]), (1, 1), "-c is symmetric");
+    assert_eq!(span_of(&["-c", "2"]), (2, 2), "-c is symmetric");
+    assert_eq!(
+        span_of(&["-c", "1", "-t", "3"]),
+        (1, 4),
+        "-t is a bonus after"
+    );
+    assert_eq!(span_of(&["-c", "2", "-t", "2"]), (2, 4), "-t adds to -c");
+    assert_eq!(
+        span_of(&["-c", "0", "-t", "4"]),
+        (0, 4),
+        "-t works without -c"
+    );
+    // No flags at all is one line each side, the same as an explicit `-c 1`.
+    assert_eq!(span_of(&[]), span_of(&["-c", "1"]), "default matches -c 1");
+}
+
+/// A file with no final newline, previewed then applied, against GNU sed. The
+/// terminator is absent only while the input's last line is still the output's,
+/// which is subtle enough that the block shape alone is not evidence.
+#[test]
+fn an_unterminated_file_round_trips_through_gnu() {
+    let d = tempfile::tempdir().unwrap();
+    let body = "a\nb\nc";
+    for (script, want) in [
+        ("s/zzz/yyy/", body),
+        ("s/c/z/", "a\nb\nz"),
+        ("1d", "b\nc"),
+        ("2i\\X", "a\nX\nb\nc"),
+        ("$d", "a\nb\n"),
+        ("$a app", "a\nb\nc\napp\n"),
+    ] {
+        write(&d.path().to_path_buf(), "u.txt", body);
+        let want = want.to_string();
+        let blocks = run_in(d.path(), None, &["-p", "u.txt", script]);
+        if stdout(&blocks).is_empty() {
+            assert_eq!(want, body, "{script}");
+            continue;
+        }
+        assert_eq!(code(&blocks), 0, "{script}: {}", stderr(&blocks));
+        let o = run_in(d.path(), Some(&stdout(&blocks)), &["apply", "u.txt"]);
+        assert_eq!(code(&o), 0, "{script}: {}", stdout(&o));
+        assert_eq!(stdout(&o), want, "{script}");
+    }
 }
 
 /// stdout is the payload and stderr is the commentary, so a redirect to a file
@@ -383,7 +489,8 @@ fn recursive_apply_is_atomic_per_file_and_echoes_the_failures() {
     );
 
     // The failed block comes back with its path, ready to fix and re-pipe.
-    assert!(out.contains("one.rs:2"), "missing the block header: {out}");
+    // One line of leading context, so the block anchors a line above the change.
+    assert!(out.contains("one.rs:1"), "missing the block header: {out}");
     assert!(out.contains("@@@OLD"), "{out}");
     assert!(out.contains("let old_name = 1;"), "{out}");
     // And a partial run is an error, with a one-line signal on stderr for a
@@ -494,7 +601,7 @@ fn glob_narrows_the_recursive_walk() {
         &["-r", "-g", "**/*.rs", "-p", ".", "s/old_name/new_name/g"],
     );
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert!(stdout(&o).contains("one.rs:2"), "{}", stdout(&o));
+    assert!(stdout(&o).contains("one.rs:1"), "{}", stdout(&o));
 
     // A pattern nothing matches yields an empty, successful preview.
     let o = run_in(
@@ -535,7 +642,10 @@ fn a_file_containing_block_markers_is_refused_not_mangled() {
     assert_eq!(code(&o), 2);
     let err = stderr(&o);
     assert!(err.contains("appliable blocks"), "{err}");
-    assert!(err.contains("@@@NEW"), "{err}");
+    // Which marker the block swallowed moved when the leading-context default
+    // did: the block now starts a line earlier, so `@@@OLD` is the first one
+    // inside it. Either is the point -- a marker as content is refused.
+    assert!(err.contains("@@@OLD") || err.contains("@@@NEW"), "{err}");
 
     // Recursively, the un-representable file is named and the other still works.
     let o = run_in(&root, None, &["-r", "-p", ".", "s/old/new/g"]);

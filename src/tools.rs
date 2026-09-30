@@ -378,6 +378,10 @@ const SED_CAPTURE_SLACK: usize = 8 * 1024;
 ///
 /// Probed once: what is installed is a property of the machine, not of the turn.
 pub(crate) fn bsed_path() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(p) = test_bsed_path() {
+        return Some(p);
+    }
     static FOUND: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     FOUND
         .get_or_init(|| {
@@ -391,6 +395,10 @@ pub(crate) fn bsed_path() -> Option<std::path::PathBuf> {
 
 /// Whether the `sed` tool can run: the binary exists and answers `--version`.
 pub(crate) fn bsed_available() -> bool {
+    #[cfg(test)]
+    if let Some(p) = test_bsed_path() {
+        return p.is_file();
+    }
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         std::process::Command::new(BSED_BIN)
@@ -401,6 +409,76 @@ pub(crate) fn bsed_available() -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     })
+}
+
+// ---------------------------------------------------------------------------
+// Test-only: resolve the bsed this workspace built
+// ---------------------------------------------------------------------------
+
+/// Where a test has said `bsed` should be found, if anywhere.
+#[cfg(test)]
+static TEST_BSED: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn test_bsed_path() -> Option<std::path::PathBuf> {
+    TEST_BSED.lock().ok()?.clone()
+}
+
+/// Point `bsed_path` at the binary this workspace just built, for as long as the
+/// returned guard lives.
+///
+/// Production resolves `bsed` from `$PATH`, and that is right — a user has it
+/// wherever they installed it. A test must not, for two reasons that both bite
+/// in practice:
+///
+/// * `$PATH` may have no `bsed` at all, and the test then quietly skips. A test
+///   that skips is indistinguishable from a test that passes, so a broken tool
+///   can go unnoticed for as long as nobody has the binary installed.
+/// * `$PATH` may have an *older* one, and then the test exercises a parser that
+///   is not this checkout's. The tool builds `bsed`'s argv, so the two have to
+///   agree; when they did not, the test failed against a stale install rather
+///   than telling anyone the argv was wrong.
+///
+/// The binary is found next to the running test executable
+/// (`target/<profile>/deps/<test>` -> `target/<profile>/bsed`), which is where
+/// `cargo test` puts it. It has to be built: the tests are in the same crate as
+/// the `[[bin]]`, and Cargo does not build binaries for unit-test targets, so a
+/// bare `cargo test` needs a `cargo build` first. The assertion below says so
+/// rather than skipping.
+#[cfg(test)]
+pub(crate) fn use_internal_bsed() -> impl Drop {
+    let exe = std::env::current_exe().expect("path of the running test");
+    // .../target/<profile>/deps/<test-bin> -> .../target/<profile>
+    let profile_dir = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap_or_else(|| panic!("cannot locate the target profile dir from {exe:?}"));
+    let bin = profile_dir.join(BSED_BIN);
+    assert!(
+        bin.is_file(),
+        "expected the workspace `{BSED_BIN}` at {bin:?}; run `cargo build` before `cargo test`"
+    );
+    let previous = {
+        let mut slot = TEST_BSED.lock().expect("TEST_BSED lock");
+        std::mem::replace(&mut *slot, Some(bin))
+    };
+    TestBsedRestores { previous }
+}
+
+/// Puts the resolver back the way the test found it, so an override installed
+/// for one test cannot leak into the next one.
+#[cfg(test)]
+struct TestBsedRestores {
+    previous: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for TestBsedRestores {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = TEST_BSED.lock() {
+            *slot = self.previous.take();
+        }
+    }
 }
 
 /// The `bsed` binary name. Kept in one place so the probe and the call agree.
@@ -2389,13 +2467,23 @@ mod edit_file_tests {
     /// only half the fix — the file has to be bound in, or `execvp` still fails.
     #[test]
     fn bsed_is_resolved_and_bound_into_the_namespace() {
+        // The workspace binary, for the same reason the `sed` tool tests use it:
+        // a missing install would skip this, and an older one would test a
+        // resolver this checkout does not have.
+        let _bsed = super::use_internal_bsed();
         let Some(bin) = super::bsed_path() else {
-            eprintln!("skipping: bsed is not installed");
-            return;
+            panic!("bsed did not resolve, but the workspace binary exists");
         };
         assert!(
             bin.is_absolute(),
             "bsed must be resolved to an absolute path"
+        );
+        // It is a real file: the sandbox binds this path, and a bind of a
+        // missing file is how the tool would fail at run time rather than here.
+        assert!(
+            bin.is_file(),
+            "bsed must resolve to a file: {}",
+            bin.display()
         );
 
         let cfg = crate::config::SandboxConfig::default().with_defaults();
@@ -2428,10 +2516,14 @@ mod edit_file_tests {
         .await
         .unwrap();
 
-        if !super::bsed_available() {
-            eprintln!("skipping: bsed is not on PATH");
-            return;
-        }
+        // This workspace's own `bsed`, not whatever `$PATH` has: the tool's
+        // argv and the binary's parser have to be the same version, and a
+        // missing install must fail the test rather than skip it.
+        let _bsed = super::use_internal_bsed();
+        assert!(
+            super::bsed_available(),
+            "the workspace bsed should be available once the override is installed"
+        );
 
         let out = sed_preview("a.txt".into(), "4s/run/walk/".into(), ContextLines(0))
             .await
@@ -2597,9 +2689,7 @@ mod edit_file_tests {
         // normal result (exit 2), not as a tool error.
         let _cwd = CwdGuard::new();
         tokio::fs::write("a.txt", "x\n").await.unwrap();
-        if !super::bsed_available() {
-            return;
-        }
+        let _bsed = super::use_internal_bsed();
         let out = sed_preview("a.txt".into(), "1w /tmp/pwned".into(), ContextLines(0))
             .await
             .expect("preview returns the message");

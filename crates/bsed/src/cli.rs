@@ -42,16 +42,16 @@ PREVIEW (never writes; the default):
                                 matches. Repeatable, and any match wins. Same
                                 semantics as the `find` tool, so use **/*.rs for a
                                 recursive match.
-    -c, --context <N>           Unchanged lines to add before each change (default 0)
-    -t, --trailing <N>          Unchanged lines to add after a change (default 0)
+    -c, --context <N>           Unchanged lines on each side of a change, like
+                                grep -C (default 1)
+    -t, --trailing <N>          Extra unchanged lines after, on top of -c
+                                (default 0)
         --no-grow               Do not extend blocks to a balanced bracket
     -b, --budget <BYTES>        Preview budget, single-file mode only (default 51200)
     -u, --unified              Emit a unified diff instead of blocks, for reading
                                 in a pager. A diff cannot be applied by anything:
                                 drop -u for blocks the `edit` tool takes. The
-                                hunk context falls back to 2 when neither -c nor
-                                -t is given, since a diff has no anchor and no
-                                context is a diff you have to open the file to read
+                                hunk widens by -c plus -t
     -h, --help
     -n, --quiet                 Suppress automatic printing (ignored; preview only)
     SCRIPT                      If no -e/-f given, first non-option is the script
@@ -76,6 +76,11 @@ EXAMPLES:
     bsed apply src/x.rs < blocks.txt | diff src/x.rs -
 ";
 
+/// Unchanged lines on each side of a change, when neither flag says otherwise.
+///
+/// The symmetric reading of "context", and the same one `grep -C` uses.
+const DEFAULT_CONTEXT: usize = 1;
+
 /// Which of the two renderings to use, and with how much context.
 #[derive(Clone, Copy)]
 struct Mode {
@@ -83,13 +88,10 @@ struct Mode {
     unified: bool,
     /// Unchanged lines each side of a diff hunk. Only consulted when `unified`.
     ///
-    /// Blocks default to zero because their reader is a program that wants the
-    /// smallest correct payload, and a block is anchored so it needs no room. A
-    /// diff has no anchor and its reader is a person, so a hunk with no context
-    /// is a diff you have to open the file to read. `-u` therefore falls back to
-    /// `udiff::DEFAULT_CONTEXT` when the caller asked for neither `-c` nor `-t`
-    /// -- the same value picocode's in-panel edit preview uses. Asking for either
-    /// overrides it, so neither flag is ever silently ignored.
+    /// A hunk has one context setting rather than a before and an after, so
+    /// this is whichever of `-c`/`-t` the caller gave first, and the default when
+    /// they gave neither. The default matches the block one, so `-u` shows the
+    /// same one-line-each-side window the blocks carry.
     diff_context: usize,
 }
 
@@ -269,8 +271,6 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut recursive = false;
     let mut globs: Vec<String> = Vec::new();
-    // Option, not a plain 0: `-c 0` is a real request for no context and
-    // must not be mistaken for "not given", which `-u` reads differently.
     let mut context: Option<usize> = None;
     let mut trailing: Option<usize> = None;
     let mut grow = true;
@@ -353,20 +353,24 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
         paths
     };
 
+    // `-c` is the symmetric context, the way `grep -C` is: N lines on each
+    // side, because that is what a reader means by "show me context". `-t` is
+    // then a bonus *on top*, for the case where the interesting continuation is
+    // after the change and not before it -- which is the asymmetry worth being
+    // able to ask for, but not worth being the default.
+    let around = context.unwrap_or(DEFAULT_CONTEXT);
     let ctx = Context {
-        leading: context.unwrap_or(0),
-        trailing: trailing.unwrap_or(0),
+        leading: around,
+        trailing: around + trailing.unwrap_or(0),
         grow,
         growth_cap: 20,
     };
     let mode = Mode {
         unified,
-        // `-u` only borrows the context flags; with neither given it uses the
-        // diff default rather than the block default of 0. See `Mode`.
-        diff_context: match (context, trailing) {
-            (None, None) => blockedit::udiff::DEFAULT_CONTEXT,
-            (c, t) => c.unwrap_or(0).max(t.unwrap_or(0)),
-        },
+        // A hunk has one symmetric context setting, so `-c` is it and the
+        // trailing bonus widens it rather than being dropped: a reader who asked
+        // for more room around the change gets it either way.
+        diff_context: ctx.trailing,
     };
 
     // Handle single file or multiple files
