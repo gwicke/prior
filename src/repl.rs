@@ -659,18 +659,22 @@ impl Repl {
         let redraw =
             |editor: &LineEditor, overlay: &[String], focus: usize, dims: (usize, usize)| {
                 let dims = (dims.0.max(1), dims.1.max(1));
-                let bar = crate::agent::status_line(
-                    ctx.session_name.as_deref(),
-                    ctx.session_first_message.as_deref(),
-                    crate::agent::BarModel {
-                        provider: &ctx.provider,
-                        model: &ctx.model,
-                        thinking: ctx.reasoning_level.as_deref(),
-                        context_tokens: ctx.context_tokens,
-                    },
+                // Grey: no turn is in flight while the input is open, and that is now a fact
+                // about the bar's *state* rather than an argument at a call site —
+                // the same `status_bar` renders the mid-turn bar green, so the
+                // two cannot drift apart.
+                let bar = crate::output::status_bar(
+                    &crate::agent::status_text(
+                        ctx.session_name.as_deref(),
+                        ctx.session_first_message.as_deref(),
+                        crate::agent::BarModel {
+                            provider: &ctx.provider,
+                            model: &ctx.model,
+                            thinking: ctx.reasoning_level.as_deref(),
+                            context_tokens: ctx.context_tokens,
+                        },
+                    ),
                     dims.0,
-                    // Grey: no turn is in flight while the input is open. The
-                    // mid-turn bar passes `true` and gets the green dot.
                     false,
                 );
                 let frame =

@@ -1,6 +1,6 @@
 use crate::app_state::AppState;
 use crate::model_catalog;
-use crate::output::Confirmation;
+use crate::output::{Confirmation, StatusText};
 use crate::params;
 use crate::repl::{InputAction, ModelFilter, Repl, ReplCtx};
 use crate::session::repo::{ForkMode, SessionRepo};
@@ -353,7 +353,7 @@ impl PicoAgent for CodeAgent {
             index.header.name.clone()
         });
         let reported_ctx = self.usage.lock().unwrap().last_input_tokens;
-        self.output.set_status(&status_line(
+        self.output.set_status(&status_text(
             session_name.as_deref(),
             first_message.as_deref(),
             BarModel {
@@ -371,12 +371,6 @@ impl PicoAgent for CodeAgent {
                     estimated_ctx
                 },
             },
-            crate::output::term_width(),
-            // The status line is only set for a turn in flight, so it is always
-            // streaming today. The flag is carried anyway: the prompt-side
-            // carrier (A2.2) shows the bar between turns, and the dot is what
-            // will tell the two states apart then.
-            true,
         ));
         self.output.begin_response();
         loop {
@@ -4795,20 +4789,6 @@ pub struct SessionStatsInfo {
     pub user_message_count: usize,
 }
 
-/// Compute the `/stat` panel lines. Renders two sections:
-///
-/// 1. **session** — display name, created/last-updated times, total session size
-///    (mirrors `/session <id>`), estimated compacted context tokens.
-/// 2. **model**   — provider/model identifier, context-window limit, current
-///    usage, approximate session cost, cache hit rate.
-///
-/// Reads the live model catalog for the window size and the per-token pricing,
-/// and the agent's accumulated [`SessionUsage`] for the per-turn / session
-/// totals. Returns plain lines so the REPL can render them in the `/stat`
-/// overlay (`render_plain` display).
-/// What separates the name from the model group, and the width it costs.
-const BAR_SEPARATOR: &str = " | ";
-
 /// The model half of the bar — everything to the right of the pipe.
 ///
 /// A struct rather than four more positional arguments because those four are
@@ -4833,32 +4813,36 @@ pub struct BarModel<'a> {
 /// what the context figure means. Fields that are unknown are dropped rather
 /// than shown empty.
 ///
-/// One pipe, and single spaces between the model fields. The labels went
-/// ("ctx 34% · 78k" → "34% 78k") because on a 120-column bar they were most of
-/// the line, and because the fields sit in a fixed order that does not change —
-/// `model thinking pct size` reads without them once you have seen it twice.
+/// **This is the data half.** A struct rather than a rendered string because the
+/// width is the drawing layer's to know: the group has to give way field by field
+/// to fit, the dot cell's width comes out of the same budget, and rendering here
+/// would mean the caller passed a width and then handed back bytes nobody
+/// downstream can re-fit. The halves are separable because there is nothing
+/// width-dependent in this one — `output::status_bar` is the other.
 ///
-/// The name is the elastic part and it *fills* what is left: it is truncated to
-/// the columns between the dot and the pipe rather than to a fixed preview
-/// width, so a long session name uses the whole gap and ends in an ellipsis
-/// instead of stopping short and leaving a hole. The model group is measured
-/// first, because it is the part with nothing to give.
-pub fn status_line(
+/// A struct rather than a rendered string because **the width is the drawing
+/// layer's to know**. The group has to give way field by field to fit, the dot
+/// cell's width comes out of the same budget, and rendering here would mean the
+/// caller passed a width and then handed back bytes nobody downstream can
+/// re-fit — which is what the streaming flag was for, and why it sat hardcoded
+/// `true` at the one call site that had it. The two halves are separable because
+/// there is nothing width-dependent in this one.
+///
+/// The group's fields are pushed in the order they should be *dropped* from the
+/// right: the context figure first, because it changes every turn and a missing
+/// one reads as "no context yet" rather than as a wrong model; then the thinking
+/// level; the model name last, because it is what identifies who is answering.
+pub fn status_text(
     session_name: Option<&str>,
     first_message: Option<&str>,
     m: BarModel<'_>,
-    width: usize,
-    streaming: bool,
-) -> String {
+) -> StatusText {
     let BarModel {
         provider,
         model,
         thinking,
         context_tokens,
     } = m;
-    // The model group, as separate fields so a narrow terminal can drop whole
-    // ones rather than being cut mid-word. The drop order below is the order
-    // they are pushed.
     let mut fields: Vec<String> = Vec::new();
     if !provider.is_empty() || !model.is_empty() {
         fields.push(format!("{provider}:{model}"));
@@ -4883,46 +4867,6 @@ pub fn status_line(
         });
     }
 
-    // The dot cell is not negotiable, and the bar's width is its whole contract —
-    // it is written full-width, so one column too many wraps, and the wrap is the
-    // one row movement the status path does not report.
-    let dot_cols = dot_cell(width).2;
-    let avail = width.saturating_sub(dot_cols);
-    // The separator costs columns only while there *is* a group to separate from.
-    // It is re-read rather than cached, because a group that drops to empty must
-    // not leave the name three columns short of a pipe that is no longer there.
-    let sep_cols = |g: &str| {
-        if g.is_empty() {
-            0
-        } else {
-            BAR_SEPARATOR.len()
-        }
-    };
-    // The group is fitted first, and gives way from the right: the context figure
-    // first, because it is the field that changes every turn and a missing one
-    // reads as "no context yet" rather than as a wrong model; then the thinking
-    // level; the model name last, because it is what identifies who is answering.
-    let mut group = fields.join(" ");
-    while !fields.is_empty()
-        && crate::row_count::display_width_ansi(&group) + sep_cols(&group) > avail
-    {
-        fields.pop();
-        group = fields.join(" ");
-    }
-    // A model name alone can still be too wide for a tiny terminal. Cut it —
-    // `truncate_to_width(_, 0)` returns its input unchanged, so a zero budget has
-    // to become an empty string rather than the whole name.
-    let group_room = avail.saturating_sub(sep_cols(&group));
-    let group = if crate::row_count::display_width_ansi(&group) > group_room {
-        if group_room == 0 {
-            String::new()
-        } else {
-            crate::row_count::truncate_to_width(&group, group_room)
-        }
-    } else {
-        group
-    };
-
     // With no name to show, the session's opening message stands in: the line
     // should still say *which* session this is, not just which model.
     let name = session_name
@@ -4936,99 +4880,10 @@ pub fn status_line(
                 .map(message_preview)
         })
         .unwrap_or_default();
-    // What is left of the row belongs to the name, and the ellipsis is the
-    // point: it takes every column the model group did not.
-    let name_room = group_room.saturating_sub(crate::row_count::display_width_ansi(&group));
-    // A name with no room goes rather than being cut to a single ellipsis, which
-    // identifies nothing and costs the reader a column to skip over.
-    let name = if name.is_empty() || name_room == 0 {
-        String::new()
-    } else {
-        crate::row_count::truncate_to_width(&name, name_room)
-    };
-
-    let line = match (name.is_empty(), group.is_empty()) {
-        (true, _) => group,
-        (false, true) => name,
-        (false, false) => format!("{name}{BAR_SEPARATOR}{group}"),
-    };
-    status_bar(&line, width, streaming)
-}
-
-/// The status line's furniture: the *table header's* background, so the bar
-/// reads as the same chrome as a menu's header rather than as another line of
-/// content, and a foreground dim enough to stay subordinate to it.
-const STATUS_BG: &str = "\x1b[48;5;237m";
-const STATUS_FG: &str = "\x1b[38;5;245m";
-const STATUS_RESET: &str = "\x1b[0m";
-/// The activity dot: green while a response is streaming, the text's own grey
-/// when it is not. This is what the spinner used to say, in one cell, on a row
-/// the user is already looking at.
-const DOT_STREAMING: &str = "\x1b[38;5;41m";
-const DOT_IDLE: &str = STATUS_FG;
-/// The dot, and the column of air that leads the bar with it.
-///
-/// The two are separate because the dot's colour has to be emitted *between*
-/// them: an `SGR` colours the cells written after it, so air-and-glyph as one
-/// literal paints the glyph in the default foreground and applies the colour to
-/// whatever follows. That is not a subtle version of the bug — the green ends up
-/// on nothing at all, and the dot reads as the default bright white.
-const DOT: &str = "\u{25cf}";
-const DOT_AIR: &str = " ";
-
-/// The air that leads the bar and the air that follows it, plus the dot's total
-/// width (lead + glyph + gap).
-///
-/// **Three** pieces, not one, and the trailing one is the reason: the text is
-/// right-aligned, so the padding between the dot and the summary is whatever is
-/// left over — which on a bar that is nearly full is *nothing*, and the summary
-/// then reads as part of the dot's cell. A guaranteed gap column costs nothing
-/// when there is padding anyway and is the whole difference when there is not.
-///
-/// The dot's colour goes between the lead and the glyph, which is why the cell
-/// cannot be one string (see [`DOT`]). The gap comes *after* the glyph and
-/// before the text's own foreground, so it is painted in the bar's colour like
-/// the rest of the row — a space has no foreground to get wrong.
-///
-/// A terminal narrower than the cell gives way rather than wrapping it: the
-/// bar's width is its contract, and a bar wider than the row wraps, and the
-/// wrap is the one row movement the status path has to report.
-fn dot_cell(width: usize) -> (&'static str, &'static str, usize) {
-    match width {
-        0 => ("", "", 0),
-        1 => ("", "", 1),
-        2 => ("", DOT_AIR, 2),
-        _ => (DOT_AIR, DOT_AIR, 3),
+    StatusText {
+        name,
+        group: fields,
     }
-}
-
-/// The status as a full-width bar with the text against the right margin.
-///
-/// The background is set *before* the padding, so the row is one solid block
-/// that separates itself from the content above it, and the figure sits where a
-/// running one belongs instead of reading as the start of a line. Padding with
-/// the background rather than leaving the leading columns default is the whole
-/// point — a bar that only covers its own text is not a bar.
-///
-/// The leading reset is load-bearing and independent of looks: streamed
-/// reasoning leaves the terminal in dim mode, and `dim` is an *attribute* that
-/// `38;5;245m` does not clear, so without it the bar rendered dimmed or not
-/// depending on what happened to be above it. (`paint_status` puts the ambient
-/// state back afterwards, so the bar cannot leak its own reset into the
-/// reasoning stream either.)
-fn status_bar(text: &str, width: usize, streaming: bool) -> String {
-    let dot = if streaming { DOT_STREAMING } else { DOT_IDLE };
-    let (air, gap, dot_cols) = dot_cell(width);
-    let pad = width
-        .saturating_sub(dot_cols)
-        .saturating_sub(crate::row_count::display_width_ansi(text));
-    // Air, the dot's colour, the glyph, a gap, then the text's own foreground:
-    // the colour has to bracket the glyph exactly, and the text's has to follow
-    // it because `38;5;245m` and the dot's colour are the same attribute slot.
-    format!(
-        "{STATUS_RESET}{STATUS_BG}{air}{dot}{DOT}{gap}{STATUS_FG}{}{text}{STATUS_RESET}",
-        " ".repeat(pad)
-    )
 }
 
 /// A first message as a single line, flattened, for the status line to truncate
@@ -5050,8 +4905,33 @@ fn message_preview(msg: &str) -> String {
 }
 
 #[cfg(test)]
-mod status_line_tests {
-    use super::{message_preview, status_line, BarModel, BAR_SEPARATOR};
+mod status_bar_tests {
+    use super::{message_preview, status_text, BarModel};
+    // The separator the fit actually used, not a copy of the string: these tests
+    // are about where the fit put it, so the constant has to be the real one.
+    use crate::output::BAR_SEPARATOR as SEPARATOR;
+
+    /// The whole bar: the data half fitted and rendered.
+    ///
+    /// Every test here is really about the *pair* — `status_text` builds the
+    /// fields and `output::status_bar` fits them to a width — so they go through
+    /// one seam-crossing helper rather than each spelling out the two calls. They
+    /// live here rather than beside `status_bar` because most of them are as much
+    /// about `BarModel`'s data (which field is dropped first, what an unknown
+    /// model does, what an unnamed session shows) as about the fitting.
+    fn bar(
+        session_name: Option<&str>,
+        first_message: Option<&str>,
+        m: BarModel<'_>,
+        width: usize,
+        streaming: bool,
+    ) -> String {
+        crate::output::status_bar(
+            &status_text(session_name, first_message, m),
+            width,
+            streaming,
+        )
+    }
 
     /// A [`BarModel`] for the tests. Positional on purpose: every test wants the
     /// same four things, and the field names at each of the twenty-odd call sites
@@ -5085,7 +4965,7 @@ mod status_line_tests {
         let text = "run the command | llamacpp:test";
         for extra in 0..6_usize {
             let w = text.chars().count() + 2 + extra;
-            let s = status_line(None, None, model("llamacpp", "test", None, 0), w, true);
+            let s = bar(None, None, model("llamacpp", "test", None, 0), w, true);
             let visible = crate::output::strip_ansi(&s);
             assert_eq!(display(&s), w, "width {w}: one row: {visible:?}");
             assert!(
@@ -5111,7 +4991,7 @@ mod status_line_tests {
     /// than the start of a line.
     #[test]
     fn the_bar_fills_the_row_and_right_aligns_the_text() {
-        let s = status_line(
+        let s = bar(
             Some("main"),
             None,
             model("llamacpp", "test", None, 0),
@@ -5154,7 +5034,7 @@ mod status_line_tests {
     fn the_bar_never_moves_the_cursor_down() {
         let long = "x".repeat(200);
         for w in [1_usize, 10, 40, 200] {
-            let s = status_line(Some(&long), None, model("p", "m", None, 0), w, true);
+            let s = bar(Some(&long), None, model("p", "m", None, 0), w, true);
             assert_eq!(
                 crate::row_count::rows_of(&s, w),
                 0,
@@ -5166,7 +5046,7 @@ mod status_line_tests {
     /// A long line is cut to the terminal, not spilled past it.
     #[test]
     fn a_long_bar_is_truncated_to_the_terminal() {
-        let s = status_line(
+        let s = bar(
             Some(&"n".repeat(100)),
             None,
             model("p", "m", None, 0),
@@ -5181,7 +5061,7 @@ mod status_line_tests {
     /// says which session this is. A name always wins: the user chose it.
     #[test]
     fn an_unnamed_session_shows_its_first_message() {
-        let s = status_line(
+        let s = bar(
             None,
             Some("fix the flaky resize test"),
             model("llamacpp", "test", None, 0),
@@ -5190,7 +5070,7 @@ mod status_line_tests {
         );
         let visible = crate::output::strip_ansi(&s);
         assert!(visible.contains("fix the flaky resize test"), "{visible:?}");
-        let named = status_line(
+        let named = bar(
             Some("main"),
             Some("fix the flaky resize test"),
             model("llamacpp", "test", None, 0),
@@ -5218,7 +5098,7 @@ mod status_line_tests {
         // and ollama needs no API key, so the percentage is real here. The
         // `None` window arm — a local endpoint or a new release — is a different
         // shape and has its own test below.
-        let s = status_line(
+        let s = bar(
             Some("main"),
             None,
             model("ollama", "llama3", Some("high"), 5_000),
@@ -5246,7 +5126,7 @@ mod status_line_tests {
     /// not no context figure.
     #[test]
     fn an_unknown_model_still_shows_its_token_count() {
-        let s = status_line(
+        let s = bar(
             Some("main"),
             None,
             model("llamacpp", "test", Some("high"), 78_000),
@@ -5272,7 +5152,7 @@ mod status_line_tests {
         let group = "ollama:llama3 high 61% 5k";
         for w in [40_usize, 60, 100] {
             let long = "a".repeat(400);
-            let s = status_line(
+            let s = bar(
                 Some(&long),
                 None,
                 model("ollama", "llama3", Some("high"), 5_000),
@@ -5291,11 +5171,11 @@ mod status_line_tests {
                 .trim_start()
                 .strip_prefix('\u{25cf}')
                 .and_then(|r| r.strip_suffix(group))
-                .and_then(|r| r.strip_suffix(BAR_SEPARATOR))
+                .and_then(|r| r.strip_suffix(SEPARATOR))
                 .unwrap_or_else(|| panic!("width {w}: cannot find the name in {visible:?}"));
             assert_eq!(
                 display(name),
-                w - 2 - group.len() - BAR_SEPARATOR.len(),
+                w - 2 - group.len() - SEPARATOR.len(),
                 "width {w}: the name should take the whole gap: {visible:?}"
             );
             assert!(name.ends_with('…'), "width {w}: {name:?}");
@@ -5334,7 +5214,7 @@ mod status_line_tests {
             // wide enough to matter would read a mixture of the two and could not
             // say which one it was looking at. The name's own give-way has its
             // own test.
-            let s = status_line(
+            let s = bar(
                 None,
                 None,
                 model("ollama", "llama3", Some("high"), 5_000),
@@ -5371,7 +5251,7 @@ mod status_line_tests {
     /// line.
     #[test]
     fn no_name_and_no_message_still_shows_the_model() {
-        let s = status_line(None, None, model("llamacpp", "test", None, 0), 40, true);
+        let s = bar(None, None, model("llamacpp", "test", None, 0), 40, true);
         let visible = crate::output::strip_ansi(&s);
         assert!(visible.ends_with("llamacpp:test"), "{visible:?}");
         assert_eq!(display(&s), 40, "{visible:?}");
@@ -5389,8 +5269,8 @@ mod status_line_tests {
     /// green lands on nothing, and the dot reads as default bright white.
     #[test]
     fn the_dot_is_green_while_streaming_and_grey_when_not() {
-        let streaming = status_line(Some("main"), None, model("p", "m", None, 0), 40, true);
-        let idle = status_line(Some("main"), None, model("p", "m", None, 0), 40, false);
+        let streaming = bar(Some("main"), None, model("p", "m", None, 0), 40, true);
+        let idle = bar(Some("main"), None, model("p", "m", None, 0), 40, false);
         assert!(
             streaming.contains("\x1b[38;5;41m"),
             "a streaming bar should carry a green dot: {streaming:?}"
@@ -5428,7 +5308,7 @@ mod status_line_tests {
     /// A leading full reset is what makes the bar self-contained.
     #[test]
     fn the_bar_resets_first_so_ambient_dim_cannot_reach_it() {
-        let s = status_line(Some("main"), None, model("p", "m", None, 0), 40, true);
+        let s = bar(Some("main"), None, model("p", "m", None, 0), 40, true);
         let body = s.trim_start_matches("\x1b[0m");
         assert!(
             s.starts_with("\x1b[0m"),
@@ -5468,7 +5348,7 @@ mod status_line_tests {
     fn a_long_message_is_cut_to_the_bar_with_an_ellipsis() {
         // No name and no model group at all: the preview has the whole row, so
         // the cut is the bar's doing and nothing else.
-        let s = status_line(
+        let s = bar(
             None,
             Some(&"a".repeat(80)),
             model("", "", None, 0),
@@ -5486,7 +5366,7 @@ mod status_line_tests {
         // to pay for, so the name gets the whole remainder.
         assert_eq!(display(text), 18, "{visible:?}");
         // A wide glyph is counted as two columns, not cut mid-character.
-        let wide = status_line(
+        let wide = bar(
             None,
             Some(&"\u{4f60}\u{597d}".repeat(20)),
             model("", "", None, 0),

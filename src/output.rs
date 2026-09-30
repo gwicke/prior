@@ -120,7 +120,7 @@ pub trait Output: Send + Sync {
     /// painted then.
     ///
     /// Default no-op: outputs with no cursor to write at have no status line.
-    fn set_status(&self, _text: &str) {}
+    fn set_status(&self, _text: &StatusText) {}
     fn display_header(
         &self,
         provider: &str,
@@ -440,8 +440,18 @@ pub struct ConsoleOutput {
     /// Where the transient status line currently sits, so the next content
     /// write can erase it (`None` when none is showing).
     status: Mutex<Option<StatusSpot>>,
-    /// The status text to paint after each content block (empty = off).
-    status_text: Mutex<String>,
+    /// The status line's content, painted after each content block (an all-empty
+    /// `StatusText` is off). Content rather than rendered bytes, because the
+    /// width is this layer's to know: see [`status_bar`].
+    status_text: Mutex<StatusText>,
+    /// Whether a turn is in flight, which is the bar dot's only state.
+    ///
+    /// Owned here rather than passed in because this layer is what *draws* it,
+    /// and the one caller that used to decide passed a hardcoded `true` — which
+    /// is how the idle bar and the streaming bar came to be two renderings of
+    /// one function. The flag flips in `begin_response`/`end_response`, so the
+    /// bar's state cannot disagree with whether a turn is actually running.
+    streaming: std::sync::atomic::AtomicBool,
     /// A frame has claimed the tail rows since the last status paint.
     ///
     /// Sticky on purpose: one content *burst* is often several writes (a
@@ -1241,8 +1251,9 @@ impl ConsoleOutput {
             last_tool: Mutex::new(None),
             stream_tail: StreamTail::new(),
             status: Mutex::new(None),
-            status_text: Mutex::new(String::new()),
+            status_text: Mutex::new(StatusText::default()),
             frame_owns_tail: std::sync::atomic::AtomicBool::new(false),
+            streaming: std::sync::atomic::AtomicBool::new(false),
             saved_writer: Mutex::new(None),
         }
     }
@@ -1537,10 +1548,20 @@ impl ConsoleOutput {
     /// - **No frame was live** — a frame owns the last rows (the prompt's
     ///   input, a dialog), and the prompt-side status is a frame concern.
     fn paint_status(&self) {
-        let text = self.status_text.lock().unwrap().clone();
-        if text.is_empty() || !self.stream_tail.at_line_start() {
+        let stored = self.status_text.lock().unwrap().clone();
+        // **Off** is tested on the stored content, not the rendered bar — the bar
+        // is a full-width row, so it is never empty even when there is nothing to
+        // say, and testing *it* would paint a blank bar where the status is
+        // supposed to be off.
+        if (stored.name.is_empty() && stored.group.is_empty()) || !self.stream_tail.at_line_start()
+        {
             return;
         }
+        let text = status_bar(
+            &stored,
+            term_width(),
+            self.streaming.load(std::sync::atomic::Ordering::Relaxed),
+        );
         if self
             .frame_owns_tail
             .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -1823,6 +1844,173 @@ struct StatusSpot {
 /// exiting while it is hidden.
 pub(crate) const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
+
+/// The status line's content, before it is fitted to a width: what names the
+/// session, and the model group as separate fields.
+///
+/// **Data, not drawing, and deliberately not the rendered bar.** `status_bar`
+/// below fits it to a width and styles it; nothing here needs to know how wide
+/// the terminal is, which is what lets the two halves live on opposite sides of
+/// the `agent` → `output` seam instead of the width being passed in from the
+/// layer that has no business knowing it.
+///
+/// The group's fields are kept separate — rather than pre-joined into one
+/// string — because a narrow terminal has to give up **whole** fields, from the
+/// right, and a joined string can only be cut mid-word. The push order is that
+/// drop order, so it is carried here rather than re-decided at the fit.
+#[derive(Default, Clone)]
+pub struct StatusText {
+    /// The session name, or its opening message standing in for it.
+    pub name: String,
+    /// The model group, in the order a narrow terminal should give it up.
+    pub group: Vec<String>,
+}
+
+/// What separates the name from the model group, and the width it costs.
+///
+/// `pub(crate)` so the bar's own tests can assert against the separator the fit
+/// actually used, rather than a copy of the string that could drift from it.
+pub(crate) const BAR_SEPARATOR: &str = " | ";
+
+/// The status line's furniture: the *table header's* background, so the bar
+/// reads as the same chrome as a menu's header rather than as another line of
+/// content, and a foreground dim enough to stay subordinate to it.
+const STATUS_BG: &str = "\x1b[48;5;237m";
+const STATUS_FG: &str = "\x1b[38;5;245m";
+const STATUS_RESET: &str = "\x1b[0m";
+
+/// The dot's two states. Streaming is green and idle takes the bar's own
+/// foreground, so the bar needs no separate "idle" colour to stay subordinate.
+const DOT_STREAMING: &str = "\x1b[38;5;41m";
+const DOT_IDLE: &str = STATUS_FG;
+
+/// The dot is `●` where there is room and a space where there is not — on a
+/// three-column terminal a real dot would leave the name no columns at all.
+/// Either way it is the first thing on the row, which is what makes it readable
+/// at a glance from a scrollback.
+const DOT: &str = "\u{25cf}";
+const DOT_AIR: &str = " ";
+
+/// The air that leads the bar and the air that follows it, plus the dot's total
+/// width (lead + glyph + gap).
+///
+/// **Three** pieces, not one, and the trailing one is the reason: the text is
+/// right-aligned, so the padding between the dot and the summary is whatever is
+/// left over — which on a bar that is nearly full is *nothing*, and the summary
+/// then reads as part of the dot's cell. A guaranteed gap column costs nothing
+/// when there is padding anyway and is the whole difference when there is not.
+///
+/// The dot's colour goes between the lead and the glyph, which is why the cell
+/// cannot be one string (see [`DOT`]). The gap comes *after* the glyph and
+/// before the text's own foreground, so it is painted in the bar's colour like
+/// the rest of the row — a space has no foreground to get wrong.
+///
+/// A terminal narrower than the cell gives way rather than wrapping it: the
+/// bar's width is its contract, and a bar wider than the row wraps, and the
+/// wrap is the one row movement the status path has to report.
+fn dot_cell(width: usize) -> (&'static str, &'static str, usize) {
+    match width {
+        0 => ("", "", 0),
+        1 => ("", "", 1),
+        2 => ("", DOT_AIR, 2),
+        _ => (DOT_AIR, DOT_AIR, 3),
+    }
+}
+
+/// The status bar: [`StatusText`] fitted to `width` and rendered as one
+/// full-width row, in the state the caller is in.
+///
+/// Everything in here needs the width, which is why it lives on this side of the
+/// seam rather than with the data that feeds it. Which field gives way, the dot
+/// cell's share of the budget, the truncation and the padding are *one*
+/// decision, and the width is what makes it.
+///
+/// Deliberately **one** function, called from two places: the area's status row
+/// and the transient bar are the same drawing, and two renderings of "fit the
+/// group, then style it" would be two places for them to drift apart.
+///
+/// One pipe, and single spaces between the model fields. The labels went
+/// ("ctx 34% · 78k" → "34% 78k") because on a 120-column bar they were most of
+/// the line, and because the fields sit in a fixed order that does not change —
+/// `model thinking pct size` reads without them once you have seen it twice.
+///
+/// The name is the elastic part and it *fills* what is left: it is truncated to
+/// the columns between the dot and the pipe rather than to a fixed preview width,
+/// so a long session name uses the whole gap and ends in an ellipsis instead of
+/// stopping short and leaving a hole. The model group is measured first, because
+/// it is the part with nothing to give.
+pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> String {
+    // Owned because the fit *pops* — that is the whole drop mechanism, and a
+    // borrowed slice cannot be popped from. One clone per bar, on a path that is
+    // about to allocate the row anyway.
+    let mut fields = text.group.clone();
+    let dot_cols = dot_cell(width).2;
+    let avail = width.saturating_sub(dot_cols);
+    // The separator costs columns only while there *is* a group to separate from.
+    // It is re-read rather than cached, because a group that drops to empty must
+    // not leave the name three columns short of a pipe that is no longer there.
+    let sep_cols = |g: &str| {
+        if g.is_empty() {
+            0
+        } else {
+            BAR_SEPARATOR.len()
+        }
+    };
+    // The group is fitted first, and gives way from the right: the context figure
+    // first, because it is the field that changes every turn and a missing one
+    // reads as "no context yet" rather than as a wrong model; then the thinking
+    // level; the model name last, because it is what identifies who is answering.
+    let mut group = fields.join(" ");
+    while !fields.is_empty()
+        && crate::row_count::display_width_ansi(&group) + sep_cols(&group) > avail
+    {
+        fields.pop();
+        group = fields.join(" ");
+    }
+    // A model name alone can still be too wide for a tiny terminal. Cut it —
+    // `truncate_to_width(_, 0)` returns its input unchanged, so a zero budget has
+    // to become an empty string rather than the whole name.
+    let group_room = avail.saturating_sub(sep_cols(&group));
+    let group = if crate::row_count::display_width_ansi(&group) > group_room {
+        if group_room == 0 {
+            String::new()
+        } else {
+            crate::row_count::truncate_to_width(&group, group_room)
+        }
+    } else {
+        group
+    };
+
+    // What is left of the row belongs to the name, and the ellipsis is the
+    // point: it takes every column the model group did not.
+    let name_room = group_room.saturating_sub(crate::row_count::display_width_ansi(&group));
+    // A name with no room goes rather than being cut to a single ellipsis, which
+    // identifies nothing and costs the reader a column to skip over.
+    let name = if text.name.is_empty() || name_room == 0 {
+        String::new()
+    } else {
+        crate::row_count::truncate_to_width(&text.name, name_room)
+    };
+
+    let line = match (name.is_empty(), group.is_empty()) {
+        (true, _) => group,
+        (false, true) => name,
+        (false, false) => format!("{name}{BAR_SEPARATOR}{group}"),
+    };
+
+    let dot = if streaming { DOT_STREAMING } else { DOT_IDLE };
+    let (air, gap, dot_cols) = dot_cell(width);
+    let pad = width
+        .saturating_sub(dot_cols)
+        .saturating_sub(crate::row_count::display_width_ansi(&line));
+    // Air, the dot's colour, the glyph, a gap, then the text's own foreground:
+    // the colour has to bracket the glyph exactly, and the text's has to follow
+    // it because `38;5;245m` and the dot's colour are the same attribute slot.
+    format!(
+        "{STATUS_RESET}{STATUS_BG}{air}{dot}{DOT}{gap}{STATUS_FG}{}{line}{STATUS_RESET}",
+        " ".repeat(pad)
+    )
+}
 
 /// The theme the answer renderer is built with: colours and clickable links on
 /// a terminal, plain otherwise. Shared with the tests, whose "what did the
@@ -2278,6 +2466,11 @@ impl Output for ConsoleOutput {
     }
 
     fn begin_response(&self) {
+        // The bar's dot goes green for the turn. Set here rather than at the
+        // call site that builds the text: this layer draws the bar, and a turn
+        // starting is exactly when its state changes.
+        self.streaming
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // One render path for every run (B3c). There used to be a second one
         // for a non-tty stdout: buffer the whole response and render it as one
         // markdown block at the end. Two paths meant every replay test — a
@@ -2417,6 +2610,10 @@ impl Output for ConsoleOutput {
     }
 
     fn end_response(&self) {
+        // Before the flush, so the last bar of the turn is still the streaming
+        // one; the bar painted after this is the idle one.
+        self.streaming
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let current_width = current_term_width();
         // One counted block: the answer and thinking flushes and the
         // trailing blank.
@@ -2631,8 +2828,8 @@ impl Output for ConsoleOutput {
     /// Remember the status line to paint after each content block; see
     /// [`ConsoleOutput::paint_status`] for the three conditions that decide
     /// whether it actually goes out.
-    fn set_status(&self, text: &str) {
-        *self.status_text.lock().unwrap() = text.to_string();
+    fn set_status(&self, text: &StatusText) {
+        *self.status_text.lock().unwrap() = text.clone();
     }
 
     fn end_capture(&self) -> Vec<u8> {
@@ -2753,6 +2950,60 @@ mod tests {
     /// answer to the question every test in this file is asking.
     ///
     /// The one test whose subject *is* the routing names both values itself.
+    /// A [`StatusText`] whose bar carries exactly `text`: the name, and no model
+    /// group — so `status_bar` renders it verbatim between the dot and the padding.
+    ///
+    /// The tests below use the bar as a *marker* to find on screen; what they are
+    /// for is the painting (transience, the gap, the erase, the dim). The fitting —
+    /// which field gives way to what, and the ellipsis — is a different contract and
+    /// has its own tests beside `status_bar`.
+    fn bar_of(text: &str) -> StatusText {
+        StatusText {
+            name: text.to_string(),
+            group: Vec::new(),
+        }
+    }
+
+    /// The dot's colour is the bar's only state, and it is **derived** from the
+    /// response lifecycle rather than passed in at a call site.
+    ///
+    /// It used to be passed in — as a hardcoded `true` at the one site that built the
+    /// text — which meant the bar's state was a claim the caller made about whether a
+    /// turn was running, and nothing checked the claim. Now the flag flips in
+    /// `begin_response`/`end_response`, so the bar cannot claim to be streaming when no
+    /// turn is in flight.
+    #[test]
+    #[serial]
+    fn the_dot_follows_the_response_lifecycle() {
+        let (out, _reasoning) = capturing_output(60);
+        out.set_status(&bar_of("[bar]"));
+        assert!(
+            !out.streaming.load(std::sync::atomic::Ordering::Relaxed),
+            "no turn in flight, so the bar is idle"
+        );
+        out.begin_capture();
+        out.begin_response();
+        out.write_content(b"x\n");
+        let during = String::from_utf8_lossy(&out.end_capture()).to_string();
+        out.begin_capture();
+        out.end_response();
+        let after = String::from_utf8_lossy(&out.end_capture()).to_string();
+        // The green dot mid-turn, and the idle one after — asserted on the bytes,
+        // because a flag that is set and never read would pass a state check alone.
+        assert!(
+            during.contains("\x1b[38;5;41m\u{25cf}"),
+            "the bar painted during the turn is green: {during:?}"
+        );
+        assert!(
+            !after.contains("\x1b[38;5;41m\u{25cf}"),
+            "and the one after the turn is not: {after:?}"
+        );
+        assert!(
+            !out.streaming.load(std::sync::atomic::Ordering::Relaxed),
+            "and the flag went back down"
+        );
+    }
+
     fn capturing_output(width: u16) -> (ConsoleOutput, crate::settings::ShowReasoningHandle) {
         crate::repl::TERMINAL_WIDTH.store(width as usize, std::sync::atomic::Ordering::SeqCst);
         let reasoning = crate::settings::default_show_reasoning_handle();
@@ -4009,7 +4260,7 @@ mod tests {
         let (out, _reasoning) = capturing_output(60);
         out.begin_capture();
         out.begin_response();
-        out.set_status(STATUS);
+        out.set_status(&bar_of(STATUS));
         out.stream_text("first block.\n\n");
         out.stream_text("second block.\n\n");
         let bytes = out.end_capture();
@@ -4052,14 +4303,18 @@ mod tests {
         let (out, _reasoning) = capturing_output(60);
         out.begin_capture();
         out.begin_response();
-        out.set_status("[bar]");
+        out.set_status(&bar_of("[bar]"));
         out.stream_text("```\nalpha\n```\n");
         let text = visible(&out.end_capture());
+        // Anchored on the bar's **dot**, not on its text: the bar is fitted to
+        // the terminal and right-aligned, so what follows the dot is padding, not
+        // the marker. This test is about how many blank rows separate the content
+        // from the bar, and the dot is where the bar starts.
         assert!(
-            text.contains("alpha\n\n[bar]"),
+            text.contains("alpha\n\n \u{25cf}"),
             "one blank row between the last line of content and the bar: {text:?}"
         );
-        assert!(!text.contains("alpha\n\n\n[bar]"), "and only one: {text:?}");
+        assert!(!text.contains("alpha\n\n\n"), "and only one: {text:?}");
     }
 
     /// The status **reuses** a blank that is already on screen instead of
@@ -4082,16 +4337,18 @@ mod tests {
         let (out, _reasoning) = capturing_output(60);
         out.begin_capture();
         out.begin_response();
-        out.set_status("[bar]");
+        out.set_status(&bar_of("[bar]"));
         out.write_content(b"alpha\n");
         out.write_content(b"\n"); // the blank line, really written
         let text = String::from_utf8_lossy(&out.end_capture()).replace('\r', "");
+        // Anchored on the dot, as in the sibling test: the bar is right-aligned,
+        // so its text is not what abuts the content.
         assert!(
-            text.contains("alpha\n\n[bar]"),
+            text.contains("alpha\n\n\x1b[0m\x1b[48;5;237m \x1b[38;5;41m\u{25cf}"),
             "the blank already on screen is the gap: {text:?}"
         );
         assert!(
-            !text.contains("alpha\n\n\n[bar]"),
+            !text.contains("alpha\n\n\n"),
             "the bar must not add a second one: {text:?}"
         );
     }
@@ -4108,7 +4365,7 @@ mod tests {
         let (out, _reasoning) = capturing_output(60);
         out.begin_capture();
         out.begin_response();
-        out.set_status("[bar]");
+        out.set_status(&bar_of("[bar]"));
         out.stream_text("```\nalpha\n```\n");
         out.stream_text("```\nbeta\n```\n");
         let text = String::from_utf8_lossy(&out.end_capture()).into_owned();
@@ -4146,7 +4403,10 @@ mod tests {
         let (out, _reasoning) = capturing_output(60);
         *out.dim_on.lock().unwrap() = true; // mid-reasoning
         out.begin_capture();
-        out.set_status("\x1b[0m\x1b[48;5;237mdim-test\x1b[0m");
+        // The marker is plain text: the bar supplies its own colours now, so escapes in
+        // here would only add a second reset in front of the one this test is
+        // about. It is testing the dim restoration, not bar contents.
+        out.set_status(&bar_of("dim-test"));
         // Painted directly rather than through a content write: the answer
         // renderer turns dim *off* before it writes, so a content write can
         // never leave the flag on for the status to find. Reasoning can, and
@@ -4180,7 +4440,7 @@ mod tests {
         let (out, _reasoning) = capturing_output(60);
         out.begin_capture();
         out.begin_response();
-        out.set_status("bar");
+        out.set_status(&bar_of("bar"));
         out.stream_text("a block\n\n");
         out.draw_frame(
             &crate::repl::Repl::compose_frame(
@@ -4210,7 +4470,7 @@ mod tests {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
         out.begin_response();
-        out.set_status("[sess | m | ctx 5%]");
+        out.set_status(&bar_of("[sess | m | ctx 5%]"));
         out.stream_text("alpha.\n\n");
         out.stream_text("beta.\n\n");
         let bytes = out.end_capture();
@@ -4275,7 +4535,7 @@ mod tests {
     fn status_lands_below_a_frame_rather_than_among_its_rows() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
-        out.set_status("[sess | m]");
+        out.set_status(&bar_of("[sess | m]"));
         let frame = crate::repl::Repl::compose_frame(
             &crate::repl::LineEditor::new(),
             "",
