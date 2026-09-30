@@ -1,6 +1,6 @@
 # Batch Editing v2 — Aider-style text edits
 
-*Status: Phase 1 implemented. W1 (multi-file path policy) implemented, no caller yet. Phase 2 gated on observed demand.*
+*Status: Phase 1 implemented. W1–W2 done — multi-file editing is accepted, split per file, and applied with per-file failure granularity. W3–W4 and W7–W8 remain.*
 
 ## Motivation
 
@@ -977,15 +977,39 @@ not blocks; `merge_path`'s own behaviour untouched.
   a wrong path. This is the P1 lesson applied one level down — name the
   malformation rather than report an absence.
 
-**W2 — the tool's Args (`blockedit/src/wire.rs`).** `EditArgs { files }`.
-`from_wire` routes the block-string shape through `split_by_file`, and wraps the
-single-edit and legacy-array shapes as a one-element `files`. Move the existing
-`ParsedEdit → EditOp` map out of `from_wire` into a shared
-`impl From<&[ParsedEdit]> for Vec<EditOp>` or a `to_ops` free function — `bsed`
-has a private copy (`crates/bsed/src/cli.rs:677`) and this would be the third.
+**W2 — the tool's Args (`blockedit/src/wire.rs`). — DONE.** `EditArgs` is now
+`{ files: Vec<FileEdit> }`, with `FileEdit { path, edits }`. `from_wire` routes a
+**multi-file** block blob through `split_by_file` and wraps the single-edit and
+single-file block shapes as a one-element `files`, so the tool has one loop and
+no shape special-case beyond construction.
 
-*Tests:* all three wire shapes still parse; a multi-file blob yields N files in
-order; a single-file blob is byte-identical to today.
+**Multi-file is now reachable by a model** — this is the commit that ships the
+feature. Routing is on `parsed.multi_file`, not on "did it look multi-file":
+a single-file blob still goes through `merge_path` and still defaults freely,
+which is the case W1's no-defaulting rule must *not* leak into (there is only
+one candidate, so a default cannot be wrong).
+
+*`to_ops` is now shared.* The `ParsedEdit → EditOp` map moved out of
+`from_wire` into `blockedit::blob::to_ops`, and `bsed`'s private copy
+(`crates/bsed/src/cli.rs:677`) is deleted in favour of it. It was going to be
+the third copy, and a copy is a place a new field silently fails to reach.
+
+*Tests:* all wire shapes still parse; a multi-file blob yields N files in
+blob order with per-block anchors intact; a `path` argument neither supplies nor
+re-targets a multi-file blob; a header-less block in a multi-file blob is
+rejected; a single-file blob is still one entry via `merge_path`. End to end
+through the erased tool: one call edits three files, and a file that fails to
+match leaves the others written.
+
+*Two scope notes, both deliberate:*
+- `FileEdit` has no `PartialEq`. `EditOp` deliberately has none, and widening a
+  core type for a convenience nothing uses would be the wrong trade.
+- **`EditFile::call` applies each file as it resolves.** That is the
+  per-file failure granularity the tool description already advertises, and the
+  single-file path is `edit_file` verbatim. What is *not* here is W4's
+  resolve-everything-then-write-what-resolved pass, which would report all of a
+  call's problems in one round trip instead of one file per trip. Until W4, a
+  multi-file call is applied file-by-file and each file's own report is returned.
 
 **W3 — the envelope (`blockedit/src/diagnose.rs`).** `BatchItem.path`,
 `FileOutcome`, `MultiFileOutcome`, and a builder that renders `ui_view` as a
@@ -1210,9 +1234,9 @@ because it is the piece that could silently re-target a file if it were wrong.
   claims its precedence matches the `edit` tool's, and now names
   `split_by_file`'s no-fallback rule.
 
-**Not available yet.** Nothing routes to `split_by_file`; `from_wire` still
-calls `merge_path`, which still rejects a multi-file blob. W2 is the commit that
-makes multi-file reachable by a model.
+**Now wired (W2).** `EditArgs::from_wire` routes a multi-file blob through this
+function, so a model can reach it. A single-file blob still goes through
+`merge_path` and still defaults freely.
 
 - `src/edit_blocks.rs` (new): `parse_blocks`, `merge_path`, `render_blob`,
   `canonicalize_edit_value` (→ array, best-effort), `array_to_blob_value`
@@ -1581,11 +1605,11 @@ corruption is now a loud `overlapping`/`all-claimed` failure).
    (W1–W8, *Phase 2*). **W1 has landed** — the strict `split_by_file` path
    policy, plus the `group_by_file` block-index fix and the `rejected_header`
    diagnosis, all with no caller yet. What remains ships as two commits:
-   1. **W2–W4 (execution)** — route the block form through `split_by_file`,
-      then apply per file: resolve-all, write-what-resolved, with a per-file
-      failure envelope. W1 is the policy half and is already in; W2–W4 are the
-      half that makes a model able to reach it. Self-contained; reverted by one
-      guard in `from_wire`.
+   1. **W1–W2 (execution) — DONE.** Multi-file blobs are accepted, split per
+      file, and applied with per-file failure granularity. What remains is
+      **W3–W4**: the aggregated `MultiFileOutcome` envelope, and
+      resolve-all-then-write-what-resolved so one round trip reports every
+      file's problem. Reverted by one guard in `from_wire`.
    2. **W7–W8 (storage + model-facing)** — one split transform at *both*
       egresses that see the call: `append_message` (N canonical single-path
       calls on disk, so pi can read the file, which also repairs compaction's

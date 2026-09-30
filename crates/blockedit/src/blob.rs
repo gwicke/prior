@@ -1164,6 +1164,24 @@ pub fn group_by_file(
         .collect())
 }
 
+/// The execution form of one file's blocks: [`EditOp`]s computed against the
+/// original file, anchors carried through as the matching hint.
+///
+/// The single conversion every consumer of a parsed blob needs. It lives here
+/// rather than in each caller because there were already two copies (this
+/// crate's `from_wire`, and a private one in `bsed`), which drift the moment a
+/// field is added to either type.
+pub fn to_ops(edits: &[ParsedEdit]) -> Vec<crate::types::EditOp> {
+    edits
+        .iter()
+        .map(|e| crate::types::EditOp {
+            old_text: e.old_text.clone(),
+            new_text: e.new_text.clone(),
+            start_line: e.start_line.map(crate::types::EditStartLine),
+        })
+        .collect()
+}
+
 /// Upper bound on files in one call. Beyond it the blob is rejected whole,
 /// before any file is touched.
 ///

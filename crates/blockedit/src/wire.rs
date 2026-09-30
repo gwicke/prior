@@ -65,10 +65,32 @@ const ELIDE_CONTEXT: usize = 1;
 const EDIT_ARGS_EXAMPLE: &str = "some/path:1234\n@@@OLD\nold text\n@@@NEW\nnew text\n@@@END";
 
 /// Arguments accepted by the `edit` tool, after normalization to the execution
-/// form (a resolved single-file `path` plus one or more [`EditOp`]s).
+/// form: one [`FileEdit`] per file, each a resolved path plus its edits.
+///
+/// A list rather than a single file because a block blob may legitimately span
+/// files, and because the unit of failure granularity is the file — the
+/// backend applies all-or-nothing *per file*, so a call about three files is
+/// three independent all-or-nothing writes. The single-edit and single-file
+/// block shapes are length 1, so the tool has one loop and no shape
+/// special-case beyond construction.
+///
+/// The pre-multi-file shape was a bare `{path, edits}`; that remains the
+/// *canonical* form on disk (pi's), but the wire type models what a call can
+/// actually do.
 #[derive(Debug)]
 pub struct EditArgs {
-    /// File to edit (from the `path` argument, or inferred from a block header).
+    /// The files to edit, in blob order.
+    pub files: Vec<FileEdit>,
+}
+
+/// One file's worth of a call: its resolved path and the edits against it.
+///
+/// No `PartialEq`: `EditOp` deliberately has none, and nothing needs to
+/// compare two of these — the wire tests assert on `path` and `edits`
+/// separately.
+#[derive(Debug, Clone)]
+pub struct FileEdit {
+    /// File to edit (from a block header, or the `path` argument).
     pub path: String,
     /// The edits to apply, computed against the original file.
     pub edits: Vec<EditOp>,
@@ -298,17 +320,30 @@ impl EditArgs {
         if let Some(text) = blob::blob_text(raw) {
             let parsed = blob::parse_blocks(text)
                 .map_err(|e| Self::invalid(raw, &format!("Invalid block: {e}")))?;
+            // A single-file blob keeps `merge_path`, which defaults freely:
+            // there is one candidate, so a default cannot be wrong. A blob that
+            // spans files goes through the strict policy instead — every block
+            // names its own file, and `json_path` is not consulted at all.
+            if parsed.multi_file {
+                let files = blob::split_by_file(parsed).map_err(|e| Self::invalid(raw, &e))?;
+                return Ok(EditArgs {
+                    files: files
+                        .into_iter()
+                        .map(|b| FileEdit {
+                            path: b.path,
+                            edits: blob::to_ops(&b.edits),
+                        })
+                        .collect(),
+                });
+            }
             let (path, blocks) =
                 blob::merge_path(json_path, parsed).map_err(|e| Self::invalid(raw, &e))?;
-            let edits = blocks
-                .into_iter()
-                .map(|b| EditOp {
-                    old_text: b.old_text,
-                    new_text: b.new_text,
-                    start_line: b.start_line.map(EditStartLine),
-                })
-                .collect();
-            return Ok(EditArgs { path, edits });
+            return Ok(EditArgs {
+                files: vec![FileEdit {
+                    path,
+                    edits: blob::to_ops(&blocks),
+                }],
+            });
         }
 
         // `edits` as an array is the canonical *storage* form, not a wire one.
@@ -346,11 +381,13 @@ impl EditArgs {
                 (None, None) => None,
             };
             return Ok(EditArgs {
-                path: path.to_string(),
-                edits: vec![EditOp {
-                    old_text: o.to_string(),
-                    new_text: n.to_string(),
-                    start_line: anchor,
+                files: vec![FileEdit {
+                    path: path.to_string(),
+                    edits: vec![EditOp {
+                        old_text: o.to_string(),
+                        new_text: n.to_string(),
+                        start_line: anchor,
+                    }],
                 }],
             });
         }
@@ -448,8 +485,9 @@ mod tests {
             "path": "src/x.rs:12", "oldText": "a", "newText": "b"
         }))
         .unwrap();
-        assert_eq!(a.path, "src/x.rs");
-        assert_eq!(a.edits[0].start_line, Some(EditStartLine(12)));
+        assert_eq!(a.files.len(), 1);
+        assert_eq!(a.files[0].path, "src/x.rs");
+        assert_eq!(a.files[0].edits[0].start_line, Some(EditStartLine(12)));
     }
 
     #[test]
@@ -470,7 +508,7 @@ mod tests {
             "blocks": "src/x.rs:7\n@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
-        assert_eq!(a.edits[0].start_line, Some(EditStartLine(7)));
+        assert_eq!(a.files[0].edits[0].start_line, Some(EditStartLine(7)));
     }
 
     #[test]
@@ -480,8 +518,8 @@ mod tests {
             "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
-        assert_eq!(a.path, "src/x.rs");
-        assert_eq!(a.edits[0].start_line, None);
+        assert_eq!(a.files[0].path, "src/x.rs");
+        assert_eq!(a.files[0].edits[0].start_line, None);
     }
 
     /// The shape this tool advertised for its whole life, still arriving from a
@@ -493,10 +531,10 @@ mod tests {
             "path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
-        assert_eq!(a.path, "src/x.rs");
-        assert_eq!(a.edits.len(), 1);
-        assert_eq!(a.edits[0].old_text, "a");
-        assert_eq!(a.edits[0].new_text, "b");
+        assert_eq!(a.files[0].path, "src/x.rs");
+        assert_eq!(a.files[0].edits.len(), 1);
+        assert_eq!(a.files[0].edits[0].old_text, "a");
+        assert_eq!(a.files[0].edits[0].new_text, "b");
     }
 
     /// `blocks` wins when both are present, and a malformed `blocks` must not
@@ -510,7 +548,7 @@ mod tests {
             "edits":  "@@@OLD\nfrom-edits\n@@@NEW\nE\n@@@END"
         }))
         .unwrap();
-        assert_eq!(a.edits[0].old_text, "from-blocks");
+        assert_eq!(a.files[0].edits[0].old_text, "from-blocks");
 
         // ...and a malformed `blocks` is an error, not a fallback.
         let e = EditArgs::from_wire(&json!({
@@ -547,8 +585,8 @@ mod tests {
             "path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
-        assert_eq!(a.path, "src/x.rs");
-        assert_eq!(a.edits.len(), 1);
+        assert_eq!(a.files[0].path, "src/x.rs");
+        assert_eq!(a.files[0].edits.len(), 1);
 
         // `blocks` as an array is not the block form, and not the single-edit
         // form either, so it is simply unrecognised.
@@ -598,7 +636,7 @@ mod tests {
             "path": "src/x.rs", "oldText": "a", "newText": "b"
         }))
         .unwrap();
-        assert_eq!(a.edits.len(), 1);
+        assert_eq!(a.files[0].edits.len(), 1);
     }
 
     /// Every shape this tool has *ever* accepted on the wire, and what each one
@@ -626,7 +664,7 @@ mod tests {
             "path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .expect("a pre-rename blob must still be accepted");
-        assert_eq!(a.edits.len(), 1);
+        assert_eq!(a.files[0].edits.len(), 1);
 
         // (2) `edits` as an array — removed on purpose, refused by name.
         let e = EditArgs::from_wire(&json!({
@@ -640,14 +678,14 @@ mod tests {
             "path": "src/x.rs", "oldText": "a", "newText": "b"
         }))
         .unwrap();
-        assert_eq!(a.edits.len(), 1);
+        assert_eq!(a.files[0].edits.len(), 1);
 
         // (4) the current name.
         let a = EditArgs::from_wire(&json!({
             "path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
-        assert_eq!(a.edits.len(), 1);
+        assert_eq!(a.files[0].edits.len(), 1);
     }
 
     #[test]
@@ -700,5 +738,94 @@ mod tests {
         let big = format!("@@@OLD\n{}\n@@@NEWEND", "x".repeat(50_000));
         let e2 = EditArgs::from_wire(&json!({ "blocks": big })).unwrap_err();
         assert!(e2.len() < 4 * MAX_ECHOED_ARGS, "len {}", e2.len());
+    }
+
+    // -- multi-file routing (Phase 2 W2) -----------------------------------
+
+    #[test]
+    fn a_multi_file_blob_yields_one_file_entry_in_blob_order() {
+        let a = EditArgs::from_wire(&json!({
+            "blocks": "src/b.rs:4\n@@@OLD\ny\n@@@NEW\nY\n@@@END\n\n\
+                        src/a.rs:9\n@@@OLD\nz\n@@@NEW\nZ\n@@@END\n\n\
+                        src/b.rs:20\n@@@OLD\nw\n@@@NEW\nW\n@@@END"
+        }))
+        .unwrap();
+        assert_eq!(a.files.len(), 2);
+        assert_eq!(a.files[0].path, "src/b.rs");
+        assert_eq!(a.files[0].edits.len(), 2);
+        assert_eq!(a.files[1].path, "src/a.rs");
+        assert_eq!(a.files[1].edits.len(), 1);
+        // Per-block anchors survive into the execution form.
+        assert_eq!(a.files[0].edits[0].start_line, Some(EditStartLine(4)));
+        assert_eq!(a.files[0].edits[1].start_line, Some(EditStartLine(20)));
+    }
+
+    #[test]
+    fn a_multi_file_call_needs_no_path_argument() {
+        // `path` is not required and not consulted; the headers answer it.
+        let a = EditArgs::from_wire(&json!({
+            "blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
+                        b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END"
+        }))
+        .unwrap();
+        assert_eq!(a.files.len(), 2);
+    }
+
+    #[test]
+    fn a_single_file_blob_is_still_one_entry_via_merge_path() {
+        // Single-file keeps `merge_path`, which still defaults: the `path`
+        // argument with no headers at all is still accepted.
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/x.rs",
+            "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+        }))
+        .unwrap();
+        assert_eq!(a.files.len(), 1);
+        assert_eq!(a.files[0].path, "src/x.rs");
+    }
+
+    #[test]
+    fn a_header_less_block_in_a_multi_file_blob_is_rejected() {
+        // The strict policy reaches the wire. Two *differing* headers make the
+        // blob multi-file, and the third block names no file — the exact blob
+        // `group_by_file` would have split into two batches.
+        let e = EditArgs::from_wire(&json!({
+            "blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
+                        b.rs\n@@@OLD\nw\n@@@NEW\nW\n@@@END\n\n\
+                        @@@OLD\ny\n@@@NEW\nY\n@@@END"
+        }))
+        .unwrap_err();
+        assert!(e.contains("names no file"), "{e}");
+        assert!(e.contains("block 3"), "{e}");
+    }
+
+    #[test]
+    fn a_header_less_block_in_a_single_file_blob_still_defaults() {
+        // Not multi-file, so `merge_path` owns it and infers from the one
+        // header. W1's no-defaulting rule must not leak into the single-file
+        // path, where there is only one candidate and a default is safe.
+        let a = EditArgs::from_wire(&json!({
+            "blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
+                        @@@OLD\ny\n@@@NEW\nY\n@@@END"
+        }))
+        .unwrap();
+        assert_eq!(a.files.len(), 1);
+        assert_eq!(a.files[0].path, "a.rs");
+        assert_eq!(a.files[0].edits.len(), 2);
+    }
+
+    #[test]
+    fn a_path_argument_does_not_re_target_a_multi_file_blob() {
+        // Block paths are authoritative: a redundant `path` naming a third
+        // file is ignored rather than reconciled, and cannot add or move one.
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/other.rs",
+            "blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
+                        b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END"
+        }))
+        .unwrap();
+        assert_eq!(a.files.len(), 2);
+        assert_eq!(a.files[0].path, "a.rs");
+        assert_eq!(a.files[1].path, "b.rs");
     }
 }

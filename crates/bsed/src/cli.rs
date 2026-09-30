@@ -533,7 +533,7 @@ fn apply(args: &[String]) -> Result<String, Failure> {
     // two hundred should not block the other hundred and ninety-nine.
     for batch in &batches {
         let path = &batch.path;
-        let edits: Vec<EditOp> = to_ops(batch.edits.clone());
+        let edits: Vec<EditOp> = blockedit::to_ops(&batch.edits);
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
@@ -626,7 +626,7 @@ fn apply(args: &[String]) -> Result<String, Failure> {
         let path = &batches[0].path;
         let text = std::fs::read_to_string(path)
             .map_err(|e| Failure::Internal(format!("{}: {e}", path)))?;
-        let edits: Vec<EditOp> = to_ops(batches[0].edits.clone());
+        let edits: Vec<EditOp> = blockedit::to_ops(&batches[0].edits);
         if let ApplyOutcome::Applied { text, .. } = blockedit::apply_to_text(&text, &edits) {
             return Ok(text);
         }
@@ -677,17 +677,6 @@ fn prose(line: &str) -> String {
     out.push('\n');
     out
 }
-fn to_ops(edits: Vec<blockedit::ParsedEdit>) -> Vec<EditOp> {
-    edits
-        .into_iter()
-        .map(|e| EditOp {
-            old_text: e.old_text,
-            new_text: e.new_text,
-            start_line: e.start_line.map(blockedit::EditStartLine),
-        })
-        .collect()
-}
-
 fn need<'a>(v: Option<&'a String>, flag: &str) -> Result<&'a str, Failure> {
     v.map(String::as_str)
         .ok_or_else(|| Failure::Usage(format!("{flag} needs a value")))
