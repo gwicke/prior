@@ -320,29 +320,20 @@ impl EditArgs {
         if let Some(text) = blob::blob_text(raw) {
             let parsed = blob::parse_blocks(text)
                 .map_err(|e| Self::invalid(raw, &format!("Invalid block: {e}")))?;
-            // A single-file blob keeps `merge_path`, which defaults freely:
-            // there is one candidate, so a default cannot be wrong. A blob that
-            // spans files goes through the strict policy instead — every block
-            // names its own file, and `json_path` is not consulted at all.
-            if parsed.multi_file {
-                let files = blob::split_by_file(parsed).map_err(|e| Self::invalid(raw, &e))?;
-                return Ok(EditArgs {
-                    files: files
-                        .into_iter()
-                        .map(|b| FileEdit {
-                            path: b.path,
-                            edits: blob::to_ops(&b.edits),
-                        })
-                        .collect(),
-                });
-            }
-            let (path, blocks) =
-                blob::merge_path(json_path, parsed).map_err(|e| Self::invalid(raw, &e))?;
+            // One policy for every block blob, single-file or multi-file: every
+            // block names its own file, and `json_path` is not consulted at all
+            // (block paths are authoritative; `path` is the single-edit form's
+            // argument). Consistency here is free — a block already carries its
+            // `path:LINE` — and it removes a rule the model has to learn twice.
+            let files = blob::split_by_file(parsed).map_err(|e| Self::invalid(raw, &e))?;
             return Ok(EditArgs {
-                files: vec![FileEdit {
-                    path,
-                    edits: blob::to_ops(&blocks),
-                }],
+                files: files
+                    .into_iter()
+                    .map(|b| FileEdit {
+                        path: b.path,
+                        edits: blob::to_ops(&b.edits),
+                    })
+                    .collect(),
             });
         }
 
@@ -515,7 +506,7 @@ mod tests {
     fn path_argument_anchor_is_peeled_in_block_form_too() {
         let a = EditArgs::from_wire(&json!({
             "path": "src/x.rs:12",
-            "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+            "blocks": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
         assert_eq!(a.files[0].path, "src/x.rs");
@@ -528,7 +519,7 @@ mod tests {
     #[test]
     fn a_legacy_edits_string_is_still_accepted() {
         let a = EditArgs::from_wire(&json!({
-            "path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+            "edits": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
         assert_eq!(a.files[0].path, "src/x.rs");
@@ -543,18 +534,16 @@ mod tests {
     #[test]
     fn blocks_wins_over_a_legacy_edits_string() {
         let a = EditArgs::from_wire(&json!({
-            "path": "src/x.rs",
-            "blocks": "@@@OLD\nfrom-blocks\n@@@NEW\nB\n@@@END",
-            "edits":  "@@@OLD\nfrom-edits\n@@@NEW\nE\n@@@END"
+            "blocks": "p\n@@@OLD\nfrom-blocks\n@@@NEW\nB\n@@@END",
+            "edits":  "p\n@@@OLD\nfrom-edits\n@@@NEW\nE\n@@@END"
         }))
         .unwrap();
         assert_eq!(a.files[0].edits[0].old_text, "from-blocks");
 
         // ...and a malformed `blocks` is an error, not a fallback.
         let e = EditArgs::from_wire(&json!({
-            "path": "src/x.rs",
-            "blocks": "@@@OLD\nno end",
-            "edits":  "@@@OLD\nfrom-edits\n@@@NEW\nE\n@@@END"
+            "blocks": "p\n@@@OLD\nno end",
+            "edits":  "p\n@@@OLD\nfrom-edits\n@@@NEW\nE\n@@@END"
         }))
         .unwrap_err();
         assert!(e.starts_with("Invalid block:"), "{e}");
@@ -582,7 +571,7 @@ mod tests {
         // and is not a blob. Neither reading may be reached through the other's
         // field, or the rename has bought nothing.
         let a = EditArgs::from_wire(&json!({
-            "path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+            "blocks": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
         assert_eq!(a.files[0].path, "src/x.rs");
@@ -661,7 +650,7 @@ mod tests {
         // Retired, but still working: `blocks` is what we ask for, not what we
         // require.
         let a = EditArgs::from_wire(&json!({
-            "path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+            "edits": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .expect("a pre-rename blob must still be accepted");
         assert_eq!(a.files[0].edits.len(), 1);
@@ -682,7 +671,7 @@ mod tests {
 
         // (4) the current name.
         let a = EditArgs::from_wire(&json!({
-            "path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+            "blocks": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
         assert_eq!(a.files[0].edits.len(), 1);
@@ -772,16 +761,29 @@ mod tests {
     }
 
     #[test]
-    fn a_single_file_blob_is_still_one_entry_via_merge_path() {
-        // Single-file keeps `merge_path`, which still defaults: the `path`
-        // argument with no headers at all is still accepted.
+    fn a_single_file_blob_is_one_entry() {
+        // Strictness is uniform: a single-file blob takes the same path through
+        // `split_by_file` as a multi-file one, and yields one entry.
         let a = EditArgs::from_wire(&json!({
-            "path": "src/x.rs",
-            "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+            "blocks": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
         assert_eq!(a.files.len(), 1);
         assert_eq!(a.files[0].path, "src/x.rs");
+    }
+
+    #[test]
+    fn a_single_file_blob_without_a_header_is_rejected() {
+        // The old lax rule: a `path` argument with a header-less blob. Now that
+        // every block must name its own file, `path` cannot supply one — the
+        // model is told which block is at fault instead.
+        let e = EditArgs::from_wire(&json!({
+            "path": "src/x.rs",
+            "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+        }))
+        .unwrap_err();
+        assert!(e.contains("names no file"), "{e}");
+        assert!(e.contains("block 1"), "{e}");
     }
 
     #[test]
@@ -800,18 +802,17 @@ mod tests {
     }
 
     #[test]
-    fn a_header_less_block_in_a_single_file_blob_still_defaults() {
-        // Not multi-file, so `merge_path` owns it and infers from the one
-        // header. W1's no-defaulting rule must not leak into the single-file
-        // path, where there is only one candidate and a default is safe.
-        let a = EditArgs::from_wire(&json!({
+    fn a_partly_headered_blob_is_rejected_whichever_file_count_it_has() {
+        // One header, one header-less block: single-file by header count, and
+        // now rejected all the same. Strictness does not depend on how many
+        // distinct files the blob happens to name.
+        let e = EditArgs::from_wire(&json!({
             "blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
                         @@@OLD\ny\n@@@NEW\nY\n@@@END"
         }))
-        .unwrap();
-        assert_eq!(a.files.len(), 1);
-        assert_eq!(a.files[0].path, "a.rs");
-        assert_eq!(a.files[0].edits.len(), 2);
+        .unwrap_err();
+        assert!(e.contains("names no file"), "{e}");
+        assert!(e.contains("block 2"), "{e}");
     }
 
     #[test]

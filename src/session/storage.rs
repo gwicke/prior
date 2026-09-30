@@ -496,7 +496,7 @@ mod tests {
         // Block string -> canonical array.
         let mut v = serde_json::json!({
             "path": "src/x.rs",
-            "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+            "blocks": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
         });
         normalize_args_in_place("edit", &mut v);
         assert_eq!(

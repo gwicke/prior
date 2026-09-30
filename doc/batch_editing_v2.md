@@ -153,21 +153,24 @@ data integrity:
   paths. This is the data-integrity guard: never silently write file A when the
   text names file B.
 - **`path` present, no header** → OK (use `path`).
-- **`path` absent, headers present and all identical** → **infer** `path` from
-  the headers (ergonomic win; removes a required arg for Aider-style calls).
-- **`path` absent, headers absent** → error ("no path").
-- **`path` absent, headers differ** → error: *"multi-file edits are not
-  supported in this form; make one `edit` call per file."* (Bridges to Phase 2.)
-- **`path` present, *some* blocks have a header and some do not** → each header
-  is checked against `path` like any other; a differing one is the conflict
-  error. This is the case a naive multi-file split silently gets wrong — see
-  Phase 2.
+- **`path` absent, headers present and all identical** → **infer** the file from
+  the headers. (Aider-style calls need no `path` argument at all.)
+- **`path` absent, headers absent** → error: block 1 names no file.
+- **`path` present, headers absent** → **error too** (this used to be the
+  ergonomic "supply the path once" case). `path` is the OpenAI form's
+  argument; the block form takes its file from each header. See *Decisions*.
+- **`path` present, headers present and differing from it** → the headers win;
+  `path` is ignored. A redundant argument is not a second source of truth, so
+  it cannot re-target the call and is not reconciled against N headers.
+- **`path` present, *some* blocks have a header and some do not** → error
+  naming the block that names no file. This is the case a naive multi-file
+  split silently gets wrong — see Phase 2.
 
-Why not "reject paths entirely": models trained on Aider will emit them, and
-failing every such call is hostile — it defeats the purpose of borrowing a
-familiar format. Why not "silently ignore conflicting paths": it is a
-silent wrong-file write. **Lenient-accept + strict-on-conflict** captures the
-familiarity win with no integrity hazard.
+Why not "reject paths entirely": models trained on Aider will emit per-block
+filenames, and failing every such call is hostile — it defeats the purpose of
+borrowing a familiar format. The block form therefore *accepts* headers
+everywhere, and the `path` argument it tolerates is ignored rather than
+reconciled, so tolerance can never become a silent wrong-file write.
 
 ### Path handling (multi-file, Phase 2) — every block names its own file
 
@@ -649,8 +652,11 @@ The original plan does not survive contact with the code. Five findings:
    first-seen order, with a tested consumer (`bsed apply -i`). "Parser allows a
    header per block; blocks may repeat or omit a path" is implemented — and its
    answer to the open question below is already coded.
-3. **`group_by_file` is not a drop-in for `merge_path`; the difference is a
-   wrong-file-write hazard.** `merge_path` is strict-on-conflict;
+3. **`group_by_file` is not a drop-in; the difference is a
+   wrong-file-write hazard.** (Written when the block path went through
+   `merge_path`, which is strict-on-conflict. `merge_path` has since been
+   removed from the block path entirely — `split_by_file` serves every blob —
+   so the hazard below stands on its own:) `merge_path` is strict-on-conflict;
    `group_by_file` is header-authoritative — a header wins and `path` only fills
    gaps. So a blob whose first block says `a.rs`, whose second block has no
    header, sent with `path: "b.rs"` is **today a loud `path mismatch` error**, but
@@ -715,7 +721,7 @@ separate evidence:
 
 | | Today | Change |
 | --- | --- | --- |
-| **execution** | `merge_path` rejects; the model retries, or had already emitted parallel per-file calls (rig dispatches those; costs nothing) | accept the blob, split per file in `EditFile::call` |
+| **execution** | a multi-file blob is rejected; the model retries, or had already emitted parallel per-file calls (rig dispatches those; costs nothing) | accept the blob, split per file in `EditFile::call` |
 | **storage** | one raw multi-file call; pi cannot read the file | split at persist into N canonical single-path calls |
 
 Either can ship alone, and each is small. The storage axis presupposes the
@@ -835,7 +841,7 @@ Everything new lives in `blockedit` (pure, testable, shared with `bsed`); the
 /// Split a parsed blob into per-file batches under the *multi-file* path
 /// policy: **every** block must carry its own header — there is no
 /// defaulting, and no `path` argument is consulted at all. A single-file blob
-/// is not this function's business; it still goes through `merge_path`.
+/// is not a special case: this one policy serves every block blob.
 pub fn split_by_file(parsed: ParsedBlocks) -> Result<Vec<FileBatch>, String>;
 
 /// `{"path": p, "edits": [{oldText, newText}, …]}` for one file — the exact
@@ -1175,9 +1181,15 @@ because it is the piece that could silently re-target a file if it were wrong.
 - **Path normalization** for the conflict check: reuse
   `path_util::resolve_normalized` (resolve both sides against cwd, then
   compare).
-- **Multi-file paths**: every block names its own file; **no defaulting** to
-  `path` or to the previous block. A single-file blob still defaults freely,
-  because there is only one candidate and a default cannot be wrong.
+- **Every block names its own file, in every blob.** Not only multi-file ones.
+  There is no defaulting to the `path` argument and no reuse-last, and there is
+  no longer a "single file is safe to default" exemption: one rule, one shape,
+  and a model that has learned it never has to ask which case it is in. The
+  exemption was dropped because it bought nothing — a block already carries its
+  `path:LINE` — while costing a rule to state, a rule to test, and a second
+  code path (`merge_path`) whose only remaining job was the lax case. With it
+  gone, the `path` argument is read for exactly one shape: the OpenAI
+  single-edit form, which has no per-edit file of its own.
 - **`path` in the block form**: MUST NOT be supplied when the blob spans files,
   and SHOULD NOT be supplied for block editing at all — **block paths are
   authoritative**, so `split_by_file` never reads the argument. `path` is the
@@ -1187,9 +1199,11 @@ because it is the piece that could silently re-target a file if it were wrong.
   redundant argument reconciled against N headers is a second source of truth
   that can only ever conflict. There is no defaulting *and* no reconciliation,
   so nothing in this path can be silently re-targeted.
-- **Line numbers**: strongly encouraged on every block (`path:LINE`). They are
-  the matching aid for repeated text, and free to supply when the model has just
-  read or grepped the file.
+- **Line numbers**: *encouraged*, not required. A block needs its file path;
+  the `:LINE` suffix is a matching aid for repeated text and is free to supply
+  when the model has just read or grepped the file. Consistency across blocks
+  costs nothing either way, which is why the strict rule below does not depend
+  on a line number being present.
 - **Blob rendering**: the path appears once, as a header line above the first
   block, with no `:LINE` suffix. For a single-file blob the text path may be
   omitted entirely (the `path` argument then supplies it); for a **multi-file**
@@ -1214,11 +1228,13 @@ because it is the piece that could silently re-target a file if it were wrong.
   `MAX_FILES_PER_CALL = 32`; grouping is keyed on the normalized path while
   `FileBatch.path` keeps the first spelling. `group_by_file` is untouched apart
   from the block-index fix, and `bsed` is unaffected.
-- **Every block names its own file.** No defaulting to the `path` argument and
-  no reuse-last. `split_by_file` takes no `path` at all, so there is no code
-  path by which a redundant argument could re-target a file. The
-  agreement-with-every-header rule from the original plan is **struck**: block
-  paths are authoritative and `path` is not reconciled against them.
+- **Every block names its own file — in every blob, not just multi-file.**
+  No defaulting to the `path` argument and no reuse-last. `split_by_file` takes
+  no `path` at all, so there is no code path by which a redundant argument
+  could re-target a file. The agreement-with-every-header rule from the
+  original plan is **struck**: block paths are authoritative and `path` is not
+  reconciled against them. The old single-file exemption is **also gone** —
+  one rule rather than two (see *Decisions*).
 - **The missing-file error names the block, quotes back what was written, and
   never offers `path`.** A bare "names no file" would tell the model to add a
   line it may already have added, so `ParsedEdit.rejected_header` carries the
@@ -1610,6 +1626,10 @@ corruption is now a loud `overlapping`/`all-claimed` failure).
       **W3–W4**: the aggregated `MultiFileOutcome` envelope, and
       resolve-all-then-write-what-resolved so one round trip reports every
       file's problem. Reverted by one guard in `from_wire`.
+      **Extended past the original W2 scope**: strictness is now uniform rather
+      than multi-file-only, which also removed `merge_path` from the block path
+      entirely and forced `render_blob` to head every block. Both were
+      consequences, not extra features — see *Decisions*.
    2. **W7–W8 (storage + model-facing)** — one split transform at *both*
       egresses that see the call: `append_message` (N canonical single-path
       calls on disk, so pi can read the file, which also repairs compaction's

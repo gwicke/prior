@@ -3192,7 +3192,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("dup.txt", "hello world\n").await.unwrap();
         let blob =
-            "dup.txt\n@@@OLD\nhello\n@@@NEW\nbye\n@@@END\n\n@@@OLD\nhello\n@@@NEW\nhi\n@@@END";
+            "dup.txt\n@@@OLD\nhello\n@@@NEW\nbye\n@@@END\n\ndup.txt\n@@@OLD\nhello\n@@@NEW\nhi\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "dup.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(looks_like_edit_failure(&out), "must fail, got: {out}");
@@ -3238,7 +3238,7 @@ mod edit_args_wire_tests {
             .await
             .unwrap();
         let blob =
-            "chain.txt\n@@@OLD\nfoo bar\n@@@NEW\nAAA\n@@@END\n\n@@@OLD\nbar\n@@@NEW\nBBB\n@@@END";
+            "chain.txt\n@@@OLD\nfoo bar\n@@@NEW\nAAA\n@@@END\n\nchain.txt\n@@@OLD\nbar\n@@@NEW\nBBB\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "chain.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(out.starts_with("Replaced"), "expected success, got: {out}");
@@ -3281,7 +3281,7 @@ mod edit_args_wire_tests {
             .await
             .unwrap();
         let blob =
-            "noclaim.txt:3\n@@@OLD\ndup\n@@@NEW\nX\n@@@END\n\n@@@OLD\ndup\n@@@NEW\nY\n@@@END";
+            "noclaim.txt:3\n@@@OLD\ndup\n@@@NEW\nX\n@@@END\n\nnoclaim.txt\n@@@OLD\ndup\n@@@NEW\nY\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "noclaim.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(looks_like_edit_failure(&out), "batch must fail, got: {out}");
@@ -3439,7 +3439,8 @@ mod edit_args_wire_tests {
     async fn block_form_applies_all_edits() {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("blob.txt", "a\nb\nc\n").await.unwrap();
-        let blob = "blob.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n@@@OLD\nc\n@@@NEW\nC\n@@@END";
+        let blob =
+            "blob.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\nblob.txt\n@@@OLD\nc\n@@@NEW\nC\n@@@END";
         let result = execute_edit(serde_json::json!({
             "path": "blob.txt",
             "blocks": blob
@@ -3481,8 +3482,8 @@ mod edit_args_wire_tests {
         let blob = "p1.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n\
                     p2.txt\n@@@OLD\nnope\n@@@NEW\nN\n@@@END\n\n\
                     p3.txt\n@@@OLD\nc\n@@@NEW\nC\n@@@END";
-        let result = execute_edit(serde_json::json!({ "blocks": blob })).await;
-        // The call reports the failure, but the other two files are written.
+        let _ = execute_edit(serde_json::json!({ "blocks": blob })).await;
+        // The other two files are written despite p2 failing.
         assert_eq!(tokio::fs::read_to_string("p1.txt").await.unwrap(), "A\n");
         assert_eq!(tokio::fs::read_to_string("p3.txt").await.unwrap(), "C\n");
         assert_eq!(
@@ -3506,14 +3507,26 @@ mod edit_args_wire_tests {
 
     #[tokio::test]
     #[serial]
-    async fn block_form_conflicting_path_errors() {
+    async fn a_redundant_path_argument_never_overrides_a_block_header() {
+        // Block paths are authoritative, and `path` is not consulted for the
+        // block form. The header names b.txt, so b.txt is edited — a.txt, which
+        // the redundant argument named, is not touched at all.
         let _cwd = super::edit_file_tests::CwdGuard::new();
-        tokio::fs::write("a.txt", "x\n").await.unwrap();
+        tokio::fs::write("a.txt", "untouched\n").await.unwrap();
+        tokio::fs::write("b.txt", "x\n").await.unwrap();
         let blob = "b.txt\n@@@OLD\nx\n@@@NEW\ny\n@@@END";
         let result = execute_edit(serde_json::json!({ "path": "a.txt", "blocks": blob })).await;
-        assert!(result.is_error(), "conflicting path must fail: {result:?}");
-        let msg = result.output().render();
-        assert!(msg.contains("path mismatch"), "got: {msg}");
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        assert_eq!(
+            tokio::fs::read_to_string("b.txt").await.unwrap(),
+            "y\n",
+            "the header names the file that is edited"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string("a.txt").await.unwrap(),
+            "untouched\n",
+            "the `path` argument must not re-target the call"
+        );
     }
 
     #[test]
