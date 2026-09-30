@@ -697,6 +697,79 @@ fn plan_append(cache: &mut DrawCache, frame: &Frame, anchor: usize, th: usize) -
     s
 }
 
+/// Reposition apply (§4.5 P1): the frame's top row has moved **down**, because
+/// content was written over the rows it used to occupy, and those rows now hold
+/// content that must not be erased.
+///
+/// This is `plan_full` with the retire step removed, and that removal is the
+/// whole point. Neither existing path fits: `plan_partial` requires an unmoved
+/// frame, and `plan_full` erases the old region — which here would erase the
+/// content that has just landed there. So the frame is walked to where the
+/// content left off and painted there, and nothing above is touched.
+///
+/// The contract is deliberately narrow: **the same frame, at a new top**. A
+/// frame that *changed* (grew a row, lost one) still goes through `plan_apply`,
+/// because only that path can retire the rows a shrunken frame orphaned. P1's
+/// caller re-emits the frame it already holds, so the height is fixed by
+/// construction and the narrowness costs nothing.
+///
+/// No `CUP`: the anchor is the cache's own caret, which is where the content
+/// write left the cursor.
+// Test-only for now: the production caller is the rest of P1, which points
+// `with_content_writer` at it instead of `plan_clear_live_frame`. A targeted
+// allow, per the convention for test-only users (no blanket `allow(dead_code)`
+// in this module) — and it goes away with that commit.
+#[allow(dead_code)]
+pub(crate) fn plan_reposition(
+    cache: &mut DrawCache,
+    frame: &Frame,
+    tw: usize,
+    th: usize,
+) -> String {
+    let h = frame.height();
+    debug_assert!(h > 0, "reposition needs rows to paint");
+    let anchor = cache.caret.0.clamp(1, th);
+    let delta = (anchor + h).saturating_sub(1).saturating_sub(th);
+    let top = anchor.saturating_sub(delta).max(1);
+    let mut s = String::new();
+    // Make room and land on the block's last row. `h-1` bare LFs do both: an LF
+    // at the bottom row scrolls, anywhere else it moves down one. So exactly
+    // `delta` of them reach scrollback and the block fits even when the tracked
+    // row was wrong — the terminal decides, as in `plan_full`.
+    for _ in 0..h.saturating_sub(1) {
+        s.push('\n');
+    }
+    // **No clear of the rows below the block**, and the omission is load-bearing
+    // enough to spell out. It is safe because those rows are provably clean:
+    //
+    // - With no scroll (`delta == 0`) they are the rows below the *old* frame,
+    //   which P4 had already cleared, and the content write stopped at the old
+    //   frame's top so it never reached them.
+    // - With a scroll, the bottom `delta` rows the scroll reveals are blank by
+    //   definition, and everything above them was the clean region from before.
+    //
+    // So the invariant P4 protects still holds without spending `below` erase
+    // codes per chunk — which matters most exactly when the area is mid-screen
+    // with free space beneath it, the case where `below` is largest.
+    for i in (0..h).rev() {
+        if i + 1 < h {
+            cuu(&mut s, 1);
+        }
+        s.push('\r');
+        s.push_str(frame.row(i));
+    }
+    let caret = push_caret(&mut s, frame, top, th);
+    cache.live = Some(LiveFrame {
+        frame_top_row: top,
+        term_w: tw,
+        term_h: th,
+        frame: frame.clone(),
+    });
+    cache.screen_bottom = th;
+    cache.caret = caret;
+    s
+}
+
 /// Emit the caret move from the block's *first* row and return the absolute
 /// `(row, col)` to store. The row is bookkeeping only — it is what row
 /// accounting compares against a terminal, and it is never addressed.
@@ -1477,6 +1550,135 @@ mod apply_tests {
         // live cleared → next frame anchors at the cursor (top + height = 7).
         assert_eq!(cache.anchor(), 7);
         assert_eq!(p.screen().cursor_position(), (6, 0));
+    }
+
+    /// §4.5 P1: content displaces the frame, and the frame comes back **below**
+    /// the content with the content intact.
+    ///
+    /// The whole case in one test, because the interesting failure is a compound
+    /// one: a reposition that erases the content it just made room for looks
+    /// correct on the frame's own rows and destroys the transcript.
+    ///
+    /// Note the `cursor_to` calls. A frame apply anchors on the *cache's* row
+    /// while the emulator is wherever the test put it, and a mismatch shows up
+    /// as a frame painted in the wrong place for reasons that have nothing to do
+    /// with the code under test — which is how the first draft of this test came
+    /// to assert a frame at row 0 and call it row 5.
+    #[test]
+    fn reposition_moves_the_frame_below_the_content_without_erasing_it() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["bar", "> "], 20);
+        cursor_to(&mut cache, 5, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(
+            rows[4], "bar",
+            "the frame starts below the content: {rows:?}"
+        );
+        assert_eq!(rows[5], ">");
+
+        // Three content rows are written where the frame used to be. In
+        // production this is `with_content_writer`: the bytes go out and
+        // `note_lines` moves the caret, so the rows the frame occupied now hold
+        // content and the frame is gone from the screen.
+        feed(&mut p, "one\r\ntwo\r\nthree\r\n");
+        cache.caret = (cache.caret.0 + 3, 0);
+        cache.live = None; // the content write retired it, as today
+        assert_eq!(
+            p.screen().cursor_position(),
+            (8, 0),
+            "the content advanced it"
+        );
+
+        // The frame comes back, at the new fold — with the content above it.
+        let s = plan_reposition(&mut cache, &f, 20, 24);
+        feed(&mut p, &s);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(
+            rows[5], "one",
+            "the content the frame vacated survives: {rows:?}"
+        );
+        assert_eq!(rows[6], "two");
+        assert_eq!(rows[7], "three");
+        assert_eq!(rows[8], "bar", "the frame is below the content: {rows:?}");
+        assert_eq!(rows[9], ">");
+        assert_eq!(cache.live.as_ref().unwrap().frame_top_row, 9);
+    }
+
+    /// …and it is relative. A `CUP` here would be the one absolute address in
+    /// the steady state, and §4.5's I4 is the invariant it would break.
+    #[test]
+    fn reposition_addresses_no_row() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["bar", "> "], 20);
+        cursor_to(&mut cache, 5, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s);
+        cache.caret = (cache.caret.0 + 3, 0);
+        cache.live = None;
+        let s = plan_reposition(&mut cache, &f, 20, 24);
+        assert!(
+            cups(&s).is_empty(),
+            "a reposition must not address a row: {s:?}"
+        );
+    }
+
+    /// The frame has to fit: when the content has pushed it past the bottom
+    /// row, the same LFs scroll and the frame lands flush at the bottom.
+    #[test]
+    fn reposition_scrolls_so_the_frame_fits_at_the_bottom() {
+        let mut cache = DrawCache::new(10);
+        let f = lines_frame(&["bar", "> "], 20);
+        cursor_to(&mut cache, 8, 10);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
+        let mut p = at(10, 20, 7);
+        feed(&mut p, &s);
+        // One more content row puts the cursor on the bottom row.
+        feed(&mut p, "x\r\n");
+        cache.caret = (10, 0);
+        cache.live = None;
+        let s = plan_reposition(&mut cache, &f, 20, 10);
+        feed(&mut p, &s);
+        let rows = screen(&p, 10, 20);
+        assert_eq!(rows[8], "bar", "the frame fits at the bottom: {rows:?}");
+        assert_eq!(rows[9], ">");
+        assert_eq!(cache.live.as_ref().unwrap().frame_top_row, 9);
+    }
+
+    /// The rows below a repositioned frame are clean **without** being cleared,
+    /// which is the omission P1's `plan_reposition` documents. This is the test
+    /// that holds that claim up — `no EL emitted` for the erase, and the screen
+    /// row that would have held a leftover to confirm it.
+    #[test]
+    fn the_rows_below_a_repositioned_frame_are_clean_without_being_cleared() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["bar", "> "], 20);
+        cursor_to(&mut cache, 5, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s);
+        feed(&mut p, "one\r\ntwo\r\nthree\r\n");
+        cache.caret = (cache.caret.0 + 3, 0);
+        cache.live = None;
+        let s = plan_reposition(&mut cache, &f, 20, 24);
+        // Not `!s.contains(EL)`: a `Lines` row carries its own trailing `EL` to
+        // pad to the terminal width, so that check could never be about the
+        // clear. A clear-below is a *walk* — `CUD` down past the block and `CUU`
+        // back — so one `CUD`, the caret move, is the whole budget.
+        assert_eq!(
+            s.matches("\x1b[1B").count(),
+            1,
+            "only the caret moves down; no clear-below walk: {s:?}"
+        );
+        feed(&mut p, &s);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(
+            rows[10], "",
+            "and the row below the new frame is blank: {rows:?}"
+        );
     }
 
     #[test]
