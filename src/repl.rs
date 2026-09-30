@@ -1230,18 +1230,12 @@ impl Repl {
         // is where the frame says it is. And it is redrawn per keystroke by the
         // same partial row-diff, so the figures are never stale.
         if let Some(bar) = status {
-            elements.push(Element::Lines(vec![bar.to_string()]));
+            elements.push(Element::lines(vec![bar.to_string()]));
         }
-        elements.push(Element::Input {
-            layout,
-            prompt: prompt.to_string(),
-        });
+        elements.push(Element::input(layout, prompt.to_string()));
         if !overlay.is_empty() {
-            elements.push(Element::Divider);
-            elements.push(Element::Overlay {
-                rows: overlay.to_vec(),
-                focus,
-            });
+            elements.push(Element::divider());
+            elements.push(Element::overlay(overlay.to_vec(), focus));
         }
         elements
     }

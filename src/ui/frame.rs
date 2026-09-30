@@ -23,8 +23,11 @@ use std::ops::Range;
 
 use crate::slashdot_menu::table::display_width;
 
-/// Rows of context preferred above the caret when an [`Element::Input`]
-/// window must clip its wrapped height (plan §3.4).
+/// Rows of context preferred above the caret when an [`Element::input`] window
+/// must clip its wrapped height (plan §3.4).
+///
+/// This is the *editor's* opinion, not the frame layer's — which is why the plan
+/// wants `InputItem` moved out to `repl.rs` and this constant with it (§3.2.2).
 const INPUT_CONTEXT_ROWS: usize = 3;
 
 /// Live-region budget for a terminal of `term_h` rows: the frame may occupy
@@ -45,52 +48,236 @@ pub(crate) struct Extent {
 }
 
 /// One drawable piece of a frame (plan §3.2).
-pub enum Element {
-    /// Prompt + editor content. `layout` is the editor's visual layout
-    /// (prompt rendered on row 0); the caret lives at `layout.cursor_row` /
-    /// `layout.cursor_col` — derived, not stored (plan's `caret` field).
-    Input {
-        layout: crate::repl::Layout,
-        prompt: String,
-    },
-    /// Dim horizontal rule spanning the full terminal width.
-    Divider,
-    /// Pre-painted overlay rows (from `paint_overlay`), windowed around the
-    /// selection `focus`. Rows must be single-line and are padded to
-    /// `term_w` at render time.
-    Overlay { rows: Vec<String>, focus: usize },
-    /// Fixed text rows (commit lines, future status line). Never flexed;
-    /// truncated from the top when the budget cannot hold them all.
-    // Not constructed outside tests yet: commit lines currently go through
-    // `display_plain` (P4), and the §4.5 fixed-bottom/status-line
-    // composition is this variant's first production user.
-    #[allow(dead_code)]
-    Lines(Vec<String>),
+///
+/// The *sizing declaration* is data: `must` and `might` sit here so
+/// [`allocate`] can read every element's floor and want before any of them is
+/// rendered — which is what §3.1's two passes require. Only the rendering is
+/// polymorphic, and that is the whole point of the shape:
+///
+/// - `render` cannot accumulate a `match` over element kinds, which is how
+///   squeeze knowledge leaked into this module in the first place (§3.2.2 —
+///   `INPUT_CONTEXT_ROWS` is the editor's opinion, `h / 2` is the menu's);
+/// - each element holds whatever *it* needs to hold — an `Rc` of its rows, a
+///   `Layout`, anything — and the frame layer neither knows nor copies it.
+pub struct Element {
+    /// Floor: rows the element keeps before anything else is served.
+    pub must: usize,
+    /// Want: rows the element takes when space allows.
+    pub might: usize,
+    /// The element's own squeeze policy, told what it got.
+    ///
+    /// `Box` rather than `Rc`: an element is owned by exactly one composition
+    /// and is only ever moved between them, so the shared ownership would buy
+    /// nothing. `Send + Sync` is not optional — `Output: Send + Sync` and
+    /// `draw: Mutex<DrawCache>` put the composition behind both.
+    render: Box<dyn RenderAt + Send + Sync>,
+}
+
+/// Height in, rows out (plan §3.2.3).
+///
+/// `term_w` is a *parameter*, not a dependency, so §3.1's "no terminal
+/// dependency" holds: an impl can be unit-tested at any width with no terminal
+/// anywhere in sight.
+pub trait RenderAt {
+    /// Produce the rows for an allocation of exactly `h` screen rows of
+    /// `term_w`, and this element's caret if it has one.
+    ///
+    /// Must not return more than `h` rows. The frame builds its row ranges
+    /// from what comes back, so an over-tall impl desynchronises `spans`, the
+    /// caret and the allocator's own arithmetic — and unlike the old `match`,
+    /// nothing downstream can clamp it, because nothing downstream knows what
+    /// the rows mean.
+    fn render_at(&self, h: usize, term_w: usize) -> Rendered;
+}
+
+/// What an element painted, and where its caret was.
+#[derive(Default)]
+pub struct Rendered {
+    /// Full screen rows, **already finished**: padded, `EL`-extended, styled.
+    /// The frame concatenates them and does no formatting of its own, so each
+    /// element decides whether it wants a background, a trailing `EL`, or
+    /// neither.
+    pub rows: Vec<String>,
+    /// `(row, display_col)`, **element-relative**. `render` offsets it by the
+    /// element's first row, so an impl never has to know where it landed.
+    pub caret: Option<(usize, usize)>,
 }
 
 impl Element {
+    /// An element with an explicit `(must, might)` and an impl of its own
+    /// rendering. Every constructor below is one line of it, so a new kind is a
+    /// `RenderAt` impl plus a constructor here — no `match` anywhere.
+    pub(crate) fn new(
+        must: usize,
+        might: usize,
+        render: impl RenderAt + Send + Sync + 'static,
+    ) -> Self {
+        Element {
+            must,
+            might,
+            render: Box::new(render),
+        }
+    }
+
+    /// Prompt + editor content. `layout` is the editor's visual layout (prompt
+    /// rendered on row 0); the caret lives at `layout.cursor_row` /
+    /// `layout.cursor_col` — derived, not stored.
+    ///
+    /// `must` is the caret's own row, which is why the input can never be
+    /// squeezed away entirely; wrapping grows `might`.
+    pub(crate) fn input(layout: crate::repl::Layout, prompt: String) -> Self {
+        let might = layout.row_count.max(1);
+        Element::new(1, might, InputItem { layout, prompt })
+    }
+
+    /// Dim horizontal rule spanning the full terminal width. All-or-nothing:
+    /// a one-row rule that does not fit is a rule nobody wanted.
+    pub(crate) fn divider() -> Self {
+        Element::new(1, 1, DividerItem)
+    }
+
+    /// Pre-painted overlay rows (from `paint_overlay`), windowed around the
+    /// selection `focus`. Rows must be single-line and are padded to `term_w`
+    /// at render time.
+    ///
+    /// `must` is 1 only when there is something to show: a composed overlay is
+    /// always meant to be seen, and callers omit the element entirely when
+    /// there is nothing.
+    pub(crate) fn overlay(rows: Vec<String>, focus: usize) -> Self {
+        Element::new(
+            usize::from(!rows.is_empty()),
+            rows.len(),
+            OverlayItem { rows, focus },
+        )
+    }
+
+    /// Fixed text rows (commit lines, future status line). `must == might`, so
+    /// it is fully served by pass 1 and never competes for the surplus — that
+    /// is what `must` is for, and it is why a status row needs no protection
+    /// from whatever else the frame is showing.
+    ///
+    /// Keeps the **first `h` rows** because it has no focus: an element whose
+    /// reader has a current row is `input` (caret) or `overlay` (focus), both of
+    /// which window around it. Focus-bearing content belongs in one of those
+    /// instead — put it here and the cut is arbitrary (plan §3.2.2, which used to
+    /// say "truncated from the top" while the code kept the front).
+    pub(crate) fn lines(rows: Vec<String>) -> Self {
+        let n = rows.len();
+        Element::new(n, n, LinesItem { rows })
+    }
+
     /// The `(must, might)` this element contributes to [`allocate`].
     pub(crate) fn extent(&self) -> Extent {
-        match self {
-            // Input keeps one row always (the caret); wraps grow `might`.
-            Element::Input { layout, .. } => Extent {
-                must: 1,
-                might: layout.row_count.max(1),
-            },
-            // Dividers are all-or-nothing cosmetics.
-            Element::Divider => Extent { must: 1, might: 1 },
-            // A composed overlay is always meant to be seen (callers omit
-            // the element when there is nothing to show).
-            Element::Overlay { rows, .. } => Extent {
-                must: usize::from(!rows.is_empty()),
-                might: rows.len(),
-            },
-            // Fixed content: all rows or (under pressure) fewer.
-            Element::Lines(rows) => Extent {
-                must: rows.len(),
-                might: rows.len(),
-            },
+        Extent {
+            must: self.must,
+            might: self.might,
         }
+    }
+}
+
+// --- the four kinds ---------------------------------------------------------
+//
+// Each owns its squeeze policy — that is the direction ui_draw_v2 §3.2.2 wants:
+// `INPUT_CONTEXT_ROWS` is the editor's opinion and `h / 2` is the menu's, and
+// they move to `repl.rs` and the menu crate respectively when these types do.
+// What they must not do is go back into `render`.
+
+/// Editor content: the prompt on row 0, the wrapped buffer below it.
+struct InputItem {
+    layout: crate::repl::Layout,
+    prompt: String,
+}
+
+impl RenderAt for InputItem {
+    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+        if h == 0 {
+            return Rendered::default();
+        }
+        let layout = &self.layout;
+        let n = layout.row_count.max(1);
+        let start = window(n, layout.cursor_row, h, INPUT_CONTEXT_ROWS);
+        let count = h.min(n.saturating_sub(start));
+        let mut rows = Vec::with_capacity(count);
+        for r in start..start + count {
+            // The prompt renders on row 0; later rows are content-only.
+            let body: &str = if r == 0 { &self.prompt } else { "" };
+            let text = layout.rows.get(r).map(String::as_str).unwrap_or("");
+            let mut content = String::with_capacity(body.len() + text.len() + 3);
+            content.push_str(body);
+            content.push_str(text);
+            // `EL` only while there is something to erase — after a full-width
+            // row the cursor is wrap-pending and `CSI K` would eat the last
+            // written cell.
+            if display_width(&content) < tw {
+                content.push_str(EL);
+            }
+            rows.push(content);
+        }
+        let caret = (layout.cursor_row >= start && layout.cursor_row < start + count)
+            .then_some((layout.cursor_row - start, layout.cursor_col));
+        Rendered { rows, caret }
+    }
+}
+
+/// A horizontal rule: one row, or none.
+struct DividerItem;
+
+impl RenderAt for DividerItem {
+    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+        if h == 0 {
+            return Rendered::default();
+        }
+        Rendered {
+            rows: vec![format!("\x1b[2m{}\x1b[0m", "─".repeat(tw))],
+            caret: None,
+        }
+    }
+}
+
+/// Pre-painted rows, windowed around `focus` with half the allocation as
+/// context above it — the menu's own preference, not the frame layer's.
+struct OverlayItem {
+    rows: Vec<String>,
+    focus: usize,
+}
+
+impl RenderAt for OverlayItem {
+    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+        if h == 0 || self.rows.is_empty() {
+            return Rendered::default();
+        }
+        let start = window(self.rows.len(), self.focus, h, h / 2);
+        let count = h.min(self.rows.len().saturating_sub(start));
+        let mut rows = Vec::with_capacity(count);
+        for r in start..start + count {
+            debug_assert!(
+                !self.rows[r].contains('\n'),
+                "overlay rows are single screen rows"
+            );
+            rows.push(pad_row(&self.rows[r], tw));
+        }
+        Rendered { rows, caret: None }
+    }
+}
+
+/// Fixed rows in reading order — no focus by construction. See
+/// [`Element::lines`] for why that is deliberate.
+struct LinesItem {
+    rows: Vec<String>,
+}
+
+impl RenderAt for LinesItem {
+    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+        let mut rows = Vec::with_capacity(h.min(self.rows.len()));
+        for row in self.rows.iter().take(h) {
+            debug_assert!(!row.contains('\n'), "line rows are single screen rows");
+            let mut content = row.clone();
+            if display_width(&content) < tw {
+                content.push_str(EL);
+            }
+            rows.push(content);
+        }
+        Rendered { rows, caret: None }
     }
 }
 
@@ -230,63 +417,21 @@ pub(crate) fn render(elements: &[Element], heights: &[usize], term_w: usize) -> 
 
     for (idx, (el, &h)) in elements.iter().zip(heights.iter()).enumerate() {
         let first_row = extents.len();
-        match el {
-            Element::Input { layout, prompt } => {
-                let n = layout.row_count.max(1);
-                if h > 0 {
-                    let start = window(n, layout.cursor_row, h, INPUT_CONTEXT_ROWS);
-                    let count = h.min(n.saturating_sub(start));
-                    for r in start..start + count {
-                        // The prompt renders on row 0; later rows are
-                        // content-only.
-                        let body = if r == 0 { prompt } else { "" };
-                        let text = layout.rows.get(r).map(String::as_str).unwrap_or("");
-                        let mut content = String::with_capacity(body.len() + text.len() + 3);
-                        content.push_str(body);
-                        content.push_str(text);
-                        // `EL` only while there is something to erase —
-                        // after a full-width row the cursor is wrap-pending
-                        // and `CSI K` would eat the last written cell.
-                        if display_width(&content) < tw {
-                            content.push_str("\x1b[K");
-                        }
-                        push_row(&mut buf, &mut extents, &content);
-                    }
-                    if layout.cursor_row >= start && layout.cursor_row < start + count {
-                        caret = Some((first_row + layout.cursor_row - start, layout.cursor_col));
-                    }
-                }
-            }
-            Element::Divider => {
-                if h > 0 {
-                    let row = format!("\x1b[2m{}\x1b[0m", "─".repeat(tw));
-                    push_row(&mut buf, &mut extents, &row);
-                }
-            }
-            Element::Overlay { rows, focus } => {
-                if h > 0 && !rows.is_empty() {
-                    let start = window(rows.len(), *focus, h, h / 2);
-                    let count = h.min(rows.len().saturating_sub(start));
-                    for r in start..start + count {
-                        debug_assert!(
-                            !rows[r].contains('\n'),
-                            "overlay rows are single screen rows"
-                        );
-                        push_row(&mut buf, &mut extents, &pad_row(&rows[r], tw));
-                    }
-                }
-            }
-            Element::Lines(rows) => {
-                // Fixed content: show the first `h` rows (reading order).
-                for row in rows.iter().take(h) {
-                    debug_assert!(!row.contains('\n'), "line rows are single screen rows");
-                    let mut content = row.clone();
-                    if display_width(&content) < tw {
-                        content.push_str("\x1b[K");
-                    }
-                    push_row(&mut buf, &mut extents, &content);
-                }
-            }
+        // The element decides what to show at `h`; the frame lays its rows out
+        // and translates its caret into frame coordinates.
+        //
+        // Nothing downstream clamps the height. That is the trade this shape
+        // makes: the old `match` could have corrected an over-tall element
+        // because it knew what every arm produced, and a `RenderAt` impl is
+        // free to be wrong — so `render_at`'s contract says fit `h`, and the
+        // module that could once enforce it no longer can. Worth it, because
+        // enforcing it meant the module knowing what each element was.
+        let out = el.render.render_at(h, tw);
+        for row in &out.rows {
+            push_row(&mut buf, &mut extents, row);
+        }
+        if let Some((r, c)) = out.caret {
+            caret = Some((first_row + r, c));
         }
         spans.push((idx, first_row..extents.len()));
     }
@@ -1062,10 +1207,7 @@ mod tests {
         let mut e = LineEditor::new();
         e.insert_str("hi");
         let layout = e.layout(20, "> ");
-        let els = [Element::Input {
-            layout,
-            prompt: "> ".to_string(),
-        }];
+        let els = [Element::input(layout, "> ".to_string())];
         let f = render(&els, &[1], 20);
         assert_eq!(f.height(), 1);
         assert_eq!(f.row(0), "> hi\x1b[K");
@@ -1084,10 +1226,7 @@ mod tests {
         let layout = e.layout(20, "> ");
         assert_eq!(layout.row_count, 6);
         assert_eq!(layout.cursor_row, 5);
-        let els = [Element::Input {
-            layout,
-            prompt: "> ".to_string(),
-        }];
+        let els = [Element::input(layout, "> ".to_string())];
         let f = render(&els, &[3], 20);
         assert_eq!(f.height(), 3);
         // Prompt row scrolled out: no "> " on the first visible row.
@@ -1099,7 +1238,7 @@ mod tests {
 
     #[test]
     fn render_divider_spans_full_width() {
-        let f = render(&[Element::Divider], &[1], 8);
+        let f = render(&[Element::divider()], &[1], 8);
         assert_eq!(f.row(0), "\x1b[2m────────\x1b[0m");
         assert_eq!(f.caret, None);
     }
@@ -1107,15 +1246,12 @@ mod tests {
     #[test]
     fn render_overlay_pads_short_rows_before_reset() {
         let rows = vec!["ab".to_string()];
-        let els = [Element::Overlay { rows, focus: 0 }];
+        let els = [Element::overlay(rows, 0)];
         let f = render(&els, &[1], 5);
         // Padding lands inside the styled span so backgrounds reach the edge.
         assert_eq!(f.row(0), "ab   ");
         // Full-width row passes through untouched.
-        let els = [Element::Overlay {
-            rows: vec!["abcde".to_string()],
-            focus: 0,
-        }];
+        let els = [Element::overlay(vec!["abcde".to_string()], 0)];
         let f = render(&els, &[1], 5);
         assert_eq!(f.row(0), "abcde");
     }
@@ -1123,7 +1259,7 @@ mod tests {
     #[test]
     fn render_overlay_windows_around_focus() {
         let rows: Vec<String> = (0..20).map(|i| format!("item {i}")).collect();
-        let els = [Element::Overlay { rows, focus: 10 }];
+        let els = [Element::overlay(rows, 10)];
         let f = render(&els, &[4], 20);
         assert_eq!(f.height(), 4);
         // Centered: focus 10 with 4 visible → start 8 (prefer h/2 = 2).
@@ -1132,13 +1268,89 @@ mod tests {
     }
 
     #[test]
-    fn render_lines_truncate_from_top() {
+    fn render_lines_keeps_the_first_h_rows() {
         let rows: Vec<String> = (1..=5).map(|i| format!("line {i}")).collect();
-        let f = render(&[Element::Lines(rows)], &[3], 20);
+        let f = render(&[Element::lines(rows)], &[3], 20);
         assert_eq!(f.height(), 3);
+        // The front, in reading order — the bottom is what is cut. This test
+        // was called `render_lines_truncate_from_top`, which described the
+        // opposite behaviour, while asserting exactly these three lines
+        // (ui_draw_v2 §3.2.2).
         assert_eq!(f.row(0), "line 1\x1b[K");
         assert_eq!(f.row(2), "line 3\x1b[K");
         assert_eq!(f.caret, None);
+    }
+
+    /// The sizing declaration is *data* now (§3.2.3), which means it can be wrong
+    /// without the allocator noticing: `allocate` reads the fields, not the impl.
+    ///
+    /// One assertion per kind, because this is the part the refactor moved from a
+    /// `match` into constructors — and mutation-checking `must: 1 → 0` on the
+    /// input sailed through the whole suite. A wrong `must`/`might` here shows up
+    /// much later as a frame squeezed wrong on a short terminal, so it is named
+    /// instead.
+    #[test]
+    fn each_kind_declares_the_floor_and_want_it_promised() {
+        let mut e = LineEditor::new();
+        e.insert_str("hi");
+        assert_eq!(
+            Element::input(e.layout(20, "> "), "> ".into()).extent(),
+            Extent {
+                must: 1,
+                might: e.layout(20, "> ").row_count.max(1)
+            },
+            "the caret's own row is the floor: the input can never be squeezed away"
+        );
+        assert_eq!(
+            Element::divider().extent(),
+            Extent { must: 1, might: 1 },
+            "a rule is all-or-nothing"
+        );
+        assert_eq!(
+            Element::overlay(vec!["a".to_string(), "b".to_string()], 0).extent(),
+            Extent { must: 1, might: 2 },
+            "an overlay always keeps a row and wants its painted height"
+        );
+        assert_eq!(
+            Element::overlay(Vec::new(), 0).extent(),
+            Extent { must: 0, might: 0 },
+            "nothing to show asks for nothing"
+        );
+        assert_eq!(
+            Element::lines(vec!["a".to_string(), "b".to_string(), "c".to_string()]).extent(),
+            Extent { must: 3, might: 3 },
+            "fixed content is served whole in pass 1 — that is what `must` is for"
+        );
+    }
+
+    /// The caret is **frame-relative**, and there is exactly one thing that can
+    /// make that false: an input that is not the first element.
+    ///
+    /// Every caret test in this file puts the input at index 0, where
+    /// `first_row` is 0 — so deleting the offset from `render` passed all 850.
+    /// In production the input is *always* second, behind the status row, and
+    /// `compose_frame`'s tests pass `status: None`, so the offset has never
+    /// been exercised either. The refactor moved this arithmetic out of
+    /// `render`'s `Input` arm into `Rendered::caret`; pin it where it is, and
+    /// pin `spans` while there, since both come from the same `first_row`.
+    #[test]
+    fn the_input_caret_is_offset_by_its_element_first_row() {
+        let mut e = LineEditor::new();
+        e.insert_str("hi");
+        let layout = e.layout(20, "> ");
+        let els = [
+            Element::lines(vec!["bar".to_string()]),
+            Element::input(layout, "> ".into()),
+        ];
+        let f = render(&els, &[1, 1], 20);
+        assert_eq!(f.height(), 2);
+        // Frame row 1, not 0 — the status row occupies row 0.
+        assert_eq!(
+            f.caret,
+            Some((1, 4)),
+            "prompt (2) + \"hi\" (2) = col 4, but on the input's own row"
+        );
+        assert_eq!(f.spans, vec![(0, 0..1), (1, 1..2)]);
     }
 
     #[test]
@@ -1149,15 +1361,9 @@ mod tests {
         e.insert_str("ls -la");
         let layout = e.layout(80, "> ");
         let els = [
-            Element::Input {
-                layout,
-                prompt: "> ".to_string(),
-            },
-            Element::Divider,
-            Element::Overlay {
-                rows: vec!["one".to_string(), "two".to_string()],
-                focus: 0,
-            },
+            Element::input(layout, "> ".to_string()),
+            Element::divider(),
+            Element::overlay(vec!["one".to_string(), "two".to_string()], 0),
         ];
         let heights = allocate(
             &els.iter().map(Element::extent).collect::<Vec<_>>(),
@@ -1185,7 +1391,7 @@ mod tests {
 
     #[test]
     fn render_zero_height_element_contributes_no_rows() {
-        let els = [Element::Divider, Element::Divider];
+        let els = [Element::divider(), Element::divider()];
         let f = render(&els, &[1, 0], 4);
         assert_eq!(f.height(), 1);
         assert_eq!(f.spans, vec![(0, 0..1), (1, 1..1)]);
@@ -1274,7 +1480,7 @@ mod apply_tests {
     fn lines_frame(rows: &[&str], tw: usize) -> Frame {
         let rows: Vec<String> = rows.iter().map(|s| s.to_string()).collect();
         let h = rows.len();
-        render(&[Element::Lines(rows)], &[h], tw)
+        render(&[Element::lines(rows)], &[h], tw)
     }
 
     /// The parameters of every `CSI … H` (CUP) in a planned byte string.
@@ -1453,10 +1659,7 @@ mod apply_tests {
         let mut e = LineEditor::new();
         let input = |e: &LineEditor, rows: &[usize]| {
             render(
-                &[Element::Input {
-                    layout: e.layout(20, "> "),
-                    prompt: "> ".to_string(),
-                }],
+                &[Element::input(e.layout(20, "> "), "> ".to_string())],
                 rows,
                 20,
             )
@@ -1729,14 +1932,7 @@ mod apply_tests {
         e.insert_str("hi there");
         let layout = e.layout(20, "> ");
         let h = layout.row_count.max(1);
-        let f = render(
-            &[Element::Input {
-                layout,
-                prompt: "> ".into(),
-            }],
-            &[h],
-            20,
-        );
+        let f = render(&[Element::input(layout, "> ".into())], &[h], 20);
         cursor_to(&mut cache, 5, 24);
         let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
         let mut p = at(24, 20, 4);
@@ -1825,14 +2021,7 @@ mod apply_tests {
         let mut e = LineEditor::new();
         e.insert_str("hi");
         let layout = e.layout(20, "> ");
-        let f = render(
-            &[Element::Input {
-                layout,
-                prompt: "> ".to_string(),
-            }],
-            &[1],
-            20,
-        );
+        let f = render(&[Element::input(layout, "> ".to_string())], &[1], 20);
         cursor_to(&mut cache, 5, 24);
         let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
         let mut p = at(24, 20, 4);

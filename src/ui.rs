@@ -184,12 +184,9 @@ fn draw_dialog(
     let painted = paint_overlay(&update_plan_sel(plan, sel), term_w, term_h);
     let mut elements = Vec::new();
     if spec.divider {
-        elements.push(Element::Divider);
+        elements.push(Element::divider());
     }
-    elements.push(Element::Overlay {
-        rows: painted.rows,
-        focus: painted.focus.unwrap_or(0),
-    });
+    elements.push(Element::overlay(painted.rows, painted.focus.unwrap_or(0)));
     // Through the tail, not a second pipeline. This builder used to hand-roll
     // `extent → allocate → render` and call `draw_frame`, which meant two places
     // in the crate decided how the terminal's rows were divided (ui_draw_v2 §5.1.1).
