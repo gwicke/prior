@@ -263,29 +263,46 @@ pub trait Output: Send + Sync {
         (dims.0.max(1), dims.1.max(1))
     }
 
-    /// Compose, allocate, render and apply an element list — **the one place the
-    /// pure pipeline runs** (ui_draw_v2 §5.1.1).
+    /// Compose, allocate, render and apply an area — **the one place the pure
+    /// pipeline runs** (ui_draw_v2 §5.1.1).
     ///
-    /// Callers supply *content*: the items, in composition order. The budget is
-    /// derived from `dims`, never passed in — a caller that hands a budget is
-    /// being asked to know something it shouldn't. `dims` itself stays as an
-    /// argument because it is the caller's *belief* about the terminal, and
-    /// resize detection compares that belief against what was painted.
+    /// Callers supply *content*: the pieces, **moved in**. Nothing comes back —
+    /// no `Vec<Element>` crosses a call site, because no caller ever used one
+    /// except to hand it straight to the next statement. The composition is
+    /// recorded through [`remember_area`](Output::remember_area), which is what
+    /// lets §4.5's content path re-draw the area without recomposing it.
+    ///
+    /// The budget is derived from `dims`, never passed in — a caller that hands
+    /// a budget is being asked to know something it shouldn't. `dims` itself
+    /// stays as an argument because it is the caller's *belief* about the
+    /// terminal, and resize detection compares that belief against what was
+    /// painted.
     ///
     /// A default impl because every output draws the same way: only the tail,
     /// [`draw_frame`](Output::draw_frame), varies (test outputs paint nothing).
     fn draw_elements(
         &self,
-        elements: Vec<Element>,
+        input: Option<Element>,
+        overlay: Option<Element>,
         policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
         let (tw, th) = (dims.0.max(1), dims.1.max(1));
-        let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
+        let stack = self.compose_area(input, overlay, tw);
+        let extents: Vec<Extent> = stack.iter().map(Element::extent).collect();
         let heights = allocate(&extents, live_budget(th));
-        let frame = render(&elements, &heights, tw);
-        self.draw_frame(&frame, policy, dims)
+        let frame = render(&stack, &heights, tw);
+        let applied = self.draw_frame(&frame, policy, dims);
+        // Moved, never copied: the recipe belongs to the composition that built
+        // it, and the cache is the only other place that reads it.
+        self.remember_area(stack);
+        applied
     }
+
+    /// Record the composition [`draw_elements`](Output::draw_elements) just
+    /// built, so §4.5's content path can re-draw it without recomposing.
+    /// Default no-op: an output with no screen has nothing to remember.
+    fn remember_area(&self, _stack: Vec<Element>) {}
 
     /// Gate the background in-flight reader should honor. While it is `true`,
     /// the reader must not read stdin, because a confirmation dialog on the
@@ -2853,10 +2870,10 @@ impl Output for ConsoleOutput {
             ],
             quick_keys: Some(&[('y', 0), ('n', 1), ('s', 2)]),
             default_sel: 1, // No
-            // Mid-turn: a divider separates the dialog from the streamed
-            // output above; the resolved choice is recorded as a synthetic
-            // decision line (`accepted tool X` / `denied tool X`).
-            divider: true,
+            // The divider that separates a mid-turn dialog from the streamed
+            // output above is the composer's rule now, not a flag here (§5.1.1).
+            // What stays spec-side is the decision line: `accepted tool X` /
+            // `denied tool X`, recorded when the dialog resolves.
             subject: Some(crate::ui::confirm_subject(message)),
         };
 
@@ -2961,6 +2978,13 @@ impl Output for ConsoleOutput {
         }
         let streaming = self.streaming.load(std::sync::atomic::Ordering::Relaxed);
         Some(Element::lines(vec![status_bar(&stored, term_w, streaming)]))
+    }
+
+    /// Remember the composition so §4.5's content path can re-draw it. The only
+    /// output that has a screen has something to keep; everyone else drops it
+    /// (the default), which is also why nothing here can be read by mistake.
+    fn remember_area(&self, stack: Vec<Element>) {
+        self.draw.lock().unwrap().element_stack = stack;
     }
 
     /// Remember the status line to paint after each content block; see
@@ -4700,37 +4724,37 @@ mod tests {
     #[serial]
     fn draw_elements_paints_exactly_what_the_hand_rolled_path_paints() {
         let tall: Vec<String> = (0..16).map(|i| format!("row {i}")).collect();
-        let build = || {
-            crate::repl::Repl::compose_elements(
-                &crate::repl::LineEditor::new(),
-                "> ",
-                Some("[bar]"),
-                &tall,
-                0,
-                60,
-            )
+        // The pieces, freshly built per call: `draw_elements` moves them in, so
+        // each path needs its own. The composer is the shared thing now — both
+        // outputs are given the same status, so `compose_area` yields the same
+        // stack for each, and the only difference under test is *who runs the
+        // pipeline*.
+        let pieces = || {
+            let layout = crate::repl::LineEditor::new().layout(60, "> ");
+            let input = Element::input(layout, "> ".to_string());
+            let overlay = (!tall.is_empty()).then(|| Element::overlay(tall.clone(), 0));
+            (Some(input), overlay)
         };
-        let (tail, _rt) = capturing_output(60);
-        tail.begin_capture();
         let dims = (60, 20);
-        let a = tail.draw_elements(build(), ApplyPolicy::Frame, dims);
+
+        let (tail, _rt) = capturing_output(60);
+        tail.set_status(&bar_of("[bar]"));
+        tail.begin_capture();
+        let (input, overlay) = pieces();
+        let a = tail.draw_elements(input, overlay, ApplyPolicy::Frame, dims);
         let via_tail = tail.end_capture();
 
         let (hand, _rh) = capturing_output(60);
+        hand.set_status(&bar_of("[bar]"));
+        // Feed `draw_frame` exactly what `draw_elements` composes — same
+        // composer, same status, same dims — so the apply half is all that
+        // differs.
+        let stack = hand.compose_area(pieces().0, pieces().1, dims.0);
+        let extents: Vec<Extent> = stack.iter().map(Element::extent).collect();
+        let heights = allocate(&extents, live_budget(dims.1));
+        let frame = render(&stack, &heights, dims.0);
         hand.begin_capture();
-        let b = hand.draw_frame(
-            &crate::repl::Repl::compose_frame(
-                &crate::repl::LineEditor::new(),
-                "> ",
-                Some("[bar]"),
-                &tall,
-                0,
-                60,
-                20,
-            ),
-            ApplyPolicy::Frame,
-            dims,
-        );
+        let b = hand.draw_frame(&frame, ApplyPolicy::Frame, dims);
         let via_hand = hand.end_capture();
 
         assert_eq!(a, b, "the same dims either way");

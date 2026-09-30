@@ -749,10 +749,11 @@ impl Repl {
                 let input = Element::input(layout, prompt.to_string());
                 let overlay =
                     (!overlay.is_empty()).then(|| Element::overlay(overlay.to_vec(), focus));
-                let items = output.compose_area(Some(input), overlay, dims.0);
-                // Composition here, division there: `draw_elements` is the one place the
-                // pipeline runs, so this can no longer build a `Frame` by hand.
-                let applied = output.draw_elements(items, ApplyPolicy::Frame, dims);
+                // Composition *and* division are the tail's now: pieces move in
+                // and nothing comes back, so no `Vec<Element>` crosses a call
+                // site (ui_draw_v2 §5.1.1) — and this can no longer build a
+                // `Frame` by hand.
+                let applied = output.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
                 painted_size.set(applied);
             };
         loop {

@@ -45,7 +45,7 @@ without an input segment".
 | Screen position | Stored rows are absolute (everything emitted/consumed is); bottom-relative quantities (`delta`, 2/3 budget, clear floor) are computed per apply. No reflow-model invariance is assumed |
 | UI surface | `Output::draw_frame(frame, anchor, policy, dims)` + `frame_anchor()`; default drops UI drawing; `ConsoleOutput` overrides and applies exactly `dims` (the size the frame was composed for — §9 #3), returning what it applied. Content-out (`display_*`) and UI-out stay separate |
 | DSR | Only via the explicit `cursor_row()` re-anchor primitive (foreign-process / size-change / dialog-entry sites); steady state uses the cache |
-| Dialogs | Same pipeline, no input segment; entry DSR re-anchor, then `frame_anchor()`; `ConfirmSpec.divider` separates mid-turn dialogs from streamed output. Resolve = `Frame::empty()` union-clear; the optional decision line is written at the cleared first row |
+| Dialogs | Same pipeline, no input segment; entry DSR re-anchor, then `frame_anchor()`; the composer's divider rule separates mid-turn dialogs from streamed output. Resolve = `Frame::empty()` union-clear; the optional decision line is written at the cleared first row |
 | Commit lines | Clear the region with a Frame apply, then write the line where the caret lands (`emit_commit`, dialog decision line). `Append` stays reserved for §4.5's chunked/fixed-bottom writes |
 
 ---
@@ -398,7 +398,8 @@ today for one reason, and this section is about that reason.
   mutable stack to add to or prune.
 - **The area lives across the turn.** Content writes stop at the fold and the
   area is re-emitted below them — never erased. The content path does not
-  compose: it re-applies the area the REPL last composed (`cache.live.frame`).
+  compose: it re-draws the element stack the last composer stored — a recipe,
+  not pixels, so the status row inside it is re-derived on every draw.
 - **The status bar is a row of that area,** so its dot flips in place. No
   transient content-line bar, and no second bar anywhere.
 - **The prompt stays live mid-turn:** the input row is part of the area while a
@@ -555,8 +556,9 @@ separately verifiable.
 `with_content_writer` stops retiring the area. Content is written from the fold
 downward, the terminal scrolls as the write reaches the bottom, and the area is
 re-emitted **once**, as a single frame, at its new fold. `ConsoleOutput`
-re-emits `cache.live.frame` — it already caches the last applied frame — which is
-the concrete form of "compose those fixed parts into the same screen update".
+re-draws the element stack it already holds — the concrete form of "compose
+those fixed parts into the same screen update", and why the cache keeps the
+stack rather than the rendered `Frame`.
 
 The apply this needs is a *reposition*: the frame's top row has moved down by the
 content's row count, and the rows it used to occupy now hold content, so nothing
@@ -756,50 +758,55 @@ hand-assembled `[Divider?, Overlay]` and called `allocate`+`render` itself
 per chunk. Two pieces, then: one **tail** that every frame goes through, and one
 **composer** that decides what the area is made of.
 
-**Status: both landed.** The tail is `Output::draw_elements` — items → allocate →
-render → `plan_apply` → write, and `ui::confirm` goes through it rather than
-hand-rolling, so a second place deciding how the terminal's rows are split is gone.
-The composer is `Output::compose_area` + `Output::status_row`, with the
-`[Input?, Divider?, Overlay?]` rule in `area_body`. `Repl::compose_elements`
-survives only as the `#[cfg(test)]` twin that takes the status as a literal — and
-`Repl::compose_frame` only because a test still needs allocate+render without the
-write — so production reaches the area through one composer and nothing else.
-The rule itself still lives in `output.rs`; §4.5's end state moves composition
-into `ui.rs`, which is also where things come out of a ~3900-line `repl.rs`.
+**Status: the composer is folded into the tail.** Callers pass *pieces* and get
+nothing back — no `Vec<Element>` crosses a call site, because no caller ever
+used one except to hand it straight on. The tail is still one place:
+`items → allocate → render → `plan_apply` → write`, so §9 #3's "one source for
+both phases" holds exactly where it did.
+
+The composer owns the stack: it stores the recipe it built, and the stack is a
+*recipe*, not pixels. That is what lets §4.5's content path re-draw it per chunk
+without recomposing — and why the status row belongs *in* the stack as an
+element that resolves itself at render time rather than as a string baked in at
+compose time (below). The rule itself still lives in `output.rs`; §4.5's end
+state moves composition into `ui.rs`, which is also where things come out of a
+~3900-line `repl.rs`.
 
 ```rust
-// The shared tail: items → allocate → render → plan_apply → write. Nothing
-// else runs the pure pipeline, so there is one place where §9 #3's "one
-// source for both phases" has to be true.
-fn draw_elements(&self, items: Vec<Item>, policy: ApplyPolicy, dims: (usize, usize)) -> (usize, usize);
+// One call: pieces in, nothing out. Composes, stores the recipe, draws it.
+fn draw_elements(&self, input: Option<Item>, overlay: Option<Item>,
+                 policy: ApplyPolicy, dims: (usize, usize)) -> (usize, usize);
 
-// The one composer for the *area*. Impure: this is the only place allowed to
-// read state the pure phases must not see.
-fn compose_area(&self, input: Option<Item>, overlay: Option<Item>) -> Vec<Item> {
-    let mut items = vec![/* the status row */];   // always
-    items.extend(input);                          // between turns only
-    items.extend(overlay);                        // when a menu is open
-    items
-}
+// The rule, a free function so it can be tested without an Output.
+fn area_body(input: Option<Item>, overlay: Option<Item>) -> Vec<Item>;
+
+// §4.5 P1/P2 — what the content path re-runs (private to ConsoleOutput: it is
+// the same object that holds the stack). Renders the stored stack and applies
+// it, so a status row inside is re-resolved on every call.
+fn draw_stack(&self, policy: ApplyPolicy, dims: (usize, usize)) -> (usize, usize);
 ```
 
 Three call sites, and what each is:
 
-| caller | items | then |
+| caller | pieces | then |
 |---|---|---|
-| `read_input`, per keystroke | `compose_area(Some(input), Some(overlay))` — both **moved** in; the REPL rebuilds them next keystroke, so nothing is preserved by copying | `draw_elements` |
-| `with_content_writer`, per chunk | `compose_area(None, None)` → the status alone | `render` → `plan_reposition` |
-| `ui::confirm` | its own `[Divider?, Overlay]`, **no status** — a dialog is not the area *yet*; **P3** replaces this row with the same path as the REPL's (4.5.5, OQ4) | `draw_elements` |
+| `read_input`, per keystroke | `draw_elements(Some(input), overlay, …)` — both **moved** in; the REPL rebuilds them next keystroke, so nothing is preserved by copying. Compose stores the stack. | tail |
+| `with_content_writer`, per chunk | none — the stored stack, re-drawn | `plan_consume` → content → `draw_stack` → `plan_reposition` |
+| `ui::confirm` | `(None, Some(dialog))` — the composer's own rule supplies the divider, and it gains the status row a dialog is due (4.5.5, OQ4; the **P3** input row is still to come) | tail |
 
 The dialog keeps its own composition because §5.3 treats it as a separate surface. What it
 gains is that it stops hand-rolling the pipeline; that is a duplicate *decision* (§4.5's
 "one place composes") versus a second *site* running `allocate`+`render`, which is
 duplicated code.
 
-**The status row is `Lines`-shaped, not a new kind**: `status_bar(...)` returns a `String`
-at compose time, so the item is `must = might = 1`. It is resolved here because compose is
-the only phase that may read `status_text` and `streaming` — putting that in `render`
-would break §3.1's purity, which is the trap the `Element::Status` idea fell into.
+**The status row is `must = might = 1`, and it resolves at render time.** §3.1's purity
+rule is "no terminal dependency — `w`/`h` passed in → unit-testable", and a status element
+that *owns* its data source (`Arc<Mutex<StatusText>>`, `Arc<AtomicBool>`) satisfies it:
+you construct one with your own state and render it anywhere. What was rejected was an
+element reaching back into `Output` from `render`, not an element holding its own bytes'
+source. Resolving at render time is what makes §4.5's re-draw of the stored stack show the
+*current* dot and context figure instead of the ones present at the last compose — compose
+runs once per keystroke, the turn's `set_status` runs after.
 
 **The terminal size is one fact, owned by the drawing layer.** Items flow up; the budget
 flows down from `dims`. The REPL keeps reading it for two things that are *not*
@@ -811,20 +818,21 @@ mismatch becomes a stale cache rather than something to clamp away.
 
 ### 5.2 REPL (`read_input`)
 
-`redraw` becomes: `out.compose_area(Some(input), overlay, term_w)` → `draw_elements(...)` —
-the compose/allocate/render tail is no longer this module's (§5.1.1). The `input_row`
+`redraw` becomes one call: `out.draw_elements(Some(input), overlay, policy, dims)` — the
+compose/allocate/render tail is no longer this module's (§5.1.1), and the element list
+never comes back to the caller. The `input_row`
 local and `prev_term_h` `Cell` are retired; `frame_anchor()` replaces `next_input_row`'s
 scroll tracking (the cache holds the post-scroll top). The REPL always applies an
 empty-input frame before returning (as today's submit paths do), so no frame is live
 when content streams under the next turn.
 
-The compose list gains the **status row**, which the REPL no longer builds: `compose_area`
+The compose list gains the **status row**, which the REPL no longer builds: the composer
 prepends it, because it reads `status_text` and `streaming`, which only this layer may
-know (§5.1.1). So `redraw` supplies `input` and `overlay` and gets back a composition
-whose first item it does not own — and the divider is the composer's too, since "a menu
-brings a separator" is a rule rather than a caller's choice. `term_w` is the one thing
-the composer takes besides those two: the status row has to be fitted for the same
-width the frame renders at, and width is composition, not budget.
+know (§5.1.1). So `redraw` supplies `input` and `overlay` and gets *nothing back* — the
+composition, and the stack it produced, belong to the output — and the divider is the
+composer's too, since "a menu brings a separator" is a rule rather than a caller's choice.
+`dims` carries the width: the status row has to be fitted for the same width the frame
+renders at, and width is composition, not budget.
 
 > **The data is still the REPL's; the row is not.** `read_input` pushes a `StatusText`
 > built from `ctx` via `set_status`, once per cycle, before the first paint. Without
@@ -846,10 +854,10 @@ dropped with the helpers.
 
 ### 5.3 Dialogs (`ui.rs::confirm`)
 
-Compose `[Divider?, Overlay]` — the divider is a `ConfirmSpec.divider` flag: mid-turn
-dialogs (tool approval, compaction review) want a separation from the streamed output
-above them; REPL-context dialogs pass `false` (scrollback already carries a separator
-above the input region). Allocate, render, apply. The entry `cursor_row()` DSR is kept:
+Compose through the same call as the REPL — `draw_elements(None, Some(dialog), …)` — so
+the divider is the composer's rule ("a menu brings a separator", §5.2) rather than
+`ConfirmSpec.divider`, and the dialog gains the status row a dialog is due (§4.5.5, OQ4).
+The input row is **P3**'s remaining piece. Allocate, render, apply. The entry `cursor_row()` DSR is kept:
 it used to be kept because mid-turn the tracked caret did not follow streamed content,
 so `frame_anchor()` alone would point into the stream — that reason is **false** now
 (#10: the streaming writers count from the bytes they emit, checked against a vt100
@@ -917,7 +925,7 @@ emit logic" into a real safety net for P2–P3.
 | DSR cost if used per-frame | Cache-first (`frame_anchor()`/`caret`); DSR only via the explicit `cursor_row()` re-anchor at foreign-process / size-change sites |
 | Terminal reflow model (top- vs bottom-anchored) | No invariance is assumed: any size change invalidates `live`; clear floor preserves the reveal; DSR re-anchors |
 | Behavioral change: input no longer pushes scrollback off the top | Intended; windowing keeps caret visible. Covered by a new test |
-| Dialog divider in mid-turn context | `ConfirmSpec.divider` (true for both mid-turn dialogs; `false` reserved for REPL-context dialogs) |
+| Dialog divider in mid-turn context | Superseded — the composer adds a divider whenever an overlay is present (§5.1.1), so a mid-turn dialog gets one unconditionally. `ConfirmSpec.divider` is **deleted** |
 
 ---
 

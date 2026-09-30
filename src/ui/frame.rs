@@ -424,6 +424,16 @@ pub(crate) struct DrawCache {
     /// bottom survive. Never cleared by invalidation.
     screen_bottom: usize,
     live: Option<LiveFrame>,
+    /// The last composition, kept as its **recipe** — the element list, not the
+    /// rendered rows it produced (ui_draw_v2 §5.1.1). §4.5's content path
+    /// re-draws this instead of recomposing: re-rendering is cheap and always
+    /// current, where the rendered rows would be a snapshot of whatever the
+    /// status said at the moment of compose.
+    ///
+    /// Deliberately *not* cleared by `note_lines`, `plan_consume` or an
+    /// invalidation — those retire the frame's *position*, and the recipe is
+    /// exactly what survives it. A later `draw_elements` overwrites it.
+    pub(crate) element_stack: Vec<Element>,
 }
 
 impl DrawCache {
@@ -432,6 +442,7 @@ impl DrawCache {
             caret: (1, 0),
             screen_bottom: term_h.max(1),
             live: None,
+            element_stack: Vec::new(),
         }
     }
 
