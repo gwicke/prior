@@ -268,9 +268,21 @@ The fold is **not** a fixed row and the area is **not** pinned to the terminal
 bottom. The area sits immediately below the content, and content pushes it
 down; when a menu opens the fold moves *up* (expansion) and when it closes the
 area descends back into the space it freed (contraction). Rows below the area
-are ordinary empty screen. An earlier draft of this section called the area
-"pinned", which is wrong: pinning would mean the content region is a constant
-`th - h` rows, which is a *different* design with a different cost (see OQ3).
+are ordinary empty screen.
+
+An earlier draft of this section called the area "pinned", which is wrong, and
+the distinction is worth stating precisely because the two designs converge:
+**nothing is reserved.** The content region is not held at `th - h` rows from the
+start, so at the first prompt of a session the area is right under the greeter,
+mid-screen, with empty rows beneath it. As content accumulates the area walks
+down; once the screen is full it stays at the bottom, because further content
+scrolls rather than grows. Same steady state, different mechanism — and the
+mechanism is what keeps the first prompt cheap.
+
+The area is also **one frame, not several**: status, input, divider and overlay
+are a single element list, allocated, rendered and applied once. "Several
+disjointed writes" is what this whole section removes, and the mid-turn status bar
+is already one — which is why it has to go rather than be extended.
 
 #### 4.5.2 What "fully-relative" means here, precisely
 
@@ -286,9 +298,11 @@ Two readings, and the difference decides how much is achievable:
   full-screen repaint that itself needs to know the scroll offset — i.e. the same
   query by another name. OQ1 asks which reading is wanted.
 
-So the honest end state is (a): absolute addressing survives only in
-foreign-writer recovery, where it is *information the cache does not have*
-rather than an architectural gap.
+So the honest end state is (a), and it is the settled target (4.5.5): absolute
+addressing survives only at **startup** and in **foreign-writer** recovery, where
+it is *information the cache does not have* rather than an architectural gap. The
+three sites that stay are `read_input`'s very first anchor, `$EDITOR` exit, and
+Ctrl-Z / width-change.
 
 #### 4.5.3 What blocks it today
 
@@ -316,8 +330,10 @@ Three facts, all of which are consequences of one decision:
 Each is checkable, and each is what a phase below establishes.
 
 - **I1 — One owner.** At every instant exactly one component composes the area.
-- **I2 — Content never writes inside the area.** Every content byte lands at or
-  above the fold. The area's rows are never clobbered by content.
+- **I2 — Content stops at the fold.** Every content byte lands at or above it.
+  The area's rows are *consumed* by the content that displaces them and then
+  re-emitted, never erased underneath it — which is P1's version of the P4 clear
+  invariant and the thing most likely to regress.
 - **I3 — The fold is derived, not remembered.** It is a function of the tracked
   caret, the area's height and `term_h` — never a separate counter.
 - **I4 — Steady state is relative.** Between a turn starting and ending, no
@@ -328,111 +344,124 @@ Each is checkable, and each is what a phase below establishes.
 - **I6 — Scrollback stays contiguous.** Scrolling back shows content with no
   gaps and no area rows interleaved.
 
-#### 4.5.5 Phases
+#### 4.5.5 Settled: the four open questions, answered
 
-Each phase is separately reviewable and separately verifiable. P1 and P2 are
-prerequisites for in-turn input; P3 and P4 are the features themselves; P5 is
-the payoff.
+Answers recorded 2026-09-30. They changed the phase list, so 4.5.6 reflects them.
+
+- **OQ1 → (a).** Steady-state relative drawing. Absolute addressing is excluded
+  only at **startup** and after **foreign writers** (`$EDITOR`, Ctrl-Z, the
+  width-change `ESC[0J` + replay). Those are the three `cursor_row()` sites that
+  stay; `ui::confirm`'s and `read_input`'s entry DSRs are in scope for removal once
+  the fold survives the turn (P5).
+- **OQ2 → deferred, deliberately.** Queuing a follow-up is the likely semantic,
+  but **in-turn input is a separate track** from the drawing work here. Nothing
+  in P1/P2 depends on the answer, and P1/P2 are worth doing without it.
+- **OQ3 → no pinning, and the area *descends*.** The input sits immediately below
+  the content. If there is free space below, the area **moves gradually toward the
+  bottom** as content arrives, and once the screen is full it stays at the bottom
+  because further content scrolls. Nothing is *reserved*: the content region is
+  not held at `th - h` from the start, which is what distinguishes this from
+  pinning — at the first prompt of a session the area is right under the greeter,
+  mid-screen, with empty rows beneath it. This is already the behaviour (the
+  frame anchors at the live edge); 4.5.1 now states it as the rule rather than as
+  an accident.
+- **OQ3, second half → one frame, not several.** The area is updated as a
+  **single composed frame** — status, input, divider, overlay in one element list,
+  one `allocate`, one `render`, one `apply`. Not several disjointed writes. This
+  is already how the REPL composes, and it is the reason the mid-turn status bar
+  has to go rather than be extended: a content-line bar *is* a disjointed write.
+- **OQ4 → a dialog is just another menu.** A confirmation composes into the same
+  area, **below the status bar and below the input row** when there is one. So
+  `ui::confirm` stops being "a frame without an input segment" (§5.3) and becomes
+  the same area with a different element list; its DSR and its own anchor go with
+  it.
+
+#### 4.5.6 Phases
+
+Two tracks. **This track is the drawing capability** (P1, P2, P3) and nothing in
+it depends on OQ2. **The input track** (P4) depends on this one being done and on
+OQ2. Each phase is separately reviewable and separately verifiable.
 
 **P1 — Contraction: the area establishes the content's lower bound.**
 `with_content_writer` stops retiring the area. Content is written from the fold
 downward, the terminal scrolls as the write reaches the bottom, and the area is
-re-emitted once at its new fold — a `Frame` apply with a known delta, which is
-what `plan_append`'s shape already anticipates. `ConsoleOutput` re-emits
-`cache.live.frame` (it already caches the last applied frame), which is the
-concrete form of "compose those fixed parts into the same screen update".
-- Establishes I2, I3, I6.
-- Verify: the post-turn screen is byte-identical to today's (the transcript does
-  not move), plus a new vt100 case where a multi-chunk stream never leaves the
-  area blank (I5).
-- Risk: this is where **P4** (the clear policy invariant) has to be restated.
-  Today "a Frame apply clears the rows below the frame, so any later append lands
-  in clean space" is what makes appends safe. With the area live, content
-  *consumes* the area's rows rather than landing below them, so the invariant
+re-emitted **once**, as a single frame, at its new fold. `ConsoleOutput`
+re-emits `cache.live.frame` — it already caches the last applied frame — which is
+the concrete form of "compose those fixed parts into the same screen update".
+
+The apply this needs is a *reposition*: the frame's top row has moved down by the
+content's row count, and the rows it used to occupy now hold content, so nothing
+may erase them. That is neither of the existing two paths — `plan_partial`
+requires an unmoved frame, and `plan_full` erases the old region, which would
+erase the content that just landed there. It is a third case: walk to the new
+top, paint, do not clear above.
+- Establishes I2, I3, I6, and the "one frame" half of I1.
+- Verify: the post-turn screen is unchanged from today's (the transcript does not
+  move), plus a new vt100 case where a multi-chunk stream never leaves the area
+  blank (I5) and one where the area is re-emitted with no `CUP`.
+- Risk: **P4** (the clear-policy invariant) has to be restated — content now
+  *consumes* the area's rows rather than landing below them. The invariant
   becomes "content writes stop at the fold; the area's rows are re-emitted, not
-  erased". That is a change to a settled decision (see the P4 row in §2) and
-  wants its own commit and its own test.
+  erased". That is a change to a settled decision (the P4 row in §2) and wants
+  its own commit and its own test.
 
 **P2 — The area survives the turn; the bar becomes a permanent row.**
 The REPL stops applying an empty-input frame to retire, and the content path
-stops clearing. The status bar moves from a content transient to
-`Element::Lines` in the area composition, and its dot is driven by real turn
-state (grey at the prompt, green in flight) — which is what makes the two states
-mean something, and it removes the jump. `StatusSpot`, `clear_status`,
-`paint_status`'s cursor-hide/dim dance and the §3.5 gap logic all become dead and
-are deleted; `row_accounting`'s gap tests go with them (or are restated as "the
-area's first row is preceded by a blank", which is the surviving requirement).
+stops clearing. The status bar moves out of the content stream and into the area
+composition as `Element::Lines`, and its dot is driven by real turn state (grey at
+the prompt, green in flight) — which is what makes the two states mean something
+and removes the jump at submit. `StatusSpot`, `clear_status`, `paint_status`'s
+cursor-hide/dim dance and the `row_accounting` §3.5 gap logic all become dead and
+are deleted; §3.5's gap tests go with them, restated as "the area's first row is
+preceded by a blank" if that is still wanted (it is: the gap is why the bar is
+readable below a tool panel).
 - Establishes I1, I4, I5.
-- Verify: the dot flips on the *same row* with no second bar anywhere; a
-  resize mid-turn re-flows the area; `plan_clear_live_frame` has no production
-  callers and is removed.
+- Verify: the dot flips on the *same row* with no second bar anywhere; a resize
+  mid-turn re-flows the area; `plan_clear_live_frame` has no production callers
+  and is removed.
 
-**P3 — In-turn input.** The read loop runs during the turn and the input row is
-live. This is the phase that needs I1 most: the streaming path and the read loop
-both want the area. The resolution is that the read loop is the area's sole
-composer and the content path writes *above* the fold and asks for a re-emit
-through that same path (P1's mechanism), rather than the two applying
-independently.
-- Establishes I1 under concurrency.
-- Verify: keys typed during a turn reach the editor; `<Esc>` still cancels the
-  turn (today it is handled by the in-flight reader thread, not the frame);
-  the area's row diff is correct under arbitrary interleaving of chunks and keys
-  — this wants a test that drives both from one thread with a deterministic
-  schedule, not a pty race.
-- OQ2 decides what Enter *means* during a turn (queue a follow-up, or something
-  else), which changes the editor's state machine but not the drawing.
+**P3 — Dialogs are menus in the area.**
+`ui::confirm` composes `[Status, Input?, Divider?, Overlay]` through the same path
+as the REPL, below the status and below the input. The two areas of duplicated
+logic §1 named — the dialog's own anchor and its `\x1b[0J` — go away, and so does
+its entry DSR.
+- Establishes I1 for dialogs, and closes half of P5.
+- Verify: a mid-turn tool approval shows the input row above it; the dialog's
+  rows are erased through the pipeline on resolve and the area comes back as
+  `[Status, Input]`; **a positional assertion is required** — the confirm suite
+  asserts behaviour (which option was chosen) and not the dialog's row, so
+  "green" is not evidence for anything here.
 
-**P4 — Menus in-turn.** The overlay joins the same area composition, so the fold
-moves up on open and down on close while content keeps streaming above it. The
-fold's movement is a scroll, and the area's rows above the new fold are consumed
-by the content exactly as in P1.
-- Verify: open and close a menu mid-turn; the content above the fold is
-  contiguous afterwards; the area's budget accounting (`live_budget`) includes
-  the bar's row, so a tall pop-up gets one row less to work with.
+**P4 — In-turn input. (Separate track; blocked on OQ2.)**
+The read loop runs during the turn and the input row is live. This is where I1 is
+under concurrency: the streaming path and the read loop both want the area. The
+resolution is that the read loop is the area's sole composer and the content path
+writes above the fold and asks for a re-emit through that same path (P1's
+mechanism), rather than the two applying independently. `<Esc>` is handled today
+by the in-flight reader thread, not the frame, so keeping that is the cheap
+option.
+- Verify: keys typed during a turn reach the editor; the area's row diff is
+  correct under interleaving of chunks and keys — this wants a test that drives
+  both from one thread on a deterministic schedule, not a pty race.
 
-**P5 — Retire the DSRs that are no longer load-bearing.** With the fold
-maintained across turns and every content write counted (done: #10), two
-re-anchors stop being load-bearing: `ui::confirm`'s (its stated reason — that
-streaming does not track rows — is already false) and possibly `read_input`'s
-entry one, if the fold survives the turn boundary so the caret never needs
-re-establishing between turns. The foreign-writer re-anchors (Ctrl-Z, `$EDITOR`
-exit, resize) stay under any reading; see OQ1.
-- Verify: removing each is a separate commit, each with the suite green and a
-  note on what now covers it. Note that `confirm_raw_mode` asserts *behaviour*
-  (which option was chosen) and not the dialog's row, so "the suite is green" is
-  not evidence for the `ui::confirm` removal — that one needs a positional
-  assertion first.
+**P5 — Retire the DSRs that are no longer load-bearing.**
+With the fold maintained across turns and every content write counted (done: #10),
+`read_input`'s entry DSR and `ui::confirm`'s (P3) stop being load-bearing.
+Startup and the three foreign-writer sites stay, by OQ1.
+- Verify: each removal is a separate commit with the suite green and a note on
+  what now covers it.
 
-#### 4.5.6 Not in scope
+#### 4.5.7 Not in scope
 
-- **The area being pinned to the bottom row.** See 4.5.1 and OQ3.
+- **The area being pinned to the bottom row.** See 4.5.1 — settled as *not*
+  pinned, with nothing reserved. The two designs converge in the steady state;
+  they differ in what happens before the screen fills.
 - **Per-row backgrounds in the area** (`row_bgs`, dropped in P5) — unrelated.
 - **Scrollback rewriting.** The area is chrome and never enters the scrollback;
   I6 says the *content* stays contiguous, not that the area is preserved.
+- **In-turn input semantics** (OQ2) — a separate track, and nothing here is
+  blocked on it.
 
-#### 4.5.7 Open questions
-
-- **OQ1 — Which reading of "fully-relative"?** (a) steady state, accepting
-  `CUP` in foreign-writer recovery (recommended: achievable, and the remaining
-  `CUP`s are honest about missing information), or (b) never, which requires
-  dropping `$EDITOR`/Ctrl-Z or accepting a repaint that needs the same query.
-- **OQ2 — In-turn input semantics.** Does Enter *queue* a follow-up for after
-  the current turn, or is a different gesture needed? Is `<Esc>` still
-  "cancel the turn", or does it become "focus the input"? And should the input
-  row be live from the moment the turn starts, or only after the first chunk?
-- **OQ3 — The cost of a non-pinned fold.** With the area below the content, the
-  content region is `th - h` rows *only when the area is at the bottom*. When
-  space below is free (a collapsed menu), the area sits mid-screen and the rows
-  beneath it are empty. Is that the intent — content filling the screen, area
-  following it down — or should the area instead sit at the bottom whenever
-  there is room (which is the "pinned" reading this section rejected)?
-- **OQ4 — Mid-turn dialogs.** `ui::confirm` is currently its own frame that
-  replaces the area entirely. With in-turn input, does a confirmation dialog
-  *replace* the area (the input row disappears) or *compose above* it (the input
-  row stays visible)? And does a dialog's fold interact with a concurrently
-  streaming turn, or does it block as it does today?
-
----
 ---
 
 ## 5. Wiring
@@ -601,6 +630,12 @@ emit logic" into a real safety net for P2–P3.
 
 Recorded while implementing P0–P5. None of these block the shipped pipeline;
 the first two were latent bugs that pre-date ui_draw_v2 — both since fixed.
+
+**Audit 2026-09-30** (after the permanent status bar and the §4.5 rewrite): the
+live work is §4.5 P1 → P2 → P3, which is a *drawing* track and is independent of
+in-turn input. The stale item most likely to mislead is "streaming does not
+track rows" — it appears in three places in this file and is false in all of
+them; §4.2, §5.3 and §9 now each say so where they state it.
 
 **Audit 2026-09-28** (after the editor cleanups, with the v2.5 engine now
 driving every `/` command in the REPL): #1–#3 re-verified done, pins still
