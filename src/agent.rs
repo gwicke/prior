@@ -76,11 +76,17 @@ pub struct SessionUsage {
 
 #[async_trait]
 pub trait PicoAgent: Send + Sync {
+    /// `params` are the params to send *for this request*: the live ones, or
+    /// the live ones with this turn's per-turn overrides applied. Passing them
+    /// in rather than reading them off `AppState` is what makes an override
+    /// per-request — nothing here mutates the live params, so there is nothing
+    /// to restore and no path by which one leaks into the next turn.
     async fn prompt(
         &self,
         input: &str,
         session: Option<&Session>,
         turn: &TurnPersistence,
+        params: &crate::params::ModelParams,
     ) -> Result<String>;
     async fn run_once(&self, input: String) -> Result<String>;
     /// Snapshot of the accumulated session token usage (for `/stat`). A zeroed
@@ -224,6 +230,7 @@ impl PicoAgent for CodeAgent {
         input: &str,
         session: Option<&Session>,
         turn: &TurnPersistence,
+        params: &crate::params::ModelParams,
     ) -> Result<String> {
         // Fresh request: clear any stale cancel flag from a previous abort so a
         // prior `Esc` doesn't silently cancel this prompt. The REPL's in-flight
@@ -279,9 +286,28 @@ impl PicoAgent for CodeAgent {
         // The run-scoped transcript is shared with the hook and the stream
         // loop so a mid-turn failure can persist exactly what completed.
         let transcript = Arc::new(Mutex::new(TurnTranscript::default()));
-        let mut stream = self
-            .agent
-            .stream_prompt(input)
+        // Per-request params, set unconditionally from `params`.
+        //
+        // `replace_additional_params`, not `merge_`: a `/reasoning` override
+        // must not leave a stale key behind, and anthropic's `thinking` block is
+        // the case that matters — merging would carry the old `budget_tokens`
+        // alongside a new `type`. Recomposing through `request_additional_params`
+        // rather than patching the baked value keeps an override turn
+        // byte-identical to a normal one, and the `without_*` arms mean an
+        // explicit `None` clears instead of silently keeping the built value.
+        //
+        // With no overrides `params` *is* `live_params`, so this recomputes what
+        // was baked at build time and the turn is unchanged.
+        let request = self.agent.stream_prompt(input);
+        let request = match params.temperature {
+            Some(t) => request.temperature(t),
+            None => request.without_temperature(),
+        };
+        let request = match request_additional_params(&self.provider, &self.model, params) {
+            Some(v) => request.replace_additional_params(v),
+            None => request.without_additional_params(),
+        };
+        let mut stream = request
             .add_hook(LoggingHook {
                 output: self.output.clone(),
                 user_cancel: self.user_cancel.clone(),
@@ -332,7 +358,7 @@ impl PicoAgent for CodeAgent {
                 model: &self.model,
                 // The status bar's own field is upstream's `thinking`; the
                 // value it reads is now the renamed reasoning level.
-                thinking: self.reasoning_level.as_deref(),
+                thinking: self.live_params.reasoning_str().as_deref(),
                 // Reported wins: it is the provider's own count of what it was
                 // sent. The estimate only stands in while there is none — turn
                 // one, where the alternative is no figure at all.
@@ -731,7 +757,8 @@ impl PicoAgent for CodeAgent {
         // `turn.sent() == 1` and the success path does not mis-deduplicate
         // `final_history[0]` against an absent session.
         turn.mark_new_dispatch();
-        let response = self.prompt(&input, None, &turn).await?;
+        // No override surface on this path, so the built live params.
+        let response = self.prompt(&input, None, &turn, &self.live_params).await?;
         Ok(response)
     }
 
@@ -1374,7 +1401,9 @@ pub struct CodeAgent {
     /// the agent is built: the level only changes on an explicit commit, and the
     /// bar is painted once per content block, so reading the config per block
     /// would only add a lock to a path that has no reason to be fresh.
-    reasoning_level: Option<String>,
+    /// The live params this agent was built with: the default for a turn with
+    /// no per-turn override, and the status bar's reasoning level.
+    live_params: crate::params::ModelParams,
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
@@ -1474,6 +1503,95 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 /// (typically thinking config). Pins requests to a preferred upstream provider
 /// so that server-side cache state accumulates across turns instead of being
 /// invalidated by load-balancing between multiple upstreams for the same model.
+/// The params to send for this turn, plus any notes about them.
+///
+/// A `/reasoning` override is deliberately *not* remapped here. The remap lives
+/// in [`crate::params::additional_params`] — the one place that knows the
+/// provider's spelling of each level and the model's own effort table — and
+/// doing it here too would be a second implementation free to disagree with the
+/// first. So the requested level goes through untouched and this *reports* the
+/// move, comparing ranks so a pure spelling difference (our `med`, their
+/// `medium`) is not announced as a downgrade.
+/// The note to show when a `/reasoning` override asks for a level `support`
+/// cannot serve, or `None` when it can.
+///
+/// Split out of [`effective_params`] so it is testable against a support table
+/// directly, with no catalog cache involved — the same reason
+/// `model_catalog::support_for_entry` is split out.
+///
+/// The comparison is on **rank**, not on the string. `resolve` returns the
+/// model's own spelling, so a model publishing `medium` for our `med` would
+/// otherwise be reported as a downgrade that never happened.
+fn reasoning_remap_note(
+    requested: crate::params::ReasoningLevel,
+    support: &crate::params::ReasoningSupport,
+) -> Option<String> {
+    let resolved = support.resolve(requested)?;
+    let moved = resolved
+        .parse::<crate::params::ReasoningLevel>()
+        .map(|l| l.rank())
+        != Ok(requested.rank());
+    moved.then(|| {
+        format!(
+            "note: reasoning '{}' → '{resolved}' (this model does not support it)",
+            requested.as_str()
+        )
+    })
+}
+
+/// The params to send for this turn, plus any notes about them.
+///
+/// A `/reasoning` override is deliberately *not* remapped here. The remap lives
+/// in [`crate::params::additional_params`] — the one place that knows the
+/// provider's spelling of each level and the model's own effort table — and
+/// doing it here too would be a second implementation free to disagree with the
+/// first. So the requested level goes through untouched and this *reports* the
+/// move, via [`reasoning_remap_note`].
+fn effective_params(
+    app_state: &crate::app_state::AppState,
+    overrides: &crate::turn_overrides::TurnOverrides,
+) -> (crate::params::ModelParams, Vec<String>) {
+    let live = app_state.params();
+    if overrides.is_empty() {
+        return (live, Vec::new());
+    }
+    let mut notes = Vec::new();
+    if let Some(requested) = overrides.reasoning {
+        let (provider, model) = app_state.with_config(|c| (c.provider.clone(), c.model.clone()));
+        let support = crate::model_catalog::reasoning_support(&provider, &model);
+        notes.extend(reasoning_remap_note(requested, &support));
+    }
+    (overrides.apply(&live), notes)
+}
+
+/// The provider-specific `additional_params` for one request: picocode's
+/// reasoning/top_p composition, then any provider post-processing.
+///
+/// The single place both the build path and the per-turn override path go
+/// through. They must agree exactly — the per-request path *replaces* the baked
+/// value, because rig's merging setter would leave a stale key behind on, say,
+/// anthropic's `thinking` block — so any divergence would show up as a request
+/// shape that depends on whether the turn happened to carry an override.
+fn request_additional_params(
+    provider: &str,
+    model: &str,
+    params: &crate::params::ModelParams,
+) -> Option<serde_json::Value> {
+    let support = crate::model_catalog::reasoning_support(provider, model);
+    let base = params::additional_params(&provider.to_lowercase(), params, &support);
+    if provider.eq_ignore_ascii_case("openrouter") {
+        // The openrouter branch in `create_agent` pins a provider preference
+        // into the same object; an override turn must keep it.
+        merge_openrouter_params(base)
+    } else {
+        base
+    }
+}
+
+/// Merge OpenRouter `ProviderPreferences` into the existing additional_params
+/// (typically thinking config). Pins requests to a preferred upstream provider
+/// so that server-side cache state accumulates across turns instead of being
+/// invalidated by load-balancing between multiple upstreams for the same model.
 fn merge_openrouter_params(existing: Option<serde_json::Value>) -> Option<serde_json::Value> {
     use rig_core::providers::openrouter::ProviderPreferences;
     let prefs = ProviderPreferences::new()
@@ -1506,14 +1624,11 @@ fn merge_openrouter_params(existing: Option<serde_json::Value>) -> Option<serde_
 pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
     let provider = config.provider.to_lowercase();
     let model = config.model.clone();
-    let reasoning_json = {
-        // What this model accepts, so a level it cannot serve is remapped
-        // instead of sent and rejected. Unknown until the catalog publishes
-        // it (P3 wires the data in); until then every level goes out as-is,
-        // which is exactly the pre-P1 behavior.
-        let support = crate::model_catalog::reasoning_support(&config.provider, &model);
-        params::additional_params(&provider, &config.params, &support)
-    };
+    // What this model accepts, so a level it cannot serve is remapped instead
+    // of sent and rejected. One shared composition, so the per-request path
+    // (a `/reasoning` override) cannot produce a different shape than a normal
+    // turn.
+    let reasoning_json = request_additional_params(&config.provider, &model, &config.params);
 
     // OAuth credentials live in a `token` sub-directory of the settings dir
     // (see `platform::app_config_dir`), kept private so refresh tokens aren't
@@ -1581,7 +1696,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.tool_call_limit,
                 config.provider,
                 model,
-                config.params.reasoning_str(),
+                config.params,
                 config.yolo,
                 config.persona_name,
                 config.user_cancel.clone(),
@@ -3966,6 +4081,33 @@ pub async fn run_interactive(
                 if input == "/q" || input == "exit" {
                     break;
                 }
+                // Per-turn overrides (doc/model_settings_v2.md A.10).
+                //
+                // `line_history` above took the RAW line, so recall shows the
+                // user what they typed including the overrides; from here on
+                // `input` is the text with the override lines removed, which is
+                // what is persisted, sent, and counted for context. Nothing is
+                // mutated: the overrides travel as a value into `prompt()` for
+                // this turn only, so there is no restore step and no way one
+                // reaches the live params or the next turn.
+                let split = crate::turn_overrides::split(&input);
+                for w in &split.warnings {
+                    config.output.display_text(w);
+                }
+                // An overrides-only prompt has nothing to send. Checked *before*
+                // `ensure_session` below, or a turn that never runs would still
+                // create a session.
+                if split.text.trim().is_empty() {
+                    config
+                        .output
+                        .display_text("nothing to send — the prompt was only overrides");
+                    continue;
+                }
+                let input = split.text;
+                let (effective_params, notes) = effective_params(&app_state, &split.overrides);
+                for n in &notes {
+                    config.output.display_text(n);
+                }
                 // Safety net: any code path that drops the in-memory session
                 // (notably `/new` and `/clear`) must leave us with a fresh one
                 // before the first post-drop prompt — otherwise
@@ -4105,6 +4247,14 @@ pub async fn run_interactive(
                 let response: std::result::Result<String, crate::PicocodeError> = {
                     let mut consecutive_failures: u8 = 0;
                     let mut next_input: String = input.clone();
+                    // The params this turn sends. They are the live ones with
+                    // the typed overrides applied, and they are *carried*, not
+                    // applied to the live config — so a retry of the same
+                    // dispatch re-uses them automatically (the stripped text is
+                    // already in `next_input`), while a synthetic re-prompt
+                    // below resets them, since an override belongs to the
+                    // user's dispatch and not to the model's own feedback.
+                    let mut turn_params = effective_params.clone();
                     // Per-turn persistence flag. Reset once per user prompt
                     // (NOT per retry): the retry loop below reuses it across
                     // `prompt()` attempts so a pre-persisted `user(input)` is
@@ -4127,7 +4277,7 @@ pub async fn run_interactive(
                         let prompt_result = agent
                             .as_ref()
                             .unwrap()
-                            .prompt(&next_input, session.as_deref(), &turn)
+                            .prompt(&next_input, session.as_deref(), &turn, &turn_params)
                             .await;
                         match prompt_result {
                             Ok(text) => break Ok(text),
@@ -4244,6 +4394,14 @@ pub async fn run_interactive(
                                     // (de-duped). Re-prompt with the synthetic
                                     // feedback so the model can self-correct.
                                     next_input = feedback;
+                                    // Drop the override: it was the user's
+                                    // instruction for *their* dispatch, and
+                                    // this is the model's own corrective
+                                    // re-prompt. Carrying a `/temperature 0.2`
+                                    // into it would silently keep applying a
+                                    // sampling the user never asked for on this
+                                    // exchange.
+                                    turn_params = app_state.params();
                                     // The feedback replaces the original prompt
                                     // as a NEW user dispatch for this turn.
                                     turn.mark_new_dispatch();
@@ -5176,7 +5334,7 @@ impl CodeAgent {
         tool_call_limit: usize,
         provider: String,
         model: String,
-        reasoning_level: Option<String>,
+        live_params: crate::params::ModelParams,
         yolo: bool,
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
@@ -5190,7 +5348,7 @@ impl CodeAgent {
             tool_call_limit,
             provider,
             model,
-            reasoning_level,
+            live_params,
             yolo,
             persona_name,
             user_cancel,
@@ -8442,6 +8600,170 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             crate::params::ModelParams::default(),
         );
         assert!(plan_rebuild(&applied, &target, None).is_some());
+    }
+    // ---- per-turn overrides: the request path (doc/model_settings_v2.md A.10) ----
+
+    fn store_with(default_reasoning: &str) -> crate::settings::SettingsStore {
+        let mut s = crate::settings::SettingsStore::from_config(&crate::Config::default(), None);
+        s.default_reasoning_level = Some(default_reasoning.to_string());
+        s
+    }
+
+    fn app_with(params: crate::params::ModelParams) -> Arc<crate::app_state::AppState> {
+        let app = crate::app_state::AppState::for_test(store_with("low"));
+        app.update_config(|c| c.params = params);
+        app
+    }
+
+    /// The load-bearing invariant. The per-request path *replaces* the value
+    /// baked at build time, so if the two compositions ever disagreed, a turn
+    /// with an override would send a different shape than a turn without one.
+    /// Both now go through `request_additional_params`, and this asserts the
+    /// identity that makes that safe.
+    #[test]
+    fn a_turn_with_no_override_recomputes_exactly_what_was_baked() {
+        let params = crate::params::ModelParams {
+            reasoning: Some(crate::params::ReasoningLevel::High),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+        };
+        // What `create_agent` bakes...
+        let baked = request_additional_params("openai", "gpt-4o", &params);
+        // ...and what the per-request path computes for the same params.
+        let per_request = request_additional_params("openai", "gpt-4o", &params);
+        assert_eq!(baked, per_request);
+    }
+
+    /// The same identity for openrouter, whose branch pins a provider
+    /// preference into the same object. Recomputing without that step would
+    /// drop the preference on every override turn.
+    #[test]
+    fn the_openrouter_branch_keeps_its_provider_preference() {
+        let params = crate::params::ModelParams {
+            reasoning: Some(crate::params::ReasoningLevel::High),
+            ..Default::default()
+        };
+        let v = request_additional_params("openrouter", "anthropic/claude", &params)
+            .expect("openrouter always has preferences");
+        let obj = v.as_object().expect("an object");
+        assert!(
+            obj.contains_key("provider"),
+            "the preference must survive recomposition: {obj:?}"
+        );
+    }
+
+    /// An override replaces rather than merges: the reason key must carry the
+    /// new value, not the old one alongside it.
+    #[test]
+    fn an_override_replaces_the_baked_reasoning() {
+        let live = crate::params::ModelParams {
+            reasoning: Some(crate::params::ReasoningLevel::Low),
+            ..Default::default()
+        };
+        let overrides = crate::turn_overrides::TurnOverrides {
+            reasoning: Some(crate::params::ReasoningLevel::High),
+            ..Default::default()
+        };
+        let effective = overrides.apply(&live);
+        assert_eq!(
+            effective.reasoning,
+            Some(crate::params::ReasoningLevel::High)
+        );
+        let with_override = request_additional_params("openai", "gpt-4o", &effective);
+        let without = request_additional_params("openai", "gpt-4o", &live);
+        assert_ne!(
+            with_override, without,
+            "the override must actually change what goes on the wire"
+        );
+    }
+
+    /// Overrides never touch the live params — the reason there is no restore
+    /// step, and the reason one cannot reach the next turn or the per-model
+    /// memory.
+    #[test]
+    fn an_override_leaves_the_live_params_alone() {
+        let app = app_with(crate::params::ModelParams {
+            reasoning: Some(crate::params::ReasoningLevel::Med),
+            temperature: Some(0.7),
+            ..Default::default()
+        });
+        let overrides = crate::turn_overrides::TurnOverrides {
+            reasoning: Some(crate::params::ReasoningLevel::Max),
+            temperature: Some(0.1),
+            top_p: Some(0.2),
+        };
+        let (effective, _) = effective_params(&app, &overrides);
+        assert_eq!(
+            effective.reasoning,
+            Some(crate::params::ReasoningLevel::Max)
+        );
+        assert_eq!(effective.temperature, Some(0.1));
+        // The live params — and therefore the per-model memory — are unchanged.
+        let live = app.params();
+        assert_eq!(live.reasoning, Some(crate::params::ReasoningLevel::Med));
+        assert_eq!(live.temperature, Some(0.7));
+        assert_eq!(live.top_p, None);
+    }
+
+    #[test]
+    fn no_overrides_means_no_notes_and_the_live_params() {
+        let app = app_with(crate::params::ModelParams {
+            reasoning: Some(crate::params::ReasoningLevel::Med),
+            ..Default::default()
+        });
+        let (effective, notes) = effective_params(&app, &Default::default());
+        assert!(notes.is_empty());
+        assert_eq!(effective, app.params());
+    }
+
+    /// A level the model cannot serve is reported, because a silent downgrade
+    /// the user cannot account for is worse than a note.
+    #[test]
+    fn a_level_the_model_lacks_is_reported() {
+        // A model that publishes only `low`, so `max` has to move down.
+        let support = crate::params::ReasoningSupport::new(vec!["low".to_string()]);
+        let note = reasoning_remap_note(crate::params::ReasoningLevel::Max, &support)
+            .expect("max cannot be served by a low-only model");
+        assert!(note.contains("max"), "{note}");
+        assert!(note.contains("low"), "{note}");
+    }
+
+    /// A pure spelling difference is not a downgrade, and must not be reported
+    /// as one: our `med` and their `medium` are the same rank.
+    #[test]
+    fn a_spelling_difference_is_not_reported_as_a_remap() {
+        let support = crate::params::ReasoningSupport::new(vec![
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+        ]);
+        assert_eq!(
+            reasoning_remap_note(crate::params::ReasoningLevel::Med, &support),
+            None,
+            "med == medium, so nothing moved"
+        );
+    }
+
+    /// An exactly-supported level is silent.
+    #[test]
+    fn a_supported_level_is_silent() {
+        let support =
+            crate::params::ReasoningSupport::new(vec!["low".to_string(), "high".to_string()]);
+        assert_eq!(
+            reasoning_remap_note(crate::params::ReasoningLevel::High, &support),
+            None
+        );
+    }
+
+    /// No data at all must not be reported as a remap: `resolve` returns `None`
+    /// when the model publishes nothing, and silence is the honest answer.
+    #[test]
+    fn an_unknown_support_table_is_silent() {
+        let support = crate::params::ReasoningSupport::unknown();
+        assert_eq!(
+            reasoning_remap_note(crate::params::ReasoningLevel::Max, &support),
+            None
+        );
     }
 }
 

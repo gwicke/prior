@@ -103,6 +103,35 @@ pub fn fmt_value(v: f64) -> String {
     }
 }
 
+/// Parse + range-check one value for `param`.
+///
+/// Empty clears the setting (the inverse of setting it). Anything else must
+/// parse as a number inside the range; the error names the key, the value and
+/// the range, because a bare "invalid" sends the user hunting.
+///
+/// The single validator, shared by the `/temperature` and `/top_p` menu nodes
+/// and by the per-turn override parser — so a value one accepts cannot be
+/// rejected by the other, and a range change lands in both at once.
+pub fn parse_value(param: NumberParam, raw: &str) -> Result<Option<f64>, String> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    let n: f64 = v
+        .parse()
+        .map_err(|_| format!("{} must be a number (got '{v}')", param.name()))?;
+    let (lo, hi) = param.range();
+    if !n.is_finite() || n < lo || n > hi {
+        return Err(format!(
+            "{} must be between {} and {} (got '{v}')",
+            param.name(),
+            fmt_value(lo),
+            fmt_value(hi),
+        ));
+    }
+    Ok(Some(n))
+}
+
 /// Display value for the row: the live value, or the fact that there is none.
 /// A literal placeholder number would be a lie — the default is the provider's.
 fn display_value(p: NumberParam, params: &ModelParams) -> String {
@@ -165,30 +194,9 @@ impl NumberParamNode {
         }
     }
 
-    /// Parse + range-check one committed value.
-    ///
-    /// Empty clears the setting (the inverse of setting it). Anything else
-    /// must parse as a number inside the range; the error names the key, the
-    /// value and the range, because a bare "invalid" sends the user hunting.
+    /// Parse + range-check one committed value. See [`parse_value`].
     fn parse(&self, raw: &str) -> Result<Option<f64>, String> {
-        let v = raw.trim();
-        if v.is_empty() {
-            return Ok(None);
-        }
-        let n: f64 = v
-            .parse()
-            .map_err(|_| format!("{} must be a number (got '{}')", self.param.name(), v))?;
-        let (lo, hi) = self.param.range();
-        if !n.is_finite() || n < lo || n > hi {
-            return Err(format!(
-                "{} must be between {} and {} (got '{}')",
-                self.param.name(),
-                fmt_value(lo),
-                fmt_value(hi),
-                v
-            ));
-        }
-        Ok(Some(n))
+        parse_value(self.param, raw)
     }
 }
 
