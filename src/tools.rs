@@ -425,28 +425,26 @@ fn test_bsed_path() -> Option<std::path::PathBuf> {
 }
 
 /// Point `bsed_path` at the binary this workspace just built, for as long as the
-/// returned guard lives.
+/// returned guard lives. `None` when there is no such binary, and in that case
+/// nothing is overridden — see the tests for what that must not turn into.
 ///
-/// Production resolves `bsed` from `$PATH`, and that is right — a user has it
-/// wherever they installed it. A test must not, for two reasons that both bite
-/// in practice:
-///
-/// * `$PATH` may have no `bsed` at all, and the test then quietly skips. A test
-///   that skips is indistinguishable from a test that passes, so a broken tool
-///   can go unnoticed for as long as nobody has the binary installed.
-/// * `$PATH` may have an *older* one, and then the test exercises a parser that
-///   is not this checkout's. The tool builds `bsed`'s argv, so the two have to
-///   agree; when they did not, the test failed against a stale install rather
-///   than telling anyone the argv was wrong.
+/// Production resolves `bsed` from `$PATH`, and that is right: a user has it
+/// wherever they installed it. A test must not, because the tool builds `bsed`'s
+/// argv and the two have to be the same version. When they were not, a test
+/// failed against a stale install and the failure pointed at the test rather
+/// than at the argv.
 ///
 /// The binary is found next to the running test executable
-/// (`target/<profile>/deps/<test>` -> `target/<profile>/bsed`), which is where
-/// `cargo test` puts it. It has to be built: the tests are in the same crate as
-/// the `[[bin]]`, and Cargo does not build binaries for unit-test targets, so a
-/// bare `cargo test` needs a `cargo build` first. The assertion below says so
-/// rather than skipping.
+/// (`target/<profile>/deps/<test>` -> `target/<profile>/bsed`). It has to have
+/// been built: these are unit tests in the crate that declares the `[[bin]]`,
+/// and Cargo does not build binaries for unit-test targets, so `cargo test`
+/// alone leaves it missing. That is why this returns `None` rather than
+/// asserting — a CI job that only runs `cargo test` should not go red over a
+/// binary it was never asked to build. The cost is that such a run does not
+/// exercise the `sed` tool at all, so CI should `cargo build` first; the skip
+/// message says so.
 #[cfg(test)]
-pub(crate) fn use_internal_bsed() -> impl Drop {
+pub(crate) fn use_internal_bsed() -> Option<impl Drop> {
     let exe = std::env::current_exe().expect("path of the running test");
     // .../target/<profile>/deps/<test-bin> -> .../target/<profile>
     let profile_dir = exe
@@ -454,15 +452,14 @@ pub(crate) fn use_internal_bsed() -> impl Drop {
         .and_then(std::path::Path::parent)
         .unwrap_or_else(|| panic!("cannot locate the target profile dir from {exe:?}"));
     let bin = profile_dir.join(BSED_BIN);
-    assert!(
-        bin.is_file(),
-        "expected the workspace `{BSED_BIN}` at {bin:?}; run `cargo build` before `cargo test`"
-    );
+    if !bin.is_file() {
+        return None;
+    }
     let previous = {
         let mut slot = TEST_BSED.lock().expect("TEST_BSED lock");
         std::mem::replace(&mut *slot, Some(bin))
     };
-    TestBsedRestores { previous }
+    Some(TestBsedRestores { previous })
 }
 
 /// Puts the resolver back the way the test found it, so an override installed
@@ -2470,7 +2467,10 @@ mod edit_file_tests {
         // The workspace binary, for the same reason the `sed` tool tests use it:
         // a missing install would skip this, and an older one would test a
         // resolver this checkout does not have.
-        let _bsed = super::use_internal_bsed();
+        let Some(_bsed) = super::use_internal_bsed() else {
+            eprintln!("skipping: no workspace bsed; run `cargo build` first");
+            return;
+        };
         let Some(bin) = super::bsed_path() else {
             panic!("bsed did not resolve, but the workspace binary exists");
         };
@@ -2516,10 +2516,16 @@ mod edit_file_tests {
         .await
         .unwrap();
 
-        // This workspace's own `bsed`, not whatever `$PATH` has: the tool's
-        // argv and the binary's parser have to be the same version, and a
-        // missing install must fail the test rather than skip it.
-        let _bsed = super::use_internal_bsed();
+        // This workspace's own `bsed`, not whatever `$PATH` has: the tool's argv
+        // and the binary's parser have to be the same version. If it was not
+        // built, skip — and do NOT fall back to `$PATH`, which is the whole
+        // point. The override is not installed, so `bsed_path` below would
+        // resolve whatever is installed and the test would be back to testing
+        // that instead.
+        let Some(_bsed) = super::use_internal_bsed() else {
+            eprintln!("skipping: no workspace bsed; run `cargo build` first");
+            return;
+        };
         assert!(
             super::bsed_available(),
             "the workspace bsed should be available once the override is installed"
@@ -2689,7 +2695,10 @@ mod edit_file_tests {
         // normal result (exit 2), not as a tool error.
         let _cwd = CwdGuard::new();
         tokio::fs::write("a.txt", "x\n").await.unwrap();
-        let _bsed = super::use_internal_bsed();
+        let Some(_bsed) = super::use_internal_bsed() else {
+            eprintln!("skipping: no workspace bsed; run `cargo build` first");
+            return;
+        };
         let out = sed_preview("a.txt".into(), "1w /tmp/pwned".into(), ContextLines(0))
             .await
             .expect("preview returns the message");
