@@ -18,6 +18,9 @@ use crate::path_util::relativize_path;
 // previews and applies in exactly the format the `edit` tool consumes. These
 // re-exports keep every call site in this file spelled as before.
 pub use blockedit::wire::{EditArgs, MAX_ECHOED_ARGS};
+// The advertised blob field is spelled by the same const the parser reads, so the
+// schema and `EditArgs::from_wire` cannot drift into naming two different fields.
+use blockedit::blob::{BLOCKS_FIELD, LEGACY_BLOCKS_FIELD};
 use blockedit::ApplyOutcome;
 pub use blockedit::{apply_to_text, EditOp};
 
@@ -245,7 +248,7 @@ impl rig_core::tool::Tool for EditFile {
                     "type": "integer",
                     "description": "Single-edit form only: a 1-indexed anchor line. When oldText occurs more than once, the occurrence nearest this line (within a small, context-scaled tolerance) is chosen. It is a hint, not a search range, and sets no end line. A `path:LINE` suffix is an equivalent alias; if both are given they must agree. Ignored in the block form — use a `path:LINE` block header there instead."
                 },
-                "blocks": {
+                (BLOCKS_FIELD): {
                     "type": "string",
                     "description": format!("Main edit entry point, with batching support, using block syntax:\n```\n{BLOCK_SYNTAX}\n```\n{BLOCK_POLICY}")
                 }
@@ -3293,7 +3296,7 @@ mod edit_args_wire_tests {
         );
 
         let props = schema.get("properties").expect("properties present");
-        for key in ["path", "oldText", "newText", "startLine", "blocks"] {
+        for key in ["path", "oldText", "newText", "startLine", BLOCKS_FIELD] {
             assert!(
                 props.get(key).is_some(),
                 "missing property `{key}`: {schema}"
@@ -3309,15 +3312,19 @@ mod edit_args_wire_tests {
         // advertising it is what invites the nested array back onto the wire.
         assert_eq!(
             props
-                .get("blocks")
+                .get(BLOCKS_FIELD)
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
             Some("string"),
-            "`blocks` must be advertised as a string"
+            "the blob field must be advertised as a string"
         );
         assert!(
-            props.get("edits").is_none(),
-            "`edits` must not be advertised: it is storage-only: {schema}"
+            props.get(LEGACY_BLOCKS_FIELD).is_none(),
+            "the canonical array must not be advertised: it is storage-only: {schema}"
+        );
+        assert!(
+            props.get("batches").is_none(),
+            "an intermediate name must not linger: {schema}"
         );
         // No property may be a JSON array — weak harnesses stringify those.
         for (key, prop) in props.as_object().expect("properties is an object") {
@@ -3344,6 +3351,60 @@ mod edit_args_wire_tests {
             required.is_empty(),
             "no parameter is required: {required:?}"
         );
+    }
+
+    /// The advertised schema and the parser must agree on which fields exist.
+    ///
+    /// They are written down separately — a `json!` literal here, a `from_wire`
+    /// match over the raw `Value` in the crate — and nothing connected them. A
+    /// *stale copy* of this schema, served to a model by a client, is not even
+    /// observable from here: the repo stays self-consistent and green while the
+    /// model is told to send a field the parser no longer reads. That is not
+    /// hypothetical — a session was handed `edits` while the tool it reached
+    /// expected `blocks`, and the mismatch was invisible to every test in the
+    /// tree, because they all read the live `parameters()`.
+    ///
+    /// So: every advertised property must be a name `from_wire` actually reads,
+    /// and the blob property must be spelled by the parser's own const. A field
+    /// advertised here but ignored there is a silent dead end for the model.
+    #[test]
+    fn every_advertised_property_is_one_the_parser_reads() {
+        let schema = EditFile.parameters();
+        let props = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties present");
+
+        // What `EditArgs::from_wire` reads. Explicit, so that adding a field to
+        // one side without the other fails here rather than in a session.
+        let parsed = ["path", "oldText", "newText", "startLine", BLOCKS_FIELD];
+
+        for name in props.keys() {
+            assert!(
+                parsed.contains(&name.as_str()),
+                "`{name}` is advertised but `from_wire` never reads it: {schema}"
+            );
+        }
+        for name in parsed {
+            assert!(
+                props.contains_key(name),
+                "`{name}` is read by the parser but not advertised: {schema}"
+            );
+        }
+
+        // The description must name the advertised field, or the model is told
+        // one thing and handed another.
+        let desc = EditFile.description();
+        assert!(
+            desc.contains(BLOCKS_FIELD),
+            "the description must name the field it advertises: {desc}"
+        );
+        for retired in [LEGACY_BLOCKS_FIELD, "batches"] {
+            assert!(
+                !desc.contains(&format!("`{retired}`")),
+                "the description still names the retired `{retired}`: {desc}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3460,6 +3521,29 @@ mod rename_verification {
 
     /// The rename must not break a caller that never saw it. This is the shape
     /// the tool advertised for its whole life.
+    /// The exact payload a real client produced this session, replayed verbatim:
+    /// the argument object wrapped into the blob field, blob mislabelled `path`.
+    /// It must be refused *and named* — a client author reading this can fix it.
+    #[tokio::test]
+    #[serial]
+    async fn the_observed_malformation_is_diagnosed_by_name() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("mangled.txt", "one\n").await.unwrap();
+        let r = call(serde_json::json!({
+            "edits": { "path": "mangled.txt\n@@@OLD\none\n@@@NEW\n1\n@@@END" },
+            "path": "mangled.txt"
+        }))
+        .await;
+        assert!(r.is_error(), "{r:?}");
+        let text = r.output().render();
+        assert!(text.contains("is an object"), "must name the fault: {text}");
+        assert_eq!(
+            tokio::fs::read_to_string("mangled.txt").await.unwrap(),
+            "one\n",
+            "a malformed call must not write"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn a_legacy_edits_string_applies_at_the_tool_boundary() {

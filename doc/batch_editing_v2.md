@@ -1525,3 +1525,151 @@ corruption is now a loud `overlapping`/`all-claimed` failure).
       three after a reload.
 
    No canonical-form migration and no session migration.
+
+---
+
+## Audit — `e35717d` → HEAD, and what is actually broken
+
+Requested after a session in which block editing could not be driven at all.
+The premise going in was that the refined error reporting had gone missing.
+It has not. What *is* wrong is real, and none of it is that.
+
+### Nothing was lost from `e35717d`
+
+`e35717d` ("make the edit tool's argument errors terse and line-based for the
+model") is an **ancestor of both sides** of the `7d7fd3b` merge, so nothing
+about it could have been dropped by the merge resolution. Verified by content,
+not by ancestry alone:
+
+| Added by `e35717d` | `e35717d` | `57e069d` | HEAD |
+| --- | --- | --- | --- |
+| `render_blob_structure` (the line-based `Actual:`) | present | present | present |
+| `actual_summary` | present | present | present |
+| `is_path_header` | present | present | present |
+| `strip_arg_error_prefixes` | present | present | present |
+| `arg_error_view` (the two-column table) | **absent** | present | present |
+
+The only deletions in the whole error path between `e35717d` and HEAD are two
+lines of mine, both deliberate: `op_from_value` and its test
+`legacy_array_shape_still_parses`, which went when the canonical array left the
+wire (`81f6fcf`), replaced by `the_edits_array_is_rejected_with_a_named_correction`.
+
+The error path at HEAD is byte-equivalent to `57e069d` and **strictly better
+than `e35717d`**, which predates `arg_error_view` entirely. Reverting does not
+restore error reporting, because none of it was lost.
+
+### What is actually broken
+
+**F1 — the client cannot express a block call, and the tool's error does not
+say so.** Every block-shaped call in the session arrived as
+
+```
+sent:    {"path": "probe.py", "edits": "<blob>"}
+arrived: {"edits": {"path": "<blob>"}, "path": "probe.py"}
+```
+
+The blob arrives as an **object**, mislabelled under a `path` key, and
+`newText` was dropped from single-edit calls. No tool build can accept that: the
+pre-rename parser wanted a *string* under `edits`, the post-rename parser wants
+a *string* under `blocks`, and neither ever sees one. Rebuilding on `57e069d`
+changed the error text from ``or `blocks` `` to ``or `edits` `` and the
+behaviour not at all.
+
+The tool's reply — *"no recognizable edit arguments"* — is true and useless.
+The malformation is specific and nameable: a property that should hold a blob
+string is holding an object.
+
+**F2 — the advertised schema and the parser are not cross-checked, so a client
+can be handed a stale one and nothing notices.** In the same session the schema
+offered advertised `edits` (string) while the tool behind it parsed `blocks`.
+The repo was self-consistent and green throughout, because every test reads the
+live `parameters()` and the *served* copy is not observable from inside. That is
+the durable class behind F1's sibling failure: the tool was fine, the contract
+was stale, and no test could see it.
+
+**F3 — a pre-existing cwd race in the test suite, surfaced by the rebuild.**
+On `57e069d` three lib tests fail deterministically — `sed_preview_is_read_only…`,
+`sed_preview_reports_a_rejected_expression…`, `grep_text_uses_ripgrep…` — all
+with `./x: No such file or directory`. Root cause, localized: `src/tools.rs`
+carries **two** cwd guards, `TempCwd` (line 1535) and `CwdGuard` (line 2222).
+Every `CwdGuard` test is `#[serial]`, but the single `TempCwd` user,
+`glob_files_results_are_relative_to_cwd`, is **not** — so it runs outside the
+mutex and `set_current_dir`s the process underneath the serialized group.
+
+The important consequence: these three pass at HEAD. That is **ordering luck**,
+not a fix. Adding or removing tests shifts the interleaving, and at HEAD the
+narrow interleaving happens to be benign. Nothing about the race was fixed, and
+the next test added anywhere in the crate can re-arm it.
+
+**F4 — a real UI bug, also pre-existing.**
+`tests/mock_turn.rs::a_committed_line_is_bracketed_by_rules_with_the_bar_below`
+fails on a clean tree at both HEAD and `57e069d`. The committed slash line's
+`─` rules are written at `repl.rs:1491-1493` and then erased, leaving the status
+bar directly above the line: that write path does not advance the frame's
+tracked row, so the next apply clears what was just written. It came in with
+`9b00ac0`, which added the rules in the first place.
+
+**F5 — multi-file is still gated.** W1–W8 above are a plan, not shipped work.
+Correctly so: the gate is still unmeasured.
+
+### Proposal
+
+**P1 — name the malformation instead of reporting an absence.** F1 is not
+tool-fixable (the payload is not there to accept), but it is *diagnosable*, and
+that is the same class as the array correction that already exists. In
+`EditArgs::from_wire`, before the fallthrough error: if `edits`/`blocks` is
+present but is neither a string nor an array, say so —
+
+> `` `blocks` is an object; it must be a string of `@@@OLD`/`@@@NEW`/`@@@END` blocks ``
+
+This refuses exactly as now, so it widens acceptance by nothing, and it turns
+the one error a client author needs into an error that names the fault. It also
+covers the plausible neighbouring case: a harness that JSON-*stringifies* the
+blob into a nested field, which is the same bug wearing a different hat.
+
+**P2 — make the advertised schema derive from the parser, and say so when they
+diverge.** Already staged, uncommitted, in `src/tools.rs`: the advertised key is
+now `(BLOCKS_FIELD)` rather than a hand-typed `"blocks"`, so the schema and
+`from_wire` cannot name two different fields. Alongside it,
+`every_advertised_property_is_one_the_parser_reads` asserts both directions —
+every advertised property is read by `from_wire`, every property `from_wire`
+reads is advertised, and the description names the field it advertises and not a
+retired one. That closes F2 from inside; it cannot detect a *served* stale copy,
+which is a client-side concern and should be, since only the client knows what
+it was handed.
+
+**P3 — fix the cwd race rather than re-roll the ordering.** Give `glob_files_
+results_are_relative_to_cwd` the `#[serial]` it is missing, and collapse
+`TempCwd` into `CwdGuard` so there is one guard and one mutex instead of two
+guards and a partial one. Worth doing *because* F1 hid it: the session's real
+blocker sent me looking for a regression that was not there, and the first
+evidence I found was three failures in a tree I had just built. A suite that
+fails differently depending on how many tests precede it cannot answer questions
+about regressions.
+
+**P4 — leave F4 to whoever owns the frame.** The row-accounting subsystem is
+delicate, `doc/row_accounting*.md` is extensive, and a speculative fix to
+tracked-row arithmetic is how a second and harder bug gets created. The
+diagnosis is recorded; the fix belongs with the work that introduced the rules.
+
+### Status
+
+**P1 and P2 are done.** `from_wire` now diagnoses a blob field that is neither
+a string nor an array, naming the fault (`` `blocks` is an object; it must be a
+string of `@@@OLD`/`@@@NEW`/`@@@END` blocks ``) instead of reporting an absence
+the caller cannot act on — refusal is unchanged, so acceptance widens by nothing.
+The advertised schema key is now `(BLOCKS_FIELD)`, and
+`every_advertised_property_is_one_the_parser_reads` closes the schema⇄parser gap
+in both directions. P1's test replays the payload this session actually produced,
+byte for byte, through `ErasedTool::execute`, and asserts the file is untouched.
+
+P3, P4 and F5 are open, in that order.
+
+### Suggested order
+
+1. ~~**P1, P2**~~ — done. Both were about one thing: a client and the tool
+   disagreeing about a field name, with neither able to say so.
+2. **P3** — before adding any further tests, or the next one added re-arms the
+   race and the suite stops being usable as a regression signal.
+3. **P4** — with the frame's owners.
+4. **F5** — still behind the telemetry gate, unchanged.

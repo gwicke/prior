@@ -35,7 +35,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::blob;
+use crate::blob::{self, BLOCKS_FIELD, LEGACY_BLOCKS_FIELD};
 use crate::types::{EditOp, EditStartLine};
 
 /// Cap on the JSON echoed back in an invalid-parameters error, so a bad call
@@ -355,6 +355,33 @@ impl EditArgs {
             });
         }
 
+        // A blob field that is neither a string nor an array is a *specific*
+        // fault — a client that serialized the call wrongly — and it is worth
+        // more than the generic absence below, which is all we can say when we
+        // genuinely do not recognize the shape. Seen in the wild: a harness that
+        // wrapped the whole argument object into one field, so the blob arrived
+        // as `{"edits": {"path": "<blob>"}}`. Without this, that caller gets
+        // "no recognizable edit arguments" and no idea which of the three
+        // accepted shapes it failed to produce.
+        for field in [BLOCKS_FIELD, LEGACY_BLOCKS_FIELD] {
+            if let Some(v) = obj.get(field) {
+                if !v.is_string() && !v.is_array() {
+                    return Err(Self::invalid(
+                        raw,
+                        &format!(
+                            "`{field}` is {}; it must be a string of `@@@OLD`/`@@@NEW`/`@@@END` \
+                             blocks, or the canonical `edits` array",
+                            match v {
+                                Value::Object(_) => "an object",
+                                Value::Array(_) => "a list",
+                                _ => "a non-string value",
+                            }
+                        ),
+                    ));
+                }
+            }
+        }
+
         Err(Self::invalid(
             raw,
             "no recognizable edit arguments (expected `oldText`+`newText`, or `blocks`)",
@@ -530,6 +557,48 @@ mod tests {
         }))
         .unwrap_err();
         assert!(e.contains("no recognizable edit arguments"), "{e}");
+    }
+
+    /// The malformation a real client produced: the whole argument object
+    /// wrapped into the blob field, so the blob arrived as an object rather than
+    /// a string. Refused exactly as before — nothing is accepted that was not
+    /// already — but the error now names the fault instead of reporting an
+    /// absence the caller cannot act on.
+    #[test]
+    fn a_blob_field_holding_an_object_is_diagnosed_rather_than_ignored() {
+        let e = EditArgs::from_wire(&json!({
+            "edits": { "path": "@@@OLD\na\n@@@NEW\nb\n@@@END" },
+            "path": "src/x.rs"
+        }))
+        .unwrap_err();
+        assert!(e.contains("is an object"), "{e}");
+        assert!(
+            e.contains(BLOCKS_FIELD) || e.contains(LEGACY_BLOCKS_FIELD),
+            "{e}"
+        );
+        // Still a self-correcting envelope, and still not a batch failure.
+        assert!(e.contains("Expected:"), "{e}");
+
+        // The same for the current name, and for a scalar.
+        let e = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "blocks": 42
+        }))
+        .unwrap_err();
+        assert!(e.contains("non-string value"), "{e}");
+
+        // A list is the canonical form and keeps its own, different correction.
+        let e = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]
+        }))
+        .unwrap_err();
+        assert!(e.contains("`edits` is a list"), "{e}");
+
+        // And the object case does not swallow a *valid* single edit.
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "oldText": "a", "newText": "b"
+        }))
+        .unwrap();
+        assert_eq!(a.edits.len(), 1);
     }
 
     /// Every shape this tool has *ever* accepted on the wire, and what each one
