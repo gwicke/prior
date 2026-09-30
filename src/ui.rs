@@ -31,11 +31,7 @@ pub struct ConfirmSpec<'a> {
     pub quick_keys: Option<&'a [(char, usize)]>,
     /// Initial cursor position (default selection).
     pub default_sel: usize,
-    /// Draw a dim divider above the dialog: mid-turn confirmations want a
-    /// separation from the streamed output above them. Dialogs drawn inside
-    /// the REPL pass `false` — scrollback already carries a separator above
-    /// the input region (and none is re-drawn on commit either).
-    pub divider: bool,
+
     /// Subject of the decision line recorded on resolve
     /// (`accepted <subject>` / `denied <subject>`), or `None` to record
     /// nothing: the compaction review records nothing because the committed
@@ -102,7 +98,7 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
 
     // Initial render.
     let mut sel: usize = spec.default_sel;
-    draw_dialog(out, spec, &plan, sel, size);
+    draw_dialog(out, &plan, sel, size);
 
     loop {
         match event::read() {
@@ -113,7 +109,7 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
             })) => {
                 if sel > 0 {
                     sel -= 1;
-                    draw_dialog(out, spec, &plan, sel, size);
+                    draw_dialog(out, &plan, sel, size);
                 }
             }
             Ok(Event::Key(KeyEvent {
@@ -123,7 +119,7 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
             })) => {
                 if sel + 1 < spec.options.len() {
                     sel += 1;
-                    draw_dialog(out, spec, &plan, sel, size);
+                    draw_dialog(out, &plan, sel, size);
                 }
             }
             Ok(Event::Key(KeyEvent {
@@ -155,7 +151,7 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
                 // Re-compose for the new size; the cached size mismatch
                 // forces a full repaint (no DSR: the dialog keeps its place).
                 size = (w.max(1) as usize, h.max(1) as usize);
-                draw_dialog(out, spec, &plan, sel, size);
+                draw_dialog(out, &plan, sel, size);
             }
             _ => {}
         }
@@ -220,13 +216,7 @@ impl RenderAt for OverlayItem {
 /// anchors at the cursor row, every later one at the live frame's top
 /// (an intact live frame → partial row-diff). Re-composed per key and per
 /// resize — cheap, and the one place the dialog's bytes come from.
-fn draw_dialog(
-    out: &dyn Output,
-    spec: &ConfirmSpec<'_>,
-    plan: &RenderPlan,
-    sel: usize,
-    size: (usize, usize),
-) {
+fn draw_dialog(out: &dyn Output, plan: &RenderPlan, sel: usize, size: (usize, usize)) {
     let (term_w, term_h) = size;
     // The painter reports the geometry it produced: `rows` are the terminal
     // rows (each already a full-width screen row) and `focus` is where the
@@ -236,15 +226,20 @@ fn draw_dialog(
     // (ui_draw_v2 §9 #5). `focus` is only consulted when the frame budget
     // squeezes the overlay below its painted height.
     let painted = paint_overlay(&update_plan_sel(plan, sel), term_w, term_h);
-    let mut elements = Vec::new();
-    if spec.divider {
-        elements.push(Element::divider());
-    }
-    elements.push(Element::overlay(painted.rows, painted.focus.unwrap_or(0)));
     // Through the tail, not a second pipeline. This builder used to hand-roll
     // `extent → allocate → render` and call `draw_frame`, which meant two places
     // in the crate decided how the terminal's rows were divided (ui_draw_v2 §5.1.1).
-    out.draw_elements(elements, ApplyPolicy::Frame, size);
+    //
+    // Pieces in, nothing back: the composer owns the divider rule ("a menu
+    // brings a separator" — an overlay is present, so one appears) and the
+    // status row. `ConfirmSpec.divider` is what this used to consult; the rule
+    // is now the composer's, and the field is left unread.
+    out.draw_elements(
+        None,
+        Some(Element::overlay(painted.rows, painted.focus.unwrap_or(0))),
+        ApplyPolicy::Frame,
+        size,
+    );
 }
 
 /// Resolve the dialog: erase its region through the frame pipeline — a
@@ -405,7 +400,7 @@ mod tests {
             options: opts,
             quick_keys: None,
             default_sel: 0,
-            divider: false,
+
             subject: None,
         }
     }
@@ -420,7 +415,7 @@ mod tests {
         let s = spec(&opts);
         let plan = build_confirm_plan(&s);
         let rec = recorder();
-        draw_dialog(&rec, &s, &plan, 0, (42, 11));
+        draw_dialog(&rec, &plan, 0, (42, 11));
         assert_eq!(*rec.0.lock().unwrap(), Some((42, 11)));
     }
 

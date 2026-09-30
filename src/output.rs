@@ -2,8 +2,8 @@ use crate::repl::current_term_width;
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
 use crate::tools::EditOp;
 use crate::ui::frame::{
-    allocate, live_budget, plan_apply, plan_clear_live_frame, render, ApplyPolicy, DrawCache,
-    Element, Extent, Frame,
+    allocate, live_budget, plan_apply, plan_consume, plan_reposition, render, ApplyPolicy,
+    DrawCache, Element, Extent, Frame, RenderAt, Rendered,
 };
 use console::{style, StyledObject};
 use libc;
@@ -193,24 +193,26 @@ pub trait Output: Send + Sync {
     /// The one composer for the *area* (ui_draw_v2 §5.1.1):
     /// `[Status?, Input?, Divider?, Overlay?]`.
     ///
-    /// **Impure, deliberately and uniquely.** This is the only place allowed to
-    /// read state the pure phases must not see — the status row is resolved
-    /// here, from [`Self::status_row`], because `status_text` and `streaming`
-    /// are facts about this output rather than about a frame. Resolving it in
-    /// `render` instead is exactly the trap the `Element::Status` idea fell
-    /// into: the render would stop being a function of the items.
+    /// **The only place that reads state the pure phases must not see** — but
+    /// what it decides is *what the area is made of*, not what each row looks
+    /// like. The status row goes in as an element that resolves itself when it
+    /// is rendered (`Element::status`), so its text and dot are current on
+    /// every draw instead of frozen at compose time. That is not a violation of
+    /// purity, it is where it was moved to: the element owns its data source
+    /// rather than reaching back into `Output`, so `render_at` is still a
+    /// function of `(h, term_w)` plus state the element itself holds.
+    ///
+    /// The distinction matters because the two events disagree about timing.
+    /// Compose runs once per keystroke; `set_status` and the dot flip run at
+    /// turn start and end, *after* the REPL composed. Freezing the row at
+    /// compose would paint the previous turn's context figure for the whole of
+    /// the next one — which is what §4.5's content path re-draw makes visible.
     ///
     /// Callers supply only what changes: the input between turns, the overlay
     /// when a menu is open. Neither the status row nor the divider that
     /// separates an overlay from what is above it is a caller's to build — that
     /// is the whole of what makes this the *one* composer rather than a
     /// convention (§5.1.1).
-    ///
-    /// `term_w` is the width the status row is fitted for, and it is the same
-    /// value [`Self::draw_elements`] renders the frame at, so the bar can never
-    /// be sized for a different terminal than the rows around it. It is the one
-    /// parameter the doc's sketch omits: width is composition, not budget, and
-    /// budget is what that sketch was being careful not to pass.
     ///
     /// The status row takes the **divider's row**, above the input — which is
     /// what makes it permanent and what makes it safe. Being in the frame is
@@ -220,29 +222,31 @@ pub trait Output: Send + Sync {
     /// clear takes it, at the one moment the cursor is where the frame says it
     /// is — and the partial row-diff redraws it per keystroke, so the figures
     /// are never stale.
-    fn compose_area(
-        &self,
-        input: Option<Element>,
-        overlay: Option<Element>,
-        term_w: usize,
-    ) -> Vec<Element> {
+    fn compose_area(&self, input: Option<Element>, overlay: Option<Element>) -> Vec<Element> {
         let mut items = Vec::new();
-        if let Some(row) = self.status_row(term_w) {
+        if let Some(row) = self.status_row() {
             items.push(row);
         }
         items.extend(area_body(input, overlay));
         items
     }
 
-    /// The status row, resolved at compose time: one `Element`, `must ==
-    /// might == 1`.
+    /// The area's status row, or `None` when there is nothing to say: one
+    /// `Element`, `must == might == 1`.
+    ///
+    /// *Presence* is decided here and content is not, because presence is the
+    /// part that does not move under it: every compose happens after
+    /// `read_input`'s `set_status`, so the flag cannot flip between compose and
+    /// draw. What the row says is `Element::status`'s own business, resolved
+    /// when it is rendered — and at the width it is rendered at, so a width
+    /// arrives from `render_at` rather than being carried through compose.
     ///
     /// Default `None` — an output with no screen has no bar to show, which is
     /// also what every non-console output wants from [`Self::compose_area`]:
     /// the input and the overlay, and nothing standing in for a readout.
     /// `ConsoleOutput` is the one that overrides it, and it is the one that
     /// holds `status_text` and `streaming`.
-    fn status_row(&self, _term_w: usize) -> Option<Element> {
+    fn status_row(&self) -> Option<Element> {
         None
     }
 
@@ -263,29 +267,46 @@ pub trait Output: Send + Sync {
         (dims.0.max(1), dims.1.max(1))
     }
 
-    /// Compose, allocate, render and apply an element list — **the one place the
-    /// pure pipeline runs** (ui_draw_v2 §5.1.1).
+    /// Compose, allocate, render and apply an area — **the one place the pure
+    /// pipeline runs** (ui_draw_v2 §5.1.1).
     ///
-    /// Callers supply *content*: the items, in composition order. The budget is
-    /// derived from `dims`, never passed in — a caller that hands a budget is
-    /// being asked to know something it shouldn't. `dims` itself stays as an
-    /// argument because it is the caller's *belief* about the terminal, and
-    /// resize detection compares that belief against what was painted.
+    /// Callers supply *content*: the pieces, **moved in**. Nothing comes back —
+    /// no `Vec<Element>` crosses a call site, because no caller ever used one
+    /// except to hand it straight to the next statement. The composition is
+    /// recorded through [`remember_area`](Output::remember_area), which is what
+    /// lets §4.5's content path re-draw the area without recomposing it.
+    ///
+    /// The budget is derived from `dims`, never passed in — a caller that hands
+    /// a budget is being asked to know something it shouldn't. `dims` itself
+    /// stays as an argument because it is the caller's *belief* about the
+    /// terminal, and resize detection compares that belief against what was
+    /// painted.
     ///
     /// A default impl because every output draws the same way: only the tail,
     /// [`draw_frame`](Output::draw_frame), varies (test outputs paint nothing).
     fn draw_elements(
         &self,
-        elements: Vec<Element>,
+        input: Option<Element>,
+        overlay: Option<Element>,
         policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
         let (tw, th) = (dims.0.max(1), dims.1.max(1));
-        let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
+        let stack = self.compose_area(input, overlay);
+        let extents: Vec<Extent> = stack.iter().map(Element::extent).collect();
         let heights = allocate(&extents, live_budget(th));
-        let frame = render(&elements, &heights, tw);
-        self.draw_frame(&frame, policy, dims)
+        let frame = render(&stack, &heights, tw);
+        let applied = self.draw_frame(&frame, policy, dims);
+        // Moved, never copied: the recipe belongs to the composition that built
+        // it, and the cache is the only other place that reads it.
+        self.remember_area(stack);
+        applied
     }
+
+    /// Record the composition [`draw_elements`](Output::draw_elements) just
+    /// built, so §4.5's content path can re-draw it without recomposing.
+    /// Default no-op: an output with no screen has nothing to remember.
+    fn remember_area(&self, _stack: Vec<Element>) {}
 
     /// Gate the background in-flight reader should honor. While it is `true`,
     /// the reader must not read stdin, because a confirmation dialog on the
@@ -543,13 +564,17 @@ pub struct ConsoleOutput {
     /// screen at exactly those points, and the boundary then emits a second
     /// blank — which is the class of bug the separator matrix pinned.
     stream_tail: StreamTail,
-    /// Where the transient status line currently sits, so the next content
-    /// write can erase it (`None` when none is showing).
-    status: Mutex<Option<StatusSpot>>,
-    /// The status line's content, painted after each content block (an all-empty
-    /// `StatusText` is off). Content rather than rendered bytes, because the
-    /// width is this layer's to know: see [`status_bar`].
-    status_text: Mutex<StatusText>,
+    /// The status line's content (an all-empty `StatusText` is off). Content
+    /// rather than rendered bytes, because the width is this layer's to know:
+    /// see [`status_bar`].
+    ///
+    /// `Arc`'d so [`Element::status`] can hold its own handle: the row is
+    /// resolved when the frame is **drawn**, not when it is composed, so a
+    /// `set_status` or a dot flip landing between compose and draw still shows
+    /// up (ui_draw_v2 §4.5 P1/P2). Compose decides *whether* the row exists —
+    /// every compose happens after `read_input`'s `set_status`, so presence is
+    /// settled — and render decides what it says.
+    status_text: Arc<Mutex<StatusText>>,
     /// Whether a turn is in flight, which is the bar dot's only state.
     ///
     /// Owned here rather than passed in because this layer is what *draws* it,
@@ -557,15 +582,7 @@ pub struct ConsoleOutput {
     /// is how the idle bar and the streaming bar came to be two renderings of
     /// one function. The flag flips in `begin_response`/`end_response`, so the
     /// bar's state cannot disagree with whether a turn is actually running.
-    streaming: std::sync::atomic::AtomicBool,
-    /// A frame has claimed the tail rows since the last status paint.
-    ///
-    /// Sticky on purpose: one content *burst* is often several writes (a
-    /// block's boundary, then its body), and the first erases the frame, so a
-    /// per-write "is a frame live?" would let the second paint a status onto
-    /// rows the frame owned. The flag clears on the first successful paint,
-    /// which is by definition after the content has moved past the frame.
-    frame_owns_tail: std::sync::atomic::AtomicBool,
+    streaming: Arc<std::sync::atomic::AtomicBool>,
     /// Stores the previous writer during a capture session (see
     /// [`ConsoleOutput::begin_capture`] / [`ConsoleOutput::end_capture`]).
     saved_writer: Mutex<Option<Box<dyn io::Write + Send>>>,
@@ -1356,10 +1373,8 @@ impl ConsoleOutput {
 
             last_tool: Mutex::new(None),
             stream_tail: StreamTail::new(),
-            status: Mutex::new(None),
-            status_text: Mutex::new(StatusText::default()),
-            frame_owns_tail: std::sync::atomic::AtomicBool::new(false),
-            streaming: std::sync::atomic::AtomicBool::new(false),
+            status_text: Arc::new(Mutex::new(StatusText::default())),
+            streaming: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saved_writer: Mutex::new(None),
         }
     }
@@ -1602,26 +1617,45 @@ impl ConsoleOutput {
     where
         F: FnOnce(&mut dyn io::Write) -> T,
     {
-        // A transient status line goes before anything is written over it, and
-        // the cursor returns to where it was — which is where this write
-        // starts. Ahead of the writer lock: `clear_status` takes it.
-        self.clear_status();
         let mut out = self.writer.lock().unwrap();
+        // **Consume, do not erase** (§4.5 P1). The cursor is inside the live
+        // frame, so it walks up to the fold and the write takes those rows over
+        // from the top down. The frame's rows are about to hold content, not be
+        // cleared — which is the whole difference from the clear this replaces,
+        // and why the area now survives the turn instead of dying at its first
+        // write.
+        let (walk, taken) = {
+            let mut cache = self.draw.lock().unwrap();
+            match plan_consume(&mut cache) {
+                Some((walk, frame)) => (walk, Some(frame)),
+                // No live area: the cursor is wherever the last write left it,
+                // which is where the content belongs. Nothing to walk and no
+                // `CR` to emit — the column is the content path's own
+                // bookkeeping here, not something to reset.
+                None => (String::new(), None),
+            }
+        };
+        // The walk goes **ahead of the counter**, straight to the writer. It is
+        // cursor movement, not content, and letting `RowCounter` see it was a
+        // real bug: `StreamTail::note` clears *both* of its bits on any byte
+        // that is not a newline, so the walk's `CR` and escapes read as "the
+        // stream does not end with a blank line" and every `boundary()` inside
+        // the write then emitted a blank line of its own.
+        //
+        // Under the old scheme that never showed, because the frame was retired
+        // by the write and the walk was empty from then on — one corrupted tail
+        // per turn, at most. The area is re-emitted now, so *every* write carries
+        // a walk and every boundary doubled. The count was never wrong either
+        // way: the walk emits no newline.
+        if !walk.is_empty() {
+            let _ = out.write_all(walk.as_bytes());
+        }
         // The counter updates the shared tail per byte, so a boundary
         // *inside* this block (a committed paragraph before the block that
         // follows it) sees the state those bytes produced, not the state from
-        // before the block.
+        // before the block — and so the tail describes the content, and nothing
+        // else.
         let mut counter = RowCounter::new(&mut **out, width, &self.stream_tail);
-        // Every content write starts at the cursor, which is inside the live
-        // frame when there is one. Erase that frame first, or the write strands
-        // the rows it does not cover (`plan_clear_live_frame`).
-        let clear = {
-            let mut cache = self.draw.lock().unwrap();
-            plan_clear_live_frame(&mut cache)
-        };
-        if !clear.is_empty() {
-            let _ = counter.write_all(clear.as_bytes());
-        }
         let r = f(&mut counter);
         let rows = counter.rows();
         let _ = counter.flush();
@@ -1631,149 +1665,62 @@ impl ConsoleOutput {
         if rows > 0 {
             self.note_lines(rows);
         }
-        // The status line rides at the tail of the content, so it is live for
-        // the whole turn rather than only at its end. After the writer lock: it
-        // writes to the writer itself, deliberately outside the counter.
-        self.paint_status();
+        // The area comes back below what was just written — re-rendered rather
+        // than replayed, so its status row is whatever it is *now*: the turn's
+        // `set_status` and the dot's flip both happen after the REPL composed.
+        // Done on every write with an area, including a zero-row one, because
+        // `plan_consume` already retired `live` and only a reposition puts it
+        // back (a missing `live` means the *next* write finds nothing to
+        // consume and the area never returns).
+        if let Some(taken) = taken {
+            let bytes = self.reposition_area(width, taken);
+            let mut out = self.writer.lock().unwrap();
+            let _ = out.write_all(bytes.as_bytes());
+            let _ = out.flush();
+        }
         r
     }
 
-    /// Paint the transient status line at the cursor, if it is time.
+    /// The area's re-emit: re-render the stored recipe (§5.1.1) and walk it to
+    /// where the content write left off.
     ///
-    /// Called at the tail of every content write, so the readout is live for
-    /// the whole turn rather than only at its end. Three conditions are the
-    /// whole contract:
+    /// Re-render rather than replay `taken`: a `Frame` is a snapshot of the
+    /// status as of the last compose, and the bar moves without the REPL
+    /// composing — `set_status` at turn start, the dot at
+    /// `begin_response`/`end_response`. The recipe is the thing that stays
+    /// current, which is why `DrawCache` keeps it and not the rendered rows.
     ///
-    /// - **Relative only** — the bytes are the text, no `CUP` — so a viewport
-    ///   scrolled back into the scrollback is never written into; the write
-    ///   lands below it, invisible. That is why this is not a frame element
-    ///   (doc/row_accounting.md, zone 2).
-    /// - **At column 0** — the line is transient and the next content write
-    ///   erases it, so starting it mid-line would take a partially written
-    ///   content line with it. `StreamTail::at_line_start` is that check, free.
-    /// - **No frame was live** — a frame owns the last rows (the prompt's
-    ///   input, a dialog), and the prompt-side status is a frame concern.
-    fn paint_status(&self) {
-        let stored = self.status_text.lock().unwrap().clone();
-        // `is_off` is the stored-content test (see it for why it isn't the bar).
-        if stored.is_off() || !self.stream_tail.at_line_start() {
-            return;
-        }
-        let text = status_bar(
-            &stored,
-            term_width(),
-            self.streaming.load(std::sync::atomic::Ordering::Relaxed),
-        );
-        if self
-            .frame_owns_tail
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            // A frame claimed these rows, and this write only just erased them
-            // (see `plan_clear_live_frame`) — so the status waits for the next
-            // one, which lands below the content rather than among them. Held
-            // across a *burst*: the boundary write and the body write are two
-            // calls, and only the second is past the frame.
-            return;
-        }
-        // Straight to the writer, **not** through the row counter: the status is
-        // transparent to the blank-line rule, and now to the row count too (see
-        // the gap note below).
-        //
-        // The **gap**: one blank row between the last content line and the bar,
-        // so the two are never adjacent — which is what makes the bar readable
-        // below a grey tool panel.
-        //
-        // `ends_blank()` is the blank-line rule's own bit, and it already answers
-        // the only question there is: it is true when the row the stream *just
-        // closed* was itself empty. When it is, that row **is** the gap and the
-        // bar takes the current row — the status reuses the blank the content
-        // path already wrote instead of stacking a second one on top of it. When
-        // it is false the last line of the block is directly above, so the status
-        // opens a blank row of its own.
-        //
-        // Reusing the rule's bit rather than keeping a second opinion is the whole
-        // trick. The two features used to disagree and the screen showed it: a
-        // tool call's boundary blank and the gap were two different rows, so a
-        // boundary followed by a bar left *two* blank lines where one was meant.
-        // One source of truth cannot disagree with itself.
-        //
-        // The status therefore *owns* the gap when it needs one, instead of
-        // borrowing the content's trailing newline: a chunk that does not end on
-        // a newline does not leave a row to borrow.
-        //
-        // The write is relative and needs no row: `at_line_start` above is what
-        // admits us here, so the status starts a fresh line.
-        let gap = !self.stream_tail.ends_blank();
-        let mut out = self.writer.lock().unwrap();
-        if gap {
-            let _ = out.write_all(b"\n");
-        }
-        let _ = out.write_all(text.as_bytes());
-        // The bar is exactly the terminal's width, so writing it leaves the
-        // cursor *wrap-pending* in the last column. A `CR` cancels that, and
-        // without it whatever writes next starts in a state it does not expect:
-        // a dialog's frame apply opens with bare LFs, and a pending wrap makes
-        // the terminal complete the line first and move a row further than the
-        // block asked for. `rows_of` is computed on the bar without this byte,
-        // which adds no row.
-        let _ = out.write_all(b"\r");
-        // Put back the dim the bar's own reset just cleared.
-        //
-        // `ensure_dim` emits `\x1b[2m` / `\x1b[0m` only when the tracked
-        // `dim_on` *changes*, so a status bar in the middle of streamed
-        // reasoning used to break it in both directions: the bar inherited the
-        // terminal's dim (its `38;5;245m` sets a colour, not an attribute, so it
-        // did not clear dim) and its trailing reset then silenced the *next*
-        // reasoning write, which saw no change to re-assert. The bar opens with
-        // its own reset now, but the ambient state is still ours to restore, and
-        // it is the flag, not the terminal, that decides.
-        if *self.dim_on.lock().unwrap() {
-            let _ = out.write_all(b"\x1b[2m");
-        }
-        // Hide the cursor for as long as the bar is up. The bar annotates a turn
-        // in flight — there is nothing to type into — and a block cursor parked
-        // at column 0 of a dark full-width bar is the brightest thing on the
-        // screen. `draw_frame` shows it again when the input row comes back, and
-        // `TermGuard::stop` covers exiting while it is hidden.
-        let _ = out.write_all(HIDE_CURSOR);
-        let _ = out.flush();
-        drop(out);
-        // The gap row, when the paint opened one, plus the bar's own row. The
-        // bar is truncated to the terminal, so it cannot wrap and the `max(1)`
-        // is its single row — kept explicit so a future change that lets it wrap
-        // widens the erase instead of leaving a row behind.
-        let rows = usize::from(gap) + crate::row_count::rows_of(&text, term_width()).max(1);
-        *self.status.lock().unwrap() = Some(StatusSpot { rows });
-        // **No `note_lines` here**, and the gap is why that is now structural
-        // rather than incidental. The cursor physically sits on the bar, one row
-        // below where the stream logically is; `clear_status` walks it back to
-        // the gap row before the next write, so every writer sees the row the
-        // content actually ended on. Counting the gap would push the tracked row
-        // one too far and the *next* block's blank-line rule would then see a
-        // row that is not blank.
-    }
-
-    /// Erase a transient status line, if one is showing, leaving the cursor at
-    /// its first cell — which is where the next content write starts. Called at
-    /// the head of every content write, so the status never outlives the block
-    /// it annotated.
-    ///
-    /// Relative, like the write: the cursor has not moved since the status was
-    /// painted, so `CR` + `EL` is the whole of it and `CUU` covers the rows a
-    /// wrapped status took. No row is addressed at all, which matters twice
-    /// over — it cannot land on the wrong row, and it cannot write into a
-    /// viewport the user has scrolled back into.
-    fn clear_status(&self) {
-        let Some(spot) = self.status.lock().unwrap().take() else {
-            return;
+    /// `taken` is not a formality: it is the fallback when no recipe recorded
+    /// itself — a frame applied without a composition behind it (a test, or a
+    /// direct `draw_frame`). Falling back keeps the invariant that matters more
+    /// than freshness, I5: an area that was consumed is always put back, so a
+    /// half-consumed frame is never left stranded on screen.
+    fn reposition_area(&self, width: usize, taken: Frame) -> String {
+        let tw = width.max(1);
+        let th = term_height().max(1);
+        let mut cache = self.draw.lock().unwrap();
+        let frame = if cache.element_stack.is_empty() {
+            taken
+        } else {
+            let heights = {
+                let extents: Vec<Extent> =
+                    cache.element_stack.iter().map(Element::extent).collect();
+                allocate(&extents, live_budget(th))
+            };
+            render(&cache.element_stack, &heights, tw)
         };
-        let mut bytes = String::from("\r\x1b[K");
-        for _ in 1..spot.rows.max(1) {
-            bytes.push_str("\x1b[1A\r\x1b[K");
+        // **A frame with no rows has nothing to put back.** `ui::resolve` clears
+        // a dialog by applying `Frame::empty()`, and `plan_full` records that as
+        // a live frame of height 0 — so a content write right after a resolve
+        // consumes a zero-height area. Repositioning it would ask
+        // `plan_reposition` to paint nothing, which is a no-op at best and a
+        // `debug_assert!(h > 0)` panic in a debug build at worst. Returning
+        // empty is the honest answer: there is no area to re-emit, and the
+        // tracked row already moved with the content that consumed it.
+        if frame.height() == 0 {
+            return String::new();
         }
-        let mut out = self.writer.lock().unwrap();
-        let _ = out.write_all(bytes.as_bytes());
-        let _ = out.flush();
+        plan_reposition(&mut cache, &frame, tw, th)
     }
 
     /// Commit all buffered *thinking* to the (dimmed) thinking renderer and
@@ -1933,19 +1880,11 @@ impl ConsoleOutput {
     }
 }
 
-/// How many rows the transient status line took — more than one when it wrapped
-/// at a narrow terminal. That is all the erase needs: the cursor is still where
-/// the status ended, so the erase is relative, exactly like the write.
-struct StatusSpot {
-    rows: usize,
-}
-
-/// DECTCEM show/hide. The status line hides the cursor while a turn streams —
-/// the bar is an annotation, not a place to type — and a frame apply shows it
-/// again. `TermGuard::stop` emits `SHOW_CURSOR` unconditionally as the net for
-/// exiting while it is hidden.
+/// DECTCEM show. A frame apply shows the cursor (a frame is where the user
+/// types), and `TermGuard::stop` emits it unconditionally as the net for
+/// exiting with it hidden. Nothing in this layer *hides* it any more — that was
+/// `paint_status`'s job, deleted with the transient bar (ui_draw_v2 §4.5 P2).
 pub(crate) const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
-const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 
 /// The status line's content, before it is fitted to a width: what names the
 /// session, and the model group as separate fields.
@@ -2057,6 +1996,54 @@ fn dot_cell(width: usize) -> (&'static str, &'static str, usize) {
 /// so a long session name uses the whole gap and ends in an ellipsis instead of
 /// stopping short and leaving a hole. The model group is measured first, because
 /// it is the part with nothing to give.
+/// The area's status row, as an element that resolves **when it is drawn**.
+///
+/// `Element::lines` would bake `status_bar(...)`'s output into the element at
+/// compose time — and compose runs once per keystroke, while the two things
+/// the bar shows (`set_status`'s figures and the streaming dot) move at turn
+/// start and end. Holding the handles instead makes every draw current,
+/// including §4.5 P1's re-emit of the area under a content write.
+///
+/// The element owns its data source rather than reaching back into `Output`,
+/// which is what keeps `render_at` a function of `(h, term_w)` plus state this
+/// element holds itself — constructible with no terminal and no output in
+/// sight, so §3.1's unit-testability is intact rather than traded away.
+struct StatusItem {
+    text: Arc<Mutex<StatusText>>,
+    streaming: Arc<AtomicBool>,
+}
+
+impl RenderAt for StatusItem {
+    fn render_at(&self, _h: usize, term_w: usize) -> Rendered {
+        let text = self.text.lock().unwrap();
+        // Off between compose and render → say nothing rather than render an
+        // empty bar's furniture. The row was reserved by the allocator either
+        // way, so nothing below it moves.
+        let row = if text.is_off() {
+            String::new()
+        } else {
+            status_bar(
+                &text,
+                term_w,
+                self.streaming.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        };
+        Rendered {
+            rows: vec![row],
+            caret: None,
+        }
+    }
+}
+
+impl Element {
+    /// The status row: `must == might == 1`, text resolved at render time.
+    /// Presence is `status_row`'s decision; this is only ever built when there
+    /// is something to say (see [`StatusItem`]).
+    pub(crate) fn status(text: Arc<Mutex<StatusText>>, streaming: Arc<AtomicBool>) -> Self {
+        Element::new(1, 1, StatusItem { text, streaming })
+    }
+}
+
 pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> String {
     // Owned because the fit *pops* — that is the whole drop mechanism, and a
     // borrowed slice cannot be popped from. One clone per bar, on a path that is
@@ -2500,10 +2487,6 @@ impl Output for ConsoleOutput {
         };
         let _ = out.write_all(bytes.as_bytes());
         let _ = out.flush();
-        // A frame no longer owns the tail rows: it was just retired, so the
-        // transient status may paint there again.
-        self.frame_owns_tail
-            .store(false, std::sync::atomic::Ordering::Relaxed);
         row
     }
 
@@ -2521,29 +2504,28 @@ impl Output for ConsoleOutput {
         // source for both phases of the frame (ui_draw_v2 §9 #3). Clamped
         // to what `plan_apply` stores as the live frame's `term_w`/`term_h`.
         let (tw, th) = (dims.0.max(1), dims.1.max(1));
-        // A transient status goes before the frame does: the frame is about to
-        // own these rows, and a full-width status bar left showing under a
-        // dialog is the most visible thing on screen. Content writes already do
-        // this (in `with_content_writer`); a frame apply is the other way a row
-        // can be taken. Ahead of the writer lock: `clear_status` takes it.
-        self.clear_status();
         // Lock the writer before the cache so the byte emission and the cache
         // advance are one atomic step, and so we never hold `draw` while
         // acquiring `writer` (matching `display_*`: writer, then `note_lines`).
         let mut out = self.writer.lock().unwrap();
         let bytes = {
             let mut cache = self.draw.lock().unwrap();
+            // The recipe belongs to whatever composed *this* frame. Reaching
+            // `draw_frame` directly (a test, `ui::resolve`'s empty frame) means
+            // nothing composed an area, so the previous one is not what is on
+            // screen any more — and a content write must not re-emit it.
+            // `draw_elements` re-stores immediately after, so its own
+            // composition survives the clear.
+            cache.element_stack.clear();
             plan_apply(&mut cache, frame, policy, tw, th)
         };
         let _ = out.write_all(bytes.as_bytes());
-        // The status line hid the cursor; a frame is where the user types again,
-        // so this is where it comes back.
+        // A frame is where the user types, so the cursor is shown here whatever
+        // left it hidden. Nothing in this layer hides it any more — that was
+        // `paint_status`'s — but `TermGuard` and the shell can, and this is the
+        // cheapest place to be sure.
         let _ = out.write_all(SHOW_CURSOR);
         let _ = out.flush();
-        // A frame now owns the tail rows: the transient status must not paint
-        // over them until content has moved past (see `frame_owns_tail`).
-        self.frame_owns_tail
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         (tw, th)
     }
 
@@ -2853,10 +2835,10 @@ impl Output for ConsoleOutput {
             ],
             quick_keys: Some(&[('y', 0), ('n', 1), ('s', 2)]),
             default_sel: 1, // No
-            // Mid-turn: a divider separates the dialog from the streamed
-            // output above; the resolved choice is recorded as a synthetic
-            // decision line (`accepted tool X` / `denied tool X`).
-            divider: true,
+            // The divider that separates a mid-turn dialog from the streamed
+            // output above is the composer's rule now, not a flag here (§5.1.1).
+            // What stays spec-side is the decision line: `accepted tool X` /
+            // `denied tool X`, recorded when the dialog resolves.
             subject: Some(crate::ui::confirm_subject(message)),
         };
 
@@ -2954,13 +2936,21 @@ impl Output for ConsoleOutput {
     /// `None` when the status is off, for the same reason `paint_status`
     /// returns early: there is no bar to show, and an off status must not
     /// become an empty full-width row.
-    fn status_row(&self, term_w: usize) -> Option<Element> {
-        let stored = self.status_text.lock().unwrap().clone();
-        if stored.is_off() {
+    fn status_row(&self) -> Option<Element> {
+        if self.status_text.lock().unwrap().is_off() {
             return None;
         }
-        let streaming = self.streaming.load(std::sync::atomic::Ordering::Relaxed);
-        Some(Element::lines(vec![status_bar(&stored, term_w, streaming)]))
+        Some(Element::status(
+            self.status_text.clone(),
+            self.streaming.clone(),
+        ))
+    }
+
+    /// Remember the composition so §4.5's content path can re-draw it. The only
+    /// output that has a screen has something to keep; everyone else drops it
+    /// (the default), which is also why nothing here can be read by mistake.
+    fn remember_area(&self, stack: Vec<Element>) {
+        self.draw.lock().unwrap().element_stack = stack;
     }
 
     /// Remember the status line to paint after each content block; see
@@ -3105,11 +3095,12 @@ mod tests {
     /// The dot's colour is the bar's only state, and it is **derived** from the
     /// response lifecycle rather than passed in at a call site.
     ///
-    /// It used to be passed in — as a hardcoded `true` at the one site that built the
-    /// text — which meant the bar's state was a claim the caller made about whether a
-    /// turn was running, and nothing checked the claim. Now the flag flips in
-    /// `begin_response`/`end_response`, so the bar cannot claim to be streaming when no
-    /// turn is in flight.
+    /// Composed **once**, deliberately. The recipe is what `DrawCache` keeps, and
+    /// the two renders below differ only in `streaming` — which is the whole of
+    /// §5.1.1's split: presence is compose's, content is the element's, resolved
+    /// when it is drawn. Asserting on the *rendered* row is what makes this a
+    /// check that the element reads the flag; a flag set and never consulted
+    /// would pass a state assertion alone.
     #[test]
     #[serial]
     fn the_dot_follows_the_response_lifecycle() {
@@ -3119,22 +3110,21 @@ mod tests {
             !out.streaming.load(std::sync::atomic::Ordering::Relaxed),
             "no turn in flight, so the bar is idle"
         );
-        out.begin_capture();
+        // Composed while idle — the REPL composes once per keystroke, and the
+        // turn's flag flips *after* that (agent.rs `begin_response`), so a row
+        // baked at compose time would show the previous turn's dot.
+        let area = out.compose_area(None, None);
         out.begin_response();
-        out.write_content(b"x\n");
-        let during = String::from_utf8_lossy(&out.end_capture()).to_string();
-        out.begin_capture();
+        let during = compose_rows(&area, 60);
         out.end_response();
-        let after = String::from_utf8_lossy(&out.end_capture()).to_string();
-        // The green dot mid-turn, and the idle one after — asserted on the bytes,
-        // because a flag that is set and never read would pass a state check alone.
+        let after = compose_rows(&area, 60);
         assert!(
-            during.contains("\x1b[38;5;41m\u{25cf}"),
-            "the bar painted during the turn is green: {during:?}"
+            during.join("\n").contains("\x1b[38;5;41m\u{25cf}"),
+            "the same recipe, mid-turn, renders a green dot: {during:?}"
         );
         assert!(
-            !after.contains("\x1b[38;5;41m\u{25cf}"),
-            "and the one after the turn is not: {after:?}"
+            !after.join("\n").contains("\x1b[38;5;41m\u{25cf}"),
+            "and idle again once the turn is over: {after:?}"
         );
         assert!(
             !out.streaming.load(std::sync::atomic::Ordering::Relaxed),
@@ -3175,15 +3165,15 @@ mod tests {
         };
 
         // Nothing supplied: the status alone, and it is first.
-        assert_eq!(compose_rows(&out.compose_area(None, None, 60), 60).len(), 1);
+        assert_eq!(compose_rows(&out.compose_area(None, None), 60).len(), 1);
 
         // Input only: no separator, because a separator is for a menu.
-        let rows = compose_rows(&out.compose_area(Some(input()), None, 60), 60);
+        let rows = compose_rows(&out.compose_area(Some(input()), None), 60);
         assert_eq!(rows.len(), 2, "status then input: {rows:?}");
 
         // Both: the divider arrives *with* the overlay, not from the caller.
         let overlay = Element::overlay(vec!["row".to_string()], 0);
-        let rows = compose_rows(&out.compose_area(Some(input()), Some(overlay), 60), 60);
+        let rows = compose_rows(&out.compose_area(Some(input()), Some(overlay)), 60);
         assert_eq!(rows.len(), 4, "status, input, divider, overlay: {rows:?}");
         assert!(
             rows[0].contains("\x1b[48;5;237m"),
@@ -3204,7 +3194,7 @@ mod tests {
     fn compose_area_reads_streaming_rather_than_being_told_it() {
         let (out, _reasoning) = capturing_output(60);
         out.set_status(&bar_of("[bar]"));
-        let idle = compose_rows(&out.compose_area(None, None, 60), 60);
+        let idle = compose_rows(&out.compose_area(None, None), 60);
         assert!(
             !idle[0].contains(DOT_STREAMING),
             "no turn in flight, so the frame bar is idle: {:?}",
@@ -3214,7 +3204,7 @@ mod tests {
         out.begin_capture();
         out.begin_response();
         let _ = out.end_capture();
-        let during = compose_rows(&out.compose_area(None, None, 60), 60);
+        let during = compose_rows(&out.compose_area(None, None), 60);
         assert!(
             during[0].contains(DOT_STREAMING),
             "mid-turn the frame bar goes green: {:?}",
@@ -3235,7 +3225,7 @@ mod tests {
     fn compose_area_drops_a_status_that_has_nothing_to_say() {
         let (out, _reasoning) = capturing_output(60);
         assert!(
-            out.compose_area(None, None, 60).is_empty(),
+            out.compose_area(None, None).is_empty(),
             "never set: there is no bar to show"
         );
         out.set_status(&StatusText {
@@ -3243,14 +3233,14 @@ mod tests {
             group: Vec::new(),
         });
         assert!(
-            out.compose_area(None, None, 60).is_empty(),
+            out.compose_area(None, None).is_empty(),
             "explicitly off: there is no bar to show"
         );
         out.set_status(&bar_of("[bar]"));
-        assert_eq!(out.compose_area(None, None, 60).len(), 1, "on: a bar");
+        assert_eq!(out.compose_area(None, None).len(), 1, "on: a bar");
 
         assert!(
-            NoOutput.compose_area(None, None, 60).is_empty(),
+            NoOutput.compose_area(None, None).is_empty(),
             "an output with no screen composes no status"
         );
     }
@@ -4502,185 +4492,6 @@ mod tests {
         );
     }
 
-    /// The transient status line: painted after each content block, relative
-    /// only, and erased by the next content write.
-    #[test]
-    #[serial]
-    fn status_line_is_transient_and_relative() {
-        const STATUS: &str = "[sess | openrouter:some/model | ctx 12% · 8k]";
-        let (out, _reasoning) = capturing_output(60);
-        out.begin_capture();
-        out.begin_response();
-        out.set_status(&bar_of(STATUS));
-        out.stream_text("first block.\n\n");
-        out.stream_text("second block.\n\n");
-        let bytes = out.end_capture();
-        let text = String::from_utf8_lossy(&bytes).replace('\r', "");
-
-        // Painted after each block, so the readout tracks the whole turn.
-        assert_eq!(
-            text.matches(STATUS).count(),
-            2,
-            "the status should follow each content block: {text:?}"
-        );
-        // *Relative*: the status goes out as contiguous text with nothing
-        // injected — an absolute write would put a `CUP` in the middle of it.
-        // (The erase that follows it is absolute, and lands on the same
-        // physical line, which is why this is a containment check.)
-        assert!(
-            text.contains(STATUS),
-            "the status must be written as plain text: {text:?}"
-        );
-    }
-
-    /// The bar never sits directly against the content: a blank row separates
-    /// them.
-    ///
-    /// A fenced block is the case that shows it, because a fence emits line by
-    /// line and its last byte is a single newline — the last line of text sits
-    /// directly above where the bar goes. A paragraph cannot show this: the
-    /// blank-line rule *swallows* the second newline and records the blank as
-    /// owed rather than written, so `"text\n\n"` reaches the screen as one
-    /// newline, and the text is above the bar there too.
-    #[test]
-    #[serial]
-    fn the_status_leaves_one_blank_row_above_itself() {
-        /// Escapes out: the bar is painted behind a cursor-hide, and the count
-        /// of newlines is the whole point.
-        fn visible(bytes: &[u8]) -> String {
-            strip_ansi(&String::from_utf8_lossy(bytes)).replace('\r', "")
-        }
-
-        let (out, _reasoning) = capturing_output(60);
-        out.begin_capture();
-        out.begin_response();
-        out.set_status(&bar_of("[bar]"));
-        out.stream_text("```\nalpha\n```\n");
-        let text = visible(&out.end_capture());
-        // Anchored on the bar's **dot**, not on its text: the bar is fitted to
-        // the terminal and right-aligned, so what follows the dot is padding, not
-        // the marker. This test is about how many blank rows separate the content
-        // from the bar, and the dot is where the bar starts.
-        assert!(
-            text.contains("alpha\n\n \u{25cf}"),
-            "one blank row between the last line of content and the bar: {text:?}"
-        );
-        assert!(!text.contains("alpha\n\n\n"), "and only one: {text:?}");
-    }
-
-    /// The status **reuses** a blank that is already on screen instead of
-    /// stacking a second one on top of it.
-    ///
-    /// `ends_blank()` is the blank-line rule's own bit, and it is the right
-    /// signal precisely because the rule swallows the second newline: a blank
-    /// line exists on screen only once a second `\n` has really been written, so
-    /// the bit flips exactly when a row above the bar is genuinely empty. The
-    /// two features used to keep separate opinions and the screen showed it — a
-    /// boundary blank and a gap of the bar's own are two different rows, so a
-    /// boundary followed by a bar left *two* blank lines where one was meant.
-    ///
-    /// The blank is written raw, because that is the only way to get two
-    /// consecutive newlines onto the screen: every high-level entry point routes
-    /// through the rule, which eats the second one.
-    #[test]
-    #[serial]
-    fn the_status_reuses_a_blank_that_is_already_on_screen() {
-        let (out, _reasoning) = capturing_output(60);
-        out.begin_capture();
-        out.begin_response();
-        out.set_status(&bar_of("[bar]"));
-        out.write_content(b"alpha\n");
-        out.write_content(b"\n"); // the blank line, really written
-        let text = String::from_utf8_lossy(&out.end_capture()).replace('\r', "");
-        // Anchored on the dot, as in the sibling test: the bar is right-aligned,
-        // so its text is not what abuts the content.
-        assert!(
-            text.contains("alpha\n\n\x1b[0m\x1b[48;5;237m \x1b[38;5;41m\u{25cf}"),
-            "the blank already on screen is the gap: {text:?}"
-        );
-        assert!(
-            !text.contains("alpha\n\n\n"),
-            "the bar must not add a second one: {text:?}"
-        );
-    }
-
-    /// The erase has to cover the gap as well as the bar, and it has to leave the
-    /// cursor where the next block writes.
-    ///
-    /// The gap is the status's own row when it opened one, and the next content
-    /// write lands *there* — so an erase that only covered the bar would leave
-    /// the blank line behind, once per block, for the rest of the session.
-    #[test]
-    #[serial]
-    fn erasing_the_status_also_erases_its_gap() {
-        let (out, _reasoning) = capturing_output(60);
-        out.begin_capture();
-        out.begin_response();
-        out.set_status(&bar_of("[bar]"));
-        out.stream_text("```\nalpha\n```\n");
-        out.stream_text("```\nbeta\n```\n");
-        let text = String::from_utf8_lossy(&out.end_capture()).into_owned();
-        // The erase walks up over the bar and the gap: two erase-in-line, and
-        // the `CUU` is what makes it a walk rather than a single row.
-        assert_eq!(
-            text.matches("\x1b[K").count(),
-            2,
-            "the bar and its gap, one erase each: {text:?}"
-        );
-        assert_eq!(
-            text.matches("\x1b[1A").count(),
-            1,
-            "one row up, from the bar to the gap: {text:?}"
-        );
-    }
-
-    /// The bar must put back the dim its own reset clears.
-    ///
-    /// `ensure_dim` emits `\x1b[2m` / `\x1b[0m` only when the tracked `dim_on`
-    /// *changes*, so a bar written mid-reasoning used to break it in both
-    /// directions: the bar inherited the terminal's dim (a colour is not an
-    /// attribute, so `38;5;245m` did not clear it), and its trailing reset then
-    /// silenced the *next* reasoning write — which saw no change to re-assert.
-    /// So the bar looked dimmed or not depending on what was above it, and the
-    /// reasoning after it flickered back to full intensity.
-    ///
-    /// The flag is set directly rather than by streaming reasoning: the
-    /// reasoning goes to its own sink, which this harness captures apart, and
-    /// the contract under test is about the flag, not about the stream that
-    /// sets it.
-    #[test]
-    #[serial]
-    fn the_status_bar_puts_back_the_dim_it_clears() {
-        let (out, _reasoning) = capturing_output(60);
-        *out.dim_on.lock().unwrap() = true; // mid-reasoning
-        out.begin_capture();
-        // The marker is plain text: the bar supplies its own colours now, so escapes in
-        // here would only add a second reset in front of the one this test is
-        // about. It is testing the dim restoration, not bar contents.
-        out.set_status(&bar_of("dim-test"));
-        // Painted directly rather than through a content write: the answer
-        // renderer turns dim *off* before it writes, so a content write can
-        // never leave the flag on for the status to find. Reasoning can, and
-        // that is the case under test.
-        out.paint_status();
-        let bytes = out.end_capture();
-        let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
-        let last_bar = text.rfind("dim-test").expect("the bar should be painted");
-        let after = &text[last_bar..];
-        let reset = after.find("\x1b[0m").expect("the bar resets");
-        assert!(
-            // reset, CR, then the dim back — and only then the cursor hide,
-            // which is about the cursor rather than the colours.
-            after[reset..].starts_with("\x1b[0m\r\x1b[2m\x1b[?25l"),
-            "the dim must come straight back after the bar's reset: {after:?}"
-        );
-        // And the flag is untouched — the bar restores, it does not toggle.
-        assert!(
-            *out.dim_on.lock().unwrap(),
-            "the tracked dim should still be on"
-        );
-    }
-
     /// `draw_elements` is the old hand-rolled path, not a new one: it must paint
     /// **byte-identically** to `draw_frame(&compose_frame(...))`.
     ///
@@ -4700,125 +4511,43 @@ mod tests {
     #[serial]
     fn draw_elements_paints_exactly_what_the_hand_rolled_path_paints() {
         let tall: Vec<String> = (0..16).map(|i| format!("row {i}")).collect();
-        let build = || {
-            crate::repl::Repl::compose_elements(
-                &crate::repl::LineEditor::new(),
-                "> ",
-                Some("[bar]"),
-                &tall,
-                0,
-                60,
-            )
+        // The pieces, freshly built per call: `draw_elements` moves them in, so
+        // each path needs its own. The composer is the shared thing now — both
+        // outputs are given the same status, so `compose_area` yields the same
+        // stack for each, and the only difference under test is *who runs the
+        // pipeline*.
+        let pieces = || {
+            let layout = crate::repl::LineEditor::new().layout(60, "> ");
+            let input = Element::input(layout, "> ".to_string());
+            let overlay = (!tall.is_empty()).then(|| Element::overlay(tall.clone(), 0));
+            (Some(input), overlay)
         };
-        let (tail, _rt) = capturing_output(60);
-        tail.begin_capture();
         let dims = (60, 20);
-        let a = tail.draw_elements(build(), ApplyPolicy::Frame, dims);
+
+        let (tail, _rt) = capturing_output(60);
+        tail.set_status(&bar_of("[bar]"));
+        tail.begin_capture();
+        let (input, overlay) = pieces();
+        let a = tail.draw_elements(input, overlay, ApplyPolicy::Frame, dims);
         let via_tail = tail.end_capture();
 
         let (hand, _rh) = capturing_output(60);
+        hand.set_status(&bar_of("[bar]"));
+        // Feed `draw_frame` exactly what `draw_elements` composes — same
+        // composer, same status, same dims — so the apply half is all that
+        // differs.
+        let stack = hand.compose_area(pieces().0, pieces().1);
+        let extents: Vec<Extent> = stack.iter().map(Element::extent).collect();
+        let heights = allocate(&extents, live_budget(dims.1));
+        let frame = render(&stack, &heights, dims.0);
         hand.begin_capture();
-        let b = hand.draw_frame(
-            &crate::repl::Repl::compose_frame(
-                &crate::repl::LineEditor::new(),
-                "> ",
-                Some("[bar]"),
-                &tall,
-                0,
-                60,
-                20,
-            ),
-            ApplyPolicy::Frame,
-            dims,
-        );
+        let b = hand.draw_frame(&frame, ApplyPolicy::Frame, dims);
         let via_hand = hand.end_capture();
 
         assert_eq!(a, b, "the same dims either way");
         assert_eq!(
             via_tail, via_hand,
             "the tail is the old path, byte for byte — not a second behaviour"
-        );
-    }
-
-    /// The cursor is hidden while the bar is up and shown when the input frame
-    /// comes back — a block cursor parked at column 0 of a dark full-width bar is
-    /// the brightest thing on the screen, and there is nothing to type into
-    /// mid-turn.
-    #[test]
-    #[serial]
-    fn the_bar_hides_the_cursor_and_a_frame_shows_it_again() {
-        let (out, _reasoning) = capturing_output(60);
-        out.begin_capture();
-        out.begin_response();
-        out.set_status(&bar_of("bar"));
-        out.stream_text("a block\n\n");
-        out.draw_frame(
-            &crate::repl::Repl::compose_frame(
-                &crate::repl::LineEditor::new(),
-                "",
-                None,
-                &[],
-                0,
-                60,
-                20,
-            ),
-            crate::ui::frame::ApplyPolicy::Frame,
-            (60, 20),
-        );
-        let bytes = out.end_capture();
-        let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
-        let hide = text.find("\x1b[?25l").expect("the bar should hide it");
-        let show = text.find("\x1b[?25h").expect("the frame should show it");
-        assert!(hide < show, "hide then show, in that order: {text:?}");
-    }
-
-    /// The next content write erases the status, so it never survives as a line
-    /// of its own in the scrollback.
-    #[test]
-    #[serial]
-    fn the_next_content_write_erases_the_status() {
-        let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
-        out.begin_response();
-        out.set_status(&bar_of("[sess | m | ctx 5%]"));
-        out.stream_text("alpha.\n\n");
-        out.stream_text("beta.\n\n");
-        let bytes = out.end_capture();
-        let mut p = vt100::Parser::new(24, 40, 1000);
-        let onlcr: Vec<u8> = bytes
-            .iter()
-            .flat_map(|&b| {
-                if b == b'\n' {
-                    vec![b'\r', b'\n']
-                } else {
-                    vec![b]
-                }
-            })
-            .collect();
-        p.process(&onlcr);
-        let rows: Vec<String> = (0..12)
-            .map(|r| {
-                (0..40)
-                    .map(|c| {
-                        p.screen()
-                            .cell(r, c)
-                            .and_then(|x| x.contents().chars().next())
-                            .unwrap_or(' ')
-                    })
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect();
-        // The status sits on the last written row, and no earlier row repeats it.
-        assert!(
-            rows.iter().any(|r| r.contains("[sess |")),
-            "the status should be on screen: {rows:?}"
-        );
-        assert_eq!(
-            rows.iter().filter(|r| r.contains("[sess |")).count(),
-            1,
-            "exactly one status line, not one per block: {rows:?}"
         );
     }
 
@@ -4837,77 +4566,18 @@ mod tests {
         assert!(tail.at_line_start());
     }
 
-    /// The status never lands among a frame's rows. A frame owns the tail, so
-    /// the first content write suppresses the status and the next one paints it
-    /// *below* the content — the frame's region is already erased by then.
+    /// Content written while a frame is live takes the frame's rows — and the
+    /// frame comes back **below** what was written (ui_draw_v2 §4.5 P1).
+    ///
+    /// The other half of the reported resume artefact (§1.1): the content
+    /// starts at a cursor inside a still-live frame, and the frame used to be
+    /// retired outright, so the menu a commit was issued over simply vanished.
+    /// Consuming means the content lands *on* the frame's rows and the
+    /// reposition puts the frame back underneath, one fold lower — still on
+    /// screen, still below the content, and with no gap the erase left behind.
     #[test]
     #[serial]
-    fn status_lands_below_a_frame_rather_than_among_its_rows() {
-        let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
-        out.set_status(&bar_of("[sess | m]"));
-        let frame = crate::repl::Repl::compose_frame(
-            &crate::repl::LineEditor::new(),
-            "",
-            None,
-            &[],
-            0,
-            40,
-            10,
-        );
-        out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
-        out.display_text("a message");
-        out.display_plain("more content");
-        let bytes = out.end_capture();
-
-        let mut p = vt100::Parser::new(24, 40, 1000);
-        let onlcr: Vec<u8> = bytes
-            .iter()
-            .flat_map(|&b| {
-                if b == b'\n' {
-                    vec![b'\r', b'\n']
-                } else {
-                    vec![b]
-                }
-            })
-            .collect();
-        p.process(&onlcr);
-        let rows: Vec<String> = (0..12)
-            .map(|r| {
-                (0..40)
-                    .map(|c| {
-                        p.screen()
-                            .cell(r, c)
-                            .and_then(|x| x.contents().chars().next())
-                            .unwrap_or(' ')
-                    })
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect();
-        let status_row = rows
-            .iter()
-            .position(|r| r.contains("[sess |"))
-            .unwrap_or_else(|| panic!("the status should be on screen: {rows:?}"));
-        let content_row = rows
-            .iter()
-            .position(|r| r.contains("more content"))
-            .unwrap_or_else(|| panic!("the content should be on screen: {rows:?}"));
-        assert!(
-            status_row > content_row,
-            "the status belongs below the content, not among the frame's rows: {rows:?}"
-        );
-    }
-
-    /// Content written while a frame is live must not leave any of it behind
-    /// (ui_draw_v2 §1.1). This is the reported resume artefact: a menu's table
-    /// header and rows left on screen *underneath* replayed content, because the
-    /// content started at a cursor inside the still-live frame and only
-    /// overwrote the rows below it.
-    #[test]
-    #[serial]
-    fn content_over_a_live_frame_erases_the_frame() {
+    fn content_over_a_live_frame_reemits_it_below() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
         // A menu frame, as `/session` has open when a commit happens: the
@@ -4950,7 +4620,7 @@ mod tests {
         p.process(&onlcr);
         let rows: Vec<String> = (0..10)
             .map(|r| {
-                (0..40)
+                (0..120)
                     .map(|c| {
                         p.screen()
                             .cell(r, c)
@@ -4964,10 +4634,20 @@ mod tests {
             rows.iter().any(|r| r.contains("Missing API key")),
             "the message should be on screen: {rows:?}"
         );
+        // The last row the content occupies: the message wraps at this width,
+        // so it is the row carrying its tail rather than its head.
+        let content_last = rows
+            .iter()
+            .rposition(|r| r.contains("provider"))
+            .unwrap_or_else(|| panic!("the message should be on screen: {rows:?}"));
         for leftover in ["MODEL", "CTX", "gpt-5", "claude-opus", "PRICE"] {
+            let at = rows
+                .iter()
+                .position(|r| r.contains(leftover))
+                .unwrap_or_else(|| panic!("frame row {leftover:?} should be back: {rows:?}"));
             assert!(
-                !rows.iter().any(|r| r.contains(leftover)),
-                "frame row {leftover:?} survived the content write: {rows:?}"
+                at > content_last,
+                "frame row {leftover:?} belongs below the content, not among it: {rows:?}"
             );
         }
     }

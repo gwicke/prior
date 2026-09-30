@@ -131,6 +131,10 @@ impl Element {
     /// which window around it. Focus-bearing content belongs in one of those
     /// instead — put it here and the cut is arbitrary (plan §3.2.2, which used to
     /// say "truncated from the top" while the code kept the front).
+    // Test-only now: production's one fixed-row element is `Element::status`,
+    // which resolves itself instead. Targeted allow, per this module's
+    // convention for test-only users.
+    #[allow(dead_code)]
     pub(crate) fn lines(rows: Vec<String>) -> Self {
         let n = rows.len();
         Element::new(n, n, LinesItem { rows })
@@ -172,7 +176,8 @@ impl RenderAt for DividerItem {
 }
 
 /// Fixed rows in reading order — no focus by construction. See
-/// [`Element::lines`] for why that is deliberate.
+/// [`Element::lines`] for why that is deliberate. Test-only alongside it.
+#[allow(dead_code)]
 struct LinesItem {
     rows: Vec<String>,
 }
@@ -424,6 +429,16 @@ pub(crate) struct DrawCache {
     /// bottom survive. Never cleared by invalidation.
     screen_bottom: usize,
     live: Option<LiveFrame>,
+    /// The last composition, kept as its **recipe** — the element list, not the
+    /// rendered rows it produced (ui_draw_v2 §5.1.1). §4.5's content path
+    /// re-draws this instead of recomposing: re-rendering is cheap and always
+    /// current, where the rendered rows would be a snapshot of whatever the
+    /// status said at the moment of compose.
+    ///
+    /// Deliberately *not* cleared by `note_lines`, `plan_consume` or an
+    /// invalidation — those retire the frame's *position*, and the recipe is
+    /// exactly what survives it. A later `draw_elements` overwrites it.
+    pub(crate) element_stack: Vec<Element>,
 }
 
 impl DrawCache {
@@ -432,6 +447,7 @@ impl DrawCache {
             caret: (1, 0),
             screen_bottom: term_h.max(1),
             live: None,
+            element_stack: Vec::new(),
         }
     }
 
@@ -696,40 +712,6 @@ fn plan_partial(cache: &mut DrawCache, frame: &Frame, top: usize, th: usize) -> 
     s
 }
 
-/// Erase the live frame's rows so a content write cannot leave any of it behind,
-/// and leave the caret where it was.
-///
-/// A content write starts at the cursor, and the cursor is *inside* the live
-/// frame (the REPL's input row, or a dialog's caret). The content grows
-/// downward from there, overwriting the frame from the caret down — and
-/// stranding the rest, which nothing else reclaims: the next frame apply's
-/// clear only reaches the previous frame's rows while `live` is set, and this
-/// write is what clears it. That is the shape of the reported resume artefact
-/// (ui_draw_v2 §1.1): a menu's table header and rows left on screen underneath
-/// replayed content, because the replay wrote while the menu's frame was still
-/// live.
-///
-/// Whole-region rather than "the rows the content will miss": a content line
-/// shorter than the terminal leaves the frame's background to its right, and
-/// the input row is padded to the full width. Empty when no frame is live,
-/// which is the case for every streamed block, so this costs nothing while a
-/// turn runs.
-///
-/// The rows are walked from the cursor, so this is correct regardless of where
-/// the terminal thinks the block is — there is no row to get wrong
-/// (row_accounting §6b).
-pub(crate) fn plan_clear_live_frame(cache: &mut DrawCache) -> String {
-    let Some(live) = cache.live.as_ref() else {
-        return String::new();
-    };
-    let h = live.frame.height();
-    let (cur, col) = frame_caret(&live.frame);
-    let mut s = String::new();
-    erase_block(&mut s, h, cur, col);
-    cache.live = None;
-    s
-}
-
 /// Append apply (plan §2, commit lines): write the rows as content — the
 /// natural form, a row and a newline each, so the terminal wraps and scrolls on
 /// its own terms and no row is addressed. The caret lands just below the block.
@@ -755,35 +737,63 @@ fn plan_append(cache: &mut DrawCache, frame: &Frame, anchor: usize, th: usize) -
 }
 
 /// Consume (§4.5 P1): a content write is about to start where the frame is.
-/// Walk the caret up to the frame's first row and take the frame, **without
-/// erasing it** — the content's own bytes overwrite those rows, and the frame
-/// comes back below the content via [`plan_reposition`].
+/// Walk to the frame's first row, clear what it painted, and take the frame —
+/// which comes back below the content via [`plan_reposition`].
+///
+/// "Consume" is about **ownership**, not pixels: the frame stops being *live*
+/// (`live = None`) but is handed back rather than dropped, so it can be
+/// re-emitted. What it replaces retires the frame outright, and that is the
+/// difference that matters (§4.5.3).
+///
+/// The pixels *are* cleared, and that is load-bearing rather than a residue of
+/// the old erase: the frame's rows are padded to full width, so a content line
+/// shorter than the terminal would leave whatever the frame painted to its
+/// right of it still showing — the other half of the §1.1 resume artefact.
+///
+/// What the retire-and-clear gets wrong is where the walk *ends*: at the
+/// block's caret, so content starts mid-frame and strands the rows above it.
+/// It ends at the block's first row, column 0, because content takes the
+/// block's **whole height** — the status and input rows are content's to use
+/// too, not a margin the write has to live below.
 ///
 /// Returns the walk and the frame to re-emit, or `None` when no frame was live.
-/// `None` is the state of a whole turn today, which is why the clear this
-/// replaces was almost always a no-op (§4.5.3).
+/// `None` was the state of a whole turn under the old scheme; now it is the
+/// state before a turn's first frame and after one resolves.
 ///
-/// **`CR` is part of the contract, not a detail.** `CUU` preserves the column and
-/// the frame's caret is out at the *input's* column, so without an explicit `CR`
-/// the content would start a prompt-width to the right. Today that is masked: the
-/// transient status bar's own clear ends in a `CR`, so a turn's first content
-/// write lands at column 0 by accident. A frame that carries its own bar row has
-/// no such accident available, which is one of the reasons the bar has to move
-/// into the frame before the wiring can be trusted.
-// Test-only for now, like `plan_reposition`: `with_content_writer` calls both
-// when the content path stops retiring the area, and the bar question that
-// decision forces is answered first. Targeted allow, per this module's
-// convention for test-only users.
-#[allow(dead_code)]
+/// **`CR` is part of the contract, not a detail.** `CUU` preserves the column,
+/// and the frame's caret is out at the *input's* column, so without an explicit
+/// `CR` the content would start a prompt-width to the right. It used to arrive
+/// by accident — the transient bar's own clear ended in one — and that bar is
+/// deleted with the rest of the transient machinery, so the byte is what
+/// carries it.
 pub(crate) fn plan_consume(cache: &mut DrawCache) -> Option<(String, Frame)> {
     let live = cache.live.take()?;
     let (caret_row, _) = frame_caret(&live.frame);
+    let h = live.frame.height();
     let mut s = String::new();
-    cuu(&mut s, caret_row);
+    // Down to the block's last row, then erase bottom-up to its first — a walk
+    // *down* out of a block is impossible: `CUD` clamps at the screen edge
+    // instead of scrolling. The block is on screen, so its last row is
+    // reachable from any row inside it.
+    //
+    // `CR` before every `EL`, and that is the whole trick: `EL` reaches only
+    // from the cursor to the end of the line, and the cursor is out at the
+    // input's caret — so without it the erase would clear what lies *past* the
+    // prompt and leave the prompt itself standing, which is exactly the tail a
+    // short content line would then inherit.
+    if h > 0 {
+        let cur = caret_row.min(h - 1);
+        cud(&mut s, h - 1 - cur);
+        for i in 0..h {
+            s.push('\r');
+            s.push_str(EL);
+            if i + 1 < h {
+                cuu(&mut s, 1);
+            }
+        }
+    }
+    // Postcondition: column 0 of the block's first row.
     s.push('\r');
-    // The frame is no longer intact on screen — `live = None` above — but its
-    // rows are about to be overwritten rather than erased, which is the whole
-    // difference from `plan_clear_live_frame`.
     cache.caret = (live.frame_top_row, 0);
     Some((s, live.frame))
 }
@@ -800,17 +810,13 @@ pub(crate) fn plan_consume(cache: &mut DrawCache) -> Option<(String, Frame)> {
 ///
 /// The contract is deliberately narrow: **the same frame, at a new top**. A
 /// frame that *changed* (grew a row, lost one) still goes through `plan_apply`,
-/// because only that path can retire the rows a shrunken frame orphaned. P1's
-/// caller re-emits the frame it already holds, so the height is fixed by
-/// construction and the narrowness costs nothing.
+/// because only that path can retire the rows a shrunken frame orphaned. The
+/// caller re-renders the *same recipe* the consume took, at the same dims, so
+/// the height is fixed by construction and the narrowness costs nothing — what
+/// changed is where it goes and what its status row says, not how tall it is.
 ///
 /// No `CUP`: the anchor is the cache's own caret, which is where the content
 /// write left the cursor.
-// Test-only for now: the production caller is the rest of P1, which points
-// `with_content_writer` at it instead of `plan_clear_live_frame`. A targeted
-// allow, per the convention for test-only users (no blanket `allow(dead_code)`
-// in this module) — and it goes away with that commit.
-#[allow(dead_code)]
 pub(crate) fn plan_reposition(
     cache: &mut DrawCache,
     frame: &Frame,
@@ -955,37 +961,6 @@ fn move_rows(s: &mut String, from: usize, to: usize) {
         cud(s, to - from)
     } else {
         cuu(s, from - to)
-    }
-}
-
-/// Erase the `h` rows of the block the cursor is inside — the cursor sitting at
-/// block row `cur`, column `col` — and leave it back at that caret.
-///
-/// Bottom-up, because a walk *down* out of the block is impossible: `CUD`
-/// clamps at the bottom row instead of scrolling. Up is safe, and the count is
-/// the block's own height, so the walk stops on its first row without clamping
-/// at row 1.
-fn erase_block(s: &mut String, h: usize, cur: usize, col: usize) {
-    if h == 0 {
-        return;
-    }
-    let cur = cur.min(h - 1);
-    cud(s, h - 1 - cur);
-    erase_up(s, h);
-    cud(s, cur);
-    // `CR` before the `CUF`: the walks above preserve the column, and the
-    // postcondition is the caret's column whatever the cursor arrived on.
-    s.push('\r');
-    cuf(s, col);
-}
-
-/// Erase `h` rows *upward* from the cursor's row, ending on the first of them.
-fn erase_up(s: &mut String, h: usize) {
-    for i in 0..h {
-        s.push_str(EL);
-        if i + 1 < h {
-            cuu(s, 1);
-        }
     }
 }
 
@@ -1464,8 +1439,6 @@ mod apply_tests {
             20,
             10,
         ));
-        // The content-write clear.
-        plans.push(plan_clear_live_frame(&mut cache));
         // Append, which writes the rows as content.
         let mut app = DrawCache::new(24);
         cursor_to(&mut app, 5, 24);
@@ -1844,14 +1817,21 @@ mod apply_tests {
     }
 
     /// §4.5 P1: consume leaves the cursor at the frame's first row, **column
-    /// 0**, and leaves the frame's own rows alone.
+    /// 0**, and clears the rows it is taking over.
     ///
-    /// The column is the substance. `CUU` preserves it, the frame's caret is out
-    /// at the input's column, and the content about to be written would start a
-    /// prompt-width to the right. Today that is masked by the transient bar's
-    /// trailing `CR`; this makes it the plan's own postcondition.
+    /// The column is the substance. `CUU`/`CUD` preserve it, the frame's caret
+    /// is out at the input's column, and the content about to be written would
+    /// start a prompt-width to the right. This makes it the plan's own
+    /// postcondition rather than something inherited from the transient bar's
+    /// trailing `CR`.
+    ///
+    /// The clear is what "consume" is *not*: it takes ownership, not pixels.
+    /// The frame's rows are padded to full width, so a content line shorter
+    /// than the terminal would otherwise strand whatever they painted to its
+    /// right of it — the other half of the §1.1 resume artefact. The frame is
+    /// still handed back, so it can be re-emitted below.
     #[test]
-    fn consume_walks_to_the_frame_top_at_column_zero_and_erases_nothing() {
+    fn consume_walks_to_the_frame_top_at_column_zero_and_clears_its_rows() {
         let mut cache = DrawCache::new(24);
         let mut e = LineEditor::new();
         e.insert_str("hi there");
@@ -1877,14 +1857,25 @@ mod apply_tests {
 
         let (walk, taken) = plan_consume(&mut cache).expect("a live frame");
         assert_eq!(taken.height(), f.height(), "the same frame comes back");
-        assert!(!walk.contains(EL), "nothing is erased: {walk:?}");
+        assert!(
+            walk.contains(EL),
+            "the rows it takes over are cleared: {walk:?}"
+        );
         feed(&mut p, &walk);
         assert_eq!(
             p.screen().cursor_position(),
             (4, 0),
             "the fold, at column 0 — not the input's column"
         );
-        assert_eq!(screen(&p, 24, 20), before, "the frame is still on screen");
+        let after = screen(&p, 24, 20);
+        assert_eq!(
+            after[4], "",
+            "the row it took over is clear to the end of the line: {after:?}"
+        );
+        assert_ne!(
+            after, before,
+            "and so the frame no longer stands as painted"
+        );
         assert!(cache.live.is_none(), "it is no longer intact");
     }
 
