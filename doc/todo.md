@@ -69,3 +69,5 @@
   - [ ] temperature support: model level only? move thinking level to model too?
   - [ ] per-turn /thinking overrides, esp. at end of turn message
 - [ ] tool errors: split the operator's view from the model's, then unredact — ./doc/path_leak_risks.md
+- [ ] edit tool: return best matched text with line numbers (read format) to
+  the *model*, so it can construct a follow-up edit; do not show the diff to the model.
