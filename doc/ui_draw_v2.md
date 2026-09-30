@@ -1015,6 +1015,83 @@ Two more notes that are easy to lose:
   assertion covering that content, check it by eye.
 ---
 
+#### Reported rendering issues
+
+Four issues found by hand, distinct from §5.2's placement — which they do not
+affect, and which they should not be folded into. Triaged in this order.
+
+**R1 — the input row is painted even when there is nothing to show.** Mid-turn
+the area renders `[status, input]`, so an empty input still occupies a row and
+the cursor rests visibly on it. It should occupy **zero** rows when empty and
+appear on the first keystroke. `compose_elements` (`repl.rs:1269`) already takes
+`Option<&str>` for the status; the input needs the same treatment.
+
+OQ2 is not contradicted by this. It settled that *the REPL stays live mid-turn* —
+it is a statement about activity, not about rows. The frame is composed and
+applied either way; it just has no input row to draw until there is input. This
+is also the "frame content changes in size" case at its most routine, so it is
+worth settling before the placement work rather than after.
+
+**R2 — consecutive committed prompts get a blank they should not have.**
+
+```
+────────              ────────              ────────
+/session … resume     /reasoning med
+────────              ────────              ────────
+```
+
+The blank is not `emit_commit`'s: `display_separator` and `display_plain` never
+call `boundary()` (`output.rs:2856`, `output.rs:2532`). It comes from the
+commit's *own trailing message* — `repl.rs:858` calls `display_text` right after
+the commit, and `display_markdown` opens every block with `boundary()`
+(`output.rs:2545`), which fires because the stream does not already end blank.
+So a content rule — two paragraphs want a blank between them — is being applied
+to two adjacent UI blocks, which want to abut. Same rule, wrong side of the
+content/UI line.
+
+**R3 — the same spacing between the status row and a separator above it.** Two
+blanks where one is wanted. Same cause as R2, different pair of blocks.
+
+**R4 — a regular prompt commit has no separator above it.** The committed line
+sits with a rule *below* it — the input's own underline — and nothing above, so
+it reads as content rather than as something the user committed. A slash commit
+is bracketed on both sides; a prompt is bracketed on one.
+
+The row to use already exists: it is the row that holds the status line, directly
+above the input (`compose_elements` pushes it at `repl.rs:1282`). On a regular
+commit that row becomes a divider instead, and the prompt commits beneath it.
+
+##### The structural fix behind R2 and R3
+
+The separation rule is in the wrong layer, and `StreamTail` is the proof:
+
+- `StreamTail` (`row_count.rs:162`) is a two-bit atomic state machine folded per
+  byte whose only production consumer is `needs_boundary()`
+  (`output.rs:1770`) — *emit a blank line before the next block*. Its second
+  accessor, `at_line_start()`, has **no production caller at all**; the only
+  reference is an assertion in `output.rs:4564`. So the whole mechanism is
+  presentation policy living in the row-counting module, and there is nothing
+  content-ish about it.
+- The rule leaks into eight call sites in `output.rs` (1798, 2223, 2545, 2558,
+  2596, 2636, 2708, 2740). Every content type has to remember to call
+  `boundary()` — the shape of a decision that belongs in one place and lives in
+  nine.
+- And it is simply wrong for UI blocks, which is R2 and R3.
+
+The fix is to move the decision, not retune it. Content emitters emit *typed
+blocks*; one owner in the composition layer decides separation, with the
+distinction R2 actually wants: **content blocks separate, adjacent UI blocks
+abut.** The fold is a scrolled rectangle in `allocate`/`render`, so this needs a
+transcript-level composer rather than a change to the fold. Once the composer
+sees every block and knows what it wrote, `StreamTail` and `ends_blank` can go —
+a byte-level guess at a structural fact stops being necessary.
+
+Worth doing while in there, though minor: `batch_commit` (`repl.rs:1482`) renders
+a commit as a bare `display_plain` line with no rules and no boundary, while
+`emit_commit` brackets it — so a startup replay looks different from the same
+action taken live. Only implicit submits reach it, which is why it went unnoticed.
+---
+
 ## 7. Risks & mitigations
 
 | Risk | Mitigation |
