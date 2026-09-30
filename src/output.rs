@@ -724,6 +724,21 @@ fn strip_read_lineno(line: &str) -> &str {
 ///   - `bash`       -> the full command line, untruncated
 ///   - `edit_file`  -> `edit <path> [start..end]`   (+ a best-effort diff)
 ///   - anything else falls back to `Name <first-arg>` (truncated to 50 cols).
+/// Per-file call arguments for a multi-file `edit` block, or `None` if the
+/// arguments are not one.
+///
+/// Each entry is a complete single-file argument value in the same form a
+/// genuine single-file call would carry, so passing it to the normal renderers
+/// yields exactly what that call would have rendered.
+fn multi_file_blobs(args: &Value) -> Option<Vec<Value>> {
+    crate::edit_blocks::per_file_blocks(args).map(|blocks| {
+        blocks
+            .into_iter()
+            .map(|b| Value::Object([("blocks".into(), Value::String(b))].into_iter().collect()))
+            .collect()
+    })
+}
+
 fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
     let obj = args.as_object();
     let get_str = |key: &str| obj.and_then(|o| o.get(key)).and_then(|v| v.as_str());
@@ -1861,6 +1876,293 @@ impl io::Write for ReasoningSink {
     }
 }
 
+impl ConsoleOutput {
+    // --- Multi-file rendering primitives ----------------------------------
+    //
+    // These live on an inherent impl, not in `impl Output`: they are the
+    // *same* rendering a single-file call uses, invoked once per file, so the
+    // view layer has exactly one code path for a tool call-result pair.
+
+    /// Per-file call arguments for the multi-file `edit` recorded in `last_tool`
+    /// and the given result, paired by index, or `None` when this result is not
+    /// a multi-file pair.
+    ///
+    /// The pairing is by index because both halves are produced from the same
+    /// file list, in first-seen order, by `edit_files` — the same derivation the
+    /// persist and model-facing splits use. A length mismatch means the two
+    /// halves disagree, which is not something to guess at, so it degrades to
+    /// rendering the result alone.
+    fn multi_file_pairs(&self, result: &str) -> Option<Vec<(String, Value, String)>> {
+        let files = blockedit::parse_file_results(result)?;
+        let (name, args) = self.last_tool.lock().unwrap().clone()?;
+        if !name.eq_ignore_ascii_case("edit") {
+            return None;
+        }
+        let blobs = multi_file_blobs(&args)?;
+        (blobs.len() == files.len()).then(|| {
+            blobs
+                .into_iter()
+                .zip(files)
+                .map(|(blob, fr)| {
+                    let single = match &fr.result {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (name.clone(), blob, single)
+                })
+                .collect()
+        })
+    }
+
+    /// The call half of one tool call-result pair: boundary, label, and the
+    /// trailing diff/preview lines.
+    ///
+    /// Exactly one file's batch per invocation — a single-file call invokes this
+    /// once, and a multi-file call once per file — so the two cases cannot drift
+    /// apart in the view layer.
+    fn render_call_panel(&self, name: &str, args: &Value) {
+        // Purpose-built label (+ optional trailing lines such as an edit diff)
+        // from `get_preview`. One blank line above the panel, unless the stream
+        // already ends with one — which is what used to need a "was the last
+        // block a tool" flag: a text segment leaves the renderer's own trailing
+        // blank behind, a tool panel does not, and the stream knows which.
+        let (label, extra) = get_preview(name, args);
+        self.boundary();
+        // Dark-grey panel box (no `⏺`, no tree line-art). The command label is
+        // the first line and is left flush; its output — the trailing
+        // diff/preview lines — is indented one column so the command's output
+        // reads as a distinct block. The command itself is syntax-highlighted
+        // through the same formatter the answer/result path uses (flushed per
+        // block via a fresh fenced code render).
+        let color = std::io::stdout().is_terminal();
+        let label_styled = highlight_code_fg(&label, command_lang(name), color);
+        self.paint_panel(&label_styled, false);
+        for line in &extra {
+            self.tool_panel(line, false, true);
+        }
+    }
+
+    /// The result half of one tool call-result pair: everything from the
+    /// structured-envelope check to `end_tool_block`.
+    ///
+    /// Expects the *single-file* result text — a bare success note or the
+    /// `{ui_view, model_view}` envelope — which is what one entry of a
+    /// multi-file result is, so a per-file batch reaches it unchanged.
+    fn render_result_panel(&self, result: &str) {
+        // Edit-tool failures are emitted as a structured JSON object with
+        // separate `ui_view` (short, no file text) and `model_view` (rich,
+        // with diff). The UI must render only the short view so we don't
+        // leak file content into scrollback; the full result string is
+        // still passed back to the model via the tool-result message.
+        if let Ok(v) = serde_json::from_str::<Value>(result) {
+            if let (Some(ui), Some(_model)) = (
+                v.get("ui_view").and_then(|x| x.as_str()),
+                v.get("model_view").and_then(|x| x.as_str()),
+            ) {
+                self.tool_panel(ui, true, true);
+                self.end_tool_block();
+                return;
+            }
+        }
+
+        // A `sed` preview result is a block blob behind a one-line banner.
+        // Render the blocks as a diff so the human reviewing the panel reads
+        // `-`/`+` lines rather than @@@ markers; the model still gets the
+        // verbatim blob in its tool message.
+        if let Some(lines) = sed_preview_body(result) {
+            // Not an error: a preview is a *proposal*, and colouring the whole
+            // body red (as the edit-failure path does) says the opposite. The
+            // `- `/`+ ` prefixes carry the red/green, matching an applied edit.
+            for line in &lines {
+                self.tool_panel(line, false, true);
+            }
+            return;
+        }
+
+        // Check for successful edit_file result and render a diff preview
+        // Success format: "Replaced N block(s) in <path>"
+
+        let unquoted = serde_json::from_str::<Value>(result)
+            .ok()
+            .and_then(|v| match v {
+                Value::String(s) => Some(s),
+                Value::Array(arr) => Some(
+                    arr.iter()
+                        .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .unwrap_or_else(|| result.to_string());
+
+        let mut cleaned = unquoted.as_str();
+        while cleaned.starts_with("Toolset error: ") || cleaned.starts_with("ToolCallError: ") {
+            if let Some(stripped) = cleaned.strip_prefix("Toolset error: ") {
+                cleaned = stripped;
+            } else if let Some(stripped) = cleaned.strip_prefix("ToolCallError: ") {
+                cleaned = stripped;
+            }
+        }
+        // Same treatment as the model: drop the redundant arg-error wrappers so
+        // the panel shows the problem, the expected block, and the offending
+        // structure — not a wall of prefixes. (Display is secondary to the model
+        // here, but the same text, so the same cleanup.)
+        cleaned = blockedit::strip_arg_error_prefixes(cleaned);
+
+        let is_error =
+            unquoted.starts_with("Toolset error") || unquoted.starts_with("ToolCallError");
+
+        // An `edit` argument error is one self-correcting message with a fixed
+        // `Expected:` / `Actual:` shape. Show it as two columns so the correct
+        // line and the line the model actually sent are on the same row, and so
+        // the block is half as tall (`Actual:` no longer falls below the fold).
+        // The *model* still receives the vertical form — see arg_error_view.
+        //
+        // Painted rather than `tool_panel`ed: these lines are already sized to
+        // the terminal and their columns align by construction, and
+        // `tool_panel` re-wraps through `wrap()`, which collapses the interior
+        // spaces that alignment depends on.
+        {
+            let width = term_width();
+            let avail = width.saturating_sub(1).max(1);
+            if let Some(table) = blockedit::arg_error_view::render_arg_error_table(cleaned, avail) {
+                for line in &table {
+                    self.paint_panel(&style(line.clone()).dim().to_string(), true);
+                }
+                return;
+            }
+        }
+
+        let lines: Vec<_> = cleaned.lines().collect();
+
+        if lines.is_empty() {
+            self.tool_panel("(empty)", false, true);
+            self.end_tool_block();
+            return;
+        }
+
+        // Which tool produced this result (set by `display_tool_call`). Drives
+        // read/write-specific rendering and language guessing.
+        let tool = self.last_tool.lock().unwrap().clone();
+        let is_read = tool
+            .as_ref()
+            .map(|(n, _)| n.eq_ignore_ascii_case("read") || n.eq_ignore_ascii_case("read_file"))
+            .unwrap_or(false);
+        let is_write = tool
+            .as_ref()
+            .map(|(n, _)| n.eq_ignore_ascii_case("write") || n.eq_ignore_ascii_case("write_file"))
+            .unwrap_or(false);
+
+        // Handle structured write result: {"path": "...", "content": "...", "lines": N, "bytes": N}
+        if is_write {
+            if let Ok(v) = serde_json::from_str::<Value>(result) {
+                if let (Some(path), Some(content), Some(total_lines)) = (
+                    v.get("path").and_then(|x| x.as_str()),
+                    v.get("content").and_then(|x| x.as_str()),
+                    v.get("lines").and_then(|x| x.as_u64()),
+                ) {
+                    // Show the path as a header with line count
+                    let color = std::io::stdout().is_terminal();
+                    let lang = guess_lang(path);
+                    let header = format!("write {} [{} lines]", path, total_lines);
+                    let header_styled = highlight_code_fg(&header, "bash", color);
+                    self.paint_panel(&header_styled, true);
+
+                    // Render the content with syntax highlighting (like read_file)
+                    let show_max = 10; // Limit preview to 10 lines (match read_file)
+                    let width = term_width();
+                    let inner = width.saturating_sub(1).max(1);
+                    let content_lines: Vec<_> = content.lines().collect();
+                    for (printed, line) in content_lines.iter().enumerate() {
+                        if printed >= show_max {
+                            break;
+                        }
+                        for wline in wrap(line, inner) {
+                            let styled = highlight_code_fg(&wline, lang, color);
+                            self.paint_panel(&styled, true);
+                        }
+                    }
+                    if content_lines.len() > show_max {
+                        self.tool_panel(
+                            &format!("... +{} lines", content_lines.len() - show_max),
+                            false,
+                            true,
+                        );
+                    }
+                    self.end_tool_block();
+                    return;
+                }
+            }
+        }
+
+        let read_path = tool
+            .as_ref()
+            .and_then(|(_, a)| a.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let color = std::io::stdout().is_terminal();
+        // Error output is shown verbatim (red). Everything else is highlighted:
+        // `read_file` output is colored by the file's guessed language, bash
+        // command output gets token highlighting, and other tools' output is
+        // colored uniformly (no meaningful grammar to tokenize).
+        let lang = if is_read {
+            guess_lang(read_path)
+        } else {
+            match tool.as_ref().map(|(n, _)| n.as_str()) {
+                Some("bash") => "bash",
+                _ => "text",
+            }
+        };
+
+        // Read results drop the `NNNN| ` line-number gutter and show up to 10
+        // lines; other results keep the previous 4-line default. Errors show
+        // everything.
+        let show_max = if is_error {
+            usize::MAX
+        } else if is_read {
+            10
+        } else {
+            8
+        };
+
+        let width = term_width();
+        let inner = width.saturating_sub(1).max(1);
+        for (printed, line) in lines.iter().enumerate() {
+            if printed >= show_max {
+                break;
+            }
+            // `read_file` renders `NNNN| content`; drop the gutter for display
+            // (the model still gets the numbers in the raw tool result).
+            let visible = if is_read {
+                strip_read_lineno(line)
+            } else {
+                line
+            };
+            for wline in wrap(visible, inner) {
+                if is_error {
+                    self.tool_panel(&wline, true, true);
+                } else {
+                    // Syntax-highlight through the result-path formatter, then
+                    // layer the grey tool panel on top (flushed per line).
+                    let styled = highlight_code_fg(&wline, lang, color);
+                    self.paint_panel(&styled, true);
+                }
+            }
+        }
+
+        if lines.len() > show_max && !is_error {
+            self.tool_panel(
+                &format!("... +{} lines", lines.len() - show_max),
+                false,
+                true,
+            );
+        }
+        self.end_tool_block();
+    }
+}
+
 impl Output for ConsoleOutput {
     fn cursor_row(&self) -> usize {
         // Prefer the real terminal cursor position (robust to wrapping,
@@ -2143,30 +2445,20 @@ impl Output for ConsoleOutput {
     }
 
     fn display_tool_call(&self, name: &str, args: &Value) {
-        // Purpose-built label (+ optional trailing lines such as an edit diff)
-        // from `get_preview`. One blank line above the panel, unless the stream
-        // already ends with one — which is what used to need a "was the last
-        // block a tool" flag: a text segment leaves the renderer's own trailing
-        // blank behind, a tool panel does not, and the stream knows which.
-        let (label, extra) = get_preview(name, args);
         // Remember the tool so `display_tool_result` can render the result
         // tool-aware (strip `read_file` line-number gutters, pick a highlight
         // language). The hook always fires the call immediately before its
         // result, so this is safe to read back on the result.
         *self.last_tool.lock().unwrap() = Some((name.to_string(), args.clone()));
-        self.boundary();
-        // Dark-grey panel box (no `⏺`, no tree line-art). The command label is
-        // the first line and is left flush; its output — the trailing
-        // diff/preview lines — is indented one column so the command's output
-        // reads as a distinct block. The command itself is syntax-highlighted
-        // through the same formatter the answer/result path uses (flushed per
-        // block via a fresh fenced code render).
-        let color = std::io::stdout().is_terminal();
-        let label_styled = highlight_code_fg(&label, command_lang(name), color);
-        self.paint_panel(&label_styled, false);
-        for line in &extra {
-            self.tool_panel(line, false, true);
+        // A multi-file `edit` renders nothing here: its pair is not complete
+        // until the result arrives, and splitting it into "all labels now, all
+        // notes later" would produce two runs rather than one block per file.
+        // `display_tool_result` renders the whole sequence of pairs then, which
+        // is what makes a multi-file batch byte-identical to N single-file ones.
+        if name.eq_ignore_ascii_case("edit") && multi_file_blobs(args).is_some() {
+            return;
         }
+        self.render_call_panel(name, args);
     }
 
     /// A tool block ends without a blank line: the panel rows are the last
@@ -2175,246 +2467,37 @@ impl Output for ConsoleOutput {
     /// ends the block with it, which is the knowledge the `last_was_tool` flag
     /// used to carry, stated by the block that has it.
     fn display_tool_result(&self, result: &str) {
-        // A multi-file `edit` result is a bare JSON array of `{path, result}`,
-        // one per file, each `result` that file's single-file result verbatim.
-        // Render it as one batch per file so the live panel and a reloaded
-        // session (which stores per-file results) agree the report is
-        // per-file. This branch is checked *before* the `Value::Array`-of-
-        // strings fall-through below, which would stringify each object.
+        // A multi-file result renders as N complete call-result pairs — label,
+        // diff, note — one per file, through the very same renderers a
+        // sequence of single-file calls uses. The call half is deferred to here
+        // because it is not complete until the result exists: rendering the
+        // labels at the call event would give two contiguous runs instead of
+        // one block per file, and the block is the unit.
+        if let Some(pairs) = self.multi_file_pairs(result) {
+            for (name, args, single) in &pairs {
+                self.render_call_panel(name, args);
+                self.render_result_panel(single);
+            }
+            return;
+        }
+        // A result with no matching call context (replayed on its own): the
+        // call half, and so the diff, is gone, but the report is still per
+        // file and still needs its path to attribute a failure.
         if let Some(files) = blockedit::parse_file_results(result) {
             let color = std::io::stdout().is_terminal();
             for fr in files {
-                // Each file under its own label, so a failure is attributable
-                // to the file it belongs to (the failure envelope carries no
-                // path of its own).
                 let label = highlight_code_fg(&format!("edit {}", fr.path), "bash", color);
                 self.paint_panel(&label, true);
-                // Reuse the per-result rendering: a failure shows its short
-                // `ui_view` (never the `model_view` diff), a success shows its
-                // note.
-                if let Some(ui) = fr.result.get("ui_view").and_then(|x| x.as_str()) {
-                    self.tool_panel(ui, true, true);
-                } else if let Some(note) = fr.result.as_str() {
-                    for line in note.lines() {
-                        self.tool_panel(line, false, true);
-                    }
-                }
+                let single = match &fr.result {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                self.render_result_panel(&single);
             }
             self.end_tool_block();
             return;
         }
-
-        // Edit-tool failures are emitted as a structured JSON object with
-        // separate `ui_view` (short, no file text) and `model_view` (rich,
-        // with diff). The UI must render only the short view so we don't
-        // leak file content into scrollback; the full result string is
-        // still passed back to the model via the tool-result message.
-        if let Ok(v) = serde_json::from_str::<Value>(result) {
-            if let (Some(ui), Some(_model)) = (
-                v.get("ui_view").and_then(|x| x.as_str()),
-                v.get("model_view").and_then(|x| x.as_str()),
-            ) {
-                self.tool_panel(ui, true, true);
-                self.end_tool_block();
-                return;
-            }
-        }
-
-        // A `sed` preview result is a block blob behind a one-line banner.
-        // Render the blocks as a diff so the human reviewing the panel reads
-        // `-`/`+` lines rather than @@@ markers; the model still gets the
-        // verbatim blob in its tool message.
-        if let Some(lines) = sed_preview_body(result) {
-            // Not an error: a preview is a *proposal*, and colouring the whole
-            // body red (as the edit-failure path does) says the opposite. The
-            // `- `/`+ ` prefixes carry the red/green, matching an applied edit.
-            for line in &lines {
-                self.tool_panel(line, false, true);
-            }
-            return;
-        }
-
-        // Check for successful edit_file result and render a diff preview
-        // Success format: "Replaced N block(s) in <path>"
-
-        let unquoted = serde_json::from_str::<Value>(result)
-            .ok()
-            .and_then(|v| match v {
-                Value::String(s) => Some(s),
-                Value::Array(arr) => Some(
-                    arr.iter()
-                        .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-                _ => None,
-            })
-            .unwrap_or_else(|| result.to_string());
-
-        let mut cleaned = unquoted.as_str();
-        while cleaned.starts_with("Toolset error: ") || cleaned.starts_with("ToolCallError: ") {
-            if let Some(stripped) = cleaned.strip_prefix("Toolset error: ") {
-                cleaned = stripped;
-            } else if let Some(stripped) = cleaned.strip_prefix("ToolCallError: ") {
-                cleaned = stripped;
-            }
-        }
-        // Same treatment as the model: drop the redundant arg-error wrappers so
-        // the panel shows the problem, the expected block, and the offending
-        // structure — not a wall of prefixes. (Display is secondary to the model
-        // here, but the same text, so the same cleanup.)
-        cleaned = blockedit::strip_arg_error_prefixes(cleaned);
-
-        let is_error =
-            unquoted.starts_with("Toolset error") || unquoted.starts_with("ToolCallError");
-
-        // An `edit` argument error is one self-correcting message with a fixed
-        // `Expected:` / `Actual:` shape. Show it as two columns so the correct
-        // line and the line the model actually sent are on the same row, and so
-        // the block is half as tall (`Actual:` no longer falls below the fold).
-        // The *model* still receives the vertical form — see arg_error_view.
-        //
-        // Painted rather than `tool_panel`ed: these lines are already sized to
-        // the terminal and their columns align by construction, and
-        // `tool_panel` re-wraps through `wrap()`, which collapses the interior
-        // spaces that alignment depends on.
-        {
-            let width = term_width();
-            let avail = width.saturating_sub(1).max(1);
-            if let Some(table) = blockedit::arg_error_view::render_arg_error_table(cleaned, avail) {
-                for line in &table {
-                    self.paint_panel(&style(line.clone()).dim().to_string(), true);
-                }
-                return;
-            }
-        }
-
-        let lines: Vec<_> = cleaned.lines().collect();
-
-        if lines.is_empty() {
-            self.tool_panel("(empty)", false, true);
-            self.end_tool_block();
-            return;
-        }
-
-        // Which tool produced this result (set by `display_tool_call`). Drives
-        // read/write-specific rendering and language guessing.
-        let tool = self.last_tool.lock().unwrap().clone();
-        let is_read = tool
-            .as_ref()
-            .map(|(n, _)| n.eq_ignore_ascii_case("read") || n.eq_ignore_ascii_case("read_file"))
-            .unwrap_or(false);
-        let is_write = tool
-            .as_ref()
-            .map(|(n, _)| n.eq_ignore_ascii_case("write") || n.eq_ignore_ascii_case("write_file"))
-            .unwrap_or(false);
-
-        // Handle structured write result: {"path": "...", "content": "...", "lines": N, "bytes": N}
-        if is_write {
-            if let Ok(v) = serde_json::from_str::<Value>(result) {
-                if let (Some(path), Some(content), Some(total_lines)) = (
-                    v.get("path").and_then(|x| x.as_str()),
-                    v.get("content").and_then(|x| x.as_str()),
-                    v.get("lines").and_then(|x| x.as_u64()),
-                ) {
-                    // Show the path as a header with line count
-                    let color = std::io::stdout().is_terminal();
-                    let lang = guess_lang(path);
-                    let header = format!("write {} [{} lines]", path, total_lines);
-                    let header_styled = highlight_code_fg(&header, "bash", color);
-                    self.paint_panel(&header_styled, true);
-
-                    // Render the content with syntax highlighting (like read_file)
-                    let show_max = 10; // Limit preview to 10 lines (match read_file)
-                    let width = term_width();
-                    let inner = width.saturating_sub(1).max(1);
-                    let content_lines: Vec<_> = content.lines().collect();
-                    for (printed, line) in content_lines.iter().enumerate() {
-                        if printed >= show_max {
-                            break;
-                        }
-                        for wline in wrap(line, inner) {
-                            let styled = highlight_code_fg(&wline, lang, color);
-                            self.paint_panel(&styled, true);
-                        }
-                    }
-                    if content_lines.len() > show_max {
-                        self.tool_panel(
-                            &format!("... +{} lines", content_lines.len() - show_max),
-                            false,
-                            true,
-                        );
-                    }
-                    self.end_tool_block();
-                    return;
-                }
-            }
-        }
-
-        let read_path = tool
-            .as_ref()
-            .and_then(|(_, a)| a.get("path"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        let color = std::io::stdout().is_terminal();
-        // Error output is shown verbatim (red). Everything else is highlighted:
-        // `read_file` output is colored by the file's guessed language, bash
-        // command output gets token highlighting, and other tools' output is
-        // colored uniformly (no meaningful grammar to tokenize).
-        let lang = if is_read {
-            guess_lang(read_path)
-        } else {
-            match tool.as_ref().map(|(n, _)| n.as_str()) {
-                Some("bash") => "bash",
-                _ => "text",
-            }
-        };
-
-        // Read results drop the `NNNN| ` line-number gutter and show up to 10
-        // lines; other results keep the previous 4-line default. Errors show
-        // everything.
-        let show_max = if is_error {
-            usize::MAX
-        } else if is_read {
-            10
-        } else {
-            8
-        };
-
-        let width = term_width();
-        let inner = width.saturating_sub(1).max(1);
-        for (printed, line) in lines.iter().enumerate() {
-            if printed >= show_max {
-                break;
-            }
-            // `read_file` renders `NNNN| content`; drop the gutter for display
-            // (the model still gets the numbers in the raw tool result).
-            let visible = if is_read {
-                strip_read_lineno(line)
-            } else {
-                line
-            };
-            for wline in wrap(visible, inner) {
-                if is_error {
-                    self.tool_panel(&wline, true, true);
-                } else {
-                    // Syntax-highlight through the result-path formatter, then
-                    // layer the grey tool panel on top (flushed per line).
-                    let styled = highlight_code_fg(&wline, lang, color);
-                    self.paint_panel(&styled, true);
-                }
-            }
-        }
-
-        if lines.len() > show_max && !is_error {
-            self.tool_panel(
-                &format!("... +{} lines", lines.len() - show_max),
-                false,
-                true,
-            );
-        }
-        self.end_tool_block();
+        self.render_result_panel(result);
     }
 
     fn get_user_input(&self) -> String {
@@ -4581,6 +4664,75 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         let c = out.end_capture_inner();
         let c = strip_ansi(&String::from_utf8_lossy(&c));
         eprintln!("=== Case C (tool + trailing thinking) ===\n{:?}", c);
+    }
+
+    /// The invariant: a multi-file batch must render exactly as N single-file
+    /// batches would. The call halves come from the same split the multi-file
+    /// path uses, so the only thing under test is that the view layer treats
+    /// them as the same sequence of call-result pairs.
+    #[test]
+    #[serial]
+    fn a_multi_file_batch_renders_identically_to_n_single_file_batches() {
+        let blob = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
+                    b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
+        let multi_args = serde_json::json!({ "blocks": blob });
+        let singles = multi_file_blobs(&multi_args).expect("multi-file blob");
+        assert_eq!(singles.len(), 2);
+
+        let notes = [
+            "Replaced 1 block(s) in ./a.rs (matched at ./a.rs:1)",
+            "Replaced 1 block(s) in ./b.rs (matched at ./b.rs:1)",
+        ];
+        let array = blockedit::render_file_results(
+            &["a.rs", "b.rs"]
+                .iter()
+                .zip(notes)
+                .map(|(path, note)| blockedit::FileResult {
+                    path: (*path).into(),
+                    result: Value::String((*note).into()),
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // A: two single-file pairs, as a sequence of real calls would render.
+        let (a, _) = capturing_output(40);
+        a.begin_capture_inner();
+        for (i, single) in singles.iter().enumerate() {
+            a.display_tool_call("edit", single);
+            a.display_tool_result(notes[i]);
+        }
+        let a = strip_ansi(&String::from_utf8_lossy(&a.end_capture_inner()));
+
+        // B: one multi-file pair.
+        let (b, _) = capturing_output(40);
+        b.begin_capture_inner();
+        b.display_tool_call("edit", &multi_args);
+        b.display_tool_result(&array);
+        let b = strip_ansi(&String::from_utf8_lossy(&b.end_capture_inner()));
+
+        assert_eq!(
+            a, b,
+            "a multi-file batch must render as N single-file batches"
+        );
+        // And the rendering this converges on is the real one: a label, a
+        // unified diff, and the per-file note — once each, in pair order. (No
+        // range here: `edit_preview` derives one by finding `old_text` in the
+        // file, and these files do not exist. The diff comes from the edits
+        // alone, so it renders regardless.)
+        for part in [
+            "edit a.rs",
+            "@@ -1 +1 @@",
+            "Replaced 1 block(s) in ./a.rs",
+            "edit b.rs",
+            "Replaced 1 block(s) in ./b.rs",
+        ] {
+            assert!(a.contains(part), "expected {part:?} in:\\n{a}");
+        }
+        assert_eq!(
+            a.matches("Replaced 1 block(s) in").count(),
+            2,
+            "one note per file:\\n{a}"
+        );
     }
 
     #[test]
