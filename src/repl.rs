@@ -18,7 +18,11 @@ use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
 use crate::output::Output;
 use crate::session::SessionTreeNode;
-use crate::ui::frame::{allocate, live_budget, render, ApplyPolicy, Element, Extent, Frame};
+use crate::ui::frame::{ApplyPolicy, Element};
+// Only `compose_frame` — the `#[cfg(test)]` pipeline convenience — needs the
+// rest; naming them unconditionally would trip `unused_imports` on a normal build.
+#[cfg(test)]
+use crate::ui::frame::{allocate, live_budget, render, Extent, Frame};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -677,9 +681,11 @@ impl Repl {
                     dims.0,
                     false,
                 );
-                let frame =
-                    Self::compose_frame(editor, prompt, Some(&bar), overlay, focus, dims.0, dims.1);
-                let applied = output.draw_frame(&frame, ApplyPolicy::Frame, dims);
+                // Composition here, division there: `draw_elements` is the one place the
+                // pipeline runs, so this can no longer build a `Frame` by hand.
+                let items =
+                    Self::compose_elements(editor, prompt, Some(&bar), overlay, focus, dims.0);
+                let applied = output.draw_elements(items, ApplyPolicy::Frame, dims);
                 painted_size.set(applied);
             };
         loop {
@@ -1181,27 +1187,36 @@ impl Repl {
         }
     }
 
-    /// Compose → allocate → render the REPL's input frame (plan §3, pure):
-    /// `[Input]`, or `[Input, Divider, Overlay]` while `overlay` shows.
+    /// Compose the REPL's element list (plan §3, pure): `[Status?, Input]`, or
+    /// `[Status?, Input, Divider, Overlay]` while `overlay` shows.
     ///
-    /// `focus` is the overlay's windowing index (the pre-computed visual row
-    /// of the selection); `term_w`/`term_h` are the size the frame is composed
-    /// for — the same values `Output::draw_frame` applies it with. The frame
-    /// (input + divider + pop-up together) never exceeds the live-region
-    /// budget of ⌈2/3·term_h⌉; overflow is windowed (`render`) and, if the
-    /// frame does not fit below its anchor, scrolled in by `plan_apply`.
+    /// **Composition only** — no `allocate`, no `render`, and therefore no
+    /// budget. The row division happens in [`Output::draw_elements`], which is
+    /// the one place the pure pipeline runs (ui_draw_v2 §5.1.1); handing a
+    /// `Frame` out of here would mean two places deciding how the terminal's
+    /// rows are split, which is exactly what `ui.rs`'s dialog builder used to do.
+    /// Overflow beyond the live-region budget of ⌈2/3·term_h⌉ is windowed there
+    /// and, if the frame does not fit below its anchor, scrolled in by
+    /// `plan_apply`.
+    ///
+    /// There is deliberately **no `term_h` parameter**: that budget is the
+    /// tail's to apply, not this function's to decide. A caller handing one in
+    /// would be a caller knowing something it shouldn't.
+    ///
+    /// `focus` is the overlay's windowing index (the pre-computed visual row of
+    /// the selection); `term_w` is the width the layout is measured for — the
+    /// same value `draw_elements` applies it with.
     ///
     /// Shared by `read_input`'s `redraw` closure and the vt100 tests, so both
     /// drive the exact bytes production emits (ui_draw_v2 P0/P3).
-    pub(crate) fn compose_frame(
+    pub(crate) fn compose_elements(
         editor: &LineEditor,
         prompt: &str,
         status: Option<&str>,
         overlay: &[String],
         focus: usize,
         term_w: usize,
-        term_h: usize,
-    ) -> Frame {
+    ) -> Vec<Element> {
         let term_w = term_w.max(1);
         let layout = editor.layout(term_w, prompt);
         let mut elements = Vec::new();
@@ -1228,6 +1243,28 @@ impl Repl {
                 focus,
             });
         }
+        elements
+    }
+
+    /// Compose *and* render, for tests that drive `plan_apply` directly and have
+    /// no output handle to go through.
+    ///
+    /// `#[cfg(test)]` on purpose: it is the only remaining way to reach the pure
+    /// pipeline outside `Output::draw_elements`, so production *cannot* build a
+    /// frame by hand. Dropping the `cfg` would silently reintroduce the second
+    /// pipeline that `ui.rs` used to have (ui_draw_v2 §5.1.1).
+    #[cfg(test)]
+    pub(crate) fn compose_frame(
+        editor: &LineEditor,
+        prompt: &str,
+        status: Option<&str>,
+        overlay: &[String],
+        focus: usize,
+        term_w: usize,
+        term_h: usize,
+    ) -> Frame {
+        let term_w = term_w.max(1);
+        let elements = Self::compose_elements(editor, prompt, status, overlay, focus, term_w);
         let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
         let heights = allocate(&extents, live_budget(term_h.max(1)));
         render(&elements, &heights, term_w)

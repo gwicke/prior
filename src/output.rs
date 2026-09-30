@@ -1,7 +1,10 @@
 use crate::repl::current_term_width;
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
 use crate::tools::EditOp;
-use crate::ui::frame::{plan_apply, plan_clear_live_frame, ApplyPolicy, DrawCache, Frame};
+use crate::ui::frame::{
+    allocate, live_budget, plan_apply, plan_clear_live_frame, render, ApplyPolicy, DrawCache,
+    Element, Extent, Frame,
+};
 use console::{style, StyledObject};
 use libc;
 use markdown_stream::{Parser, StreamParser};
@@ -179,6 +182,30 @@ pub trait Output: Send + Sync {
         dims: (usize, usize),
     ) -> (usize, usize) {
         (dims.0.max(1), dims.1.max(1))
+    }
+
+    /// Compose, allocate, render and apply an element list — **the one place the
+    /// pure pipeline runs** (ui_draw_v2 §5.1.1).
+    ///
+    /// Callers supply *content*: the items, in composition order. The budget is
+    /// derived from `dims`, never passed in — a caller that hands a budget is
+    /// being asked to know something it shouldn't. `dims` itself stays as an
+    /// argument because it is the caller's *belief* about the terminal, and
+    /// resize detection compares that belief against what was painted.
+    ///
+    /// A default impl because every output draws the same way: only the tail,
+    /// [`draw_frame`](Output::draw_frame), varies (test outputs paint nothing).
+    fn draw_elements(
+        &self,
+        elements: Vec<Element>,
+        policy: ApplyPolicy,
+        dims: (usize, usize),
+    ) -> (usize, usize) {
+        let (tw, th) = (dims.0.max(1), dims.1.max(1));
+        let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
+        let heights = allocate(&extents, live_budget(th));
+        let frame = render(&elements, &heights, tw);
+        self.draw_frame(&frame, policy, dims)
     }
 
     /// Gate the background in-flight reader should honor. While it is `true`,
@@ -4427,6 +4454,65 @@ mod tests {
         assert!(
             *out.dim_on.lock().unwrap(),
             "the tracked dim should still be on"
+        );
+    }
+
+    /// `draw_elements` is the old hand-rolled path, not a new one: it must paint
+    /// **byte-identically** to `draw_frame(&compose_frame(...))`.
+    ///
+    /// Two paths that are meant to be the same are usually asserted against a
+    /// transcript, which pins each independently and lets them drift together.
+    /// Here they are compared *to each other*, because the whole point of §5.1.1
+    /// was that nothing changed — only where the decision is made. Exercises all
+    /// four variants so a split in any of them shows.
+    ///
+    /// **The pop-up is deliberately taller than the live budget.** With a
+    /// composition that fits, `allocate` early-returns and both paths agree
+    /// trivially — the first version of this test passed with the budget line
+    /// mutated out from under it. Total `might` here is above `live_budget(20)`
+    /// (⌈2/3·20⌉ = 14) and below the raw height, so the two paths only agree if
+    /// they derive the *same* budget, not just the same items.
+    #[test]
+    #[serial]
+    fn draw_elements_paints_exactly_what_the_hand_rolled_path_paints() {
+        let tall: Vec<String> = (0..16).map(|i| format!("row {i}")).collect();
+        let build = || {
+            crate::repl::Repl::compose_elements(
+                &crate::repl::LineEditor::new(),
+                "> ",
+                Some("[bar]"),
+                &tall,
+                0,
+                60,
+            )
+        };
+        let (tail, _rt) = capturing_output(60);
+        tail.begin_capture();
+        let dims = (60, 20);
+        let a = tail.draw_elements(build(), ApplyPolicy::Frame, dims);
+        let via_tail = tail.end_capture();
+
+        let (hand, _rh) = capturing_output(60);
+        hand.begin_capture();
+        let b = hand.draw_frame(
+            &crate::repl::Repl::compose_frame(
+                &crate::repl::LineEditor::new(),
+                "> ",
+                Some("[bar]"),
+                &tall,
+                0,
+                60,
+                20,
+            ),
+            ApplyPolicy::Frame,
+            dims,
+        );
+        let via_hand = hand.end_capture();
+
+        assert_eq!(a, b, "the same dims either way");
+        assert_eq!(
+            via_tail, via_hand,
+            "the tail is the old path, byte for byte — not a second behaviour"
         );
     }
 

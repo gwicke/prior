@@ -17,7 +17,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crate::output::{Confirmation, Output};
 use crate::slashdot_menu::node_impl::StaticRow;
 use crate::slashdot_menu::render::{paint_overlay, LogicalLine, RenderPlan};
-use crate::ui::frame::{allocate, live_budget, render, ApplyPolicy, Element, Extent, Frame};
+use crate::ui::frame::{ApplyPolicy, Element, Frame};
 use std::rc::Rc;
 
 /// Specification for a confirmation dialog.
@@ -190,10 +190,10 @@ fn draw_dialog(
         rows: painted.rows,
         focus: painted.focus.unwrap_or(0),
     });
-    let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
-    let heights = allocate(&extents, live_budget(term_h));
-    let frame = render(&elements, &heights, term_w);
-    out.draw_frame(&frame, ApplyPolicy::Frame, size);
+    // Through the tail, not a second pipeline. This builder used to hand-roll
+    // `extent → allocate → render` and call `draw_frame`, which meant two places
+    // in the crate decided how the terminal's rows were divided (ui_draw_v2 §5.1.1).
+    out.draw_elements(elements, ApplyPolicy::Frame, size);
 }
 
 /// Resolve the dialog: erase its region through the frame pipeline — a

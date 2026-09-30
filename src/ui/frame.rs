@@ -45,7 +45,7 @@ pub(crate) struct Extent {
 }
 
 /// One drawable piece of a frame (plan §3.2).
-pub(crate) enum Element {
+pub enum Element {
     /// Prompt + editor content. `layout` is the editor's visual layout
     /// (prompt rendered on row 0); the caret lives at `layout.cursor_row` /
     /// `layout.cursor_col` — derived, not stored (plan's `caret` field).
