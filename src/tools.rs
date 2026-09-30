@@ -17,7 +17,7 @@ use crate::path_util::relativize_path;
 // The block-edit core moved to the `blockedit` crate so the `bsed` binary
 // previews and applies in exactly the format the `edit` tool consumes. These
 // re-exports keep every call site in this file spelled as before.
-pub use blockedit::wire::{EditArgs, MAX_ECHOED_ARGS};
+pub use blockedit::wire::{EditArgs, FileEdit, MAX_ECHOED_ARGS};
 // The advertised blob field is spelled by the same const the parser reads, so the
 // schema and `EditArgs::from_wire` cannot drift into naming two different fields.
 #[allow(unused)]
@@ -262,8 +262,35 @@ impl rig_core::tool::Tool for EditFile {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        edit_file(args.path, args.edits).await
+        edit_files(args.files).await
     }
+}
+
+/// Apply a call's edits, one file at a time.
+///
+/// Failure granularity is the **file**: each file is applied all-or-nothing on
+/// its own, and a file that fails is reported without blocking the others.
+/// That is what the tool description advertises, and it is why a call about
+/// three files is three independent writes rather than one giant atomic one.
+///
+/// A single-file call is `edit_file` verbatim, so the single-file path — still
+/// the overwhelmingly common one — is unchanged by construction.
+///
+/// This applies each file as it resolves. The follow-up (W4 in
+/// `doc/batch_editing_v2.md`) resolves *every* file in memory first, so a call
+/// reports all of its problems in one round trip instead of one file per trip;
+/// `apply_to_text` is pure over text, so that is a change to the write step
+/// only.
+pub async fn edit_files(files: Vec<FileEdit>) -> Result<String, ToolError> {
+    if files.len() == 1 {
+        let FileEdit { path, edits } = files.into_iter().next().unwrap();
+        return edit_file(path, edits).await;
+    }
+    let mut reports = Vec::with_capacity(files.len());
+    for FileEdit { path, edits } in files {
+        reports.push(edit_file(path, edits).await?);
+    }
+    Ok(reports.join("\n"))
 }
 
 /// Apply a batch of edits to one file, all-or-nothing.
@@ -3165,7 +3192,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("dup.txt", "hello world\n").await.unwrap();
         let blob =
-            "dup.txt\n@@@OLD\nhello\n@@@NEW\nbye\n@@@END\n\n@@@OLD\nhello\n@@@NEW\nhi\n@@@END";
+            "dup.txt\n@@@OLD\nhello\n@@@NEW\nbye\n@@@END\n\ndup.txt\n@@@OLD\nhello\n@@@NEW\nhi\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "dup.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(looks_like_edit_failure(&out), "must fail, got: {out}");
@@ -3211,7 +3238,7 @@ mod edit_args_wire_tests {
             .await
             .unwrap();
         let blob =
-            "chain.txt\n@@@OLD\nfoo bar\n@@@NEW\nAAA\n@@@END\n\n@@@OLD\nbar\n@@@NEW\nBBB\n@@@END";
+            "chain.txt\n@@@OLD\nfoo bar\n@@@NEW\nAAA\n@@@END\n\nchain.txt\n@@@OLD\nbar\n@@@NEW\nBBB\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "chain.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(out.starts_with("Replaced"), "expected success, got: {out}");
@@ -3254,7 +3281,7 @@ mod edit_args_wire_tests {
             .await
             .unwrap();
         let blob =
-            "noclaim.txt:3\n@@@OLD\ndup\n@@@NEW\nX\n@@@END\n\n@@@OLD\ndup\n@@@NEW\nY\n@@@END";
+            "noclaim.txt:3\n@@@OLD\ndup\n@@@NEW\nX\n@@@END\n\nnoclaim.txt\n@@@OLD\ndup\n@@@NEW\nY\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "noclaim.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(looks_like_edit_failure(&out), "batch must fail, got: {out}");
@@ -3412,7 +3439,8 @@ mod edit_args_wire_tests {
     async fn block_form_applies_all_edits() {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("blob.txt", "a\nb\nc\n").await.unwrap();
-        let blob = "blob.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n@@@OLD\nc\n@@@NEW\nC\n@@@END";
+        let blob =
+            "blob.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\nblob.txt\n@@@OLD\nc\n@@@NEW\nC\n@@@END";
         let result = execute_edit(serde_json::json!({
             "path": "blob.txt",
             "blocks": blob
@@ -3421,6 +3449,48 @@ mod edit_args_wire_tests {
         assert!(result.is_success(), "expected success, got: {result:?}");
         let after = tokio::fs::read_to_string("blob.txt").await.unwrap();
         assert_eq!(after, "A\nb\nC\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_multi_file_blob_edits_every_named_file() {
+        // The W2 wiring, end to end through the erased tool: one call, three
+        // files, each applied independently.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("m1.txt", "a\n").await.unwrap();
+        tokio::fs::write("m2.txt", "b\n").await.unwrap();
+        tokio::fs::write("m3.txt", "c\n").await.unwrap();
+        let blob = "m1.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n\
+                    m2.txt\n@@@OLD\nb\n@@@NEW\nB\n@@@END\n\n\
+                    m3.txt\n@@@OLD\nc\n@@@NEW\nC\n@@@END";
+        let result = execute_edit(serde_json::json!({ "blocks": blob })).await;
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        assert_eq!(tokio::fs::read_to_string("m1.txt").await.unwrap(), "A\n");
+        assert_eq!(tokio::fs::read_to_string("m2.txt").await.unwrap(), "B\n");
+        assert_eq!(tokio::fs::read_to_string("m3.txt").await.unwrap(), "C\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn one_failing_file_does_not_block_the_others() {
+        // Failure granularity is the file, which is what the tool description
+        // advertises: m2 does not match, so m1 and m3 must still be written.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("p1.txt", "a\n").await.unwrap();
+        tokio::fs::write("p2.txt", "different\n").await.unwrap();
+        tokio::fs::write("p3.txt", "c\n").await.unwrap();
+        let blob = "p1.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n\
+                    p2.txt\n@@@OLD\nnope\n@@@NEW\nN\n@@@END\n\n\
+                    p3.txt\n@@@OLD\nc\n@@@NEW\nC\n@@@END";
+        let _ = execute_edit(serde_json::json!({ "blocks": blob })).await;
+        // The other two files are written despite p2 failing.
+        assert_eq!(tokio::fs::read_to_string("p1.txt").await.unwrap(), "A\n");
+        assert_eq!(tokio::fs::read_to_string("p3.txt").await.unwrap(), "C\n");
+        assert_eq!(
+            tokio::fs::read_to_string("p2.txt").await.unwrap(),
+            "different\n",
+            "the failing file must be untouched"
+        );
     }
 
     #[tokio::test]
@@ -3437,14 +3507,26 @@ mod edit_args_wire_tests {
 
     #[tokio::test]
     #[serial]
-    async fn block_form_conflicting_path_errors() {
+    async fn a_redundant_path_argument_never_overrides_a_block_header() {
+        // Block paths are authoritative, and `path` is not consulted for the
+        // block form. The header names b.txt, so b.txt is edited — a.txt, which
+        // the redundant argument named, is not touched at all.
         let _cwd = super::edit_file_tests::CwdGuard::new();
-        tokio::fs::write("a.txt", "x\n").await.unwrap();
+        tokio::fs::write("a.txt", "untouched\n").await.unwrap();
+        tokio::fs::write("b.txt", "x\n").await.unwrap();
         let blob = "b.txt\n@@@OLD\nx\n@@@NEW\ny\n@@@END";
         let result = execute_edit(serde_json::json!({ "path": "a.txt", "blocks": blob })).await;
-        assert!(result.is_error(), "conflicting path must fail: {result:?}");
-        let msg = result.output().render();
-        assert!(msg.contains("path mismatch"), "got: {msg}");
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        assert_eq!(
+            tokio::fs::read_to_string("b.txt").await.unwrap(),
+            "y\n",
+            "the header names the file that is edited"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string("a.txt").await.unwrap(),
+            "untouched\n",
+            "the `path` argument must not re-target the call"
+        );
     }
 
     #[test]

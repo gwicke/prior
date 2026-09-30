@@ -407,52 +407,23 @@ fn same_path(a: &str, b: &str) -> bool {
     }
 }
 
-/// Apply the path policy and produce the resolved single-file target plus the
-/// block pairs.
+/// Render block pairs as a blob, with the path repeated as a header line above
+/// **every** block (Aider-style). Anchors are a transient matching aid and are
+/// not represented.
 ///
-/// `json_path` is the trimmed, non-empty `path` argument (or `None`).
-pub fn merge_path(
-    json_path: Option<&str>,
-    parsed: ParsedBlocks,
-) -> Result<(String, Vec<ParsedEdit>), String> {
-    if parsed.multi_file {
-        return Err(
-            "multi-file edits are not supported in this form; make one `edit` call per file"
-                .to_string(),
-        );
-    }
-    match (json_path, parsed.path) {
-        (Some(p), Some(h)) => {
-            if same_path(p, &h) {
-                Ok((p.to_string(), parsed.edits))
-            } else {
-                Err(format!(
-                    "path mismatch: the `path` argument is `{p}` but the edit text names `{h}`; \
-                     they must agree"
-                ))
-            }
-        }
-        (Some(p), None) => Ok((p.to_string(), parsed.edits)),
-        (None, Some(h)) => Ok((h, parsed.edits)),
-        (None, None) => Err(
-            "no file path: set the `path` argument or include a filename line before the \
-             `@@@OLD` marker"
-                .to_string(),
-        ),
-    }
-}
-
-/// Render block pairs as a blob, with the path as a header line above the
-/// first block (Aider-style). Anchors (`startLine`/`endLine`) are a transient
-/// matching aid and are not represented.
+/// The path is repeated because the tool *requires* a header on every block —
+/// the model-facing form has to be a form the tool accepts, or the agent is
+/// being taught an invalid call. Writing it once above the first block was the
+/// old, laxer layout; it is no longer expressible, and a repeated header costs
+/// a few tokens per block against the clarity of one uniform rule.
 pub fn render_blob(path: &str, edits: &[ParsedEdit]) -> String {
     let mut out = String::new();
-    if !path.is_empty() {
-        out.push_str(path);
-        out.push('\n');
-    }
     for (i, e) in edits.iter().enumerate() {
         if i > 0 {
+            out.push('\n');
+        }
+        if !path.is_empty() {
+            out.push_str(path);
             out.push('\n');
         }
         out.push_str(SEARCH_MARKER);
@@ -498,23 +469,31 @@ fn edits_to_value(edits: &[ParsedEdit]) -> Value {
 /// so reaching those branches here means we are normalizing something we read
 /// back off disk, which is exactly what they are for.
 ///
-/// On a malformed blob (unparseable, or a conflicting path) the value is
-/// returned unchanged so replay degrades gracefully rather than erroring.
+/// On a blob that does not satisfy the block policy (unparseable, a block that
+/// names no file, or a multi-file blob) the value is returned unchanged so
+/// replay degrades gracefully rather than erroring.
 pub fn canonicalize_edit_value(args: &Value) -> Value {
     let Some(obj) = args.as_object() else {
         return args.clone();
     };
-    let json_path = obj
-        .get("path")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
 
     // Blob string (the model-facing field).
     if let Some(text) = blob_text(args) {
+        // Same policy as the wire (`from_wire`): every block names its own
+        // file, and the `path` argument is not consulted. Canonicalization must
+        // not be laxer than the tool, or it would resolve blobs the tool
+        // rejects — and a persisted call has to mean what it meant on ingress.
         if let Ok(parsed) = parse_blocks(text) {
-            if let Ok((path, pairs)) = merge_path(json_path, parsed) {
-                return json!({ "path": path, "edits": edits_to_value(&pairs) });
+            if let Ok(files) = split_by_file(parsed) {
+                // The canonical form is one path per call, so only a
+                // single-file blob canonicalizes; a multi-file one is stored
+                // raw (degrades gracefully) until the storage axis splits it.
+                if let [one] = files.as_slice() {
+                    return json!({
+                        "path": one.path,
+                        "edits": edits_to_value(&one.edits),
+                    });
+                }
             }
         }
         return args.clone();
@@ -859,40 +838,9 @@ mod tests {
         );
     }
 
-    fn one_block(path: Option<&str>) -> ParsedBlocks {
-        ParsedBlocks {
-            path: path.map(str::to_string),
-            multi_file: false,
-            edits: vec![plain("a", "b")],
-        }
-    }
-
-    #[test]
-    fn merge_path_infers_from_header() {
-        let (path, edits) = merge_path(None, one_block(Some("src/x.rs"))).unwrap();
-        assert_eq!(path, "src/x.rs");
-        assert_eq!(edits, vec![plain("a", "b")]);
-    }
-
-    #[test]
-    fn merge_path_rejects_conflict() {
-        assert!(merge_path(Some("a.rs"), one_block(Some("b.rs"))).is_err());
-    }
-
-    #[test]
-    fn merge_path_accepts_equivalent_spellings() {
-        // `./src/x.rs` and `src/x.rs` normalize equal.
-        assert!(merge_path(Some("./src/x.rs"), one_block(Some("src/x.rs"))).is_ok());
-    }
-
-    #[test]
-    fn merge_path_requires_a_path() {
-        assert!(merge_path(None, one_block(None)).is_err());
-    }
-
     #[test]
     fn canonicalize_blob_string() {
-        let v = json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
+        let v = json!({"path": "src/x.rs", "blocks": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"});
         let c = canonicalize_edit_value(&v);
         assert_eq!(
             c,
@@ -922,7 +870,7 @@ mod tests {
         // *string* is the pre-rename blob, and it still parses and canonicalizes
         // — a session recorded before the rename now normalizes on load, which
         // is a small recovery the rename had thrown away.
-        let v = json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
+        let v = json!({"path": "src/x.rs", "edits": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"});
         assert!(blob_text(&v).is_some());
         assert_eq!(
             canonicalize_edit_value(&v),
@@ -962,10 +910,31 @@ mod tests {
         let text = blob.get(BLOCKS_FIELD).and_then(|x| x.as_str()).unwrap();
         let parsed = parse_blocks(text).unwrap();
         assert_eq!(parsed.path.as_deref(), Some("src/x.rs"));
+        // Every block carries its own header, because the tool requires one.
         assert_eq!(
             parsed.edits,
-            vec![headed("src/x.rs", "a", "b"), plain("c", "d")]
+            vec![headed("src/x.rs", "a", "b"), headed("src/x.rs", "c", "d")]
         );
+    }
+
+    #[test]
+    fn the_model_facing_form_satisfies_the_tools_own_policy() {
+        // The agent teaches the blob form by rewriting stored args into it, so
+        // what it teaches must be a form the tool accepts. Under the strict
+        // policy that means a header on *every* block — writing the path once
+        // above the first block would be teaching an invalid call.
+        let v = json!({
+            "path": "src/x.rs",
+            "edits": [{"oldText": "a", "newText": "b"}, {"oldText": "c", "newText": "d"}]
+        });
+        let blob = array_to_blob_value(&v);
+        let text = blob.get(BLOCKS_FIELD).and_then(|x| x.as_str()).unwrap();
+        // It passes the policy the wire applies...
+        let files = split_by_file(parse_blocks(text).unwrap()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].edits.len(), 2);
+        // ...and still canonicalizes to what it came from.
+        assert_eq!(canonicalize_edit_value(&blob), v);
     }
 
     #[test]
@@ -1162,6 +1131,24 @@ pub fn group_by_file(
             FileBatch { path, edits }
         })
         .collect())
+}
+
+/// The execution form of one file's blocks: [`EditOp`]s computed against the
+/// original file, anchors carried through as the matching hint.
+///
+/// The single conversion every consumer of a parsed blob needs. It lives here
+/// rather than in each caller because there were already two copies (this
+/// crate's `from_wire`, and a private one in `bsed`), which drift the moment a
+/// field is added to either type.
+pub fn to_ops(edits: &[ParsedEdit]) -> Vec<crate::types::EditOp> {
+    edits
+        .iter()
+        .map(|e| crate::types::EditOp {
+            old_text: e.old_text.clone(),
+            new_text: e.new_text.clone(),
+            start_line: e.start_line.map(crate::types::EditStartLine),
+        })
+        .collect()
 }
 
 /// Upper bound on files in one call. Beyond it the blob is rejected whole,
