@@ -708,7 +708,11 @@ mod tests {
         let text = "a.rs\n@@@OLD\nx\n@@@NEW\ny\n@@@END\n\nb.rs\n@@@OLD\np\n@@@NEW\nq\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert!(p.multi_file);
-        assert!(merge_path(Some("a.rs"), p).is_err());
+        // Two files -> two batches, and the `path` argument is not consulted.
+        let files = split_by_file(p).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "a.rs");
+        assert_eq!(files[1].path, "b.rs");
     }
 
     #[test]
@@ -1162,8 +1166,8 @@ pub const MAX_FILES_PER_CALL: usize = 32;
 
 /// The path each block names, keyed for grouping, in first-seen order.
 ///
-/// `split_by_file` is the *multi-file* path policy, and it is deliberately
-/// stricter than [`group_by_file`] and than [`merge_path`]:
+/// `split_by_file` is **the** path policy for every block blob, single-file or
+/// not. There is deliberately one rule rather than two:
 ///
 /// 1. **Every** block must carry its own header. No defaulting — not to the
 ///    `path` argument, not to the previous block. A header-less block in a
@@ -1179,10 +1183,13 @@ pub const MAX_FILES_PER_CALL: usize = 32;
 ///    would be a bug, not a feature.
 /// 4. More than [`MAX_FILES_PER_CALL`] distinct files is rejected whole.
 ///
-/// Unlike `merge_path` there is no fallback: a single-file blob still goes
-/// through `merge_path` and still defaults freely, because there is only one
-/// candidate and a default cannot be wrong. That is also why this function is
-/// not a drop-in for `group_by_file` — see the hazards its own tests pin.
+/// There is no fallback, and there is no single-file exemption either: an
+/// earlier design let `path` supply the file for a header-less *single-file*
+/// blob, and keeping it would have meant a model holding two rules for one
+/// thing, on a point where one costs nothing (a block already carries its
+/// `path`). This is also why the function is not a drop-in for
+/// [`group_by_file`], which is header-authoritative *with a fallback* and
+/// keys on the raw string — see the hazards its own tests pin.
 pub fn split_by_file(parsed: ParsedBlocks) -> Result<Vec<FileBatch>, String> {
     if parsed.edits.is_empty() {
         return Err("no edit blocks found".to_string());

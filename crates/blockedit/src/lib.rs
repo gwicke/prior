@@ -35,6 +35,7 @@ pub use blob::{
     split_by_file, split_line_anchor, to_ops, FileBatch, ParseError, ParsedBlocks, ParsedEdit,
     DIVIDER, MAX_FILES_PER_CALL, REPLACE_MARKER, SEARCH_MARKER,
 };
+pub use diagnose::{parse_file_results, render_file_results, FileResult};
 pub use tool_errors::strip_arg_error_prefixes;
 pub use types::{EditOp, EditStartLine};
 pub use wire::{EditArgs, FileEdit};

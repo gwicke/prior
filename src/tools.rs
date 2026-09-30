@@ -282,15 +282,28 @@ impl rig_core::tool::Tool for EditFile {
 /// `apply_to_text` is pure over text, so that is a change to the write step
 /// only.
 pub async fn edit_files(files: Vec<FileEdit>) -> Result<String, ToolError> {
+    // A single-file call is byte-identical to `edit_file` — a bare success note
+    // or a bare `{ui_view, model_view}` envelope, never a one-element array, so
+    // the overwhelmingly common case is untouched.
     if files.len() == 1 {
         let FileEdit { path, edits } = files.into_iter().next().unwrap();
         return edit_file(path, edits).await;
     }
-    let mut reports = Vec::with_capacity(files.len());
+    let mut results = Vec::with_capacity(files.len());
     for FileEdit { path, edits } in files {
-        reports.push(edit_file(path, edits).await?);
+        // `edit_file` returns either a success note (plain text) or a rendered
+        // failure envelope (a JSON string). Hold both as a `Value` so the array
+        // carries the two shapes verbatim rather than re-encoding them.
+        let raw = edit_file(path.clone(), edits).await?;
+        let result = match serde_json::from_str::<serde_json::Value>(&raw) {
+            // A success note is plain text and is not JSON, so it becomes a
+            // string; a failure envelope is already an object.
+            Ok(v) => v,
+            Err(_) => serde_json::Value::String(raw),
+        };
+        results.push(blockedit::FileResult { path, result });
     }
-    Ok(reports.join("\n"))
+    Ok(blockedit::render_file_results(&results))
 }
 
 /// Apply a batch of edits to one file, all-or-nothing.
@@ -3490,6 +3503,54 @@ mod edit_args_wire_tests {
             tokio::fs::read_to_string("p2.txt").await.unwrap(),
             "different\n",
             "the failing file must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_multi_file_result_is_a_bare_array_with_per_file_results() {
+        // The wire shape W3 fixes: a bare array of `{path, result}`, each result
+        // the file's single-file report verbatim. It must reach the history
+        // intact so W7/W8 can split it (see doc/batch_editing_v2.md).
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("w1.txt", "a\n").await.unwrap();
+        tokio::fs::write("w2.txt", "different\n").await.unwrap();
+        let blob = "w1.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n\
+                    w2.txt\n@@@OLD\nnope\n@@@NEW\nN\n@@@END";
+        let raw = execute_edit(serde_json::json!({ "blocks": blob })).await;
+        let out = raw.output().render();
+        let v: serde_json::Value = serde_json::from_str(&out).expect("result must be JSON");
+        let arr = v.as_array().expect("multi-file result is a bare array");
+        assert_eq!(arr.len(), 2);
+        assert!(v.get("ui_view").is_none(), "no aggregate wrapper: {out}");
+        assert_eq!(arr[0]["path"], "w1.txt");
+        assert!(
+            arr[0]["result"].is_string(),
+            "success is a bare note: {out}"
+        );
+        assert_eq!(arr[1]["path"], "w2.txt");
+        // The failing file carries the existing {ui_view, model_view} envelope.
+        assert!(arr[1]["result"]["ui_view"].is_string(), "{out}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_single_file_result_is_never_a_one_element_array() {
+        // Byte-identical to today: a bare note, not an array.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("solo.txt", "a\n").await.unwrap();
+        let blob = "solo.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END";
+        let out = execute_edit(serde_json::json!({ "blocks": blob }))
+            .await
+            .output()
+            .render();
+        assert!(out.contains("Replaced 1 block(s)"), "{out}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .is_none(),
+            "single-file must not become an array: {out}"
         );
     }
 
