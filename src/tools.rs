@@ -189,7 +189,7 @@ pub async fn write_file(path: String, content: String) -> Result<String, ToolErr
 /// and not a `concat!`: the policy needs a format string, and the syntax is
 /// pasted into a markdown fence where braces must survive it.
 const BLOCK_SYNTAX: &str = "\
-some/path
+some/path:1234
 @@@OLD
 the original text
 @@@NEW
@@ -198,12 +198,11 @@ the replacement text
 
 /// The batch policy sentence that follows the syntax: atomicity, and the
 /// `path:LINE` anchor the model needs for repeated text.
-const BLOCK_POLICY: &str = "Multiple blocks are executed as an all-or-nothing batch, \
-but all blocks need to be within the same file. Each edit's text must occur \
-exactly once: if it repeats, anchor it near the right occurrence with a \
-`path:LINE` hint, which specifies the start line location of the original text. \
-So in the example block, `some/path` becomes `some/path:1234`, 1-based line \
-numbers e.g. from `read`.";
+const BLOCK_POLICY: &str = "Each block MUST specify its file path, and SHOULD \
+provide the 1-based start line number hint, from `read` or `grep`. \
+Line numbers greatly reduce the chance of edit failures, \
+especially when there are similar content lines in other parts of the file. Blocks \
+editing the same file are executed all-or-nothing";
 
 /// Static tool facade for `edit`. Hand-written (rather than `#[rig_tool]`) so
 /// the args deserializer can select a variant from the raw JSON and accept the
@@ -220,7 +219,7 @@ impl rig_core::tool::Tool for EditFile {
 
     fn description(&self) -> String {
         format!(
-            "Replace text in a file. Prefer the `blocks` block string:\n```\n{BLOCK_SYNTAX}\n```\n\
+            "Replace text in a file. Prefer the `blocks` string syntax with batching support:\n```\n{BLOCK_SYNTAX}\n```\n\
              {BLOCK_POLICY}\n\
              For single edits, the traditional OpenAI path / oldText / newText API is available as well."
         )
@@ -232,26 +231,26 @@ impl rig_core::tool::Tool for EditFile {
         serde_json::json!({
             "type": "object",
             "properties": {
+                (BLOCKS_FIELD): {
+                    "type": "string",
+                    "description": format!("Blocks format: Primary edit entry point with batching support. Block syntax:\n```\n{BLOCK_SYNTAX}\n```\n{BLOCK_POLICY}")
+                },
                 "path": {
                     "type": "string",
-                    "description": "File to edit, relative to the working directory. Required for the single-edit form; optional for the block form when the edit text starts with a filename line. It accepts the `file:LINE` idiom (e.g. `src/foo.rs:120`): for a single edit the suffix is an anchor; in the block form only the path part is used (per-block anchors live on the block headers)."
+                    "description": "OpenAI format: File to edit, relative to the working directory. For `blocks` based edits, specify path:LINE in each block header instead."
                 },
                 "oldText": {
                     "type": "string",
-                    "description": "Exact text to replace (single-edit form). Must occur exactly once in the file, or pair with `startLine`/a `path:LINE` suffix."
+                    "description": "OpenAI format: Exact text to replace (single-edit form). Must occur exactly once in the file, or pair with `startLine`/a `path:LINE` suffix."
                 },
                 "newText": {
                     "type": "string",
-                    "description": "Replacement text (single-edit form)."
+                    "description": "OpenAI format: Replacement text (single-edit form)."
                 },
                 "startLine": {
                     "type": "integer",
-                    "description": "Single-edit form only: a 1-indexed anchor line. When oldText occurs more than once, the occurrence nearest this line (within a small, context-scaled tolerance) is chosen. It is a hint, not a search range, and sets no end line. A `path:LINE` suffix is an equivalent alias; if both are given they must agree. Ignored in the block form — use a `path:LINE` block header there instead."
+                    "description": "OpenAI format: a 1-indexed anchor line. Greatly reduces the chance of edit failures. When using `blocks`, use `path:LINE` block headers instead."
                 },
-                (BLOCKS_FIELD): {
-                    "type": "string",
-                    "description": format!("Main edit entry point, with batching support, using block syntax:\n```\n{BLOCK_SYNTAX}\n```\n{BLOCK_POLICY}")
-                }
             },
             "required": []
         })
