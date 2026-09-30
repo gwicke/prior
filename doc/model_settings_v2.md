@@ -854,6 +854,30 @@ activation. `settings.rs:401` (`apply_to_config`) would also be a bug if ever
 wired into the live path — it sets `cfg.params.reasoning` from the global,
 stomping the per-model value. It is test-only today; noted in a comment.
 
+**P5.6 — the records reached the store at all.** **Done (2026-09-30).** Found
+by report, and it made the whole per-model feature dead at startup. P5.5's
+seeding read the record correctly; there was simply never a record in memory.
+`main.rs` built the startup store with `SettingsStore::from_agent_config`, which
+hardcoded `models: HashMap::new()` under a comment claiming `main` would thread
+the records in — it never did, and `AgentConfig` has no field for them, so the
+constructor could not have recovered them on its own. One symptom, three
+consequences:
+
+1. `activate_model_params` found nothing and fell back to the global, so
+   `/reasoning` reported `low` while the file said `max`.
+2. The Ctrl-E prefill was handed a default record, and `render_fragment`
+   renders an unset key as a commented suggestion — so the editor showed a
+   fully-commented example instead of `reasoning = "max"`.
+3. The damaging one: `apply_model_settings` *replaces* the table, so a Ctrl-E
+   commit against an empty record dropped the keys the file already had.
+
+`from_agent_config` now takes the records as a parameter, and `main` passes
+`config.models`. *Tests:* 5, all deliberately going through the **startup
+constructor** or a **real settings file** — a test that hand-builds a store with
+`models` populated passes happily and proves nothing, which is exactly how this
+hid. One test covers the whole chain from a written `settings.toml` through
+`Config::load` → `from_agent_config` → `AppState::new` → seeding.
+
 **P6 — per-turn overrides.** `turn_overrides::split`; `PicoAgent::prompt`
 signature change; the `Submit`-arm wiring; warnings. *Tests:* parser table
 (strip / no-strip / partial block / invalid value / duplicate / only-overrides);

@@ -7050,7 +7050,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             message_log_path: None,
             sessions_dir: Some(sessions_dir.clone()),
         };
-        let settings = SettingsStore::from_agent_config(&config, None);
+        let settings = SettingsStore::from_agent_config(&config, &Default::default(), None);
 
         // No normal prompt is ever submitted, so the agent is never created and
         // `create_agent` (and its `set_sandbox`) is never called — exactly the
@@ -7162,7 +7162,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             message_log_path: None,
             sessions_dir: Some(sessions_tempdir.path().to_path_buf()),
         };
-        let settings = SettingsStore::from_agent_config(&config, None);
+        let settings = SettingsStore::from_agent_config(&config, &Default::default(), None);
 
         super::run_interactive(config, settings, false)
             .await

@@ -319,7 +319,11 @@ impl SettingsStore {
     /// Build the store from the *resolved* effective session config, so the
     /// menu shows the actual current values (CLI > file > built-in precedence
     /// is already applied by the caller in `main.rs`).
-    pub fn from_agent_config(cfg: &crate::AgentConfig, path: Option<&Path>) -> Self {
+    pub fn from_agent_config(
+        cfg: &crate::AgentConfig,
+        models: &std::collections::HashMap<String, crate::model_settings::ModelSettings>,
+        path: Option<&Path>,
+    ) -> Self {
         SettingsStore {
             default_model: cfg.qualified_model_id(),
             security_mode: if cfg.yolo {
@@ -345,10 +349,19 @@ impl SettingsStore {
             reasoning_in_context: cfg.reasoning_in_context,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::new(),
-            // No per-model defaults at startup: the store mirrors the running
-            // session's view, and the file's records are loaded by
-            // `SettingsStore::load` / threaded in by `main`.
-            models: std::collections::HashMap::new(),
+            // The per-model records, threaded in from the parsed `Config`.
+            //
+            // They have to be a parameter: they exist only on `Config`, and
+            // `AgentConfig` has no field for them, so this constructor could
+            // not recover them on its own. Defaulting them to empty here — with
+            // a comment claiming `main` would fill them in — is what made the
+            // whole per-model feature dead at startup: the file's records were
+            // written correctly and never read, so `activate_model_params`
+            // fell back to the global and the Ctrl-E prefill rendered a
+            // fully-commented template. A Ctrl-E commit was worse still,
+            // since `apply_model_settings` replaces the table, so committing
+            // an edit against an empty record dropped the user's other keys.
+            models: models.clone(),
             path: path.map(|p| p.to_path_buf()),
         }
     }
@@ -1395,5 +1408,185 @@ mod tests {
         assert_eq!(p.reasoning, Some(crate::params::ReasoningLevel::Med));
         assert_eq!(p.temperature, Some(0.2));
         assert_eq!(p.top_p, Some(0.9));
+    }
+
+    // ---- the startup store must carry the file's records (P5.6) ----
+
+    /// The whole per-model feature was dead at startup because
+    /// `from_agent_config` had nowhere to get `[models.*]` and defaulted them
+    /// to empty. These go through the *startup* constructor deliberately: a
+    /// test that hand-builds a `SettingsStore` with `models` populated passes
+    /// happily and proves nothing, which is exactly what hid the bug.
+    fn startup_store(records: &[(&str, ReasoningLevel)]) -> (SettingsStore, crate::AgentConfig) {
+        let mut cfg = SettingsStore::from_config(&crate::Config::default(), None);
+        cfg.default_reasoning_level = Some("low".to_string());
+        cfg.models = records
+            .iter()
+            .map(|(id, level)| {
+                (
+                    id.to_string(),
+                    crate::model_settings::ModelSettings {
+                        reasoning: Some(*level),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let agent_config = crate::AgentConfig {
+            provider: "openrouter".to_string(),
+            model: "stealth/space-bunny-alpha".to_string(),
+            params: crate::params::ModelParams {
+                reasoning: Some(ReasoningLevel::Low),
+                ..Default::default()
+            },
+            ..test_agent_config()
+        };
+        let store = SettingsStore::from_agent_config(&agent_config, &cfg.models, None);
+        (store, agent_config)
+    }
+
+    fn test_agent_config() -> crate::AgentConfig {
+        crate::AgentConfig {
+            provider: "test".to_string(),
+            model: "model".to_string(),
+            output: Arc::new(crate::output::NoOutput),
+            yolo: false,
+            quiet: true,
+            params: Default::default(),
+            tool_call_limit: 10,
+            system_message_extension: None,
+            persona_prompt: None,
+            persona_name: None,
+            bash_auto_allow: None,
+            agent_prompt: None,
+            user_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            sandbox: None,
+            show_reasoning_handle: crate::settings::ShowReasoningHandle::default(),
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
+            message_log_path: None,
+            sessions_dir: None,
+        }
+    }
+
+    /// Symptom 1: the model's record was ignored and the global won, so
+    /// `/reasoning` reported the global's level.
+    #[test]
+    fn the_startup_store_keeps_the_per_model_records() {
+        let (store, _) =
+            startup_store(&[("openrouter:stealth/space-bunny-alpha", ReasoningLevel::Max)]);
+        let record = store
+            .model_settings("openrouter:stealth/space-bunny-alpha")
+            .expect("the record must survive the startup constructor");
+        assert_eq!(record.reasoning, Some(ReasoningLevel::Max));
+    }
+
+    /// ...which is only interesting because it fixes the seeding that reads it.
+    #[test]
+    fn seeding_reads_the_record_through_the_startup_store() {
+        let (store, agent_config) =
+            startup_store(&[("openrouter:stealth/space-bunny-alpha", ReasoningLevel::Max)]);
+        let app = crate::app_state::AppState::new(agent_config, store, None);
+        app.activate_model_params("openrouter:stealth/space-bunny-alpha");
+        assert_eq!(
+            app.params().reasoning,
+            Some(ReasoningLevel::Max),
+            "the model's own level, not the global's 'low'"
+        );
+    }
+
+    /// Symptom 2: the Ctrl-E prefill rendered every key commented out, because
+    /// it was handed a default record instead of the stored one.
+    #[test]
+    fn the_editor_prefill_shows_the_stored_values() {
+        let (store, _) =
+            startup_store(&[("openrouter:stealth/space-bunny-alpha", ReasoningLevel::Max)]);
+        let current = store
+            .model_settings("openrouter:stealth/space-bunny-alpha")
+            .cloned()
+            .unwrap();
+        let offered = crate::model_settings::render_fragment(
+            "openrouter:stealth/space-bunny-alpha",
+            &current,
+            &Default::default(),
+        );
+        assert!(
+            offered.contains("\nreasoning = \"max\"\n"),
+            "the stored level must render uncommented; got:\n{offered}"
+        );
+        assert!(
+            !offered.contains("# reasoning = "),
+            "and not as a commented suggestion:\n{offered}"
+        );
+    }
+
+    /// Symptom 3, the damaging one: `apply_model_settings` replaces the table,
+    /// so a Ctrl-E commit against an empty startup record would have dropped
+    /// the keys the file already had.
+    #[test]
+    fn a_ctrl_e_commit_keeps_the_keys_it_did_not_touch() {
+        let mut store =
+            startup_store(&[("openrouter:stealth/space-bunny-alpha", ReasoningLevel::Max)]).0;
+        let mut edited = store
+            .model_settings("openrouter:stealth/space-bunny-alpha")
+            .cloned()
+            .unwrap();
+        edited.context_length = Some(4096);
+        store.apply_model_settings("openrouter:stealth/space-bunny-alpha", &edited);
+        let after = store
+            .model_settings("openrouter:stealth/space-bunny-alpha")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            after.reasoning,
+            Some(ReasoningLevel::Max),
+            "untouched key kept"
+        );
+        assert_eq!(after.context_length, Some(4096), "edited key applied");
+    }
+
+    /// The full startup chain, real file included: parse the settings file,
+    /// build the store the way `main` does, and confirm the record reaches the
+    /// live params. This is the step the previous tests stubbed out — the file
+    /// *is* read correctly (`Config::parse` populates `models`), so nothing
+    /// above this line would have caught the bug.
+    #[test]
+    fn a_real_settings_file_survives_the_whole_startup_chain() {
+        let dir = std::env::temp_dir().join("picocode-startup-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.toml");
+        std::fs::write(
+            &path,
+            r#"default_model = "ollama:llama3"
+default_reasoning_level = "low"
+
+[models."ollama:llama3"]
+reasoning = "max"
+"#,
+        )
+        .unwrap();
+
+        // 1. the file parses, and the record is on the Config
+        let cfg = crate::Config::load(Some(path.to_str().unwrap())).expect("load");
+        let record = cfg
+            .models
+            .get("ollama:llama3")
+            .expect("Config::parse must populate models");
+        assert_eq!(record.reasoning, Some(ReasoningLevel::Max));
+
+        // 2. the startup store keeps it
+        let store =
+            SettingsStore::from_agent_config(&test_agent_config(), &cfg.models, Some(&path));
+        assert!(store.model_settings("ollama:llama3").is_some());
+
+        // 3. seeding honours it over the global
+        let app = crate::app_state::AppState::new(test_agent_config(), store, None);
+        app.activate_model_params("ollama:llama3");
+        assert_eq!(
+            app.params().reasoning,
+            Some(ReasoningLevel::Max),
+            "the file's record must beat the global's 'low'"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

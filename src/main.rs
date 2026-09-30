@@ -330,7 +330,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         message_log_path: args.log_messages.clone(),
         sessions_dir: None,
     };
-    let settings = SettingsStore::from_agent_config(&agent_config, settings_path.as_deref());
+    let settings =
+        SettingsStore::from_agent_config(&agent_config, &config.models, settings_path.as_deref());
     match command {
         Commands::Recipe { name: _ } => {
             let agent = create_agent(agent_config.clone()).await?;
