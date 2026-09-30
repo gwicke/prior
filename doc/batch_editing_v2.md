@@ -1601,15 +1601,7 @@ not a fix. Adding or removing tests shifts the interleaving, and at HEAD the
 narrow interleaving happens to be benign. Nothing about the race was fixed, and
 the next test added anywhere in the crate can re-arm it.
 
-**F4 — a real UI bug, also pre-existing.**
-`tests/mock_turn.rs::a_committed_line_is_bracketed_by_rules_with_the_bar_below`
-fails on a clean tree at both HEAD and `57e069d`. The committed slash line's
-`─` rules are written at `repl.rs:1491-1493` and then erased, leaving the status
-bar directly above the line: that write path does not advance the frame's
-tracked row, so the next apply clears what was just written. It came in with
-`9b00ac0`, which added the rules in the first place.
-
-**F5 — multi-file is still gated.** W1–W8 above are a plan, not shipped work.
+**F4 — multi-file is still gated.** W1–W8 above are a plan, not shipped work.
 Correctly so: the gate is still unmeasured.
 
 ### Proposal
@@ -1637,20 +1629,6 @@ reads is advertised, and the description names the field it advertises and not a
 retired one. That closes F2 from inside; it cannot detect a *served* stale copy,
 which is a client-side concern and should be, since only the client knows what
 it was handed.
-
-**P3 — fix the cwd race rather than re-roll the ordering.** Give `glob_files_
-results_are_relative_to_cwd` the `#[serial]` it is missing, and collapse
-`TempCwd` into `CwdGuard` so there is one guard and one mutex instead of two
-guards and a partial one. Worth doing *because* F1 hid it: the session's real
-blocker sent me looking for a regression that was not there, and the first
-evidence I found was three failures in a tree I had just built. A suite that
-fails differently depending on how many tests precede it cannot answer questions
-about regressions.
-
-**P4 — leave F4 to whoever owns the frame.** The row-accounting subsystem is
-delicate, `doc/row_accounting*.md` is extensive, and a speculative fix to
-tracked-row arithmetic is how a second and harder bug gets created. The
-diagnosis is recorded; the fix belongs with the work that introduced the rules.
 
 ### Status
 
