@@ -2483,7 +2483,7 @@ impl Output for ConsoleOutput {
         let mut out = self.writer.lock().unwrap();
         let (row, bytes) = {
             let mut cache = self.draw.lock().unwrap();
-            cache.reanchor(row)
+            cache.reanchor(row, term_width(), term_height())
         };
         let _ = out.write_all(bytes.as_bytes());
         let _ = out.flush();

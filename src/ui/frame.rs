@@ -493,20 +493,81 @@ impl DrawCache {
     /// never answered, e.g. a headless pty) the tracked row stands and the old
     /// region is still erased, because a silent terminal offers no more
     /// guarantee than an answering one (plan §9 latent issue 2).
-    pub(crate) fn reanchor(&mut self, row: Option<usize>) -> (usize, String) {
+    pub(crate) fn reanchor(
+        &mut self,
+        row: Option<usize>,
+        term_w: usize,
+        term_h: usize,
+    ) -> (usize, String) {
         let mut s = String::new();
-        if let Some(live) = self.live.as_ref() {
-            let top = live.frame_top_row;
-            let bottom = top + live.frame.height().saturating_sub(1);
-            for r in top..=bottom {
-                s.push_str(&cup(r, 1));
-                s.push_str(EL);
-            }
-        }
         if let Some(r) = row {
             self.caret.0 = r.max(1);
         }
-        self.live = None;
+        // Copy out before mutating: the borrow of `self.live` has to end before
+        // the refresh below re-takes it.
+        let info = self.live.as_ref().map(|l| {
+            (
+                frame_caret(&l.frame).0,
+                l.frame.height(),
+                l.frame_top_row,
+                l.term_w,
+                l.term_h,
+            )
+        });
+        if let Some((off, h, top, old_w, old_h)) = info {
+            // **A narrowing resize wraps.** The area's own rows survive, but each
+            // of its lines can now span several terminal rows, so clearing `h`
+            // of them leaves wrapped remnants behind. Clear each line as many
+            // rows as it now occupies.
+            let wrap = if old_w > term_w && term_w > 0 {
+                old_w.div_ceil(term_w)
+            } else {
+                1
+            };
+            let rows = h.saturating_mul(wrap);
+            let reflowed = old_w != term_w || old_h != term_h;
+
+            if reflowed && row.is_some() {
+                // **The reflowed case: only the cursor is trustworthy.**
+                // `frame_top_row` is a pre-resize absolute and addresses a row
+                // the area no longer occupies, so the area's rows come from the
+                // cursor — `top = cursor - offset` — and the clear walks up to
+                // them and down again, all relative.
+                //
+                // This is also what stops the area drifting down a row per
+                // re-anchor: the old code left `caret` on the cursor's row (the
+                // area's *last*) and dropped `live`, so the next apply anchored
+                // there. Refreshing `frame_top_row` instead keeps `anchor()`
+                // reading the area's own top, which also unloads `cache.caret`
+                // of the second job it was doing.
+                //
+                // `term_w`/`term_h` stay at the size the frame was *applied* at,
+                // so the partial-apply predicate still sees the mismatch and
+                // forces a full re-apply.
+                cuu(&mut s, off);
+                for i in 0..rows {
+                    s.push('\r');
+                    s.push_str(EL);
+                    if i + 1 < rows {
+                        cud(&mut s, 1);
+                    }
+                }
+                if let Some(l) = self.live.as_mut() {
+                    l.frame_top_row = self.caret.0.saturating_sub(off).max(1);
+                }
+            } else {
+                // **No reflow, or a silent terminal.** The cursor may be
+                // *outside* the block — a foreign writer put it there — so a
+                // relative walk cannot reach the block's rows at all, and the
+                // pre-resize row is the only thing left to address. This is the
+                // one absolute address in a frame apply (row_accounting §6b).
+                for i in 0..rows {
+                    s.push_str(&cup(top + i, 1));
+                    s.push_str(EL);
+                }
+                self.live = None;
+            }
+        }
         s.push_str(&cup(self.caret.0, self.caret.1 + 1));
         (self.caret.0, s)
     }
@@ -1475,14 +1536,122 @@ mod apply_tests {
             &mut p,
             &plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24),
         );
-        let (_, clear) = cache.reanchor(Some(9));
+        let (_, clear) = cache.reanchor(Some(9), 20, 24);
         // Erase the block's rows where they are, then park on the new row.
         assert_eq!(cups(&clear), vec!["5;1", "6;1", "9;1"], "{clear:?}");
         // And with no frame live it is only the cursor park — which is why it is
         // safe to run on every `cursor_row()` call, including mid-stream.
         let mut idle = DrawCache::new(24);
-        let (_, park) = idle.reanchor(Some(7));
+        let (_, park) = idle.reanchor(Some(7), 20, 24);
         assert_eq!(cups(&park), vec!["7;1"], "{park:?}");
+    }
+
+    /// **After a reflow the area is derived from the cursor, not from its own
+    /// stale absolute row.**
+    ///
+    /// `frame_top_row` was recorded before the resize, so the terminal has
+    /// reflowed since and it addresses a row the area no longer occupies. The
+    /// cursor is the only thing that survived, so the clear walks up from it and
+    /// never addresses a row outright — which is what stops the area sliding one
+    /// row further down on every re-anchor.
+    #[test]
+    fn reanchor_after_a_reflow_walks_from_the_cursor() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["one", "two"], 20);
+        cursor_to(&mut cache, 5, 24);
+        let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+        assert_eq!(cache.live.as_ref().map(|l| l.frame_top_row), Some(5));
+
+        // A *vertical* resize: the terminal shrank, everything reflowed, and the
+        // cursor — which sat on the area's last row — now reports row 9.
+        let (row, bytes) = cache.reanchor(Some(9), 20, 10);
+
+        assert_eq!(row, 9, "the cursor's row is still the cursor's row");
+        // No absolute address to the old rows: the only CUP left is the final
+        // park, which is the sanctioned one.
+        assert_eq!(
+            cups(&bytes),
+            vec!["9;1"],
+            "a reflowed area is cleared relatively, not addressed: {bytes:?}"
+        );
+        // `live` survives, and its top is re-derived as `cursor - offset`. This
+        // frame has no caret of its own, so it rests on its last row: offset 1.
+        assert_eq!(
+            cache.live.as_ref().map(|l| l.frame_top_row),
+            Some(8),
+            "the area's top follows the cursor instead of drifting down"
+        );
+        // The applied size stays behind, so the partial-apply predicate still
+        // forces a full re-apply rather than trusting a frame laid out for the
+        // old height.
+        let l = cache.live.as_ref().expect("live survives a reflow");
+        assert_eq!(
+            (l.term_w, l.term_h),
+            (20, 24),
+            "the applied size is what it was"
+        );
+    }
+
+    /// A **narrowing** resize wraps the area's rows, so clearing one row per line
+    /// leaves remnants on the wrapped continuations.
+    #[test]
+    fn reanchor_after_a_narrowing_resize_clears_wrapped_rows() {
+        let lines = 2;
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["one", "two"], 40);
+        cursor_to(&mut cache, 5, 24);
+        let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 40, 24);
+
+        // 40 columns down to 20: every line occupies two terminal rows now, so
+        // the area's two lines span four.
+        let (_, bytes) = cache.reanchor(Some(9), 20, 10);
+        assert_eq!(
+            bytes.matches(EL).count(),
+            lines * 2,
+            "a halved width means two terminal rows per line: {bytes:?}"
+        );
+
+        // A pure height change does not wrap, so it still clears one row per line.
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["one", "two"], 20);
+        cursor_to(&mut cache, 5, 24);
+        let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+        let (_, bytes) = cache.reanchor(Some(9), 20, 10);
+        assert_eq!(
+            bytes.matches(EL).count(),
+            lines,
+            "a vertical-only resize does not wrap: {bytes:?}"
+        );
+    }
+
+    /// The regression this exists for: the area must not walk down the screen by
+    /// one row per re-anchor. Before the fix `caret` was left on the cursor's
+    /// row — the area's *last* — with `live` dropped, so the next apply anchored
+    /// there and the next re-anchor measured from the new one.
+    #[test]
+    fn repeated_reflow_reanchors_do_not_drift() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["one", "two"], 20);
+        cursor_to(&mut cache, 5, 24);
+        let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+
+        let mut tops = Vec::new();
+        for height in (12..=20).rev() {
+            let row = cache.caret.0;
+            let (seen, _) = cache.reanchor(Some(row), 20, height);
+            assert_eq!(seen, row, "a re-anchor leaves the cursor where it was");
+            tops.push(
+                cache
+                    .live
+                    .as_ref()
+                    .map(|l| l.frame_top_row)
+                    .expect("a reflowed area survives to be re-anchored"),
+            );
+        }
+        assert!(
+            tops.windows(2).all(|w| w[0] == w[1]),
+            "the area's top must not move on a pure re-anchor: {tops:?}"
+        );
     }
 
     #[test]
@@ -1652,7 +1821,7 @@ mod apply_tests {
         // where it went and erases the block's old rows — the one absolute
         // address in a frame apply, and the reason it exists: from row 8 a
         // relative walk cannot reach rows 5 and 6 at all.
-        let (_row, clear) = cache.reanchor(Some(8));
+        let (_row, clear) = cache.reanchor(Some(8), 20, 24);
         // The re-anchor's answer is now *only* bookkeeping — the apply reads the
         // cache, not a caller's row (A3.2).
         let s2 = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
@@ -1984,7 +2153,7 @@ mod apply_tests {
         let f = lines_frame(&["x"], 20);
         cursor_to(&mut cache, 5, 10);
         let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
-        assert_eq!(cache.reanchor(Some(3)).0, 3);
+        assert_eq!(cache.reanchor(Some(3), 20, 10).0, 3);
         assert_eq!(cache.anchor(), 3);
     }
 
@@ -1999,7 +2168,7 @@ mod apply_tests {
         let f = lines_frame(&["x"], 20);
         cursor_to(&mut cache, 5, 10);
         let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
-        assert_eq!(cache.reanchor(None).0, 5, "tracked row stands");
+        assert_eq!(cache.reanchor(None, 20, 10).0, 5, "tracked row stands");
         assert!(cache.live.is_none(), "live frame must be invalidated");
         // Identical frame, same anchor: the partial path would emit nothing
         // but the caret; the full path clears the region below the frame.
