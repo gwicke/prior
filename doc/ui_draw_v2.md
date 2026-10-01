@@ -1082,7 +1082,7 @@ Every claim below was checked against the code, not against the phase list.
 | ✅ | **U1** contraction | Landed. `with_content_writer` consumes the area instead of retiring it, and `plan_reposition` is the third apply case. **But** it places the area by its bottom edge, which §4.5.7 rules out — see §5.2's known gap. Implemented, and wrong in the one respect §4.5.7 settled. |
 | ✅ | **U2** area survives the turn | Landed. The bar is a composed row resolved from `status_text` + `streaming`; the transient-bar machinery is gone. |
 | ✅ | **U3** dialogs are menus | Landed. `ui::confirm` composes `[Divider?, Overlay]` through the same composer. |
-| ❌ | **U4** in-turn input | **Not started.** `editor`, `nav`, `v25_menu`, `v25_handle`, `prose` and `pending_key` are still locals of `read_input`, and the agent's `tokio::select!` (`agent.rs:377`) still has exactly one branch — `item = stream.next()`. No mid-turn key can reach any of them. |
+| ⚠️ | **U4** in-turn input | **Planned, not started.** The plan is recorded under U4 itself (four units, reader decision taken). The code is unchanged: `editor`, `nav`, `v25_menu`, `v25_handle`, `prose` and `pending_key` are still locals of `read_input`, and the agent's `tokio::select!` (`agent.rs:377`) still has exactly one branch — `item = stream.next()`. No mid-turn key can reach any of them. |
 | ❌ | **U5** retire the entry DSRs | **Not started.** `read_input`'s entry DSR is live at `repl.rs:683` and `ui::confirm`'s at `ui.rs:92`, both marked for removal. The three sanctioned sites are correctly still there (Ctrl-Z resume `repl.rs:806`, the width-change `ESC[0J` + replay `repl.rs:841`, and the confirm error path `repl.rs:942`). |
 | ⏸ | **U6** scroll region | Optional, gates nothing, not started. |
 
