@@ -439,6 +439,46 @@ pub(crate) struct DrawCache {
     /// invalidation — those retire the frame's *position*, and the recipe is
     /// exactly what survives it. A later `draw_elements` overwrites it.
     pub(crate) element_stack: Vec<Element>,
+    /// The size the last `draw_elements` actually applied (clamped), i.e. what
+    /// the *next* compose can assume about what is on screen — the answer to
+    /// "has the terminal changed shape since?" (ui_draw_v2 §9 #3).
+    ///
+    /// `None` until the first apply, so a caller asking before anything has
+    /// been painted falls back to a live terminal query instead of being told
+    /// a size nobody ever drew at.
+    ///
+    /// Owned here rather than by the caller that happens to paint (the REPL
+    /// loop used to keep its own `Cell`): `read_input` and the turn's key
+    /// branch both apply frames now, and two independent books of the same
+    /// number are two ways for them to disagree about whether a repaint is due.
+    pub(crate) applied: Option<(usize, usize)>,
+    /// True while a content batch is open (`Output::begin_batch`). While set a
+    /// content write consumes the frame and does **not** put it back — one
+    /// re-emit when the guard drops, instead of one per write (ui_draw_v2 R5).
+    ///
+    /// A flag rather than a nesting depth, because batches are **flat**: one
+    /// at a time, opened and closed iteratively, never recursed. A counter
+    /// would have made nesting *supported* and brought the failure mode that
+    /// goes with it — an unbalanced enter/exit leaves a nonzero depth
+    /// permanently, and then the area never comes back at all.
+    ///
+    /// A nested open therefore **collapses**: `begin_batch` returns a guard
+    /// that owns nothing, and only the guard that raised this flag clears it.
+    /// That makes nesting impossible rather than merely handled — and because
+    /// the collapse is silent, `begin_batch` also `debug_assert`s, so it is
+    /// loud in debug builds and merely correct in release. The worst a
+    /// mistimed end does is redraw once too often.
+    pub(crate) batch_active: bool,
+    /// The frame taken by a batch's *first* consume, held until the batch
+    /// ends.
+    ///
+    /// Needed because `reposition_area` falls back to `taken` when no recipe
+    /// recorded itself — reachable in production by `draw_frame` called
+    /// directly (`ui::resolve`'s empty frame), which applies a frame and
+    /// clears `element_stack`. Without this stash a batch would consume that
+    /// area and its final reposition would find an empty recipe and render
+    /// nothing, so the area would never return.
+    pub(crate) deferred: Option<Frame>,
 }
 
 impl DrawCache {
@@ -448,6 +488,9 @@ impl DrawCache {
             screen_bottom: term_h.max(1),
             live: None,
             element_stack: Vec::new(),
+            applied: None,
+            batch_active: false,
+            deferred: None,
         }
     }
 

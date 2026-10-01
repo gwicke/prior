@@ -28,7 +28,7 @@ use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use std::cell::Cell;
+
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
@@ -70,32 +70,89 @@ pub(crate) fn register_sigcont() {
     }
 }
 
-/// Spawn a background stdin reader that lives *only* while an LLM request
-/// is in flight (`prompt().await` blocks the main task). In raw mode
-/// `event::read` is blocking and the main task cannot read keys during
-/// the await, so this thread catches `Esc`/`Ctrl-C`/`Ctrl-Z` that
-/// arrive mid-request. Normal editing keys are read by `read_input`
-/// (main task) and are simply dropped here.
+/// Where the in-flight reader sends one terminal event.
 ///
-/// - `Esc`        → `cancel.store(true)` (the rig `PromptHook` bridge
-///                  aborts the in-flight request).
-/// - `Ctrl-C`     → restore terminal, hard exit (process-wide).
-/// - `Ctrl-Z`     → restore terminal, `killpg(getpgrp(), SIGTSTP)`
-///                  (suspend the whole process group to the shell).
-/// - other keys  → ignored (cannot be typed into the prompt mid-request).
+/// Split out of `spawn_in_flight_reader` because the *policy* is the part
+/// worth arguing about and the part worth testing: which keys may wait, and
+/// which may not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReaderRoute {
+    /// Deal with it here — process/terminal/abort state, or an event with
+    /// nobody to hand it to.
+    Inline,
+    /// Hand it to the turn's key branch on the channel.
+    Forward,
+}
+
+/// Route one terminal event arriving while a request is in flight.
+///
+/// **Inline — must not wait:**
+/// - `Resize`: the streaming renderers read `TERMINAL_WIDTH`, and only this
+///   thread can update it while the main task is parked on the turn.
+///   Forwarding it too would make the turn consume the width instead of the
+///   renderers reading it directly.
+/// - `Ctrl-C` / `Ctrl-Z`: process and terminal state (`exit`,
+///   `killpg(SIGTSTP)`), handled where they land, never queued.
+///
+/// **Forwarded:** every other key, plus `Paste`. These are content for the
+/// prompt; `read_input` already treats `Event::Paste` as a bulk insert, so
+/// the turn's key branch reads them the same way (U4.3). `Esc` is one of
+/// them, and that is a change:
+///
+/// `Esc` used to be Inline, and Inline meant *abort* — unconditionally, from
+/// here. Settled U4 makes it menu-first: the ladder runs while a menu is
+/// open, and it aborts only at root. This thread cannot make that call (it
+/// has no session to look at), so the decision moves to the one that can,
+/// and `Esc` rides the forwarded path with everything else. The cost is
+/// explicit: a root `Esc` is no longer guaranteed to land ahead of a paste
+/// backlog, where it was before. `Ctrl-C` still is, and it still never
+/// queues — that is what "immediately reachable" now rests on.
+///
+/// Everything else — mouse, focus — returns [`ReaderRoute::Inline`] and is
+/// ignored, exactly as it was before there was anywhere to forward to.
+pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
+    match ev {
+        Event::Resize(..) => ReaderRoute::Inline,
+        Event::Key(key) => match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ReaderRoute::Inline
+            }
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ReaderRoute::Inline
+            }
+            _ => ReaderRoute::Forward,
+        },
+        Event::Paste(..) => ReaderRoute::Forward,
+        _ => ReaderRoute::Inline,
+    }
+}
+
+/// What to do with each event is [`route_event`]'s call, not a pile of
+/// branches here. The reader handles three things inline and forwards the
+/// rest on `keys` (ui_draw_v2 §4.5 U4.2); until U4.2 nothing was
+/// forwarded and edit keys typed mid-request were simply dropped.
+///
+/// `keys` is **unbounded** on purpose: a bounded channel that filled would
+/// block this thread at precisely the moment it has to deliver `Ctrl-C`.
+///
+/// Spawned *only* while an LLM request is in flight (`prompt().await`
+/// blocks the main task). In raw mode `event::read` is blocking and the
+/// main task cannot read keys during the await, so this thread is what
+/// sees `Ctrl-C`/`Ctrl-Z` arriving mid-request. `Esc` was this thread's
+/// until U4.3 made it menu-first — a decision it cannot make without a
+/// session to look at — so it is forwarded now and the turn decides; see
+/// [`route_event`].
 ///
 /// `done` is set by the caller once the await returns, so the loop can
-/// exit and be joined. `guard` and `cancel` are `Arc` and `stop()`/
-/// `store()` are process-wide, so calling them from this thread is safe.
-/// `paused` is set by a confirmation dialog on the main task while it owns
-/// stdin; while it is `true` this reader must not read, or it would swallow
-/// the dialog's keystrokes.
+/// exit and be joined. `guard` is `Arc` and `stop()` is process-wide, so
+/// calling it from this thread is safe. `paused` is set by a confirmation
+/// dialog on the main task while it owns stdin; while it is `true` this
+/// reader must not read, or it would swallow the dialog's keystrokes.
 pub(crate) fn spawn_in_flight_reader(
     guard: Arc<TermGuard>,
-    cancel: Arc<AtomicBool>,
-    cancel_notify: Arc<tokio::sync::Notify>,
     done: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    keys: tokio::sync::mpsc::UnboundedSender<Event>,
 ) -> std::thread::JoinHandle<()> {
     thread::spawn(move || loop {
         if done.load(Ordering::SeqCst) {
@@ -112,6 +169,13 @@ pub(crate) fn spawn_in_flight_reader(
         }
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {
+                // U4.2: edit keys this thread used to drop now go to the turn.
+                // `send` on an unbounded tokio mpsc never blocks, so this is
+                // safe from a plain OS thread — and being non-blocking is the
+                // whole reason the channel is unbounded (see `route_event`).
+                Ok(ev) if route_event(&ev) == ReaderRoute::Forward => {
+                    let _ = keys.send(ev);
+                }
                 Ok(Event::Resize(w, _h)) => {
                     // Update the shared terminal width so renderers pick up
                     // the change on their next streaming call.
@@ -129,16 +193,6 @@ pub(crate) fn spawn_in_flight_reader(
                             unsafe {
                                 libc::killpg(libc::getpgrp(), libc::SIGTSTP);
                             }
-                        }
-                    } else if let KeyCode::Esc = key.code {
-                        cancel.store(true, Ordering::SeqCst);
-                        cancel_notify.notify_one();
-                        // Wake any in-flight tool watchdog threads so the
-                        // shell command is killed immediately (not after the
-                        // timeout).  Sending on an unbounded mpsc channel is
-                        // non-blocking, so this is safe from the reader thread.
-                        for tx in crate::tools::TOOL_CANCEL_SENDERS.lock().unwrap().iter() {
-                            let _ = tx.send(());
                         }
                     }
                 }
@@ -539,6 +593,96 @@ impl Element {
         let might = layout.row_count.max(1);
         Element::new(1, might, InputItem { layout, prompt })
     }
+
+    /// An input that occupies **no rows at all** — the mid-turn case.
+    ///
+    /// An input row with nothing in it reads as "type here", and while a turn is
+    /// running there is nothing to submit, so the row is a claim the screen
+    /// cannot back up. Between turns it is the opposite: it is what tells the
+    /// reader where input goes, so [`Self::input`] keeps it. The REPL is live
+    /// either way (OQ2) — the frame is composed and applied on every keystroke;
+    /// it simply has no row to draw until something is typed.
+    ///
+    /// `must == might == 0`, so the allocator serves it nothing and
+    /// `InputItem::render_at(0, _)` returns the empty `Rendered`. The choice is
+    /// made here rather than inferred inside the element, because "is a turn
+    /// running" is the output's fact (`streaming`), not the frame layer's.
+    pub(crate) fn input_hidden(layout: Layout, prompt: String) -> Self {
+        Element::new(0, 0, InputItem { layout, prompt })
+    }
+}
+
+/// The input element for one compose, and the R1 rule in one place.
+///
+/// Mid-turn an empty input is **no row at all**; between turns it is the resting
+/// row that says where to type; anything typed is an ordinary input either way.
+/// [`Element::input_hidden`] has the reasoning.
+///
+/// Shared by the REPL's redraw and the test harness rather than written twice —
+/// a copy would drift, and then the tests would pin a rule that production does
+/// not follow.
+pub(crate) fn input_element(
+    editor: &LineEditor,
+    prompt: &str,
+    streaming: bool,
+    term_w: usize,
+) -> Element {
+    let layout = editor.layout(term_w, prompt);
+    if streaming && editor.text().is_empty() {
+        Element::input_hidden(layout, prompt.to_string())
+    } else {
+        Element::input(layout, prompt.to_string())
+    }
+}
+
+/// The overlay's rows and the window focus among them, as the painter wants
+/// them: no overlay ⇒ no rows and focus 0.
+pub(crate) fn overlay_paint(overlay: &ActiveOverlay, w: usize, h: usize) -> (Vec<String>, usize) {
+    let painted = match overlay {
+        ActiveOverlay::None => None,
+        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
+            Some(crate::slashdot_menu::render::paint_overlay(plan, w, h))
+        }
+    };
+    // A plan whose selection did not fit falls back to 0 — window from the
+    // top — which is what the frame's focus means there.
+    let focus = painted.as_ref().and_then(|p| p.focus).unwrap_or(0);
+    (painted.map_or_else(Vec::new, |p| p.rows), focus)
+}
+
+/// Compose and apply the prompt frame: `[Input]`, or
+/// `[Input, Divider, Overlay]` while a pop-up shows (plan §5.2).
+///
+/// **The one way the prompt writes to the terminal.** `read_input`'s blocking
+/// loop and the turn's `select!` key branch both come here (ui_draw_v2 §4.5
+/// U4), so neither pump can grow its own idea of what the input row looks
+/// like — the split that made `handle_key` and `eval` draw nothing only holds
+/// if the pixels they are silent about have exactly one owner.
+///
+/// The apply phase owns the rest: an intact live frame means a partial row-diff
+/// (so a tall pop-up's scroll is followed without a row counter), and the
+/// scroll `delta` and bounded clear live in `plan_apply`. Content *above* the
+/// frame — greeter, status, session — is never touched.
+pub(crate) fn paint_prompt(
+    output: &dyn Output,
+    label: &str,
+    editor: &LineEditor,
+    overlay_rows: &[String],
+    focus: usize,
+    dims: (usize, usize),
+) {
+    let dims = (dims.0.max(1), dims.1.max(1));
+    // The REPL supplies only what changes: the input, and the menu when one is
+    // open. The status row is `compose_area`'s to resolve — it is made of
+    // `status_text` and `streaming`, which are this output's facts and not
+    // something this module may reason about — and so is the divider that
+    // separates the menu from the input above it (ui_draw_v2 §5.1.1).
+    let input = input_element(editor, label, output.is_streaming(), dims.0);
+    let overlay =
+        (!overlay_rows.is_empty()).then(|| Element::overlay(overlay_rows.to_vec(), focus));
+    // Composition *and* division are the tail's now: pieces move in and nothing
+    // comes back, so no `Vec<Element>` crosses a call site (ui_draw_v2 §5.1.1).
+    let _ = output.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
 }
 
 /// Editor content: the prompt on row 0, the wrapped buffer below it.
@@ -573,6 +717,676 @@ impl RenderAt for InputItem {
         let caret = (layout.cursor_row >= start && layout.cursor_row < start + count)
             .then_some((layout.cursor_row - start, layout.cursor_col));
         Rendered { rows, caret }
+    }
+}
+
+/// What one key did to the prompt session.
+///
+/// [`PromptSession::handle_key`] mutates the session and answers with one of
+/// these; **it never draws.** Keeping the drawing out of it is the whole point
+/// of the split: the same dispatcher has to serve two pumps — `read_input`'s
+/// blocking loop today, and the turn's `tokio::select!` branch once in-turn
+/// input lands (ui_draw_v2 §4.5 U4) — and a dispatcher that painted would give
+/// them two ways to write the terminal.
+pub(crate) enum KeyOutcome {
+    /// Nothing that leaves the wait loop: repaint and read the next key.
+    Continue,
+    /// Hand the tty to `$EDITOR` over the input buffer. The takeover (reader
+    /// gate, raw mode, DSR re-anchor) belongs to the caller — see
+    /// `editor::run_editor`, which owns that whole sequence.
+    RunEditor,
+    /// Leave `read_input` with this action. The caller draws first for a
+    /// `Submit` (the input region is cleared before the transcript gets it).
+    Action(InputAction),
+}
+
+/// What [`PromptSession::eval`] asks the caller to do once the state is settled.
+///
+/// `eval` resolves the pending key into an overlay; it does **not** write to
+/// the terminal. Two branches used to write from inside the engine call —
+/// they now hand back the bytes and the shape of the write instead, so the
+/// same eval can drive `read_input`'s blocking loop *and* the turn's
+/// `select!` branch (ui_draw_v2 §4.5 U4) without either growing a second
+/// copy of the sequence.
+///
+/// It is the same split `KeyOutcome` makes for keys: state here, pixels at
+/// the call site. One dispatcher, two pumps — and now one evaluator too.
+#[derive(Debug)]
+pub(crate) enum EvalOutcome {
+    /// Nothing terminal. `overlay` holds the frame: sync the selection and
+    /// paint.
+    Frame,
+    /// A menu commit landed on `AppState`. The caller writes it —
+    /// [`Repl::emit_commit`], then the engine's optional message — and
+    /// returns [`InputAction::MenuDone`], whose convergence step applies the
+    /// targets this eval wrote. `emit_commit` is what clears the buffer.
+    Commit {
+        /// The self-documenting prompt as committed, e.g. `/reasoning low`.
+        line: String,
+        /// The node's message, when it had one.
+        message: Option<String>,
+    },
+    /// A non-Enter key ended a rewrite chain. The caller clears the input
+    /// region, surfaces `message` in the transcript and re-anchors (DSR).
+    /// `eval` has already emptied the buffer and left the `/`-session.
+    Error { message: String },
+}
+
+/// Everything that survives between one keystroke and the next.
+///
+/// This used to be six `let mut`s at the top of `Repl::read_input`, which
+/// meant the prompt session could not outlive that function's frame — the
+/// blocking loop, the drawing and the state were one thing. Splitting it out
+/// is what lets the state reach the turn's `select!` (ui_draw_v2 §4.5 U4).
+///
+/// The `SlashDotMenu` lives here too, and is *not* a borrow: the menu handle
+/// borrows it, so storing both would be self-referential. Instead the session
+/// tracks `epoch_active` and mints a handle for the duration of each eval —
+/// [`SlashDotMenu::get_handle`] when a `/`-session begins (bumping the epoch so
+/// a new invocation starts clean), [`SlashDotMenu::continuation_handle`]
+/// afterwards (so the in-progress one keeps its view restore and armed
+/// confirm).
+pub struct PromptSession {
+    /// The input buffer, cursor and wrap layout.
+    editor: LineEditor,
+    /// History navigation: `Some(index)` while paging back through it.
+    nav: Option<usize>,
+    /// The line history was on before `nav` started, so leaving it restores.
+    draft: String,
+    /// Selected row of the current overlay.
+    sel: usize,
+    /// Overlay discriminant, for resetting `sel` when the overlay *kind*
+    /// changes rather than its contents.
+    last_disc: u8,
+    /// Prose (non-`/`) completion. Spawns its FS worker; the worker exits when
+    /// this drops.
+    prose: crate::prompt_complete::PromptCompletion,
+    /// Engine key queued for the *next* eval (eval → display → wait shape).
+    /// Consumed unconditionally at the top of the loop, so a stale key cannot
+    /// outlive one iteration.
+    pending_key: Option<crate::slashdot_menu::HostKey>,
+    /// The v2.5 menu tree. Persistent for the session.
+    menu: crate::slashdot_menu::menu::SlashDotMenu,
+    /// Whether a `/`-session is in progress — i.e. whether the epoch has been
+    /// bumped for the invocation currently on screen.
+    ///
+    /// Named for the mechanism, not the buffer: this is *not* "the prompt
+    /// starts with `/`" (the buffer says that) but "an epoch has been bumped
+    /// for the invocation on screen". It is what used to be read off
+    /// `v25_handle.is_none()`, kept as a `bool` because the handle itself
+    /// cannot be stored alongside the menu it borrows.
+    epoch_active: bool,
+    /// The overlay the last eval produced, which the next key dispatches
+    /// against. Recomputed every iteration; held here so `handle_key` sees the
+    /// same frame that was just painted.
+    overlay: ActiveOverlay,
+}
+
+/// Everything the turn needs to put a key back into the prompt
+/// (ui_draw_v2 §4.5 U4).
+///
+/// Bundled so `prompt()` gains one parameter rather than five, and because the
+/// pieces are coupled: they exist only where there *is* an interactive prompt.
+/// Piped/batch input builds no session and spawns no in-flight reader, so it
+/// has nothing to hand over — hence the caller wraps this in an `Option`.
+///
+/// It is the same set `read_input` receives, arrived at differently: there the
+/// pieces are arguments, here they are a value carried alongside the turn. The
+/// turn is the second pump, and the second pump gets the same inputs.
+pub struct InTurnInput<'a> {
+    /// The session keys land in. Its `handle_key` → [`settle`](PromptSession::settle)
+    /// ordering is `read_input`'s loop ordering, minus the wait between them.
+    pub session: &'a mut PromptSession,
+    /// The in-flight reader's channel. Unbounded because a bounded one that
+    /// filled would block the reader at the moment it most needs to deliver
+    /// `Ctrl-C` (see `route_event`).
+    pub keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    /// What the input row says — `read_input`'s `prompt` argument.
+    pub label: &'a str,
+    /// History the Up/Down keys page through.
+    pub history: &'a mut History,
+    /// For [`open_editor`](PromptSession::open_editor) when `Ctrl-E` lands
+    /// mid-turn. There is no reader to stop in that case — the turn's own is
+    /// what handed us the key — but the raw-mode turnover and the DSR
+    /// re-anchor are still the wrapper's to do.
+    pub guard: &'a TermGuard,
+}
+
+impl PromptSession {
+    /// Fresh session, seeded with `initial_buffer` if the caller has one
+    /// (the `/session <id> resume` prefill, and any other pop that wants the
+    /// editor to start with text already in it).
+    pub(crate) fn new(initial_buffer: Option<&str>, app_state: &Arc<AppState>) -> Self {
+        let mut editor = LineEditor::new();
+        if let Some(s) = initial_buffer {
+            editor.set(s);
+        }
+        Self {
+            editor,
+            nav: None,
+            draft: String::new(),
+            sel: 0,
+            last_disc: 0,
+            prose: crate::prompt_complete::PromptCompletion::new(),
+            pending_key: None,
+            menu: crate::v25_menu::build_menu(app_state),
+            epoch_active: false,
+            overlay: ActiveOverlay::None,
+        }
+    }
+
+    /// Seed the editor with a prefill.
+    ///
+    /// *Replaces* the buffer, because a prefill (`/session <id> resume` and
+    /// anything else that calls `set_prefill`) is an instruction for this
+    /// particular prompt — it is the one thing allowed to override what the
+    /// carried buffer holds. When there is no prefill, the session keeps what
+    /// it had: the `/` prompt *is* the menu state, so the buffer that ends a
+    /// turn is the buffer the next prompt opens with.
+    pub(crate) fn apply_prefill(&mut self, text: &str) {
+        self.editor.set(text);
+    }
+
+    /// The handle to eval with, for the `/`-session the buffer is currently in.
+    ///
+    /// Bumps the epoch only on the way *into* `/`, so one invocation's
+    /// traversal memory survives every key inside it (see the struct doc).
+    ///
+    /// Takes the two fields rather than `&mut self` because [`eval`](Self::eval)
+    /// has the session destructured by the time it needs the handle, and a
+    /// borrow of the whole session would not survive alongside them. Passing
+    /// the fields keeps those borrows disjoint.
+    ///
+    /// TODO(api): see the note on [`SlashDotMenu::continuation_handle`] — this
+    /// helper, and `epoch_active` below, exist only because the host has to
+    /// choose between two constructors. A held invocation would delete both.
+    fn slash_handle<'m>(
+        menu: &'m mut crate::slashdot_menu::menu::SlashDotMenu,
+        epoch_active: &mut bool,
+    ) -> crate::slashdot_menu::menu::SlashDotHandle<'m> {
+        let fresh = !*epoch_active;
+        *epoch_active = true;
+        if fresh {
+            menu.get_handle()
+        } else {
+            menu.continuation_handle()
+        }
+    }
+
+    /// Resolve the pending key (or a passive frame) into an overlay.
+    ///
+    /// The one place an engine prompt is applied to the buffer *and* its plan
+    /// rendered, so a §5.1 keyless restore lands both in the same frame — no
+    /// window for a racing edit between them. Takes `pending_key` unconditionally,
+    /// so a queued key cannot outlive one eval.
+    ///
+    /// Writes nothing itself: what must reach the terminal comes back as an
+    /// [`EvalOutcome`], and the frame it produced is in `overlay`.
+    ///
+    /// Takes `&mut self` for the reason [`handle_key`](Self::handle_key) does:
+    /// both pumps drive one session by reference, and neither may see it split
+    /// apart.
+    pub(crate) async fn eval(&mut self) -> EvalOutcome {
+        let Self {
+            editor,
+            pending_key,
+            menu,
+            epoch_active,
+            prose,
+            overlay,
+            ..
+        } = self;
+        let key = pending_key
+            .take()
+            .unwrap_or(crate::slashdot_menu::HostKey::None);
+        let buf_text = editor.text();
+        *overlay = if buf_text.starts_with('/') {
+            // All `/` commands route through the v2.5 engine. The handle is
+            // minted for the eval and dropped with it — it carries no state
+            // beyond the borrowed root and the epoch, both of which live in
+            // the session's menu (`slash_handle` decides which epoch).
+            let cursor = editor.cursor;
+            let result = {
+                let mut handle = Self::slash_handle(menu, epoch_active);
+                Repl::v25_eval(&mut handle, &buf_text, cursor, key).await
+            };
+            match result {
+                V25Frame::Continue(plan, prompt) => {
+                    // Apply the engine's prompt — but only when it actually
+                    // changed: an unchanged passive eval must not reset a
+                    // mid-line text cursor (`LineEditor::set` jumps to EOL).
+                    let new_buf = format!("/{}", prompt);
+                    if new_buf != editor.text() {
+                        editor.set(&new_buf);
+                    }
+                    ActiveOverlay::V25Menu { plan }
+                }
+                V25Frame::DoneSuccess(msg, prompt)
+                    if matches!(key, crate::slashdot_menu::HostKey::Enter) =>
+                {
+                    // The node's submit() wrote to `AppState` (target config
+                    // for `/reasoning`/`/model`/…, control fields for
+                    // `/session`/`/replay`/…). Use the engine-provided
+                    // self-documenting prompt (e.g. "/reasoning low").
+                    return EvalOutcome::Commit {
+                        line: format!("/{}", prompt),
+                        message: msg,
+                    };
+                }
+                V25Frame::DoneError(err, prompt)
+                    if matches!(key, crate::slashdot_menu::HostKey::Enter) =>
+                {
+                    return EvalOutcome::Commit {
+                        line: format!("/{}", prompt),
+                        message: Some(err),
+                    };
+                }
+                // Rewrite-cycle bail-out on a non-Enter key (chain already on
+                // stderr from `v25_eval`): the caller clears the input area,
+                // surfaces it in the transcript and re-anchors; we drop the
+                // prompt — back to normal operation. The buffer and the
+                // `/`-session are cleared here rather than by the caller,
+                // because they are state, not pixels.
+                V25Frame::DoneError(err, _) => {
+                    editor.set("");
+                    *epoch_active = false;
+                    *overlay = ActiveOverlay::None;
+                    return EvalOutcome::Error { message: err };
+                }
+                // Esc at root — close the overlay.
+                V25Frame::DoneSuccess(_, _) => {
+                    editor.set("");
+                    *epoch_active = false;
+                    ActiveOverlay::None
+                }
+            }
+        } else {
+            // Leave the `/`-session: the next `/` starts a fresh invocation
+            // (a fresh epoch), so no traversal memory carries across.
+            *epoch_active = false;
+            // Prose frames: one eval drives the word gate, the debounce, and
+            // the dialog. Idle ⇒ no overlay (stateless dismissal: the next
+            // frame re-derives from the buffer).
+            let ctx = crate::slashdot_menu::RenderContext {
+                term_width: crate::output::term_width().max(1),
+            };
+            match prose.eval(editor, key, ctx) {
+                crate::prompt_complete::Frame::Idle => ActiveOverlay::None,
+                crate::prompt_complete::Frame::Dialog(plan) => ActiveOverlay::PathComplete { plan },
+            }
+        };
+        EvalOutcome::Frame
+    }
+
+    /// Align the selection to the overlay [`eval`](Self::eval) just produced.
+    ///
+    /// Hoisted for the same reason `eval` was: the turn's key branch must do
+    /// this too, and two copies would let the cursor and the paint disagree
+    /// about which row is selected. It no longer hands its rows back —
+    /// [`settle`](Self::settle) reads them off the overlay for the painter, and
+    /// a returned copy would be a second thing to keep in step with the first.
+    pub(crate) fn sync_selection(&mut self) {
+        let Self {
+            overlay,
+            sel,
+            last_disc,
+            ..
+        } = self;
+        let (raw_opts, active) = overlay.display_rows();
+        let cur_disc = overlay.overlay_disc();
+        if overlay.cursor_row().is_some() {
+            // Engine-owned cursor: `sel` IS the engine's cursor row (arrows
+            // mutate engine state; Tab/Enter act on it). The marker `active`
+            // (ctx-driven `*`) is separate. No host-side cursor policy for
+            // these overlays.
+            *sel = overlay
+                .cursor_row()
+                .unwrap_or(active.unwrap_or(0))
+                .min(raw_opts.len().saturating_sub(1));
+        } else {
+            // Host-side policy: a *changed* overlay starts back at the top.
+            *sel = Repl::cursor_sel_policy(cur_disc != *last_disc, *sel);
+        }
+        if cur_disc != *last_disc {
+            *last_disc = cur_disc;
+        }
+        let max_sel = raw_opts.len().saturating_sub(1);
+        if *sel > max_sel {
+            *sel = max_sel;
+        }
+    }
+
+    /// The overlay's row count at this instant — the bounds `handle_key`'s
+    /// host-side cursor needs.
+    ///
+    /// `settle` renders those rows for the painter instead; this is for a
+    /// dispatcher that needs the number and nothing else. Both read `overlay`,
+    /// and `overlay` is only ever written by [`eval`](Self::eval), so neither
+    /// can be out of step with the other.
+    pub(crate) fn opts_len(&self) -> usize {
+        self.overlay.display_rows().0.len()
+    }
+
+    /// Is a v2.5 menu open — the case where `Esc` steps the engine back a
+    /// level instead of ending the turn (settled U4: menu-first, abort only at
+    /// root).
+    ///
+    /// Deliberately `V25Menu` and not "any overlay": prose's dialog is
+    /// dismissed by the buffer, not by `Esc` — [`handle_key`](Self::handle_key)
+    /// says so in its `Esc` arm — so there is nothing there for `Esc` to step
+    /// out of. A bare prompt is the same situation. Both count as root, and
+    /// root is where the turn stops.
+    pub(crate) fn menu_open(&self) -> bool {
+        matches!(self.overlay, ActiveOverlay::V25Menu { .. })
+    }
+
+    /// How long the turn's `select!` should wait before re-evaluating prose —
+    /// `None` when nothing is pending, and there is then nothing to wake for.
+    ///
+    /// Without this arm the turn's key branch would be the only one with a
+    /// deadline, and prose would go inert mid-turn: its debounce and in-flight
+    /// slices need a timeout of their own to fire while the stream runs.
+    ///
+    /// See [`crate::prompt_complete::PromptCompletion::poll_timeout`].
+    pub(crate) fn prose_timeout(&self) -> Option<Duration> {
+        self.prose.poll_timeout()
+    }
+
+    /// Hand the tty to `$EDITOR` over the buffer and write the result back.
+    ///
+    /// Shared for the reason [`settle`](Self::settle) is: `read_input`'s
+    /// [`KeyOutcome::RunEditor`] arm and the turn's would otherwise each carry
+    /// the raw-mode turnover and the DSR re-anchor — and a failure that
+    /// surfaces differently depending on which pump took the key is a failure
+    /// the user sees one way out of two.
+    pub(crate) fn open_editor(&mut self, guard: &TermGuard, output: &dyn Output) {
+        match run_editor(guard, output, &self.editor.text(), EditorMode::Edit) {
+            Ok(new_text) => self.editor.set(&new_text),
+            Err(e) => {
+                let _ = io::stdout().write_all(format!("\r\neditor error: {}\r\n", e).as_bytes());
+            }
+        }
+    }
+
+    /// Insert pasted text at the caret. Shared so "paste" is one operation
+    /// rather than one each pump reaches for differently.
+    pub(crate) fn paste(&mut self, text: &str) {
+        self.editor.insert_str(text);
+    }
+
+    /// eval → outcome → sync → paint: the whole "make the session say
+    /// something true, and say it out loud" half of one pump iteration.
+    ///
+    /// **Both pumps call this.** `read_input`'s loop and the turn's `select!`
+    /// branch (ui_draw_v2 §4.5 U4) share it rather than each carrying a copy,
+    /// and the reason is sharpest in the arms: a `/`-command committed
+    /// mid-turn has to land exactly where it lands at the prompt, and an eval
+    /// that bails out of the rewrite chain has to look the same there. Two
+    /// versions would be two ways to see a different result from one keystroke.
+    ///
+    /// Returns `Some(action)` when the read ends — only `MenuDone`, from a
+    /// committed `/`-command. `None` means "keep looping": by then the frame
+    /// is already painted.
+    pub(crate) async fn settle(
+        &mut self,
+        output: &dyn Output,
+        prompt: &str,
+        history: &mut History,
+        dims: (usize, usize),
+    ) -> Option<InputAction> {
+        // `emit_commit` wants a painter as a closure; the painter it wants is
+        // the same one everything else uses, so this is an adapter over
+        // `paint_prompt` and not a second composition.
+        let redraw = |editor: &LineEditor, rows: &[String], focus: usize, dims: (usize, usize)| {
+            paint_prompt(output, prompt, editor, rows, focus, dims);
+        };
+        // Bound before the `match` on purpose: a future in a match scrutinee
+        // lives to the end of the `match`, and it would still hold the borrow
+        // of `self` the arms below want back.
+        let eval = self.eval().await;
+        match eval {
+            EvalOutcome::Frame => {}
+            EvalOutcome::Commit { line, message } => {
+                Repl::emit_commit(
+                    output,
+                    &mut self.editor,
+                    &redraw,
+                    self.sel,
+                    dims,
+                    &line,
+                    "",
+                    history,
+                );
+                if let Some(text) = message {
+                    output.display_text(&text);
+                }
+                // Dismiss the overlay and hand control back to the agent loop,
+                // whose convergence step applies the targets this eval wrote.
+                return Some(InputAction::MenuDone);
+            }
+            EvalOutcome::Error { message } => {
+                // Clear the input region through the frame path — the menu
+                // that produced the error is not what should keep showing
+                // under its message — surface it, then re-anchor (DSR) so the
+                // next iteration anchors below it.
+                //
+                // The DSR used to be justified by "the exact line
+                // `display_text` consumed depends on inline-markdown wrapping,
+                // so re-anchor rather than trusting the wrap count". That is
+                // no longer true: the count is *measured* from the emitted
+                // bytes, and `display_text_row_is_measured_not_predicted` pins
+                // it against a terminal emulator. The DSR stays because this is
+                // an error path — rare, and the cost of being wrong is a
+                // stranded input region — not because the accounting needs
+                // rescuing.
+                redraw(&LineEditor::new(), &[], self.sel, dims);
+                output.display_text(&message);
+                let _ = output.cursor_row();
+            }
+        }
+        self.sync_selection();
+        let (rows, focus) = overlay_paint(&self.overlay, dims.0, dims.1);
+        paint_prompt(output, prompt, &self.editor, &rows, focus, dims);
+        None
+    }
+
+    /// Apply one key to the session.
+    ///
+    /// **Draws nothing.** Every branch either mutates state and asks for
+    /// another turn ([`KeyOutcome::Continue`]), hands the tty to `$EDITOR`
+    /// ([`KeyOutcome::RunEditor`]), or ends the read
+    /// ([`KeyOutcome::Action`]) — what that looks like on screen is the
+    /// caller's decision. Two pumps drive this: `read_input`'s blocking loop
+    /// today, the turn's `tokio::select!` branch once in-turn input lands
+    /// (ui_draw_v2 §4.5 U4). A dispatcher that painted would hand them two
+    /// ways to write the terminal.
+    ///
+    /// Takes `&mut self` because both pumps hold the session by reference:
+    /// `read_input`'s loop, and the turn's `select!` branch (ui_draw_v2 §4.5
+    /// U4). Everything that is plain text editing still goes to
+    /// [`Repl::edit_key`].
+    ///
+    /// `Ctrl-C` and `Ctrl-Z` are *not* here: they are process and terminal
+    /// operations that must not queue behind edit keys, so the caller handles
+    /// them before this runs.
+    pub(crate) fn handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        // Row count of the overlay as the caller measured it — the bounds the
+        // host-side cursor needs. Passed rather than recomputed so the
+        // dispatch and the paint cannot disagree about how many rows there are.
+        opts_len: usize,
+        prompt: &str,
+        history: &mut History,
+    ) -> KeyOutcome {
+        let Self {
+            editor,
+            nav,
+            draft,
+            sel,
+            pending_key,
+            ..
+        } = self;
+        // Read, never written: bound immutably so the arms see the
+        // `&ActiveOverlay` they were written against rather than a `&mut` that
+        // would re-bind every `plan` in them.
+        let overlay: &ActiveOverlay = &self.overlay;
+        let epoch_active: bool = self.epoch_active;
+        // Ctrl-E: external editor for input buffer (no overlay) or header (V25Menu).
+        if let KeyCode::Char('e') = key.code {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match overlay {
+                    ActiveOverlay::None => {
+                        // Edit the input buffer. The wrapper owns the whole
+                        // turnover — reader gate, raw mode, DSR re-anchor; no
+                        // local logic here (doc/editor_cleanup.md §2).
+                        return KeyOutcome::RunEditor;
+                    }
+                    ActiveOverlay::V25Menu { .. } => {
+                        // Ctrl-E on a menu endpoint dispatches to the node's
+                        // edit() through the engine (doc/editor_cleanup.md
+                        // §3/§5): the node owns what (if anything) to edit.
+                        *pending_key = Some(crate::slashdot_menu::HostKey::Edit);
+                        return KeyOutcome::Continue;
+                    }
+                    ActiveOverlay::PathComplete { .. } => {
+                        // No-op in prose completion dialog.
+                    }
+                }
+            }
+        }
+        // Active overlay key dispatch via enum methods.
+        if !matches!(overlay, ActiveOverlay::None) {
+            match key.code {
+                KeyCode::Down | KeyCode::Up => {
+                    // Engine-owned cursor (slash handle or prose completer):
+                    // queue the delta for the next eval — it applies the
+                    // result in one place. The host-`sel` fallback below is
+                    // for the empty-plan V25Menu case only.
+                    if overlay.cursor_row().is_some() {
+                        let delta: i32 = if key.code == KeyCode::Down { 1 } else { -1 };
+                        *pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
+                        return KeyOutcome::Continue;
+                    }
+                    if key.code == KeyCode::Down {
+                        if *sel + 1 < opts_len {
+                            *sel += 1;
+                        }
+                    } else if *sel > 0 {
+                        *sel -= 1;
+                    }
+                }
+                KeyCode::PageDown | KeyCode::PageUp => {
+                    // Plan-carrying overlays: visual-line-aware page scroll
+                    // through the engine that owns the cursor (slash handle /
+                    // prose).
+                    let plan = match overlay {
+                        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
+                            Some(plan)
+                        }
+                        ActiveOverlay::None => None,
+                    };
+                    if let Some(plan) = plan {
+                        if !matches!(overlay, ActiveOverlay::PathComplete { .. }) && !epoch_active {
+                            return KeyOutcome::Continue; // V25 overlay without its handle
+                        }
+                        let cur_sel = plan.selected.unwrap_or(0);
+                        // Page in the units the painter works in: ask it what
+                        // it painted and move the cursor by the rows that fit
+                        // on one screen (ui_draw_v2 §9 #5, #7). A row the
+                        // painter split across terminal rows counts for all of
+                        // them, so a PageDown moves a page and not a page and
+                        // a half.
+                        let (cur_h, _) = crossterm::terminal::size().unwrap_or((80, 24));
+                        let painted = crate::slashdot_menu::render::paint_overlay(
+                            plan,
+                            crate::output::term_width().max(1),
+                            cur_h.max(1) as usize,
+                        );
+                        let direction = if matches!(key.code, KeyCode::PageDown) {
+                            1
+                        } else {
+                            -1
+                        };
+                        let delta = crate::slashdot_menu::render::page_delta_heights(
+                            &painted.data_heights,
+                            cur_sel,
+                            painted.data_budget,
+                            direction,
+                        );
+                        if delta != 0 {
+                            *pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
+                        }
+                        return KeyOutcome::Continue;
+                    }
+                    let page = {
+                        let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+                        (h as usize).saturating_sub(2).max(1)
+                    };
+                    let max = opts_len.saturating_sub(1);
+                    if matches!(key.code, KeyCode::PageDown) {
+                        *sel = (*sel + page).min(max);
+                    } else {
+                        *sel = (*sel).saturating_sub(page);
+                    }
+                }
+                KeyCode::Tab => {
+                    // Both plan-carrying overlays route Tab through the engine
+                    // that produced the plan: slash drills/expands, prose
+                    // splices the selected id over the word.
+                    if matches!(
+                        overlay,
+                        ActiveOverlay::V25Menu { .. } | ActiveOverlay::PathComplete { .. }
+                    ) {
+                        *pending_key = Some(crate::slashdot_menu::HostKey::Tab);
+                    }
+                }
+                KeyCode::Enter => {
+                    if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                        if !key.modifiers.contains(KeyModifiers::SHIFT) {
+                            // Slash: queue the key; the next iteration's eval
+                            // handles submit (commit + return) or rewrite
+                            // inline.
+                            *pending_key = Some(crate::slashdot_menu::HostKey::Enter);
+                        }
+                        return KeyOutcome::Continue;
+                    }
+                    // Prose dialog: Enter bypasses completion — submit the raw
+                    // line (Shift+Enter inserts a newline). Tab is the only
+                    // expansion key.
+                    if let Some(a) = Repl::edit_key(key, editor, history, nav, draft, prompt) {
+                        return KeyOutcome::Action(a);
+                    }
+                    return KeyOutcome::Continue;
+                }
+                KeyCode::Esc => {
+                    // Slash engine-backed overlays route Esc through the
+                    // engine's per-level ladder (frame replay + esc()). Prose:
+                    // Esc is a no-op — dismissal is buffer-driven (stateless);
+                    // in plain editing Esc is a no-op too, so this is uniform.
+                    if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                        *pending_key = Some(crate::slashdot_menu::HostKey::Esc);
+                        return KeyOutcome::Continue;
+                    }
+                }
+                _ => {
+                    // Editing keys pass through in both cases; dismissal is
+                    // stateless — the next eval re-derives the dialog from
+                    // the buffer.
+                    if let Some(a) = Repl::edit_key(key, editor, history, nav, draft, prompt) {
+                        return KeyOutcome::Action(a);
+                    }
+                }
+            }
+            return KeyOutcome::Continue;
+        }
+        // No overlay: normal editing (Tab with no dialog is inert — implicit
+        // open means the dialog is already up whenever there is anything to
+        // complete).
+        if let Some(a) = Repl::edit_key(key, editor, history, nav, draft, prompt) {
+            return KeyOutcome::Action(a);
+        }
+        KeyOutcome::Continue
     }
 }
 
@@ -621,7 +1435,10 @@ impl Repl {
     pub async fn read_input(
         &mut self,
         prompt: &str,
-        initial_buffer: Option<&str>,
+        // The prompt session. Borrowed, not owned: this is the state the turn
+        // needs once in-turn input lands (ui_draw_v2 §4.5 U4), so it has to
+        // outlive this call.
+        session: &mut PromptSession,
         history: &mut History,
         ctx: &ReplCtx,
         app_state: &Arc<AppState>,
@@ -673,48 +1490,23 @@ impl Repl {
                 context_tokens: ctx.context_tokens,
             },
         ));
-        let mut editor = LineEditor::new();
-        // Seed the editor with a prefill string if one was provided. Used by
-        // `/session <id> resume` to surface the resumed session's stored model
-        // (`/model <provider>:<model_id>`) so the user can press Enter to
-        // accept, Esc to dismiss, or type to choose a different model.
-        // Pre-filling a slash command also opens its overlay immediately,
-        // so the model picker is visible without any extra keystroke.
-        if let Some(s) = initial_buffer {
-            editor.set(s);
-        }
-        let mut nav: Option<usize> = None;
-        let mut draft = String::new();
-        let mut sel: usize = 0;
-        let mut last_disc: u8 = 0; // overlay discriminant for sel-reset tracking
-                                   // v2.5 engine: persistent menu tree + guard-like handle.
-                                   // The menu lives for the entire prompt session; the handle is
-                                   // created when the prompt starts with `/` and dropped when it
-                                   // no longer does. All `/` dispatch goes through `eval_prompt`.
-        let mut v25_menu = crate::v25_menu::build_menu(app_state);
-        let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
-        // Prose (non-`/`) completion: one instance for the prompt
-        // session, parallel to the slash handle. Spawns its FS worker;
-        // the worker exits when this (and its `Sender`) drops.
-        let mut prose = crate::prompt_complete::PromptCompletion::new();
-        // Engine key queued by the dispatch below for the *next*
-        // iteration's eval (eval → display → wait loop shape). `None`
-        // = passive frame (buffer edits, first iteration). Consumed
-        // unconditionally at the top, so a stale key can never outlive
-        // one iteration.
-        let mut pending_key: Option<crate::slashdot_menu::HostKey> = None;
-        // Terminal size at the last paint, `(w, h)`. Resizes are consumed
-        // without repainting (see the wait below), so a mismatch at the top of
-        // the loop is the "repaint is due, and re-anchor first" signal (plan
-        // §4.2); a *width* change additionally wipes + replays first. The
-        // clear bound this pair used to provide is `plan_apply`'s
-        // `screen_bottom` now (plan §4.3). Interior mutability (`Cell`) lets
-        // the loop read it without holding a mutable borrow.
-        let painted_size = Cell::new(
-            crossterm::terminal::size()
-                .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
-                .unwrap_or((80, 24)),
-        );
+        // The session's state, as the loop's own bindings. Destructuring a
+        // `&mut PromptSession` reborrows each field *disjointly*, so the body
+        // keeps addressing them as locals while they are, in fact, one movable
+        // value — and `PromptSession::handle_key` can be handed exactly the
+        // fields it touches instead of a `&mut self` that would conflict with
+        // these bindings.
+        // Terminal size at the last paint is `output.painted_size()`'s answer,
+        // read fresh each iteration rather than kept in a `Cell` here. Resizes
+        // are consumed without repainting (see the wait below), so a mismatch at
+        // the top of the loop is the "repaint is due, and re-anchor first"
+        // signal (plan §4.2); a *width* change additionally wipes + replays
+        // first. The clear bound this pair used to provide is `plan_apply`'s
+        // `screen_bottom` now (plan §4.3).
+        //
+        // Owning it in the output rather than here also means a resize that
+        // happens *during a turn* is caught when the next prompt opens, instead
+        // of being absorbed by a fresh read at entry.
 
         // Compose → allocate → render → apply the input frame (plan §5.2):
         // `[Input]`, or `[Input, Divider, Overlay]` while a pop-up shows.
@@ -722,11 +1514,12 @@ impl Repl {
         // row-diff (so a tall pop-up's scroll is followed without a row
         // counter), and the scroll `delta` and bounded clear live in
         // `plan_apply`. Content *above* the frame (greeter / status / session)
-        // is never touched. The closure's one piece of state is
-        // `painted_size`: compose and apply both receive the same `dims`, so
-        // they cannot disagree on the frame's size (ui_draw_v2 §9 #3), and
-        // the applied pair `draw_frame` reports is what gets recorded — the
-        // repaint bookkeeping is the engine's fact, not a secondhand read.
+        // is never touched. The closure keeps no state of its own: compose and
+        // apply both receive the same `dims`, so they cannot disagree on the
+        // frame's size (ui_draw_v2 §9 #3), and the applied pair `draw_frame`
+        // reports is recorded by the output itself — the repaint bookkeeping is
+        // the engine's fact, not a secondhand read and not a number this loop
+        // has to carry between calls.
         // The prompt-side status bar: the same `status_line` the mid-turn bar
         // uses, with the dot **grey** — the two states are the whole reason the
         // bar is permanent. Built once per `read_input`, not per keystroke: the
@@ -737,25 +1530,6 @@ impl Repl {
         // `term_width` is read at paint time rather than here, so a resize that
         // lands mid-edit re-flows the bar with the frame instead of leaving a
         // bar sized for the old terminal.
-        let redraw =
-            |editor: &LineEditor, overlay: &[String], focus: usize, dims: (usize, usize)| {
-                let dims = (dims.0.max(1), dims.1.max(1));
-                // The REPL supplies only what changes: the input, and the menu when one
-                // is open. The status row is `compose_area`'s to resolve — it is made of
-                // `status_text` and `streaming`, which are this output's facts and not
-                // something this module may reason about — and so is the divider that
-                // separates the menu from the input above it (ui_draw_v2 §5.1.1).
-                let layout = editor.layout(dims.0, prompt);
-                let input = Element::input(layout, prompt.to_string());
-                let overlay =
-                    (!overlay.is_empty()).then(|| Element::overlay(overlay.to_vec(), focus));
-                // Composition *and* division are the tail's now: pieces move in
-                // and nothing comes back, so no `Vec<Element>` crosses a call
-                // site (ui_draw_v2 §5.1.1) — and this can no longer build a
-                // `Frame` by hand.
-                let applied = output.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
-                painted_size.set(applied);
-            };
         loop {
             // On resume from Ctrl-Z (editing phase; the in-flight reader thread
             // is not running then), re-enter raw mode so the next keystroke is
@@ -766,7 +1540,7 @@ impl Repl {
                 let _ = self.guard.start();
                 let _ = output.cursor_row();
             }
-            // Resize detection against `painted_size`. Resize events are
+            // Resize detection against the output's `painted_size`. Resize events are
             // consumed without repainting (see the wait below), so after a drag
             // this check first fires on the keystroke that triggers the
             // repaint: a size mismatch means "repaint is due, and re-anchor
@@ -778,7 +1552,7 @@ impl Repl {
             let (cur_w_u16, cur_h_u16) = crossterm::terminal::size().unwrap_or((80, 24));
             let cur_h = cur_h_u16 as usize;
             let cur_w = cur_w_u16 as usize;
-            let (painted_w, painted_h) = painted_size.get();
+            let (painted_w, painted_h) = output.painted_size();
             if cur_w != painted_w || cur_h != painted_h {
                 // Key-triggered repaint after a size change. A *width*
                 // change makes a reflowing terminal (wezterm) re-wrap the
@@ -788,7 +1562,7 @@ impl Repl {
                 // it at the end of the content — the best possible
                 // starting point), replay the last turn through the normal
                 // scrollback (pushing any corruption above the fold), then
-                // re-anchor; the usual redraw below repaints the input.
+                // re-anchor; `settle`'s paint below repaints the input.
                 // Skipped without a session — nothing to replay and usually
                 // nothing to clear up. Height-only changes don't re-wrap,
                 // so they keep the cheap re-anchor path.
@@ -804,173 +1578,20 @@ impl Repl {
             // Keep the shared width in sync (covers width changes even without
             // an explicit Resize event, e.g. on some terminals).
             TERMINAL_WIDTH.store(cur_w, Ordering::SeqCst);
-            // --- Eval: resolve the pending key (or a passive frame)
-            // into an overlay. Single place where an engine prompt is
-            // applied to the buffer AND its plan rendered, so a §5.1
-            // keyless restore lands both in the same frame — no window
-            // for a racing edit between them. ---
-            let key = pending_key
-                .take()
-                .unwrap_or(crate::slashdot_menu::HostKey::None);
-            let buf_text = editor.text();
-            let overlay = if buf_text.starts_with('/') {
-                // All `/` commands route through the v2.5 engine.
-                // Manage handle lifecycle: create on first `/`, drop when not `/.
-                if v25_handle.is_none() {
-                    v25_handle = Some(v25_menu.get_handle());
-                }
-                let result = {
-                    let handle = v25_handle.as_mut().unwrap();
-                    Self::v25_eval(handle, &buf_text, editor.cursor, key).await
-                };
-                match result {
-                    V25Frame::Continue(plan, prompt) => {
-                        // Apply the engine's prompt — but only when it
-                        // actually changed: an unchanged passive eval
-                        // must not reset a mid-line text cursor
-                        // (`LineEditor::set` jumps to EOL).
-                        let new_buf = format!("/{}", prompt);
-                        if new_buf != editor.text() {
-                            editor.set(&new_buf);
-                        }
-                        ActiveOverlay::V25Menu { plan }
-                    }
-                    V25Frame::DoneSuccess(msg, prompt)
-                        if matches!(key, crate::slashdot_menu::HostKey::Enter) =>
-                    {
-                        // The node's submit() wrote to `AppState` (target
-                        // config for `/reasoning`/`/model`/…, control fields
-                        // for `/session`/`/replay`/…). Use the
-                        // engine-provided self-documenting prompt
-                        // (e.g. "/reasoning low").
-                        let committed = format!("/{}", prompt);
-                        Repl::emit_commit(
-                            output,
-                            &mut editor,
-                            &redraw,
-                            sel,
-                            (cur_w, cur_h),
-                            &committed,
-                            "",
-                            history,
-                        );
-                        if let Some(text) = msg {
-                            output.display_text(&text);
-                        }
-                        // Dismiss the overlay and hand control back to the
-                        // agent loop, whose convergence step applies the
-                        // targets written during this eval.
-                        return Some(InputAction::MenuDone);
-                    }
-                    V25Frame::DoneError(err, prompt)
-                        if matches!(key, crate::slashdot_menu::HostKey::Enter) =>
-                    {
-                        let committed = format!("/{}", prompt);
-                        Repl::emit_commit(
-                            output,
-                            &mut editor,
-                            &redraw,
-                            sel,
-                            (cur_w, cur_h),
-                            &committed,
-                            "",
-                            history,
-                        );
-                        output.display_text(&err);
-                        return Some(InputAction::MenuDone);
-                    }
-                    // Rewrite-cycle bail-out on a non-Enter key (chain
-                    // already on stderr from v25_eval): clear the input
-                    // area, surface it in the transcript, and drop the
-                    // prompt — back to normal operation.
-                    V25Frame::DoneError(err, _) => {
-                        // Clear the input region through the frame path, then
-                        // surface the error, then re-anchor (DSR) so the next
-                        // iteration anchors below it.
-                        //
-                        // This one used to be justified by "the exact line
-                        // `display_text` consumed depends on inline-markdown
-                        // wrapping, so re-anchor rather than trusting the wrap
-                        // count". That is no longer true: the count is *measured*
-                        // from the emitted bytes, and
-                        // `display_text_row_is_measured_not_predicted` pins it
-                        // against a terminal emulator. The DSR stays because this
-                        // is an error path — rare, and the cost of being wrong
-                        // is a stranded input region — not because the accounting
-                        // needs rescuing.
-                        redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
-                        output.display_text(&err);
-                        let _ = output.cursor_row();
-                        editor.set("");
-                        v25_handle = None;
-                        ActiveOverlay::None
-                    }
-                    // Esc at root — close the overlay.
-                    V25Frame::DoneSuccess(_, _) => {
-                        editor.set("");
-                        v25_handle = None;
-                        ActiveOverlay::None
-                    }
-                }
-            } else {
-                // Drop the v25 handle when prompt leaves `/`.
-                v25_handle = None;
-                // Prose frames: one eval drives the word gate, the
-                // debounce, and the dialog. Idle ⇒ no overlay (stateless
-                // dismissal: the next frame re-derives from the buffer).
-                let ctx = crate::slashdot_menu::RenderContext {
-                    term_width: crate::output::term_width().max(1),
-                };
-                match prose.eval(&mut editor, key, ctx) {
-                    crate::prompt_complete::Frame::Idle => ActiveOverlay::None,
-                    crate::prompt_complete::Frame::Dialog(plan) => {
-                        ActiveOverlay::PathComplete { plan }
-                    }
-                }
-            };
-            // Hoisted before the sel-reset so `active` (the menu's
-            // default/current-state row) can drive the cursor policy below.
-            let (raw_opts, active) = overlay.display_rows();
-            let cur_disc = overlay.overlay_disc();
-            if overlay.cursor_row().is_some() {
-                // Engine-owned cursor: `sel` IS the engine's cursor row
-                // (arrows mutate engine state; Tab/Enter act on it). The
-                // marker `active` (ctx-driven `*`) is separate. No
-                // host-side cursor policy for these overlays.
-                sel = overlay
-                    .cursor_row()
-                    .unwrap_or(active.unwrap_or(0))
-                    .min(raw_opts.len().saturating_sub(1));
-                if cur_disc != last_disc {
-                    last_disc = cur_disc;
-                }
-            } else {
-                sel = Self::cursor_sel_policy(cur_disc != last_disc, sel);
+            // --- Eval → outcome → sync → paint, and end the read if that
+            // produced an action. The whole sequence lives in `settle`
+            // because the turn's `select!` branch runs it too (ui_draw_v2
+            // §4.5 U4): one place to get a `/`-command commit and a
+            // rewrite-chain bail-out right, rather than two that drift.
+            // Everything after it here is the *other* half of the iteration —
+            // waiting for a key — which is exactly what the turn has instead
+            // of a wait.
+            if let Some(action) = session
+                .settle(output, prompt, history, (cur_w, cur_h))
+                .await
+            {
+                return Some(action);
             }
-            if cur_disc != last_disc {
-                last_disc = cur_disc;
-            }
-            let opts = raw_opts;
-            let max_sel = opts.len().saturating_sub(1);
-            if sel > max_sel {
-                sel = max_sel;
-            }
-            // The painter reports the geometry it produced: terminal rows to
-            // show, and the windowing focus among them. The focus used to be
-            // re-derived here — `1 + Σ(1 + newlines(opts[..sel]))` — which
-            // assumed a one-row header and no table header, so it pointed at
-            // the wrong row for any menu with either (ui_draw_v2 §9 #5).
-            let painted = match &overlay {
-                ActiveOverlay::None => None,
-                ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => Some(
-                    crate::slashdot_menu::render::paint_overlay(plan, cur_w, cur_h),
-                ),
-            };
-            // A plan whose selection did not fit falls back to 0 — window from
-            // the top — which is what the frame's focus means there.
-            let focus = painted.as_ref().and_then(|p| p.focus).unwrap_or(0);
-            let overlay_rows: &[String] = painted.as_ref().map_or(&[], |p| p.rows.as_slice());
-            redraw(&editor, overlay_rows, focus, (cur_w, cur_h));
 
             // --- Wait for a key (or a prose-completion wake). While a
             // prose request is armed/in flight, poll with a deadline so
@@ -986,10 +1607,10 @@ impl Repl {
             // The painted frame is left for the terminal to reflow on its own;
             // the next keystroke re-anchors via DSR at the top of the loop and
             // repaints once, against the settled size. ---
-            let prose_wait = if editor.chars().first() == Some(&'/') {
+            let prose_wait = if session.editor.chars().first() == Some(&'/') {
                 None
             } else {
-                prose.poll_timeout()
+                session.prose.poll_timeout()
             };
             let ev: Option<Event> = loop {
                 let e = match prose_wait {
@@ -1038,216 +1659,50 @@ impl Repl {
                             let _ = self.guard.start();
                         }
                     }
-                    // Ctrl-E: external editor for input buffer (no overlay) or header (V25Menu).
-                    if let KeyCode::Char('e') = key.code {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            match &overlay {
-                                ActiveOverlay::None => {
-                                    // Edit the input buffer. The wrapper owns
-                                    // the whole turnover — reader gate, raw
-                                    // mode, DSR re-anchor; no local logic here
-                                    // (doc/editor_cleanup.md §2).
-                                    match run_editor(
-                                        &self.guard,
-                                        output,
-                                        &editor.text(),
-                                        EditorMode::Edit,
-                                    ) {
-                                        Ok(new_text) => {
-                                            editor.set(&new_text);
-                                        }
-                                        Err(e) => {
-                                            let _ = io::stdout().write_all(
-                                                format!("\r\neditor error: {}\r\n", e).as_bytes(),
-                                            );
-                                        }
-                                    }
-                                    continue;
-                                }
-                                ActiveOverlay::V25Menu { .. } => {
-                                    // Ctrl-E on a menu endpoint dispatches to
-                                    // the node's edit() through the engine
-                                    // (doc/editor_cleanup.md §3/§5): the node
-                                    // owns what (if anything) to edit.
-                                    pending_key = Some(crate::slashdot_menu::HostKey::Edit);
-                                    continue;
-                                }
-                                ActiveOverlay::PathComplete { .. } => {
-                                    // No-op in prose completion dialog.
-                                }
-                            }
+                    // The dispatcher. It answers with what *should* happen on
+                    // screen; this loop is the one that actually does it, so
+                    // the same function can serve the turn's `select!` branch
+                    // later (ui_draw_v2 §4.5 U4) without learning to draw.
+                    // Bound before the call: the receiver's borrow of `session`
+                    // would otherwise still be live while the argument reads
+                    // the same session for its row count.
+                    let opts_len = session.opts_len();
+                    match session.handle_key(key, opts_len, prompt, history) {
+                        KeyOutcome::Continue => {}
+                        KeyOutcome::RunEditor => {
+                            // The wrapper owns the whole turnover — reader
+                            // gate, raw mode, DSR re-anchor; no local logic
+                            // here (doc/editor_cleanup.md §2). It is shared
+                            // because the turn's arm calls it too.
+                            session.open_editor(&self.guard, output);
                         }
-                    }
-                    // Active overlay key dispatch via enum methods.
-                    if !matches!(overlay, ActiveOverlay::None) {
-                        match key.code {
-                            KeyCode::Down | KeyCode::Up => {
-                                // Engine-owned cursor (slash handle or prose
-                                // completer): queue the delta for the next
-                                // eval — it applies the result in one place.
-                                // The host-`sel` fallback below is for the
-                                // empty-plan V25Menu case only.
-                                if overlay.cursor_row().is_some() {
-                                    let delta: i32 = if key.code == KeyCode::Down { 1 } else { -1 };
-                                    pending_key =
-                                        Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
-                                    continue;
-                                }
-                                if key.code == KeyCode::Down {
-                                    if sel + 1 < opts.len() {
-                                        sel += 1;
-                                    }
-                                } else {
-                                    if sel > 0 {
-                                        sel -= 1;
-                                    }
-                                }
-                            }
-                            KeyCode::PageDown | KeyCode::PageUp => {
-                                // Plan-carrying overlays: visual-line-aware
-                                // page scroll through the engine that owns
-                                // the cursor (slash handle / prose).
-                                let plan = match &overlay {
-                                    ActiveOverlay::V25Menu { plan }
-                                    | ActiveOverlay::PathComplete { plan } => Some(plan),
-                                    ActiveOverlay::None => None,
-                                };
-                                if let Some(plan) = plan {
-                                    if !matches!(overlay, ActiveOverlay::PathComplete { .. })
-                                        && v25_handle.is_none()
-                                    {
-                                        continue; // V25 overlay without its handle
-                                    }
-                                    let cur_sel = plan.selected.unwrap_or(0);
-                                    // Page in the units the painter works in:
-                                    // ask it what it painted and move the
-                                    // cursor by the rows that fit on one
-                                    // screen (ui_draw_v2 §9 #5, #7). A row the
-                                    // painter split across terminal rows
-                                    // counts for all of them, so a PageDown
-                                    // moves a page and not a page and a half.
-                                    let (cur_h, _) =
-                                        crossterm::terminal::size().unwrap_or((80, 24));
-                                    let painted = crate::slashdot_menu::render::paint_overlay(
-                                        plan,
-                                        crate::output::term_width().max(1),
-                                        cur_h.max(1) as usize,
-                                    );
-                                    let direction = if matches!(key.code, KeyCode::PageDown) {
-                                        1
-                                    } else {
-                                        -1
-                                    };
-                                    let delta = crate::slashdot_menu::render::page_delta_heights(
-                                        &painted.data_heights,
-                                        cur_sel,
-                                        painted.data_budget,
-                                        direction,
-                                    );
-                                    if delta != 0 {
-                                        pending_key =
-                                            Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
-                                    }
-                                    continue;
-                                }
-                                let page = {
-                                    let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                                    (h as usize).saturating_sub(2).max(1)
-                                };
-                                if matches!(key.code, KeyCode::PageDown) {
-                                    sel = (sel + page).min(opts.len().saturating_sub(1));
-                                } else {
-                                    sel = sel.saturating_sub(page);
-                                }
-                            }
-                            KeyCode::Tab => {
-                                // Both plan-carrying overlays route Tab
-                                // through the engine that produced the plan:
-                                // slash drills/expands, prose splices the
-                                // selected id over the word.
-                                if matches!(
-                                    overlay,
-                                    ActiveOverlay::V25Menu { .. }
-                                        | ActiveOverlay::PathComplete { .. }
-                                ) {
-                                    pending_key = Some(crate::slashdot_menu::HostKey::Tab);
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
-                                    if !key.modifiers.contains(KeyModifiers::SHIFT) {
-                                        // Slash: queue the key; the next
-                                        // iteration's eval handles submit
-                                        // (commit + return) or rewrite inline.
-                                        pending_key = Some(crate::slashdot_menu::HostKey::Enter);
-                                    }
-                                    continue;
-                                }
-                                // Prose dialog: Enter bypasses completion —
-                                // submit the raw line (Shift+Enter inserts a
-                                // newline). Tab is the only expansion key.
-                                if let Some(a) = Self::edit_key(
-                                    key,
-                                    &mut editor,
-                                    history,
-                                    &mut nav,
-                                    &mut draft,
+                        KeyOutcome::Action(a) => {
+                            if let InputAction::Submit(_) = &a {
+                                // U4: one `PromptSession` outlives this call,
+                                // so the *painted* editor being empty is not the
+                                // same as the editor being empty. Painting a
+                                // throwaway `LineEditor::new()` cleared the screen
+                                // and left the submitted text in `session.editor`,
+                                // which is what the *next* compose paints — so
+                                // the first keystroke of the turn, or the next
+                                // prompt, put the old text back on screen. Clear
+                                // the real one and paint that.
+                                session.editor.set("");
+                                paint_prompt(
+                                    output,
                                     prompt,
-                                ) {
-                                    if let InputAction::Submit(_) = &a {
-                                        redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
-                                    }
-                                    return Some(a);
-                                }
-                                continue;
+                                    &session.editor,
+                                    &[],
+                                    session.sel,
+                                    (cur_w, cur_h),
+                                );
                             }
-                            KeyCode::Esc => {
-                                // Slash engine-backed overlays route Esc
-                                // through the engine's per-level ladder
-                                // (frame replay + esc()). Prose: Esc is a
-                                // no-op — dismissal is buffer-driven
-                                // (stateless); in plain editing Esc is a
-                                // no-op too, so this is uniform.
-                                if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
-                                    pending_key = Some(crate::slashdot_menu::HostKey::Esc);
-                                    continue;
-                                }
-                            }
-                            _ => {
-                                // Editing keys pass through in both cases;
-                                // dismissal is stateless — the next eval
-                                // re-derives the dialog from the buffer.
-                                if let Some(a) = Self::edit_key(
-                                    key,
-                                    &mut editor,
-                                    history,
-                                    &mut nav,
-                                    &mut draft,
-                                    prompt,
-                                ) {
-                                    if let InputAction::Submit(_) = &a {
-                                        redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
-                                    }
-                                    return Some(a);
-                                }
-                            }
+                            return Some(a);
                         }
-                        continue;
-                    }
-                    // No overlay: normal editing (Tab with no dialog is
-                    // inert — implicit open means the dialog is already up
-                    // whenever there is anything to complete).
-                    if let Some(a) =
-                        Self::edit_key(key, &mut editor, history, &mut nav, &mut draft, prompt)
-                    {
-                        if let InputAction::Submit(_) = &a {
-                            redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
-                        }
-                        return Some(a);
                     }
                 }
                 Some(Event::Paste(text)) => {
-                    editor.insert_str(&text);
+                    session.paste(&text);
                 }
                 Some(_) => {} // other events (mouse): ignored
                 None => {}    // prose wake with no key: re-eval below
@@ -2297,6 +2752,107 @@ fn history_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
+
+    /// The in-flight reader's routing policy: which events may wait, and which
+    /// may not.
+    ///
+    /// Pinned as a *correctness* property rather than a preference — "an abort
+    /// cannot ride behind a paste backlog" (ui_draw_v2 §4.5) — and the
+    /// channel's unboundedness follows from it: a bounded one that filled would
+    /// block the reader at precisely the moment it has to deliver `Ctrl-C`.
+    ///
+    /// `Esc` used to be in this list and is deliberately gone from it now, for
+    /// the reason [`esc_is_forwarded_so_the_turn_can_decide`] pins.
+    #[test]
+    fn an_abort_never_queues_behind_content() {
+        let urgent = [
+            (
+                "Ctrl-C",
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ),
+            (
+                "Ctrl-Z",
+                Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            ),
+            ("Resize", Event::Resize(120, 40)),
+        ];
+        for (what, ev) in urgent {
+            assert_eq!(
+                route_event(&ev),
+                ReaderRoute::Inline,
+                "{} must be handled inline, never queued",
+                what
+            );
+        }
+    }
+
+    /// `Esc` is forwarded, and that is the fix for the settled menu-first rule
+    /// (ui_draw_v2 §4.5, "abort only at root").
+    ///
+    /// It could not be decided where it used to be decided: routing `Esc`
+    /// Inline here meant routing it to *abort*, with no way to ask whether a
+    /// menu was open, because this function has no session to look at. Moving
+    /// it to the forwarded path is what lets the turn answer the question
+    /// correctly — step the ladder when a menu is up, stop the turn when there
+    /// is not. The trade is stated in [`route_event`]'s doc: a root `Esc` now
+    /// rides the queue like any other key.
+    #[test]
+    fn esc_is_forwarded_so_the_turn_can_decide() {
+        let ev = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(route_event(&ev), ReaderRoute::Forward);
+    }
+
+    /// Everything the prompt can hold is content, and content goes to the turn
+    /// instead of being dropped the way it was before U4.2.
+    #[test]
+    fn what_the_prompt_can_hold_is_forwarded() {
+        let content = [
+            (
+                "a character",
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            ),
+            (
+                "Enter",
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ),
+            (
+                "Shift+Enter (a newline)",
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            ),
+            (
+                "Up",
+                Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            ),
+            (
+                "Backspace",
+                Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            ),
+            ("a paste", Event::Paste("hello world".to_string())),
+        ];
+        for (what, ev) in content {
+            assert_eq!(
+                route_event(&ev),
+                ReaderRoute::Forward,
+                "{} is content for the prompt",
+                what
+            );
+        }
+    }
+
+    /// Events with nowhere to go keep their old fate instead of being
+    /// forwarded, so the channel carries no more than the prompt could ever
+    /// show.
+    #[test]
+    fn events_with_nowhere_to_go_stay_inline() {
+        let ev = Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(route_event(&ev), ReaderRoute::Inline);
+    }
 
     /// A committed line is bracketed by rules: one above, one below, and the
     /// line between them.
@@ -2426,8 +2982,7 @@ mod tests {
         out: &crate::output::ConsoleOutput,
     ) -> impl Fn(&LineEditor, &[String], usize, (usize, usize)) + '_ {
         move |editor: &LineEditor, overlay: &[String], sel: usize, dims: (usize, usize)| {
-            let layout = editor.layout(dims.0, "> ");
-            let input = Element::input(layout, "> ".to_string());
+            let input = input_element(editor, "> ", out.is_streaming(), dims.0);
             let ov = (!overlay.is_empty()).then(|| Element::overlay(overlay.to_vec(), sel));
             out.draw_elements(Some(input), ov, ApplyPolicy::Frame, dims);
         }
@@ -4126,5 +4681,58 @@ mod tests {
         let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 0, 20);
         assert_eq!(c, 20, "must use full budget");
         assert_eq!(s, 0, "starts at 0");
+    }
+
+    /// **R1: the input is a row between turns and no row at all mid-turn.**
+    ///
+    /// The contract has three cases, and the third is the one that keeps it from
+    /// being "never draw the input": between turns an empty buffer still shows
+    /// its row, because that row is what tells the reader where to type.
+    ///
+    /// Asserted through [`input_element`] rather than through a composed frame,
+    /// because this is a property of the element's `(must, might)` and a test
+    /// that replayed bytes to find it would pass just as well with the frame
+    /// layer accidentally padding the gap back in.
+    #[test]
+    fn an_empty_input_is_a_row_between_turns_and_none_mid_turn() {
+        let empty = LineEditor::new();
+
+        // Between turns: the resting row, `must == 1`.
+        let e = input_element(&empty, "> ", false, 60);
+        assert_eq!(
+            (e.must, e.might),
+            (1, 1),
+            "an idle REPL keeps its prompt row — it is where input goes"
+        );
+
+        // Mid-turn, still empty: nothing to submit, so no row and no claim.
+        let e = input_element(&empty, "> ", true, 60);
+        assert_eq!(
+            (e.must, e.might),
+            (0, 0),
+            "an empty input mid-turn is not a row"
+        );
+
+        // Mid-turn with something typed: an ordinary input again, and `must` is
+        // the caret's row so it can never be squeezed away entirely.
+        let mut typed = LineEditor::new();
+        typed.set("hello");
+        let e = input_element(&typed, "> ", true, 60);
+        assert_eq!(
+            (e.must, e.might),
+            (1, 1),
+            "typed input is drawn mid-turn: the row appears on the first keystroke"
+        );
+
+        // And through the real pipeline, a zero-row element really yields a zero-row
+        // frame — otherwise `must == might == 0` would only be a claim.
+        use crate::ui::frame::{allocate, live_budget, render};
+        let height = |streaming: bool| {
+            let e = input_element(&empty, "> ", streaming, 60);
+            let heights = allocate(&[e.extent()], live_budget(24));
+            render(&[e], &heights, 60).height()
+        };
+        assert_eq!(height(true), 0, "a hidden input paints no row at all");
+        assert_eq!(height(false), 1, "a resting input paints its row");
     }
 }

@@ -357,9 +357,9 @@ still sync); the async conversion rides on top.
    (scripted, paren-balanced, one descending insertion pass) — 242
    wraps; test bodies and helpers unchanged.
 4. **Slot exposure** **[done].** `SessionSlot` gains the two shared handles —
-   `session: Option<Arc<Session>>` (all methods `&self`; internals are
-   `Arc<AsyncMutex>` by design) and `agent: Option<Arc<dyn PicoAgent>>`
-   (`Send + Sync`, all methods `&self`) — plus `activate_session(id)` /
+  `session: Option<Arc<Session>>` (all methods `&self`; internals are
+  `Arc<AsyncMutex>` by design) and `agent: Option<Arc<CodeAgent>>`
+  (`Send + Sync`, all methods `&self`) — plus `activate_session(id)` /
    `activate_agent(a)` one-acquisition swaps (stronger bundle guarantee:
    one atomic write). Loop call-sites become *lock → clone `Arc` out →
    drop guard → await*; creation/rebuild stays loop-side, from the

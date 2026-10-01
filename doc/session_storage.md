@@ -1076,7 +1076,7 @@ fn rig_message_to_pi(msg: &Message) -> serde_json::Value {
 
 1. **`Session` must be `Send + Sync`.** Both `storage` and `index` are wrapped in `Arc<AsyncMutex<>>` so append helpers take `&self` not `&mut self`. Essential for Phase 3 where `Session` is shared by reference.
 
-2. **`build_context()` is async.** Index access goes through an async mutex, so `get_branch()` and `build_context()` are async methods. This affects `PicoAgent::prompt()` and all callers.
+2. **`build_context()` is async.** Index access goes through an async mutex, so `get_branch()` and `build_context()` are async methods. This affects `CodeAgent::prompt()` and all callers.
 
 3. **Leaf pointer updated automatically.** Every append helper writes a `type:"leaf"` entry to storage AND updates the in-memory index. No separate `set_leaf()` call needed.
 

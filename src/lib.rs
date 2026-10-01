@@ -54,7 +54,7 @@ pub use rig_core::client::{CompletionClient, ProviderClient};
 pub use rig_core::completion::CompletionModel;
 pub use rig_core::providers;
 
-pub use agent::{create_agent, load_agents_md, run_interactive, AgentConfig, CodeAgent, PicoAgent};
+pub use agent::{create_agent, load_agents_md, run_interactive, AgentConfig, CodeAgent};
 pub use output::{Confirmation, ConsoleOutput, LogOutput, NoOutput, Output, QuietOutput};
 
 /// A provider's own explanation of a failure, reduced to one readable line.

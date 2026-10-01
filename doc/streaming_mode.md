@@ -36,7 +36,7 @@ agent→`Output` response path:
 
 ### 2.1 No streaming — the response is fully buffered
 
-`CodeAgent::prompt` (`src/agent.rs`, `impl PicoAgent`, the `async fn prompt`)
+`CodeAgent::prompt` (`src/agent.rs`, the `async fn prompt`)
 builds a non-streaming request and `.await`s the whole thing:
 
 ```rust
@@ -305,7 +305,7 @@ machinery exists — exactly the early formatting-issue detection requested (§3
 - `QuietOutput`/`NoOutput`/`LogOutput`/`ScrollbackOutput` unchanged (defaults).
 
 ### Phase 2 — Streaming plumbing (`src/agent.rs`)
-**Status: implemented** (2025-07-17). `PicoAgent::prompt` now drives
+**Status: implemented** (2025-07-17). `CodeAgent::prompt` now drives
 `agent.stream_prompt(input).with_hook(LoggingHook{..}).multi_turn(limit).with_history(prior).await`
 (rig 0.38's `IntoFuture` for `StreamingPromptRequest` returns the *item stream*
 itself, not a collected response — there is no `multi_turn_with` / `stream()`

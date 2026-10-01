@@ -54,7 +54,44 @@ pub(crate) fn area_body(input: Option<Element>, overlay: Option<Element>) -> Vec
     items
 }
 
+/// Ends a content batch when dropped: one frame re-emit for the whole burst,
+/// instead of one per write (ui_draw_v2 R5).
+///
+/// Dropped rather than called, because `?`, an early `return` and a panic all
+/// release it. The failure mode of *forgetting* to end a batch would be a
+/// suppressed reposition — an area that was consumed and never comes back,
+/// which is exactly the invariant the per-write re-emit exists to hold. `Drop`
+/// makes that unreachable rather than merely documented.
+pub struct BatchGuard<'a> {
+    out: Option<&'a dyn Output>,
+}
+
+impl Drop for BatchGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(out) = self.out {
+            out.end_batch();
+        }
+    }
+}
+
 pub trait Output: Send + Sync {
+    /// Open a batch of content writes: repositioning is suppressed until the
+    /// returned guard drops, which emits the frame once (ui_draw_v2 R5).
+    ///
+    /// For bursts — replay, resume, anything that prints history — where the
+    /// per-write re-emit costs `O(writes × frame rows)` and the frame is not
+    /// changing anyway. **Not** for live streaming: there the re-emit is what
+    /// keeps the input row visible while content flows past it, and batching a
+    /// turn would hide the prompt for the whole response.
+    ///
+    /// The default guard does nothing, which is correct rather than lazy: an
+    /// output that does not override this already repositions on every write,
+    /// and that *is* the unbatched case.
+    fn begin_batch(&self) -> BatchGuard<'_> {
+        BatchGuard { out: None }
+    }
+    /// Ends a batch, called by [`BatchGuard`]'s drop. Default no-op.
+    fn end_batch(&self) {}
     fn display_text(&self, text: &str);
     /// Render a model *response* as markdown. Defaults to `display_text` so
     /// non-console impls (quiet/log/no-op) need no change; `ConsoleOutput`
@@ -65,7 +102,7 @@ pub trait Output: Send + Sync {
         self.display_text(text);
     }
     // ---- Response event sequence ----
-    // Both the live streaming path (`PicoAgent::prompt`) and the session
+    // Both the live streaming path (`CodeAgent::prompt`) and the session
     // replay path (`replay_units`) drive these methods in the same
     // order, so `ConsoleOutput` only needs one rendering implementation and
     // replay output is guaranteed to match live output.
@@ -147,6 +184,20 @@ pub trait Output: Send + Sync {
     ///
     /// Default no-op: outputs with no cursor to write at have no status line.
     fn set_status(&self, _text: &StatusText) {}
+
+    /// Is a turn running right now?
+    ///
+    /// The composer needs this to decide whether an empty input is a row (the
+    /// resting prompt, between turns) or no row at all (mid-turn, where there is
+    /// nothing to submit). `streaming` is already this output's fact — the
+    /// status row's dot is resolved from the same flag — so the phase is read
+    /// here rather than plumbed in from the caller.
+    ///
+    /// Default `false`: an output with no streaming phase has only the resting
+    /// case, and so always shows its input row.
+    fn is_streaming(&self) -> bool {
+        false
+    }
     fn display_header(
         &self,
         provider: &str,
@@ -273,8 +324,8 @@ pub trait Output: Send + Sync {
     /// Callers supply *content*: the pieces, **moved in**. Nothing comes back —
     /// no `Vec<Element>` crosses a call site, because no caller ever used one
     /// except to hand it straight to the next statement. The composition is
-    /// recorded through [`remember_area`](Output::remember_area), which is what
-    /// lets §4.5's content path re-draw the area without recomposing it.
+    /// recorded through [`remember_compose`](Output::remember_compose), which is
+    /// what lets §4.5's content path re-draw the area without recomposing it.
     ///
     /// The budget is derived from `dims`, never passed in — a caller that hands
     /// a budget is being asked to know something it shouldn't. `dims` itself
@@ -298,15 +349,37 @@ pub trait Output: Send + Sync {
         let frame = render(&stack, &heights, tw);
         let applied = self.draw_frame(&frame, policy, dims);
         // Moved, never copied: the recipe belongs to the composition that built
-        // it, and the cache is the only other place that reads it.
-        self.remember_area(stack);
+        // it, and the cache is the only other place that reads it. The size is
+        // written under the same lock so the recipe and the geometry it was
+        // rendered at can never be read apart.
+        self.remember_compose(stack, applied);
         applied
     }
 
-    /// Record the composition [`draw_elements`](Output::draw_elements) just
-    /// built, so §4.5's content path can re-draw it without recomposing.
+    /// Record what [`draw_elements`](Output::draw_elements) just built — the
+    /// composition, so §4.5's content path can re-draw it without recomposing,
+    /// and the size it was applied at, so [`painted_size`](Output::painted_size)
+    /// answers from the same place.
+    ///
     /// Default no-op: an output with no screen has nothing to remember.
-    fn remember_area(&self, _stack: Vec<Element>) {}
+    fn remember_compose(&self, _stack: Vec<Element>, _applied: (usize, usize)) {}
+
+    /// The size the **last frame this output applied** took — the one number
+    /// resize detection compares the terminal against (ui_draw_v2 §9 #3).
+    ///
+    /// Before anything has been applied, a fresh terminal query: a caller that
+    /// has not painted yet should start from what is actually on screen, not
+    /// from a size nobody drew at.
+    ///
+    /// Distinct from [`frame_size`](Output::frame_size), which is the *current*
+    /// terminal size and never a memory — that is what a dialog wants when it
+    /// opens, this is what a painter wants when it is deciding whether its last
+    /// paint still describes the screen.
+    fn painted_size(&self) -> (usize, usize) {
+        crossterm::terminal::size()
+            .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
+            .unwrap_or((80, 24))
+    }
 
     /// Gate the background in-flight reader should honor. While it is `true`,
     /// the reader must not read stdin, because a confirmation dialog on the
@@ -1675,7 +1748,26 @@ impl ConsoleOutput {
         // `plan_consume` already retired `live` and only a reposition puts it
         // back (a missing `live` means the *next* write finds nothing to
         // consume and the area never returns).
+        //
+        // Inside a batch that reposition waits: the frame stays consumed for
+        // the whole burst and the guard's drop emits it once (ui_draw_v2 R5).
+        // The invariant above is not weakened — it is satisfied by the *final*
+        // reposition instead of by every intermediate one, and a write that
+        // finds no live area already takes the `None` path above, so content
+        // keeps flowing without a walk.
         if let Some(taken) = taken {
+            {
+                let mut cache = self.draw.lock().unwrap();
+                if cache.batch_active {
+                    // Keep the *first* frame taken: it is `reposition_area`'s
+                    // fallback when no recipe recorded itself, and a later
+                    // write finds nothing to consume and so contributes none.
+                    if cache.deferred.is_none() {
+                        cache.deferred = Some(taken);
+                    }
+                    return r;
+                }
+            }
             let bytes = self.reposition_area(width, taken);
             let mut out = self.writer.lock().unwrap();
             let _ = out.write_all(bytes.as_bytes());
@@ -1883,11 +1975,25 @@ impl ConsoleOutput {
     }
 }
 
-/// DECTCEM show. A frame apply shows the cursor (a frame is where the user
-/// types), and `TermGuard::stop` emits it unconditionally as the net for
-/// exiting with it hidden. Nothing in this layer *hides* it any more — that was
-/// `paint_status`'s job, deleted with the transient bar (ui_draw_v2 §4.5 P2).
+/// DECTCEM show — emitted when the applied frame has a caret, because that is
+/// where the user types. `TermGuard::stop` emits it unconditionally as the net
+/// for exiting with it hidden.
 pub(crate) const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+
+/// DECTCEM hide — the other half of [`SHOW_CURSOR`], for a frame with **no
+/// caret**.
+///
+/// Mid-turn an empty input is no row at all (`input_hidden`), so there is
+/// nowhere to put a caret, and showing it leaves a cursor blinking against a
+/// row that was never drawn. `Frame::caret` is `None` in exactly those cases,
+/// so the decision reads the frame's own answer instead of tracking input
+/// state here.
+///
+/// Not the hide that `paint_status` used to do and that went with the transient
+/// bar: that one hid the cursor *around a content write*, to stop it flickering
+/// over text arriving mid-render. This one describes the frame that was
+/// composed, decided once per apply.
+pub(crate) const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 
 /// The status line's content, before it is fitted to a width: what names the
 /// session, and the model group as separate fields.
@@ -2497,6 +2603,65 @@ impl Output for ConsoleOutput {
         (term_width(), term_height())
     }
 
+    fn painted_size(&self) -> (usize, usize) {
+        // The size of the last frame actually applied, so a painter comparing
+        // the terminal against it notices a change made since — including one
+        // that happened while someone else (a turn) held the screen.
+        self.draw.lock().unwrap().applied.unwrap_or_else(|| {
+            crossterm::terminal::size()
+                .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
+                .unwrap_or((80, 24))
+        })
+    }
+
+    fn begin_batch(&self) -> BatchGuard<'_> {
+        let mut cache = self.draw.lock().unwrap();
+        // Flat, not recursive: a nested open adds no state, because the outer
+        // batch already covers everything written inside it. So it collapses
+        // to a guard that owns nothing — only the guard that raised the flag
+        // ever clears it, which is what keeps a stray inner scope from ending
+        // the outer batch's repositioning early.
+        //
+        // The assert exists because that collapse is *silent*: `out: None`
+        // ends nothing, and someone who wrote an inner batch almost certainly
+        // meant an independent one. Loud where it is free (debug builds), and
+        // harmless where it is not (release keeps batching correctly) —
+        // rather than a missing redraw to chase at runtime.
+        debug_assert!(
+            !cache.batch_active,
+            "batches do not nest: this begin_batch is a no-op, because the \
+             open batch above already covers everything written inside it"
+        );
+        if cache.batch_active {
+            return BatchGuard { out: None };
+        }
+        cache.batch_active = true;
+        BatchGuard { out: Some(self) }
+    }
+
+    fn end_batch(&self) {
+        // Locks taken separately and never nested the other way round: every
+        // other frame path holds `writer` *then* `draw`, so acquiring `draw`
+        // while holding `writer` here is the same order, and dropping it
+        // before `reposition_area` (which takes it again) keeps the two from
+        // ever being held inverted.
+        let taken = {
+            let mut cache = self.draw.lock().unwrap();
+            if !cache.batch_active {
+                return;
+            }
+            cache.batch_active = false;
+            cache.deferred.take()
+        };
+        let Some(taken) = taken else {
+            return;
+        };
+        let bytes = self.reposition_area(term_width(), taken);
+        let mut out = self.writer.lock().unwrap();
+        let _ = out.write_all(bytes.as_bytes());
+        let _ = out.flush();
+    }
+
     fn draw_frame(
         &self,
         frame: &Frame,
@@ -2523,11 +2688,17 @@ impl Output for ConsoleOutput {
             plan_apply(&mut cache, frame, policy, tw, th)
         };
         let _ = out.write_all(bytes.as_bytes());
-        // A frame is where the user types, so the cursor is shown here whatever
-        // left it hidden. Nothing in this layer hides it any more — that was
-        // `paint_status`'s — but `TermGuard` and the shell can, and this is the
-        // cheapest place to be sure.
-        let _ = out.write_all(SHOW_CURSOR);
+        // The cursor follows the frame's own caret. A composed frame with one is
+        // where the user types; a frame whose input is hidden mid-turn (R1) has
+        // none to place, so hiding is the honest reading of the same fact rather
+        // than a second piece of input state kept in step by hand. Either way
+        // this is the cheapest place to be sure — `TermGuard` and the shell can
+        // also leave it hidden.
+        let _ = out.write_all(if frame.caret.is_some() {
+            SHOW_CURSOR
+        } else {
+            HIDE_CURSOR
+        });
         let _ = out.flush();
         (tw, th)
     }
@@ -2952,8 +3123,12 @@ impl Output for ConsoleOutput {
     /// Remember the composition so §4.5's content path can re-draw it. The only
     /// output that has a screen has something to keep; everyone else drops it
     /// (the default), which is also why nothing here can be read by mistake.
-    fn remember_area(&self, stack: Vec<Element>) {
-        self.draw.lock().unwrap().element_stack = stack;
+    fn remember_compose(&self, stack: Vec<Element>, applied: (usize, usize)) {
+        // One lock for both: the recipe and the geometry it was rendered at
+        // describe one paint and must not be read apart.
+        let mut draw = self.draw.lock().unwrap();
+        draw.element_stack = stack;
+        draw.applied = Some(applied);
     }
 
     /// Remember the status line to paint after each content block; see
@@ -2961,6 +3136,10 @@ impl Output for ConsoleOutput {
     /// whether it actually goes out.
     fn set_status(&self, text: &StatusText) {
         *self.status_text.lock().unwrap() = text.clone();
+    }
+
+    fn is_streaming(&self) -> bool {
+        self.streaming.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn end_capture(&self) -> Vec<u8> {
@@ -4656,6 +4835,45 @@ mod tests {
         }
     }
 
+    /// The cursor follows the frame's own caret: shown where the user can type,
+    /// hidden when the input is drawn as no row at all (ui_draw_v2 R1).
+    ///
+    /// Showing it unconditionally was correct while every frame had an input
+    /// row, and wrong the moment R1 removed one — the cursor sat blinking
+    /// against a row that was never drawn. `Frame::caret` is already `None` in
+    /// exactly those cases, so the decision reads the frame rather than
+    /// tracking input state separately.
+    #[test]
+    #[serial]
+    fn the_cursor_follows_the_frames_own_caret() {
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        // Streaming with an empty buffer is R1's `input_hidden`: no input row,
+        // and so no caret to place.
+        out.begin_response();
+        crate::repl::paint_prompt(&out, "", &crate::repl::LineEditor::new(), &[], 0, (40, 24));
+        let bytes = out.end_capture();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("\x1b[?25l"),
+            "a frame with no caret hides the cursor"
+        );
+
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        let mut editor = crate::repl::LineEditor::new();
+        editor.set("hi");
+        crate::repl::paint_prompt(&out, "", &editor, &[], 0, (40, 24));
+        let text = String::from_utf8_lossy(&out.end_capture()).into_owned();
+        assert!(
+            text.contains("\x1b[?25h"),
+            "a frame with a caret shows it: {text:?}"
+        );
+        assert!(
+            !text.contains("\x1b[?25l"),
+            "…and does not also hide it: {text:?}"
+        );
+    }
+
     /// The clear only applies when a frame is live: streamed blocks just
     /// append, so the tracked row stays in step with the screen and a
     /// scrolled-back viewport is never written into.
@@ -4675,6 +4893,93 @@ mod tests {
             String::from_utf8_lossy(&bytes).escape_debug().to_string()
         );
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
+    }
+
+    /// A content batch defers the frame's re-emit to the guard's drop instead
+    /// of paying one per write (ui_draw_v2 R5).
+    ///
+    /// Both halves are asserted because either can break alone: the frame is
+    /// emitted **once** for a whole burst, *and* it comes back. The invariant
+    /// the per-write reposition exists to hold — an area that is consumed is
+    /// always put back — is not relaxed here, it is satisfied once at the end
+    /// instead of once per write.
+    #[test]
+    #[serial]
+    fn a_content_batch_emits_the_frame_once_at_the_end() {
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        let overlay = vec![
+            "MODEL            CTX    PRICE".to_string(),
+            "  gpt-5          400k   1.00".to_string(),
+        ];
+        let frame = crate::repl::Repl::compose_frame(
+            &crate::repl::LineEditor::new(),
+            "",
+            None,
+            &overlay,
+            0,
+            40,
+            10,
+        );
+        out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
+        {
+            let _batch = out.begin_batch();
+            out.display_text("first line");
+            out.display_text("second line");
+            out.display_text("third line");
+        } // the guard's drop owns the redraw
+        let bytes = out.end_capture();
+
+        // Once for the frame's own apply, once for the batch's single
+        // re-emit. Unbatched it is four — the apply plus one per write — and
+        // that multiplier is R5.
+        let text = String::from_utf8_lossy(&bytes);
+        let emits = text.matches("MODEL").count();
+        assert_eq!(
+            emits, 2,
+            "one frame re-emit for the whole batch, got {emits}: {text:?}"
+        );
+
+        // …and it came back, below the content it was consumed for.
+        let mut p = vt100::Parser::new(24, 40, 1000);
+        p.process(b"\r\n\r\n");
+        let onlcr: Vec<u8> = bytes
+            .iter()
+            .flat_map(|&b| {
+                if b == b'\n' {
+                    vec![b'\r', b'\n']
+                } else {
+                    vec![b]
+                }
+            })
+            .collect();
+        p.process(&onlcr);
+        let rows: Vec<String> = (0..10)
+            .map(|r| {
+                (0..120)
+                    .map(|c| {
+                        p.screen()
+                            .cell(r, c)
+                            .and_then(|x| x.contents().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect()
+            })
+            .collect();
+        let content_last = rows
+            .iter()
+            .rposition(|r| r.contains("third"))
+            .unwrap_or_else(|| panic!("content should be on screen: {rows:?}"));
+        for leftover in ["MODEL", "gpt-5"] {
+            let at = rows
+                .iter()
+                .position(|r| r.contains(leftover))
+                .unwrap_or_else(|| panic!("frame row {leftover:?} should be back: {rows:?}"));
+            assert!(
+                at > content_last,
+                "frame row {leftover:?} belongs below the content: {rows:?}"
+            );
+        }
     }
 
     /// A tool block followed by reasoning showed **two** blank lines: the host
