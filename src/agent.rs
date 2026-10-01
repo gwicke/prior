@@ -77,7 +77,20 @@ pub struct SessionUsage {
     pub session_reasoning_tokens: u64,
 }
 
-#[async_trait]
+/// `?Send`: since U4.3 the turn carries the REPL's prompt session into
+/// [`PicoAgent::prompt`], and that session is single-threaded by construction —
+/// it holds `Rc`s (line windows, menu views) and a sync `mpsc` completer, and
+/// it never once leaves the task that `run_interactive` runs on.
+///
+/// Requiring a `Send` future here would force that session chain to `Arc`
+/// across `slashdot_menu` for a property it does not use: nothing spawns these
+/// futures. `main` awaits `run_interactive`, every test awaits it, and there
+/// is exactly one implementor. The values stay `Send + Sync` — it is only the
+/// *futures* that must be polled where they are awaited.
+///
+/// If a caller ever needs to `tokio::spawn` a request, the session chain has
+/// to become `Send` first; this bound is where that cost becomes visible.
+#[async_trait(?Send)]
 pub trait PicoAgent: Send + Sync {
     /// `params` are the params to send *for this request*: the live ones, or
     /// the live ones with this turn's per-turn overrides applied. Passing them
@@ -90,6 +103,7 @@ pub trait PicoAgent: Send + Sync {
         session: Option<&Session>,
         turn: &TurnPersistence,
         params: &crate::params::ModelParams,
+        in_turn: Option<crate::repl::InTurnInput<'_>>,
     ) -> Result<String>;
     async fn run_once(&self, input: String) -> Result<String>;
     /// Snapshot of the accumulated session token usage (for `/stat`). A zeroed
@@ -226,7 +240,7 @@ impl TurnPersistence {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl PicoAgent for CodeAgent {
     async fn prompt(
         &self,
@@ -234,6 +248,7 @@ impl PicoAgent for CodeAgent {
         session: Option<&Session>,
         turn: &TurnPersistence,
         params: &crate::params::ModelParams,
+        in_turn: Option<crate::repl::InTurnInput<'_>>,
     ) -> Result<String> {
         // Fresh request: clear any stale cancel flag from a previous abort so a
         // prior `Esc` doesn't silently cancel this prompt. The REPL's in-flight
@@ -373,6 +388,22 @@ impl PicoAgent for CodeAgent {
             },
         ));
         self.output.begin_response();
+        // U4.3: the turn's second pump, split out of `in_turn` into bindings the
+        // two new futures below can borrow *disjointly* — one future per
+        // binding, so neither is borrowed twice at once. `tokio::select!`
+        // scopes its futures to their own block ("a scope to separate polling
+        // from handling the output"), so by the time a handler runs these are
+        // free again for the handler to take.
+        let (mut it_keys, mut it_session, it_label, mut it_history, it_guard) = match in_turn {
+            Some(crate::repl::InTurnInput {
+                session,
+                keys,
+                label,
+                history,
+                guard,
+            }) => (Some(keys), Some(session), label, Some(history), Some(guard)),
+            None => (None, None, "", None, None),
+        };
         loop {
             tokio::select! {
                 item = stream.next() => {
@@ -691,6 +722,95 @@ impl PicoAgent for CodeAgent {
                         break;
                     }
                 }
+
+                // U4.3: a key typed during the turn, evaluated as it arrives —
+                // no queue, no holding back (ui_draw_v2 §4.5). This is
+                // `read_input`'s loop minus its wait: dispatch, then settle.
+                // `route_event` has already taken `Ctrl-C`/`Ctrl-Z`/`Esc`
+                // inline before anything reaches this channel, so what lands
+                // here is ordinary editing — and a submit, which is blocked.
+                ev = async {
+                    match it_keys.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // No in-flight reader (piped input): nothing can ever
+                        // arrive, so the branch never completes instead of
+                        // completing with `None` every time round.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let (Some(ev), Some(sess), Some(history)) = (
+                        ev,
+                        it_session.as_deref_mut(),
+                        it_history.as_deref_mut(),
+                    ) {
+                        let dims = self.output.frame_size();
+                        match ev {
+                            crossterm::event::Event::Key(key) => {
+                                let opts_len = sess.opts_len();
+                                match sess.handle_key(key, opts_len, it_label, history) {
+                                    crate::repl::KeyOutcome::RunEditor => {
+                                        if let Some(g) = it_guard {
+                                            sess.open_editor(g, self.output.as_ref());
+                                        }
+                                    }
+                                    // `Action` — a submit, or any other
+                                    // read-ending request — is blocked
+                                    // mid-turn, and *silently*: v0 offers no
+                                    // mid-turn action, and a message printed
+                                    // over the live stream would be worse than
+                                    // none. The turn keeps running, so unlike at
+                                    // the prompt there is a next iteration —
+                                    // which is why this still settles, and the
+                                    // screen stays true to the state the key
+                                    // left behind.
+                                    crate::repl::KeyOutcome::Continue
+                                    | crate::repl::KeyOutcome::Action(_) => {}
+                                }
+                                // `settle` is where a `/`-command committed
+                                // mid-turn lands exactly as it does at the
+                                // prompt. Its `MenuDone` is dropped: applying a
+                                // command needs the convergence machinery that
+                                // runs *after* `prompt()` returns, which is
+                                // still post-turn only (U4.3+).
+                                let _ = sess
+                                    .settle(self.output.as_ref(), it_label, history, dims)
+                                    .await;
+                            }
+                            crossterm::event::Event::Paste(text) => {
+                                sess.paste(&text);
+                                let _ = sess
+                                    .settle(self.output.as_ref(), it_label, history, dims)
+                                    .await;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Prose needs a deadline even while the stream runs: its
+                // debounce, its in-flight slices and its dialog all fire on it.
+                // Without this arm prose would go inert for the whole turn —
+                // the stream branch alone never yields for them — which is the
+                // same reason `read_input`'s wait is a *poll* while prose is
+                // armed and a block otherwise.
+                _ = async {
+                    match it_session.as_deref() {
+                        Some(s) => match s.prose_timeout() {
+                            Some(d) => tokio::time::sleep(d).await,
+                            None => std::future::pending().await,
+                        },
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let (Some(sess), Some(history)) =
+                        (it_session.as_deref_mut(), it_history.as_deref_mut())
+                    {
+                        let dims = self.output.frame_size();
+                        let _ = sess
+                            .settle(self.output.as_ref(), it_label, history, dims)
+                            .await;
+                    }
+                }
             }
         }
         self.output.end_response();
@@ -755,7 +875,9 @@ impl PicoAgent for CodeAgent {
         // `final_history[0]` against an absent session.
         turn.mark_new_dispatch();
         // No override surface on this path, so the built live params.
-        let response = self.prompt(&input, None, &turn, &self.live_params).await?;
+        let response = self
+            .prompt(&input, None, &turn, &self.live_params, None)
+            .await?;
         Ok(response)
     }
 
@@ -4564,20 +4686,19 @@ pub async fn run_interactive(
                 // (if any) spanning the whole window. `Esc` during the
                 // retry's back-off sleep returns `Cancelled`; `Esc` during
                 // the prompt itself is handled inside `prompt()`.
-                // U4.2: edit keys typed while the turn runs. The reader owns
-                // the sender; the receiver is bound for the whole turn so the
-                // queue lives exactly as long as the reader can feed it.
+                // U4.2/U4.3: edit keys typed while the turn runs. The reader
+                // owns the sender; the receiver is bound for the whole turn so
+                // the queue lives exactly as long as the reader can feed it,
+                // and it is handed into `prompt()` as `InTurnInput::keys` for
+                // the key branch to drain.
                 //
-                // `_` because nothing reads it until U4.3 adds the key branch
-                // to `prompt()`'s `select!` — deliberately not consumed, not
-                // discarded. Holding it keeps `send` working (a dropped
-                // receiver would make every send a no-op), and dropping it at
-                // the end of this scope drops the queue with it, so a keystroke
-                // cannot leak into the *next* prompt. Until U4.3 lands, a key
-                // typed mid-turn is lost exactly as it was before; the
-                // difference is that it is now lost from a place the key branch
-                // will be able to reach.
-                let (in_turn_keys_tx, _in_turn_keys_rx) = tokio::sync::mpsc::unbounded_channel();
+                // Holding it is what keeps `send` working — a dropped receiver
+                // makes every send a no-op, which would silently turn the
+                // forwarding back into the drop U4.2 existed to remove. It
+                // dies with this scope, so the queue dies with it and a
+                // keystroke queued at the end of one turn cannot leak into the
+                // next prompt.
+                let (in_turn_keys_tx, mut in_turn_keys) = tokio::sync::mpsc::unbounded_channel();
                 let reader_handle = if let Some(g) = &guard {
                     let done = Arc::new(AtomicBool::new(false));
                     let confirm_gate = config
@@ -4629,7 +4750,27 @@ pub async fn run_interactive(
                         let prompt_result = agent
                             .as_ref()
                             .unwrap()
-                            .prompt(&next_input, session.as_deref(), &turn, &turn_params)
+                            .prompt(
+                                &next_input,
+                                session.as_deref(),
+                                &turn,
+                                &turn_params,
+                                // `zip`: the key branch exists only where there
+                                // is both a session to receive the key and a
+                                // guard to stop the reader for it. Piped input
+                                // has neither, and piped input with a guard
+                                // has no reader, so there is no key either.
+                                prompt_session
+                                    .as_mut()
+                                    .zip(guard.as_deref())
+                                    .map(|(sess, g)| crate::repl::InTurnInput {
+                                        session: sess,
+                                        keys: &mut in_turn_keys,
+                                        label: &prompt_str,
+                                        history: &mut line_history,
+                                        guard: g,
+                                    }),
+                            )
                             .await;
                         match prompt_result {
                             Ok(text) => break Ok(text),

@@ -831,6 +831,36 @@ pub struct PromptSession {
     overlay: ActiveOverlay,
 }
 
+/// Everything the turn needs to put a key back into the prompt
+/// (ui_draw_v2 §4.5 U4).
+///
+/// Bundled so `prompt()` gains one parameter rather than five, and because the
+/// pieces are coupled: they exist only where there *is* an interactive prompt.
+/// Piped/batch input builds no session and spawns no in-flight reader, so it
+/// has nothing to hand over — hence the caller wraps this in an `Option`.
+///
+/// It is the same set `read_input` receives, arrived at differently: there the
+/// pieces are arguments, here they are a value carried alongside the turn. The
+/// turn is the second pump, and the second pump gets the same inputs.
+pub struct InTurnInput<'a> {
+    /// The session keys land in. Its `handle_key` → [`settle`](PromptSession::settle)
+    /// ordering is `read_input`'s loop ordering, minus the wait between them.
+    pub session: &'a mut PromptSession,
+    /// The in-flight reader's channel. Unbounded because a bounded one that
+    /// filled would block the reader at the moment it most needs to deliver
+    /// `Ctrl-C` (see `route_event`).
+    pub keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    /// What the input row says — `read_input`'s `prompt` argument.
+    pub label: &'a str,
+    /// History the Up/Down keys page through.
+    pub history: &'a mut History,
+    /// For [`open_editor`](PromptSession::open_editor) when `Ctrl-E` lands
+    /// mid-turn. There is no reader to stop in that case — the turn's own is
+    /// what handed us the key — but the raw-mode turnover and the DSR
+    /// re-anchor are still the wrapper's to do.
+    pub guard: &'a TermGuard,
+}
+
 impl PromptSession {
     /// Fresh session, seeded with `initial_buffer` if the caller has one
     /// (the `/session <id> resume` prefill, and any other pop that wants the
@@ -1044,6 +1074,40 @@ impl PromptSession {
     /// can be out of step with the other.
     pub(crate) fn opts_len(&self) -> usize {
         self.overlay.display_rows().0.len()
+    }
+
+    /// How long the turn's `select!` should wait before re-evaluating prose —
+    /// `None` when nothing is pending, and there is then nothing to wake for.
+    ///
+    /// Without this arm the turn's key branch would be the only one with a
+    /// deadline, and prose would go inert mid-turn: its debounce and in-flight
+    /// slices need a timeout of their own to fire while the stream runs.
+    ///
+    /// See [`crate::prompt_complete::PromptCompletion::poll_timeout`].
+    pub(crate) fn prose_timeout(&self) -> Option<Duration> {
+        self.prose.poll_timeout()
+    }
+
+    /// Hand the tty to `$EDITOR` over the buffer and write the result back.
+    ///
+    /// Shared for the reason [`settle`](Self::settle) is: `read_input`'s
+    /// [`KeyOutcome::RunEditor`] arm and the turn's would otherwise each carry
+    /// the raw-mode turnover and the DSR re-anchor — and a failure that
+    /// surfaces differently depending on which pump took the key is a failure
+    /// the user sees one way out of two.
+    pub(crate) fn open_editor(&mut self, guard: &TermGuard, output: &dyn Output) {
+        match run_editor(guard, output, &self.editor.text(), EditorMode::Edit) {
+            Ok(new_text) => self.editor.set(&new_text),
+            Err(e) => {
+                let _ = io::stdout().write_all(format!("\r\neditor error: {}\r\n", e).as_bytes());
+            }
+        }
+    }
+
+    /// Insert pasted text at the caret. Shared so "paste" is one operation
+    /// rather than one each pump reaches for differently.
+    pub(crate) fn paste(&mut self, text: &str) {
+        self.editor.insert_str(text);
     }
 
     /// eval → outcome → sync → paint: the whole "make the session say
@@ -1604,22 +1668,9 @@ impl Repl {
                         KeyOutcome::RunEditor => {
                             // The wrapper owns the whole turnover — reader
                             // gate, raw mode, DSR re-anchor; no local logic
-                            // here (doc/editor_cleanup.md §2).
-                            match run_editor(
-                                &self.guard,
-                                output,
-                                &session.editor.text(),
-                                EditorMode::Edit,
-                            ) {
-                                Ok(new_text) => {
-                                    session.editor.set(&new_text);
-                                }
-                                Err(e) => {
-                                    let _ = io::stdout().write_all(
-                                        format!("\r\neditor error: {}\r\n", e).as_bytes(),
-                                    );
-                                }
-                            }
+                            // here (doc/editor_cleanup.md §2). It is shared
+                            // because the turn's arm calls it too.
+                            session.open_editor(&self.guard, output);
                         }
                         KeyOutcome::Action(a) => {
                             if let InputAction::Submit(_) = &a {
@@ -1637,7 +1688,7 @@ impl Repl {
                     }
                 }
                 Some(Event::Paste(text)) => {
-                    session.editor.insert_str(&text);
+                    session.paste(&text);
                 }
                 Some(_) => {} // other events (mouse): ignored
                 None => {}    // prose wake with no key: re-eval below
