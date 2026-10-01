@@ -1203,7 +1203,7 @@ impl SlashDotNode for TreeCompactManualNode {
             path_args,
             CompactMode::Manual,
             "",
-            &self.stash,
+            &mut self.stash,
             false,
         )
         .await
@@ -1216,7 +1216,7 @@ impl SlashDotNode for TreeCompactManualNode {
             path_args,
             CompactMode::Manual,
             "",
-            &self.stash,
+            &mut self.stash,
             true,
         )
         .await
@@ -1230,7 +1230,7 @@ impl SlashDotNode for TreeCompactManualNode {
     }
 
     async fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        compact_submit(&self.app_state, epoch, path_args, &self.stash).await
+        compact_submit(&self.app_state, epoch, path_args, &mut self.stash).await
     }
 }
 
@@ -1270,7 +1270,7 @@ impl SlashDotNode for TreeCompactTextNode {
             path_args,
             CompactMode::TextOnly,
             "",
-            &self.stash,
+            &mut self.stash,
             false,
         )
         .await
@@ -1283,7 +1283,7 @@ impl SlashDotNode for TreeCompactTextNode {
             path_args,
             CompactMode::TextOnly,
             "",
-            &self.stash,
+            &mut self.stash,
             true,
         )
         .await
@@ -1298,7 +1298,7 @@ impl SlashDotNode for TreeCompactTextNode {
     }
 
     async fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        compact_submit(&self.app_state, epoch, path_args, &self.stash).await
+        compact_submit(&self.app_state, epoch, path_args, &mut self.stash).await
     }
 }
 
@@ -1340,7 +1340,7 @@ impl SlashDotNode for TreeCompactPromptNode {
             path_args,
             CompactMode::Prompt,
             &path_args.suffix,
-            &self.stash,
+            &mut self.stash,
             false,
         )
         .await
@@ -1353,7 +1353,7 @@ impl SlashDotNode for TreeCompactPromptNode {
             path_args,
             CompactMode::Prompt,
             &path_args.suffix,
-            &self.stash,
+            &mut self.stash,
             true,
         )
         .await
@@ -1383,7 +1383,7 @@ impl SlashDotNode for TreeCompactPromptNode {
     }
 
     async fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        compact_submit(&self.app_state, epoch, path_args, &self.stash).await
+        compact_submit(&self.app_state, epoch, path_args, &mut self.stash).await
     }
 }
 
@@ -1422,13 +1422,21 @@ struct CompactStash {
 ///
 /// `reuse_stash` (`edit()`, Ctrl-E): re-open the stashed draft while
 /// its key still matches, regenerate otherwise (§4).
+///
+/// The stash is taken **`&mut`, not `&`** — and not because of the writes,
+/// which the `RefCell` would cover on its own. `RefCell<T>` is *unconditionally*
+/// `!Sync` (its borrow flag is a non-atomic `Cell`), so `&RefCell<T>` is never
+/// `Send`, and this borrow lives across `generate_compaction(...).await`: a `&`
+/// here would make this future `!Send` whatever `CompactStash` contained.
+/// `&mut` asks only for `T: Send`, which it is. The same holds for
+/// [`compact_submit`] and `edit_draft`.
 async fn compact_prepare(
     app_state: &Arc<AppState>,
     epoch: u64,
     path_args: &PathArgs,
     mode: CompactMode,
     payload: &str,
-    stash: &std::cell::RefCell<Option<CompactStash>>,
+    stash: &mut std::cell::RefCell<Option<CompactStash>>,
     reuse_stash: bool,
 ) -> SubmitResult {
     let target_id = extract_target_id(path_args);
@@ -1459,7 +1467,7 @@ async fn compact_prepare(
 /// the pre-split review closure behaved the same outside the REPL.
 fn edit_draft(
     app_state: &Arc<AppState>,
-    stash: &std::cell::RefCell<Option<CompactStash>>,
+    stash: &mut std::cell::RefCell<Option<CompactStash>>,
     epoch: u64,
     target_id: String,
     mut draft: crate::agent::CompactionDraft,
@@ -1494,7 +1502,7 @@ async fn compact_submit(
     app_state: &Arc<AppState>,
     epoch: u64,
     path_args: &PathArgs,
-    stash: &std::cell::RefCell<Option<CompactStash>>,
+    stash: &mut std::cell::RefCell<Option<CompactStash>>,
 ) -> SubmitResult {
     let target_id = extract_target_id(path_args);
     let prepared = stash
