@@ -1755,7 +1755,7 @@ impl ConsoleOutput {
         if let Some(taken) = taken {
             {
                 let mut cache = self.draw.lock().unwrap();
-                if cache.batch_depth > 0 {
+                if cache.batch_active {
                     // Keep the *first* frame taken: it is `reposition_area`'s
                     // fallback when no recipe recorded itself, and a later
                     // write finds nothing to consume and so contributes none.
@@ -2598,7 +2598,27 @@ impl Output for ConsoleOutput {
     }
 
     fn begin_batch(&self) -> BatchGuard<'_> {
-        self.draw.lock().unwrap().batch_depth += 1;
+        let mut cache = self.draw.lock().unwrap();
+        // Flat, not recursive: a nested open adds no state, because the outer
+        // batch already covers everything written inside it. So it collapses
+        // to a guard that owns nothing — only the guard that raised the flag
+        // ever clears it, which is what keeps a stray inner scope from ending
+        // the outer batch's repositioning early.
+        //
+        // The assert exists because that collapse is *silent*: `out: None`
+        // ends nothing, and someone who wrote an inner batch almost certainly
+        // meant an independent one. Loud where it is free (debug builds), and
+        // harmless where it is not (release keeps batching correctly) —
+        // rather than a missing redraw to chase at runtime.
+        debug_assert!(
+            !cache.batch_active,
+            "batches do not nest: this begin_batch is a no-op, because the \
+             open batch above already covers everything written inside it"
+        );
+        if cache.batch_active {
+            return BatchGuard { out: None };
+        }
+        cache.batch_active = true;
         BatchGuard { out: Some(self) }
     }
 
@@ -2610,10 +2630,10 @@ impl Output for ConsoleOutput {
         // ever being held inverted.
         let taken = {
             let mut cache = self.draw.lock().unwrap();
-            cache.batch_depth = cache.batch_depth.saturating_sub(1);
-            if cache.batch_depth > 0 {
+            if !cache.batch_active {
                 return;
             }
+            cache.batch_active = false;
             cache.deferred.take()
         };
         let Some(taken) = taken else {

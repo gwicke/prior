@@ -452,13 +452,23 @@ pub(crate) struct DrawCache {
     /// branch both apply frames now, and two independent books of the same
     /// number are two ways for them to disagree about whether a repaint is due.
     pub(crate) applied: Option<(usize, usize)>,
-    /// Nesting depth of open content batches (`Output::begin_batch`). While
-    /// non-zero a content write consumes the frame and does **not** put it
-    /// back — one re-emit when the outermost guard drops, instead of one per
-    /// write (ui_draw_v2 R5). A depth rather than a flag so a nested batch
-    /// cannot re-enable per-write repositioning, or fire the trailing redraw,
-    /// while the outer one is still running.
-    pub(crate) batch_depth: usize,
+    /// True while a content batch is open (`Output::begin_batch`). While set a
+    /// content write consumes the frame and does **not** put it back — one
+    /// re-emit when the guard drops, instead of one per write (ui_draw_v2 R5).
+    ///
+    /// A flag rather than a nesting depth, because batches are **flat**: one
+    /// at a time, opened and closed iteratively, never recursed. A counter
+    /// would have made nesting *supported* and brought the failure mode that
+    /// goes with it — an unbalanced enter/exit leaves a nonzero depth
+    /// permanently, and then the area never comes back at all.
+    ///
+    /// A nested open therefore **collapses**: `begin_batch` returns a guard
+    /// that owns nothing, and only the guard that raised this flag clears it.
+    /// That makes nesting impossible rather than merely handled — and because
+    /// the collapse is silent, `begin_batch` also `debug_assert`s, so it is
+    /// loud in debug builds and merely correct in release. The worst a
+    /// mistimed end does is redraw once too often.
+    pub(crate) batch_active: bool,
     /// The frame taken by a batch's *first* consume, held until the batch
     /// ends.
     ///
@@ -479,7 +489,7 @@ impl DrawCache {
             live: None,
             element_stack: Vec::new(),
             applied: None,
-            batch_depth: 0,
+            batch_active: false,
             deferred: None,
         }
     }
