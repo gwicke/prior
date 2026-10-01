@@ -1073,7 +1073,7 @@ Each phase: green build + `cargo test` + `cargo fmt`.
 P0 is not optional: it converts the existing carefully-tuned tests from "a copy of the
 emit logic" into a real safety net for P2–P3.
 
-#### Open before the §5.2 change (bottom-edge placement)
+#### Open before the §5.2 change
 
 The §5.2 diagnosis is settled; the change itself is not started. Three things
 have to land with it, and none of them is optional:
@@ -1597,15 +1597,5 @@ Pull streaming content boundary handling into the same layer:
   each segment can be emitted in many delta chunks, without an actual
   boundary.
 
-## Drawing efficiency & audit
-- Limit clearing:
-  - Overwrite only if frame height did not change, or if it increased. No
-    clearing.
-  - Only clear rows below frame if 
-    `old_frame_height - new_frame_height - content_rows_written > 0`, so if
-    old rows are not overwritten anyway, and the fold is now not at the
-    bottom-most possible position. Do this clearing *at the end* of the
-    regular output pass, to minimize flickering in new content.
-- Caret-only moves: When only the caret moves (no row changes), is a
-  caret-only emit worth a special case, or is it subsumed by the diff (both
-  cheap)?
+## Drawing efficiency
+See ./ui_draw_261001.md
