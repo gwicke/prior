@@ -3361,7 +3361,6 @@ pub(crate) async fn handle_replay(
                 output.display_text("Session is empty");
             } else {
                 output.begin_capture();
-                output.display_separator();
                 replay_units(output, &units, 0);
                 let bytes = output.end_capture();
                 let captured = String::from_utf8_lossy(&bytes);
@@ -3983,7 +3982,6 @@ pub(crate) async fn resume_session(
         let branch = new_session.get_branch().await;
         let units = build_replay_units(&branch);
         let total = count_turns(&units);
-        output.display_separator();
         if is_lines {
             // Line-based: capture full replay via writer, tail lines.
             output.begin_capture();
