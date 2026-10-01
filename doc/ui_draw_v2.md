@@ -1129,7 +1129,7 @@ Every claim below was checked against the code, not against the phase list.
 Five issues found by hand, distinct from §5.2's placement — which they do not
 affect, and which they should not be folded into. Triaged in this order.
 
-**R1 — the input row is painted even when there is nothing to show.** Mid-turn
+**R1 — the input row is painted even when there is nothing to show. - DONE** Mid-turn
 the area renders `[status, input]`, so an empty input still occupies a row and
 the cursor rests visibly on it. It should occupy **zero** rows when empty and
 appear on the first keystroke. `compose_elements` (`repl.rs:1269`) already takes
@@ -1169,6 +1169,20 @@ is bracketed on both sides; a prompt is bracketed on one.
 The row to use already exists: it is the row that holds the status line, directly
 above the input (`compose_elements` pushes it at `repl.rs:1282`). On a regular
 commit that row becomes a divider instead, and the prompt commits beneath it.
+
+**Fixed:** a committed prompt goes through `Output::display_committed_prompt`,
+which brackets it and, when the previous content was also a committed prompt,
+shares the rule between the two instead of stacking one. Consecutive commits
+therefore render `sep / prompt / sep / prompt / sep` with no blank row — while
+a prompt against model output keeps `boundary()`'s blank on the content side,
+which is the two different spacings a transcript wants at those two boundaries.
+
+**Follow-up:** a compaction marker should ride the same path. Compaction is a
+user action in this agent (there is no automatic compaction), so
+`ReplayUnit::Compaction` drawing `display_system("[compaction: …k tokens]")`
+is a committed line that does not go through the committed-prompt path: it gets
+no bracket and takes no part in the shared-rule collapse. Rendering it through
+`display_committed_prompt` would make every user action consistent.
 
 **R5 — bulk output re-emits the area after every line, and `/replay` re-emits
 its own menu between the lines of history.** Reported by hand: replaying a
@@ -1258,19 +1272,6 @@ action taken live. Only implicit submits reach it, which is why it went unnotice
      budget, and the cursor position is at the bottom, then render to that
      sum, and only scroll to what is used. If the ask is for more than budget,
      then actual render height of elements will be scaled to fit.
-2. **Input `must` height.** 1 row (caret only) vs. a small context floor (e.g. 3 rows).
-   Affects tiny-terminal UX.
-   - Input `must` is one row today. I would keep the min at that value for
-     now, with the `max` scaled to fit actual wrapped contents. So in the
-     typical menu situation with a short input, input min=max=1. The final
-     assignment should balance between flexible elements. Maybe start with an
-     even division of "flex rows" between flexible elements? If more tuning is
-     required, weights could be added later - but keep it simple for now.
-3. **Partial-repaint and the caret.** When only the caret moves (no row changes), is a
-   caret-only emit worth a special case, or is it subsumed by the diff (both cheap)?
-   - Up to you - if caret-only diffing is easy enough, then do so. If keeping
-     it bundled with rows makes it simpler, then I think that would be fine
-     too.
 
 ---
 
@@ -1550,23 +1551,18 @@ still targeted (no blanket `allow(dead_code)` came back).
   `streamed_thinking_is_counted`. The DSRs stayed, for the reasons §4.2 now
   records. §4.5 is the remaining work, and it was never gated on this.)*
 
-### Recommended order (audit 2026-09-28)
 
-#5, #7, #9 and #11 are done. What remains, in order:
+## Backlog
 
-1. **§4.5 U1 → U2** — contraction, then the area surviving the turn. This is the
-   live work: it is what in-turn input and in-turn menus are waiting on, and it
-   retires the transient-bar mechanism rather than adding to it.
-  #6 (`display_text` accounting) and #10 (streaming accounting) were both long
-  assumed to be this section's gate. Both are done, and the four open questions
-  are now answered (4.5.5); what remains is restating the clear-policy invariant
-  for a live area (§2's P4 row).
-2. **#4 — explicit confirm subject.** Bundle with any of the above; on its
-   own it only buys a quieter line.
-
-One theme across the fixed ones: every fix moved a piece of knowledge to
-where the truth is, instead of re-deriving it downstream. The painter learned
-the geometry (#5, #7, #11) so neither host has to guess it; the next natural
-step in that direction is #6 (let `display_text` measure the bytes it wrote
-instead of predicting them) and #10 (let the streaming writers account for
-their rows).
+- Drawing efficiency
+  - Limit clearing:
+    - Overwrite only if frame height did not change, or if it increased. No
+      clearing.
+    - Only clear rows below frame if 
+      `old_frame_height - new_frame_height - content_rows_written > 0`, so if
+      old rows are not overwritten anyway, and the fold is now not at the
+      bottom-most possible position. Do this clearing *at the end* of the
+      regular output pass, to minimize flickering in new content.
+  - Caret-only moves: When only the caret moves (no row changes), is a
+    caret-only emit worth a special case, or is it subsumed by the diff (both
+    cheap)?
