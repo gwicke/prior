@@ -4200,12 +4200,20 @@ pub async fn run_interactive(
                 // iteration starts with `None`.
                 let prefill = app_state.take_prefill();
                 let prefill_ref = prefill.as_deref();
+                // The prompt session is created *here*, not inside
+                // `read_input`: it is the state the turn will need once
+                // in-turn input lands (ui_draw_v2 §4.5 U4), so it has to
+                // outlive the read. The prefill seeds its editor — the
+                // `/session <id> resume` resume puts the stored `/model …`
+                // in the buffer so Enter accepts, Esc dismisses, and a slash
+                // prefill opens its overlay on the first frame.
+                let mut session = crate::repl::PromptSession::new(prefill_ref, &app_state);
                 // `read_input` re-anchors the draw cache itself on entry
                 // (DSR); afterwards the frame follows the cursor, which the
                 // cache tracks (ui_draw_v2 §5.2).
                 r.read_input(
                     &prompt_str,
-                    prefill_ref,
+                    &mut session,
                     &mut line_history,
                     &ctx,
                     &app_state,

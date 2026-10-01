@@ -616,6 +616,115 @@ impl RenderAt for InputItem {
     }
 }
 
+/// What one key did to the prompt session.
+///
+/// [`PromptSession::handle_key`] mutates the session and answers with one of
+/// these; **it never draws.** Keeping the drawing out of it is the whole point
+/// of the split: the same dispatcher has to serve two pumps — `read_input`'s
+/// blocking loop today, and the turn's `tokio::select!` branch once in-turn
+/// input lands (ui_draw_v2 §4.5 U4) — and a dispatcher that painted would give
+/// them two ways to write the terminal.
+pub(crate) enum KeyOutcome {
+    /// Nothing that leaves the wait loop: repaint and read the next key.
+    Continue,
+    /// Hand the tty to `$EDITOR` over the input buffer. The takeover (reader
+    /// gate, raw mode, DSR re-anchor) belongs to the caller — see
+    /// `editor::run_editor`, which owns that whole sequence.
+    RunEditor,
+    /// Leave `read_input` with this action. The caller draws first for a
+    /// `Submit` (the input region is cleared before the transcript gets it).
+    Action(InputAction),
+}
+
+/// Everything that survives between one keystroke and the next.
+///
+/// This used to be six `let mut`s at the top of `Repl::read_input`, which
+/// meant the prompt session could not outlive that function's frame — the
+/// blocking loop, the drawing and the state were one thing. Splitting it out
+/// is what lets the state reach the turn's `select!` (ui_draw_v2 §4.5 U4).
+///
+/// The `SlashDotMenu` lives here too, and is *not* a borrow: the menu handle
+/// borrows it, so storing both would be self-referential. Instead the session
+/// tracks `in_slash` and mints a handle for the duration of each eval —
+/// [`SlashDotMenu::get_handle`] when a `/`-session begins (bumping the epoch so
+/// a new invocation starts clean), [`SlashDotMenu::continuation_handle`]
+/// afterwards (so the in-progress one keeps its view restore and armed
+/// confirm).
+pub struct PromptSession {
+    /// The input buffer, cursor and wrap layout.
+    editor: LineEditor,
+    /// History navigation: `Some(index)` while paging back through it.
+    nav: Option<usize>,
+    /// The line history was on before `nav` started, so leaving it restores.
+    draft: String,
+    /// Selected row of the current overlay.
+    sel: usize,
+    /// Overlay discriminant, for resetting `sel` when the overlay *kind*
+    /// changes rather than its contents.
+    last_disc: u8,
+    /// Prose (non-`/`) completion. Spawns its FS worker; the worker exits when
+    /// this drops.
+    prose: crate::prompt_complete::PromptCompletion,
+    /// Engine key queued for the *next* eval (eval → display → wait shape).
+    /// Consumed unconditionally at the top of the loop, so a stale key cannot
+    /// outlive one iteration.
+    pending_key: Option<crate::slashdot_menu::HostKey>,
+    /// The v2.5 menu tree. Persistent for the session.
+    menu: crate::slashdot_menu::menu::SlashDotMenu,
+    /// Whether a `/`-session is in progress — i.e. whether the epoch has been
+    /// bumped for the invocation currently on screen.
+    in_slash: bool,
+    /// The overlay the last eval produced, which the next key dispatches
+    /// against. Recomputed every iteration; held here so `handle_key` sees the
+    /// same frame that was just painted.
+    overlay: ActiveOverlay,
+}
+
+impl PromptSession {
+    /// Fresh session, seeded with `initial_buffer` if the caller has one
+    /// (the `/session <id> resume` prefill, and any other pop that wants the
+    /// editor to start with text already in it).
+    pub(crate) fn new(initial_buffer: Option<&str>, app_state: &Arc<AppState>) -> Self {
+        let mut editor = LineEditor::new();
+        if let Some(s) = initial_buffer {
+            editor.set(s);
+        }
+        Self {
+            editor,
+            nav: None,
+            draft: String::new(),
+            sel: 0,
+            last_disc: 0,
+            prose: crate::prompt_complete::PromptCompletion::new(),
+            pending_key: None,
+            menu: crate::v25_menu::build_menu(app_state),
+            in_slash: false,
+            overlay: ActiveOverlay::None,
+        }
+    }
+
+    /// The handle to eval with, for the `/`-session the buffer is currently in.
+    ///
+    /// Bumps the epoch only on the way *into* `/`, so one invocation's
+    /// traversal memory survives every key inside it (see the struct doc).
+    ///
+    /// Takes the two fields rather than `&mut self` because the caller
+    /// (`read_input`) has the session destructured into its loop's own
+    /// bindings, and the handle's borrow must not span them.
+    fn slash_handle<'m>(
+        menu: &'m mut crate::slashdot_menu::menu::SlashDotMenu,
+        in_slash: &mut bool,
+    ) -> crate::slashdot_menu::menu::SlashDotHandle<'m> {
+        let fresh = !*in_slash;
+        *in_slash = true;
+        if fresh {
+            menu.get_handle()
+        } else {
+            menu.continuation_handle()
+        }
+    }
+}
+
 impl Repl {
     pub fn new() -> Self {
         Self {
@@ -661,7 +770,10 @@ impl Repl {
     pub async fn read_input(
         &mut self,
         prompt: &str,
-        initial_buffer: Option<&str>,
+        // The prompt session. Borrowed, not owned: this is the state the turn
+        // needs once in-turn input lands (ui_draw_v2 §4.5 U4), so it has to
+        // outlive this call.
+        session: &mut PromptSession,
         history: &mut History,
         ctx: &ReplCtx,
         app_state: &Arc<AppState>,
@@ -713,36 +825,24 @@ impl Repl {
                 context_tokens: ctx.context_tokens,
             },
         ));
-        let mut editor = LineEditor::new();
-        // Seed the editor with a prefill string if one was provided. Used by
-        // `/session <id> resume` to surface the resumed session's stored model
-        // (`/model <provider>:<model_id>`) so the user can press Enter to
-        // accept, Esc to dismiss, or type to choose a different model.
-        // Pre-filling a slash command also opens its overlay immediately,
-        // so the model picker is visible without any extra keystroke.
-        if let Some(s) = initial_buffer {
-            editor.set(s);
-        }
-        let mut nav: Option<usize> = None;
-        let mut draft = String::new();
-        let mut sel: usize = 0;
-        let mut last_disc: u8 = 0; // overlay discriminant for sel-reset tracking
-                                   // v2.5 engine: persistent menu tree + guard-like handle.
-                                   // The menu lives for the entire prompt session; the handle is
-                                   // created when the prompt starts with `/` and dropped when it
-                                   // no longer does. All `/` dispatch goes through `eval_prompt`.
-        let mut v25_menu = crate::v25_menu::build_menu(app_state);
-        let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
-        // Prose (non-`/`) completion: one instance for the prompt
-        // session, parallel to the slash handle. Spawns its FS worker;
-        // the worker exits when this (and its `Sender`) drops.
-        let mut prose = crate::prompt_complete::PromptCompletion::new();
-        // Engine key queued by the dispatch below for the *next*
-        // iteration's eval (eval → display → wait loop shape). `None`
-        // = passive frame (buffer edits, first iteration). Consumed
-        // unconditionally at the top, so a stale key can never outlive
-        // one iteration.
-        let mut pending_key: Option<crate::slashdot_menu::HostKey> = None;
+        // The session's state, as the loop's own bindings. Destructuring a
+        // `&mut PromptSession` reborrows each field *disjointly*, so the body
+        // keeps addressing them as locals while they are, in fact, one movable
+        // value — and `PromptSession::handle_key` can be handed exactly the
+        // fields it touches instead of a `&mut self` that would conflict with
+        // these bindings.
+        let PromptSession {
+            editor,
+            nav,
+            draft,
+            sel,
+            last_disc,
+            prose,
+            pending_key,
+            menu,
+            in_slash,
+            overlay,
+        } = session;
         // Terminal size at the last paint, `(w, h)`. Resizes are consumed
         // without repainting (see the wait below), so a mismatch at the top of
         // the loop is the "repaint is due, and re-anchor first" signal (plan
@@ -852,15 +952,15 @@ impl Repl {
                 .take()
                 .unwrap_or(crate::slashdot_menu::HostKey::None);
             let buf_text = editor.text();
-            let overlay = if buf_text.starts_with('/') {
-                // All `/` commands route through the v2.5 engine.
-                // Manage handle lifecycle: create on first `/`, drop when not `/.
-                if v25_handle.is_none() {
-                    v25_handle = Some(v25_menu.get_handle());
-                }
+            *overlay = if buf_text.starts_with('/') {
+                // All `/` commands route through the v2.5 engine. The handle is
+                // minted for the eval and dropped with it — it carries no state
+                // beyond the borrowed root and the epoch, both of which live in
+                // the session's menu (`slash_handle` decides which epoch).
+                let cursor = editor.cursor;
                 let result = {
-                    let handle = v25_handle.as_mut().unwrap();
-                    Self::v25_eval(handle, &buf_text, editor.cursor, key).await
+                    let mut handle = PromptSession::slash_handle(menu, in_slash);
+                    Self::v25_eval(&mut handle, &buf_text, cursor, key).await
                 };
                 match result {
                     V25Frame::Continue(plan, prompt) => {
@@ -885,9 +985,9 @@ impl Repl {
                         let committed = format!("/{}", prompt);
                         Repl::emit_commit(
                             output,
-                            &mut editor,
+                            editor,
                             &redraw,
-                            sel,
+                            *sel,
                             (cur_w, cur_h),
                             &committed,
                             "",
@@ -907,9 +1007,9 @@ impl Repl {
                         let committed = format!("/{}", prompt);
                         Repl::emit_commit(
                             output,
-                            &mut editor,
+                            editor,
                             &redraw,
-                            sel,
+                            *sel,
                             (cur_w, cur_h),
                             &committed,
                             "",
@@ -937,30 +1037,31 @@ impl Repl {
                         // is an error path — rare, and the cost of being wrong
                         // is a stranded input region — not because the accounting
                         // needs rescuing.
-                        redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
+                        redraw(&LineEditor::new(), &[], *sel, (cur_w, cur_h));
                         output.display_text(&err);
                         let _ = output.cursor_row();
                         editor.set("");
-                        v25_handle = None;
+                        *in_slash = false;
                         ActiveOverlay::None
                     }
                     // Esc at root — close the overlay.
                     V25Frame::DoneSuccess(_, _) => {
                         editor.set("");
-                        v25_handle = None;
+                        *in_slash = false;
                         ActiveOverlay::None
                     }
                 }
             } else {
-                // Drop the v25 handle when prompt leaves `/`.
-                v25_handle = None;
+                // Leave the `/`-session: the next `/` starts a fresh invocation
+                // (a fresh epoch), so no traversal memory carries across.
+                *in_slash = false;
                 // Prose frames: one eval drives the word gate, the
                 // debounce, and the dialog. Idle ⇒ no overlay (stateless
                 // dismissal: the next frame re-derives from the buffer).
                 let ctx = crate::slashdot_menu::RenderContext {
                     term_width: crate::output::term_width().max(1),
                 };
-                match prose.eval(&mut editor, key, ctx) {
+                match prose.eval(editor, key, ctx) {
                     crate::prompt_complete::Frame::Idle => ActiveOverlay::None,
                     crate::prompt_complete::Frame::Dialog(plan) => {
                         ActiveOverlay::PathComplete { plan }
@@ -976,23 +1077,23 @@ impl Repl {
                 // (arrows mutate engine state; Tab/Enter act on it). The
                 // marker `active` (ctx-driven `*`) is separate. No
                 // host-side cursor policy for these overlays.
-                sel = overlay
+                *sel = overlay
                     .cursor_row()
                     .unwrap_or(active.unwrap_or(0))
                     .min(raw_opts.len().saturating_sub(1));
-                if cur_disc != last_disc {
-                    last_disc = cur_disc;
+                if cur_disc != *last_disc {
+                    *last_disc = cur_disc;
                 }
             } else {
-                sel = Self::cursor_sel_policy(cur_disc != last_disc, sel);
+                *sel = Self::cursor_sel_policy(cur_disc != *last_disc, *sel);
             }
-            if cur_disc != last_disc {
-                last_disc = cur_disc;
+            if cur_disc != *last_disc {
+                *last_disc = cur_disc;
             }
             let opts = raw_opts;
             let max_sel = opts.len().saturating_sub(1);
-            if sel > max_sel {
-                sel = max_sel;
+            if *sel > max_sel {
+                *sel = max_sel;
             }
             // The painter reports the geometry it produced: terminal rows to
             // show, and the windowing focus among them. The focus used to be
@@ -1108,7 +1209,7 @@ impl Repl {
                                     // the node's edit() through the engine
                                     // (doc/editor_cleanup.md §3/§5): the node
                                     // owns what (if anything) to edit.
-                                    pending_key = Some(crate::slashdot_menu::HostKey::Edit);
+                                    *pending_key = Some(crate::slashdot_menu::HostKey::Edit);
                                     continue;
                                 }
                                 ActiveOverlay::PathComplete { .. } => {
@@ -1128,17 +1229,17 @@ impl Repl {
                                 // empty-plan V25Menu case only.
                                 if overlay.cursor_row().is_some() {
                                     let delta: i32 = if key.code == KeyCode::Down { 1 } else { -1 };
-                                    pending_key =
+                                    *pending_key =
                                         Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
                                     continue;
                                 }
                                 if key.code == KeyCode::Down {
-                                    if sel + 1 < opts.len() {
-                                        sel += 1;
+                                    if *sel + 1 < opts.len() {
+                                        *sel += 1;
                                     }
                                 } else {
-                                    if sel > 0 {
-                                        sel -= 1;
+                                    if *sel > 0 {
+                                        *sel -= 1;
                                     }
                                 }
                             }
@@ -1153,7 +1254,7 @@ impl Repl {
                                 };
                                 if let Some(plan) = plan {
                                     if !matches!(overlay, ActiveOverlay::PathComplete { .. })
-                                        && v25_handle.is_none()
+                                        && !*in_slash
                                     {
                                         continue; // V25 overlay without its handle
                                     }
@@ -1184,7 +1285,7 @@ impl Repl {
                                         direction,
                                     );
                                     if delta != 0 {
-                                        pending_key =
+                                        *pending_key =
                                             Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
                                     }
                                     continue;
@@ -1194,9 +1295,9 @@ impl Repl {
                                     (h as usize).saturating_sub(2).max(1)
                                 };
                                 if matches!(key.code, KeyCode::PageDown) {
-                                    sel = (sel + page).min(opts.len().saturating_sub(1));
+                                    *sel = (*sel + page).min(opts.len().saturating_sub(1));
                                 } else {
-                                    sel = sel.saturating_sub(page);
+                                    *sel = (*sel).saturating_sub(page);
                                 }
                             }
                             KeyCode::Tab => {
@@ -1209,7 +1310,7 @@ impl Repl {
                                     ActiveOverlay::V25Menu { .. }
                                         | ActiveOverlay::PathComplete { .. }
                                 ) {
-                                    pending_key = Some(crate::slashdot_menu::HostKey::Tab);
+                                    *pending_key = Some(crate::slashdot_menu::HostKey::Tab);
                                 }
                             }
                             KeyCode::Enter => {
@@ -1218,23 +1319,18 @@ impl Repl {
                                         // Slash: queue the key; the next
                                         // iteration's eval handles submit
                                         // (commit + return) or rewrite inline.
-                                        pending_key = Some(crate::slashdot_menu::HostKey::Enter);
+                                        *pending_key = Some(crate::slashdot_menu::HostKey::Enter);
                                     }
                                     continue;
                                 }
                                 // Prose dialog: Enter bypasses completion —
                                 // submit the raw line (Shift+Enter inserts a
                                 // newline). Tab is the only expansion key.
-                                if let Some(a) = Self::edit_key(
-                                    key,
-                                    &mut editor,
-                                    history,
-                                    &mut nav,
-                                    &mut draft,
-                                    prompt,
-                                ) {
+                                if let Some(a) =
+                                    Self::edit_key(key, editor, history, nav, draft, prompt)
+                                {
                                     if let InputAction::Submit(_) = &a {
-                                        redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
+                                        redraw(&LineEditor::new(), &[], *sel, (cur_w, cur_h));
                                     }
                                     return Some(a);
                                 }
@@ -1248,7 +1344,7 @@ impl Repl {
                                 // (stateless); in plain editing Esc is a
                                 // no-op too, so this is uniform.
                                 if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
-                                    pending_key = Some(crate::slashdot_menu::HostKey::Esc);
+                                    *pending_key = Some(crate::slashdot_menu::HostKey::Esc);
                                     continue;
                                 }
                             }
@@ -1256,16 +1352,11 @@ impl Repl {
                                 // Editing keys pass through in both cases;
                                 // dismissal is stateless — the next eval
                                 // re-derives the dialog from the buffer.
-                                if let Some(a) = Self::edit_key(
-                                    key,
-                                    &mut editor,
-                                    history,
-                                    &mut nav,
-                                    &mut draft,
-                                    prompt,
-                                ) {
+                                if let Some(a) =
+                                    Self::edit_key(key, editor, history, nav, draft, prompt)
+                                {
                                     if let InputAction::Submit(_) = &a {
-                                        redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
+                                        redraw(&LineEditor::new(), &[], *sel, (cur_w, cur_h));
                                     }
                                     return Some(a);
                                 }
@@ -1276,11 +1367,9 @@ impl Repl {
                     // No overlay: normal editing (Tab with no dialog is
                     // inert — implicit open means the dialog is already up
                     // whenever there is anything to complete).
-                    if let Some(a) =
-                        Self::edit_key(key, &mut editor, history, &mut nav, &mut draft, prompt)
-                    {
+                    if let Some(a) = Self::edit_key(key, editor, history, nav, draft, prompt) {
                         if let InputAction::Submit(_) = &a {
-                            redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
+                            redraw(&LineEditor::new(), &[], *sel, (cur_w, cur_h));
                         }
                         return Some(a);
                     }

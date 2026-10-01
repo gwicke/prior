@@ -98,6 +98,27 @@ impl SlashDotMenu {
             epoch: self.epoch,
         }
     }
+
+    /// Get a handle for a *continuing* invocation — the epoch
+    /// [`SlashDotMenu::get_handle`] already bumped for it.
+    ///
+    /// The split exists because the epoch means two opposite things to the
+    /// two callers. `get_handle` bumps so that a **new** invocation cannot
+    /// inherit the previous one's intent. This one must not *lose* the
+    /// current invocation's: a node's `EpochState` (node_entry §epoch
+    /// state — the §5.1 view restore, `should_restore_view_args`, the armed
+    /// confirm dialog) is reset whenever `cache_epoch != epoch`, so handing
+    /// out a freshly-bumped epoch on every key would wipe the user's
+    /// position in the menu after each keystroke.
+    ///
+    /// The host tracks which of the two it wants with its own
+    /// "am I still inside one `/`-session" flag.
+    pub fn continuation_handle(&mut self) -> SlashDotHandle<'_> {
+        SlashDotHandle {
+            root: &mut self.root,
+            epoch: self.epoch,
+        }
+    }
 }
 
 /// Guard-like handle for one menu invocation. Borrows the menu's root
