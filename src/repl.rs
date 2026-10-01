@@ -772,6 +772,18 @@ impl PromptSession {
         }
     }
 
+    /// Seed the editor with a prefill.
+    ///
+    /// *Replaces* the buffer, because a prefill (`/session <id> resume` and
+    /// anything else that calls `set_prefill`) is an instruction for this
+    /// particular prompt — it is the one thing allowed to override what the
+    /// carried buffer holds. When there is no prefill, the session keeps what
+    /// it had: the `/` prompt *is* the menu state, so the buffer that ends a
+    /// turn is the buffer the next prompt opens with.
+    pub(crate) fn apply_prefill(&mut self, text: &str) {
+        self.editor.set(text);
+    }
+
     /// The handle to eval with, for the `/`-session the buffer is currently in.
     ///
     /// Bumps the epoch only on the way *into* `/`, so one invocation's
