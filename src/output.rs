@@ -65,6 +65,175 @@ pub(crate) enum ContentDisplayKind {
     /// a `!command`. Consecutive ones share a divider rather than stacking one
     /// between each pair.
     Prompt,
+    /// `stream_text`, and the segment flushes that close a segment: the answer
+    /// of a turn, written through the GFM answer renderer.
+    ResponseText,
+    /// `stream_thinking` — the reasoning a turn shows, dimmed inline. Its
+    /// dimming is internal to the block: the escape that ends it, and the
+    /// newline that ends its last line, belong to this kind's content, and the
+    /// row that follows it is the boundary matrix's, not this block's.
+    ResponseReasoning,
+    /// A tool block — `render_call_panel` / `render_result_panel`, which is
+    /// every row `paint_panel` writes. One kind for call and result alike:
+    /// the two halves of a pair are one block, so the second must not draw a
+    /// separator above itself.
+    ResponseTool,
+    /// `display_text` / `display_error` — a discrete message or error block.
+    SystemMessage,
+    /// `display_markdown` / `display_system` — a generated block: a compaction
+    /// summary, a marker, a notice.
+    SystemContent,
+}
+
+/// The single line `boundary` inserts between two blocks — the *formatting*
+/// half of the rule, separated from the writing so an emitter can draw a whole
+/// block in one `with_content_writer` and still get its boundaries right.
+///
+/// Different kinds separate; the same kind does not, which is what lets a
+/// response's internals (a tool panel, a segment flush) stay inside one block,
+/// and what collapses two adjacent prompts onto one rule. `None` — the stream's
+/// start, or content that did not declare itself — never separates, so the
+/// first thing written never gains a blank line above it.
+fn boundary_spacer(
+    old: Option<ContentDisplayKind>,
+    new: Option<ContentDisplayKind>,
+) -> Option<&'static [u8]> {
+    match (old, new) {
+        (Some(a), Some(b)) if a != b => Some(b"\n"),
+        _ => None,
+    }
+}
+
+/// The `──────` rule at a width — the *formatting* of a separator, kept apart
+/// from writing it so an emitter can draw a whole block in a single
+/// `with_content_writer` under one kind.
+fn separator_line(width: usize) -> String {
+    format!("{}\n", style("─".repeat(width)).dim())
+}
+
+/// A finished block with its trailing blank lines stripped, so what is emitted
+/// ends at a line boundary with **no** blank row.
+///
+/// That is the state `boundary_spacer` needs: its single newline then lands as
+/// exactly one blank row — never two, and never a newline spent just closing a
+/// line that had no blank after it. The one line terminator the last line needs
+/// is put back, which is the "strip, then add by rule" of the normalization.
+fn at_line_start(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    while out.last() == Some(&b'\n') {
+        out.pop();
+    }
+    if !out.is_empty() {
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Drops the leading blank lines of the block being written, passing the rest
+/// through untouched.
+///
+/// Stops at the first byte that is not a newline, so from that point on it is
+/// inert: interior paragraph gaps, and a block written across several calls,
+/// are unaffected — only the very first bytes of the block are examined.
+/// Content that never starts (an all-newline chunk) is simply withheld, which
+/// is the whole point: the spacer already supplied the row it would have
+/// stacked on.
+struct StripLeading<'a, W: io::Write + ?Sized> {
+    inner: &'a mut W,
+    /// Cleared once a non-newline byte has passed.
+    armed: bool,
+}
+
+impl<W: io::Write + ?Sized> io::Write for StripLeading<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.armed {
+            self.inner.write_all(buf)?;
+        } else if let Some(i) = buf.iter().position(|b| *b != b'\n') {
+            self.armed = true;
+            self.inner.write_all(&buf[i..])?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Withholds the blank rows a write ends with, releasing them only if more
+/// content arrives in the same block.
+///
+/// Not a trim — the separator still exists, it is merely written by the *next*
+/// write rather than by this one. A kind change never asks for it (the caller
+/// drops it, and `boundary_spacer` supplies that boundary's divider instead),
+/// and the end of the stream never asks for it either, because there is no next
+/// write. That is the whole contract in one structure: internal separators are
+/// preserved, only *when* they are emitted moves, and the response's last one
+/// disappears without anything having to know, as it writes, whether more
+/// content follows.
+///
+/// One newline is never withheld: that is the line terminator closing the last
+/// line of content, not a blank row — without it the stream would sit
+/// mid-line.
+struct HoldTrailing<'a, W: io::Write + ?Sized> {
+    inner: &'a mut W,
+    /// Newlines withheld since the last byte of content.
+    pending: usize,
+    /// Whether anything that is *not* a newline passed through — the
+    /// difference between a write that still owes its line terminator and one
+    /// that is nothing but separators.
+    wrote_content: bool,
+}
+
+impl<W: io::Write + ?Sized> HoldTrailing<'_, W> {
+    /// Hand back everything still withheld, once the content of this write is
+    /// in.
+    ///
+    /// The decision comes from the content alone — no reading of the stream —
+    /// because that is the convention every emitter is held to: content ends
+    /// with exactly one newline and no separator lines. Of `pending` trailing
+    /// newlines the first is that terminator and stays (the block ends at a
+    /// line boundary); the rest are empty lines and are held for whoever comes
+    /// next.
+    ///
+    /// A write that produced no content owes no terminator. It is nothing but
+    /// separators, and separators are written only when same-kind content
+    /// arrives to sit below them — so writing one here, on a stream that by
+    /// convention already ends at a line boundary, would be inventing a blank
+    /// row from a write that emitted no content at all.
+    fn finish(&mut self) -> usize {
+        if self.pending > 0 && self.wrote_content {
+            let _ = self.inner.write_all(b"\n");
+            self.pending -= 1;
+        }
+        std::mem::take(&mut self.pending)
+    }
+}
+
+impl<W: io::Write + ?Sized> io::Write for HoldTrailing<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match buf.iter().rposition(|b| *b != b'\n') {
+            // Ends with content: what was held turns out to be interior after
+            // all, so release it, then take this chunk and hold its tail.
+            Some(i) => {
+                self.wrote_content = true;
+                if self.pending > 0 {
+                    let held = std::mem::take(&mut self.pending);
+                    let blank = vec![b'\n'; held];
+                    self.inner.write_all(&blank)?;
+                }
+                self.inner.write_all(&buf[..=i])?;
+                self.pending += buf.len() - i - 1;
+            }
+            // All newlines: trailing until something says otherwise.
+            None => self.pending += buf.len(),
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Ends a content batch when dropped: one frame re-emit for the whole burst,
@@ -303,6 +472,14 @@ pub trait Output: Send + Sync {
     fn compose_area(&self, input: Option<Element>, overlay: Option<Element>) -> Vec<Element> {
         let mut items = Vec::new();
         if let Some(row) = self.status_row() {
+            // The row between the last content and the bar is the **frame's**,
+            // not the content path's: synthetic content no longer emits a
+            // trailing separator, so without this there would be nothing
+            // between what was written and the status line. Static and part of
+            // the area, so it retires with it — a content write that consumes
+            // the frame takes this row too, and it can never become a
+            // permanent blank in the transcript.
+            items.push(Element::lines(vec![String::new()]));
             items.push(row);
         }
         items.extend(area_body(input, overlay));
@@ -683,6 +860,16 @@ pub struct ConsoleOutput {
     /// one function. The flag flips in `begin_response`/`end_response`, so the
     /// bar's state cannot disagree with whether a turn is actually running.
     streaming: Arc<std::sync::atomic::AtomicBool>,
+    /// Blank rows withheld from the end of the last content write.
+    ///
+    /// Trailing separators are **held, not dropped**: a following write of the
+    /// same kind releases them (the internal spacing is unchanged — only *when*
+    /// it is written moved), a write of a different kind discards them (that
+    /// boundary's divider belongs to the next block), and the end of the
+    /// stream discards them by simply never releasing. Which is what strips
+    /// the response's last separator without needing to know, at the time it is
+    /// written, whether anything comes after it.
+    held_blank: std::sync::atomic::AtomicUsize,
     /// Stores the previous writer during a capture session (see
     /// [`ConsoleOutput::begin_capture`] / [`ConsoleOutput::end_capture`]).
     saved_writer: Mutex<Option<Box<dyn io::Write + Send>>>,
@@ -1475,6 +1662,7 @@ impl ConsoleOutput {
             stream_tail: StreamTail::new(),
             status_text: Arc::new(Mutex::new(StatusText::default())),
             streaming: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            held_blank: std::sync::atomic::AtomicUsize::new(0),
             saved_writer: Mutex::new(None),
         }
     }
@@ -1710,19 +1898,6 @@ impl ConsoleOutput {
         });
     }
 
-    /// The rule that brackets a committed prompt — written with the prompt's
-    /// kind rather than as a bare separator.
-    ///
-    /// The bracket belongs to the prompt it wraps, so what the next write reads
-    /// still says `Prompt`. That is the whole collapsing contract in one line:
-    /// the three writes of a bracket are still one committed prompt, and the
-    /// next commit may share its closing rule instead of opening a new one.
-    fn committed_prompt_rule(&self) {
-        let width = term_width();
-        let rule = format!("{}\n", style("─".repeat(width)).dim());
-        self.write_content_kinded(rule.as_bytes(), Some(ContentDisplayKind::Prompt));
-    }
-
     /// Run `f` with the writer lock wrapped in a [`RowCounter`], then advance
     /// the draw cache by the rows `f` wrote. For the writers that produce
     /// their own bytes — the streaming markdown renderers, which want a
@@ -1749,13 +1924,32 @@ impl ConsoleOutput {
         F: FnOnce(&mut dyn io::Write) -> T,
     {
         let mut out = self.writer.lock().unwrap();
-        // This write's kind becomes the transcript's last, so the next write's
-        // collapse decision reads it. The *caller* declares the kind — the
-        // choke point never guesses from bytes — which puts one obligation on
-        // a wrapper that draws several writes: the bracket around a committed
-        // prompt has to pass `Prompt` for the rule *and* the line, or its own
-        // final write would clear the very record the next commit checks.
-        self.draw.lock().unwrap().last_content_display_kind = kind;
+        // The *caller* declares the kind — the choke point never guesses from
+        // bytes — and the previous one is read first, because the whole
+        // boundary rule is a statement about the pair. Recording before `f`
+        // runs is deliberate: an emitter drawing several things inside this one
+        // block then reads back its own kind, so its internal separators are
+        // (kind, kind) and contribute nothing.
+        let old = {
+            let mut cache = self.draw.lock().unwrap();
+            let old = cache.last_content_display_kind;
+            cache.last_content_display_kind = kind;
+            old
+        };
+        let opener = old != kind;
+        // Blank rows the previous write held. A boundary's own row is
+        // `boundary_spacer`'s to emit, so arriving at a boundary still holding
+        // anything means the outgoing block asked for a trailing blank — which
+        // the contract forbids outright, and which is worth naming rather than
+        // quietly swallowing: it is the previous caller's bug, not this block's.
+        let held = self.held_blank.swap(0, std::sync::atomic::Ordering::SeqCst);
+        debug_assert!(
+            !(opener && held > 0),
+            "content left a held blank line at a content boundary: \
+             {old:?} -> {kind:?} held {held} row(s)\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+
         // **Consume, do not erase** (§4.5 P1). The cursor is inside the live
         // frame, so it walks up to the fold and the write takes those rows over
         // from the top down. The frame's rows are about to hold content, not be
@@ -1794,7 +1988,58 @@ impl ConsoleOutput {
         // before the block — and so the tail describes the content, and nothing
         // else.
         let mut counter = RowCounter::new(&mut **out, width, &self.stream_tail);
-        let r = f(&mut counter);
+        if opener {
+            // The boundary line belongs to the space *between* blocks, so it is
+            // written before the content — and therefore not eaten by the
+            // leading strip, which only ever removes the content's own blanks.
+            // No test of the stream is needed: content ends at a line boundary
+            // by convention, so one newline *is* one empty row.
+            if let Some(spacer) = boundary_spacer(old, kind) {
+                let _ = counter.write_all(spacer);
+            }
+        } else if held > 0 {
+            // Same kind: the separator the previous write held is released here,
+            // which is the only difference from having written it inline. An
+            // opener discards what it holds instead — see `held_blank`.
+            let blank = vec![b'\n'; held];
+            let _ = counter.write_all(&blank);
+        }
+        let mut hold = HoldTrailing {
+            inner: &mut counter,
+            pending: 0,
+            wrote_content: false,
+        };
+        let r = if opener {
+            // Strip a block's leading blank lines: the boundary line above put
+            // exactly one row there, and content that opens with newlines
+            // would turn it into two. Stops at the first byte that is not a
+            // newline, so everything after it — interior paragraph gaps
+            // included — is untouched.
+            let mut strip = StripLeading {
+                inner: &mut hold,
+                armed: false,
+            };
+            f(&mut strip)
+        } else {
+            f(&mut hold)
+        };
+        // Hand back everything the content held past its terminator; the next
+        // write of this kind releases it, the next boundary blames it.
+        let wrote = hold.wrote_content;
+        let held_next = hold.finish();
+        drop(hold);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/held.log")
+        {
+            let _ = writeln!(
+                f,
+                "{old:?} -> {kind:?} wrote={wrote} held {held} -> {held_next}"
+            );
+        }
+        self.held_blank
+            .store(held_next, std::sync::atomic::Ordering::SeqCst);
         let rows = counter.rows();
         let _ = counter.flush();
         drop(counter);
@@ -1903,8 +2148,7 @@ impl ConsoleOutput {
     }
 
     fn separator(&self) {
-        let width = term_width();
-        self.write_content(format!("{}\n", style("─".repeat(width)).dim()).as_bytes());
+        self.write_content(separator_line(term_width()).as_bytes());
     }
 
     /// Emit the blank line that separates this block from what came before —
@@ -1916,15 +2160,29 @@ impl ConsoleOutput {
     /// what makes it hold: the renderer ends a paragraph with a blank line of
     /// its own, so a hand-kept "did I just print a blank" flag disagrees with
     /// the screen at exactly those points and the boundary adds a second one.
-    fn boundary(&self) {
+    /// A blank line *within* one content stream — two parts of the same block
+    /// putting a row between themselves.
+    ///
+    /// `kind` is the caller's own, and that is the point: the pair it is
+    /// recorded under is (kind, kind), which `boundary_spacer` never
+    /// separates, so an internal separator can neither trigger nor be
+    /// triggered by the cross-block rule. Formatting a line and writing it are
+    /// two things — this does the second, using the first.
+    fn boundary(&self, kind: Option<ContentDisplayKind>) {
         if self.needs_boundary() {
-            self.write_content(b"\n");
+            self.write_content_kinded(b"\n", kind);
         }
     }
 
     /// Does the next block need a blank line above it?
     fn needs_boundary(&self) -> bool {
+        // A row held at the end of the previous write *is* the separator this
+        // call would otherwise draw — it materialises before the next content
+        // that arrives. Asking only the stream finds no blank row (it was
+        // never written) and draws a second one, which is how a tool block
+        // ended up with two rows between it and what follows.
         !self.stream_tail.ends_blank()
+            && self.held_blank.load(std::sync::atomic::Ordering::SeqCst) == 0
     }
 
     /// Start the renderers fresh, so the next block either of them renders
@@ -1952,7 +2210,7 @@ impl ConsoleOutput {
     /// Close a tool block: the blank line above whatever comes next, and the
     /// renderers starting fresh for it.
     fn end_tool_block(&self) {
-        self.boundary();
+        self.boundary(Some(ContentDisplayKind::Response));
         self.reset_renderer_gaps();
     }
 
@@ -1999,7 +2257,14 @@ impl ConsoleOutput {
             format!("{BG}"),
             format!("{}{}", " ".repeat(pad), RESET),
         );
-        self.write_content(format!("{row}\n").as_bytes());
+        // Hard-coded `Response`: a panel is a tool block, and tool blocks only
+        // ever occur between `begin_response` and `end_response`. Nothing here
+        // is ever drawn as anything else, so there is no caller to pass a kind
+        // down from — the one place that rule lets a utility decide.
+        self.write_content_kinded(
+            format!("{row}\n").as_bytes(),
+            Some(ContentDisplayKind::Response),
+        );
     }
 
     /// Render one full-width dark-grey panel row for plain `text` (no ANSI).
@@ -2324,7 +2589,8 @@ impl ReasoningSink {
             let _ = err.write_all(&bytes);
             let _ = err.flush();
         } else {
-            out.write_content(&bytes);
+            // Reasoning sits inside `begin_response`…`end_response`.
+            out.write_content_kinded(&bytes, Some(ContentDisplayKind::Response));
         }
     }
 }
@@ -2391,7 +2657,7 @@ impl ConsoleOutput {
         // block a tool" flag: a text segment leaves the renderer's own trailing
         // blank behind, a tool panel does not, and the stream knows which.
         let (label, extra) = get_preview(name, args);
-        self.boundary();
+        self.boundary(Some(ContentDisplayKind::Response));
         // Dark-grey panel box (no `⏺`, no tree line-art). The command label is
         // the first line and is left flush; its output — the trailing
         // diff/preview lines — is indented one column so the command's output
@@ -2728,9 +2994,11 @@ impl Output for ConsoleOutput {
     /// prompt — *sharing* the closing rule with it instead of stacking one
     /// (ui_draw_v2 R4).
     ///
-    /// The decision reads the transcript's last kind and is taken **before**
-    /// any of the writes below, because those three writes each record the
-    /// kind themselves; reading later would only ever find this prompt.
+    /// **One** `with_content_writer`, declared as `Prompt`. The rules are
+    /// formatting, drawn here inside the block the prompt owns, rather than
+    /// separate writes that would each have to declare a kind of their own —
+    /// which is also why the share-or-open decision is taken *before* that
+    /// write: read after it, the last kind could only ever be this prompt.
     ///
     /// ```text
     /// ────
@@ -2740,21 +3008,20 @@ impl Output for ConsoleOutput {
     /// ────
     /// ```
     ///
-    /// It stops at the prompt rather than at the rule: content either side
-    /// still gets its blank line from `boundary()`, so a prompt followed by
-    /// model output reads as a turn, while two adjacent prompts read as two
-    /// commits sharing one rule.
+    /// The prompt stops at its rules rather than carrying blank lines of its
+    /// own: a blank row either side comes from `boundary_spacer`, so a prompt
+    /// against model output reads as a turn while two adjacent prompts read as
+    /// two commits sharing one rule.
     fn display_committed_prompt(&self, line: &str) {
         let shares_rule =
             self.draw.lock().unwrap().last_content_display_kind == Some(ContentDisplayKind::Prompt);
-        if !shares_rule {
-            self.committed_prompt_rule();
-        }
-        self.write_content_kinded(
-            format!("{}\n", line).as_bytes(),
-            Some(ContentDisplayKind::Prompt),
-        );
-        self.committed_prompt_rule();
+        let rule = separator_line(term_width());
+        let block = if shares_rule {
+            format!("{line}\n{rule}")
+        } else {
+            format!("{rule}{line}\n{rule}")
+        };
+        self.write_content_kinded(block.as_bytes(), Some(ContentDisplayKind::Prompt));
     }
 
     fn draw_frame(
@@ -2800,38 +3067,47 @@ impl Output for ConsoleOutput {
 
     fn display_plain(&self, text: &str) {
         // The count comes from the bytes: `writeln!` adds the newline, and a
-        // caller-supplied line is padded or not as it likes.
-        self.write_content(format!("{}\n", text).as_bytes());
+        // caller-supplied line is padded or not as it likes. Then normalized —
+        // a caller whose text already ends in a newline would otherwise emit a
+        // trailing blank row, which the contract forbids: synthetic content
+        // ends at a line boundary, never with a separator.
+        let block = format!("{}\n", text);
+        self.write_content_kinded(
+            &at_line_start(block.as_bytes()),
+            Some(ContentDisplayKind::SystemMessage),
+        );
     }
 
     fn display_markdown(&self, text: &str) {
         let color = std::io::stdout().is_terminal();
         let rendered = render_markdown(text, term_width(), color);
-        // One blank line above the block, unless the stream already ends with
-        // one — the same rule every other block uses, and the reason two
-        // consecutive blocks (e.g. an error right after `end_response`) stay
-        // one line apart without either of them knowing about the other.
-        self.boundary();
         let mut block = String::with_capacity(rendered.len() + 1);
         block.push_str(&rendered);
         block.push('\n');
         // Measured, not predicted: a long rendered line wraps, and `rendered`
         // is a count of *logical* lines, not screen rows (§9 #6/#10).
-        self.write_content(block.as_bytes());
+        // The blank above the block is not this method's business any more:
+        // `boundary_spacer` puts it there when the kind changes, which is the
+        // pair this block opens. The trailing one is ours to suppress: the
+        // renderer often ends with a blank of its own, and a synthetic block
+        // may not.
+        self.write_content_kinded(
+            &at_line_start(block.as_bytes()),
+            Some(ContentDisplayKind::SystemContent),
+        );
     }
 
     fn display_text(&self, text: &str) {
-        // One blank line above the message, unless the stream already ends with
-        // one (e.g. the error path, where `end_response` left a trailing blank),
-        // so the message sits exactly one empty line below the prior block.
-        self.boundary();
         // The bytes, not the source, decide the height: the `⏺ ` prefix is two
         // columns the old `wrap(text).len()` count never saw, inline markdown
         // rewrites the text, and a message that exactly fills the width wraps
         // onto another row (§9 #6). Measuring the bytes removes the guess *and*
         // the DSR that used to correct for it.
         let block = format!("{} {}\n", style("⏺").cyan(), termimad::inline(text));
-        self.write_content(block.as_bytes());
+        self.write_content_kinded(
+            &at_line_start(block.as_bytes()),
+            Some(ContentDisplayKind::SystemMessage),
+        );
     }
 
     fn begin_response(&self) {
@@ -2859,10 +3135,11 @@ impl Output for ConsoleOutput {
         let mut trenderer = self.thinking_renderer.lock().unwrap();
         *trenderer = Renderer::new(Theme::dimmed(), current_width);
         *self.dim_on.lock().unwrap() = false;
-        // One blank line between the prompt (or whatever preceded) and the
-        // response — the same rule the blocks below use, so a response that
-        // starts right after a trailing blank does not gain a second one.
-        self.boundary();
+        // No blank line written here: the row between the prompt and the
+        // response is `boundary_spacer`'s, on the first `Response` write —
+        // `begin_response` writes nothing, so it has nothing to ask the stream
+        // about. Its leading blank lines are stripped by that same write,
+        // which is this half of "begin/end_response strip".
     }
 
     fn stream_text(&self, delta: &str) {
@@ -2887,28 +3164,32 @@ impl Output for ConsoleOutput {
         // One counted block: the boundary blank (if any) and the rendered
         // blocks. The renderer produced the bytes, so the counter measures
         // them rather than the delta text (§9 #10).
-        self.with_content_writer(current_width, None, |mut out| {
-            // Thinking just ended: commit whatever is still buffered (while dim
-            // is still on) so it lands above the answer, then turn the dim off
-            // and put one blank line between them. The dim reset MUST come
-            // before the blank: a GFM list/table emits no trailing newline of
-            // its own, so a `\n` before the reset would be swallowed as the
-            // block's closing newline instead of a separator.
-            //
-            // The tool→text boundary is *not* handled here: a completed tool
-            // block ends with its own separator (`display_tool_result`), so the
-            // stream already ends blank and this has nothing to add. That is
-            // what the `last_was_tool` flag used to be for.
-            if *self.dim_on.lock().unwrap() {
-                self.commit_thinking(&mut out);
-                self.ensure_dim(false, &mut out);
-                self.boundary_into(out);
-            }
-            let mut parser = self.parser.lock().unwrap();
-            let events = parser.write(delta.as_bytes());
-            let mut renderer = self.renderer.lock().unwrap();
-            let _ = renderer.feed(&events, &mut out);
-        });
+        self.with_content_writer(
+            current_width,
+            Some(ContentDisplayKind::Response),
+            |mut out| {
+                // Thinking just ended: commit whatever is still buffered (while dim
+                // is still on) so it lands above the answer, then turn the dim off
+                // and put one blank line between them. The dim reset MUST come
+                // before the blank: a GFM list/table emits no trailing newline of
+                // its own, so a `\n` before the reset would be swallowed as the
+                // block's closing newline instead of a separator.
+                //
+                // The tool→text boundary is *not* handled here: a completed tool
+                // block ends with its own separator (`display_tool_result`), so the
+                // stream already ends blank and this has nothing to add. That is
+                // what the `last_was_tool` flag used to be for.
+                if *self.dim_on.lock().unwrap() {
+                    self.commit_thinking(&mut out);
+                    self.ensure_dim(false, &mut out);
+                    self.boundary_into(out);
+                }
+                let mut parser = self.parser.lock().unwrap();
+                let events = parser.write(delta.as_bytes());
+                let mut renderer = self.renderer.lock().unwrap();
+                let _ = renderer.feed(&events, &mut out);
+            },
+        );
     }
 
     fn stream_thinking(&self, delta: &str) {
@@ -2945,37 +3226,43 @@ impl Output for ConsoleOutput {
     fn end_response_segment(&self) {
         let current_width = current_term_width();
         // One counted block: the answer commit, the thinking commit, the
-        // boundary blank and the dim reset.
-        self.with_content_writer(current_width, None, |mut out| {
-            // Commit any open answer paragraph so the tool call/result prints
-            // below, then start a *fresh* answer renderer for the next segment.
-            // This drops the renderer's `pending_gap`, which otherwise fires at
-            // the next answer segment's first block and would double the blank
-            // line at the thinking→answer boundary in multi-turn turns (the
-            // transition already emits one blank).
-            {
-                let mut parser = self.parser.lock().unwrap();
-                // `flush()` (not `write("\n\n")`) so a segment whose answer text
-                // ends in a list/table is emitted now rather than stranded; then
-                // start a fresh answer parser + renderer for the next segment.
-                let events = parser.flush();
-                *parser = StreamParser::new_gfm_stream();
-                let mut renderer = self.renderer.lock().unwrap();
-                let _ = renderer.feed(&events, &mut out);
-                let mut theme = Theme::default();
-                theme.clickable_links = true; // real TTY path
-                *renderer = Renderer::new(theme, current_width);
-            }
-            // Commit thinking (the thinking renderer is kept — post-tool
-            // thinking continues as one continuous faded stream; only the
-            // parser is reset, inside `commit_thinking`).
-            self.commit_thinking(&mut out);
-            self.ensure_dim(false, &mut out);
-            // One blank line between this segment's content and the tool panel
-            // below. Stacked boundaries — an empty terminal `CompletionCall`
-            // after a segment that already left a blank — collapse to one.
-            self.boundary_into(out);
-        });
+        // boundary blank and the dim reset. Inside the turn, so `Response`:
+        // the separators between a segment and the tool panel below are the
+        // response's own, not a content boundary.
+        self.with_content_writer(
+            current_width,
+            Some(ContentDisplayKind::Response),
+            |mut out| {
+                // Commit any open answer paragraph so the tool call/result prints
+                // below, then start a *fresh* answer renderer for the next segment.
+                // This drops the renderer's `pending_gap`, which otherwise fires at
+                // the next answer segment's first block and would double the blank
+                // line at the thinking→answer boundary in multi-turn turns (the
+                // transition already emits one blank).
+                {
+                    let mut parser = self.parser.lock().unwrap();
+                    // `flush()` (not `write("\n\n")`) so a segment whose answer text
+                    // ends in a list/table is emitted now rather than stranded; then
+                    // start a fresh answer parser + renderer for the next segment.
+                    let events = parser.flush();
+                    *parser = StreamParser::new_gfm_stream();
+                    let mut renderer = self.renderer.lock().unwrap();
+                    let _ = renderer.feed(&events, &mut out);
+                    let mut theme = Theme::default();
+                    theme.clickable_links = true; // real TTY path
+                    *renderer = Renderer::new(theme, current_width);
+                }
+                // Commit thinking (the thinking renderer is kept — post-tool
+                // thinking continues as one continuous faded stream; only the
+                // parser is reset, inside `commit_thinking`).
+                self.commit_thinking(&mut out);
+                self.ensure_dim(false, &mut out);
+                // One blank line between this segment's content and the tool panel
+                // below. Stacked boundaries — an empty terminal `CompletionCall`
+                // after a segment that already left a blank — collapse to one.
+                self.boundary_into(out);
+            },
+        );
     }
 
     fn end_response(&self) {
@@ -2984,29 +3271,33 @@ impl Output for ConsoleOutput {
         self.streaming
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let current_width = current_term_width();
-        // One counted block: the answer and thinking flushes and the
-        // trailing blank.
-        self.with_content_writer(current_width, None, |mut out| {
+        // One counted block: the answer and thinking flushes, ending at a line
+        // boundary with no blank row behind them.
+        self.with_content_writer(current_width, Some(ContentDisplayKind::Response), |out| {
+            // Streaming is over, so the remainder comes back as one buffer:
+            // strip it whole rather than carry a "might still be trailing"
+            // state across chunks `end_response` will never see again.
+            let mut buf: Vec<u8> = Vec::new();
             // Finalize the answer document.
             {
                 let mut parser = self.parser.lock().unwrap();
                 let events = parser.flush();
                 let mut renderer = self.renderer.lock().unwrap();
-                let _ = renderer.feed(&events, &mut out);
+                let _ = renderer.feed(&events, &mut buf);
             }
             // Finalize thinking (it was rendered inline + dimmed as it streamed).
             {
                 let mut parser = self.thinking_parser.lock().unwrap();
                 let events = parser.flush();
                 let mut renderer = self.thinking_renderer.lock().unwrap();
-                let _ = renderer.feed(&events, &mut out);
+                let _ = renderer.feed(&events, &mut buf);
             }
-            self.ensure_dim(false, &mut out);
-            // A trailing blank, so the separator that opens the next loop
-            // iteration does not butt against the last line of the response.
-            // Skipped when the turn already ended with a blank (the terminal
-            // `CompletionCall`'s `end_response_segment` left one).
-            self.boundary_into(out);
+            self.ensure_dim(false, &mut buf);
+            // The turn's outer trailing edge: what the flushes left, stripped,
+            // then emitted. The row *between* this response and whatever comes
+            // next is `boundary_spacer`'s — one blank line is its answer, and
+            // writing one here would make two.
+            let _ = out.write_all(&at_line_start(&buf));
         });
     }
 
@@ -3084,11 +3375,19 @@ impl Output for ConsoleOutput {
     fn display_error(&self, error: &str) {
         // Measured: a long error wraps, and the message carries a 2-column
         // prefix the row count has to include.
-        self.write_content(format!("{} Error: {}\n", style("⏺").red(), error).as_bytes());
+        let block = format!("{} Error: {}\n", style("⏺").red(), error);
+        self.write_content_kinded(
+            &at_line_start(block.as_bytes()),
+            Some(ContentDisplayKind::SystemMessage),
+        );
     }
 
     fn display_system(&self, text: &str) {
-        self.write_content(format!("{}\n", style(text).bold().dim()).as_bytes());
+        let block = format!("{}\n", style(text).bold().dim());
+        self.write_content_kinded(
+            &at_line_start(block.as_bytes()),
+            Some(ContentDisplayKind::SystemContent),
+        );
     }
 
     fn confirm(&self, message: &str) -> Confirmation {
@@ -3441,25 +3740,34 @@ mod tests {
             )
         };
 
-        // Nothing supplied: the status alone, and it is first.
-        assert_eq!(compose_rows(&out.compose_area(None, None), 60).len(), 1);
+        // Nothing supplied: the gap and the status, and they come first.
+        assert_eq!(compose_rows(&out.compose_area(None, None), 60).len(), 2);
 
         // Input only: no separator, because a separator is for a menu.
         let rows = compose_rows(&out.compose_area(Some(input()), None), 60);
-        assert_eq!(rows.len(), 2, "status then input: {rows:?}");
+        assert_eq!(rows.len(), 3, "gap, status, input: {rows:?}");
 
         // Both: the divider arrives *with* the overlay, not from the caller.
         let overlay = Element::overlay(vec!["row".to_string()], 0);
         let rows = compose_rows(&out.compose_area(Some(input()), Some(overlay)), 60);
-        assert_eq!(rows.len(), 4, "status, input, divider, overlay: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            5,
+            "gap, status, input, divider, overlay: {rows:?}"
+        );
         assert!(
-            rows[0].contains("\x1b[48;5;237m"),
-            "row 0 is the status bar: {:?}",
+            !rows[0].contains("[bar]") && !rows[0].contains('─'),
+            "row 0 is the empty gap above the bar: {:?}",
             rows[0]
         );
-        assert!(rows[1].contains("> "), "row 1 is the input: {:?}", rows[1]);
-        assert!(rows[2].contains('─'), "row 2 is the divider: {:?}", rows[2]);
-        assert!(rows[3].contains("row"), "row 3 is the menu: {:?}", rows[3]);
+        assert!(
+            rows[1].contains("\x1b[48;5;237m"),
+            "row 1 is the status bar: {:?}",
+            rows[1]
+        );
+        assert!(rows[2].contains("> "), "row 2 is the input: {:?}", rows[2]);
+        assert!(rows[3].contains('─'), "row 3 is the divider: {:?}", rows[3]);
+        assert!(rows[4].contains("row"), "row 4 is the menu: {:?}", rows[4]);
     }
 
     /// The frame bar's dot is read from `streaming` at compose time rather than
@@ -3473,9 +3781,9 @@ mod tests {
         out.set_status(&bar_of("[bar]"));
         let idle = compose_rows(&out.compose_area(None, None), 60);
         assert!(
-            !idle[0].contains(DOT_STREAMING),
+            !idle[1].contains(DOT_STREAMING),
             "no turn in flight, so the frame bar is idle: {:?}",
-            idle[0]
+            idle[1]
         );
 
         out.begin_capture();
@@ -3483,9 +3791,9 @@ mod tests {
         let _ = out.end_capture();
         let during = compose_rows(&out.compose_area(None, None), 60);
         assert!(
-            during[0].contains(DOT_STREAMING),
+            during[1].contains(DOT_STREAMING),
             "mid-turn the frame bar goes green: {:?}",
-            during[0]
+            during[1]
         );
 
         out.begin_capture();
@@ -3514,7 +3822,7 @@ mod tests {
             "explicitly off: there is no bar to show"
         );
         out.set_status(&bar_of("[bar]"));
-        assert_eq!(out.compose_area(None, None).len(), 1, "on: a bar");
+        assert_eq!(out.compose_area(None, None).len(), 2, "gap, then a bar");
 
         assert!(
             NoOutput.compose_area(None, None).is_empty(),
@@ -3826,9 +4134,9 @@ mod tests {
         );
     }
 
-    /// One segment, one answer block: the painted output is the leading blank
-    /// from `begin_response` and then *exactly* what the renderer produced.
-    /// Anything else is a byte the host contributed on its own.
+    /// One segment, one answer block: the painted output is *exactly* what the
+    /// renderer produced, ending at a line boundary. Anything else is a byte
+    /// the host contributed on its own.
     #[test]
     #[serial]
     fn host_adds_nothing_inside_a_segment() {
@@ -3841,12 +4149,23 @@ mod tests {
             for chunk in Chunking::all() {
                 let bytes = run_script(&[Step::Say(text), Step::ResponseEnd], chunk);
                 let painted = String::from_utf8_lossy(&bytes).to_string();
-                // `begin_response`'s leading blank, the renderer's own output,
-                // and `end_response`'s trailing blank. Nothing else.
+                // Neither end may add a separator. At the stream's start there
+                // is nothing to separate from, so `boundary_spacer` has no
+                // answer for (None, Response) and `begin_response` writes
+                // nothing at all. And `end_response` strips the flushes' blank
+                // rows, because the row *below* this response is the next
+                // block's divider to emit — synthetic content ends at a line
+                // boundary and never with a separator. What is left is the
+                // renderer's bytes, with its own trailing blank normalized to
+                // the one line terminator the last line needs.
                 let alone = renderer_alone(text);
+                let mut expected = alone.trim_end_matches('\n').to_string();
+                if !expected.is_empty() {
+                    expected.push('\n');
+                }
                 assert_eq!(
                     painted,
-                    format!("\n{alone}\n"),
+                    expected,
                     "host contributed extra bytes for {text:?} [{}]",
                     chunk.name()
                 );

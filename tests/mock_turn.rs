@@ -406,6 +406,16 @@ fn blanks_before_status(data: &[u8]) -> usize {
             break;
         }
     }
+    if blanks > 1 {
+        let last = rows[..bar]
+            .iter()
+            .rposition(|r| !r.trim().is_empty())
+            .unwrap_or(0);
+        eprintln!(
+            "BLANKS={blanks} bar={bar} last_content={last} rows={:?}",
+            &rows[last..=bar]
+        );
+    }
     blanks
 }
 

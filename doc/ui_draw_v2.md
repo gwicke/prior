@@ -1568,6 +1568,9 @@ opposite principle:
   separator lines etc - UI issue
   - Provides the formatting, but does not force newlines into the content -
     enables the "collapse newlines between prompts" behavior.
+- Segment boundaries between begin_response and end_response should follow the
+  same conventions: One trailing newline, NO trailing separator lines.
+  Following content is responsible for any separators.
 
 ### Initial ContentDisplayKind set
 
