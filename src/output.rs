@@ -54,6 +54,19 @@ pub(crate) fn area_body(input: Option<Element>, overlay: Option<Element>) -> Vec
     items
 }
 
+/// The logical kind of one transcript content write.
+///
+/// Kinds, not formatting: `Prompt` is a committed user line, whoever decided to
+/// draw it with rules or without. Only what was *written* goes here, so
+/// changing the separators around a kind cannot invalidate the record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ContentDisplayKind {
+    /// A user line committed with Enter — a turn's prompt, a slash command, or
+    /// a `!command`. Consecutive ones share a divider rather than stacking one
+    /// between each pair.
+    Prompt,
+}
+
 /// Ends a content batch when dropped: one frame re-emit for the whole burst,
 /// instead of one per write (ui_draw_v2 R5).
 ///
@@ -219,6 +232,20 @@ pub trait Output: Send + Sync {
     /// hint/status line and REPL-originated confirmations). Advances the
     /// tracked cursor by the wrapped line count.
     fn display_plain(&self, _text: &str) {}
+
+    /// A line the user committed with Enter — a turn's prompt, a slash command,
+    /// or a `!command` — bracketed by rules, the way a turn is (ui_draw_v2 R4).
+    ///
+    /// The default draws all three parts unconditionally, which is what every
+    /// implementation that does not override it wants. `ConsoleOutput`
+    /// overrides it to *share* a rule with a directly preceding commit rather
+    /// than stacking one between each pair; that is a drawing decision about
+    /// how a kind looks, and no other implementation draws rules to collapse.
+    fn display_committed_prompt(&self, line: &str) {
+        self.display_separator();
+        self.display_plain(line);
+        self.display_separator();
+    }
     /// Current cursor row (1-based). The REPL uses it to position the input
     /// line at the natural cursor rather than forcing it to the screen
     /// bottom (which would leave a gap in the scrollback). The default
@@ -1669,10 +1696,34 @@ impl ConsoleOutput {
     /// through here or [`Self::with_content_writer`], so the count cannot be
     /// forgotten; a writer that bypassed both is a bug the frame tests find.
     fn write_content(&self, bytes: &[u8]) {
+        self.write_content_kinded(bytes, None);
+    }
+
+    /// [`Self::write_content`] that also says what was written, so
+    /// `with_content_writer` can record it as the transcript's last kind.
+    ///
+    /// Most content is not classified — a message, a tool result, streamed
+    /// text — and passes `None`, which simply clears the record. The point of
+    /// the parameter is that a *caller* declares its own kind; the choke point
+    /// never has to guess from the bytes.
+    fn write_content_kinded(&self, bytes: &[u8], kind: Option<ContentDisplayKind>) {
         let width = term_width();
-        self.with_content_writer(width, |out| {
+        self.with_content_writer(width, kind, |out| {
             let _ = out.write_all(bytes);
         });
+    }
+
+    /// The rule that brackets a committed prompt — written with the prompt's
+    /// kind rather than as a bare separator.
+    ///
+    /// The bracket belongs to the prompt it wraps, so what the next write reads
+    /// still says `Prompt`. That is the whole collapsing contract in one line:
+    /// the three writes of a bracket are still one committed prompt, and the
+    /// next commit may share its closing rule instead of opening a new one.
+    fn committed_prompt_rule(&self) {
+        let width = term_width();
+        let rule = format!("{}\n", style("─".repeat(width)).dim());
+        self.write_content_kinded(rule.as_bytes(), Some(ContentDisplayKind::Prompt));
     }
 
     /// Run `f` with the writer lock wrapped in a [`RowCounter`], then advance
@@ -1689,11 +1740,25 @@ impl ConsoleOutput {
     /// `width` is the width the content is being rendered for; pass the
     /// renderer's own width so a line that wrapped at render time is counted
     /// at that width.
-    fn with_content_writer<T, F>(&self, width: usize, f: F) -> T
+    ///
+    /// `kind` is what this write *is* (see [`ContentDisplayKind`]). It is
+    /// recorded as the transcript's last kind once the write has landed —
+    /// recorded last so a wrapper that makes several of these calls can leave
+    /// the kind it wants standing, rather than having its own first call clear
+    /// it. `None` clears the record: "unclassified" is the honest answer for
+    /// content that did not declare itself.
+    fn with_content_writer<T, F>(&self, width: usize, kind: Option<ContentDisplayKind>, f: F) -> T
     where
         F: FnOnce(&mut dyn io::Write) -> T,
     {
         let mut out = self.writer.lock().unwrap();
+        // This write's kind becomes the transcript's last, so the next write's
+        // collapse decision reads it. The *caller* declares the kind — the
+        // choke point never guesses from bytes — which puts one obligation on
+        // a wrapper that draws several writes: the bracket around a committed
+        // prompt has to pass `Prompt` for the rule *and* the line, or its own
+        // final write would clear the very record the next commit checks.
+        self.draw.lock().unwrap().last_content_display_kind = kind;
         // **Consume, do not erase** (§4.5 P1). The cursor is inside the live
         // frame, so it walks up to the fold and the write takes those rows over
         // from the top down. The frame's rows are about to hold content, not be
@@ -2662,6 +2727,39 @@ impl Output for ConsoleOutput {
         let _ = out.flush();
     }
 
+    /// Bracketed, and — where the previous content was also a committed
+    /// prompt — *sharing* the closing rule with it instead of stacking one
+    /// (ui_draw_v2 R4).
+    ///
+    /// The decision reads the transcript's last kind and is taken **before**
+    /// any of the writes below, because those three writes each record the
+    /// kind themselves; reading later would only ever find this prompt.
+    ///
+    /// ```text
+    /// ────
+    /// first
+    /// ────
+    /// second
+    /// ────
+    /// ```
+    ///
+    /// It stops at the prompt rather than at the rule: content either side
+    /// still gets its blank line from `boundary()`, so a prompt followed by
+    /// model output reads as a turn, while two adjacent prompts read as two
+    /// commits sharing one rule.
+    fn display_committed_prompt(&self, line: &str) {
+        let shares_rule =
+            self.draw.lock().unwrap().last_content_display_kind == Some(ContentDisplayKind::Prompt);
+        if !shares_rule {
+            self.committed_prompt_rule();
+        }
+        self.write_content_kinded(
+            format!("{}\n", line).as_bytes(),
+            Some(ContentDisplayKind::Prompt),
+        );
+        self.committed_prompt_rule();
+    }
+
     fn draw_frame(
         &self,
         frame: &Frame,
@@ -2792,7 +2890,7 @@ impl Output for ConsoleOutput {
         // One counted block: the boundary blank (if any) and the rendered
         // blocks. The renderer produced the bytes, so the counter measures
         // them rather than the delta text (§9 #10).
-        self.with_content_writer(current_width, |mut out| {
+        self.with_content_writer(current_width, None, |mut out| {
             // Thinking just ended: commit whatever is still buffered (while dim
             // is still on) so it lands above the answer, then turn the dim off
             // and put one blank line between them. The dim reset MUST come
@@ -2851,7 +2949,7 @@ impl Output for ConsoleOutput {
         let current_width = current_term_width();
         // One counted block: the answer commit, the thinking commit, the
         // boundary blank and the dim reset.
-        self.with_content_writer(current_width, |mut out| {
+        self.with_content_writer(current_width, None, |mut out| {
             // Commit any open answer paragraph so the tool call/result prints
             // below, then start a *fresh* answer renderer for the next segment.
             // This drops the renderer's `pending_gap`, which otherwise fires at
@@ -2891,7 +2989,7 @@ impl Output for ConsoleOutput {
         let current_width = current_term_width();
         // One counted block: the answer and thinking flushes and the
         // trailing blank.
-        self.with_content_writer(current_width, |mut out| {
+        self.with_content_writer(current_width, None, |mut out| {
             // Finalize the answer document.
             {
                 let mut parser = self.parser.lock().unwrap();

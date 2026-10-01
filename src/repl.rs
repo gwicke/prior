@@ -2026,16 +2026,16 @@ impl Repl {
         // (plan §4.2). Clear the input region, then echo the line
         // at the caret the frame apply left.
         redraw(&LineEditor::new(), &[], sel, dims);
-        // Bracketed by rules, the way a turn is. A committed line is a real
-        // event in the transcript — `/thinking high` changed a setting the reader
-        // will want to find again after scrolling — and a bare `/thinking high`
-        // between two answers is easy to read as something the model said. The
-        // status bar follows underneath, because the next `redraw` repaints the
-        // frame below whatever was just written: content written at the caret
-        // pushes the tracked row down, and the next apply clears from *there*.
-        output.display_separator();
-        output.display_plain(line);
-        output.display_separator();
+        // Bracketed by rules, the way a turn is — and, when a prompt follows
+        // directly, sharing one with it rather than stacking two (ui_draw_v2
+        // R4). A committed line is a real event in the transcript — `/thinking
+        // high` changed a setting the reader will want to find again after
+        // scrolling — and a bare `/thinking high` between two answers is easy
+        // to read as something the model said. The status bar follows
+        // underneath, because the next `redraw` repaints the frame below
+        // whatever was just written: content written at the caret pushes the
+        // tracked row down, and the next apply clears from *there*.
+        output.display_committed_prompt(line);
         editor.set(next_input);
     }
 
@@ -3024,30 +3024,33 @@ mod tests {
         }
         let rows = screen_rows(&out.end_capture());
 
-        let rule = rows.iter().position(|r| r.starts_with('\u{2500}'));
-        let first = rule.expect("the first rule is on screen");
-        let second = rows
+        // Two commits, and the rule *between* them is shared: one `──────`,
+        // not the first's closing rule stacked against the second's opening
+        // one (which is what this test's arithmetic used to assume — four
+        // rules, adjacent, and a `third == second + 1` that only held because
+        // both rules were drawn). Three rules for two commits is the outer
+        // pair of each plus that shared middle.
+        let rules: Vec<usize> = rows
             .iter()
             .enumerate()
-            .skip(first + 1)
-            .find(|(_, r)| r.starts_with('\u{2500}'))
+            .filter(|(_, r)| r.starts_with('\u{2500}'))
             .map(|(i, _)| i)
-            .expect("a rule below the first committed line");
-        // rule(1st), line, rule(2nd) … rule(3rd): rules at `first`, `second`,
-        // and the third pair's own opening rule must follow `second` directly.
-        let third = rows
-            .iter()
-            .enumerate()
-            .skip(second + 1)
-            .find(|(_, r)| r.starts_with('\u{2500}'))
-            .map(|(i, _)| i)
-            .expect("the next group's opening rule");
+            .collect();
         assert_eq!(
-            third,
-            second + 1,
-            "no blank row between the two rule groups: {:?}",
-            &rows[first..=third + 1]
+            rules.len(),
+            3,
+            "two consecutive commits share the rule between them: {rows:?}"
         );
+        // …and nothing spaced out: the point of the shared rule is that a
+        // prompt commits directly beneath the one above it (ui_draw_v2 R4).
+        for pair in rules.windows(2) {
+            assert!(
+                rows[pair[0] + 1..pair[1]]
+                    .iter()
+                    .all(|r| !r.trim().is_empty()),
+                "blank row between the rules of two consecutive commits: {rows:?}"
+            );
+        }
     }
 
     /// A committed prompt following turn content keeps **both** its rules.

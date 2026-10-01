@@ -21,6 +21,7 @@
 
 use std::ops::Range;
 
+use crate::output::ContentDisplayKind;
 use crate::slashdot_menu::table::display_width;
 
 /// Live-region budget for a terminal of `term_h` rows: the frame may occupy
@@ -452,6 +453,18 @@ pub(crate) struct DrawCache {
     /// branch both apply frames now, and two independent books of the same
     /// number are two ways for them to disagree about whether a repaint is due.
     pub(crate) applied: Option<(usize, usize)>,
+    /// The logical kind of the **last transcript content** written.
+    ///
+    /// Not "was a rule just emitted" — *what was written*, so a change to how
+    /// content is formatted does not have to change this. `None` means the
+    /// last write was not classified (which is every path that does not opt
+    /// in), and `with_content_writer` overwrites it on every content write
+    /// rather than letting it go stale.
+    ///
+    /// `draw_frame` deliberately does **not** touch it: an area apply is not
+    /// transcript content, and treating it as such would let a frame's last
+    /// row decide what a later commit may collapse against.
+    pub(crate) last_content_display_kind: Option<ContentDisplayKind>,
     /// True while a content batch is open (`Output::begin_batch`). While set a
     /// content write consumes the frame and does **not** put it back — one
     /// re-emit when the guard drops, instead of one per write (ui_draw_v2 R5).
@@ -489,6 +502,7 @@ impl DrawCache {
             live: None,
             element_stack: Vec::new(),
             applied: None,
+            last_content_display_kind: None,
             batch_active: false,
             deferred: None,
         }
