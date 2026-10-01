@@ -28,7 +28,7 @@ use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use std::cell::Cell;
+
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
@@ -1292,18 +1292,17 @@ impl Repl {
             epoch_active,
             overlay,
         } = session;
-        // Terminal size at the last paint, `(w, h)`. Resizes are consumed
-        // without repainting (see the wait below), so a mismatch at the top of
-        // the loop is the "repaint is due, and re-anchor first" signal (plan
-        // §4.2); a *width* change additionally wipes + replays first. The
-        // clear bound this pair used to provide is `plan_apply`'s
-        // `screen_bottom` now (plan §4.3). Interior mutability (`Cell`) lets
-        // the loop read it without holding a mutable borrow.
-        let painted_size = Cell::new(
-            crossterm::terminal::size()
-                .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
-                .unwrap_or((80, 24)),
-        );
+        // Terminal size at the last paint is `output.painted_size()`'s answer,
+        // read fresh each iteration rather than kept in a `Cell` here. Resizes
+        // are consumed without repainting (see the wait below), so a mismatch at
+        // the top of the loop is the "repaint is due, and re-anchor first"
+        // signal (plan §4.2); a *width* change additionally wipes + replays
+        // first. The clear bound this pair used to provide is `plan_apply`'s
+        // `screen_bottom` now (plan §4.3).
+        //
+        // Owning it in the output rather than here also means a resize that
+        // happens *during a turn* is caught when the next prompt opens, instead
+        // of being absorbed by a fresh read at entry.
 
         // Compose → allocate → render → apply the input frame (plan §5.2):
         // `[Input]`, or `[Input, Divider, Overlay]` while a pop-up shows.
@@ -1311,11 +1310,12 @@ impl Repl {
         // row-diff (so a tall pop-up's scroll is followed without a row
         // counter), and the scroll `delta` and bounded clear live in
         // `plan_apply`. Content *above* the frame (greeter / status / session)
-        // is never touched. The closure's one piece of state is
-        // `painted_size`: compose and apply both receive the same `dims`, so
-        // they cannot disagree on the frame's size (ui_draw_v2 §9 #3), and
-        // the applied pair `draw_frame` reports is what gets recorded — the
-        // repaint bookkeeping is the engine's fact, not a secondhand read.
+        // is never touched. The closure keeps no state of its own: compose and
+        // apply both receive the same `dims`, so they cannot disagree on the
+        // frame's size (ui_draw_v2 §9 #3), and the applied pair `draw_frame`
+        // reports is recorded by the output itself — the repaint bookkeeping is
+        // the engine's fact, not a secondhand read and not a number this loop
+        // has to carry between calls.
         // The prompt-side status bar: the same `status_line` the mid-turn bar
         // uses, with the dot **grey** — the two states are the whole reason the
         // bar is permanent. Built once per `read_input`, not per keystroke: the
@@ -1341,8 +1341,7 @@ impl Repl {
                 // and nothing comes back, so no `Vec<Element>` crosses a call
                 // site (ui_draw_v2 §5.1.1) — and this can no longer build a
                 // `Frame` by hand.
-                let applied = output.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
-                painted_size.set(applied);
+                let _ = output.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
             };
         loop {
             // On resume from Ctrl-Z (editing phase; the in-flight reader thread
@@ -1354,7 +1353,7 @@ impl Repl {
                 let _ = self.guard.start();
                 let _ = output.cursor_row();
             }
-            // Resize detection against `painted_size`. Resize events are
+            // Resize detection against the output's `painted_size`. Resize events are
             // consumed without repainting (see the wait below), so after a drag
             // this check first fires on the keystroke that triggers the
             // repaint: a size mismatch means "repaint is due, and re-anchor
@@ -1366,7 +1365,7 @@ impl Repl {
             let (cur_w_u16, cur_h_u16) = crossterm::terminal::size().unwrap_or((80, 24));
             let cur_h = cur_h_u16 as usize;
             let cur_w = cur_w_u16 as usize;
-            let (painted_w, painted_h) = painted_size.get();
+            let (painted_w, painted_h) = output.painted_size();
             if cur_w != painted_w || cur_h != painted_h {
                 // Key-triggered repaint after a size change. A *width*
                 // change makes a reflowing terminal (wezterm) re-wrap the

@@ -287,8 +287,8 @@ pub trait Output: Send + Sync {
     /// Callers supply *content*: the pieces, **moved in**. Nothing comes back —
     /// no `Vec<Element>` crosses a call site, because no caller ever used one
     /// except to hand it straight to the next statement. The composition is
-    /// recorded through [`remember_area`](Output::remember_area), which is what
-    /// lets §4.5's content path re-draw the area without recomposing it.
+    /// recorded through [`remember_compose`](Output::remember_compose), which is
+    /// what lets §4.5's content path re-draw the area without recomposing it.
     ///
     /// The budget is derived from `dims`, never passed in — a caller that hands
     /// a budget is being asked to know something it shouldn't. `dims` itself
@@ -312,15 +312,37 @@ pub trait Output: Send + Sync {
         let frame = render(&stack, &heights, tw);
         let applied = self.draw_frame(&frame, policy, dims);
         // Moved, never copied: the recipe belongs to the composition that built
-        // it, and the cache is the only other place that reads it.
-        self.remember_area(stack);
+        // it, and the cache is the only other place that reads it. The size is
+        // written under the same lock so the recipe and the geometry it was
+        // rendered at can never be read apart.
+        self.remember_compose(stack, applied);
         applied
     }
 
-    /// Record the composition [`draw_elements`](Output::draw_elements) just
-    /// built, so §4.5's content path can re-draw it without recomposing.
+    /// Record what [`draw_elements`](Output::draw_elements) just built — the
+    /// composition, so §4.5's content path can re-draw it without recomposing,
+    /// and the size it was applied at, so [`painted_size`](Output::painted_size)
+    /// answers from the same place.
+    ///
     /// Default no-op: an output with no screen has nothing to remember.
-    fn remember_area(&self, _stack: Vec<Element>) {}
+    fn remember_compose(&self, _stack: Vec<Element>, _applied: (usize, usize)) {}
+
+    /// The size the **last frame this output applied** took — the one number
+    /// resize detection compares the terminal against (ui_draw_v2 §9 #3).
+    ///
+    /// Before anything has been applied, a fresh terminal query: a caller that
+    /// has not painted yet should start from what is actually on screen, not
+    /// from a size nobody drew at.
+    ///
+    /// Distinct from [`frame_size`](Output::frame_size), which is the *current*
+    /// terminal size and never a memory — that is what a dialog wants when it
+    /// opens, this is what a painter wants when it is deciding whether its last
+    /// paint still describes the screen.
+    fn painted_size(&self) -> (usize, usize) {
+        crossterm::terminal::size()
+            .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
+            .unwrap_or((80, 24))
+    }
 
     /// Gate the background in-flight reader should honor. While it is `true`,
     /// the reader must not read stdin, because a confirmation dialog on the
@@ -2508,6 +2530,17 @@ impl Output for ConsoleOutput {
         (term_width(), term_height())
     }
 
+    fn painted_size(&self) -> (usize, usize) {
+        // The size of the last frame actually applied, so a painter comparing
+        // the terminal against it notices a change made since — including one
+        // that happened while someone else (a turn) held the screen.
+        self.draw.lock().unwrap().applied.unwrap_or_else(|| {
+            crossterm::terminal::size()
+                .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
+                .unwrap_or((80, 24))
+        })
+    }
+
     fn draw_frame(
         &self,
         frame: &Frame,
@@ -2963,8 +2996,12 @@ impl Output for ConsoleOutput {
     /// Remember the composition so §4.5's content path can re-draw it. The only
     /// output that has a screen has something to keep; everyone else drops it
     /// (the default), which is also why nothing here can be read by mistake.
-    fn remember_area(&self, stack: Vec<Element>) {
-        self.draw.lock().unwrap().element_stack = stack;
+    fn remember_compose(&self, stack: Vec<Element>, applied: (usize, usize)) {
+        // One lock for both: the recipe and the geometry it was rendered at
+        // describe one paint and must not be read apart.
+        let mut draw = self.draw.lock().unwrap();
+        draw.element_stack = stack;
+        draw.applied = Some(applied);
     }
 
     /// Remember the status line to paint after each content block; see

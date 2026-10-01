@@ -439,6 +439,19 @@ pub(crate) struct DrawCache {
     /// invalidation — those retire the frame's *position*, and the recipe is
     /// exactly what survives it. A later `draw_elements` overwrites it.
     pub(crate) element_stack: Vec<Element>,
+    /// The size the last `draw_elements` actually applied (clamped), i.e. what
+    /// the *next* compose can assume about what is on screen — the answer to
+    /// "has the terminal changed shape since?" (ui_draw_v2 §9 #3).
+    ///
+    /// `None` until the first apply, so a caller asking before anything has
+    /// been painted falls back to a live terminal query instead of being told
+    /// a size nobody ever drew at.
+    ///
+    /// Owned here rather than by the caller that happens to paint (the REPL
+    /// loop used to keep its own `Cell`): `read_input` and the turn's key
+    /// branch both apply frames now, and two independent books of the same
+    /// number are two ways for them to disagree about whether a repaint is due.
+    pub(crate) applied: Option<(usize, usize)>,
 }
 
 impl DrawCache {
@@ -448,6 +461,7 @@ impl DrawCache {
             screen_bottom: term_h.max(1),
             live: None,
             element_stack: Vec::new(),
+            applied: None,
         }
     }
 
