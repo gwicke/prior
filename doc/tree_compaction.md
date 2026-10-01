@@ -216,7 +216,7 @@ That is exactly the requested split: **replay full, context scoped.**
   1. always emits a summary message even when `summary` is empty;
   2. text format is `[Compacted: …]`, not pi's wrapper.
 - `build_context` (`session.rs:131`) applies `apply_transforms` then
-  `extract_messages`; `PicoAgent::prompt` (`agent.rs:101`) calls it fresh every
+  `extract_messages`; `CodeAgent::prompt` (`agent.rs:101`) calls it fresh every
   turn, so scoping automatically applies to normal turns **and** after resume.
 - Replay paths (`/replay` at `agent.rs:2283`, resume at `agent.rs:1538`) all go
   through `build_context().await` → `group_into_turns` → `replay_recent_turns`.
@@ -390,7 +390,7 @@ Notes:
   at the front, not duplicated at its path position).
 - This exactly reproduces pi's `buildContextEntries` message order for the
   single-compaction case: `[summary?] [firstKept…compaction) [post-compaction…]`.
-- Because `PicoAgent::prompt` calls `build_context()` fresh each turn
+- Because `CodeAgent::prompt` calls `build_context()` fresh each turn
   (`agent.rs:101`), **resume and subsequent turns get the scoped context for
   free** — this satisfies "compactions handled correctly when loading session
   context on session resume."
@@ -986,7 +986,7 @@ how the LLM gets the right context**. The user sees:
 
 1. Their prompt is committed to the scrollback.
 2. The "Thinking…" indicator appears (already emitted by
-   `PicoAgent::prompt`).
+   `CodeAgent::prompt`).
 3. The LLM streams its response.
 4. **Nothing else happens on screen**. No `/tree navigated (…)` line, no
    "forked from <id>", no "switched back to <id>". The committed prompt is
@@ -1034,7 +1034,7 @@ that path. This is the same logic the header already uses to count
 
 ### 6.5 Streamed vs. non-streamed summary
 
-`PicoAgent::summarize` (the existing non-streaming `chat()` surface used by
+`CodeAgent::summarize` (the existing non-streaming `chat()` surface used by
 `/tree switch --summarize`) is a natural fit and produces a cleaner UX:
 
 - It already runs a single user turn against the model with no hooks,

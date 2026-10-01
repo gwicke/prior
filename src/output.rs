@@ -65,7 +65,7 @@ pub trait Output: Send + Sync {
         self.display_text(text);
     }
     // ---- Response event sequence ----
-    // Both the live streaming path (`PicoAgent::prompt`) and the session
+    // Both the live streaming path (`CodeAgent::prompt`) and the session
     // replay path (`replay_units`) drive these methods in the same
     // order, so `ConsoleOutput` only needs one rendering implementation and
     // replay output is guaranteed to match live output.

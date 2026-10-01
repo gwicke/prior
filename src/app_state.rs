@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::agent::{PicoAgent, SessionUsage};
+use crate::agent::{CodeAgent, SessionUsage};
 use crate::session::repo::JsonlSessionRepo;
 use crate::session::{Session, SessionTreeNode};
 use crate::settings::{SettingKey, SettingsStore};
@@ -126,7 +126,7 @@ pub struct SessionSlot {
     /// The running agent — `Send + Sync`, all methods `&self`. Created
     /// and rebuilt **loop-side from the applied config** (convergence),
     /// published via `activate_agent`; handlers only consume the `Arc`.
-    pub(crate) agent: Option<Arc<dyn PicoAgent>>,
+    pub(crate) agent: Option<Arc<CodeAgent>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -460,13 +460,13 @@ impl AppState {
 
     /// Clone-out of the running agent (created/rebuilt loop-side from the
     /// applied config; handlers only consume).
-    pub fn agent(&self) -> Option<Arc<dyn PicoAgent>> {
+    pub fn agent(&self) -> Option<Arc<CodeAgent>> {
         self.state.lock().session.agent.clone()
     }
 
     /// Publish a freshly created/rebuilt agent (convergence, lazy first
     /// prompt, compact's Llm fallback — all loop-side).
-    pub fn activate_agent(&self, agent: Arc<dyn PicoAgent>) {
+    pub fn activate_agent(&self, agent: Arc<CodeAgent>) {
         self.state.lock().session.agent = Some(agent);
     }
 

@@ -62,7 +62,7 @@ This plan mirrors the existing `/model` + `/thinking` inline-overlay design in
   through `toml_edit` so user comments + recipes survive. See §A.5.
 - **Live application today** is the `SetModel`/`SetThinking` path in
   `agent.rs::run_interactive`: it clones `config`, calls `create_agent`, and
-  rebuilds the `Box<dyn PicoAgent>`. Phase 2 reuses this rebuild mechanism.
+  rebuilds the `Arc<CodeAgent>`. Phase 2 reuses this rebuild mechanism.
 
 ## A.2 Settings model
 

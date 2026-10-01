@@ -13,7 +13,7 @@ use crate::tools::{
 };
 use crate::Output;
 use crate::Result;
-use async_trait::async_trait;
+
 use chrono::Utc;
 use console::style;
 use futures::StreamExt;
@@ -75,63 +75,6 @@ pub struct SessionUsage {
     pub session_cache_creation_input_tokens: u64,
     /// Cumulative reasoning tokens across the session.
     pub session_reasoning_tokens: u64,
-}
-
-/// `?Send`: since U4.3 the turn carries the REPL's prompt session into
-/// [`PicoAgent::prompt`], and that session is single-threaded by construction —
-/// it holds `Rc`s (line windows, menu views) and a sync `mpsc` completer, and
-/// it never once leaves the task that `run_interactive` runs on.
-///
-/// Requiring a `Send` future here would force that session chain to `Arc`
-/// across `slashdot_menu` for a property it does not use: nothing spawns these
-/// futures. `main` awaits `run_interactive`, every test awaits it, and there
-/// is exactly one implementor. The values stay `Send + Sync` — it is only the
-/// *futures* that must be polled where they are awaited.
-///
-/// If a caller ever needs to `tokio::spawn` a request, the session chain has
-/// to become `Send` first; this bound is where that cost becomes visible.
-#[async_trait(?Send)]
-pub trait PicoAgent: Send + Sync {
-    /// `params` are the params to send *for this request*: the live ones, or
-    /// the live ones with this turn's per-turn overrides applied. Passing them
-    /// in rather than reading them off `AppState` is what makes an override
-    /// per-request — nothing here mutates the live params, so there is nothing
-    /// to restore and no path by which one leaks into the next turn.
-    async fn prompt(
-        &self,
-        input: &str,
-        session: Option<&Session>,
-        turn: &TurnPersistence,
-        params: &crate::params::ModelParams,
-        in_turn: Option<crate::repl::InTurnInput<'_>>,
-    ) -> Result<String>;
-    async fn run_once(&self, input: String) -> Result<String>;
-    /// Snapshot of the accumulated session token usage (for `/stat`). A zeroed
-    /// result means no completion call has reported usage yet.
-    fn session_usage(&self) -> SessionUsage;
-    /// Generate a concise summary of the given text using the agent's model.
-    /// Used by `/tree --summarize` to summarise abandoned branches.
-    async fn summarize(&self, prompt: &str) -> Result<String>;
-    /// Run a one-shot summarization whose **request context is the live
-    /// conversation prefix** at the session's current leaf, plus
-    /// `instruction` as the final user message.
-    ///
-    /// This is the cache-preserving compaction request shape: the leading
-    /// history is built by exactly the same `Session::build_context()` (plus
-    /// the same `maybe_strip_reasoning` pass) that a normal user prompt at
-    /// that position would use, so the provider's prefix cache — warmed by
-    /// the live turns — hits for the whole conversation span. Only the
-    /// summarization instruction itself is a fresh (cache-write) tail.
-    ///
-    /// The session's leaf is READ but never MODIFIED here: callers that need
-    /// to summarize a *prefix* of the conversation move the leaf to the
-    /// desired position first (the `/tree <id> compact llm` leaf dance) and
-    /// restore it on every return path afterwards.
-    async fn summarize_with_session_context(
-        &self,
-        session: &Session,
-        instruction: &str,
-    ) -> Result<String>;
 }
 
 /// Per-turn persistence state threaded across `prompt()` retries inside one
@@ -240,9 +183,29 @@ impl TurnPersistence {
     }
 }
 
-#[async_trait(?Send)]
-impl PicoAgent for CodeAgent {
-    async fn prompt(
+impl CodeAgent {
+    /// `params` are the params to send *for this request*: the live ones, or
+    /// the live ones with this turn's per-turn overrides applied. Passing them
+    /// in rather than reading them off `AppState` is what makes an override
+    /// per-request — nothing here mutates the live params, so there is nothing
+    /// to restore and no path by which one leaks into the next turn.
+    ///
+    /// **This future is `!Send`; the summarizers below are not.** Since U4.3
+    /// the turn carries the REPL's prompt session in, and that session is
+    /// single-threaded by construction — `Rc` line windows, `Rc` menu views, a
+    /// sync `mpsc` completer — and it never leaves the task `run_interactive`
+    /// runs on. Requiring `Send` would mean rewriting that chain to `Arc` for a
+    /// property nothing uses: `main` awaits `run_interactive`, every test
+    /// awaits it, and no request is ever spawned. (`run_once` inherits it — it
+    /// awaits this.)
+    ///
+    /// It is recorded here as a property of the future rather than as a bound
+    /// on an interface, which is what the trait this replaces declared: an
+    /// interface-wide `?Send` would cost every method its `Send`-ness to buy
+    /// one of them, and would need updating by hand if the session ever became
+    /// `Send`. A caller who wants to `tokio::spawn` a request makes the session
+    /// chain `Send` first, and this is where that becomes visible.
+    pub async fn prompt(
         &self,
         input: &str,
         session: Option<&Session>,
@@ -865,7 +828,7 @@ impl PicoAgent for CodeAgent {
         Ok(output)
     }
 
-    async fn run_once(&self, input: String) -> Result<String> {
+    pub async fn run_once(&self, input: String) -> Result<String> {
         self.output.display_header(
             &self.provider,
             &self.model,
@@ -888,11 +851,15 @@ impl PicoAgent for CodeAgent {
         Ok(response)
     }
 
-    fn session_usage(&self) -> SessionUsage {
+    /// Snapshot of the accumulated session token usage (for `/stat`). A zeroed
+    /// result means no completion call has reported usage yet.
+    pub fn session_usage(&self) -> SessionUsage {
         self.usage.lock().map(|g| *g).unwrap_or_default()
     }
 
-    async fn summarize(&self, prompt: &str) -> Result<String> {
+    /// Generate a concise summary of the given text using the agent's model.
+    /// Used by `/tree --summarize` to summarise abandoned branches.
+    pub async fn summarize(&self, prompt: &str) -> Result<String> {
         let msg = Message::user(prompt);
         let mut history: Vec<Message> = vec![];
         self.agent
@@ -901,7 +868,22 @@ impl PicoAgent for CodeAgent {
             .map_err(|e| classify_prompt_error(&e, "summarize"))
     }
 
-    async fn summarize_with_session_context(
+    /// Run a one-shot summarization whose **request context is the live
+    /// conversation prefix** at the session's current leaf, plus
+    /// `instruction` as the final user message.
+    ///
+    /// This is the cache-preserving compaction request shape: the leading
+    /// history is built by exactly the same `Session::build_context()` (plus
+    /// the same `maybe_strip_reasoning` pass) that a normal user prompt at
+    /// that position would use, so the provider's prefix cache — warmed by
+    /// the live turns — hits for the whole conversation span. Only the
+    /// summarization instruction itself is a fresh (cache-write) tail.
+    ///
+    /// The session's leaf is READ but never MODIFIED here: callers that need
+    /// to summarize a *prefix* of the conversation move the leaf to the
+    /// desired position first (the `/tree <id> compact llm` leaf dance) and
+    /// restore it on every return path afterwards.
+    pub async fn summarize_with_session_context(
         &self,
         session: &Session,
         instruction: &str,
@@ -2074,7 +2056,7 @@ fn merge_openrouter_params(existing: Option<serde_json::Value>) -> Option<serde_
     }
 }
 
-pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
+pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
     let provider = config.provider.to_lowercase();
     let model = config.model.clone();
     // What this model accepts, so a level it cannot serve is remapped instead
@@ -2143,7 +2125,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 None
             };
 
-            Box::new(CodeAgent::new(
+            CodeAgent::new(
                 rig_agent,
                 config.output,
                 config.tool_call_limit,
@@ -2156,7 +2138,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.cancel_notify.clone(),
                 config.reasoning_in_context,
                 message_logger,
-            ))
+            )
         }};
     }
 
@@ -2179,7 +2161,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
         };
     }
 
-    let agent: Box<dyn PicoAgent> = match provider.as_str() {
+    let agent: CodeAgent = match provider.as_str() {
         "anthropic" => {
             check_env!("ANTHROPIC_API_KEY");
             build!(anthropic anthropic::Client::from_env()?)
@@ -3624,7 +3606,7 @@ pub(crate) async fn generate_compaction(
         let cfg = app_state.config_snapshot();
         match create_agent(cfg).await {
             Ok(a) => {
-                let a: Arc<dyn PicoAgent> = Arc::from(a);
+                let a: Arc<CodeAgent> = Arc::from(a);
                 app_state.activate_agent(a.clone());
                 agent = Some(a);
             }
@@ -3681,7 +3663,7 @@ async fn draft_at_pivot(
     session_dir: &std::path::Path,
     mode: CompactSummaryMode,
     llm_payload: &str,
-    agent: &Option<Arc<dyn PicoAgent>>,
+    agent: &Option<Arc<CodeAgent>>,
     app_state: &AppState,
 ) -> std::result::Result<String, String> {
     let seed_text = session
@@ -4046,10 +4028,15 @@ fn save_recent_models(models: &[String]) {
     }
 }
 
-/// Interactive chat loop. Owns the `Box<dyn PicoAgent>` and the `AgentConfig`
-/// so slash commands that change model/provider/thinking can rebuild the agent
-/// via `create_agent` (required because `CodeAgent<M>` is generic over the
-/// provider's completion-model type).
+/// Interactive chat loop. Owns the agent and the `AgentConfig` so slash
+/// commands that change model/provider/thinking can rebuild the agent via
+/// `create_agent`.
+///
+/// (The parenthetical this used to carry — "required because `CodeAgent<M>` is
+/// generic over the provider's completion-model type" — died with the rig 0.42
+/// migration that made `CodeAgent` concrete. The rebuild mechanism outlived its
+/// original reason, which is usually a sign the comment should go rather than
+/// the code.)
 /// Fingerprint of the target state the REPL has *attempted* to build an agent
 /// for. Equality is the whole point: the loop rebuilds once per distinct
 /// fingerprint, so a failed `create_agent` is reported once instead of every
