@@ -1581,11 +1581,9 @@ enum ContentDisplayKind {
     /// (text, reasoning, tool calls), one kind until the refinement below.
     Response,
     /// `display_text` — a discrete message or error block.
-    Message,
+    SystemMessage,
     /// `display_system` — a marker or notice (`[compaction: …k tokens]`).
-    System,
-    /// `display_separator` — a `──────` rule written as content.
-    Rule,
+    SystemContent,
 }
 ```
 
