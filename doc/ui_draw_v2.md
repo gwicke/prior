@@ -678,12 +678,63 @@ the menu opens over it, `Esc` aborts the turn, and **submit is blocked in v0**
   input branch is mechanical — moving the state is not.
 - **I1 under concurrency.** The streaming path and the read loop both want the
   area. The resolution holds: the read loop is the area's sole composer, the
-  content path writes above the fold and asks for a re-emit (P1's mechanism),
+  content path writes above the fold and asks for a re-emit (U1's mechanism),
   and the two *interleave* in the `select!` rather than running in parallel.
 
 Growing the area mid-turn (the input popping up) adds **no new apply case** —
 see 4.5.1: emitting the taller area from the fold pushes the content above up
 by the terminal's own scroll.
+
+**Plan (2026-10-01). One pump, one composer.** The stream branch and the new key
+branch are arms of the *same* `tokio::select!` in `prompt()` (agent.rs:377), so
+they interleave by construction: no mutex, and the remembered `element_stack`
+cannot be stale relative to a compose because there is no parallel compose.
+
+**Reader: keep `spawn_in_flight_reader` as a thread, add a channel.** It already
+drops edit keys ("cannot be typed into the prompt mid-request") — U4.2 makes that
+arm send instead. Not `crossterm::EventStream`, though `event-stream` is already
+enabled and it would delete the thread, the 50 ms tick, the channel and the
+`done`/`join()` handoff:
+
+> **U4 requires a pauseable reader, and `EventStream` cannot be paused.**
+> `run_editor` (editor.rs) owns a stdin window covering *both* the `$EDITOR`
+> child and the post-editor DSR re-anchor — "its reply arrives on stdin, so an
+> unguarded reader would swallow it" — and it is reachable **mid-turn** through
+> the v2.5 menu (`v25_listing_node`, `v25_tree`), which U4 exists to open.
+> `ReaderHold` gates the thread with one `load()` before every `poll`; crossterm's
+> only disarm is `Drop`. EventStream would be safe only while nobody polls it
+> during the window — safe by timing, not by policy, and broken silently by
+> making the arm `.await`ed or catching a key mid-window.
+
+OQ4 makes `confirm` a menu, so it stops needing the gate — but the editor never
+can: it hands the tty to a child and reads a DSR back. Unifying confirm retires
+one gate user, not the gate. (Two further reasons the thread keeps its duties:
+Ctrl-C / Ctrl-Z / `Esc` / Resize must stay *inline* so an abort cannot ride
+behind a paste backlog, and `done` + `join()` is what makes `read_input` the sole
+reader again — a correctness property, not a detail. The 50 ms is only how long
+an *idle* `poll` takes to notice those flags; keystroke latency is ~0.)
+
+**Four units, separately green:**
+
+- **U4.1 — extract `PromptSession`** out of `read_input`'s frame (`editor`,
+  `nav`, `history`, `draft`, `prose`, `pending_key`, `v25_menu`, `v25_handle`,
+  overlays). `read_input` keeps the blocking loop and the drawing and drives it.
+  **`handle_key` draws nothing** — it mutates and returns `Option<InputAction>`,
+  the caller decides what to draw. One dispatcher, two pumps; generalises the
+  `edit_key` split (repl.rs:1631). Largest diff, **no behavior change**.
+- **U4.2 — forward edit keys** to an unbounded mpsc. Urgent keys stay inline.
+  Unbounded because a bounded channel that fills would block the reader at the
+  moment it most needs to deliver Ctrl-C.
+- **U4.3 — the key branch** in `prompt()`'s `select!`, plus a timer arm for
+  `prose.poll_timeout()` (repl.rs:1031) or prose goes inert mid-turn. Submit
+  behind a policy flag. First point at which mid-turn typing works.
+- **U4.4 — re-emit ordering:** key branch → `draw_elements` (compose + remember);
+  content branch → write + `reposition_area`.
+
+**Open:** `Esc` with a menu open — propose menu-first, abort only at root, which
+keeps "`Esc` aborts the turn" true at the prompt. Submit blocked in v0: notice or
+silent. Prose mid-turn: live or inert. One `PromptSession` carried across turns,
+or reconstructed each turn.
 
 - Verify: keys typed during a turn reach the editor; the area's row diff is
   correct under interleaving of chunks and keys — this wants a test that drives
