@@ -1551,6 +1551,50 @@ still targeted (no blanket `allow(dead_code)` came back).
   `streamed_thinking_is_counted`. The DSRs stayed, for the reasons §4.2 now
   records. §4.5 is the remaining work, and it was never gated on this.)*
 
+## Segment boundary normalization, v2
+Replace the boundary() stuff that emits newlines after turn content with the
+opposite principle:
+
+- Strip all leading / trailing blank lines from all content output at kind boundaries 
+  - begin_response and end_response strip leading / trailing newlines
+  - synthetic content never emits spacer lines at its boundaries
+- Single point emitting separator lines: Turn boundary() into
+  boundary(oldDisplayKind, newDisplayKind), and call it at the start of
+  `with_content_writer`. How it encodes its logic is internal (matrix,
+  conditions, whatever) - important is that it is the *only* point emitting
+  seprator lines at content bondaries. It owns the policy.
+- UI controls spacing at fold: Display a spacer line between last turn output and status
+  / input in the UI (frame content)- can change whether to display spacer(s),
+  separator lines etc - UI issue
+  - Provides the formatting, but does not force newlines into the content -
+    enables the "collapse newlines between prompts" behavior.
+
+### Initial ContentDisplayKind set
+
+```rust
+enum ContentDisplayKind {
+    /// `display_committed_prompt` — a line committed with Enter: a turn's
+    /// prompt, a slash command, a `!command`. Formats its own rules and
+    /// handles the collapse between consecutive ones.
+    Prompt,
+    /// `begin_response` … `end_response` — streamed model content
+    /// (text, reasoning, tool calls), one kind until the refinement below.
+    Response,
+    /// `display_text` — a discrete message or error block.
+    Message,
+    /// `display_system` — a marker or notice (`[compaction: …k tokens]`).
+    System,
+    /// `display_separator` — a `──────` rule written as content.
+    Rule,
+}
+```
+
+### Future refinements
+Pull streaming content boundary handling into the same layer:
+- Refine ContentDisplayKind to cover model content segments (text / reasoning / tool calls)
+- Maybe separately track streaming "first chunk" / "last chunk" status, since
+  each segment can be emitted in many delta chunks, without an actual
+  boundary.
 
 ## Backlog
 
