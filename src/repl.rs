@@ -871,9 +871,10 @@ impl PromptSession {
     /// Bumps the epoch only on the way *into* `/`, so one invocation's
     /// traversal memory survives every key inside it (see the struct doc).
     ///
-    /// Takes the two fields rather than `&mut self` because the caller
-    /// (`read_input`) has the session destructured into its loop's own
-    /// bindings, and the handle's borrow must not span them.
+    /// Takes the two fields rather than `&mut self` because [`eval`](Self::eval)
+    /// has the session destructured by the time it needs the handle, and a
+    /// borrow of the whole session would not survive alongside them. Passing
+    /// the fields keeps those borrows disjoint.
     ///
     /// TODO(api): see the note on [`SlashDotMenu::continuation_handle`] — this
     /// helper, and `epoch_active` below, exist only because the host has to
@@ -901,17 +902,19 @@ impl PromptSession {
     /// Writes nothing itself: what must reach the terminal comes back as an
     /// [`EvalOutcome`], and the frame it produced is in `overlay`.
     ///
-    /// Takes the session's fields rather than `&mut self` for the reason
-    /// [`handle_key`](Self::handle_key) does — `read_input` holds them
-    /// destructured into its loop's own bindings.
-    pub(crate) async fn eval(
-        editor: &mut LineEditor,
-        pending_key: &mut Option<crate::slashdot_menu::HostKey>,
-        menu: &mut crate::slashdot_menu::menu::SlashDotMenu,
-        epoch_active: &mut bool,
-        prose: &mut crate::prompt_complete::PromptCompletion,
-        overlay: &mut ActiveOverlay,
-    ) -> EvalOutcome {
+    /// Takes `&mut self` for the reason [`handle_key`](Self::handle_key) does:
+    /// both pumps drive one session by reference, and neither may see it split
+    /// apart.
+    pub(crate) async fn eval(&mut self) -> EvalOutcome {
+        let Self {
+            editor,
+            pending_key,
+            menu,
+            epoch_active,
+            prose,
+            overlay,
+            ..
+        } = self;
         let key = pending_key
             .take()
             .unwrap_or(crate::slashdot_menu::HostKey::None);
@@ -1000,11 +1003,13 @@ impl PromptSession {
     /// Hoisted for the same reason `eval` was: the turn's key branch must do
     /// this too, and two copies would let the cursor and the paint disagree
     /// about which row is selected.
-    pub(crate) fn sync_selection(
-        overlay: &ActiveOverlay,
-        sel: &mut usize,
-        last_disc: &mut u8,
-    ) -> Vec<String> {
+    pub(crate) fn sync_selection(&mut self) -> Vec<String> {
+        let Self {
+            overlay,
+            sel,
+            last_disc,
+            ..
+        } = self;
         let (raw_opts, active) = overlay.display_rows();
         let cur_disc = overlay.overlay_disc();
         if overlay.cursor_row().is_some() {
@@ -1041,31 +1046,37 @@ impl PromptSession {
     /// (ui_draw_v2 §4.5 U4). A dispatcher that painted would hand them two
     /// ways to write the terminal.
     ///
-    /// Takes the session's fields rather than `&mut self` because `read_input`
-    /// holds them destructured into its loop's own bindings, and a `&mut self`
-    /// would conflict with them. Same shape, and same reason, as
-    /// [`Repl::edit_key`] — which this calls for everything that is plain
-    /// text editing.
+    /// Takes `&mut self` because both pumps hold the session by reference:
+    /// `read_input`'s loop, and the turn's `select!` branch (ui_draw_v2 §4.5
+    /// U4). Everything that is plain text editing still goes to
+    /// [`Repl::edit_key`].
     ///
     /// `Ctrl-C` and `Ctrl-Z` are *not* here: they are process and terminal
     /// operations that must not queue behind edit keys, so the caller handles
     /// them before this runs.
     pub(crate) fn handle_key(
+        &mut self,
         key: crossterm::event::KeyEvent,
-        editor: &mut LineEditor,
-        nav: &mut Option<usize>,
-        draft: &mut String,
-        sel: &mut usize,
-        pending_key: &mut Option<crate::slashdot_menu::HostKey>,
-        overlay: &ActiveOverlay,
-        epoch_active: bool,
-        // Row count of `overlay` as the caller measured it — the bounds the
+        // Row count of the overlay as the caller measured it — the bounds the
         // host-side cursor needs. Passed rather than recomputed so the
         // dispatch and the paint cannot disagree about how many rows there are.
         opts_len: usize,
         prompt: &str,
         history: &mut History,
     ) -> KeyOutcome {
+        let Self {
+            editor,
+            nav,
+            draft,
+            sel,
+            pending_key,
+            ..
+        } = self;
+        // Read, never written: bound immutably so the arms see the
+        // `&ActiveOverlay` they were written against rather than a `&mut` that
+        // would re-bind every `plan` in them.
+        let overlay: &ActiveOverlay = &self.overlay;
+        let epoch_active: bool = self.epoch_active;
         // Ctrl-E: external editor for input buffer (no overlay) or header (V25Menu).
         if let KeyCode::Char('e') = key.code {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1330,18 +1341,6 @@ impl Repl {
         // value — and `PromptSession::handle_key` can be handed exactly the
         // fields it touches instead of a `&mut self` that would conflict with
         // these bindings.
-        let PromptSession {
-            editor,
-            nav,
-            draft,
-            sel,
-            last_disc,
-            prose,
-            pending_key,
-            menu,
-            epoch_active,
-            overlay,
-        } = session;
         // Terminal size at the last paint is `output.painted_size()`'s answer,
         // read fresh each iteration rather than kept in a `Cell` here. Resizes
         // are consumed without repainting (see the wait below), so a mismatch at
@@ -1437,18 +1436,17 @@ impl Repl {
             // instead of a second copy of the sequence (ui_draw_v2 §4.5 U4).
             //
             // Bound before the `match` on purpose: a future in a match
-            // scrutinee lives to the end of the `match`, and it holds the
-            // reborrow of `editor` the arms below want back.
-            let eval =
-                PromptSession::eval(editor, pending_key, menu, epoch_active, prose, overlay).await;
+            // scrutinee lives to the end of the `match`, and it would still
+            // hold the borrow of `session` the arms below want back.
+            let eval = session.eval().await;
             match eval {
                 EvalOutcome::Frame => {}
                 EvalOutcome::Commit { line, message } => {
                     Repl::emit_commit(
                         output,
-                        editor,
+                        &mut session.editor,
                         &redraw,
-                        *sel,
+                        session.sel,
                         (cur_w, cur_h),
                         &line,
                         "",
@@ -1477,20 +1475,20 @@ impl Repl {
                     // is an error path — rare, and the cost of being wrong
                     // is a stranded input region — not because the accounting
                     // needs rescuing.
-                    redraw(&LineEditor::new(), &[], *sel, (cur_w, cur_h));
+                    redraw(&LineEditor::new(), &[], session.sel, (cur_w, cur_h));
                     output.display_text(&message);
                     let _ = output.cursor_row();
                 }
             }
             // The rows the painter and the dispatcher both bound themselves to.
-            let opts = PromptSession::sync_selection(overlay, sel, last_disc);
+            let opts = session.sync_selection();
             // The painter reports the geometry it produced: terminal rows to
             // show, and the windowing focus among them. The focus used to be
             // re-derived here — `1 + Σ(1 + newlines(opts[..sel]))` — which
             // assumed a one-row header and no table header, so it pointed at
             // the wrong row for any menu with either (ui_draw_v2 §9 #5).
-            let (rows, focus) = overlay_paint(overlay, cur_w, cur_h);
-            redraw(&editor, &rows, focus, (cur_w, cur_h));
+            let (rows, focus) = overlay_paint(&session.overlay, cur_w, cur_h);
+            redraw(&session.editor, &rows, focus, (cur_w, cur_h));
 
             // --- Wait for a key (or a prose-completion wake). While a
             // prose request is armed/in flight, poll with a deadline so
@@ -1506,10 +1504,10 @@ impl Repl {
             // The painted frame is left for the terminal to reflow on its own;
             // the next keystroke re-anchors via DSR at the top of the loop and
             // repaints once, against the settled size. ---
-            let prose_wait = if editor.chars().first() == Some(&'/') {
+            let prose_wait = if session.editor.chars().first() == Some(&'/') {
                 None
             } else {
-                prose.poll_timeout()
+                session.prose.poll_timeout()
             };
             let ev: Option<Event> = loop {
                 let e = match prose_wait {
@@ -1562,28 +1560,20 @@ impl Repl {
                     // screen; this loop is the one that actually does it, so
                     // the same function can serve the turn's `select!` branch
                     // later (ui_draw_v2 §4.5 U4) without learning to draw.
-                    match PromptSession::handle_key(
-                        key,
-                        editor,
-                        nav,
-                        draft,
-                        sel,
-                        pending_key,
-                        overlay,
-                        *epoch_active,
-                        opts.len(),
-                        prompt,
-                        history,
-                    ) {
+                    match session.handle_key(key, opts.len(), prompt, history) {
                         KeyOutcome::Continue => {}
                         KeyOutcome::RunEditor => {
                             // The wrapper owns the whole turnover — reader
                             // gate, raw mode, DSR re-anchor; no local logic
                             // here (doc/editor_cleanup.md §2).
-                            match run_editor(&self.guard, output, &editor.text(), EditorMode::Edit)
-                            {
+                            match run_editor(
+                                &self.guard,
+                                output,
+                                &session.editor.text(),
+                                EditorMode::Edit,
+                            ) {
                                 Ok(new_text) => {
-                                    editor.set(&new_text);
+                                    session.editor.set(&new_text);
                                 }
                                 Err(e) => {
                                     let _ = io::stdout().write_all(
@@ -1594,14 +1584,14 @@ impl Repl {
                         }
                         KeyOutcome::Action(a) => {
                             if let InputAction::Submit(_) = &a {
-                                redraw(&LineEditor::new(), &[], *sel, (cur_w, cur_h));
+                                redraw(&LineEditor::new(), &[], session.sel, (cur_w, cur_h));
                             }
                             return Some(a);
                         }
                     }
                 }
                 Some(Event::Paste(text)) => {
-                    editor.insert_str(&text);
+                    session.editor.insert_str(&text);
                 }
                 Some(_) => {} // other events (mouse): ignored
                 None => {}    // prose wake with no key: re-eval below
