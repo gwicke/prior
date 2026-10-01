@@ -54,7 +54,44 @@ pub(crate) fn area_body(input: Option<Element>, overlay: Option<Element>) -> Vec
     items
 }
 
+/// Ends a content batch when dropped: one frame re-emit for the whole burst,
+/// instead of one per write (ui_draw_v2 R5).
+///
+/// Dropped rather than called, because `?`, an early `return` and a panic all
+/// release it. The failure mode of *forgetting* to end a batch would be a
+/// suppressed reposition — an area that was consumed and never comes back,
+/// which is exactly the invariant the per-write re-emit exists to hold. `Drop`
+/// makes that unreachable rather than merely documented.
+pub struct BatchGuard<'a> {
+    out: Option<&'a dyn Output>,
+}
+
+impl Drop for BatchGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(out) = self.out {
+            out.end_batch();
+        }
+    }
+}
+
 pub trait Output: Send + Sync {
+    /// Open a batch of content writes: repositioning is suppressed until the
+    /// returned guard drops, which emits the frame once (ui_draw_v2 R5).
+    ///
+    /// For bursts — replay, resume, anything that prints history — where the
+    /// per-write re-emit costs `O(writes × frame rows)` and the frame is not
+    /// changing anyway. **Not** for live streaming: there the re-emit is what
+    /// keeps the input row visible while content flows past it, and batching a
+    /// turn would hide the prompt for the whole response.
+    ///
+    /// The default guard does nothing, which is correct rather than lazy: an
+    /// output that does not override this already repositions on every write,
+    /// and that *is* the unbatched case.
+    fn begin_batch(&self) -> BatchGuard<'_> {
+        BatchGuard { out: None }
+    }
+    /// Ends a batch, called by [`BatchGuard`]'s drop. Default no-op.
+    fn end_batch(&self) {}
     fn display_text(&self, text: &str);
     /// Render a model *response* as markdown. Defaults to `display_text` so
     /// non-console impls (quiet/log/no-op) need no change; `ConsoleOutput`
@@ -1708,7 +1745,26 @@ impl ConsoleOutput {
         // `plan_consume` already retired `live` and only a reposition puts it
         // back (a missing `live` means the *next* write finds nothing to
         // consume and the area never returns).
+        //
+        // Inside a batch that reposition waits: the frame stays consumed for
+        // the whole burst and the guard's drop emits it once (ui_draw_v2 R5).
+        // The invariant above is not weakened — it is satisfied by the *final*
+        // reposition instead of by every intermediate one, and a write that
+        // finds no live area already takes the `None` path above, so content
+        // keeps flowing without a walk.
         if let Some(taken) = taken {
+            {
+                let mut cache = self.draw.lock().unwrap();
+                if cache.batch_depth > 0 {
+                    // Keep the *first* frame taken: it is `reposition_area`'s
+                    // fallback when no recipe recorded itself, and a later
+                    // write finds nothing to consume and so contributes none.
+                    if cache.deferred.is_none() {
+                        cache.deferred = Some(taken);
+                    }
+                    return r;
+                }
+            }
             let bytes = self.reposition_area(width, taken);
             let mut out = self.writer.lock().unwrap();
             let _ = out.write_all(bytes.as_bytes());
@@ -2539,6 +2595,34 @@ impl Output for ConsoleOutput {
                 .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
                 .unwrap_or((80, 24))
         })
+    }
+
+    fn begin_batch(&self) -> BatchGuard<'_> {
+        self.draw.lock().unwrap().batch_depth += 1;
+        BatchGuard { out: Some(self) }
+    }
+
+    fn end_batch(&self) {
+        // Locks taken separately and never nested the other way round: every
+        // other frame path holds `writer` *then* `draw`, so acquiring `draw`
+        // while holding `writer` here is the same order, and dropping it
+        // before `reposition_area` (which takes it again) keeps the two from
+        // ever being held inverted.
+        let taken = {
+            let mut cache = self.draw.lock().unwrap();
+            cache.batch_depth = cache.batch_depth.saturating_sub(1);
+            if cache.batch_depth > 0 {
+                return;
+            }
+            cache.deferred.take()
+        };
+        let Some(taken) = taken else {
+            return;
+        };
+        let bytes = self.reposition_area(term_width(), taken);
+        let mut out = self.writer.lock().unwrap();
+        let _ = out.write_all(bytes.as_bytes());
+        let _ = out.flush();
     }
 
     fn draw_frame(
@@ -4726,6 +4810,93 @@ mod tests {
             String::from_utf8_lossy(&bytes).escape_debug().to_string()
         );
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
+    }
+
+    /// A content batch defers the frame's re-emit to the guard's drop instead
+    /// of paying one per write (ui_draw_v2 R5).
+    ///
+    /// Both halves are asserted because either can break alone: the frame is
+    /// emitted **once** for a whole burst, *and* it comes back. The invariant
+    /// the per-write reposition exists to hold — an area that is consumed is
+    /// always put back — is not relaxed here, it is satisfied once at the end
+    /// instead of once per write.
+    #[test]
+    #[serial]
+    fn a_content_batch_emits_the_frame_once_at_the_end() {
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        let overlay = vec![
+            "MODEL            CTX    PRICE".to_string(),
+            "  gpt-5          400k   1.00".to_string(),
+        ];
+        let frame = crate::repl::Repl::compose_frame(
+            &crate::repl::LineEditor::new(),
+            "",
+            None,
+            &overlay,
+            0,
+            40,
+            10,
+        );
+        out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
+        {
+            let _batch = out.begin_batch();
+            out.display_text("first line");
+            out.display_text("second line");
+            out.display_text("third line");
+        } // the guard's drop owns the redraw
+        let bytes = out.end_capture();
+
+        // Once for the frame's own apply, once for the batch's single
+        // re-emit. Unbatched it is four — the apply plus one per write — and
+        // that multiplier is R5.
+        let text = String::from_utf8_lossy(&bytes);
+        let emits = text.matches("MODEL").count();
+        assert_eq!(
+            emits, 2,
+            "one frame re-emit for the whole batch, got {emits}: {text:?}"
+        );
+
+        // …and it came back, below the content it was consumed for.
+        let mut p = vt100::Parser::new(24, 40, 1000);
+        p.process(b"\r\n\r\n");
+        let onlcr: Vec<u8> = bytes
+            .iter()
+            .flat_map(|&b| {
+                if b == b'\n' {
+                    vec![b'\r', b'\n']
+                } else {
+                    vec![b]
+                }
+            })
+            .collect();
+        p.process(&onlcr);
+        let rows: Vec<String> = (0..10)
+            .map(|r| {
+                (0..120)
+                    .map(|c| {
+                        p.screen()
+                            .cell(r, c)
+                            .and_then(|x| x.contents().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect()
+            })
+            .collect();
+        let content_last = rows
+            .iter()
+            .rposition(|r| r.contains("third"))
+            .unwrap_or_else(|| panic!("content should be on screen: {rows:?}"));
+        for leftover in ["MODEL", "gpt-5"] {
+            let at = rows
+                .iter()
+                .position(|r| r.contains(leftover))
+                .unwrap_or_else(|| panic!("frame row {leftover:?} should be back: {rows:?}"));
+            assert!(
+                at > content_last,
+                "frame row {leftover:?} belongs below the content: {rows:?}"
+            );
+        }
     }
 
     /// A tool block followed by reasoning showed **two** blank lines: the host

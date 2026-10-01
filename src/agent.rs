@@ -3223,6 +3223,15 @@ fn render_turn(output: &dyn Output, turn: &ConversationTurn, leading_separator: 
 /// dim system notice between turns; `Nt`/`Nl` limits count TURNS (markers are
 /// not turns and are always drawn when inside the selected window).
 fn replay_units(output: &dyn Output, units: &[ReplayUnit], start: usize) {
+    // One frame re-emit for the whole replay, not one per line of history
+    // (ui_draw_v2 R5). All three callers — `/replay`, resume, and the silent
+    // Ctrl-Z restore — arrive here, so this is the one place the batching has
+    // to be declared.
+    //
+    // Deliberately *not* around live streaming: `stream_text` enters the same
+    // writer once per delta, and there the per-write re-emit is what keeps the
+    // input row visible while text flows past it.
+    let _batch = output.begin_batch();
     // Leading separators only space out turns (turns *after* the first one).
     // Compaction markers are not turns and never force a separator.
     let mut first_turn_seen = false;

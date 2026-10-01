@@ -452,6 +452,23 @@ pub(crate) struct DrawCache {
     /// branch both apply frames now, and two independent books of the same
     /// number are two ways for them to disagree about whether a repaint is due.
     pub(crate) applied: Option<(usize, usize)>,
+    /// Nesting depth of open content batches (`Output::begin_batch`). While
+    /// non-zero a content write consumes the frame and does **not** put it
+    /// back — one re-emit when the outermost guard drops, instead of one per
+    /// write (ui_draw_v2 R5). A depth rather than a flag so a nested batch
+    /// cannot re-enable per-write repositioning, or fire the trailing redraw,
+    /// while the outer one is still running.
+    pub(crate) batch_depth: usize,
+    /// The frame taken by a batch's *first* consume, held until the batch
+    /// ends.
+    ///
+    /// Needed because `reposition_area` falls back to `taken` when no recipe
+    /// recorded itself — reachable in production by `draw_frame` called
+    /// directly (`ui::resolve`'s empty frame), which applies a frame and
+    /// clears `element_stack`. Without this stash a batch would consume that
+    /// area and its final reposition would find an empty recipe and render
+    /// nothing, so the area would never return.
+    pub(crate) deferred: Option<Frame>,
 }
 
 impl DrawCache {
@@ -462,6 +479,8 @@ impl DrawCache {
             live: None,
             element_stack: Vec::new(),
             applied: None,
+            batch_depth: 0,
+            deferred: None,
         }
     }
 
