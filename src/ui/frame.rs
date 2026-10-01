@@ -465,6 +465,12 @@ pub(crate) struct DrawCache {
     /// transcript content, and treating it as such would let a frame's last
     /// row decide what a later commit may collapse against.
     pub(crate) last_content_display_kind: Option<ContentDisplayKind>,
+    /// True when that last write declared itself the last flush of its
+    /// segment, so the next content write opens a new block even under the
+    /// same kind. Read and cleared by `with_content_writer`, which is the only
+    /// consumer: like `last_content_display_kind`, it is not transcript
+    /// content and `draw_frame` leaves it alone.
+    pub(crate) last_content_closes_segment: bool,
     /// True while a content batch is open (`Output::begin_batch`). While set a
     /// content write consumes the frame and does **not** put it back — one
     /// re-emit when the guard drops, instead of one per write (ui_draw_v2 R5).
@@ -503,6 +509,7 @@ impl DrawCache {
             element_stack: Vec::new(),
             applied: None,
             last_content_display_kind: None,
+            last_content_closes_segment: false,
             batch_active: false,
             deferred: None,
         }

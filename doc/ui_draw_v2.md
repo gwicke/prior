@@ -1597,17 +1597,15 @@ Pull streaming content boundary handling into the same layer:
   each segment can be emitted in many delta chunks, without an actual
   boundary.
 
-## Backlog
-
-- Drawing efficiency
-  - Limit clearing:
-    - Overwrite only if frame height did not change, or if it increased. No
-      clearing.
-    - Only clear rows below frame if 
-      `old_frame_height - new_frame_height - content_rows_written > 0`, so if
-      old rows are not overwritten anyway, and the fold is now not at the
-      bottom-most possible position. Do this clearing *at the end* of the
-      regular output pass, to minimize flickering in new content.
-  - Caret-only moves: When only the caret moves (no row changes), is a
-    caret-only emit worth a special case, or is it subsumed by the diff (both
-    cheap)?
+## Drawing efficiency & audit
+- Limit clearing:
+  - Overwrite only if frame height did not change, or if it increased. No
+    clearing.
+  - Only clear rows below frame if 
+    `old_frame_height - new_frame_height - content_rows_written > 0`, so if
+    old rows are not overwritten anyway, and the fold is now not at the
+    bottom-most possible position. Do this clearing *at the end* of the
+    regular output pass, to minimize flickering in new content.
+- Caret-only moves: When only the caret moves (no row changes), is a
+  caret-only emit worth a special case, or is it subsumed by the diff (both
+  cheap)?
