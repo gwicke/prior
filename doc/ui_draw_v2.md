@@ -1126,7 +1126,7 @@ Every claim below was checked against the code, not against the phase list.
 
 #### Reported rendering issues
 
-Four issues found by hand, distinct from §5.2's placement — which they do not
+Five issues found by hand, distinct from §5.2's placement — which they do not
 affect, and which they should not be folded into. Triaged in this order.
 
 **R1 — the input row is painted even when there is nothing to show.** Mid-turn
@@ -1169,6 +1169,52 @@ is bracketed on both sides; a prompt is bracketed on one.
 The row to use already exists: it is the row that holds the status line, directly
 above the input (`compose_elements` pushes it at `repl.rs:1282`). On a regular
 commit that row becomes a divider instead, and the prompt commits beneath it.
+
+**R5 — bulk output re-emits the area after every line, and `/replay` re-emits
+its own menu between the lines of history.** Reported by hand: replaying a
+session is slow, and `/replay` menus keep popping up in the middle of the
+output they were invoked to produce.
+
+Both come from one shape. `with_content_writer` (`output.rs:1652`) does, **per
+write**:
+
+```
+lock writer → plan_consume (walk to the fold, take the frame) → write the
+             content → reposition_area → write the frame back below → flush
+```
+
+and `reposition_area` (`output.rs:1734`) does not replay the frame it just
+took — it re-*renders* `cache.element_stack`, the recipe the last compose
+recorded. So a burst of `N` lines pays `N` recipe re-renders and `N` frame
+re-emits, and the frame it re-emits is whatever that compose happened to
+contain. During `/replay` that includes the menu, so the menu is drawn again
+between each line of history, fighting the very output it should sit above.
+
+**Ruled out:** past prompts are *not* re-entering the slash machinery.
+`render_turn` (`agent.rs:3173`) hands the historical line to `display_plain`,
+which is `write_content("{text}\n")` — no parsing. The only `starts_with('/')`
+tests in the crate are on the live buffer (`repl.rs:943`), a session path
+(`session.rs:279`), and live submit dispatch (`repl.rs:1860`).
+
+**Open:** *which* recipe is in the stack. `read_input`'s submit paint passes
+`&[]` for the overlay (`repl.rs:1681`), which should leave the recipe
+menu-free by the time the command runs — so either something composed again
+after it (a mid-turn invocation carries the menu through `settle`), or the
+stack outlived the paint that should have replaced it. Distinguishing those
+decides the fix: stale ⇒ drop or re-record the recipe when the menu closes;
+merely expensive ⇒ the batch fast-path below removes the cost without touching
+the content.
+
+**The fast-path this wants.** Large batch output should defer the reposition:
+consume the frame, let it stay consumed for the whole burst, and do **one**
+`reposition_area` when the burst ends — the explicit "now redraw the frame"
+rather than one per write. The invariant `with_content_writer`'s comment
+guards still holds, because the final reposition is what restores `live` (a
+missing `live` means the *next* write finds nothing to consume and the area
+never returns); it only moves from every write to the end of the batch. Note
+this is not only a replay problem — `stream_text` (`output.rs:2668`) enters
+`with_content_writer` once per delta, so a live stream pays the same
+consume/reposition cycle per token, where the frame is merely small.
 
 ##### The structural fix behind R2 and R3
 
