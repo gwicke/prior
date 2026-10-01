@@ -206,10 +206,10 @@ the replacement text
 /// The batch policy sentence that follows the syntax: atomicity, and the
 /// `path:LINE` anchor the model needs for repeated text.
 const BLOCK_POLICY: &str = "Each block MUST specify its file path, and SHOULD \
-provide the 1-based start line number hint, from `read` or `grep`. \
+provide the 1-based start line number hint, e.g. from `read` or `grep`. \
 Line numbers greatly reduce the chance of edit failures, \
 especially when there are similar content lines in other parts of the file. Blocks \
-editing the same file are executed all-or-nothing";
+editing the same file are executed all-or-nothing. Multi-file batches are supported.";
 
 /// Static tool facade for `edit`. Hand-written (rather than `#[rig_tool]`) so
 /// the args deserializer can select a variant from the raw JSON and accept the
@@ -228,7 +228,7 @@ impl rig_core::tool::Tool for EditFile {
         format!(
             "Replace text in a file. Prefer the `blocks` string syntax with batching support:\n```\n{BLOCK_SYNTAX}\n```\n\
              {BLOCK_POLICY}\n\
-             For single edits, the traditional OpenAI path / oldText / newText API is available as well."
+             For single edits, the traditional OpenAI path / oldText / newText API is available too."
         )
     }
 
@@ -483,13 +483,13 @@ const BSED_BIN: &str = "bsed";
 
 #[rig_tool(
     name = "sed",
-    description = "Preview what GNU sed expressions would change in a file, as editable blocks. \
-This tool NEVER writes the file: it returns the change as @@@OLD / @@@NEW blocks, each \
-anchored to a line with a `path:LINE` header. Review them, then pass them to the `edit` tool \
-as its `blocks` argument to apply. One expression per line, GNU sed syntax (s///, d, a, i, c, \
+    description = "Safe GNU sed batch editing. Returns editable @@@OLD / @@@NEW blocks for the edit tool. \
+NEVER writes the file: it returns the change as @@@OLD / @@@NEW blocks, each \
+anchored to a line with a `path:LINE` header. Review the changes, edit @@@NEW text if necessary, \
+then pass blocks to the `edit` tool as its `blocks` argument to apply. \
+Syntax: One expression per line, GNU sed syntax (s///, d, a, i, c, \
 y///, addresses, ranges) — `c` works over an address range, replacing it with one copy of the \
-text. `w`, `e` and `q` are refused: use the `edit` or `bash` tools for those. Files with CRLF \
-line endings are refused; convert them to LF first.",
+text. `w`, `e` and `q` are refused: use the `edit` or `bash` tools for those.",
     required(path, expressions)
 )]
 pub async fn sed_preview(
