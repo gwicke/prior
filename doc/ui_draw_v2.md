@@ -739,6 +739,8 @@ or reconstructed each turn.
 - Verify: keys typed during a turn reach the editor; the area's row diff is
   correct under interleaving of chunks and keys — this wants a test that drives
   both from one thread on a deterministic schedule, not a pty race.
+- gwicke: Agreed, only abort turn when at prompt (empty or not), not when
+  overlay / menu is active.
 
 **U5 — Retire the DSRs that are no longer load-bearing.**
 With the fold maintained across turns and every content write counted (done: #10),
