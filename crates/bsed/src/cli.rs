@@ -47,7 +47,9 @@ PREVIEW (never writes; the default):
     -t, --trailing <N>          Extra unchanged lines after, on top of -c
                                 (default 0)
         --no-grow               Do not extend blocks to a balanced bracket
-    -b, --budget <BYTES>        Preview budget, single-file mode only (default 51200)
+    -b, --budget <SIZE>         Payload budget; a tree preview is cut at a file
+                                boundary. Accepts units: 32kb, 3mb, 1gib
+                                (default 512kb)
     -u, --unified              Emit a unified diff instead of blocks, for reading
                                 in a pager. A diff cannot be applied by anything:
                                 drop -u for blocks the `edit` tool takes. The
@@ -75,6 +77,14 @@ EXAMPLES:
     bsed apply -i < blocks.txt
     bsed apply src/x.rs < blocks.txt | diff src/x.rs -
 ";
+
+/// Default payload budget for the `bsed` binary: 512 KB.
+///
+/// Higher than [`crate::DEFAULT_PREVIEW_BUDGET`] on purpose. The library default
+/// is sized for a model reading a paste into `edit`; a person running `bsed -r`
+/// in a pager wants as much of the tree as will fit on a screen, and silently
+/// dropping the rest is the one outcome this tool must not produce quietly.
+const DEFAULT_CLI_BUDGET: usize = 512_000;
 
 /// Unchanged lines on each side of a change, when neither flag says otherwise.
 ///
@@ -274,7 +284,9 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
     let mut context: Option<usize> = None;
     let mut trailing: Option<usize> = None;
     let mut grow = true;
-    let mut budget = Options::default().max_preview_bytes;
+    // The CLI's own default is higher than the library's: here the reader is a
+    // person at a pager, and a truncated tree preview is the worst outcome.
+    let mut budget = DEFAULT_CLI_BUDGET;
     let mut script_parts: Vec<String> = Vec::new();
     let mut only_positional = false;
     let mut saw_e_or_f = false;
@@ -309,7 +321,10 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
             "-g" | "--glob" => globs.push(need(it.next(), "-g")?.to_string()),
             "-c" | "--context" => context = Some(need_num(it.next(), "-c")?),
             "-t" | "--trailing" => trailing = Some(need_num(it.next(), "-t")?),
-            "-b" | "--budget" => budget = need_num(it.next(), "-b")?,
+            "-b" | "--budget" => {
+                budget =
+                    crate::script::parse_size(need(it.next(), "-b")?).map_err(Failure::Usage)?;
+            }
             "--no-grow" => grow = false,
             "-u" | "--unified" => unified = true,
             "-n" | "--quiet" => {

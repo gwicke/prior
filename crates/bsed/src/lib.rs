@@ -44,11 +44,21 @@ pub struct Options {
     pub max_preview_bytes: usize,
 }
 
+/// Default preview budget for a library caller: 32 KB.
+///
+/// Small on purpose. The payload is a paste into the `edit` tool, and its cost is
+/// paid in a context window the caller is sharing with a conversation, so the
+/// default is set for the model that has to read it rather than for how much of
+/// a refactor it can cover. A caller that knows its reader wants more passes a
+/// bigger budget; the `bsed` binary's own default is higher, because there the
+/// reader is a person in a pager.
+pub const DEFAULT_PREVIEW_BUDGET: usize = 32_000;
+
 impl Default for Options {
     fn default() -> Self {
         Options {
             context: Context::default(),
-            max_preview_bytes: 50 * 1024,
+            max_preview_bytes: DEFAULT_PREVIEW_BUDGET,
         }
     }
 }
