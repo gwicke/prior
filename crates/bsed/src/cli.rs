@@ -801,9 +801,10 @@ fn recursive_preview(
              NOT in the output:\n",
             blocked.len()
         ));
-        for (path, why) in &blocked {
-            out.push_str(&format!("  {path}: {why}\n"));
-        }
+        push_list(
+            &mut out,
+            blocked.iter().map(|(p, why)| format!("{p}: {why}")),
+        );
     }
     if !crlf.is_empty() {
         out.push_str(&crlf_report(&crlf));
@@ -816,6 +817,32 @@ fn recursive_preview(
         payload,
         status: out,
     })
+}
+
+/// How many filenames a refusal note names before it counts the rest.
+const MAX_LISTED: usize = 10;
+
+/// Append at most [`MAX_LISTED`] indented entries, then a count of the remainder.
+///
+/// A tree can refuse hundreds of files for one reason, and naming every one of
+/// them costs more of a reader's attention than it returns. The count is what
+/// tells a reader how big the problem is and the first few are enough to show
+/// its shape; the rest are recoverable by looking at the tree, which is what a
+/// reader is going to do with the count anyway.
+fn push_list(out: &mut String, items: impl Iterator<Item = String>) {
+    let mut items = items.peekable();
+    let mut n = 0usize;
+    while n < MAX_LISTED {
+        let Some(item) = items.next() else { return };
+        out.push_str("  ");
+        out.push_str(&item);
+        out.push('\n');
+        n += 1;
+    }
+    let rest = items.count();
+    if rest > 0 {
+        out.push_str(&format!("  ... and {rest} more\n"));
+    }
 }
 
 /// Name the files that were refused for CRLF, and what to do about them.
@@ -833,9 +860,7 @@ fn crlf_report(paths: &[String]) -> String {
         paths.len(),
         if paths.len() == 1 { "it" } else { "them" }
     );
-    for p in paths {
-        s.push_str(&format!("  {p}\n"));
-    }
+    push_list(&mut s, paths.iter().map(|p| p.to_string()));
     s
 }
 

@@ -362,7 +362,20 @@ pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolE
 ///
 /// The `bsed` process is run with a capture cap just above this so a truncated
 /// read is detectable rather than silently acted on.
-const SED_PREVIEW_BUDGET: usize = 50 * 1024;
+///
+/// A bare byte count rather than the `32kb` form `-b` now accepts: the tool picks
+/// this number, so a unit suffix buys nothing, and `bsed_available()` only
+/// resolves the binary from PATH without checking what it can parse. A picocode
+/// paired with a `bsed` older than unit support would fail every `sed` call over
+/// a suffix the user never typed. Units are for people typing into a shell.
+///
+/// The slack absorbs the commentary `bsed` writes to stderr, which the capture
+/// merges in. It is sized for the longest status this tool can provoke: the
+/// refusal notes now name at most ten files each and then count the rest, so the
+/// commentary is bounded by a small constant rather than by the size of the
+/// tree. A tree of 50,000 refused files costs the same as a tree of ten, which
+/// is the point -- an unbounded note would eat the payload's own budget.
+const SED_PREVIEW_BUDGET: usize = 32_000;
 const SED_CAPTURE_SLACK: usize = 8 * 1024;
 
 /// The absolute path of the `bsed` binary, or `None` when it is not installed.
@@ -487,6 +500,13 @@ const BSED_BIN: &str = "bsed";
 NEVER writes the file: it returns the change as @@@OLD / @@@NEW blocks, each \
 anchored to a line with a `path:LINE` header. Review the changes, edit @@@NEW text if necessary, \
 then pass blocks to the `edit` tool as its `blocks` argument to apply. \
+Point `path` at a directory to preview every text file under it (hidden and \
+ignored files are skipped); a file path previews just that file. The payload is \
+budgeted, so a tree that matches in many places returns ONE batch, cut at a \
+file boundary and saying so: when the summary says `returned N of M`, apply the \
+batch, then run the same call again for the rest. Re-running is how a wide \
+refactor finishes, and it costs nothing to re-run on a tree that is already \
+done — you get `no lines matched` back. \
 Syntax: One expression per line, GNU sed syntax (s///, d, a, i, c, \
 y///, addresses, ranges) — `c` works over an address range, replacing it with one copy of the \
 text. `w`, `e` and `q` are refused: use the `edit` or `bash` tools for those.",
