@@ -405,6 +405,15 @@ impl PicoAgent for CodeAgent {
             None => (None, None, "", None, None),
         };
         loop {
+            // Prose's wake-up for this iteration, resolved *before* the select
+            // rather than inside the timer's async block: `Option<Duration>` is
+            // `Copy`, so the future below needs nothing from the session and
+            // borrows nothing — one fewer thing held across every await in
+            // here. Computed per iteration, which is as fresh as computing it
+            // in the block would be, since the block is rebuilt each pass.
+            let prose_deadline = it_session
+                .as_deref()
+                .and_then(crate::repl::PromptSession::prose_timeout);
             tokio::select! {
                 item = stream.next() => {
                     match item {
@@ -794,11 +803,9 @@ impl PicoAgent for CodeAgent {
                 // same reason `read_input`'s wait is a *poll* while prose is
                 // armed and a block otherwise.
                 _ = async {
-                    match it_session.as_deref() {
-                        Some(s) => match s.prose_timeout() {
-                            Some(d) => tokio::time::sleep(d).await,
-                            None => std::future::pending().await,
-                        },
+                    match prose_deadline {
+                        Some(d) => tokio::time::sleep(d).await,
+                        // `None`: nothing pending, and no timer to wake for.
                         None => std::future::pending().await,
                     }
                 } => {
