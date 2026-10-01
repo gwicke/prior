@@ -388,40 +388,47 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
         diff_context: ctx.trailing,
     };
 
+    // A directory means "walk it". Asking for a tree is what a directory *is* to
+    // this tool, the way it is to `grep -r` and `sed`, and making it a flag the
+    // caller has to remember meant the common case -- "preview the change across
+    // src/" -- was the one that errored. `-r` is still accepted and still means
+    // the same thing; it is a statement of intent rather than a requirement.
+    //
+    // The converse stays an error: `-r` on a file is asking to walk something
+    // that is not a directory, and quietly treating it as a single file would
+    // hide a typo.
+    let any_dir = input_files.iter().any(|p| p.is_dir());
+    if any_dir {
+        if input_files.len() > 1 || recursive && input_files[0].is_file() {
+            return Err(Failure::Usage(format!(
+                "a walk takes one directory, but {} paths were given. Name the directory alone.",
+                input_files.len()
+            )));
+        }
+        // No `--glob` check here: this *is* the walk, so a filter always applies.
+        // The single-file path below is where a filter has nothing to filter.
+        return recursive_preview(&input_files[0], &script, ctx, &globs, mode, budget);
+    }
+    if recursive {
+        return Err(Failure::Usage(format!(
+            "--recursive needs a directory, and {} is not one.",
+            input_files[0].display()
+        )));
+    }
+    if !globs.is_empty() {
+        return Err(Failure::Usage("--glob only applies to a directory".into()));
+    }
+
     // Handle single file or multiple files
-    if input_files.len() == 1 && !recursive {
+    if input_files.len() == 1 {
         let p = &input_files[0];
         if p == Path::new("-") {
             let text = read_stdin()?;
             return one_file(&text, "(stdin)", &script, ctx, budget, mode);
         }
-        if p.is_dir() {
-            if !recursive {
-                return Err(Failure::Usage(format!(
-                    "{} is a directory. Use `bsed -r -p {}` to preview every file under it.",
-                    p.display(),
-                    p.display()
-                )));
-            }
-            return recursive_preview(p, &script, ctx, &globs, mode);
-        }
-        if !globs.is_empty() {
-            return Err(Failure::Usage(
-                "--glob only applies with --recursive".into(),
-            ));
-        }
         let text = std::fs::read_to_string(p)
             .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
         one_file(&text, &p.display().to_string(), &script, ctx, budget, mode)
-    } else if recursive && input_files.len() == 1 && input_files[0].is_dir() {
-        // Single directory with -r
-        recursive_preview(&input_files[0], &script, ctx, &globs, mode)
-    } else if recursive {
-        // Multiple files with -r: treat each as a root to walk
-        // (This is a simplification; typically -r takes one directory)
-        return Err(Failure::Usage(
-            "--recursive expects a single directory".into(),
-        ));
     } else {
         // Multiple files: preview each, and keep the two streams apart as we go
         // so the payloads concatenate into one pipeable blob.
@@ -433,11 +440,6 @@ fn preview(args: &[String]) -> Result<Out, Failure> {
             let shown = if p == Path::new("-") {
                 let text = read_stdin()?;
                 one_file(&text, "(stdin)", &script, ctx, budget, mode)?
-            } else if p.is_dir() {
-                return Err(Failure::Usage(format!(
-                    "{} is a directory. Use -r to preview recursively.",
-                    p.display()
-                )));
             } else {
                 let text = std::fs::read_to_string(p)
                     .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
@@ -571,6 +573,7 @@ fn recursive_preview(
     ctx: Context,
     globs: &[String],
     mode: Mode,
+    budget: usize,
 ) -> Result<Out, Failure> {
     // Same matcher and the same semantics as picocode's `find` tool: the pattern
     // is matched against the path *relative to the walk root*, so a recursive
@@ -613,12 +616,37 @@ fn recursive_preview(
     let mut blob = String::new();
     let mut changed_files = 0usize;
     let mut blocks = 0usize;
+    // The walk does not stop when the budget runs out. Every file is read, run
+    // and diffed regardless -- that work is already done by the time anything is
+    // emitted -- so the *total* is free, and a total is what makes a partial
+    // result legible: "returned 12 of 140" tells a reader there is more to come,
+    // where a bare "12" does not. These are what got left out.
+    let mut emitted_files = 0usize;
+    let mut emitted_blocks = 0usize;
     let mut skipped = 0usize;
     let mut blocked: Vec<(String, String)> = Vec::new();
     // Kept apart from `blocked` because the advice differs. "Re-run on that file
     // alone" is what rescues a block that cannot be expressed; a CRLF file is
     // refused either way, so telling the reader to retry it would be a loop.
     let mut crlf: Vec<String> = Vec::new();
+
+    // Add one file's worth of payload, unless it would not fit. A file is kept
+    // whole or left out: half a file's blocks is a payload that neither applies
+    // nor describes what it left out, and a boundary at the file is the one place
+    // a reader can see where a batch stopped.
+    let mut fits = |blob: &mut String, piece: &str, room: &mut isize| -> bool {
+        let cost = piece.len() as isize + usize::from(!blob.is_empty()) as isize;
+        if cost > *room {
+            return false;
+        }
+        if !blob.is_empty() {
+            blob.push('\n');
+        }
+        blob.push_str(piece);
+        *room -= cost;
+        true
+    };
+    let mut room = budget as isize;
 
     for f in &files {
         let Ok(text) = std::fs::read_to_string(f) else {
@@ -642,14 +670,9 @@ fn recursive_preview(
             if d.is_empty() {
                 continue;
             }
-            // Blank line between files, so a reader (or `patch`) can tell one
-            // file's hunks from the next.
-            if !blob.is_empty() {
-                blob.push('\n');
-            }
-            blob.push_str(&d);
-            blob.push('\n');
             changed_files += 1;
+            let piece = format!("{d}\n");
+            let _ = fits(&mut blob, &piece, &mut room);
             continue;
         }
         let p = match crate::preview_text(&text, &shown, expressions, opts) {
@@ -672,12 +695,30 @@ fn recursive_preview(
             continue;
         }
         let b = p.blob;
-        if !blob.is_empty() {
-            blob.push('\n');
-        }
-        blob.push_str(&b);
         changed_files += 1;
         blocks += count_blocks(&b);
+        // The first changed file always gets through, whatever the budget. A
+        // budget too small for the first file would otherwise return nothing and
+        // say "re-run for the next batch" -- which returns nothing again, since
+        // the budget is the same. Iterative coverage depends on every call
+        // making progress, so the budget bounds everything after the first file
+        // and never the first file itself. It matches the single-file rule that
+        // one block is emitted whatever it costs.
+        if emitted_files == 0 {
+            // The first file goes in whatever it costs, but it still has to come
+            // *out* of the budget: leaving `room` whole would let the second
+            // file fit as though the first were free, and the cut would never
+            // happen at all.
+            if !blob.is_empty() {
+                blob.push('\n');
+            }
+            blob.push_str(&b);
+            room -= b.len() as isize + 1;
+        } else if !fits(&mut blob, &b, &mut room) {
+            continue;
+        }
+        emitted_files += 1;
+        emitted_blocks += count_blocks(&b);
     }
 
     if changed_files == 0 {
@@ -715,19 +756,35 @@ fn recursive_preview(
         });
     }
 
-    let mut out = if mode.unified {
-        // A diff cannot be applied by anything, so the summary must not invite
-        // it to be. `blocks` is 0 in this mode by construction.
-        format!(
-            "sed diff: {changed_files} of {} file(s) under {} changed. A diff is for reading; \
-             drop -u for blocks `bsed apply -i` can write.\n",
-            files.len(),
-            root.display(),
-        )
+    let noun = if mode.unified { "diff" } else { "preview" };
+    // `changed_files == 0` returned above, so from here there is something to
+    // describe and the only question is whether all of it fit.
+    let mut out = if emitted_blocks == blocks {
+        // Everything fit, so there is no batch to describe and nothing to warn
+        // about. This is the common case and it should read like the common case.
+        if mode.unified {
+            format!(
+                "sed diff: {changed_files} of {} file(s) under {} changed. A diff is for \
+                 reading; drop -u for blocks `edit` can apply.\n",
+                files.len(),
+                root.display(),
+            )
+        } else {
+            format!(
+                "sed preview: {blocks} block(s) in {changed_files} of {} file(s) under {}. \
+                 Check and apply them with `edit`.\n",
+                files.len(),
+                root.display(),
+            )
+        }
     } else {
+        // Partial. The two numbers are the whole message: how much of the work
+        // this call carries, and how much is left, so a reader can tell a batch
+        // from the end of a refactor without counting anything.
         format!(
-            "sed preview: {changed_files} of {} file(s) under {} changed, {blocks} block(s) \
-             total. Review the blocks below, then apply them with `bsed apply -i`.\n",
+            "sed {noun}: {blocks} match(es) in {changed_files} of {} file(s) under {}; \
+             returned {emitted_blocks} of {blocks} in {emitted_files} file(s). This is ONE \
+             batch. Check and apply it with `edit`, then re-run sed for the next.\n",
             files.len(),
             root.display(),
         )

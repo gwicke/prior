@@ -65,11 +65,29 @@ fn tree() -> tempfile::TempDir {
 }
 
 #[test]
-fn a_directory_without_recursive_is_a_usage_error() {
+fn a_directory_implies_a_walk() {
+    // Asking for a tree is what a directory *is* here, the way it is to `grep -r`.
+    // Making it a flag meant the common case -- "preview the change across src/"
+    // -- was the one that errored.
     let d = tree();
-    let o = run_in(d.path(), None, &["-p", ".", "s/a/b/"]);
+    let o = run_in(d.path(), None, &["-p", ".", "s/old_name/new_name/g"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("one.rs:"), "{out}");
+    assert!(out.contains("sub/two.rs:"), "{out}");
+    // ...and the flag still means the same thing when it is given.
+    let o2 = run_in(d.path(), None, &["-r", "-p", ".", "s/old_name/new_name/g"]);
+    assert_eq!(stdout(&o2), out, "-r should not change the result");
+}
+
+/// The converse stays an error: `-r` on a file asks to walk something that is
+/// not a directory, and treating it as a single file would hide the typo.
+#[test]
+fn recursive_on_a_file_is_an_error() {
+    let d = tree();
+    let o = run_in(d.path(), None, &["-r", "-p", "one.rs", "s/a/b/"]);
     assert_eq!(code(&o), 2);
-    assert!(stderr(&o).contains("--recursive"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("not one"), "{}", stderr(&o));
 }
 
 #[test]
@@ -412,6 +430,83 @@ fn an_unterminated_file_round_trips_through_gnu() {
         let o = run_in(d.path(), Some(&stdout(&blocks)), &["apply", "u.txt"]);
         assert_eq!(code(&o), 0, "{script}: {}", stdout(&o));
         assert_eq!(stdout(&o), want, "{script}");
+    }
+}
+
+/// A tree preview is cut at a *file* boundary, and says what it left out.
+///
+/// The counts are the point: every file is read and diffed regardless of the
+/// budget, so the total is known, and a reader can tell one batch from the end
+/// of a refactor without counting anything.
+#[test]
+fn a_tight_budget_returns_a_partial_batch_and_says_so() {
+    let d = tree(); // two changed files
+    let all = run_in(&d.path(), None, &["-p", ".", "s/old_name/new_name/g"]);
+    assert_eq!(code(&all), 0, "{}", stderr(&all));
+    let full = stdout(&all);
+    let status = stderr(&all);
+    // Nothing is dropped when the budget is generous, so there is no batch to
+    // describe and the summary does not pretend otherwise.
+    assert!(!status.contains("ONE batch"), "{status}");
+    assert!(status.contains("2 block(s) in 2 of"), "{status}");
+
+    // A budget that fits one file's blocks but not both returns one of them, whole.
+    // Derived rather than guessed: preview `one.rs` alone to learn what one
+    // file's payload costs, then give the walk exactly that.
+    let one = stdout(&run_in(
+        d.path(),
+        None,
+        &["-p", "one.rs", "s/old_name/new_name/g"],
+    ));
+    let budget = one.len() + 8;
+    let o = run_in(
+        d.path(),
+        None,
+        &[
+            "-b",
+            &format!("{budget}b"),
+            "-p",
+            ".",
+            "s/old_name/new_name/g",
+        ],
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    let err = stderr(&o);
+    assert!(err.contains("ONE batch"), "{err}");
+    assert!(err.contains("returned"), "{err}");
+    assert!(err.contains("of 2 "), "should report the total: {err}");
+    // Exactly one file's blocks, and the payload still parses.
+    let parsed = blockedit::parse_blocks(&out).expect("payload parses");
+    assert_eq!(parsed.edits.len(), 1, "{out}");
+    let path = parsed.edits[0].header.clone().unwrap();
+    // The walk roots at `.`, so the header is spelled `./one.rs`; `split_by_file`
+    // keeps the first spelling and keys on the normalized form, so the test
+    // cares which file it was and not how it was written.
+    assert!(path.ends_with("one.rs"), "{path}");
+}
+
+/// Every call must make progress, or "re-run for the next batch" is a loop: a
+/// budget too small for the first file would return nothing, and the next call
+/// with the same budget would too.
+#[test]
+fn every_recursive_call_returns_at_least_one_batch() {
+    let d = tree();
+    for budget in ["1b", "2b", "10b", "64b"] {
+        let o = run_in(
+            &d.path(),
+            None,
+            &["-b", budget, "-p", ".", "s/old_name/new_name/g"],
+        );
+        assert_eq!(code(&o), 0, "{budget}: {}", stderr(&o));
+        let out = stdout(&o);
+        assert!(!out.is_empty(), "{budget}: nothing returned");
+        blockedit::parse_blocks(&out).unwrap_or_else(|e| panic!("{budget}: {e}"));
+        assert!(
+            !stderr(&o).contains("returned 0 of"),
+            "{budget}: a batch of nothing: {}",
+            stderr(&o)
+        );
     }
 }
 
