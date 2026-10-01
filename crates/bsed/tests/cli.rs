@@ -441,10 +441,16 @@ fn an_unterminated_file_round_trips_through_gnu() {
 #[test]
 fn a_tight_budget_returns_a_partial_batch_and_says_so() {
     let d = tree(); // two changed files
-    let all = run_in(&d.path(), None, &["-p", ".", "s/old_name/new_name/g"]);
+    let all = run_in(d.path(), None, &["-p", ".", "s/old_name/new_name/g"]);
     assert_eq!(code(&all), 0, "{}", stderr(&all));
     let full = stdout(&all);
     let status = stderr(&all);
+    // Premise of the test: both files really do change, so a budget can cut.
+    assert_eq!(
+        blockedit::parse_blocks(&full).unwrap().edits.len(),
+        2,
+        "{full}"
+    );
     // Nothing is dropped when the budget is generous, so there is no batch to
     // describe and the summary does not pretend otherwise.
     assert!(!status.contains("ONE batch"), "{status}");
@@ -494,7 +500,7 @@ fn every_recursive_call_returns_at_least_one_batch() {
     let d = tree();
     for budget in ["1b", "2b", "10b", "64b"] {
         let o = run_in(
-            &d.path(),
+            d.path(),
             None,
             &["-b", budget, "-p", ".", "s/old_name/new_name/g"],
         );
