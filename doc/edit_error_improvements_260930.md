@@ -89,6 +89,7 @@ carried only as an **identifier** (§ *Origin*), and never as a possible cause.
 | Q6 | Path in the body | Not threaded — the origin string already carries it |
 | Q7 | Fallback elision | At most 20 lines, elided at the end |
 | Q8 | Candidate context for `non_unique` | **Deferred** — see *Follow-ups* |
+| Q9 | Vocabulary in the model-facing prose | `@@@OLD lines`, not `oldText`; the `ui_view` keeps `oldText` |
 
 ### Q1 — format
 
@@ -168,7 +169,50 @@ Caught by the test that checks rendered numbers against the file, which is the
 reason that test exists. `i + 1` is now literally `read`'s expression, so the two
 renders cannot drift.
 
+### 3. The rewrite reintroduced a panic the diff had already fixed
+
+The old diff called `floor_char_boundary`/`ceil_char_boundary` on the window
+edges. Making the window *line*-aligned looked like it made those guards
+redundant, and they were dropped — but they were guarding something else.
+
+`find_anchor` matches over **bytes**. UTF-8 is self-synchronizing, so two
+different characters can share a byte or two and a byte-wise longest common
+substring can start or end *inside* one. `line_start_at`'s `text[..at]` then
+panicked with "byte index is not a char boundary".
+
+This was not theoretical. A fuzz over random Unicode reproduced it in
+**48,587 of 400,000 inputs** — roughly one in eight — and it was found by
+asking, not by testing: the existing multibyte tests passed throughout,
+because they use single-width files whose anchors happen to land on
+boundaries. 1.2M inputs now run clean, and the witness plus a deterministic
+sweep are pinned in `diagnose::byte_boundary_tests`. Both fail if the guards
+are removed again, which was verified by removing them.
+
+The lesson is the one the diff's own comments recorded: line alignment and
+character alignment are different properties, and making one safe does not make
+the other safe.
+
 ## Design
+
+### Vocabulary
+
+`oldText` is the **fallback** wire shape; blocks are the primary mechanism. So
+the model-facing prose names `@@@OLD lines` throughout — in the not-found
+header and in the prose of `non_unique`, `anchor_ambiguous`,
+`anchor_out_of_tolerance`, `all_candidates_claimed` and `overlap_conflict`. A
+diagnostic that taught the model `oldText` would be teaching the exception.
+
+The split is **asymmetric**, and deliberately so:
+
+| | speaks | why |
+|---|---|---|
+| `model_view` | `@@@OLD lines` only — never `oldText` | blocks are the default; naming the exception teaches the wrong thing |
+| `ui_view` | may name `oldText`; must never contain `@@@OLD` | a person recognises the field, not the block syntax, and the panel must not teach the model-facing wording |
+
+Both directions are pinned in `diagnose::vocabulary_tests`. Note that a
+`ui_view` is not required to mention `oldText` at all: `overlap_conflict` names
+the two edits and their line ranges instead, which is the better summary when
+the failure is about two edits colliding rather than about the text.
 
 ### The rendered region
 

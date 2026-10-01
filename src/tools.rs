@@ -2859,7 +2859,7 @@ mod edit_file_tests {
         )
         .await
         .unwrap();
-        assert!(res.contains("appears 3 times"));
+        assert!(res.contains("@@@OLD lines appear 3 times"));
         assert!(
             res.contains("lines: 1, 3, 5"),
             "expected per-occurrence line numbers, got: {res}",
@@ -2885,7 +2885,7 @@ mod edit_file_tests {
         )
         .await
         .unwrap();
-        assert!(res.contains("appears 15 times"));
+        assert!(res.contains("@@@OLD lines appear 15 times"));
         assert!(
             res.contains("(...and 5 more)"),
             "expected truncation notice, got: {res}",
@@ -3163,7 +3163,10 @@ mod edit_args_wire_tests {
         }))
         .await;
         assert!(
-            result.output().render().contains("appears 2 times"),
+            result
+                .output()
+                .render()
+                .contains("@@@OLD lines appear 2 times"),
             "top-level startLine must be ignored in blob form; got: {}",
             result.output().render()
         );
@@ -3239,7 +3242,10 @@ mod edit_args_wire_tests {
         }))
         .await;
         assert!(
-            result.output().render().contains("appears 2 times"),
+            result
+                .output()
+                .render()
+                .contains("@@@OLD lines appear 2 times"),
             "got: {}",
             result.output().render()
         );
@@ -3355,7 +3361,7 @@ mod edit_args_wire_tests {
     async fn header_anchor_ignored_when_match_is_unique() {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("uniq.txt", "only\nhere\n").await.unwrap();
-        // A wildly-off anchor is harmless when oldText occurs exactly once.
+        // A wildly-off anchor is harmless when the @@@OLD lines occur exactly once.
         let blob = "uniq.txt:100\n@@@OLD\nhere\n@@@NEW\nthere\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "uniq.txt", "blocks": blob})).await;
         assert!(result.is_success(), "expected success, got: {result:?}");
@@ -3588,7 +3594,7 @@ mod edit_args_wire_tests {
         assert!(out.contains("edit #1"), "pass-1 diagnostic missing: {out}");
         // Pass-2: no claims exist → plain ambiguity, explicitly NOT claimed.
         assert!(
-            out.contains("appears 2 times"),
+            out.contains("@@@OLD lines appear 2 times"),
             "pass-2 diagnostic missing: {out}"
         );
         assert!(

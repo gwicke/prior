@@ -270,6 +270,8 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
         search_text,
         (anchor_end + query.len()).min(search_text.len()),
     );
+    // `win_start` is 0 or just past a '\n' and `win_end` just before one, so both
+    // are char boundaries already; `prefix` is kept off this hot path anyway.
     let window = &search_text[win_start..win_end];
     let offset = count_lines(&search_text[..win_start]) + 1;
 
@@ -317,8 +319,8 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
     let span = if lo == usize::MAX {
         // Nothing changed as far as Myers can tell. A true miss should never get
         // here; fall back to the anchor's own span rather than underflow.
-        let first = count_lines(&search_text[..anchor_start]) + 1;
-        let last = (count_lines(&search_text[..anchor_end]) + 1).min(total_lines(search_text));
+        let first = count_lines(prefix(search_text, anchor_start)) + 1;
+        let last = (count_lines(prefix(search_text, anchor_end)) + 1).min(total_lines(search_text));
         (first, last.max(first))
     } else {
         (
@@ -404,13 +406,27 @@ fn elide_middle(body: &str, cap: usize) -> String {
     out
 }
 
+/// `&text[..at]` with `at` forced to a char boundary.
+///
+/// `find_anchor` matches over **bytes** — UTF-8 is self-synchronizing, so two
+/// different characters can share a byte or two and a byte-wise longest common
+/// substring can start or end inside one. Every slice of the file by a computed
+/// offset must go through this or a prefix. The diff this replaced got this for
+/// free by calling `floor_char_boundary`/`ceil_char_boundary`; dropping those
+/// when the window became line-aligned reintroduced the panic, and it is an
+/// easy one to hit — a fuzz over random Unicode reproduces it in roughly one
+/// input in eight.
+fn prefix(text: &str, at: usize) -> &str {
+    &text[..text.floor_char_boundary(at.min(text.len()))]
+}
+
 /// The byte offset of the start of the line containing `at`.
 ///
-/// The window is aligned to line boundaries, not merely to char boundaries. The
-/// diff this replaced aligned to `floor_char_boundary`, which let the window
-/// begin mid-line and emit a torn fragment as its first diff row.
+/// `at` is floored first: subtracting a byte count from a char boundary does not
+/// land on one, so the caller's arithmetic cannot be trusted to have produced
+/// a sliceable offset.
 fn line_start_at(text: &str, at: usize) -> usize {
-    match text[..at].rfind('\n') {
+    match prefix(text, at).rfind('\n') {
         Some(i) => i + 1,
         None => 0,
     }
@@ -418,8 +434,10 @@ fn line_start_at(text: &str, at: usize) -> usize {
 
 /// The byte offset of the first newline at or after `at`, or the end of `text`.
 ///
-/// Exclusive end of a line-aligned span.
+/// Exclusive end of a line-aligned span. `at` is ceiled, for the same reason
+/// [`line_start_at`] floors.
 fn line_end_at(text: &str, at: usize) -> usize {
+    let at = text.ceil_char_boundary(at.min(text.len()));
     match text[at..].find('\n') {
         Some(i) => at + i,
         None => text.len(),
@@ -495,14 +513,14 @@ impl EditFailure {
              decisive{second_clause}.",
         );
         let model_view = format!(
-            "oldText appears {count} times. Anchor line {anchor}: the nearest occurrence \
+            "@@@OLD lines appear {count} times. Anchor line {anchor}: the nearest occurrence \
              at line {nearest_line} is {d1} line(s) away; the next-nearest is {d2_clause}. \
              An anchor is accepted only when the nearest is within {tolerance} line(s), or \
              when it is at least {ratio}× closer than the next-nearest and within {cap} \
              lines — this pick satisfies neither. All occurrences at lines: {line_list}\
              {shown_more}. The anchor is a near-line hint, not a range. Re-read the file \
              (`read` gives line numbers) and either correct the `path:LINE`/`startLine` \
-             anchor or include more surrounding context in oldText so the match is \
+             anchor or include more surrounding context in @@@OLD so the match is \
              unambiguous.",
             d2_clause = candidates
                 .get(1)
@@ -538,7 +556,7 @@ impl EditFailure {
              ({theirs}). Edits in one batch are all computed against the original \
              file, so their regions must be disjoint — overlapping matches would corrupt \
              each other. Merge the overlapping changes into a single block, or adjust \
-             oldText so the regions are disjoint.",
+             @@@OLD so the regions are disjoint.",
         );
         EditFailure {
             ui_view,
@@ -580,11 +598,11 @@ impl EditFailure {
             )
         };
         let model_view = format!(
-            "oldText occurs {count} time(s) in the file (lines: {line_list}), but every \
+            "@@@OLD lines occur {count} time(s) in the file (lines: {line_list}), but every \
              occurrence overlaps a match already claimed by edit(s) {claimer_list} in this \
              batch — two blocks cannot target the same region (matches are computed against \
              the original file). Either this block duplicates what the other edit already \
-             replaces — drop it — or give it distinct oldText/anchors. ",
+             replaces — drop it — or give it distinct @@@OLD blocks/anchors. ",
         );
         EditFailure {
             ui_view,
@@ -609,9 +627,9 @@ impl EditFailure {
              (occurrences at lines: {line_list}).",
         );
         let model_view = format!(
-            "oldText has multiple occurrences equally close to the anchor line \
+            "@@@OLD lines have multiple occurrences equally close to the anchor line \
              {anchor} (lines: {line_list}). Include more surrounding context in \
-             oldText so exactly one occurrence matches.",
+             @@@OLD so exactly one occurrence matches.",
         );
         EditFailure {
             ui_view,
@@ -661,12 +679,12 @@ impl EditFailure {
              (free lines: {line_list}); anchor it with a `path:LINE` header.",
         );
         let model_view = format!(
-            "oldText appears {count} times{excluded_note}, so it is ambiguous. \
+            "@@@OLD lines appear {count} times{excluded_note}, so it is ambiguous. \
              Free occurrences at lines: {line_list}. To pick one, put a `path:LINE` \
              header line just above that block's `{marker}` marker — e.g. use \
              `...:{first}` to target the first free occurrence — which anchors the \
              block to the nearest occurrence (line numbers come from `read`). \
-             Alternatively, include more surrounding context in oldText (the \
+             Alternatively, include more surrounding context in @@@OLD (the \
              line(s) immediately before/after) so only one occurrence matches. \
             ",
             marker = crate::blob::SEARCH_MARKER,
@@ -1100,8 +1118,10 @@ mod tests {
             anchored: false,
             old_text: String::new(),
             failure: EditFailure {
-                ui_view: "edit #1 oldText not found. Closest match at file lines 60-91 (similarity 0.92).".into(),
-                model_view: "<diff>".into(),
+                ui_view: "edit #1 oldText not found. Closest match at file lines 60-91.".into(),
+                model_view:
+                    "@@@OLD lines not found. Closest match at file lines 60-91:\n  60| fn a();"
+                        .into(),
             },
         }];
         let b = BatchEditFailure::build(1, items);
@@ -1140,8 +1160,8 @@ mod tests {
             anchored: false,
             old_text: String::new(),
             failure: EditFailure {
-                ui_view: "edit #1 oldText not found. Closest match at file lines 60-91 (similarity 0.92).".into(),
-                model_view: "oldText not found. Closest match: similarity 0.92, file lines 60-91.\nDiff:\n a\n-b".into(),
+                ui_view: "edit #1 oldText not found. Closest match at file lines 60-91.".into(),
+                model_view: "@@@OLD lines not found. Closest match at file lines 60-91:\n  60| fn a();\n  61| fn b();".into(),
             },
         }];
         let b = BatchEditFailure::build(1, items);
@@ -1149,11 +1169,12 @@ mod tests {
         assert!(b.model_view.starts_with("1 of 1 edit(s) failed"));
         assert!(b.model_view.contains("--- edit #1 ---"));
         // Body preserved.
-        assert!(b.model_view.contains("Closest match: similarity 0.92"));
+        assert!(b.model_view.contains("Closest match at file lines 60-91:"));
         // No redundant "edit failed:" within the body.
         assert!(!b.model_view.contains("edit failed:"));
         // No redundant "edit #1 oldText not found." line in the body
-        // (that's the ui_view's job).
+        // (that's the ui_view's job), and no similarity ratio — the report
+        // leads with the origin string instead.
         assert!(!b.model_view.contains("edit #1 oldText not found."));
     }
 
@@ -1559,5 +1580,190 @@ mod origin_tests {
         let text = "run();\nkeep();\nrun();\n";
         let mv = model_view(text, vec![op(dup, Some("a/b.rs:1"), false)]);
         assert!(mv.contains("Your block `a/b.rs:1` failed:"), "{mv}");
+    }
+}
+
+#[cfg(test)]
+mod vocabulary_tests {
+    //! The model is told about `@@@OLD`; the panel is not.
+    //!
+    //! Blocks are the primary edit mechanism and `oldText`/`newText` only the
+    //! fallback wire shape, so a diagnostic that names `oldText` to the model
+    //! teaches the wrong default. The split is asymmetric by design: the model
+    //! must never be told about `oldText`, while a `ui_view` may name it — a
+    //! person watching the panel recognises the field, not the block syntax.
+
+    use super::*;
+
+    /// Every failure constructor, with a name to blame. Their `ui_view` shapes
+    /// differ (some carry their own `edit #N` prefix, some are fragments the
+    /// caller completes), which the tests below are written to tolerate rather
+    /// than pin.
+    fn every_failure() -> Vec<(&'static str, EditFailure)> {
+        vec![
+            ("not_found_no_match", EditFailure::not_found_no_match()),
+            (
+                "anchor_out_of_tolerance",
+                EditFailure::anchor_out_of_tolerance(1, 5, 0, 3, &[(9, 5), (20, 14)]),
+            ),
+            (
+                "overlap_conflict",
+                EditFailure::overlap_conflict(1, (1, 3), 2, (2, 4)),
+            ),
+            (
+                "all_candidates_claimed",
+                EditFailure::all_candidates_claimed(1, 2, &[3, 8], &[2]),
+            ),
+            (
+                "anchor_ambiguous",
+                EditFailure::anchor_ambiguous(1, 7, &[4, 10]),
+            ),
+            ("non_unique", EditFailure::non_unique(1, 3, &[2, 6, 9], 1)),
+        ]
+    }
+
+    #[test]
+    fn model_views_speak_about_at_markers_and_never_oldtext() {
+        for (name, f) in every_failure() {
+            assert!(
+                f.model_view.contains("@@@OLD"),
+                "{name}: model_view never names the block syntax:\n{}",
+                f.model_view
+            );
+            assert!(
+                !f.model_view.contains("oldText"),
+                "{name}: model_view still names the fallback wire field:\n{}",
+                f.model_view
+            );
+        }
+    }
+
+    #[test]
+    fn ui_views_never_leak_the_model_facing_vocabulary() {
+        // Only one direction is a hard rule. A `ui_view` may name the field
+        // (`oldText appears 3 times`) or, where the failure is really about two
+        // edits colliding, name the edits and their lines instead —
+        // `overlap_conflict` does the latter, which is the better summary for a
+        // person. What must never happen is the model-facing vocabulary
+        // reaching the panel.
+        for (name, f) in every_failure() {
+            assert!(
+                !f.ui_view.contains("@@@OLD"),
+                "{name}: ui_view leaks the model-facing block syntax:\n{}",
+                f.ui_view
+            );
+            assert!(
+                !f.ui_view.contains("Your block"),
+                "{name}: ui_view leaks the model-facing framing:\n{}",
+                f.ui_view
+            );
+            // The standing contract: no file content, and it stays short.
+            assert!(
+                f.ui_view.lines().count() <= 2 && f.ui_view.len() < 200,
+                "{name}: ui_view is not the short summary it must be:\n{}",
+                f.ui_view
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod byte_boundary_tests {
+    //! `find_anchor` matches over bytes, so a computed offset can land inside a
+    //! character. Every slice by such an offset must be forced to a boundary.
+    //!
+    //! This was a live panic, not a theoretical one: before the fix, a fuzz over
+    //! random Unicode reproduced it in roughly one input in eight, and the diff
+    //! this module guards had been caught by exactly this bug before.
+
+    use super::*;
+
+    /// The witness from that fuzz, kept verbatim. Small enough to debug, and
+    /// specific enough that a future refactor that re-breaks the boundary
+    /// handling fails on it without needing the fuzzer.
+    const FILE: &str = "—\n X\n─→ \n  —─漢→\n";
+    const QUERY: &str = "——\n漢€é";
+
+    #[test]
+    fn a_misaligned_anchor_does_not_panic() {
+        // The assertion is that this returns at all.
+        let _ = diagnose(QUERY, FILE);
+    }
+
+    /// A short deterministic sweep in the shape of the fuzz: a mixed-width
+    /// alphabet, near-miss queries, and files long enough that the anchor lands
+    /// away from both edges.
+    #[test]
+    fn random_unicode_near_misses_do_not_panic() {
+        const POOL: &[char] = &[
+            'a',
+            'X',
+            ' ',
+            '\n',
+            '\t',
+            '─',
+            '—',
+            '·',
+            'é',
+            '€',
+            '→',
+            '漢',
+            '\u{1F600}',
+            '\u{10FFFF}',
+            '\r',
+        ];
+        // A tiny LCG: deterministic, no dependency, and the point is coverage
+        // of byte offsets rather than randomness quality.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0 >> 33
+            }
+        }
+
+        let mut panics: Vec<(String, String)> = Vec::new();
+        for seed in 1..=8u64 {
+            let mut l = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            for _ in 0..3_000 {
+                let file: String = (0..(l.next() % 40) + 1)
+                    .map(|_| POOL[(l.next() as usize) % POOL.len()])
+                    .collect();
+                let mut query: String = (0..(l.next() % 40) + 1)
+                    .map(|_| POOL[(l.next() as usize) % POOL.len()])
+                    .collect();
+                if !query.is_empty() && !file.is_empty() {
+                    let c = (l.next() as usize) % query.len().max(1);
+                    let s = query.floor_char_boundary(c);
+                    let e = file.floor_char_boundary(file.len().min(s + l.next() as usize % 8));
+                    query = format!("{}{}", &query[..s], &file[..e]);
+                }
+                if std::panic::catch_unwind(|| diagnose(&query, &file).is_some()).is_err()
+                    && panics.len() < 3
+                {
+                    panics.push((file.clone(), query.clone()));
+                }
+            }
+        }
+        assert!(
+            panics.is_empty(),
+            "diagnose panicked on {} misaligned case(s): {panics:?}",
+            panics.len()
+        );
+    }
+
+    #[test]
+    fn prefix_never_splits_a_character() {
+        for text in ["a─b€c漢", "────", "é", "\u{1F600}x"] {
+            for at in 0..=text.len() {
+                let p = prefix(text, at);
+                assert!(text.starts_with(p), "prefix is not a prefix: {p:?}");
+            }
+        }
+        // Out of range clamps rather than panicking.
+        assert_eq!(prefix("abc", 99), "abc");
     }
 }
