@@ -206,10 +206,10 @@ the replacement text
 /// The batch policy sentence that follows the syntax: atomicity, and the
 /// `path:LINE` anchor the model needs for repeated text.
 const BLOCK_POLICY: &str = "Each block MUST specify its file path, and SHOULD \
-provide the 1-based start line number hint, from `read` or `grep`. \
+provide the 1-based start line number hint, e.g. from `read` or `grep`. \
 Line numbers greatly reduce the chance of edit failures, \
 especially when there are similar content lines in other parts of the file. Blocks \
-editing the same file are executed all-or-nothing";
+editing the same file are executed all-or-nothing. Multi-file batches are supported.";
 
 /// Static tool facade for `edit`. Hand-written (rather than `#[rig_tool]`) so
 /// the args deserializer can select a variant from the raw JSON and accept the
@@ -228,7 +228,7 @@ impl rig_core::tool::Tool for EditFile {
         format!(
             "Replace text in a file. Prefer the `blocks` string syntax with batching support:\n```\n{BLOCK_SYNTAX}\n```\n\
              {BLOCK_POLICY}\n\
-             For single edits, the traditional OpenAI path / oldText / newText API is available as well."
+             For single edits, the traditional OpenAI path / oldText / newText API is available too."
         )
     }
 
@@ -362,7 +362,20 @@ pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolE
 ///
 /// The `bsed` process is run with a capture cap just above this so a truncated
 /// read is detectable rather than silently acted on.
-const SED_PREVIEW_BUDGET: usize = 50 * 1024;
+///
+/// A bare byte count rather than the `32kb` form `-b` now accepts: the tool picks
+/// this number, so a unit suffix buys nothing, and `bsed_available()` only
+/// resolves the binary from PATH without checking what it can parse. A picocode
+/// paired with a `bsed` older than unit support would fail every `sed` call over
+/// a suffix the user never typed. Units are for people typing into a shell.
+///
+/// The slack absorbs the commentary `bsed` writes to stderr, which the capture
+/// merges in. It is sized for the longest status this tool can provoke: the
+/// refusal notes now name at most ten files each and then count the rest, so the
+/// commentary is bounded by a small constant rather than by the size of the
+/// tree. A tree of 50,000 refused files costs the same as a tree of ten, which
+/// is the point -- an unbounded note would eat the payload's own budget.
+const SED_PREVIEW_BUDGET: usize = 32_000;
 const SED_CAPTURE_SLACK: usize = 8 * 1024;
 
 /// The absolute path of the `bsed` binary, or `None` when it is not installed.
@@ -483,13 +496,20 @@ const BSED_BIN: &str = "bsed";
 
 #[rig_tool(
     name = "sed",
-    description = "Preview what GNU sed expressions would change in a file, as editable blocks. \
-This tool NEVER writes the file: it returns the change as @@@OLD / @@@NEW blocks, each \
-anchored to a line with a `path:LINE` header. Review them, then pass them to the `edit` tool \
-as its `blocks` argument to apply. One expression per line, GNU sed syntax (s///, d, a, i, c, \
+    description = "Safe GNU sed batch editing. Returns editable @@@OLD / @@@NEW blocks for the edit tool. \
+NEVER writes the file: it returns the change as @@@OLD / @@@NEW blocks, each \
+anchored to a line with a `path:LINE` header. Review the changes, edit @@@NEW text if necessary, \
+then pass blocks to the `edit` tool as its `blocks` argument to apply. \
+Point `path` at a directory to preview every text file under it (hidden and \
+ignored files are skipped); a file path previews just that file. The payload is \
+budgeted, so a tree that matches in many places returns ONE batch, cut at a \
+file boundary and saying so: when the summary says `returned N of M`, apply the \
+batch, then run the same call again for the rest. Re-running is how a wide \
+refactor finishes, and it costs nothing to re-run on a tree that is already \
+done — you get `no lines matched` back. \
+Syntax: One expression per line, GNU sed syntax (s///, d, a, i, c, \
 y///, addresses, ranges) — `c` works over an address range, replacing it with one copy of the \
-text. `w`, `e` and `q` are refused: use the `edit` or `bash` tools for those. Files with CRLF \
-line endings are refused; convert them to LF first.",
+text. `w`, `e` and `q` are refused: use the `edit` or `bash` tools for those.",
     required(path, expressions)
 )]
 pub async fn sed_preview(

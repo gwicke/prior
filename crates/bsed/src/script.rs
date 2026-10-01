@@ -616,6 +616,59 @@ fn screen_substitute(s: &SubstituteCmd, n: usize, line: &str) -> Result<(), Scri
 // Case escapes
 // ---------------------------------------------------------------------------
 
+/// Parse a byte size, with an optional unit suffix.
+///
+/// Accepts a bare number (`32768`), an SI suffix (`32kb`, `3mb`, `1GB`) which is
+/// 1000-based, or an IEC suffix (`32kib`, `3mib`) which is 1024-based. Suffixes
+/// are case-insensitive, and a space or underscore between number and suffix is
+/// ignored, so `3 Mb` reads the same as `3mb`.
+///
+/// The two families are distinguished rather than guessed at: `kb` next to a
+/// flag that counts *bytes* would otherwise leave 32kb meaning 32000 or 32768
+/// depending on who typed it, and the only person who can resolve that is the
+/// person who wrote it. Bare `k`/`m`/`g` take the SI reading, matching how a
+/// size is written rather than how memory is counted.
+pub fn parse_size(spec: &str) -> Result<usize, String> {
+    let t: String = spec
+        .trim()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '_')
+        .collect();
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (digits, suffix) = t.split_at(split);
+    if digits.is_empty() {
+        return Err(format!("`{spec}` is not a byte size: no number"));
+    }
+    // A suffix that is not all letters is a malformed *number*, not an unknown
+    // unit: `1.5kb` splits at the `.` and the tail is not a unit anyone wrote.
+    if !suffix.is_empty() && !suffix.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err(format!(
+            "`{spec}` is not a byte size: bad number `{digits}{suffix}`"
+        ));
+    }
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("`{spec}` is not a byte size: bad number `{digits}`"))?;
+    let mult: u64 = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1000,
+        "m" | "mb" => 1000 * 1000,
+        "g" | "gb" => 1000 * 1000 * 1000,
+        "kib" => 1024,
+        "mib" => 1024 * 1024,
+        "gib" => 1024 * 1024 * 1024,
+        other => {
+            return Err(format!(
+                "`{spec}` is not a byte size: unknown unit `{other}`. Use b, kb, mb, gb \
+                 (1000-based) or kib, mib, gib (1024-based)."
+            ))
+        }
+    };
+    n.checked_mul(mult)
+        .map(|v| v as usize)
+        .ok_or_else(|| format!("`{spec}` is too large to be a byte size"))
+}
+
 /// The private-use characters a case span is wrapped in, carrying its mode.
 pub const OPEN_UPPER: &str = "\u{e001}";
 pub const OPEN_LOWER: &str = "\u{e002}";
@@ -906,5 +959,64 @@ mod text_escape_tests {
         assert_eq!(render_text_command('a', "   deep"), "a\\   deep");
         assert_eq!(render_text_command('a', "\tlead"), "a\\\tlead");
         assert_eq!(render_text_command('a', "lead"), "a\\lead");
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::parse_size;
+
+    #[test]
+    fn a_bare_number_is_bytes() {
+        assert_eq!(parse_size("0"), Ok(0));
+        assert_eq!(parse_size("32768"), Ok(32768));
+    }
+
+    #[test]
+    fn si_units_are_1000_based() {
+        assert_eq!(parse_size("1b"), Ok(1));
+        assert_eq!(parse_size("32kb"), Ok(32_000));
+        assert_eq!(parse_size("3mb"), Ok(3_000_000));
+        assert_eq!(parse_size("1gb"), Ok(1_000_000_000));
+        assert_eq!(parse_size("32k"), Ok(32_000));
+    }
+
+    #[test]
+    fn iec_units_are_1024_based() {
+        assert_eq!(parse_size("32kib"), Ok(32 * 1024));
+        assert_eq!(parse_size("3mib"), Ok(3 * 1024 * 1024));
+        assert_eq!(parse_size("1gib"), Ok(1024 * 1024 * 1024));
+    }
+
+    /// The whole reason both families exist: `kb` beside a flag that counts
+    /// bytes would otherwise mean two things.
+    #[test]
+    fn kb_and_kib_are_different_numbers() {
+        assert_ne!(parse_size("1kb").unwrap(), parse_size("1kib").unwrap());
+    }
+
+    #[test]
+    fn case_and_separators_do_not_matter() {
+        for spec in ["3Mb", "3mb", "3MB", "3 Mb", "3_mb", "3mb"] {
+            assert_eq!(parse_size(spec), Ok(3_000_000), "spec: {spec}");
+        }
+    }
+
+    #[test]
+    fn nonsense_is_rejected_with_the_reason() {
+        for (spec, needle) in [
+            ("kb", "no number"),
+            ("12 apples", "unknown unit"),
+            ("1.5kb", "bad number"),
+            ("", "no number"),
+        ] {
+            let e = parse_size(spec).unwrap_err();
+            assert!(e.contains(needle), "{spec}: {e}");
+        }
+    }
+
+    #[test]
+    fn overflow_is_rejected_rather_than_wrapping() {
+        assert!(parse_size("99999999999999999999gb").is_err());
     }
 }

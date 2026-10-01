@@ -35,8 +35,8 @@ pub fn split_id(
 ///
 /// `None` covers the single-file case (which is the overwhelmingly common one
 /// and must stay byte-identical), a blob that does not parse, and one beyond
-/// `MAX_FILES_PER_CALL` — all of which the tool itself handles and reports, so
-/// there is nothing for a surface to split.
+/// anything the tool itself handles and reports — so there is nothing for a
+/// surface to split.
 ///
 /// The per-file blobs are the *model-facing* form, so a split call is
 /// indistinguishable from N real single-file calls; each surface then applies
