@@ -4559,6 +4559,20 @@ pub async fn run_interactive(
                 // (if any) spanning the whole window. `Esc` during the
                 // retry's back-off sleep returns `Cancelled`; `Esc` during
                 // the prompt itself is handled inside `prompt()`.
+                // U4.2: edit keys typed while the turn runs. The reader owns
+                // the sender; the receiver is bound for the whole turn so the
+                // queue lives exactly as long as the reader can feed it.
+                //
+                // `_` because nothing reads it until U4.3 adds the key branch
+                // to `prompt()`'s `select!` — deliberately not consumed, not
+                // discarded. Holding it keeps `send` working (a dropped
+                // receiver would make every send a no-op), and dropping it at
+                // the end of this scope drops the queue with it, so a keystroke
+                // cannot leak into the *next* prompt. Until U4.3 lands, a key
+                // typed mid-turn is lost exactly as it was before; the
+                // difference is that it is now lost from a place the key branch
+                // will be able to reach.
+                let (in_turn_keys_tx, _in_turn_keys_rx) = tokio::sync::mpsc::unbounded_channel();
                 let reader_handle = if let Some(g) = &guard {
                     let done = Arc::new(AtomicBool::new(false));
                     let confirm_gate = config
@@ -4571,6 +4585,7 @@ pub async fn run_interactive(
                         config.cancel_notify.clone(),
                         done.clone(),
                         confirm_gate,
+                        in_turn_keys_tx,
                     );
                     Some((h, done))
                 } else {

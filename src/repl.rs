@@ -70,19 +70,74 @@ pub(crate) fn register_sigcont() {
     }
 }
 
-/// Spawn a background stdin reader that lives *only* while an LLM request
-/// is in flight (`prompt().await` blocks the main task). In raw mode
-/// `event::read` is blocking and the main task cannot read keys during
-/// the await, so this thread catches `Esc`/`Ctrl-C`/`Ctrl-Z` that
-/// arrive mid-request. Normal editing keys are read by `read_input`
-/// (main task) and are simply dropped here.
+/// Where the in-flight reader sends one terminal event.
 ///
-/// - `Esc`        → `cancel.store(true)` (the rig `PromptHook` bridge
-///                  aborts the in-flight request).
-/// - `Ctrl-C`     → restore terminal, hard exit (process-wide).
-/// - `Ctrl-Z`     → restore terminal, `killpg(getpgrp(), SIGTSTP)`
-///                  (suspend the whole process group to the shell).
-/// - other keys  → ignored (cannot be typed into the prompt mid-request).
+/// Split out of `spawn_in_flight_reader` because the *policy* is the part
+/// worth arguing about and the part worth testing: which keys may wait, and
+/// which may not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReaderRoute {
+    /// Deal with it here — process/terminal/abort state, or an event with
+    /// nobody to hand it to.
+    Inline,
+    /// Hand it to the turn's key branch on the channel.
+    Forward,
+}
+
+/// Route one terminal event arriving while a request is in flight.
+///
+/// **Inline — must not wait:**
+/// - `Resize`: the streaming renderers read `TERMINAL_WIDTH`, and only this
+///   thread can update it while the main task is parked on the turn.
+///   Forwarding it too would make the turn consume the width instead of the
+///   renderers reading it directly.
+/// - `Ctrl-C` / `Ctrl-Z`: process and terminal state (`exit`,
+///   `killpg(SIGTSTP)`), handled where they land, never queued.
+/// - `Esc`: aborts the turn through `cancel`. Inline so that an abort
+///   cannot ride behind a paste backlog — which is the same reason the
+///   channel is unbounded.
+///
+/// **Forwarded:** every other key, plus `Paste`. These are content for the
+/// prompt; `read_input` already treats `Event::Paste` as a bulk insert, so
+/// the turn's key branch reads them the same way (U4.3).
+///
+/// Everything else — mouse, focus — returns [`ReaderRoute::Inline`] and is
+/// ignored, exactly as it was before there was anywhere to forward to.
+///
+/// TODO(U4.3): `Esc` should be menu-first while a menu is open (settled:
+/// "abort only at root"), and this thread cannot know whether one is. That
+/// decision either moves `Esc` onto the forwarded path or duplicates it —
+/// the turn can see the session, this thread cannot.
+pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
+    match ev {
+        Event::Resize(..) => ReaderRoute::Inline,
+        Event::Key(key) => match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ReaderRoute::Inline
+            }
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ReaderRoute::Inline
+            }
+            KeyCode::Esc => ReaderRoute::Inline,
+            _ => ReaderRoute::Forward,
+        },
+        Event::Paste(..) => ReaderRoute::Forward,
+        _ => ReaderRoute::Inline,
+    }
+}
+
+/// What to do with each event is [`route_event`]'s call, not a pile of
+/// branches here. The reader handles four things inline and forwards the
+/// rest on `keys` (ui_draw_v2 §4.5 U4.2); until U4.2 nothing was
+/// forwarded and edit keys typed mid-request were simply dropped.
+///
+/// `keys` is **unbounded** on purpose: a bounded channel that filled would
+/// block this thread at precisely the moment it has to deliver `Ctrl-C`.
+///
+/// Spawned *only* while an LLM request is in flight (`prompt().await`
+/// blocks the main task). In raw mode `event::read` is blocking and the
+/// main task cannot read keys during the await, so this thread is what
+/// sees `Esc`/`Ctrl-C`/`Ctrl-Z` arriving mid-request.
 ///
 /// `done` is set by the caller once the await returns, so the loop can
 /// exit and be joined. `guard` and `cancel` are `Arc` and `stop()`/
@@ -96,6 +151,7 @@ pub(crate) fn spawn_in_flight_reader(
     cancel_notify: Arc<tokio::sync::Notify>,
     done: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    keys: tokio::sync::mpsc::UnboundedSender<Event>,
 ) -> std::thread::JoinHandle<()> {
     thread::spawn(move || loop {
         if done.load(Ordering::SeqCst) {
@@ -112,6 +168,13 @@ pub(crate) fn spawn_in_flight_reader(
         }
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {
+                // U4.2: edit keys this thread used to drop now go to the turn.
+                // `send` on an unbounded tokio mpsc never blocks, so this is
+                // safe from a plain OS thread — and being non-blocking is the
+                // whole reason the channel is unbounded (see `route_event`).
+                Ok(ev) if route_event(&ev) == ReaderRoute::Forward => {
+                    let _ = keys.send(ev);
+                }
                 Ok(Event::Resize(w, _h)) => {
                     // Update the shared terminal width so renderers pick up
                     // the change on their next streaming call.
@@ -2474,6 +2537,92 @@ fn history_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
+
+    /// The in-flight reader's routing policy: which events may wait, and which
+    /// may not.
+    ///
+    /// Pinned as a *correctness* property rather than a preference — "an abort
+    /// cannot ride behind a paste backlog" (ui_draw_v2 §4.5) — and the
+    /// channel's unboundedness follows from it: a bounded one that filled would
+    /// block the reader at precisely the moment it has to deliver `Ctrl-C`.
+    #[test]
+    fn an_abort_never_queues_behind_content() {
+        let urgent = [
+            (
+                "Ctrl-C",
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ),
+            (
+                "Ctrl-Z",
+                Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            ),
+            (
+                "Esc",
+                Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ),
+            ("Resize", Event::Resize(120, 40)),
+        ];
+        for (what, ev) in urgent {
+            assert_eq!(
+                route_event(&ev),
+                ReaderRoute::Inline,
+                "{} must be handled inline, never queued",
+                what
+            );
+        }
+    }
+
+    /// Everything the prompt can hold is content, and content goes to the turn
+    /// instead of being dropped the way it was before U4.2.
+    #[test]
+    fn what_the_prompt_can_hold_is_forwarded() {
+        let content = [
+            (
+                "a character",
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            ),
+            (
+                "Enter",
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ),
+            (
+                "Shift+Enter (a newline)",
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            ),
+            (
+                "Up",
+                Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            ),
+            (
+                "Backspace",
+                Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            ),
+            ("a paste", Event::Paste("hello world".to_string())),
+        ];
+        for (what, ev) in content {
+            assert_eq!(
+                route_event(&ev),
+                ReaderRoute::Forward,
+                "{} is content for the prompt",
+                what
+            );
+        }
+    }
+
+    /// Events with nowhere to go keep their old fate instead of being
+    /// forwarded, so the channel carries no more than the prompt could ever
+    /// show.
+    #[test]
+    fn events_with_nowhere_to_go_stay_inline() {
+        let ev = Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(route_event(&ev), ReaderRoute::Inline);
+    }
 
     /// A committed line is bracketed by rules: one above, one below, and the
     /// line between them.
