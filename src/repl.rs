@@ -644,6 +644,56 @@ pub(crate) fn input_element(
     }
 }
 
+/// The overlay's rows and the window focus among them, as the painter wants
+/// them: no overlay ⇒ no rows and focus 0.
+pub(crate) fn overlay_paint(overlay: &ActiveOverlay, w: usize, h: usize) -> (Vec<String>, usize) {
+    let painted = match overlay {
+        ActiveOverlay::None => None,
+        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
+            Some(crate::slashdot_menu::render::paint_overlay(plan, w, h))
+        }
+    };
+    // A plan whose selection did not fit falls back to 0 — window from the
+    // top — which is what the frame's focus means there.
+    let focus = painted.as_ref().and_then(|p| p.focus).unwrap_or(0);
+    (painted.map_or_else(Vec::new, |p| p.rows), focus)
+}
+
+/// Compose and apply the prompt frame: `[Input]`, or
+/// `[Input, Divider, Overlay]` while a pop-up shows (plan §5.2).
+///
+/// **The one way the prompt writes to the terminal.** `read_input`'s blocking
+/// loop and the turn's `select!` key branch both come here (ui_draw_v2 §4.5
+/// U4), so neither pump can grow its own idea of what the input row looks
+/// like — the split that made `handle_key` and `eval` draw nothing only holds
+/// if the pixels they are silent about have exactly one owner.
+///
+/// The apply phase owns the rest: an intact live frame means a partial row-diff
+/// (so a tall pop-up's scroll is followed without a row counter), and the
+/// scroll `delta` and bounded clear live in `plan_apply`. Content *above* the
+/// frame — greeter, status, session — is never touched.
+pub(crate) fn paint_prompt(
+    output: &dyn Output,
+    label: &str,
+    editor: &LineEditor,
+    overlay_rows: &[String],
+    focus: usize,
+    dims: (usize, usize),
+) {
+    let dims = (dims.0.max(1), dims.1.max(1));
+    // The REPL supplies only what changes: the input, and the menu when one is
+    // open. The status row is `compose_area`'s to resolve — it is made of
+    // `status_text` and `streaming`, which are this output's facts and not
+    // something this module may reason about — and so is the divider that
+    // separates the menu from the input above it (ui_draw_v2 §5.1.1).
+    let input = input_element(editor, label, output.is_streaming(), dims.0);
+    let overlay =
+        (!overlay_rows.is_empty()).then(|| Element::overlay(overlay_rows.to_vec(), focus));
+    // Composition *and* division are the tail's now: pieces move in and nothing
+    // comes back, so no `Vec<Element>` crosses a call site (ui_draw_v2 §5.1.1).
+    let _ = output.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
+}
+
 /// Editor content: the prompt on row 0, the wrapped buffer below it.
 struct InputItem {
     layout: Layout,
@@ -1326,22 +1376,12 @@ impl Repl {
         // `term_width` is read at paint time rather than here, so a resize that
         // lands mid-edit re-flows the bar with the frame instead of leaving a
         // bar sized for the old terminal.
+        // The loop's whole painter is the shared one: the turn's key branch
+        // calls `paint_prompt` directly, and a second body here would be the
+        // second way to write the terminal that U4 exists to avoid.
         let redraw =
             |editor: &LineEditor, overlay: &[String], focus: usize, dims: (usize, usize)| {
-                let dims = (dims.0.max(1), dims.1.max(1));
-                // The REPL supplies only what changes: the input, and the menu when one
-                // is open. The status row is `compose_area`'s to resolve — it is made of
-                // `status_text` and `streaming`, which are this output's facts and not
-                // something this module may reason about — and so is the divider that
-                // separates the menu from the input above it (ui_draw_v2 §5.1.1).
-                let input = input_element(editor, prompt, output.is_streaming(), dims.0);
-                let overlay =
-                    (!overlay.is_empty()).then(|| Element::overlay(overlay.to_vec(), focus));
-                // Composition *and* division are the tail's now: pieces move in
-                // and nothing comes back, so no `Vec<Element>` crosses a call
-                // site (ui_draw_v2 §5.1.1) — and this can no longer build a
-                // `Frame` by hand.
-                let _ = output.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
+                paint_prompt(output, prompt, editor, overlay, focus, dims);
             };
         loop {
             // On resume from Ctrl-Z (editing phase; the in-flight reader thread
@@ -1449,17 +1489,8 @@ impl Repl {
             // re-derived here — `1 + Σ(1 + newlines(opts[..sel]))` — which
             // assumed a one-row header and no table header, so it pointed at
             // the wrong row for any menu with either (ui_draw_v2 §9 #5).
-            let painted = match &overlay {
-                ActiveOverlay::None => None,
-                ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => Some(
-                    crate::slashdot_menu::render::paint_overlay(plan, cur_w, cur_h),
-                ),
-            };
-            // A plan whose selection did not fit falls back to 0 — window from
-            // the top — which is what the frame's focus means there.
-            let focus = painted.as_ref().and_then(|p| p.focus).unwrap_or(0);
-            let overlay_rows: &[String] = painted.as_ref().map_or(&[], |p| p.rows.as_slice());
-            redraw(&editor, overlay_rows, focus, (cur_w, cur_h));
+            let (rows, focus) = overlay_paint(overlay, cur_w, cur_h);
+            redraw(&editor, &rows, focus, (cur_w, cur_h));
 
             // --- Wait for a key (or a prose-completion wake). While a
             // prose request is armed/in flight, poll with a deadline so
