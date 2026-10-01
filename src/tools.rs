@@ -2553,6 +2553,7 @@ mod edit_file_tests {
                 old_text: e.old_text.clone(),
                 new_text: e.new_text.clone(),
                 start_line: e.start_line.map(crate::config::EditStartLine),
+                origin: None,
             })
             .collect();
         assert_eq!(parsed.edits[0].start_line, Some(4));
@@ -2729,6 +2730,7 @@ mod edit_file_tests {
                 old_text: "hello".into(),
                 new_text: "goodbye".into(),
                 start_line: None,
+                origin: None,
             }],
         )
         .await
@@ -2755,6 +2757,7 @@ mod edit_file_tests {
                 old_text: "hello".into(),
                 new_text: "goodbye".into(),
                 start_line: None,
+                origin: None,
             }],
         )
         .await
@@ -2786,6 +2789,7 @@ mod edit_file_tests {
                 old_text: "fn main() {\n   let x = 1;\n    let y = 2;\n}\n".into(),
                 new_text: "noop".into(),
                 start_line: None,
+                origin: None,
             }],
         )
         .await
@@ -2816,7 +2820,7 @@ mod edit_file_tests {
                 old_text: "completely different unrelated content here that shares no characters with the file".into(),
                 new_text: "noop".into(),
                 start_line: None,
-            }],
+                origin: None,}],
         )
         .await
         .unwrap();
@@ -2850,6 +2854,7 @@ mod edit_file_tests {
                 old_text: "foo".into(),
                 new_text: "bar".into(),
                 start_line: None,
+                origin: None,
             }],
         )
         .await
@@ -2875,6 +2880,7 @@ mod edit_file_tests {
                 old_text: "x ".into(),
                 new_text: "y ".into(),
                 start_line: None,
+                origin: None,
             }],
         )
         .await
@@ -2909,16 +2915,19 @@ mod edit_file_tests {
                     old_text: "    let a = 1;".into(),
                     new_text: "    let a = 42;".into(),
                     start_line: None,
+                    origin: None,
                 },
                 EditOp {
                     old_text: "    let nonexistent = 99;".into(),
                     new_text: "    let z = 99;".into(),
                     start_line: None,
+                    origin: None,
                 },
                 EditOp {
                     old_text: "fn".into(),
                     new_text: "function".into(),
                     start_line: None,
+                    origin: None,
                 },
             ],
         )
@@ -2973,6 +2982,7 @@ mod edit_file_tests {
                 old_text: "fn main() {\n   let x = 1;\n}\n".into(),
                 new_text: "noop".into(),
                 start_line: None,
+                origin: None,
             }],
         )
         .await
@@ -3742,6 +3752,49 @@ mod edit_args_wire_tests {
 
     #[tokio::test]
     #[serial]
+    async fn a_failed_block_is_named_by_its_header_and_given_readable_context() {
+        // End to end through the erased tool, on the path a model actually
+        // takes: a block blob whose header carried an anchor, with one typo in
+        // the old text.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        let file = "fn main() {\n    let alpha = 1;\n    let beta = 2;\n    let gamma = 3;\n}\n";
+        tokio::fs::write("ctx.txt", file).await.unwrap();
+        let blob = "ctx.txt:1\n@@@OLD\nfn main() {\n    let alpha = 1;\n    let beta = 2;\n    let delta = 3;\n}\n@@@NEW\nfn main() {\n    let alpha = 1;\n    let beta = 2;\n    let delta = 4;\n}\n@@@END";
+        let result = execute_edit(serde_json::json!({ "blocks": blob })).await;
+        // A match failure is reported as a *successful* call carrying the
+        // structured envelope, which is what `display_tool_result` splits on.
+        let text = result.output().render();
+        assert!(
+            crate::edit_match::looks_like_edit_failure(&text),
+            "expected a failure envelope, got: {text}"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&text).expect("structured failure envelope");
+        let model = v["model_view"].as_str().unwrap();
+
+        // Named by the header the model itself wrote, verbatim.
+        assert!(model.contains("Your block `ctx.txt:1` failed:"), "{model}");
+        // Given the file, in `read`'s format, at the line that differs.
+        assert!(
+            model.contains("let gamma = 3;"),
+            "changed line missing:\n{model}"
+        );
+        // `read`'s format: 4-wide number, pipe, one space, indentation intact.
+        // The region is the divergent line plus 2 either side, so it starts at
+        // line 2 — the changed line is line 4.
+        assert!(
+            model.contains("   2|     let alpha = 1;"),
+            "not read format:\n{model}"
+        );
+        // No diff, and no echo of the model's own text.
+        assert!(!model.contains("Diff"), "{model}");
+        assert!(!model.contains("let delta = 3"), "oldText echoed:\n{model}");
+        // The file is untouched — a diagnostic must never half-apply.
+        assert_eq!(tokio::fs::read_to_string("ctx.txt").await.unwrap(), file);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn a_multi_file_blob_edits_every_named_file() {
         // The W2 wiring, end to end through the erased tool: one call, three
         // files, each applied independently.
@@ -3902,6 +3955,9 @@ mod edit_args_wire_tests {
             1,
             vec![crate::edit_match::BatchItem {
                 edit_index: 0,
+                origin: None,
+                anchored: false,
+                old_text: String::new(),
                 failure: crate::edit_match::EditFailure {
                     ui_view: "u".into(),
                     model_view: "m".into(),

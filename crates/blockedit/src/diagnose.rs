@@ -19,16 +19,24 @@
 use serde::Serialize;
 use similar::{ChangeTag, TextDiff};
 
+use crate::wire;
+
 /// Tunables. Constants for now; can become config later if there's call.
 const MIN_ANCHOR_LEN: usize = 4;
-/// Window size on each side of the anchor for Myers diff. Anchors shorter
-/// than this are extended; longer anchors stay as-is. Bounded by file size.
-const WINDOW_PAD: usize = 256;
-/// If similarity is below this ratio, we say "no close match" rather than
-/// try to guide the model toward a phantom.
-const MIN_SIMILARITY: f64 = 0.5;
-/// Cap on the number of diff lines rendered into the model_view.
-const MAX_DIFF_LINES: usize = 30;
+/// If the anchor is shorter than this fraction of `oldText`, we say "no close
+/// match" rather than point the model at a phantom.
+const MIN_ANCHOR_RATIO: f64 = 0.5;
+/// Lines of file context shown on each side of the divergent region.
+const CONTEXT_PAD: usize = 2;
+/// Cap on rendered context lines, split evenly around the divergence.
+///
+/// Unlike the diff cap this replaces, eliding is **non-destructive**: every
+/// rendered line keeps its own true line number, so a truncated region is still
+/// directly usable by the model. That property is why the region is worth
+/// showing at all.
+const MAX_CONTEXT_LINES: usize = 40;
+/// Cap on the echoed `oldText` when it is the only thing identifying a block.
+const MAX_ECHOED_OLD_LINES: usize = 20;
 
 /// Skew rule: for an anchor beyond the context tolerance, accept the nearest
 /// candidate only if it is at least this many times closer than the second
@@ -76,6 +84,19 @@ pub struct BatchItem {
     /// Per-edit failure (or a plain-error fallback when no close match
     /// was found).
     pub failure: EditFailure,
+    /// The block's origin string exactly as the model spelled it, for naming
+    /// the failure. `None` when the call could not supply one.
+    pub origin: Option<String>,
+    /// Whether the model supplied a line anchor for this block. Not derived
+    /// from `origin` — a replayed session has no origin string at all, and
+    /// guessing an anchor back out of text is exactly the reconstruction this
+    /// field exists to avoid.
+    pub anchored: bool,
+    /// The block's `oldText`, carried so [`BatchEditFailure::build`] can decide
+    /// whether it is needed. `build` holds `total` and the whole failure list,
+    /// so it is the only place that can tell whether the edit index is
+    /// ambiguous; the per-failure constructors cannot. Already in memory.
+    pub old_text: String,
 }
 
 /// Result of a multi-edit call where one or more edits failed. The
@@ -105,6 +126,11 @@ impl BatchEditFailure {
     /// human watching the TUI sees something useful. For multi-failure
     /// batches the `ui_view` falls back to a count-only summary to keep
     /// the panel bounded.
+    ///
+    /// Each failure is led by the block's **origin string**, verbatim — the
+    /// `src/foo.rs:140` header line the model itself wrote. In a batch of ten
+    /// that is a literal string the model can find in its own message, which
+    /// is a far better identifier than an ordinal it would have to count out.
     pub fn build(total: usize, items: Vec<BatchItem>) -> Self {
         let failed = items.len();
         let mut model_view = String::new();
@@ -117,8 +143,13 @@ impl BatchEditFailure {
             model_view.push_str(&format!(
                 "\n--- edit #{} ---\n{}",
                 item.edit_index + 1,
-                item.failure.model_view,
+                lead_with_origin(&item.failure.model_view, item),
             ));
+            // An ordinal plus a bare path is enough only when the model can
+            // trust the ordinal. See `needs_old_text`.
+            if needs_old_text(item, total) {
+                model_view.push_str(&echo_old_text(&item.old_text));
+            }
         }
         let ui_view = if items.len() == 1 {
             // Single failure: the per-edit summary IS the message. The
@@ -149,7 +180,57 @@ pub fn render_batch(failure: &BatchEditFailure) -> String {
     serde_json::to_string(failure).expect("BatchEditFailure is always serializable")
 }
 
-/// Try to find a substring of `file_text` that closely resembles `query`.
+/// Prefix a per-edit body with the block's origin string.
+///
+/// `Your block \`src/foo.rs:140\` failed: …` — the string is the model's own,
+/// reproduced unchanged, so the model can match it against the header line it
+/// wrote rather than translate an ordinal. A failure with no origin (a replayed
+/// session carries none) keeps its body as-is rather than inventing one.
+fn lead_with_origin(body: &str, item: &BatchItem) -> String {
+    match item.origin.as_deref() {
+        Some(origin) => format!("Your block `{origin}` failed: {body}"),
+        None => body.to_string(),
+    }
+}
+
+/// Must this failure fall back to echoing the model's `oldText` to be
+/// identified?
+///
+/// The origin string usually settles it — but only when the model supplied a
+/// line anchor, because that is what makes the string unique within a file. With
+/// several blocks in one file and no anchors, the best identifier left is
+/// `edit #N`, and an ordinal the model must count out across a batch it may be
+/// reading ten blocks of is not an identifier, it is a puzzle.
+///
+/// Keyed on `total`, the number of blocks in this file, **not** on how many
+/// failed: a ten-block file with one failure is exactly the case where `edit #4`
+/// forces the model to count. A single-block call never needs it, because
+/// `edit #1` is unambiguous.
+fn needs_old_text(item: &BatchItem, total: usize) -> bool {
+    total > 1 && !item.anchored
+}
+
+/// Render the model's `oldText` as an identifier fallback: fenced, so it cannot
+/// be confused with the `NNNN| ` numbered file lines it sits under.
+fn echo_old_text(old_text: &str) -> String {
+    let lines: Vec<&str> = old_text.split('\n').collect();
+    let shown = lines.len().min(MAX_ECHOED_OLD_LINES);
+    // Lead with a newline: the per-edit body does not end in one, and running
+    // the two together would weld the last context line to this heading.
+    let mut out = String::from("\nThe text you sent for this block was:\n```\n");
+    for l in &lines[..shown] {
+        out.push_str(l);
+        out.push('\n');
+    }
+    if lines.len() > shown {
+        out.push_str(&wire::elision_notice(lines.len() - shown));
+        out.push('\n');
+    }
+    out.push_str("```\n");
+    out
+}
+
+/// Try to find a region of `file_text` that closely resembles `query`.
 ///
 /// `query` is what the model sent as `oldText`. `file_text` is the current
 /// file contents. On exact-match (the normal path) we never get here; this
@@ -157,6 +238,12 @@ pub fn render_batch(failure: &BatchEditFailure) -> String {
 ///
 /// The whole file is searched: the anchor only disambiguates between *exact*
 /// matches, so it plays no part in diagnosing a miss.
+///
+/// **Returns file content in the same format as `read`** — `   12| line` —
+/// not a diff. The diff this replaced showed the model a padded window wearing
+/// `-`/`+` markers, capped at 30 rows from the front, so the rows that differed
+/// were usually the ones cut. A model can act on numbered lines; it cannot act
+/// on a diff of a region it has to re-derive.
 ///
 /// Returns `None` if no region is similar enough to be worth showing.
 pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
@@ -166,94 +253,178 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
 
     let search_text = file_text;
 
-    // Stage 1: anchor via longest-common-substring.
-    let anchor = find_anchor(search_text, query, MIN_ANCHOR_LEN)?;
-    let (anchor_start, anchor_len) = anchor;
+    // Stage 1: anchor via longest-common-substring. Its job is to seed the
+    // locator below and to answer "is anything related here at all".
+    let (anchor_start, anchor_len) = find_anchor(search_text, query, MIN_ANCHOR_LEN)?;
+
+    // Stage 2: Myers over a window sized to the **query**, not to the file. The
+    // window used to be padded by a fixed 256 bytes on each side, which could
+    // only inflate the equal-line count — padding lines match nothing in the
+    // query but do count as context, so a long near-match scored ~0.99 and was
+    // then rendered as thirty identical lines. Sizing the window to `oldText`
+    // keeps the window honest *and* still covers the whole query: the anchor is
+    // itself a large fraction of it.
     let anchor_end = anchor_start + anchor_len;
-
-    // Stage 2: extract a window around the anchor so Myers diff has a
-    // bounded region to work on. The window is `query.len()`-bounded on
-    // each side so the diff stays informative without scanning the whole
-    // file.
-    let win_start = anchor_start.saturating_sub(query.len() + WINDOW_PAD);
-    let win_end = (anchor_end + query.len() + WINDOW_PAD).min(search_text.len());
-    // Align to character boundaries to avoid slicing inside multi-byte chars.
-    let win_start = search_text.floor_char_boundary(win_start);
-    let win_end = search_text.ceil_char_boundary(win_end);
+    let win_start = line_start_at(search_text, anchor_start.saturating_sub(query.len()));
+    let win_end = line_end_at(
+        search_text,
+        (anchor_end + query.len()).min(search_text.len()),
+    );
     let window = &search_text[win_start..win_end];
+    let offset = count_lines(&search_text[..win_start]) + 1;
 
-    // Stage 3: Myers diff between the model's `query` and the on-disk
-    // `window`. Cap the rendered output at MAX_DIFF_LINES lines so a huge
-    // diff doesn't blow up the model's context.
+    // Two signals, max-of. The anchor ratio catches the "one bad character in a
+    // long block" case, where whole lines differ and no line is equal even
+    // though most characters match. The line ratio catches indentation drift,
+    // where the shared run is short but most lines still line up — the
+    // dominant real-world failure, and one the anchor ratio alone rejects.
+    // Neither alone is sufficient; the max is not an inflation risk once the
+    // window holds nothing but query-sized context.
     //
-    // Similarity is a hybrid: max of (anchor length / query length) and
-    // (equal lines / total lines). The anchor metric catches the
-    // "single-line tweak with one bad character" case (lines may show
-    // 0 equal even though 99% of chars match); the line metric catches
-    // the "tab vs space drift" case where the longest shared run is
-    // short but most lines line up. Max-of keeps the bar low for
-    // genuinely-close matches while still rejecting totally-wrong
-    // queries.
+    // The ratio is a gate only. It is deliberately **not reported**: a number
+    // the model cannot act on, which was previously both misleading (0.99 for a
+    // region that rendered as pure context) and the loudest thing in the
+    // message.
     let diff = TextDiff::from_lines(query, window);
     let changes: Vec<_> = diff.iter_all_changes().collect();
-    let anchor_sim = (anchor_len as f64) / (query.len() as f64);
-    let total_lines = count_lines(query).max(count_lines(window)).max(1);
+    let anchor_ratio = (anchor_len as f64) / (query.len() as f64);
+    let span_lines = count_lines(query).max(count_lines(window)).max(1);
     let equal_lines = changes
         .iter()
         .filter(|c| matches!(c.tag(), ChangeTag::Equal))
         .count();
-    let line_sim = (equal_lines as f64) / total_lines as f64;
-    let similarity = anchor_sim.max(line_sim);
-
-    if similarity < MIN_SIMILARITY {
+    let line_ratio = (equal_lines as f64) / span_lines as f64;
+    if anchor_ratio.max(line_ratio) < MIN_ANCHOR_RATIO {
         return None;
     }
 
-    // Translate the window-relative line numbers back to file-relative
-    // line numbers so the model can `read` the right region.
-    let window_line_offset = count_lines(&search_text[..win_start]);
-
-    // Build the rich model_view body (no header; the caller adds a
-    // batch envelope around it).
-    let mut model_view = String::new();
-    model_view.push_str(&format!(
-        "oldText not found. Closest match: similarity {:.2}, file lines {}-{} \
-         (anchor at line {}, length {} chars).\n\
-         Diff (your oldText vs. file content at that region):\n",
-        similarity,
-        window_line_offset + 1,
-        window_line_offset + window.lines().count().max(1),
-        window_line_offset + count_lines(&search_text[..anchor_start]) + 1,
-        anchor_len,
-    ));
-
-    for (rendered, change) in changes.iter().enumerate() {
-        if rendered >= MAX_DIFF_LINES {
-            model_view.push_str(&format!(
-                "... ({} more diff lines truncated)\n",
-                changes.len().saturating_sub(rendered),
-            ));
-            break;
+    // Stage 3: which of those window lines actually differ. Change indices come
+    // from the *new* (window) side: `TextDiff::from_lines` puts the query on the
+    // old side, so an `old_index` would name a line of what the model wrote
+    // rather than a line of the file it needs to fix.
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+    for change in &changes {
+        if matches!(change.tag(), ChangeTag::Equal) {
+            continue;
         }
-        let tag = match change.tag() {
-            ChangeTag::Equal => " ",
-            ChangeTag::Insert => "+",
-            ChangeTag::Delete => "-",
-        };
-        model_view.push_str(&format!("{}{}", tag, change.value()));
+        if let Some(i) = change.new_index() {
+            lo = lo.min(i);
+            hi = hi.max(i);
+        }
     }
 
-    let ui_view = format!(
-        "Closest match at file lines {}-{} (similarity {:.2}).",
-        window_line_offset + 1,
-        window_line_offset + window.lines().count().max(1),
-        similarity,
+    let span = if lo == usize::MAX {
+        // Nothing changed as far as Myers can tell. A true miss should never get
+        // here; fall back to the anchor's own span rather than underflow.
+        let first = count_lines(&search_text[..anchor_start]) + 1;
+        let last = (count_lines(&search_text[..anchor_end]) + 1).min(total_lines(search_text));
+        (first, last.max(first))
+    } else {
+        (
+            (offset + lo).max(1),
+            (offset + hi + 1).min(total_lines(search_text)),
+        )
+    };
+
+    let first = span.0.saturating_sub(CONTEXT_PAD).max(1);
+    let last = (span.1 + CONTEXT_PAD).min(total_lines(search_text));
+    let last = last.max(first);
+
+    let body = elide_middle(
+        &render_numbered(search_text, first, last),
+        MAX_CONTEXT_LINES,
     );
+
+    let model_view = format!(
+        "oldText not found. Closest match at file lines {}-{}; the file reads:\n{}\
+         Copy the lines above into @@@OLD verbatim, or anchor the block with path:{first}.",
+        first, last, body,
+    );
+    let ui_view = format!("Closest match at file lines {first}-{last}.");
 
     Some(EditFailure {
         ui_view,
         model_view,
     })
+}
+
+/// Total lines in `text`, counting a final line with no trailing newline.
+fn total_lines(text: &str) -> usize {
+    count_lines(text) + usize::from(!text.is_empty() && !text.ends_with('\n'))
+}
+
+/// Render `text` over the 1-based inclusive line span `[first, last]` in `read`'s
+/// exact format: `format!("{:4}| {}", line_no, content)`.
+///
+/// Byte-identical to `read` on purpose (`src/tools.rs`), so the model can lift
+/// these lines straight into a `@@@OLD` block and reuse the numbers as a
+/// `path:LINE` anchor. That also means it inherits `read`'s `\r`-stripping: on a
+/// CRLF file these lines cannot be copied byte-exactly. Consistency with `read`
+/// is worth more than a fix applied in one of the two places.
+fn render_numbered(text: &str, first: usize, last: usize) -> String {
+    let mut out = String::new();
+    for (i, line) in text
+        .lines()
+        .enumerate()
+        .skip(first.saturating_sub(1))
+        .take(last.saturating_sub(first) + 1)
+    {
+        // `i + 1`, not `first + i`: `enumerate` numbers the whole stream, so
+        // after `skip` its index is already the absolute file line.
+        out.push_str(&format!("{:4}| {}\n", i + 1, line));
+    }
+    out
+}
+
+/// Keep the first and last halves of `body` when it exceeds `cap`, collapsing
+/// the run between them into one notice.
+///
+/// Splitting around the middle rather than truncating the tail matters because
+/// the divergent lines are usually in the middle of the region — a tail-only cap
+/// would drop exactly the lines the model came for.
+fn elide_middle(body: &str, cap: usize) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.len() <= cap {
+        return body.to_string();
+    }
+    let head = cap / 2;
+    let tail = cap - head;
+    let elided = lines.len() - cap;
+    let mut out = String::new();
+    for l in &lines[..head] {
+        out.push_str(l);
+        out.push('\n');
+    }
+    out.push_str(&wire::elision_notice(elided));
+    out.push('\n');
+    for l in &lines[lines.len() - tail..] {
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
+/// The byte offset of the start of the line containing `at`.
+///
+/// The window is aligned to line boundaries, not merely to char boundaries. The
+/// diff this replaced aligned to `floor_char_boundary`, which let the window
+/// begin mid-line and emit a torn fragment as its first diff row.
+fn line_start_at(text: &str, at: usize) -> usize {
+    match text[..at].rfind('\n') {
+        Some(i) => i + 1,
+        None => 0,
+    }
+}
+
+/// The byte offset of the first newline at or after `at`, or the end of `text`.
+///
+/// Exclusive end of a line-aligned span.
+fn line_end_at(text: &str, at: usize) -> usize {
+    match text[at..].find('\n') {
+        Some(i) => at + i,
+        None => text.len(),
+    }
 }
 
 /// Render a 1-based inclusive line span for messages: `line 7` when the span
@@ -268,18 +439,17 @@ fn render_line_span((first, last): (usize, usize)) -> String {
 
 impl EditFailure {
     /// Construct a fallback for "oldText not found and no close match".
-    /// Used both directly (single-edit call) and inside batch items.
-    pub fn not_found_no_match(edit_index_1based: usize, old_text: &str) -> Self {
-        let ui_view = format!(
-            "edit #{edit_index_1based} oldText not found. \
-             No similar region in file.",
-        );
-        let model_view = format!(
-            "oldText not found. No close-enough region in the file; \
-             please re-read the file and re-anchor your edit. \
-             Original oldText: '{}'.",
-            old_text,
-        );
+    ///
+    /// `ui_view` is the **fragment only** — `"No similar region in file."` — with
+    /// no `edit #N` prefix and no trailing period of its own. The caller supplies
+    /// the leading `edit #N oldText not found.`, which every not-found failure
+    /// shares; baking it in here as well produced a doubled prefix on the
+    /// one path that reaches this constructor.
+    pub fn not_found_no_match() -> Self {
+        let ui_view = "No similar region in file.".to_string();
+        let model_view = "oldText not found. No close-enough region in the file; \
+             please re-read the file and re-anchor your edit."
+            .to_string();
         EditFailure {
             ui_view,
             model_view,
@@ -296,7 +466,6 @@ impl EditFailure {
     /// the rule failed.
     pub fn anchor_out_of_tolerance(
         edit_index_1based: usize,
-        old_text: &str,
         anchor: usize,
         tolerance: usize,
         count: usize,
@@ -335,8 +504,7 @@ impl EditFailure {
              {shown_more}. The anchor is a near-line hint, not a range. Re-read the file \
              (`read` gives line numbers) and either correct the `path:LINE`/`startLine` \
              anchor or include more surrounding context in oldText so the match is \
-             unambiguous. Original oldText: '{}'.",
-            old_text,
+             unambiguous.",
             d2_clause = candidates
                 .get(1)
                 .map(|(l, d)| format!("{d} line(s) (at line {l})"))
@@ -356,7 +524,6 @@ impl EditFailure {
     /// the original file, so overlapping regions would corrupt each other.
     pub fn overlap_conflict(
         edit_index_1based: usize,
-        old_text: &str,
         my_lines: (usize, usize),
         other_edit_index_1based: usize,
         other_lines: (usize, usize),
@@ -372,8 +539,7 @@ impl EditFailure {
              ({theirs}). Edits in one batch are all computed against the original \
              file, so their regions must be disjoint — overlapping matches would corrupt \
              each other. Merge the overlapping changes into a single block, or adjust \
-             oldText so the regions are disjoint. Original oldText: '{}'.",
-            old_text,
+             oldText so the regions are disjoint.",
         );
         EditFailure {
             ui_view,
@@ -389,7 +555,6 @@ impl EditFailure {
     /// 1-based indices of the edits whose matches consumed them (deduped).
     pub fn all_candidates_claimed(
         edit_index_1based: usize,
-        old_text: &str,
         count: usize,
         candidate_lines: &[usize],
         claimer_edits: &[usize],
@@ -420,9 +585,7 @@ impl EditFailure {
              occurrence overlaps a match already claimed by edit(s) {claimer_list} in this \
              batch — two blocks cannot target the same region (matches are computed against \
              the original file). Either this block duplicates what the other edit already \
-             replaces — drop it — or give it distinct oldText/anchors. Original oldText: \
-             '{}'.",
-            old_text,
+             replaces — drop it — or give it distinct oldText/anchors. ",
         );
         EditFailure {
             ui_view,
@@ -434,7 +597,6 @@ impl EditFailure {
     /// the anchor line", so nearest-match cannot pick one safely.
     pub fn anchor_ambiguous(
         edit_index_1based: usize,
-        old_text: &str,
         anchor: usize,
         line_numbers: &[usize],
     ) -> Self {
@@ -450,8 +612,7 @@ impl EditFailure {
         let model_view = format!(
             "oldText has multiple occurrences equally close to the anchor line \
              {anchor} (lines: {line_list}). Include more surrounding context in \
-             oldText so exactly one occurrence matches. Original oldText: '{}'.",
-            old_text,
+             oldText so exactly one occurrence matches.",
         );
         EditFailure {
             ui_view,
@@ -468,7 +629,6 @@ impl EditFailure {
     /// `line_numbers` the free candidate lines (≤10).
     pub fn non_unique(
         edit_index_1based: usize,
-        old_text: &str,
         count: usize,
         line_numbers: &[usize],
         excluded: usize,
@@ -509,8 +669,7 @@ impl EditFailure {
              block to the nearest occurrence (line numbers come from `read`). \
              Alternatively, include more surrounding context in oldText (the \
              line(s) immediately before/after) so only one occurrence matches. \
-             Original oldText: '{}'.",
-            old_text,
+            ",
             marker = crate::blob::SEARCH_MARKER,
             first = line_numbers.first().copied().unwrap_or(0),
         );
@@ -791,29 +950,28 @@ mod tests {
 
     #[test]
     fn not_found_no_match_carries_message_in_both_views() {
-        let f = EditFailure::not_found_no_match(2, "missing");
-        // ui_view carries the edit index for the human.
-        assert!(f.ui_view.contains("edit #2"));
-        // model_view is body-only (the envelope adds the edit index
-        // header); verify the body content is there.
+        let f = EditFailure::not_found_no_match();
+        // ui_view is the bare fragment: `not_found_failure` supplies the
+        // `edit #N oldText not found.` prefix every not-found failure shares,
+        // so this must not carry one of its own.
+        assert_eq!(f.ui_view, "No similar region in file.");
         assert!(f.model_view.contains("No close-enough region"));
-        assert!(f.model_view.contains("missing"));
-        // UI view should not contain the raw oldText (it's not a secret,
-        // but the contract is "UI view is short, no file content").
-        assert!(!f.ui_view.contains("missing"));
+        // The model already has its own text in its own tool call; echoing it
+        // back costs tokens and adds no information.
+        assert!(!f.model_view.contains("Original oldText"));
     }
 
     #[test]
     fn non_unique_lists_line_numbers() {
-        let f = EditFailure::non_unique(1, "foo", 3, &[1, 3, 5], 0);
+        let f = EditFailure::non_unique(1, 3, &[1, 3, 5], 0);
         assert!(f.ui_view.contains("lines: 1, 3, 5"));
         assert!(f.model_view.contains("lines: 1, 3, 5"));
-        assert!(f.model_view.contains("foo"));
+        assert!(!f.model_view.contains("foo"), "oldText must not be echoed");
     }
 
     #[test]
     fn non_unique_caps_listing_with_truncation_notice() {
-        let f = EditFailure::non_unique(1, "foo", 15, &(1..=10).collect::<Vec<_>>(), 0);
+        let f = EditFailure::non_unique(1, 15, &(1..=10).collect::<Vec<_>>(), 0);
         assert!(f.ui_view.contains("(...and 5 more)"));
         assert!(f.ui_view.contains("1, 2, 3, 4, 5, 6, 7, 8, 9, 10"));
     }
@@ -822,7 +980,7 @@ mod tests {
     fn non_unique_reports_excluded_claims() {
         // 5 total, 2 already claimed → 3 free; free = 5 - 2, shown = 3 → no
         // truncation note, but the excluded count is called out.
-        let f = EditFailure::non_unique(2, "foo", 5, &[10, 20, 30], 2);
+        let f = EditFailure::non_unique(2, 5, &[10, 20, 30], 2);
         assert!(f.ui_view.contains("appears 5 times"));
         assert!(f.ui_view.contains("2 occurrence(s) already matched"));
         assert!(f.ui_view.contains("free lines: 10, 20, 30"));
@@ -833,31 +991,33 @@ mod tests {
     fn non_unique_truncation_counts_only_free_candidates() {
         // 15 total, 5 excluded → 10 free, all shown → no "...and more" note
         // even though total (15) > shown (10).
-        let f = EditFailure::non_unique(1, "foo", 15, &(1..=10).collect::<Vec<_>>(), 5);
+        let f = EditFailure::non_unique(1, 15, &(1..=10).collect::<Vec<_>>(), 5);
         assert!(!f.ui_view.contains("more)"));
     }
 
     #[test]
     fn overlap_conflict_names_both_edits_and_ranges() {
-        let f = EditFailure::overlap_conflict(2, "the text", (140, 143), 1, (141, 145));
+        let f = EditFailure::overlap_conflict(2, (140, 143), 1, (141, 145));
         assert!(f.ui_view.contains("edit #2"));
         assert!(f.ui_view.contains("edit #1"));
         assert!(f.ui_view.contains("140-143"));
         assert!(f.ui_view.contains("141-145"));
         assert!(f.model_view.contains("disjoint"));
-        assert!(f.model_view.contains("the text"));
-        // ui_view stays short, no file content
-        assert!(!f.ui_view.contains("the text"));
+        // The line ranges already say which region; the oldText added nothing.
+        assert!(!f.model_view.contains("the text"));
     }
 
     #[test]
     fn all_candidates_claimed_lists_claimers() {
-        let f = EditFailure::all_candidates_claimed(3, "dup text", 2, &[7, 12], &[1, 2]);
+        let f = EditFailure::all_candidates_claimed(3, 2, &[7, 12], &[1, 2]);
         assert!(f.ui_view.contains("edit #3"));
         assert!(f.ui_view.contains("#1, #2"));
         assert!(f.ui_view.contains("lines: 7, 12"));
-        assert!(f.model_view.contains("dup text"));
         assert!(f.model_view.contains("drop it"));
+        assert!(
+            !f.model_view.contains("dup text"),
+            "oldText must not be echoed"
+        );
     }
 
     #[test]
@@ -882,11 +1042,17 @@ mod tests {
         let items = vec![
             BatchItem {
                 edit_index: 0,
-                failure: EditFailure::not_found_no_match(1, "x"),
+                origin: None,
+                anchored: false,
+                old_text: String::new(),
+                failure: EditFailure::not_found_no_match(),
             },
             BatchItem {
                 edit_index: 2,
-                failure: EditFailure::non_unique(3, "y", 2, &[4, 8], 0),
+                origin: None,
+                anchored: false,
+                old_text: String::new(),
+                failure: EditFailure::non_unique(3, 2, &[4, 8], 0),
             },
         ];
         let b = BatchEditFailure::build(3, items);
@@ -905,6 +1071,9 @@ mod tests {
     fn batch_with_single_failure_passes_through_per_edit_ui() {
         let items = vec![BatchItem {
             edit_index: 0,
+            origin: None,
+            anchored: false,
+            old_text: String::new(),
             failure: EditFailure {
                 ui_view: "edit #1 closest match at line 42".into(),
                 model_view: "edit #1 closest match at line 42\n<diff>".into(),
@@ -928,6 +1097,9 @@ mod tests {
         // "edit failed:" header.
         let items = vec![BatchItem {
             edit_index: 0,
+            origin: None,
+            anchored: false,
+            old_text: String::new(),
             failure: EditFailure {
                 ui_view: "edit #1 oldText not found. Closest match at file lines 60-91 (similarity 0.92).".into(),
                 model_view: "<diff>".into(),
@@ -945,7 +1117,10 @@ mod tests {
     fn render_batch_emits_recognizable_json() {
         let items = vec![BatchItem {
             edit_index: 0,
-            failure: EditFailure::not_found_no_match(1, "x"),
+            origin: None,
+            anchored: false,
+            old_text: String::new(),
+            failure: EditFailure::not_found_no_match(),
         }];
         let b = BatchEditFailure::build(2, items);
         let s = render_batch(&b);
@@ -962,6 +1137,9 @@ mod tests {
         // those.
         let items = vec![BatchItem {
             edit_index: 0,
+            origin: None,
+            anchored: false,
+            old_text: String::new(),
             failure: EditFailure {
                 ui_view: "edit #1 oldText not found. Closest match at file lines 60-91 (similarity 0.92).".into(),
                 model_view: "oldText not found. Closest match: similarity 0.92, file lines 60-91.\nDiff:\n a\n-b".into(),
@@ -991,8 +1169,9 @@ mod tests {
         let query = "─── midd"; // This overlaps the 3-byte chars
         let f = diagnose(query, file_text).expect("should diagnose");
         assert!(f.model_view.contains("Closest match"));
-        // The window slice must not panic
-        assert!(f.model_view.contains("Diff"));
+        // The window slice must not panic, and must still be read-format
+        // lines: selecting whole lines makes a split char impossible.
+        assert!(f.model_view.contains("| "));
     }
 
     #[test]
@@ -1019,6 +1198,366 @@ mod tests {
         let query = &file_text[1000..1030]; // Includes the '─'
         let f = diagnose(query, &file_text).expect("should diagnose");
         assert!(f.model_view.contains("Closest match"));
-        assert!(f.model_view.contains("Diff"));
+        assert!(f.model_view.contains("| "));
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    //! Tests for the read-format context render that replaced the diff.
+    //!
+    //! These pin the properties the diff could not hold: that the region shown
+    //! actually *contains* the difference, that every line number is the file's
+    //! own, and that nothing the model sent comes back at it.
+
+    use crate::apply::{apply_to_text, ApplyOutcome};
+    use crate::types::EditOp;
+
+    fn op(old: &str, origin: Option<&str>, anchored: bool) -> EditOp {
+        EditOp {
+            old_text: old.into(),
+            new_text: "NEW".into(),
+            start_line: anchored.then_some(crate::types::EditStartLine(1)),
+            origin: origin.map(str::to_string),
+        }
+    }
+
+    /// Run one failing edit and return its `model_view`.
+    fn model_view(text: &str, edits: Vec<EditOp>) -> String {
+        match apply_to_text(text, &edits) {
+            ApplyOutcome::Applied { .. } => panic!("expected the edit to fail"),
+            ApplyOutcome::Failed { report, .. } => {
+                let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+                v["model_view"].as_str().unwrap().to_string()
+            }
+        }
+    }
+
+    /// The `NNNN| ` rows of a rendered body, as `(line_no, content)`.
+    fn numbered(mv: &str) -> Vec<(usize, String)> {
+        mv.lines()
+            .filter_map(|l| {
+                let (n, rest) = l.split_once('|')?;
+                let n: usize = n.trim().parse().ok()?;
+                // Exactly one space, per `read`. Anything more would hide a
+                // change to the leading indentation — which is content.
+                Some((n, rest.strip_prefix(' ')?.to_string()))
+            })
+            .collect()
+    }
+
+    /// Assert the numbered rows are exactly what `read` would emit for those
+    /// lines. Spelled as `read`'s own expression rather than a near-copy, so a
+    /// divergence between the two renders fails here.
+    #[test]
+    fn the_body_is_byte_identical_to_reads_format() {
+        let file = "fn main() {\n    let alpha = 1;\n    let beta = 2;\n    let gamma = 3;\n}\n";
+        let q = "fn main() {\n    let alpha = 1;\n    let beta = 2;\n    let delta = 3;\n}\n";
+        let mv = model_view(file, vec![op(q, Some("f.rs:2"), true)]);
+        let rows = numbered(&mv);
+        assert!(!rows.is_empty(), "no numbered rows in:\n{mv}");
+        let expect: Vec<(usize, String)> = rows
+            .iter()
+            .map(|&(n, _)| (n, file.lines().nth(n - 1).unwrap().to_string()))
+            .collect();
+        assert_eq!(rows, expect, "body does not match `read`'s rendering");
+        // And the row really is `read`'s expression.
+        let rendered: Vec<String> = file
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| rows.iter().any(|(n, _)| *n == i + 1))
+            .map(|(i, l)| format!("{:4}| {}\n", i + 1, l))
+            .collect();
+        for (row, want) in rows.iter().zip(rendered.iter()) {
+            assert!(
+                mv.contains(want.trim_end()),
+                "expected read's exact row {want:?} for line {}",
+                row.0
+            );
+        }
+    }
+
+    #[test]
+    fn the_body_carries_no_diff_markers() {
+        let file = "fn main() {\n    let alpha = 1;\n    let beta = 2;\n}\n";
+        let q = "fn main() {\n    let alpha = 1;\n    let bxta = 2;\n}\n";
+        let mv = model_view(file, vec![op(q, Some("f.rs:2"), true)]);
+        assert!(!mv.contains("Diff"), "diff header survived:\n{mv}");
+        // Scope to the rendered region: the envelope's own `--- edit #N ---`
+        // separator legitimately starts with `-`.
+        let body = mv
+            .split_once("the file reads:\n")
+            .map(|(_, b)| b)
+            .expect("rendered body");
+        assert!(
+            !body.lines().any(|l| l.starts_with("@@")),
+            "hunk marker survived:\n{body}"
+        );
+        assert!(
+            !body
+                .lines()
+                .any(|l| l.starts_with('+') || l.starts_with('-')),
+            "diff rows survived:\n{body}"
+        );
+        assert!(
+            !body.contains("... ("),
+            "truncation notice survived:\n{body}"
+        );
+    }
+
+    /// The diff rendered a padded window from the front, so a change late in a
+    /// long block was cut before it was shown. This is the case it got wrong.
+    #[test]
+    fn a_typo_on_the_last_line_of_a_long_block_is_shown() {
+        let mut file: String = (1..=120)
+            .map(|i| format!("line{i:03} original\n"))
+            .collect();
+        file.push_str("fn main() { let alpha = 1; }\n");
+        let mut q: String = (1..=120)
+            .map(|i| format!("line{i:03} original\n"))
+            .collect();
+        q.push_str("fn main() { let alhpa = 1; }\n");
+
+        let mv = model_view(&file, vec![op(&q, Some("big.rs:121"), true)]);
+        assert!(
+            mv.contains("let alpha = 1;"),
+            "the changed line must be shown:\n{mv}"
+        );
+        assert!(mv.contains("121| fn main() { let alpha = 1; }"), "{mv}");
+    }
+
+    /// The other end of the block: the anchor is the longest common *substring*,
+    /// so a change on the first line must not push the region past it.
+    #[test]
+    fn a_typo_on_the_first_line_of_a_block_is_shown() {
+        let file = (1..=10)
+            .map(|i| format!("line{i:02} original\n"))
+            .collect::<String>();
+        let q = format!("LINE01 wrong\n{}", &file[12..]);
+        let mv = model_view(&file, vec![op(&q, Some("f.rs:1"), true)]);
+        assert!(
+            mv.contains("line01 original"),
+            "changed line missing:\n{mv}"
+        );
+        assert!(mv.contains("   1|"), "line 1 missing:\n{mv}");
+    }
+
+    /// Pins the double-count that made the header claim line 347 in a 202-line
+    /// file: the reported span and the rendered rows must agree.
+    #[test]
+    fn reported_line_numbers_are_the_files_own() {
+        let mut file = String::new();
+        for i in 1..=200 {
+            file.push_str(&format!("a{i:03}\n"));
+        }
+        file.push_str("target here\nmore code\n");
+        let mv = model_view(
+            &file,
+            vec![op("target HERE\nmore code\n", Some("f.rs:201"), true)],
+        );
+
+        let (first, last) = parse_span(&mv);
+        assert!(
+            first <= 201 && last <= 202,
+            "span {first}-{last} must lie inside the {}-line file",
+            file.lines().count()
+        );
+        // Every row's number must index the file's real content.
+        for (n, content) in numbered(&mv) {
+            assert_eq!(
+                file.lines().nth(n - 1).unwrap(),
+                content,
+                "line {n} does not match the file"
+            );
+        }
+    }
+
+    fn parse_span(mv: &str) -> (usize, usize) {
+        let marker = "Closest match at file lines ";
+        let rest = &mv[mv.find(marker).expect("span in header") + marker.len()..];
+        let end = rest.find(';').expect("span terminator");
+        let mut it = rest[..end].split('-').map(|s| s.parse().unwrap());
+        (it.next().unwrap(), it.next().unwrap())
+    }
+
+    #[test]
+    fn elision_keeps_true_line_numbers_on_both_sides() {
+        // 80 unchanged lines around one changed line: past the 40-line cap.
+        let mut file = String::new();
+        for i in 1..=80 {
+            file.push_str(&format!("same line {i:02}\n"));
+        }
+        let mut q = String::new();
+        for i in 1..=80 {
+            q.push_str(&format!("same line {i:02}\n"));
+        }
+        q.push_str("the changed line\n");
+        let mv = model_view(&file, vec![op(&q, Some("f.rs:81"), true)]);
+
+        assert!(mv.contains("lines elided"), "no elision notice:\n{mv}");
+        let rows = numbered(&mv);
+        assert!(rows.len() <= 42, "cap not applied: {} rows", rows.len());
+        // The elision is non-destructive: numbers stay real, so the head and
+        // the tail are each independently usable.
+        assert!(rows.first().unwrap().0 < 40, "head not near the start");
+        assert!(rows.last().unwrap().0 > 45, "tail not near the end");
+        for (n, content) in &rows {
+            assert_eq!(file.lines().nth(n - 1).unwrap(), content, "line {n}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_anchor_is_not_blamed_and_the_region_is_still_shown() {
+        // A line number is a disambiguator, not a validity check, so a wildly
+        // wrong anchor cannot be why this failed and must not be named as such.
+        let file = "fn main() {\n    let alpha = 1;\n    let beta = 2;\n}\n";
+        let q = "fn main() {\n    let alpha = 1;\n    let beta = 9999;\n}\n";
+        let mv = model_view(file, vec![op(q, Some("f.rs:99999"), true)]);
+        assert!(mv.contains("Closest match"), "{mv}");
+        assert!(!mv.contains("anchored near"), "anchor blamed:\n{mv}");
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    //! The identifier that tells the model *which* of its blocks failed.
+
+    use crate::apply::{apply_to_text, ApplyOutcome};
+    use crate::types::EditOp;
+
+    fn op(old: &str, origin: Option<&str>, anchored: bool) -> EditOp {
+        EditOp {
+            old_text: old.into(),
+            new_text: "NEW".into(),
+            start_line: anchored.then_some(crate::types::EditStartLine(1)),
+            origin: origin.map(str::to_string),
+        }
+    }
+
+    fn model_view(text: &str, edits: Vec<EditOp>) -> String {
+        match apply_to_text(text, &edits) {
+            ApplyOutcome::Applied { .. } => panic!("expected the edit to fail"),
+            ApplyOutcome::Failed { report, .. } => {
+                let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+                v["model_view"].as_str().unwrap().to_string()
+            }
+        }
+    }
+
+    const FILE: &str = "fn main() {\n    let alpha = 1;\n    let beta = 2;\n}\n";
+    const Q: &str = "fn main() {\n    let alpha = 1;\n    let bxta = 2;\n}\n";
+
+    #[test]
+    fn an_anchored_block_is_named_by_its_own_header_string() {
+        let mv = model_view(FILE, vec![op(Q, Some("src/foo.rs:140"), true)]);
+        assert!(mv.contains("Your block `src/foo.rs:140` failed:"), "{mv}");
+    }
+
+    /// The oldText is the fallback for when the origin cannot identify the
+    /// block: several blocks in one file and no anchor to tell them apart.
+    #[test]
+    fn oldtext_is_echoed_only_for_unanchored_multi_block_calls() {
+        // total == 1, unanchored: `edit #1` is unambiguous, so no echo.
+        let single = model_view(FILE, vec![op(Q, Some("src/foo.rs"), false)]);
+        assert!(
+            !single.contains("The text you sent"),
+            "echoed needlessly:\n{single}"
+        );
+
+        // total == 3, unanchored: the model would have to count, so echo.
+        let multi = model_view(
+            FILE,
+            vec![
+                op(
+                    "fn main() {\n    let alpha = 1;\n",
+                    Some("src/foo.rs"),
+                    false,
+                ),
+                op(
+                    "    let beta = 2;\n    let gamma = 3;\n",
+                    Some("src/foo.rs"),
+                    false,
+                ),
+                op(Q, Some("src/foo.rs"), false),
+            ],
+        );
+        assert!(
+            multi.contains("The text you sent for this block"),
+            "{multi}"
+        );
+        assert!(
+            multi.contains("let bxta = 2;"),
+            "wrong text echoed:\n{multi}"
+        );
+    }
+
+    #[test]
+    fn an_anchor_suppresses_the_echo_even_in_a_multi_block_call() {
+        let mv = model_view(
+            FILE,
+            vec![
+                op(
+                    "fn main() {\n    let alpha = 1;\n",
+                    Some("src/foo.rs:1"),
+                    true,
+                ),
+                op(Q, Some("src/foo.rs:2"), true),
+            ],
+        );
+        assert!(
+            !mv.contains("The text you sent"),
+            "echoed needlessly:\n{mv}"
+        );
+    }
+
+    #[test]
+    fn the_echo_is_capped_at_twenty_lines_and_elided_at_the_end() {
+        let mut file = String::new();
+        for i in 1..=200 {
+            file.push_str(&format!("filler line {i:03}\n"));
+        }
+        file.push_str("const WANTED = 1;\n");
+        let q: String = (1..=40).map(|i| format!("q line {i:03}\n")).collect();
+        let mut bad = q.clone();
+        bad.push_str("const WANTED = 2;\n");
+
+        // Two blocks in the file, so the ordinal alone cannot identify one.
+        let mv = model_view(
+            &file,
+            vec![
+                op("filler line 001\n", Some("f.rs:1"), false),
+                op(&bad, Some("f.rs"), false),
+            ],
+        );
+        let fence = mv
+            .split("The text you sent")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no echo in:\n{mv}"));
+        let echoed: Vec<&str> = fence
+            .lines()
+            .skip_while(|l| !l.contains("```"))
+            .skip(1)
+            .take_while(|l| *l != "```")
+            .collect();
+        // 20 lines plus the elision notice.
+        assert!(echoed.len() <= 21, "echo too long: {}", echoed.len());
+        assert!(
+            echoed.iter().any(|l| l.contains("lines elided")),
+            "no elision notice: {echoed:?}"
+        );
+        // The notice is last: elided at the end, not in the middle.
+        assert!(
+            echoed.last().unwrap().contains("lines elided"),
+            "not elided at the end: {echoed:?}"
+        );
+    }
+
+    #[test]
+    fn every_failure_kind_leads_with_the_origin_string() {
+        // `non_unique`: two occurrences of the same text, both unanchored.
+        let dup = "run();\n";
+        let text = "run();\nkeep();\nrun();\n";
+        let mv = model_view(text, vec![op(dup, Some("a/b.rs:1"), false)]);
+        assert!(mv.contains("Your block `a/b.rs:1` failed:"), "{mv}");
     }
 }

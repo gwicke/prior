@@ -119,7 +119,7 @@ fn is_structural_line(line: &str) -> bool {
 }
 
 /// The marker emitted in place of a run of elided lines.
-fn elision_notice(lines: usize) -> String {
+pub(crate) fn elision_notice(lines: usize) -> String {
     format!(
         "… ({lines} line{} elided) …",
         if lines == 1 { "" } else { "s" }
@@ -371,6 +371,17 @@ impl EditArgs {
                 (None, Some(p)) => Some(EditStartLine(p)),
                 (None, None) => None,
             };
+            // The origin string for this shape is a *reconstruction*, not a
+            // capture: there is no header line in the single-edit form. Rebuild
+            // the closest thing to what the model wrote — the `path` as spelled
+            // (keeping any `:LINE` it carried verbatim), with the anchor
+            // appended when the line arrived as a separate `startLine` field.
+            // The two anchor sources are required to agree above, so appending
+            // the resolved one is faithful either way.
+            let origin = raw_path.map(|p| match path_anchor.or_else(|| anchor.map(|s| s.0)) {
+                Some(l) if !p.ends_with(&format!(":{l}")) => format!("{p}:{l}"),
+                _ => p.to_string(),
+            });
             return Ok(EditArgs {
                 files: vec![FileEdit {
                     path: path.to_string(),
@@ -378,6 +389,7 @@ impl EditArgs {
                         old_text: o.to_string(),
                         new_text: n.to_string(),
                         start_line: anchor,
+                        origin,
                     }],
                 }],
             });
@@ -828,5 +840,79 @@ mod tests {
         assert_eq!(a.files.len(), 2);
         assert_eq!(a.files[0].path, "a.rs");
         assert_eq!(a.files[1].path, "b.rs");
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    //! The origin string identifies a failed block back to the model.
+    //!
+    //! In the blob form it must be the header line **verbatim**, because the
+    //! model can only search its own message for the exact bytes it wrote.
+
+    use super::*;
+    use crate::blob::parse_blocks;
+    use serde_json::json;
+
+    #[test]
+    fn a_blob_header_is_captured_verbatim_with_its_column() {
+        // `split_line_anchor` peels `:LINE:COL` for matching; the origin must
+        // still carry the column, or the model cannot find this header again.
+        let text = "a/b.rs:100:5\n@@@OLD\nold\n@@@NEW\nnew\n@@@END";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.edits[0].start_line, Some(100));
+        assert_eq!(p.edits[0].raw_header.as_deref(), Some("a/b.rs:100:5"));
+        assert_eq!(p.edits[0].header.as_deref(), Some("a/b.rs"));
+        // And it survives into the execution form.
+        let ops = crate::blob::to_ops(&p.edits);
+        assert_eq!(ops[0].origin.as_deref(), Some("a/b.rs:100:5"));
+    }
+
+    #[test]
+    fn a_headerless_blob_block_has_no_origin() {
+        let text = "@@@OLD\nold\n@@@NEW\nnew\n@@@END";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.edits[0].raw_header, None);
+        assert_eq!(crate::blob::to_ops(&p.edits)[0].origin, None);
+    }
+
+    #[test]
+    fn the_single_edit_form_reconstructs_the_origin_from_the_path_argument() {
+        // `path:LINE` written as one string: kept exactly.
+        let args = EditArgs::from_wire(&json!({
+            "path": "a/b.rs:100", "oldText": "old", "newText": "new"
+        }))
+        .unwrap();
+        assert_eq!(args.files[0].edits[0].origin.as_deref(), Some("a/b.rs:100"));
+        assert_eq!(args.files[0].edits[0].start_line.map(|s| s.0), Some(100));
+
+        // Line given as a separate field: appended.
+        let args = EditArgs::from_wire(&json!({
+            "path": "a/b.rs", "startLine": 100, "oldText": "old", "newText": "new"
+        }))
+        .unwrap();
+        assert_eq!(args.files[0].edits[0].origin.as_deref(), Some("a/b.rs:100"));
+
+        // No line at all: the bare path, with no invented suffix.
+        let args = EditArgs::from_wire(&json!({"path": "a/b.rs", "oldText": "o", "newText": "n"}))
+            .unwrap();
+        assert_eq!(args.files[0].edits[0].origin.as_deref(), Some("a/b.rs"));
+    }
+
+    #[test]
+    fn origin_is_never_persisted_or_sent_to_the_model() {
+        // `EditOp::origin` is `serde(skip)`: it identifies a failure at
+        // dispatch time and has no business on disk or in the transcript.
+        let op = crate::types::EditOp {
+            old_text: "o".into(),
+            new_text: "n".into(),
+            start_line: None,
+            origin: Some("a/b.rs:7".into()),
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert!(json.get("origin").is_none(), "origin serialized: {json}");
+        let back: crate::types::EditOp =
+            serde_json::from_value(json).expect("round-trips without origin");
+        assert_eq!(back.origin, None);
     }
 }

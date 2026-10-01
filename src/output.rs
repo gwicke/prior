@@ -966,6 +966,7 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                                 .get("startLine")
                                 .and_then(|v| v.as_u64())
                                 .map(crate::config::EditStartLine),
+                            origin: None,
                         })
                     })
                     .collect()
@@ -975,6 +976,7 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                     old_text: old.to_string(),
                     new_text: new.to_string(),
                     start_line: None,
+                    origin: None,
                 }]
             } else {
                 vec![]
@@ -991,6 +993,7 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                         old_text: old.to_string(),
                         new_text: new_str.to_string(),
                         start_line: None,
+                        origin: None,
                     }],
                 )
             };
@@ -4064,6 +4067,7 @@ mod tests {
             old_text: old_text.clone(),
             new_text: new_text.clone(),
             start_line: None,
+            origin: None,
         }];
         let (_range, diff) = edit_preview(path.to_str().unwrap(), &edits);
 

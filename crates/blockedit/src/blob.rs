@@ -76,6 +76,16 @@ pub struct ParsedEdit {
     /// error is about. Kept so the multi-file policy can quote it back. Not
     /// persisted.
     pub rejected_header: Option<String>,
+    /// The block's header line **verbatim**, captured before
+    /// [`split_line_anchor`] peeled any `:LINE`/`:LINE:COL` suffix off into
+    /// `start_line`.
+    ///
+    /// Kept so a failure can quote the model back the exact string it wrote
+    /// (`a/b.rs:100:5`, column included) rather than a reconstruction that
+    /// would have silently dropped the column. `header` cannot serve this
+    /// purpose: it holds the path part only. `None` when the block carried no
+    /// header. Not persisted.
+    pub raw_header: Option<String>,
 }
 
 /// Result of parsing a blob.
@@ -259,11 +269,16 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         // it was not a usable header. Kept only to be quoted back in an error:
         // prose and a path-with-a-space are indistinguishable from `None`.
         let mut rejected_header: Option<String> = None;
+        let mut raw_header: Option<String> = None;
         if i > 0 {
             if let Some(h) = header_candidate(&lines[i - 1]) {
                 let (path_part, anchor) = split_line_anchor(&h);
                 saw_any_header = true;
                 header_anchor = anchor;
+                // Verbatim, before peeling — `split_line_anchor` above already
+                // discarded a `:COL` suffix, which a failure report must quote
+                // back exactly.
+                raw_header = Some(h.clone());
                 header_path = Some(path_part.clone());
                 if !distinct_headers.iter().any(|d| same_path(d, &path_part)) {
                     distinct_headers.push(path_part);
@@ -357,6 +372,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
             start_line: header_anchor,
             header: header_path,
             rejected_header,
+            raw_header,
         });
 
         i = k + 1;
@@ -554,6 +570,7 @@ pub fn array_to_blob_value(args: &Value) -> Value {
             start_line: None,
             header: None,
             rejected_header: None,
+            raw_header: None,
         })
         .collect();
     let blob = render_blob(path, &parsed);
@@ -569,6 +586,10 @@ mod tests {
     fn headed(path: &str, old: &str, new: &str) -> ParsedEdit {
         ParsedEdit {
             header: Some(path.to_string()),
+            // The header token as the model spelled it. Equal to `path` here
+            // because these fixtures carry no `:LINE` suffix; an anchored
+            // fixture would need the suffix kept.
+            raw_header: Some(path.to_string()),
             ..plain(old, new)
         }
     }
@@ -581,6 +602,7 @@ mod tests {
             start_line: None,
             header: None,
             rejected_header: None,
+            raw_header: None,
         }
     }
 
@@ -1151,6 +1173,7 @@ pub fn to_ops(edits: &[ParsedEdit]) -> Vec<crate::types::EditOp> {
             old_text: e.old_text.clone(),
             new_text: e.new_text.clone(),
             start_line: e.start_line.map(crate::types::EditStartLine),
+            origin: e.raw_header.clone(),
         })
         .collect()
 }

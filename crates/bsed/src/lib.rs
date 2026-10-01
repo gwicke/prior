@@ -521,6 +521,7 @@ mod tests {
                     old_text: e.old_text.clone(),
                     new_text: e.new_text.clone(),
                     start_line: e.start_line.map(blockedit::EditStartLine),
+                    origin: None,
                 })
                 .collect();
             let applied = match blockedit::apply_to_text(before, &edits) {
@@ -644,6 +645,7 @@ mod tests {
                     old_text: e.old_text.clone(),
                     new_text: e.new_text.clone(),
                     start_line: e.start_line.map(blockedit::EditStartLine),
+                    origin: None,
                 })
                 .collect();
             let applied = match blockedit::apply_to_text(FILE, &edits) {

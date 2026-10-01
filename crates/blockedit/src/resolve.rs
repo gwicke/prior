@@ -63,39 +63,37 @@ fn first_claim_overlap(
         .position(|&(_, cs, ce)| start < ce && cs < end)
 }
 
-/// The "oldText not found" failure, shared by both resolution passes.
-fn not_found_failure(edit_index0: usize, edit: &EditOp, text: &str) -> BatchItem {
-    let edit_idx_1 = edit_index0 + 1;
-    let anchor_info = match edit.start_line.map(|l| l.0) {
-        Some(s) => format!(" (anchored near line {s})"),
-        None => String::new(),
-    };
-    let failure = match diagnose::diagnose(&edit.old_text, text) {
-        Some(mut f) => {
-            f.ui_view = format!(
-                "edit #{edit_idx_1} oldText not found.{anchor_info} {}",
-                f.ui_view
-            );
-            f
-        }
-        None => {
-            let mut msg = format!("edit #{edit_idx_1} oldText not found{anchor_info} ");
-            msg.push_str("No similar region in the file; re-read the file and re-anchor the edit.");
-            EditFailure {
-                ui_view: msg,
-                model_view: format!(
-                    "oldText not found{anchor_info} No close-enough region in the file; \
-                     please re-read the file and re-anchor your edit. \
-                     Original oldText: '{}'.",
-                    edit.old_text
-                ),
-            }
-        }
-    };
+/// Wrap a per-edit failure with the identifying data the batch envelope needs.
+///
+/// One constructor for all six failure kinds, so the identifier fields cannot
+/// drift between them: the origin string is what lets the model find *which* of
+/// its blocks this was, and it must be attached uniformly or a rarer failure
+/// becomes the one that cannot name itself.
+fn batch_item(edit_index0: usize, edit: &EditOp, failure: EditFailure) -> BatchItem {
     BatchItem {
         edit_index: edit_index0,
         failure,
+        origin: edit.origin.clone(),
+        anchored: edit.start_line.is_some(),
+        old_text: edit.old_text.clone(),
     }
+}
+
+/// The "oldText not found" failure, shared by both resolution passes.
+///
+/// The block's anchor is deliberately absent from this message. A line number
+/// is a disambiguator, not a validity check — a content-unique match is applied
+/// whatever the anchor says — so naming it here would imply a wrong anchor could
+/// have caused a failure. The anchor reaches the model as part of the origin
+/// string, which is an identifier and nothing more.
+fn not_found_failure(edit_index0: usize, edit: &EditOp, text: &str) -> BatchItem {
+    let edit_idx_1 = edit_index0 + 1;
+    let mut f = match diagnose::diagnose(&edit.old_text, text) {
+        Some(f) => f,
+        None => EditFailure::not_found_no_match(),
+    };
+    f.ui_view = format!("edit #{edit_idx_1} oldText not found. {}", f.ui_view);
+    batch_item(edit_index0, edit, f)
 }
 
 /// Resolve the `edit` tool's matching in two passes over the original file:
@@ -152,30 +150,26 @@ pub fn resolve_edits(
             if !diagnose::anchor_accepts(d1, d2, tol) {
                 let candidates: Vec<(usize, usize)> =
                     ranked.iter().take(10).map(|&(_, l, d)| (l, d)).collect();
-                failures.push(BatchItem {
-                    edit_index: i,
-                    failure: EditFailure::anchor_out_of_tolerance(
+                failures.push(batch_item(
+                    i,
+                    edit,
+                    EditFailure::anchor_out_of_tolerance(
                         i + 1,
-                        &edit.old_text,
                         anchor as usize,
                         tol,
                         occs.len(),
                         &candidates,
                     ),
-                });
+                ));
                 continue;
             }
             if ranked.iter().filter(|(_, _, d)| *d == d1).count() > 1 {
                 let lines: Vec<usize> = ranked.iter().take(10).map(|&(_, l, _)| l).collect();
-                failures.push(BatchItem {
-                    edit_index: i,
-                    failure: EditFailure::anchor_ambiguous(
-                        i + 1,
-                        &edit.old_text,
-                        anchor as usize,
-                        &lines,
-                    ),
-                });
+                failures.push(batch_item(
+                    i,
+                    edit,
+                    EditFailure::anchor_ambiguous(i + 1, anchor as usize, &lines),
+                ));
                 continue;
             }
             nearest_byte
@@ -185,16 +179,16 @@ pub fn resolve_edits(
         let end = chosen + edit.old_text.len();
         if let Some(ci) = first_claim_overlap(&claims, chosen, end) {
             let (other_i, cs, ce) = claims[ci];
-            failures.push(BatchItem {
-                edit_index: i,
-                failure: EditFailure::overlap_conflict(
+            failures.push(batch_item(
+                i,
+                edit,
+                EditFailure::overlap_conflict(
                     i + 1,
-                    &edit.old_text,
                     span_line_range(text, chosen, end),
                     other_i + 1,
                     span_line_range(text, cs, ce),
                 ),
-            });
+            ));
             continue;
         }
         claims.push((i, chosen, end));
@@ -230,30 +224,20 @@ pub fn resolve_edits(
 
         if free.is_empty() {
             let lines: Vec<usize> = occs.iter().take(10).map(|&(_, l)| l).collect();
-            failures.push(BatchItem {
-                edit_index: i,
-                failure: EditFailure::all_candidates_claimed(
-                    i + 1,
-                    &edit.old_text,
-                    occs.len(),
-                    &lines,
-                    &claimers,
-                ),
-            });
+            failures.push(batch_item(
+                i,
+                edit,
+                EditFailure::all_candidates_claimed(i + 1, occs.len(), &lines, &claimers),
+            ));
             continue;
         }
         if free.len() > 1 {
             let free_lines: Vec<usize> = free.iter().take(10).map(|&(_, l)| l).collect();
-            failures.push(BatchItem {
-                edit_index: i,
-                failure: EditFailure::non_unique(
-                    i + 1,
-                    &edit.old_text,
-                    occs.len(),
-                    &free_lines,
-                    excluded,
-                ),
-            });
+            failures.push(batch_item(
+                i,
+                edit,
+                EditFailure::non_unique(i + 1, occs.len(), &free_lines, excluded),
+            ));
             continue;
         }
         let (chosen, _line) = free[0];
@@ -284,6 +268,7 @@ mod tests {
             old_text: old.to_string(),
             new_text: new.to_string(),
             start_line: anchor.map(crate::types::EditStartLine),
+            origin: None,
         }
     }
 

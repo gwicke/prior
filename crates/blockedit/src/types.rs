@@ -27,6 +27,19 @@ pub struct EditOp {
     /// supplies this per-block in the blob form.
     #[serde(rename = "startLine", default, skip_serializing_if = "Option::is_none")]
     pub start_line: Option<EditStartLine>,
+    /// The block's origin string **exactly as the model spelled it** — the
+    /// verbatim header line in the blob form (`src/foo.rs:140`, column suffix
+    /// included), a reconstruction of the `path` argument in the single-edit
+    /// form. See [`crate::diagnose`] for why it must be captured rather than
+    /// rebuilt.
+    ///
+    /// Carried for one purpose: to tell the model *which* of its blocks failed
+    /// when a batch holds several. It is an **identifier only** — it is never
+    /// resolved against the file, never treated as a cause of failure (a wrong
+    /// anchor never fails a content-unique match), and never consulted by
+    /// matching. Never persisted and never sent to the model.
+    #[serde(skip)]
+    pub origin: Option<String>,
 }
 
 /// A 1-indexed anchor line, validated on deserialize.

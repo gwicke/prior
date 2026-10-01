@@ -274,12 +274,21 @@ The edit tool result does **not** echo the raw edit parameters, and should not.
 Two different "echoes" are worth separating:
 
 - **The tool-result body.** Today it returns `Replaced N block(s) in <path>` on
-  success, and a structured `{ui_view, model_view}` failure (with a targeted
-  diff of the mismatching region) on error. That is the right shape: the model
-  already *has* its own parameters, so re-sending them wastes tokens and adds no
-  information. The result only needs to convey the **outcome** — success, or the
-  diagnostic needed to fix it. (Error diagnostics legitimately quote the *old
-  text* region; that is a diff, not a parameter dump.)
+  success, and a structured `{ui_view, model_view}` failure on error. That is the
+  right shape: the model already *has* its own parameters, so re-sending them
+  wastes tokens and adds no information. The result only needs to convey the
+  **outcome** — success, or the diagnostic needed to fix it.
+
+  The failure diagnostic **used to** be a targeted diff of the mismatching
+  region, and the parenthetical below used to argue for it: *"Error diagnostics
+  legitimately quote the old text region; that is a diff, not a parameter dump."*
+  **That argument no longer holds.** The diff was over a window padded by a fixed
+  256 bytes on each side, capped at 30 rows from the front, so for a small
+  `oldText` in a short-line file the rows that actually differed were usually the
+  ones cut — the model received its own rejected line and nothing else. It now
+  quotes the **file**, in `read`'s exact `NNNN| ` format, at the region that
+  differs; it never quotes the model's own text except when the block cannot be
+  identified any other way. See `doc/edit_error_improvements_260930.md`.
 - **The assistant's own tool-call arguments in the transcript.** These are
   re-sent to the model on every completion because the assistant message is part
   of history — this is not something the tool result controls. It means we are
