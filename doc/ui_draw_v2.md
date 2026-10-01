@@ -731,10 +731,33 @@ an *idle* `poll` takes to notice those flags; keystroke latency is ~0.)
 - **U4.4 — re-emit ordering:** key branch → `draw_elements` (compose + remember);
   content branch → write + `reposition_area`.
 
-**Open:** `Esc` with a menu open — propose menu-first, abort only at root, which
-keeps "`Esc` aborts the turn" true at the prompt. Submit blocked in v0: notice or
-silent. Prose mid-turn: live or inert. One `PromptSession` carried across turns,
-or reconstructed each turn.
+**Settled.** All four open questions answered:
+
+- **`Esc`** — menu-first; abort the turn only at root, which keeps "`Esc` aborts
+  the turn" true at the prompt (agreed below).
+- **Submit mid-turn** — *silent* while submit is blocked in v0: Enter does
+  nothing and says nothing. A real actions mechanism comes later.
+- **Prose mid-turn** — *live*, but with no submit: it may draft the next prompt
+  and may open the menu, it may not send.
+- **Session lifetime** — **one `PromptSession` carried across turns**, never
+  reconstructed.
+
+Two rules follow from the lifetime answer, and both are restraints rather than
+mechanisms:
+
+- **The `/` prompt *is* the menu state.** There is no parallel menu state to go
+  stale across a turn boundary: whatever the buffer holds *is* the menu, so
+  carrying the buffer is carrying the menu, and there is nothing for a
+  prompt-boundary reset to protect. The epoch contract therefore stays exactly
+  as it is — `get_handle` bumps on a fresh `/`-entry and every node's
+  `EpochState` (armed confirm, `view_args`, cursor) resets there — and
+  `confirm_prompt` is already keyed to the buffer, so a rewrite disarms.
+  "Menu cursor carried or reset": carried; do not touch it.
+- **No queuing, no holding back.** Keys are evaluated and dispatched
+  *throughout* the turn as they arrive, one at a time. The turn's key branch
+  evals after every key rather than parking a `pending_key` for a later
+  iteration — which also makes the cross-boundary `pending_key` leak
+  unrepresentable instead of merely theoretical.
 
 - Verify: keys typed during a turn reach the editor; the area's row diff is
   correct under interleaving of chunks and keys — this wants a test that drives
