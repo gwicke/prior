@@ -997,13 +997,14 @@ impl PromptSession {
         EvalOutcome::Frame
     }
 
-    /// Align the selection to the overlay [`eval`](Self::eval) just produced,
-    /// and hand back its rows for the painter.
+    /// Align the selection to the overlay [`eval`](Self::eval) just produced.
     ///
     /// Hoisted for the same reason `eval` was: the turn's key branch must do
     /// this too, and two copies would let the cursor and the paint disagree
-    /// about which row is selected.
-    pub(crate) fn sync_selection(&mut self) -> Vec<String> {
+    /// about which row is selected. It no longer hands its rows back —
+    /// [`settle`](Self::settle) reads them off the overlay for the painter, and
+    /// a returned copy would be a second thing to keep in step with the first.
+    pub(crate) fn sync_selection(&mut self) {
         let Self {
             overlay,
             sel,
@@ -1032,7 +1033,93 @@ impl PromptSession {
         if *sel > max_sel {
             *sel = max_sel;
         }
-        raw_opts
+    }
+
+    /// The overlay's row count at this instant — the bounds `handle_key`'s
+    /// host-side cursor needs.
+    ///
+    /// `settle` renders those rows for the painter instead; this is for a
+    /// dispatcher that needs the number and nothing else. Both read `overlay`,
+    /// and `overlay` is only ever written by [`eval`](Self::eval), so neither
+    /// can be out of step with the other.
+    pub(crate) fn opts_len(&self) -> usize {
+        self.overlay.display_rows().0.len()
+    }
+
+    /// eval → outcome → sync → paint: the whole "make the session say
+    /// something true, and say it out loud" half of one pump iteration.
+    ///
+    /// **Both pumps call this.** `read_input`'s loop and the turn's `select!`
+    /// branch (ui_draw_v2 §4.5 U4) share it rather than each carrying a copy,
+    /// and the reason is sharpest in the arms: a `/`-command committed
+    /// mid-turn has to land exactly where it lands at the prompt, and an eval
+    /// that bails out of the rewrite chain has to look the same there. Two
+    /// versions would be two ways to see a different result from one keystroke.
+    ///
+    /// Returns `Some(action)` when the read ends — only `MenuDone`, from a
+    /// committed `/`-command. `None` means "keep looping": by then the frame
+    /// is already painted.
+    pub(crate) async fn settle(
+        &mut self,
+        output: &dyn Output,
+        prompt: &str,
+        history: &mut History,
+        dims: (usize, usize),
+    ) -> Option<InputAction> {
+        // `emit_commit` wants a painter as a closure; the painter it wants is
+        // the same one everything else uses, so this is an adapter over
+        // `paint_prompt` and not a second composition.
+        let redraw = |editor: &LineEditor, rows: &[String], focus: usize, dims: (usize, usize)| {
+            paint_prompt(output, prompt, editor, rows, focus, dims);
+        };
+        // Bound before the `match` on purpose: a future in a match scrutinee
+        // lives to the end of the `match`, and it would still hold the borrow
+        // of `self` the arms below want back.
+        let eval = self.eval().await;
+        match eval {
+            EvalOutcome::Frame => {}
+            EvalOutcome::Commit { line, message } => {
+                Repl::emit_commit(
+                    output,
+                    &mut self.editor,
+                    &redraw,
+                    self.sel,
+                    dims,
+                    &line,
+                    "",
+                    history,
+                );
+                if let Some(text) = message {
+                    output.display_text(&text);
+                }
+                // Dismiss the overlay and hand control back to the agent loop,
+                // whose convergence step applies the targets this eval wrote.
+                return Some(InputAction::MenuDone);
+            }
+            EvalOutcome::Error { message } => {
+                // Clear the input region through the frame path — the menu
+                // that produced the error is not what should keep showing
+                // under its message — surface it, then re-anchor (DSR) so the
+                // next iteration anchors below it.
+                //
+                // The DSR used to be justified by "the exact line
+                // `display_text` consumed depends on inline-markdown wrapping,
+                // so re-anchor rather than trusting the wrap count". That is
+                // no longer true: the count is *measured* from the emitted
+                // bytes, and `display_text_row_is_measured_not_predicted` pins
+                // it against a terminal emulator. The DSR stays because this is
+                // an error path — rare, and the cost of being wrong is a
+                // stranded input region — not because the accounting needs
+                // rescuing.
+                redraw(&LineEditor::new(), &[], self.sel, dims);
+                output.display_text(&message);
+                let _ = output.cursor_row();
+            }
+        }
+        self.sync_selection();
+        let (rows, focus) = overlay_paint(&self.overlay, dims.0, dims.1);
+        paint_prompt(output, prompt, &self.editor, &rows, focus, dims);
+        None
     }
 
     /// Apply one key to the session.
@@ -1375,13 +1462,6 @@ impl Repl {
         // `term_width` is read at paint time rather than here, so a resize that
         // lands mid-edit re-flows the bar with the frame instead of leaving a
         // bar sized for the old terminal.
-        // The loop's whole painter is the shared one: the turn's key branch
-        // calls `paint_prompt` directly, and a second body here would be the
-        // second way to write the terminal that U4 exists to avoid.
-        let redraw =
-            |editor: &LineEditor, overlay: &[String], focus: usize, dims: (usize, usize)| {
-                paint_prompt(output, prompt, editor, overlay, focus, dims);
-            };
         loop {
             // On resume from Ctrl-Z (editing phase; the in-flight reader thread
             // is not running then), re-enter raw mode so the next keystroke is
@@ -1414,7 +1494,7 @@ impl Repl {
                 // it at the end of the content — the best possible
                 // starting point), replay the last turn through the normal
                 // scrollback (pushing any corruption above the fold), then
-                // re-anchor; the usual redraw below repaints the input.
+                // re-anchor; `settle`'s paint below repaints the input.
                 // Skipped without a session — nothing to replay and usually
                 // nothing to clear up. Height-only changes don't re-wrap,
                 // so they keep the cheap re-anchor path.
@@ -1430,65 +1510,20 @@ impl Repl {
             // Keep the shared width in sync (covers width changes even without
             // an explicit Resize event, e.g. on some terminals).
             TERMINAL_WIDTH.store(cur_w, Ordering::SeqCst);
-            // --- Eval: resolve the pending key (or a passive frame) into an
-            // overlay, then align the selection to it. Both are out of this
-            // loop now so the turn's key branch runs the same two calls
-            // instead of a second copy of the sequence (ui_draw_v2 §4.5 U4).
-            //
-            // Bound before the `match` on purpose: a future in a match
-            // scrutinee lives to the end of the `match`, and it would still
-            // hold the borrow of `session` the arms below want back.
-            let eval = session.eval().await;
-            match eval {
-                EvalOutcome::Frame => {}
-                EvalOutcome::Commit { line, message } => {
-                    Repl::emit_commit(
-                        output,
-                        &mut session.editor,
-                        &redraw,
-                        session.sel,
-                        (cur_w, cur_h),
-                        &line,
-                        "",
-                        history,
-                    );
-                    if let Some(text) = message {
-                        output.display_text(&text);
-                    }
-                    // Dismiss the overlay and hand control back to the agent
-                    // loop, whose convergence step applies the targets this
-                    // eval wrote.
-                    return Some(InputAction::MenuDone);
-                }
-                EvalOutcome::Error { message } => {
-                    // Clear the input region through the frame path, then
-                    // surface the error, then re-anchor (DSR) so the next
-                    // iteration anchors below it.
-                    //
-                    // The DSR used to be justified by "the exact line
-                    // `display_text` consumed depends on inline-markdown
-                    // wrapping, so re-anchor rather than trusting the wrap
-                    // count". That is no longer true: the count is *measured*
-                    // from the emitted bytes, and
-                    // `display_text_row_is_measured_not_predicted` pins it
-                    // against a terminal emulator. The DSR stays because this
-                    // is an error path — rare, and the cost of being wrong
-                    // is a stranded input region — not because the accounting
-                    // needs rescuing.
-                    redraw(&LineEditor::new(), &[], session.sel, (cur_w, cur_h));
-                    output.display_text(&message);
-                    let _ = output.cursor_row();
-                }
+            // --- Eval → outcome → sync → paint, and end the read if that
+            // produced an action. The whole sequence lives in `settle`
+            // because the turn's `select!` branch runs it too (ui_draw_v2
+            // §4.5 U4): one place to get a `/`-command commit and a
+            // rewrite-chain bail-out right, rather than two that drift.
+            // Everything after it here is the *other* half of the iteration —
+            // waiting for a key — which is exactly what the turn has instead
+            // of a wait.
+            if let Some(action) = session
+                .settle(output, prompt, history, (cur_w, cur_h))
+                .await
+            {
+                return Some(action);
             }
-            // The rows the painter and the dispatcher both bound themselves to.
-            let opts = session.sync_selection();
-            // The painter reports the geometry it produced: terminal rows to
-            // show, and the windowing focus among them. The focus used to be
-            // re-derived here — `1 + Σ(1 + newlines(opts[..sel]))` — which
-            // assumed a one-row header and no table header, so it pointed at
-            // the wrong row for any menu with either (ui_draw_v2 §9 #5).
-            let (rows, focus) = overlay_paint(&session.overlay, cur_w, cur_h);
-            redraw(&session.editor, &rows, focus, (cur_w, cur_h));
 
             // --- Wait for a key (or a prose-completion wake). While a
             // prose request is armed/in flight, poll with a deadline so
@@ -1560,7 +1595,11 @@ impl Repl {
                     // screen; this loop is the one that actually does it, so
                     // the same function can serve the turn's `select!` branch
                     // later (ui_draw_v2 §4.5 U4) without learning to draw.
-                    match session.handle_key(key, opts.len(), prompt, history) {
+                    // Bound before the call: the receiver's borrow of `session`
+                    // would otherwise still be live while the argument reads
+                    // the same session for its row count.
+                    let opts_len = session.opts_len();
+                    match session.handle_key(key, opts_len, prompt, history) {
                         KeyOutcome::Continue => {}
                         KeyOutcome::RunEditor => {
                             // The wrapper owns the whole turnover — reader
@@ -1584,7 +1623,14 @@ impl Repl {
                         }
                         KeyOutcome::Action(a) => {
                             if let InputAction::Submit(_) = &a {
-                                redraw(&LineEditor::new(), &[], session.sel, (cur_w, cur_h));
+                                paint_prompt(
+                                    output,
+                                    prompt,
+                                    &LineEditor::new(),
+                                    &[],
+                                    session.sel,
+                                    (cur_w, cur_h),
+                                );
                             }
                             return Some(a);
                         }
