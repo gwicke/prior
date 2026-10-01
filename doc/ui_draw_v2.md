@@ -1,7 +1,7 @@
 # UI Draw v2 — unified frame composition for REPL, menus & dialogs
 
 **Status:** Design settled — implemented (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 ✅, P5 ✅;
-§4.5 P1/P2 ✅ in the API fold, P3–P6 not started). One end-to-end layout
+§4.5 U1/U2 ✅ in the API fold, U3–U6 not started). One end-to-end layout
 assertion is off by one row — see §5.2.
 Post-implementation follow-ups (§9): 7 done, 3 open, 1 accepted limitation —
 audited 2026-09-28, recommended order at the end of §9.
@@ -40,7 +40,7 @@ without an input segment".
 | Budget | Live region ≤ **2/3 of terminal height**; top 1/3 guaranteed scrollback |
 | Full apply | **Scroll-then-paint**: LF scroll by `delta` from the bottom row (never `CSI S` — it deletes rows instead of pushing scrollback), then absolute writes |
 | Partial apply | Row-diff repaint when `delta == 0 ∧ top == live.frame_top_row ∧ term size (w, h) unchanged` |
-| Clear policy | Full apply: clear the union of the old frame region (scroll-shifted) and the rows below the new frame, floored at `min(term_h, screen_bottom)`. Partial apply: row-diff + shrink remainder only. Append: no region clear (reserved for §4.5's chunked writes). **General invariant (P4):** a Frame apply clears the rows below the frame, so any later append-only render (and any row-diff) lands in already-clean space and never re-clears it. **To be restated by §4.5 P1:** with the area live across a turn, content *consumes* the area's rows instead of landing below them, so the invariant becomes "content writes stop at the fold; the area's rows are re-emitted, not erased". That is a change to a settled decision and wants its own commit and test |
+| Clear policy | Full apply: clear the union of the old frame region (scroll-shifted) and the rows below the new frame, floored at `min(term_h, screen_bottom)`. Partial apply: row-diff + shrink remainder only. Append: no region clear (reserved for §4.5's chunked writes). **General invariant (P4):** a Frame apply clears the rows below the frame, so any later append-only render (and any row-diff) lands in already-clean space and never re-clears it. **To be restated by §4.5 U1:** with the area live across a turn, content *consumes* the area's rows instead of landing below them, so the invariant becomes "content writes stop at the fold; the area's rows are re-emitted, not erased". That is a change to a settled decision and wants its own commit and test |
 | Buffer | Flat `String` + per-screen-row extents `Vec<Range<usize>>` |
 | Caret | Absolute `(row, col)` in the cache (row authoritative, col best-effort); frame-relative `(row_idx, display_col)` inside `Frame`; applied with `CUP` + `CHA` (`\x1b[{col}G`) |
 | Draw state | `DrawCache { caret, screen_bottom, live: Option<LiveFrame> }` in `ConsoleOutput`; all writers maintain it before returning |
@@ -307,7 +307,7 @@ derived as `frame_top_row + frame.caret.row`; never stored twice. `frame_anchor(
 | `$EDITOR` wrapper (`run_editor`: Ctrl-E prompt edit, compaction draft edit) | `cursor_row()` (DSR) after exit → `caret`; `live = None` |
 | Resize | `cursor_row()` (DSR) re-anchor; `live = None` |
 | Ctrl-Z resume | `cursor_row()` (DSR) re-anchor; `live = None` |
-| Dialog entry (`ui::confirm`) | `cursor_row()` (DSR) re-anchor; `live = None`. Afterwards the dialog itself maintains the cache through `draw_frame`. (The reason used to be "the tracked caret does not follow streamed content" — false since the streaming writers started counting, see #10. Kept as a cheap confirmation on a path where a wrong anchor strands the dialog; §4.5 P5 revisits it.) |
+| Dialog entry (`ui::confirm`) | `cursor_row()` (DSR) re-anchor; `live = None`. Afterwards the dialog itself maintains the cache through `draw_frame`. (The reason used to be "the tracked caret does not follow streamed content" — false since the streaming writers started counting, see #10. Kept as a cheap confirmation on a path where a wrong anchor strands the dialog; §4.5 U5 revisits it.) |
 
 `live = None` forces the full path on the next apply. Any uncertainty → clear it.
 
@@ -519,7 +519,7 @@ list, so 4.5.6 reflects them.
   and end. Absolute addressing is excluded only at **startup** and after
   **foreign writers** (`$EDITOR`, Ctrl-Z, the width-change `ESC[0J` + replay) —
   the three `cursor_row()` sites that stay. `ui::confirm`'s and `read_input`'s
-  entry DSRs are in scope for removal once the fold survives the turn (P5).
+  entry DSRs are in scope for removal once the fold survives the turn (U5).
 - **OQ2 → the prompt stays live mid-turn.** The input row is part of the area
   while a turn runs and the menu opens over it. What is *allowed* narrows:
   - **Submit is blocked in v0.** Pre-composing the next prompt and browsing the
@@ -547,14 +547,21 @@ list, so 4.5.6 reflects them.
 
 #### 4.5.6 Phases
 
-**P1–P3 are the drawing capability** and have to land before anything can be
+**U1–U3 are the drawing capability** and have to land before anything can be
 *live* mid-turn: there is no area to keep open while content still retires it
-(P1) or while the bar is still a content line (P2). **P4** is the in-turn
-prompt, which OQ2 now answers. **P5** is the payoff and **P6** an optional
-optimisation that gates nothing. Each phase is separately reviewable and
+(U1) or while the bar is still a content line (U2). **U4** is the in-turn
+prompt, which OQ2 now answers. **U5** is the payoff and **U6** an optional
+optimisation that gates nothing. Each unit is separately reviewable and
 separately verifiable.
 
-**P1 — Contraction: the area establishes the content's lower bound.**
+**Why `U` and not `P`.** The phase table above numbers the *capability* work
+`P0`–`P5`, and this list numbered the *delivery* work `P1`–`P6` — so one label
+meant two different things. `P1` was `Element`/`Frame`/`allocate` in the table and
+contraction here; `P4` was dialog wiring in the table and in-turn input here.
+Anyone planning against the table would have read in-turn input as done, which it
+is not. `P` is capability, `U` is delivery.
+
+**U1 — Contraction: the area establishes the content's lower bound.**
 `with_content_writer` stops retiring the area. Content is written from the fold
 downward, the terminal scrolls as the write reaches the bottom, and the area is
 re-emitted **once**, as a single frame, at its new fold. `ConsoleOutput`
@@ -598,18 +605,18 @@ This is the part that is easy to get wrong, because the obvious case is the
   self-maintaining — the terminal moves the content, not us — and a content chunk
   costs nothing but its own bytes.
 
-  P1 as scoped does **not** do this: it writes at the fold in both cases, so it
+  U1 as scoped does **not** do this: it writes at the fold in both cases, so it
   has one mechanism and one write point. The scroll region is a separate, later
-  optimisation (P6) rather than a refinement of P1.
+  optimisation (U6) rather than a refinement of U1.
 
-  **Deferred, not dismissed** (P6). The saving is real but bounded (one area
+  **Deferred, not dismissed** (U6). The saving is real but bounded (one area
   re-emit per chunk: ~2 rows, a few hundred bytes), and the cost is a *global
   terminal mode* that every write path must honour: a resize, a full repaint, the
   dialog path and (later) in-turn input all have to re-issue or reset it, and a
   path that forgets scrolls the wrong part of the screen — a bug class that is
   miserable to diagnose from a transcript. Recommend measuring the re-emit cost
   first; the region does not change I1–I6, so it can land whenever the
-  measurement justifies it. It is written down because P1 will *look* like it is
+  measurement justifies it. It is written down because U1 will *look* like it is
   re-emitting something avoidable, and the next reader deserves to know it was
   considered.
 - Establishes I2, I3, I6, and the "one frame" half of I1.
@@ -631,7 +638,7 @@ This is the part that is easy to get wrong, because the obvious case is the
   `plan_consume`'s explicit `CR` must carry column 0 on its own before P1's
   wiring goes in.
 
-**P2 — The area survives the turn; the bar becomes a permanent row.**
+**U2 — The area survives the turn; the bar becomes a permanent row.**
 The REPL stops applying an empty-input frame to retire, and the content path
 stops clearing. The status bar moves out of the content stream and into the area
 composition as `Element::Lines`, and its dot is driven by real turn state (grey at
@@ -646,7 +653,7 @@ readable below a tool panel).
   mid-turn re-flows the area; `plan_clear_live_frame` has no production callers
   and is removed.
 
-**P3 — Dialogs are menus in the area.**
+**U3 — Dialogs are menus in the area.**
 `ui::confirm` composes `[Status, Input?, Divider?, Overlay]` through the same path
 as the REPL, below the status and below the input. The two areas of duplicated
 logic §1 named — the dialog's own anchor and its `\x1b[0J` — go away, and so does
@@ -658,7 +665,7 @@ its entry DSR.
   asserts behaviour (which option was chosen) and not the dialog's row, so
   "green" is not evidence for anything here.
 
-**P4 — In-turn input. (Unblocked by OQ2; depends on P1–P3.)**
+**U4 — In-turn input. (Unblocked by OQ2; depends on U1–U3.)**
 The read loop stays alive while the turn runs: the input row is part of the area,
 the menu opens over it, `Esc` aborts the turn, and **submit is blocked in v0**
 (4.5.5). Two pieces of work, and the drawing is not the hard one:
@@ -682,14 +689,14 @@ by the terminal's own scroll.
   correct under interleaving of chunks and keys — this wants a test that drives
   both from one thread on a deterministic schedule, not a pty race.
 
-**P5 — Retire the DSRs that are no longer load-bearing.**
+**U5 — Retire the DSRs that are no longer load-bearing.**
 With the fold maintained across turns and every content write counted (done: #10),
 `read_input`'s entry DSR and `ui::confirm`'s (P3) stop being load-bearing.
 Startup and the three foreign-writer sites stay, by OQ1.
 - Verify: each removal is a separate commit with the suite green and a note on
   what now covers it.
 
-**P6 — Scroll region, if the re-emit measures expensive. (Optional.)**
+**U6 — Scroll region, if the re-emit measures expensive. (Optional.)**
 Set the terminal's scrolling region to the content area so the fold is maintained
 by the terminal in the stationary case, and a content chunk costs only its own
 bytes. Changes the content write point in that case (region bottom, not the fold).
@@ -782,7 +789,7 @@ fn draw_elements(&self, input: Option<Item>, overlay: Option<Item>,
 // The rule, a free function so it can be tested without an Output.
 fn area_body(input: Option<Item>, overlay: Option<Item>) -> Vec<Item>;
 
-// §4.5 P1/P2 — what the content path re-runs (private to ConsoleOutput: it is
+// §4.5 U1/U2 — what the content path re-runs (private to ConsoleOutput: it is
 // the same object that holds the stack). Renders the stored stack and applies
 // it, so a status row inside is re-resolved on every call.
 fn draw_stack(&self, policy: ApplyPolicy, dims: (usize, usize)) -> (usize, usize);
@@ -933,7 +940,7 @@ so `frame_anchor()` alone would point into the stream — that reason is **false
 (#10: the streaming writers count from the bytes they emit, checked against a vt100
 replay). It is kept as a cheap confirmation on a path where a wrong anchor strands the
 dialog over the output, and because the confirm suite asserts *behaviour* rather than
-the dialog's row, so "green" is not evidence either way. §4.5 P5 revisits it.
+the dialog's row, so "green" is not evidence either way. §4.5 U5 revisits it.
 After the DSR the dialog anchors via `frame_anchor()`, and if
 it does not fit below, `delta` scrolls it into the live region. Key loop stays; each
 key re-composes (cheap) and re-applies (partial). A resize re-composes at the new size
@@ -1014,6 +1021,25 @@ Two more notes that are easy to lose:
   reached the screen, and nothing asserted against it. Until there is an
   assertion covering that content, check it by eye.
 ---
+
+#### Audit of U1–U6 against the tree
+
+Every claim below was checked against the code, not against the phase list.
+
+| | unit | state |
+|---|---|---|
+| ✅ | **U1** contraction | Landed. `with_content_writer` consumes the area instead of retiring it, and `plan_reposition` is the third apply case. **But** it places the area by its bottom edge, which §4.5.7 rules out — see §5.2's known gap. Implemented, and wrong in the one respect §4.5.7 settled. |
+| ✅ | **U2** area survives the turn | Landed. The bar is a composed row resolved from `status_text` + `streaming`; the transient-bar machinery is gone. |
+| ✅ | **U3** dialogs are menus | Landed. `ui::confirm` composes `[Divider?, Overlay]` through the same composer. |
+| ❌ | **U4** in-turn input | **Not started.** `editor`, `nav`, `v25_menu`, `v25_handle`, `prose` and `pending_key` are still locals of `read_input`, and the agent's `tokio::select!` (`agent.rs:377`) still has exactly one branch — `item = stream.next()`. No mid-turn key can reach any of them. |
+| ❌ | **U5** retire the entry DSRs | **Not started.** `read_input`'s entry DSR is live at `repl.rs:683` and `ui::confirm`'s at `ui.rs:92`, both marked for removal. The three sanctioned sites are correctly still there (Ctrl-Z resume `repl.rs:806`, the width-change `ESC[0J` + replay `repl.rs:841`, and the confirm error path `repl.rs:942`). |
+| ⏸ | **U6** scroll region | Optional, gates nothing, not started. |
+
+**Two things this audit changes about the plan.**
+
+*U4 is the gate for everything the status-row and input proposals want.* R1 (an empty input is no row mid-turn) is written, tested and **dormant**: it asks `is_streaming()` at compose time, and the only compose that happens during a turn is none. `read_input` returns on submit; the agent loop never composes an area. So the rule cannot fire until U4 exists, and its unit test passes without production ever reaching it — a test that could not have caught the real defect, which is why R1 was reported as done when it was not.
+
+*U5 cannot start before U4.* It retires `read_input`'s entry DSR on the grounds that the fold now survives the turn — but the fold surviving the turn is exactly what U4's in-turn composer has to keep true once the area starts changing shape mid-turn. Doing U5 first optimises away the safety net that U4 would be leaning on.
 
 #### Reported rendering issues
 
@@ -1137,7 +1163,7 @@ Recorded while implementing P0–P5. None of these block the shipped pipeline;
 the first two were latent bugs that pre-date ui_draw_v2 — both since fixed.
 
 **Audit 2026-09-30** (after the permanent status bar and the §4.5 rewrite): the
-live work is §4.5 P1 → P2 → P3, which is a *drawing* track and is independent of
+live work is §4.5 U1 → U2 → U3, which is a *drawing* track and is independent of
 in-turn input. The stale item most likely to mislead is "streaming does not
 track rows" — it appears in three places in this file and is false in all of
 them; §4.2, §5.3 and §9 now each say so where they state it.
@@ -1249,7 +1275,7 @@ A recommended order for what remains is at the end of the section.
    with a message that exactly fills the width and one a column wider.
    The DSR after the DoneError `display_text` (`repl.rs` → `display_text` →
    `cursor_row()`) is still there, but no longer as a correction — it is
-   insurance on an error path, and its comment now says so. §4.5 P5 revisits
+   insurance on an error path, and its comment now says so. §4.5 U5 revisits
    whether it is still needed once the fold survives the turn.
 
 7. **`paint_plan` under-buffers multi-line plans on large terminals**
@@ -1373,7 +1399,7 @@ still targeted (no blanket `allow(dead_code)` came back).
 - **`Element::Lines`** — no longer deferred: the prompt-side status bar is its
   first production user (`compose_frame` puts it in the divider's row, above the
   input, so the frame's own union clear takes it at submit). The `#[allow(dead_code)]`
-  on the variant can go once the mid-turn bar moves here too — §4.5 P2.
+  on the variant can go once the mid-turn bar moves here too — §4.5 U2.
 - **`Frame::spans`** — §4.4's dirty-span refinement; the row diff is
   deliberately the sole reader until profiling asks for more.
 - **`ApplyPolicy::Append`** — built and vt100-tested in P2, no production user
@@ -1411,7 +1437,7 @@ still targeted (no blanket `allow(dead_code)` came back).
 
 #5, #7, #9 and #11 are done. What remains, in order:
 
-1. **§4.5 P1 → P2** — contraction, then the area surviving the turn. This is the
+1. **§4.5 U1 → U2** — contraction, then the area surviving the turn. This is the
    live work: it is what in-turn input and in-turn menus are waiting on, and it
    retires the transient-bar mechanism rather than adding to it.
   #6 (`display_text` accounting) and #10 (streaming accounting) were both long
