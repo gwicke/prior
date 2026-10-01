@@ -337,8 +337,7 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
     );
 
     let model_view = format!(
-        "oldText not found. Closest match at file lines {}-{}; the file reads:\n{}\
-         Copy the lines above into @@@OLD verbatim, or anchor the block with path:{first}.",
+        "@@@OLD lines not found. Closest match at file lines {}-{}:\n{}",
         first, last, body,
     );
     let ui_view = format!("Closest match at file lines {first}-{last}.");
@@ -447,7 +446,7 @@ impl EditFailure {
     /// one path that reaches this constructor.
     pub fn not_found_no_match() -> Self {
         let ui_view = "No similar region in file.".to_string();
-        let model_view = "oldText not found. No close-enough region in the file; \
+        let model_view = "@@@OLD lines not found. No close-enough region in the file; \
              please re-read the file and re-anchor your edit."
             .to_string();
         EditFailure {
@@ -1286,7 +1285,8 @@ mod render_tests {
         // Scope to the rendered region: the envelope's own `--- edit #N ---`
         // separator legitimately starts with `-`.
         let body = mv
-            .split_once("the file reads:\n")
+            .split_once("Closest match at file lines ")
+            .and_then(|(_, b)| b.split_once('\n'))
             .map(|(_, b)| b)
             .expect("rendered body");
         assert!(
@@ -1375,7 +1375,7 @@ mod render_tests {
     fn parse_span(mv: &str) -> (usize, usize) {
         let marker = "Closest match at file lines ";
         let rest = &mv[mv.find(marker).expect("span in header") + marker.len()..];
-        let end = rest.find(';').expect("span terminator");
+        let end = rest.find(':').expect("span terminator");
         let mut it = rest[..end].split('-').map(|s| s.parse().unwrap());
         (it.next().unwrap(), it.next().unwrap())
     }

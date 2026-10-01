@@ -5095,3 +5095,54 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         );
     }
 }
+
+#[cfg(test)]
+mod ui_render_scope_tests {
+    //! The model-facing rewrite must not change what the human sees.
+    //!
+    //! The failure envelope carries two views; only `ui_view` reaches the panel.
+    //! This pins that a real failure renders its `ui_view` and never its
+    //! `model_view` — whatever file content that now contains.
+
+    use super::*;
+    use crate::settings::default_show_reasoning_handle;
+
+    fn render(result: &str) -> String {
+        let out = ConsoleOutput::new(default_show_reasoning_handle());
+        out.begin_capture_inner();
+        out.display_tool_result(result);
+        let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture_inner()));
+        d
+    }
+
+    /// The panel word-wraps at the terminal width, so a long `ui_view` arrives
+    /// broken across lines. Collapse whitespace before asserting on content —
+    /// otherwise the test measures the terminal width, not the render split.
+    fn unwrapped(d: &str) -> String {
+        d.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn a_failed_edit_renders_only_its_ui_view() {
+        let envelope = serde_json::json!({
+            "ui_view": "edit failed:\n  edit #1 oldText not found. Closest match at file lines 2-5.",
+            "model_view": "1 of 1 edit(s) failed.\n\n--- edit #1 ---\n\
+                Your block `ctx.txt:1` failed: @@@OLD lines not found. \
+                Closest match at file lines 2-5:\n   2|     let alpha = 1;\n   3|     let beta = 2;"
+        });
+        let d = render(&envelope.to_string());
+
+        let flat = unwrapped(&d);
+        // The human gets the short summary...
+        assert!(
+            flat.contains("edit #1 oldText not found. Closest match at file lines 2-5."),
+            "{d}"
+        );
+        // ...and none of the file content, the origin string, or the block
+        // syntax the model is being taught.
+        assert!(!flat.contains("let alpha = 1;"), "file content leaked: {d}");
+        assert!(!flat.contains("ctx.txt:1"), "origin leaked: {d}");
+        assert!(!flat.contains("@@@OLD"), "model wording leaked: {d}");
+        assert!(!flat.contains("Your block"), "model wording leaked: {d}");
+    }
+}
