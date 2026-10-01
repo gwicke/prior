@@ -3186,20 +3186,21 @@ fn feed_turn_into(open: &mut Option<ConversationTurn>, msg: &Message) {
 }
 
 /// Render a single `ConversationTurn` through the Output event sequence
-/// (identical to the live streaming path). `leading_separator` controls
-/// whether a separator precedes the user prompt (replay skips it for the very
-/// first unit because the loop already emitted one).
-fn render_turn(output: &dyn Output, turn: &ConversationTurn, leading_separator: bool) {
-    if leading_separator {
-        output.display_separator();
-    }
-    output.display_plain(&turn.user_text);
+/// (identical to the live streaming path).
+///
+/// The prompt's rules are the committed prompt's own, so this no longer
+/// decides whether a separator precedes it: a prompt straight after another
+/// commit shares the rule it is already closed with, and one that opens a
+/// turn draws its own. The rule that used to sit between the prompt and the
+/// response is that closing rule too — `begin_response` then puts the blank
+/// line on it, which is the spacing a turn's prompt and its output want.
+fn render_turn(output: &dyn Output, turn: &ConversationTurn) {
+    output.display_committed_prompt(&turn.user_text);
 
     if turn.segments.is_empty() {
         return;
     }
 
-    output.display_separator();
     output.begin_response();
 
     let seg_count = turn.segments.len();
@@ -3251,14 +3252,14 @@ fn replay_units(output: &dyn Output, units: &[ReplayUnit], start: usize) {
     // writer once per delta, and there the per-write re-emit is what keeps the
     // input row visible while text flows past it.
     let _batch = output.begin_batch();
-    // Leading separators only space out turns (turns *after* the first one).
-    // Compaction markers are not turns and never force a separator.
-    let mut first_turn_seen = false;
+    // No leading-separator bookkeeping: a turn's prompt brackets itself, and
+    // the rule that used to be forced between turns *after* the first is
+    // the closing rule of the turn above. Compaction markers are not turns
+    // and never forced one.
     for unit in &units[start..] {
         match unit {
             ReplayUnit::Turn(turn) => {
-                render_turn(output, turn, first_turn_seen);
-                first_turn_seen = true;
+                render_turn(output, turn);
             }
             ReplayUnit::Compaction {
                 tokens_before,
@@ -3375,9 +3376,6 @@ pub(crate) async fn handle_replay(
                 let _ = handle.flush();
             }
         } else {
-            if total > 0 {
-                output.display_separator();
-            }
             replay_units(output, &units, 0);
         }
     } else {
@@ -3390,18 +3388,17 @@ pub(crate) async fn handle_replay(
             output.display_text("Session is empty");
         } else {
             let count = if count == 0 { total } else { count.min(total) };
-            output.display_separator();
             replay_last_turns(output, &units, count);
         }
     }
 }
 
-/// Quiet `/replay 1`: separator + the last turn only — no status messages,
-/// and a no-op when the session has no turns yet. Used by the key-driven
-/// resize repaint in `read_input`, which wipes the old frame and replays
-/// the last turn to push reflow corruption out of view; that path must
-/// stay silent (a session exists from startup, long before it has any
-/// turns to replay).
+/// Quiet `/replay 1`: the last turn only — no status messages, no divider of
+/// its own, and a no-op when the session has no turns yet. Used by the
+/// key-driven resize repaint in `read_input`, which wipes the old frame and
+/// replays the last turn to push reflow corruption out of view; that path must
+/// stay silent (a session exists from startup, long before it has any turns to
+/// replay).
 pub(crate) async fn replay_last_turn_silent(
     session: &crate::session::Session,
     output: &dyn Output,
@@ -3411,13 +3408,12 @@ pub(crate) async fn replay_last_turn_silent(
     if count_turns(&units) == 0 {
         return;
     }
-    output.display_separator();
+    // No rule of our own: the replayed turn's prompt brackets itself, and an
+    // implicit replay after a resize has nothing above it worth separating
+    // from. Its closing rule is also what the trailing `display_separator()`
+    // used to paint — otherwise the repainted input sat flush against the
+    // replayed turn — so the prompt's own bracket covers it.
     replay_last_turns(output, &units, 1);
-    // Trailing rule: manual `/replay 1` leaves the echoed command line
-    // between the replayed content and the input; the silent path skips
-    // the echo, so paint the divider ourselves — otherwise the repainted
-    // input sits flush against the replayed turn.
-    output.display_separator();
 }
 
 /// The canonical `provider:model` id a session has recorded, or `None`
@@ -4659,9 +4655,10 @@ pub async fn run_interactive(
                         (true, &input[1..])
                     };
                     let cmd = cmd.trim();
-                    // Reprint the submitted command (cleared by `read_input`).
-                    config.output.display_plain(&input);
-                    config.output.display_separator();
+                    // Reprint the submitted command (cleared by `read_input`),
+                    // bracketed like every other line the user committed with
+                    // Enter (ui_draw_v2 R4).
+                    config.output.display_committed_prompt(&input);
                     if cmd.is_empty() {
                         config
                             .output
@@ -4718,10 +4715,11 @@ pub async fn run_interactive(
                 // to do for that keyword.
                 // Reprint the submitted prompt via the `Output` impl so the
                 // session (and cursor tracking) stays correct; `read_input`
-                // cleared the input line on submit.
-                config.output.display_plain(&input);
-                // Separator between the user's prompt and the agent response.
-                config.output.display_separator();
+                // cleared the input line on submit. Bracketed — a rule above
+                // *and* below, which the second call used to add by hand — and
+                // shared with a directly preceding commit instead of stacked
+                // (ui_draw_v2 R4).
+                config.output.display_committed_prompt(&input);
                 // Normal prompt — create the agent lazily on first use
                 // (loop-side, applied config; published to the slot).
                 if app_state.agent().is_none() {
@@ -5996,13 +5994,13 @@ mod tests {
         live.end_response();
         let live_bytes = live.end_capture();
 
-        // The same turn through replay. `render_turn` draws the user prompt and
-        // a separator around the response, so the live output should be the
+        // The same turn through replay. `render_turn` draws the user prompt
+        // (bracketed) and then the response, so the live output should be the
         // *tail* of what replay paints — byte for byte, reasoning included.
         let mut replay = ConsoleOutput::new(reasoning);
         replay.reasoning_on_stderr = false;
         replay.begin_capture();
-        render_turn(&replay, &turn, false);
+        render_turn(&replay, &turn);
         let replay_bytes = replay.end_capture();
 
         let live_text = String::from_utf8_lossy(&live_bytes).to_string();
