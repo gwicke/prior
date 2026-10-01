@@ -1247,18 +1247,6 @@ a commit as a bare `display_plain` line with no rules and no boundary, while
 action taken live. Only implicit submits reach it, which is why it went unnoticed.
 ---
 
-## 7. Risks & mitigations
-
-| Risk | Mitigation |
-|---|---|
-| Byte-stream changes break subtle layout cases | P0 makes vt100 tests exercise production emission before anything changes |
-| Scroll/clear regressions (the class of bug `next_input_row` exists to prevent) | Partial path has `delta == 0` guard; full path recomputes `top` from cache; vt100 tests assert final screen + caret |
-| Cache goes stale after external writes | Explicit invalidation contract (§4.2); `live = None` on any uncertainty |
-| DSR cost if used per-frame | Cache-first (`frame_anchor()`/`caret`); DSR only via the explicit `cursor_row()` re-anchor at foreign-process / size-change sites |
-| Terminal reflow model (top- vs bottom-anchored) | No invariance is assumed: any size change invalidates `live`; clear floor preserves the reveal; DSR re-anchors |
-| Behavioral change: input no longer pushes scrollback off the top | Intended; windowing keeps caret visible. Covered by a new test |
-| Dialog divider in mid-turn context | Superseded — the composer adds a divider whenever an overlay is present (§5.1.1), so a mid-turn dialog gets one unconditionally. `ConfirmSpec.divider` is **deleted** |
-
 ---
 
 ## 8. Open questions (resolved)
