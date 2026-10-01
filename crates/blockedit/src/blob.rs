@@ -1178,15 +1178,6 @@ pub fn to_ops(edits: &[ParsedEdit]) -> Vec<crate::types::EditOp> {
         .collect()
 }
 
-/// Upper bound on files in one call. Beyond it the blob is rejected whole,
-/// before any file is touched.
-///
-/// This bounds the work a single string argument can fan out into. The
-/// single-file form caps *blocks* not at all, so there is no precedent to copy
-/// here; 32 is chosen because a cross-file refactor fits under it comfortably
-/// and the bound is about boundedness, not about taste.
-pub const MAX_FILES_PER_CALL: usize = 32;
-
 /// The path each block names, keyed for grouping, in first-seen order.
 ///
 /// `split_by_file` is **the** path policy for every block blob, single-file or
@@ -1204,7 +1195,21 @@ pub const MAX_FILES_PER_CALL: usize = 32;
 /// 3. Grouping is keyed on the **normalized** path, so `./a.rs` and `a.rs`
 ///    are one file and one batch — two all-or-nothing applies for one file
 ///    would be a bug, not a feature.
-/// 4. More than [`MAX_FILES_PER_CALL`] distinct files is rejected whole.
+/// 4. There is no cap on how many files a blob may name.
+///
+///    There was one, at 32, on the reasoning that a single string argument
+///    should not fan out into unbounded work. That conflated two different
+///    limits: how much *work* the call does, and how much of the model's
+///    context it consumes. The second is the one that matters and it is not
+///    this function's to bound — the caller already had to write the blob, so
+///    the blob's size is a fact about the request, not a surprise to defend
+///    against. The first is the sandbox's: work inside it runs under the same
+///    timeout and against the same bounds as `bash`, which is no more
+///    restricted, and nothing here is more dangerous than a shell.
+///
+///    The cost is that an over-large blob now fails later rather than at
+///    ingress: more files means more reads and writes, bounded by the timeout
+///    and reported per file by `edit_files`, which is fault-tolerant per file.
 ///
 /// There is no fallback, and there is no single-file exemption either: an
 /// earlier design let `path` supply the file for a header-less *single-file*
@@ -1233,14 +1238,6 @@ pub fn split_by_file(parsed: ParsedBlocks) -> Result<Vec<FileBatch>, String> {
             order.push(spelled);
         }
         batches.entry(key).or_default().push(edit);
-    }
-
-    if order.len() > MAX_FILES_PER_CALL {
-        return Err(format!(
-            "this edit names {} files; the limit is {MAX_FILES_PER_CALL}. Split it into \
-             several `edit` calls",
-            order.len()
-        ));
     }
 
     Ok(order
@@ -1522,37 +1519,28 @@ mod split_tests {
         assert_eq!(g[0].path, "./a.rs");
     }
 
-    // -- rule 4: the fan-out cap -------------------------------------------
+    // -- rule 4: no fan-out cap -------------------------------------------
 
     #[test]
-    fn exactly_the_cap_is_accepted_and_one_more_is_rejected() {
-        let at_cap: Vec<(String, &str)> = (0..MAX_FILES_PER_CALL)
-            .map(|i| (format!("f{i}.rs"), "x"))
-            .collect();
-        let spec: Vec<(&str, &str)> = at_cap.iter().map(|(p, b)| (p.as_str(), *b)).collect();
-        assert_eq!(
-            split_by_file(blob(&spec)).unwrap().len(),
-            MAX_FILES_PER_CALL
-        );
-
-        let over: Vec<(String, &str)> = (0..=MAX_FILES_PER_CALL)
-            .map(|i| (format!("f{i}.rs"), "x"))
-            .collect();
-        let spec: Vec<(&str, &str)> = over.iter().map(|(p, b)| (p.as_str(), *b)).collect();
-        let err = split_by_file(blob(&spec)).unwrap_err();
-        assert!(
-            err.contains(&format!("the limit is {MAX_FILES_PER_CALL}")),
-            "{err}"
-        );
+    fn a_blob_may_name_as_many_files_as_it_carries() {
+        // The old cap was 32 and rejected the whole blob past it, on the theory
+        // that a string argument should not fan out into unbounded work. The
+        // caller wrote the blob, so its size is a fact about the request rather
+        // than a surprise, and the sandbox bounds the work. See rule 4.
+        let wide: Vec<(String, &str)> = (0..500).map(|i| (format!("f{i}.rs"), "x")).collect();
+        let spec: Vec<(&str, &str)> = wide.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+        let g = split_by_file(blob(&spec)).unwrap();
+        assert_eq!(g.len(), 500);
+        // Still one block each: the file count was never what limited blocks.
+        assert!(g.iter().all(|b| b.edits.len() == 1));
     }
 
     #[test]
-    fn the_cap_counts_files_not_blocks() {
-        // Many blocks, one file: not a fan-out, so not capped.
-        let spec: Vec<(&str, &str)> = (0..MAX_FILES_PER_CALL + 5).map(|_| ("a.rs", "x")).collect();
+    fn many_blocks_in_one_file_are_never_capped() {
+        let spec: Vec<(&str, &str)> = (0..500).map(|_| ("a.rs", "x")).collect();
         let g = split_by_file(blob(&spec)).unwrap();
         assert_eq!(g.len(), 1);
-        assert_eq!(g[0].edits.len(), MAX_FILES_PER_CALL + 5);
+        assert_eq!(g[0].edits.len(), 500);
     }
 
     // -- the hazard this whole function exists to avoid -------------------

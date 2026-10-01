@@ -34,7 +34,7 @@ pub use apply::{apply_to_file, apply_to_text, success_note, ApplyOutcome};
 pub use blob::{
     array_to_blob_value, blob_text, canonicalize_edit_value, group_by_file, parse_blocks,
     render_blob, split_by_file, split_line_anchor, to_ops, FileBatch, ParseError, ParsedBlocks,
-    ParsedEdit, DIVIDER, MAX_FILES_PER_CALL, REPLACE_MARKER, SEARCH_MARKER,
+    ParsedEdit, DIVIDER, REPLACE_MARKER, SEARCH_MARKER,
 };
 pub use diagnose::{parse_file_results, render_file_results, FileResult};
 pub use tool_errors::strip_arg_error_prefixes;
