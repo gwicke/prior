@@ -33,13 +33,13 @@ USAGE:
 PREVIEW (never writes; the default):
     -e, --expression <SCRIPT>   Add the script to the commands to execute
     -f, --file <SCRIPT_FILE>    Add the contents of script-file to the commands
-    -p, --path <PATH>           File to preview, or a directory with -r
+    -p, --path <PATH>           File to preview; a directory is walked
     -r, --recursive             Walk a directory (.gitignore-aware, hidden files
                                 skipped) and preview every file, emitting one blob
-                                with a header per file. No budget: a human is reading
-                                this, not a model.
-    -g, --glob <PATTERN>        With -r, only files whose path relative to the root
-                                matches. Repeatable, and any match wins. Same
+                                with a header per file. A directory is walked
+                                without it; this states the intent.
+    -g, --glob <PATTERN>        When walking, only files whose path relative to the
+                                root matches. Repeatable, and any match wins. Same
                                 semantics as the `find` tool, so use **/*.rs for a
                                 recursive match.
     -c, --context <N>           Unchanged lines on each side of a change, like
@@ -73,7 +73,7 @@ EXAMPLES:
     bsed -e 's/old/new/' -p src/x.rs
     bsed -f script.sed src/x.rs
     bsed -u 's/old/new/' src/x.rs | less
-    bsed -r -p src 's/old/new/' > blocks.txt
+    bsed -p src 's/old/new/' > blocks.txt
     bsed apply -i < blocks.txt
     bsed apply src/x.rs < blocks.txt | diff src/x.rs -
 ";
