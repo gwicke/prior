@@ -126,6 +126,46 @@ fn a_crlf_file_does_not_sink_a_recursive_preview() {
     assert!(err.contains("crlf.txt"), "{err}");
     assert!(err.contains("CRLF"), "{err}");
     assert!(!out.contains("crlf.txt"), "{out}");
+    // The count covers only what can batch: one file was previewable and it
+    // changed. Counting the CRLF file would put a permanent exclusion next to
+    // a real change and read as "there is more coming".
+    assert!(err.contains("1 of 1 file(s)"), "{err}");
+}
+
+/// A file that cannot be batched is in no batch, ever — re-running cannot
+/// surface it — so the summary must not read as finished while one sits
+/// unchanged. This is the case the count alone gets wrong.
+///
+/// Models this is the shape of: everything batchable has been applied, and
+/// this is the second look that decides whether the refactor is done. The one
+/// file left matched, and still produced no blocks.
+#[test]
+fn a_refused_file_does_not_leave_the_summary_reading_as_done() {
+    let d = tempfile::tempdir().unwrap();
+    // `normal.txt` is already in its final state, so it matches nothing: this is
+    // what a tree looks like once every appliable batch has been applied.
+    std::fs::write(d.path().join("normal.txt"), "new_name\n").unwrap();
+    std::fs::write(d.path().join("windows.txt"), "old_name\r\n").unwrap();
+
+    let o = run_in(d.path(), None, &["-p", ".", "s/old_name/new_name/"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).is_empty(),
+        "nothing can be applied: {}",
+        stdout(&o)
+    );
+    let err = stderr(&o);
+
+    // The only previewable file has nothing to change, so the count is over that
+    // one file -- and not over both, which would read as "one still to do".
+    assert!(err.contains("none of the 1 file(s)"), "{err}");
+    // The refusal note is the only thing standing between this and a reader who
+    // concludes the tree is finished, so it has to name the file.
+    assert!(
+        err.contains("windows.txt"),
+        "the refusal must name the file: {err}"
+    );
+    assert!(err.contains("CRLF"), "{err}");
 }
 
 /// A tree that is *only* refused files must not report "no lines matched" and

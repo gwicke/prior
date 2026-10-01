@@ -634,7 +634,7 @@ fn recursive_preview(
     // whole or left out: half a file's blocks is a payload that neither applies
     // nor describes what it left out, and a boundary at the file is the one place
     // a reader can see where a batch stopped.
-    let mut fits = |blob: &mut String, piece: &str, room: &mut isize| -> bool {
+    let fits = |blob: &mut String, piece: &str, room: &mut isize| -> bool {
         let cost = piece.len() as isize + usize::from(!blob.is_empty()) as isize;
         if cost > *room {
             return false;
@@ -721,25 +721,37 @@ fn recursive_preview(
         emitted_blocks += count_blocks(&b);
     }
 
+    // The denominator of every count below. A file that cannot be batched --
+    // skipped, CRLF, or unexpressible -- is not a file waiting for a later
+    // batch, it is a file that will never be previewed at all, so counting it
+    // here would put a permanent exclusion among the transient ones. "1 of 2
+    // files changed" reads as half-done-and-there's-more; what it means is
+    // that one file is finished and the other is stuck. The refused files get
+    // their own notes, which say *which* files and what to do about them, so
+    // this count only ever describes the population that can actually batch.
+    let considered = files.len() - skipped - crlf.len() - blocked.len();
+
     if changed_files == 0 {
         let mut out = format!(
-            "no lines matched — none of the {} file(s) under {} changed{}{}\n",
-            files.len() - skipped,
+            "no lines matched — none of the {considered} file(s) under {} changed\n",
             root.display(),
-            if skipped > 0 {
-                format!(" ({skipped} skipped: not UTF-8 text)")
-            } else {
-                String::new()
-            },
-            if blocked.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " ({} matched but not expressible as blocks — re-run on those files alone)",
-                    blocked.len()
-                )
-            }
         );
+        if skipped > 0 {
+            out.push_str(&format!(
+                "NOTE: {skipped} file(s) skipped (not UTF-8 text).\n"
+            ));
+        }
+        if !blocked.is_empty() {
+            out.push_str(&format!(
+                "NOTE: {} file(s) matched but cannot be expressed as appliable blocks, and are \
+                 NOT in the output. Re-run on those files alone:\n",
+                blocked.len()
+            ));
+            push_list(
+                &mut out,
+                blocked.iter().map(|(p, why)| format!("{p}: {why}")),
+            );
+        }
         // "no lines matched" is the wrong sentence when a file did match and was
         // refused, so the CRLF files are spelled out rather than just counted.
         if !crlf.is_empty() {
@@ -766,14 +778,14 @@ fn recursive_preview(
             format!(
                 "sed diff: {changed_files} of {} file(s) under {} changed. A diff is for \
                  reading; drop -u for blocks `edit` can apply.\n",
-                files.len(),
+                considered,
                 root.display(),
             )
         } else {
             format!(
                 "sed preview: {blocks} block(s) in {changed_files} of {} file(s) under {}. \
                  Check and apply them with `edit`.\n",
-                files.len(),
+                considered,
                 root.display(),
             )
         }
@@ -785,7 +797,7 @@ fn recursive_preview(
             "sed {noun}: {blocks} match(es) in {changed_files} of {} file(s) under {}; \
              returned {emitted_blocks} of {blocks} in {emitted_files} file(s). This is ONE \
              batch. Check and apply it with `edit`, then re-run sed for the next.\n",
-            files.len(),
+            considered,
             root.display(),
         )
     };
