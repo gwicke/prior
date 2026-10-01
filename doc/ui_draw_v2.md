@@ -405,8 +405,9 @@ today for one reason, and this section is about that reason.
 - **The status bar is a row of that area,** so its dot flips in place. No
   transient content-line bar, and no second bar anywhere.
 - **The prompt stays live mid-turn:** the input row is part of the area while a
-  turn runs, the menu opens over it (browsable, read-only), and `Esc` aborts the
-  turn. **Submit is blocked mid-turn in v0** — pre-compose the next prompt and
+  turn runs, the menu opens over it (browsable, read-only), and `Esc` steps the
+  menu back a level, stopping the turn only at root. **Submit is blocked
+  mid-turn in v0** — pre-compose the next prompt and
   browse, but do not commit one. Steering is a later iteration, most likely a
   message injected at the next natural segment boundary.
 
@@ -529,7 +530,10 @@ list, so 4.5.6 reflects them.
   - **The menu browses; changes defer.** Per-turn overrides already apply per
     request and never to the config (`model_settings_v2.md`), so a setting
     change would only reach a future request — deferred by policy, not danger.
-  - **`Esc` aborts the turn.** It still reaches the running tool through
+  - **`Esc` stops the turn — at root.** U4's settled rule refines this: with a
+    v2.5 menu open it steps the ladder instead (menu-first, abort only at
+    root), which is why it is forwarded to the turn rather than handled in the
+    reader. Either way it still reaches the running tool through
     `TOOL_CANCEL_SENDERS`; that registry survives as the *mechanism*, while
     "kill this child" stops being the whole meaning.
   - **Steering is a later iteration:** most likely a message injected at the
@@ -667,8 +671,9 @@ its entry DSR.
 
 **U4 — In-turn input. (Unblocked by OQ2; depends on U1–U3.)**
 The read loop stays alive while the turn runs: the input row is part of the area,
-the menu opens over it, `Esc` aborts the turn, and **submit is blocked in v0**
-(4.5.5). Two pieces of work, and the drawing is not the hard one:
+the menu opens over it, `Esc` is menu-first (stopping the turn only at root), and
+**submit is blocked in v0** (4.5.5). Two pieces of work, and the drawing is not
+the hard one:
 
 - **The prompt session has to leave `read_input`'s frame.** `editor`, `nav`,
   `v25_menu`, `v25_handle`, `prose` and `pending_key` are locals there, so a
@@ -686,7 +691,7 @@ see 4.5.1: emitting the taller area from the fold pushes the content above up
 by the terminal's own scroll.
 
 **Plan (2026-10-01). One pump, one composer.** The stream branch and the new key
-branch are arms of the *same* `tokio::select!` in `prompt()` (agent.rs:377), so
+branch are arms of the *same* `tokio::select!` in `prompt()` (agent.rs:380), so
 they interleave by construction: no mutex, and the remembered `element_stack`
 cannot be stale relative to a compose because there is no parallel compose.
 
@@ -709,10 +714,12 @@ enabled and it would delete the thread, the 50 ms tick, the channel and the
 OQ4 makes `confirm` a menu, so it stops needing the gate — but the editor never
 can: it hands the tty to a child and reads a DSR back. Unifying confirm retires
 one gate user, not the gate. (Two further reasons the thread keeps its duties:
-Ctrl-C / Ctrl-Z / `Esc` / Resize must stay *inline* so an abort cannot ride
-behind a paste backlog, and `done` + `join()` is what makes `read_input` the sole
-reader again — a correctness property, not a detail. The 50 ms is only how long
-an *idle* `poll` takes to notice those flags; keystroke latency is ~0.)
+Ctrl-C / Ctrl-Z / Resize must stay *inline* so an abort cannot ride behind a
+paste backlog — `Esc` was in that list until U4.3 gave it a decision to make,
+which this thread cannot make without a session, so it forwards now — and
+`done` + `join()` is what makes `read_input` the sole reader again — a
+correctness property, not a detail. The 50 ms is only how long an *idle* `poll`
+takes to notice those flags; keystroke latency is ~0.)
 
 **Four units, separately green:**
 
@@ -1107,13 +1114,13 @@ Every claim below was checked against the code, not against the phase list.
 | ✅ | **U1** contraction | Landed. `with_content_writer` consumes the area instead of retiring it, and `plan_reposition` is the third apply case. **But** it places the area by its bottom edge, which §4.5.7 rules out — see §5.2's known gap. Implemented, and wrong in the one respect §4.5.7 settled. |
 | ✅ | **U2** area survives the turn | Landed. The bar is a composed row resolved from `status_text` + `streaming`; the transient-bar machinery is gone. |
 | ✅ | **U3** dialogs are menus | Landed. `ui::confirm` composes `[Divider?, Overlay]` through the same composer. |
-| 🔶 | **U4** in-turn input | **U4.1 + U4.2 landed; U4.3–U4.4 open.** The plan is recorded under U4 itself. Landed: `PromptSession` owns `editor`, `nav`, `draft`, `sel`, `last_disc`, `prose`, `pending_key`, the `SlashDotMenu` and the overlay, and `read_input` takes it by `&mut`, so the state outlives the call; `handle_key` is the draw-free dispatcher (`Continue` / `RunEditor` / `Action`), generalising the `edit_key` split; `slashdot_menu` gained `continuation_handle` so a `/`-session keeps its epoch across evals. The in-flight reader no longer drops edit keys — `route_event` routes each one `Inline` (Ctrl-C, Ctrl-Z, Esc, Resize: an abort must not ride behind a paste backlog) or `Forward` (every other key, plus paste) onto an unbounded mpsc, unbounded precisely so a full queue can never block the thread at the moment it must deliver Ctrl-C. **Nothing polls that receiver yet**: it is bound for the turn and dropped with it, so a mid-turn keystroke is still lost exactly as before — just from a place U4.3 can reach. What still stops mid-turn typing is the agent's `tokio::select!` (`agent.rs:377`) having exactly one branch — `item = stream.next()`. `eval` also remains inline in `read_input`, so the session is not yet self-driving. |
+| 🔶 | **U4** in-turn input | **U4.1–U4.3 landed; U4.4 open.** The plan is recorded under U4 itself. Landed: `PromptSession` owns `editor`, `nav`, `draft`, `sel`, `last_disc`, `prose`, `pending_key`, the `SlashDotMenu` and the overlay, and `read_input` takes it by `&mut`, so the state outlives the call; `handle_key` is the draw-free dispatcher (`Continue` / `RunEditor` / `Action`), generalising the `edit_key` split; `slashdot_menu` gained `continuation_handle` so a `/`-session keeps its epoch across evals. The in-flight reader no longer drops edit keys — `route_event` routes each one `Inline` (Ctrl-C, Ctrl-Z, Resize) or `Forward` (every other key, **`Esc` among them**, plus paste) onto an unbounded mpsc, unbounded precisely so a full queue can never block the thread at the moment it must deliver Ctrl-C. **The receiver is drained:** `prompt()`'s `select!` grew a key branch that runs `handle_key` → `settle` — eval, outcome, sync, paint, the sequence `read_input` runs minus its wait — plus a prose timer for `prose.poll_timeout()`, without which prose would go inert mid-turn. Submit is blocked and silent, as settled. `Esc` is menu-first: the ladder runs while a v2.5 menu is open and the turn stops only at root, which is *why* it moved to `Forward` — the reader has no session to look at, so routing it inline was routing it to "abort" unconditionally. `eval` is out of `read_input` and into `settle`, so the session is self-driving. **Still open: U4.4**, the ordering between the key branch's compose and the content branch's write + `reposition_area`. |
 | ❌ | **U5** retire the entry DSRs | **Not started.** `read_input`'s entry DSR is live at `repl.rs:683` and `ui::confirm`'s at `ui.rs:92`, both marked for removal. The three sanctioned sites are correctly still there (Ctrl-Z resume `repl.rs:806`, the width-change `ESC[0J` + replay `repl.rs:841`, and the confirm error path `repl.rs:942`). |
 | ⏸ | **U6** scroll region | Optional, gates nothing, not started. |
 
 **Two things this audit changes about the plan.**
 
-*U4 is the gate for everything the status-row and input proposals want.* R1 (an empty input is no row mid-turn) is written, tested and **dormant**: it asks `is_streaming()` at compose time, and the only compose that happens during a turn is none. `read_input` returns on submit; the agent loop never composes an area. So the rule cannot fire until U4 exists, and its unit test passes without production ever reaching it — a test that could not have caught the real defect, which is why R1 was reported as done when it was not.
+*U4 is the gate for everything the status-row and input proposals want.* R1 (an empty input is no row mid-turn) is written, tested and **was dormant**: it asks `is_streaming()` at compose time, and until U4.3 the only compose that happened during a turn was none — `read_input` returned on submit and the agent loop never composed an area. Its unit test passed without production ever reaching it, a test that could not have caught the real defect, which is why R1 was reported as done when it was not. **U4.3's key branch is the path that opens:** pressing a key mid-turn runs `settle` → `paint_prompt`, so a compose now happens with the stream live and R1 is reachable in production rather than only in its unit test.
 
 *U5 cannot start before U4.* It retires `read_input`'s entry DSR on the grounds that the fold now survives the turn — but the fold surviving the turn is exactly what U4's in-turn composer has to keep true once the area starts changing shape mid-turn. Doing U5 first optimises away the safety net that U4 would be leaning on.
 

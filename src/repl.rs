@@ -93,21 +93,23 @@ pub(crate) enum ReaderRoute {
 ///   renderers reading it directly.
 /// - `Ctrl-C` / `Ctrl-Z`: process and terminal state (`exit`,
 ///   `killpg(SIGTSTP)`), handled where they land, never queued.
-/// - `Esc`: aborts the turn through `cancel`. Inline so that an abort
-///   cannot ride behind a paste backlog — which is the same reason the
-///   channel is unbounded.
 ///
 /// **Forwarded:** every other key, plus `Paste`. These are content for the
 /// prompt; `read_input` already treats `Event::Paste` as a bulk insert, so
-/// the turn's key branch reads them the same way (U4.3).
+/// the turn's key branch reads them the same way (U4.3). `Esc` is one of
+/// them, and that is a change:
+///
+/// `Esc` used to be Inline, and Inline meant *abort* — unconditionally, from
+/// here. Settled U4 makes it menu-first: the ladder runs while a menu is
+/// open, and it aborts only at root. This thread cannot make that call (it
+/// has no session to look at), so the decision moves to the one that can,
+/// and `Esc` rides the forwarded path with everything else. The cost is
+/// explicit: a root `Esc` is no longer guaranteed to land ahead of a paste
+/// backlog, where it was before. `Ctrl-C` still is, and it still never
+/// queues — that is what "immediately reachable" now rests on.
 ///
 /// Everything else — mouse, focus — returns [`ReaderRoute::Inline`] and is
 /// ignored, exactly as it was before there was anywhere to forward to.
-///
-/// TODO(U4.3): `Esc` should be menu-first while a menu is open (settled:
-/// "abort only at root"), and this thread cannot know whether one is. That
-/// decision either moves `Esc` onto the forwarded path or duplicates it —
-/// the turn can see the session, this thread cannot.
 pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
     match ev {
         Event::Resize(..) => ReaderRoute::Inline,
@@ -118,7 +120,6 @@ pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
             KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ReaderRoute::Inline
             }
-            KeyCode::Esc => ReaderRoute::Inline,
             _ => ReaderRoute::Forward,
         },
         Event::Paste(..) => ReaderRoute::Forward,
@@ -127,7 +128,7 @@ pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
 }
 
 /// What to do with each event is [`route_event`]'s call, not a pile of
-/// branches here. The reader handles four things inline and forwards the
+/// branches here. The reader handles three things inline and forwards the
 /// rest on `keys` (ui_draw_v2 §4.5 U4.2); until U4.2 nothing was
 /// forwarded and edit keys typed mid-request were simply dropped.
 ///
@@ -137,18 +138,18 @@ pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
 /// Spawned *only* while an LLM request is in flight (`prompt().await`
 /// blocks the main task). In raw mode `event::read` is blocking and the
 /// main task cannot read keys during the await, so this thread is what
-/// sees `Esc`/`Ctrl-C`/`Ctrl-Z` arriving mid-request.
+/// sees `Ctrl-C`/`Ctrl-Z` arriving mid-request. `Esc` was this thread's
+/// until U4.3 made it menu-first — a decision it cannot make without a
+/// session to look at — so it is forwarded now and the turn decides; see
+/// [`route_event`].
 ///
 /// `done` is set by the caller once the await returns, so the loop can
-/// exit and be joined. `guard` and `cancel` are `Arc` and `stop()`/
-/// `store()` are process-wide, so calling them from this thread is safe.
-/// `paused` is set by a confirmation dialog on the main task while it owns
-/// stdin; while it is `true` this reader must not read, or it would swallow
-/// the dialog's keystrokes.
+/// exit and be joined. `guard` is `Arc` and `stop()` is process-wide, so
+/// calling it from this thread is safe. `paused` is set by a confirmation
+/// dialog on the main task while it owns stdin; while it is `true` this
+/// reader must not read, or it would swallow the dialog's keystrokes.
 pub(crate) fn spawn_in_flight_reader(
     guard: Arc<TermGuard>,
-    cancel: Arc<AtomicBool>,
-    cancel_notify: Arc<tokio::sync::Notify>,
     done: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     keys: tokio::sync::mpsc::UnboundedSender<Event>,
@@ -192,16 +193,6 @@ pub(crate) fn spawn_in_flight_reader(
                             unsafe {
                                 libc::killpg(libc::getpgrp(), libc::SIGTSTP);
                             }
-                        }
-                    } else if let KeyCode::Esc = key.code {
-                        cancel.store(true, Ordering::SeqCst);
-                        cancel_notify.notify_one();
-                        // Wake any in-flight tool watchdog threads so the
-                        // shell command is killed immediately (not after the
-                        // timeout).  Sending on an unbounded mpsc channel is
-                        // non-blocking, so this is safe from the reader thread.
-                        for tx in crate::tools::TOOL_CANCEL_SENDERS.lock().unwrap().iter() {
-                            let _ = tx.send(());
                         }
                     }
                 }
@@ -1074,6 +1065,19 @@ impl PromptSession {
     /// can be out of step with the other.
     pub(crate) fn opts_len(&self) -> usize {
         self.overlay.display_rows().0.len()
+    }
+
+    /// Is a v2.5 menu open — the case where `Esc` steps the engine back a
+    /// level instead of ending the turn (settled U4: menu-first, abort only at
+    /// root).
+    ///
+    /// Deliberately `V25Menu` and not "any overlay": prose's dialog is
+    /// dismissed by the buffer, not by `Esc` — [`handle_key`](Self::handle_key)
+    /// says so in its `Esc` arm — so there is nothing there for `Esc` to step
+    /// out of. A bare prompt is the same situation. Both count as root, and
+    /// root is where the turn stops.
+    pub(crate) fn menu_open(&self) -> bool {
+        matches!(self.overlay, ActiveOverlay::V25Menu { .. })
     }
 
     /// How long the turn's `select!` should wait before re-evaluating prose —
@@ -2747,6 +2751,9 @@ mod tests {
     /// cannot ride behind a paste backlog" (ui_draw_v2 §4.5) — and the
     /// channel's unboundedness follows from it: a bounded one that filled would
     /// block the reader at precisely the moment it has to deliver `Ctrl-C`.
+    ///
+    /// `Esc` used to be in this list and is deliberately gone from it now, for
+    /// the reason [`esc_is_forwarded_so_the_turn_can_decide`] pins.
     #[test]
     fn an_abort_never_queues_behind_content() {
         let urgent = [
@@ -2758,10 +2765,6 @@ mod tests {
                 "Ctrl-Z",
                 Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
             ),
-            (
-                "Esc",
-                Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            ),
             ("Resize", Event::Resize(120, 40)),
         ];
         for (what, ev) in urgent {
@@ -2772,6 +2775,22 @@ mod tests {
                 what
             );
         }
+    }
+
+    /// `Esc` is forwarded, and that is the fix for the settled menu-first rule
+    /// (ui_draw_v2 §4.5, "abort only at root").
+    ///
+    /// It could not be decided where it used to be decided: routing `Esc`
+    /// Inline here meant routing it to *abort*, with no way to ask whether a
+    /// menu was open, because this function has no session to look at. Moving
+    /// it to the forwarded path is what lets the turn answer the question
+    /// correctly — step the ladder when a menu is up, stop the turn when there
+    /// is not. The trade is stated in [`route_event`]'s doc: a root `Esc` now
+    /// rides the queue like any other key.
+    #[test]
+    fn esc_is_forwarded_so_the_turn_can_decide() {
+        let ev = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(route_event(&ev), ReaderRoute::Forward);
     }
 
     /// Everything the prompt can hold is content, and content goes to the turn

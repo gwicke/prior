@@ -698,9 +698,9 @@ impl CodeAgent {
                 // U4.3: a key typed during the turn, evaluated as it arrives —
                 // no queue, no holding back (ui_draw_v2 §4.5). This is
                 // `read_input`'s loop minus its wait: dispatch, then settle.
-                // `route_event` has already taken `Ctrl-C`/`Ctrl-Z`/`Esc`
-                // inline before anything reaches this channel, so what lands
-                // here is ordinary editing — and a submit, which is blocked.
+                // `route_event` takes `Ctrl-C`/`Ctrl-Z` inline before anything
+                // reaches this channel, so what lands here is ordinary editing:
+                // a submit (blocked, silently) and `Esc` (menu-first, below).
                 ev = async {
                     match it_keys.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -718,6 +718,39 @@ impl CodeAgent {
                         let dims = self.output.frame_size();
                         match ev {
                             crossterm::event::Event::Key(key) => {
+                                // Settled U4: `Esc` is menu-first. With a v2.5
+                                // menu open it goes to `handle_key`, whose ladder
+                                // steps the engine back one level. At root — a
+                                // bare prompt, or only unsubmitted prose that the
+                                // session carries across the turn anyway — there
+                                // is nothing to step out of, so it does what it
+                                // did before this branch existed and stops the
+                                // turn.
+                                //
+                                // The reader used to make this call, and made it
+                                // with no way to see a menu: unconditional.
+                                // Same three lines, moved to a place that can
+                                // tell the difference.
+                                if key.code == crossterm::event::KeyCode::Esc
+                                    && !sess.menu_open()
+                                {
+                                    self.user_cancel.store(true, Ordering::SeqCst);
+                                    self.cancel_notify.notify_one();
+                                    // Wake in-flight tool watchdogs so a running
+                                    // shell dies now rather than at its next
+                                    // check. Unbounded mpsc, so this cannot block
+                                    // the main task.
+                                    for tx in crate::tools::TOOL_CANCEL_SENDERS
+                                        .lock()
+                                        .unwrap()
+                                        .iter()
+                                    {
+                                        let _ = tx.send(());
+                                    }
+                                    // Nothing to re-evaluate: the stream branch
+                                    // reads the flag and ends the turn.
+                                    continue;
+                                }
                                 let opts_len = sess.opts_len();
                                 match sess.handle_key(key, opts_len, it_label, history) {
                                     crate::repl::KeyOutcome::RunEditor => {
@@ -4162,9 +4195,10 @@ pub async fn run_interactive(
             None
         };
     let mut line_history = crate::repl::History::load();
-    // Shared cancel flag: the in-flight reader thread sets it on `Esc`; the
-    // `LoggingHook` bridge turns it into a rig `CancelSignal` that aborts the
-    // current request.
+    // Shared cancel flag: set on a root `Esc` by the turn's key branch (the
+    // in-flight reader used to set it, but it cannot see a menu and so could
+    // not honour menu-first); the `LoggingHook` bridge turns it into a rig
+    // `CancelSignal` that aborts the current request.
     let cancel = Arc::new(AtomicBool::new(false));
     // So `/model` etc. embed the same flag into the rebuilt agent.
     config.user_cancel = cancel.clone();
@@ -4701,8 +4735,6 @@ pub async fn run_interactive(
                         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
                     let h = crate::repl::spawn_in_flight_reader(
                         g.clone(),
-                        cancel.clone(),
-                        config.cancel_notify.clone(),
                         done.clone(),
                         confirm_gate,
                         in_turn_keys_tx,
