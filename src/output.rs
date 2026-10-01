@@ -1972,11 +1972,25 @@ impl ConsoleOutput {
     }
 }
 
-/// DECTCEM show. A frame apply shows the cursor (a frame is where the user
-/// types), and `TermGuard::stop` emits it unconditionally as the net for
-/// exiting with it hidden. Nothing in this layer *hides* it any more — that was
-/// `paint_status`'s job, deleted with the transient bar (ui_draw_v2 §4.5 P2).
+/// DECTCEM show — emitted when the applied frame has a caret, because that is
+/// where the user types. `TermGuard::stop` emits it unconditionally as the net
+/// for exiting with it hidden.
 pub(crate) const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+
+/// DECTCEM hide — the other half of [`SHOW_CURSOR`], for a frame with **no
+/// caret**.
+///
+/// Mid-turn an empty input is no row at all (`input_hidden`), so there is
+/// nowhere to put a caret, and showing it leaves a cursor blinking against a
+/// row that was never drawn. `Frame::caret` is `None` in exactly those cases,
+/// so the decision reads the frame's own answer instead of tracking input
+/// state here.
+///
+/// Not the hide that `paint_status` used to do and that went with the transient
+/// bar: that one hid the cursor *around a content write*, to stop it flickering
+/// over text arriving mid-render. This one describes the frame that was
+/// composed, decided once per apply.
+pub(crate) const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 
 /// The status line's content, before it is fitted to a width: what names the
 /// session, and the model group as separate fields.
@@ -2671,11 +2685,17 @@ impl Output for ConsoleOutput {
             plan_apply(&mut cache, frame, policy, tw, th)
         };
         let _ = out.write_all(bytes.as_bytes());
-        // A frame is where the user types, so the cursor is shown here whatever
-        // left it hidden. Nothing in this layer hides it any more — that was
-        // `paint_status`'s — but `TermGuard` and the shell can, and this is the
-        // cheapest place to be sure.
-        let _ = out.write_all(SHOW_CURSOR);
+        // The cursor follows the frame's own caret. A composed frame with one is
+        // where the user types; a frame whose input is hidden mid-turn (R1) has
+        // none to place, so hiding is the honest reading of the same fact rather
+        // than a second piece of input state kept in step by hand. Either way
+        // this is the cheapest place to be sure — `TermGuard` and the shell can
+        // also leave it hidden.
+        let _ = out.write_all(if frame.caret.is_some() {
+            SHOW_CURSOR
+        } else {
+            HIDE_CURSOR
+        });
         let _ = out.flush();
         (tw, th)
     }
@@ -4809,6 +4829,45 @@ mod tests {
                 "frame row {leftover:?} belongs below the content, not among it: {rows:?}"
             );
         }
+    }
+
+    /// The cursor follows the frame's own caret: shown where the user can type,
+    /// hidden when the input is drawn as no row at all (ui_draw_v2 R1).
+    ///
+    /// Showing it unconditionally was correct while every frame had an input
+    /// row, and wrong the moment R1 removed one — the cursor sat blinking
+    /// against a row that was never drawn. `Frame::caret` is already `None` in
+    /// exactly those cases, so the decision reads the frame rather than
+    /// tracking input state separately.
+    #[test]
+    #[serial]
+    fn the_cursor_follows_the_frames_own_caret() {
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        // Streaming with an empty buffer is R1's `input_hidden`: no input row,
+        // and so no caret to place.
+        out.begin_response();
+        crate::repl::paint_prompt(&out, "", &crate::repl::LineEditor::new(), &[], 0, (40, 24));
+        let bytes = out.end_capture();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("\x1b[?25l"),
+            "a frame with no caret hides the cursor"
+        );
+
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        let mut editor = crate::repl::LineEditor::new();
+        editor.set("hi");
+        crate::repl::paint_prompt(&out, "", &editor, &[], 0, (40, 24));
+        let text = String::from_utf8_lossy(&out.end_capture()).into_owned();
+        assert!(
+            text.contains("\x1b[?25h"),
+            "a frame with a caret shows it: {text:?}"
+        );
+        assert!(
+            !text.contains("\x1b[?25l"),
+            "…and does not also hide it: {text:?}"
+        );
     }
 
     /// The clear only applies when a frame is live: streamed blocks just

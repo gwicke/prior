@@ -1678,10 +1678,20 @@ impl Repl {
                         }
                         KeyOutcome::Action(a) => {
                             if let InputAction::Submit(_) = &a {
+                                // U4: one `PromptSession` outlives this call,
+                                // so the *painted* editor being empty is not the
+                                // same as the editor being empty. Painting a
+                                // throwaway `LineEditor::new()` cleared the screen
+                                // and left the submitted text in `session.editor`,
+                                // which is what the *next* compose paints — so
+                                // the first keystroke of the turn, or the next
+                                // prompt, put the old text back on screen. Clear
+                                // the real one and paint that.
+                                session.editor.set("");
                                 paint_prompt(
                                     output,
                                     prompt,
-                                    &LineEditor::new(),
+                                    &session.editor,
                                     &[],
                                     session.sel,
                                     (cur_w, cur_h),

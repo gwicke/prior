@@ -367,6 +367,25 @@ impl CodeAgent {
             }) => (Some(keys), Some(session), label, Some(history), Some(guard)),
             None => (None, None, "", None, None),
         };
+        // The area has to say the turn started *now*. `begin_response` above
+        // flipped `streaming`, and the frame on screen was composed while it was
+        // false — so until some keystroke happened to compose again, the input
+        // row stayed drawn and the status dot stayed grey for the whole turn.
+        //
+        // One `settle` at the switch, and it is the same paint path both pumps
+        // use rather than a second way to compose: the buffer was just emptied
+        // by the submit, so its `eval` is a passive derive with nothing to
+        // dispatch and the action it returns is empty by construction.
+        if let (Some(sess), Some(hist)) = (it_session.as_deref_mut(), it_history.as_deref_mut()) {
+            let _ = sess
+                .settle(
+                    self.output.as_ref(),
+                    it_label,
+                    hist,
+                    self.output.frame_size(),
+                )
+                .await;
+        }
         loop {
             // Prose's wake-up for this iteration, resolved *before* the select
             // rather than inside the timer's async block: `Option<Duration>` is
