@@ -113,6 +113,22 @@ impl SlashDotMenu {
     ///
     /// The host tracks which of the two it wants with its own
     /// "am I still inside one `/`-session" flag.
+    ///
+    /// TODO(api): this pair asks the host to track an open invocation and to
+    /// pick the right constructor for it — `PromptSession::epoch_active` and
+    /// `PromptSession::slash_handle` exist only to do that. A better shape
+    /// would make the invocation the unit: something the host *holds* for the
+    /// duration of one `/`-session, constructed with the bump and offering
+    /// only continuation afterwards, so there is no flag and no choice. The
+    /// host already does exactly that where it can — `Repl::batch_slash` keeps
+    /// `menu` and `handle` as two locals for a whole rewrite chain.
+    ///
+    /// What blocks it is not taste but the borrow rule: the invocation would
+    /// borrow the menu, and a struct that owns its menu cannot also hold a
+    /// borrow of it. Fixing that properly means either an unsafe/self-
+    /// referential handle or moving the menu out of the session, which would
+    /// stop `PromptSession` being one value the turn can carry (ui_draw_v2
+    /// §4.5 U4). Worth revisiting if that constraint ever lifts.
     pub fn continuation_handle(&mut self) -> SlashDotHandle<'_> {
         SlashDotHandle {
             root: &mut self.root,

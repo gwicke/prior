@@ -645,7 +645,7 @@ pub(crate) enum KeyOutcome {
 ///
 /// The `SlashDotMenu` lives here too, and is *not* a borrow: the menu handle
 /// borrows it, so storing both would be self-referential. Instead the session
-/// tracks `in_slash` and mints a handle for the duration of each eval —
+/// tracks `epoch_active` and mints a handle for the duration of each eval —
 /// [`SlashDotMenu::get_handle`] when a `/`-session begins (bumping the epoch so
 /// a new invocation starts clean), [`SlashDotMenu::continuation_handle`]
 /// afterwards (so the in-progress one keeps its view restore and armed
@@ -673,7 +673,13 @@ pub struct PromptSession {
     menu: crate::slashdot_menu::menu::SlashDotMenu,
     /// Whether a `/`-session is in progress — i.e. whether the epoch has been
     /// bumped for the invocation currently on screen.
-    in_slash: bool,
+    ///
+    /// Named for the mechanism, not the buffer: this is *not* "the prompt
+    /// starts with `/`" (the buffer says that) but "an epoch has been bumped
+    /// for the invocation on screen". It is what used to be read off
+    /// `v25_handle.is_none()`, kept as a `bool` because the handle itself
+    /// cannot be stored alongside the menu it borrows.
+    epoch_active: bool,
     /// The overlay the last eval produced, which the next key dispatches
     /// against. Recomputed every iteration; held here so `handle_key` sees the
     /// same frame that was just painted.
@@ -698,7 +704,7 @@ impl PromptSession {
             prose: crate::prompt_complete::PromptCompletion::new(),
             pending_key: None,
             menu: crate::v25_menu::build_menu(app_state),
-            in_slash: false,
+            epoch_active: false,
             overlay: ActiveOverlay::None,
         }
     }
@@ -711,12 +717,16 @@ impl PromptSession {
     /// Takes the two fields rather than `&mut self` because the caller
     /// (`read_input`) has the session destructured into its loop's own
     /// bindings, and the handle's borrow must not span them.
+    ///
+    /// TODO(api): see the note on [`SlashDotMenu::continuation_handle`] — this
+    /// helper, and `epoch_active` below, exist only because the host has to
+    /// choose between two constructors. A held invocation would delete both.
     fn slash_handle<'m>(
         menu: &'m mut crate::slashdot_menu::menu::SlashDotMenu,
-        in_slash: &mut bool,
+        epoch_active: &mut bool,
     ) -> crate::slashdot_menu::menu::SlashDotHandle<'m> {
-        let fresh = !*in_slash;
-        *in_slash = true;
+        let fresh = !*epoch_active;
+        *epoch_active = true;
         if fresh {
             menu.get_handle()
         } else {
@@ -752,7 +762,7 @@ impl PromptSession {
         sel: &mut usize,
         pending_key: &mut Option<crate::slashdot_menu::HostKey>,
         overlay: &ActiveOverlay,
-        in_slash: bool,
+        epoch_active: bool,
         // Row count of `overlay` as the caller measured it — the bounds the
         // host-side cursor needs. Passed rather than recomputed so the
         // dispatch and the paint cannot disagree about how many rows there are.
@@ -815,7 +825,7 @@ impl PromptSession {
                         ActiveOverlay::None => None,
                     };
                     if let Some(plan) = plan {
-                        if !matches!(overlay, ActiveOverlay::PathComplete { .. }) && !in_slash {
+                        if !matches!(overlay, ActiveOverlay::PathComplete { .. }) && !epoch_active {
                             return KeyOutcome::Continue; // V25 overlay without its handle
                         }
                         let cur_sel = plan.selected.unwrap_or(0);
@@ -1033,7 +1043,7 @@ impl Repl {
             prose,
             pending_key,
             menu,
-            in_slash,
+            epoch_active,
             overlay,
         } = session;
         // Terminal size at the last paint, `(w, h)`. Resizes are consumed
@@ -1152,7 +1162,7 @@ impl Repl {
                 // the session's menu (`slash_handle` decides which epoch).
                 let cursor = editor.cursor;
                 let result = {
-                    let mut handle = PromptSession::slash_handle(menu, in_slash);
+                    let mut handle = PromptSession::slash_handle(menu, epoch_active);
                     Self::v25_eval(&mut handle, &buf_text, cursor, key).await
                 };
                 match result {
@@ -1234,20 +1244,20 @@ impl Repl {
                         output.display_text(&err);
                         let _ = output.cursor_row();
                         editor.set("");
-                        *in_slash = false;
+                        *epoch_active = false;
                         ActiveOverlay::None
                     }
                     // Esc at root — close the overlay.
                     V25Frame::DoneSuccess(_, _) => {
                         editor.set("");
-                        *in_slash = false;
+                        *epoch_active = false;
                         ActiveOverlay::None
                     }
                 }
             } else {
                 // Leave the `/`-session: the next `/` starts a fresh invocation
                 // (a fresh epoch), so no traversal memory carries across.
-                *in_slash = false;
+                *epoch_active = false;
                 // Prose frames: one eval drives the word gate, the
                 // debounce, and the dialog. Idle ⇒ no overlay (stateless
                 // dismissal: the next frame re-derives from the buffer).
@@ -1383,7 +1393,7 @@ impl Repl {
                         sel,
                         pending_key,
                         overlay,
-                        *in_slash,
+                        *epoch_active,
                         opts.len(),
                         prompt,
                         history,
