@@ -723,6 +723,199 @@ impl PromptSession {
             menu.continuation_handle()
         }
     }
+
+    /// Apply one key to the session.
+    ///
+    /// **Draws nothing.** Every branch either mutates state and asks for
+    /// another turn ([`KeyOutcome::Continue`]), hands the tty to `$EDITOR`
+    /// ([`KeyOutcome::RunEditor`]), or ends the read
+    /// ([`KeyOutcome::Action`]) — what that looks like on screen is the
+    /// caller's decision. Two pumps drive this: `read_input`'s blocking loop
+    /// today, the turn's `tokio::select!` branch once in-turn input lands
+    /// (ui_draw_v2 §4.5 U4). A dispatcher that painted would hand them two
+    /// ways to write the terminal.
+    ///
+    /// Takes the session's fields rather than `&mut self` because `read_input`
+    /// holds them destructured into its loop's own bindings, and a `&mut self`
+    /// would conflict with them. Same shape, and same reason, as
+    /// [`Repl::edit_key`] — which this calls for everything that is plain
+    /// text editing.
+    ///
+    /// `Ctrl-C` and `Ctrl-Z` are *not* here: they are process and terminal
+    /// operations that must not queue behind edit keys, so the caller handles
+    /// them before this runs.
+    pub(crate) fn handle_key(
+        key: crossterm::event::KeyEvent,
+        editor: &mut LineEditor,
+        nav: &mut Option<usize>,
+        draft: &mut String,
+        sel: &mut usize,
+        pending_key: &mut Option<crate::slashdot_menu::HostKey>,
+        overlay: &ActiveOverlay,
+        in_slash: bool,
+        // Row count of `overlay` as the caller measured it — the bounds the
+        // host-side cursor needs. Passed rather than recomputed so the
+        // dispatch and the paint cannot disagree about how many rows there are.
+        opts_len: usize,
+        prompt: &str,
+        history: &mut History,
+    ) -> KeyOutcome {
+        // Ctrl-E: external editor for input buffer (no overlay) or header (V25Menu).
+        if let KeyCode::Char('e') = key.code {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match overlay {
+                    ActiveOverlay::None => {
+                        // Edit the input buffer. The wrapper owns the whole
+                        // turnover — reader gate, raw mode, DSR re-anchor; no
+                        // local logic here (doc/editor_cleanup.md §2).
+                        return KeyOutcome::RunEditor;
+                    }
+                    ActiveOverlay::V25Menu { .. } => {
+                        // Ctrl-E on a menu endpoint dispatches to the node's
+                        // edit() through the engine (doc/editor_cleanup.md
+                        // §3/§5): the node owns what (if anything) to edit.
+                        *pending_key = Some(crate::slashdot_menu::HostKey::Edit);
+                        return KeyOutcome::Continue;
+                    }
+                    ActiveOverlay::PathComplete { .. } => {
+                        // No-op in prose completion dialog.
+                    }
+                }
+            }
+        }
+        // Active overlay key dispatch via enum methods.
+        if !matches!(overlay, ActiveOverlay::None) {
+            match key.code {
+                KeyCode::Down | KeyCode::Up => {
+                    // Engine-owned cursor (slash handle or prose completer):
+                    // queue the delta for the next eval — it applies the
+                    // result in one place. The host-`sel` fallback below is
+                    // for the empty-plan V25Menu case only.
+                    if overlay.cursor_row().is_some() {
+                        let delta: i32 = if key.code == KeyCode::Down { 1 } else { -1 };
+                        *pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
+                        return KeyOutcome::Continue;
+                    }
+                    if key.code == KeyCode::Down {
+                        if *sel + 1 < opts_len {
+                            *sel += 1;
+                        }
+                    } else if *sel > 0 {
+                        *sel -= 1;
+                    }
+                }
+                KeyCode::PageDown | KeyCode::PageUp => {
+                    // Plan-carrying overlays: visual-line-aware page scroll
+                    // through the engine that owns the cursor (slash handle /
+                    // prose).
+                    let plan = match overlay {
+                        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
+                            Some(plan)
+                        }
+                        ActiveOverlay::None => None,
+                    };
+                    if let Some(plan) = plan {
+                        if !matches!(overlay, ActiveOverlay::PathComplete { .. }) && !in_slash {
+                            return KeyOutcome::Continue; // V25 overlay without its handle
+                        }
+                        let cur_sel = plan.selected.unwrap_or(0);
+                        // Page in the units the painter works in: ask it what
+                        // it painted and move the cursor by the rows that fit
+                        // on one screen (ui_draw_v2 §9 #5, #7). A row the
+                        // painter split across terminal rows counts for all of
+                        // them, so a PageDown moves a page and not a page and
+                        // a half.
+                        let (cur_h, _) = crossterm::terminal::size().unwrap_or((80, 24));
+                        let painted = crate::slashdot_menu::render::paint_overlay(
+                            plan,
+                            crate::output::term_width().max(1),
+                            cur_h.max(1) as usize,
+                        );
+                        let direction = if matches!(key.code, KeyCode::PageDown) {
+                            1
+                        } else {
+                            -1
+                        };
+                        let delta = crate::slashdot_menu::render::page_delta_heights(
+                            &painted.data_heights,
+                            cur_sel,
+                            painted.data_budget,
+                            direction,
+                        );
+                        if delta != 0 {
+                            *pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
+                        }
+                        return KeyOutcome::Continue;
+                    }
+                    let page = {
+                        let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+                        (h as usize).saturating_sub(2).max(1)
+                    };
+                    let max = opts_len.saturating_sub(1);
+                    if matches!(key.code, KeyCode::PageDown) {
+                        *sel = (*sel + page).min(max);
+                    } else {
+                        *sel = (*sel).saturating_sub(page);
+                    }
+                }
+                KeyCode::Tab => {
+                    // Both plan-carrying overlays route Tab through the engine
+                    // that produced the plan: slash drills/expands, prose
+                    // splices the selected id over the word.
+                    if matches!(
+                        overlay,
+                        ActiveOverlay::V25Menu { .. } | ActiveOverlay::PathComplete { .. }
+                    ) {
+                        *pending_key = Some(crate::slashdot_menu::HostKey::Tab);
+                    }
+                }
+                KeyCode::Enter => {
+                    if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                        if !key.modifiers.contains(KeyModifiers::SHIFT) {
+                            // Slash: queue the key; the next iteration's eval
+                            // handles submit (commit + return) or rewrite
+                            // inline.
+                            *pending_key = Some(crate::slashdot_menu::HostKey::Enter);
+                        }
+                        return KeyOutcome::Continue;
+                    }
+                    // Prose dialog: Enter bypasses completion — submit the raw
+                    // line (Shift+Enter inserts a newline). Tab is the only
+                    // expansion key.
+                    if let Some(a) = Repl::edit_key(key, editor, history, nav, draft, prompt) {
+                        return KeyOutcome::Action(a);
+                    }
+                    return KeyOutcome::Continue;
+                }
+                KeyCode::Esc => {
+                    // Slash engine-backed overlays route Esc through the
+                    // engine's per-level ladder (frame replay + esc()). Prose:
+                    // Esc is a no-op — dismissal is buffer-driven (stateless);
+                    // in plain editing Esc is a no-op too, so this is uniform.
+                    if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                        *pending_key = Some(crate::slashdot_menu::HostKey::Esc);
+                        return KeyOutcome::Continue;
+                    }
+                }
+                _ => {
+                    // Editing keys pass through in both cases; dismissal is
+                    // stateless — the next eval re-derives the dialog from
+                    // the buffer.
+                    if let Some(a) = Repl::edit_key(key, editor, history, nav, draft, prompt) {
+                        return KeyOutcome::Action(a);
+                    }
+                }
+            }
+            return KeyOutcome::Continue;
+        }
+        // No overlay: normal editing (Tab with no dialog is inert — implicit
+        // open means the dialog is already up whenever there is anything to
+        // complete).
+        if let Some(a) = Repl::edit_key(key, editor, history, nav, draft, prompt) {
+            return KeyOutcome::Action(a);
+        }
+        KeyOutcome::Continue
+    }
 }
 
 impl Repl {
@@ -1178,200 +1371,46 @@ impl Repl {
                             let _ = self.guard.start();
                         }
                     }
-                    // Ctrl-E: external editor for input buffer (no overlay) or header (V25Menu).
-                    if let KeyCode::Char('e') = key.code {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            match &overlay {
-                                ActiveOverlay::None => {
-                                    // Edit the input buffer. The wrapper owns
-                                    // the whole turnover — reader gate, raw
-                                    // mode, DSR re-anchor; no local logic here
-                                    // (doc/editor_cleanup.md §2).
-                                    match run_editor(
-                                        &self.guard,
-                                        output,
-                                        &editor.text(),
-                                        EditorMode::Edit,
-                                    ) {
-                                        Ok(new_text) => {
-                                            editor.set(&new_text);
-                                        }
-                                        Err(e) => {
-                                            let _ = io::stdout().write_all(
-                                                format!("\r\neditor error: {}\r\n", e).as_bytes(),
-                                            );
-                                        }
-                                    }
-                                    continue;
+                    // The dispatcher. It answers with what *should* happen on
+                    // screen; this loop is the one that actually does it, so
+                    // the same function can serve the turn's `select!` branch
+                    // later (ui_draw_v2 §4.5 U4) without learning to draw.
+                    match PromptSession::handle_key(
+                        key,
+                        editor,
+                        nav,
+                        draft,
+                        sel,
+                        pending_key,
+                        overlay,
+                        *in_slash,
+                        opts.len(),
+                        prompt,
+                        history,
+                    ) {
+                        KeyOutcome::Continue => {}
+                        KeyOutcome::RunEditor => {
+                            // The wrapper owns the whole turnover — reader
+                            // gate, raw mode, DSR re-anchor; no local logic
+                            // here (doc/editor_cleanup.md §2).
+                            match run_editor(&self.guard, output, &editor.text(), EditorMode::Edit)
+                            {
+                                Ok(new_text) => {
+                                    editor.set(&new_text);
                                 }
-                                ActiveOverlay::V25Menu { .. } => {
-                                    // Ctrl-E on a menu endpoint dispatches to
-                                    // the node's edit() through the engine
-                                    // (doc/editor_cleanup.md §3/§5): the node
-                                    // owns what (if anything) to edit.
-                                    *pending_key = Some(crate::slashdot_menu::HostKey::Edit);
-                                    continue;
-                                }
-                                ActiveOverlay::PathComplete { .. } => {
-                                    // No-op in prose completion dialog.
-                                }
-                            }
-                        }
-                    }
-                    // Active overlay key dispatch via enum methods.
-                    if !matches!(overlay, ActiveOverlay::None) {
-                        match key.code {
-                            KeyCode::Down | KeyCode::Up => {
-                                // Engine-owned cursor (slash handle or prose
-                                // completer): queue the delta for the next
-                                // eval — it applies the result in one place.
-                                // The host-`sel` fallback below is for the
-                                // empty-plan V25Menu case only.
-                                if overlay.cursor_row().is_some() {
-                                    let delta: i32 = if key.code == KeyCode::Down { 1 } else { -1 };
-                                    *pending_key =
-                                        Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
-                                    continue;
-                                }
-                                if key.code == KeyCode::Down {
-                                    if *sel + 1 < opts.len() {
-                                        *sel += 1;
-                                    }
-                                } else {
-                                    if *sel > 0 {
-                                        *sel -= 1;
-                                    }
-                                }
-                            }
-                            KeyCode::PageDown | KeyCode::PageUp => {
-                                // Plan-carrying overlays: visual-line-aware
-                                // page scroll through the engine that owns
-                                // the cursor (slash handle / prose).
-                                let plan = match &overlay {
-                                    ActiveOverlay::V25Menu { plan }
-                                    | ActiveOverlay::PathComplete { plan } => Some(plan),
-                                    ActiveOverlay::None => None,
-                                };
-                                if let Some(plan) = plan {
-                                    if !matches!(overlay, ActiveOverlay::PathComplete { .. })
-                                        && !*in_slash
-                                    {
-                                        continue; // V25 overlay without its handle
-                                    }
-                                    let cur_sel = plan.selected.unwrap_or(0);
-                                    // Page in the units the painter works in:
-                                    // ask it what it painted and move the
-                                    // cursor by the rows that fit on one
-                                    // screen (ui_draw_v2 §9 #5, #7). A row the
-                                    // painter split across terminal rows
-                                    // counts for all of them, so a PageDown
-                                    // moves a page and not a page and a half.
-                                    let (cur_h, _) =
-                                        crossterm::terminal::size().unwrap_or((80, 24));
-                                    let painted = crate::slashdot_menu::render::paint_overlay(
-                                        plan,
-                                        crate::output::term_width().max(1),
-                                        cur_h.max(1) as usize,
+                                Err(e) => {
+                                    let _ = io::stdout().write_all(
+                                        format!("\r\neditor error: {}\r\n", e).as_bytes(),
                                     );
-                                    let direction = if matches!(key.code, KeyCode::PageDown) {
-                                        1
-                                    } else {
-                                        -1
-                                    };
-                                    let delta = crate::slashdot_menu::render::page_delta_heights(
-                                        &painted.data_heights,
-                                        cur_sel,
-                                        painted.data_budget,
-                                        direction,
-                                    );
-                                    if delta != 0 {
-                                        *pending_key =
-                                            Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
-                                    }
-                                    continue;
-                                }
-                                let page = {
-                                    let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                                    (h as usize).saturating_sub(2).max(1)
-                                };
-                                if matches!(key.code, KeyCode::PageDown) {
-                                    *sel = (*sel + page).min(opts.len().saturating_sub(1));
-                                } else {
-                                    *sel = (*sel).saturating_sub(page);
-                                }
-                            }
-                            KeyCode::Tab => {
-                                // Both plan-carrying overlays route Tab
-                                // through the engine that produced the plan:
-                                // slash drills/expands, prose splices the
-                                // selected id over the word.
-                                if matches!(
-                                    overlay,
-                                    ActiveOverlay::V25Menu { .. }
-                                        | ActiveOverlay::PathComplete { .. }
-                                ) {
-                                    *pending_key = Some(crate::slashdot_menu::HostKey::Tab);
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
-                                    if !key.modifiers.contains(KeyModifiers::SHIFT) {
-                                        // Slash: queue the key; the next
-                                        // iteration's eval handles submit
-                                        // (commit + return) or rewrite inline.
-                                        *pending_key = Some(crate::slashdot_menu::HostKey::Enter);
-                                    }
-                                    continue;
-                                }
-                                // Prose dialog: Enter bypasses completion —
-                                // submit the raw line (Shift+Enter inserts a
-                                // newline). Tab is the only expansion key.
-                                if let Some(a) =
-                                    Self::edit_key(key, editor, history, nav, draft, prompt)
-                                {
-                                    if let InputAction::Submit(_) = &a {
-                                        redraw(&LineEditor::new(), &[], *sel, (cur_w, cur_h));
-                                    }
-                                    return Some(a);
-                                }
-                                continue;
-                            }
-                            KeyCode::Esc => {
-                                // Slash engine-backed overlays route Esc
-                                // through the engine's per-level ladder
-                                // (frame replay + esc()). Prose: Esc is a
-                                // no-op — dismissal is buffer-driven
-                                // (stateless); in plain editing Esc is a
-                                // no-op too, so this is uniform.
-                                if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
-                                    *pending_key = Some(crate::slashdot_menu::HostKey::Esc);
-                                    continue;
-                                }
-                            }
-                            _ => {
-                                // Editing keys pass through in both cases;
-                                // dismissal is stateless — the next eval
-                                // re-derives the dialog from the buffer.
-                                if let Some(a) =
-                                    Self::edit_key(key, editor, history, nav, draft, prompt)
-                                {
-                                    if let InputAction::Submit(_) = &a {
-                                        redraw(&LineEditor::new(), &[], *sel, (cur_w, cur_h));
-                                    }
-                                    return Some(a);
                                 }
                             }
                         }
-                        continue;
-                    }
-                    // No overlay: normal editing (Tab with no dialog is
-                    // inert — implicit open means the dialog is already up
-                    // whenever there is anything to complete).
-                    if let Some(a) = Self::edit_key(key, editor, history, nav, draft, prompt) {
-                        if let InputAction::Submit(_) = &a {
-                            redraw(&LineEditor::new(), &[], *sel, (cur_w, cur_h));
+                        KeyOutcome::Action(a) => {
+                            if let InputAction::Submit(_) = &a {
+                                redraw(&LineEditor::new(), &[], *sel, (cur_w, cur_h));
+                            }
+                            return Some(a);
                         }
-                        return Some(a);
                     }
                 }
                 Some(Event::Paste(text)) => {
