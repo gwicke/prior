@@ -12,6 +12,7 @@ pub mod tools;
 pub use slashdot_menu;
 pub mod app_state;
 pub mod confirm;
+pub mod interactive;
 pub mod model_catalog;
 pub mod model_settings;
 pub mod params;
@@ -55,7 +56,8 @@ pub use rig_core::client::{CompletionClient, ProviderClient};
 pub use rig_core::completion::CompletionModel;
 pub use rig_core::providers;
 
-pub use agent::{create_agent, load_agents_md, run_interactive, AgentConfig, CodeAgent};
+pub use agent::{create_agent, load_agents_md, AgentConfig, CodeAgent};
+pub use interactive::run_interactive;
 pub use output::{Confirmation, ConsoleOutput, LogOutput, NoOutput, Output, QuietOutput};
 
 /// A provider's own explanation of a failure, reduced to one readable line.

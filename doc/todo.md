@@ -39,3 +39,10 @@ More detail -> create and link a doc/ and/or commit hash
 - [ ] Adjust tool call limit for summarization requests - currently 1
 - [ ] Investigate source of initial turn blank line - suppress in retries
 - [ ] System prompt / tool documentation: Mention @@@END consistently
+
+- [ ] `src/agent.rs` refactor — 261002_agent_refactor.md
+  - [ ] Step 1: move `run_interactive` out to `src/interactive.rs` (§3)
+  - [ ] Read all of `mod tests`, produce a placement table to review (§6)
+  - [ ] Step 2: split `agent.rs` into `agent/` — 9 files, one commit each (§3)
+  - [ ] Step 3: `Interactive` struct, in the new `interactive.rs` (§3)
+  - [ ] Deferred: `CodeAgent::prompt` — deliberately, not cleanup (§4)

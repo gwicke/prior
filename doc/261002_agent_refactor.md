@@ -127,16 +127,50 @@ under `doc/turn_cancellation_persistence_bugs.md`, which suggests it has
 already been bitten once. The risk/benefit is unfavourable for a change framed
 as cleanup. Split it deliberately, with the full suite.
 
-## 5. Two things to decide before starting
+## 5. Visibility widening — probe during step 2, not up front
 
-- **~25 items need `pub(crate)` widening.** Some are good hygiene, but
-  `first_user_text` and `effective_params` are pure helpers that would become
-  crate-visible purely as a split artifact. Worth a pass to see which are
-  better as methods or arguments.
-- **`mod tests` is 4,814 lines over 9 concerns.** Splitting it means reading
-  all of it to place it. Budget a full pass, not a mechanical move.
+A split widens ~25 private items to `pub(crate)`. Do this **as each cluster
+lands**, not as a separate pass first: the compiler enumerates the exact set
+for that cluster, so the list is free and stays accurate. Widening everything
+up front would make `pub(crate)` the default and hide which widenings are
+load-bearing.
 
-## 6. Net
+Two are worth pushing back on when they come up, because crate-visibility
+would be an artifact of the split rather than a real API:
+
+- `first_user_text` — one caller (`prompt`, line 256). A parameter, or a
+  method on the status-bar model that already takes a `Message` list.
+- `effective_params` — one production caller (`run_interactive`, line 5555;
+  the rest are tests).
+
+Neither is forced by the module boundaries; both just happened to sit in the
+wrong file. Resolving them properly costs one commit and keeps the crate
+surface honest.
+
+`TurnPump`'s six fields are the other case worth catching early: the probe
+widened all six because a test constructs the struct literally. A
+`TurnPump::new(...)` constructor keeps them private and is strictly better —
+do that in 2b rather than shipping the widened fields.
+
+## 6. Test placement — budget a full read
+
+`mod tests` is 4,814 lines over 9 concerns, and the split means placing every
+one of them. Treat this as a **reading pass, not a mechanical move**:
+
+- Some tests don't obviously belong to the cluster their code sits in — the
+  `ensure_session` / `new_and_clear` tests (10807, 10916) exercise interactive
+  state, `message_logger_writes_jsonl_file` (9240) sits far from `MessageLogger`.
+- Several clusters are already internally sectioned (`// ---- compaction: retry
+  + generate/apply ----` and seven more), which gives a placement order but not
+  a placement guarantee.
+- Moving a test can surface a test that only passed because of shared module
+  state. That is a finding, not an obstacle — but it needs someone who has
+  read the test to be worth anything.
+
+Budget a full pass over all 4,814 lines before step 2d, and treat the result as
+a placement table to review, not a file-move to run.
+
+## 7. Net
 
 ~4,100 lines out of `agent/` (34%); `agent/` 11,889 → ~4,000; largest single
 function 892 → ~420; tests next to their subjects. ~12 commits, each

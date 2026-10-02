@@ -375,7 +375,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", response);
                 }
             } else {
-                picocode::agent::run_interactive(agent_config, settings, args.resume).await?;
+                picocode::run_interactive(agent_config, settings, args.resume).await?;
             }
         }
     }
