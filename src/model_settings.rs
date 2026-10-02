@@ -336,7 +336,7 @@ fn coerce(key: &str, item: &toml_edit::Item) -> Result<(), String> {
                     type_of(value)
                 )
             })?;
-            s.parse::<ReasoningLevel>().map(|_| ()).map_err(|e| e)
+            s.parse::<ReasoningLevel>().map(|_| ())
         }
         "supports_reasoning" => value.as_bool().map(|_| ()).ok_or_else(|| {
             format!(

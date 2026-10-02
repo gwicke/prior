@@ -171,7 +171,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
                     if chunk_w + a.w > content_width && chunk_w > 0 {
                         if first_chunk {
                             let mut l = new_indent();
-                            l.extend(chunk.drain(..));
+                            l.append(&mut chunk);
                             out.push(render(&l));
                             first_chunk = false;
                         } else {

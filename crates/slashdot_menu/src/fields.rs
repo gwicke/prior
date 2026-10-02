@@ -90,17 +90,12 @@ pub struct FieldSpec {
     pub description: Option<String>,
 }
 
-impl Default for SortDir {
-    fn default() -> Self {
-        SortDir::Asc
-    }
-}
-
 /// Sort direction. `>` = descending (large first), `<` = ascending
 /// (design §7.1 as user-adjusted, suffix form: `.sort:field>` desc,
 /// `.sort:field<` asc).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortDir {
+    #[default]
     Asc,
     Desc,
 }
@@ -206,11 +201,9 @@ pub fn row_field_value(row: &Row, name: &str) -> Option<Value> {
 pub fn distinct_values(rows: &[Row], name: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for r in rows {
-        if let Some(v) = row_field_value(r, name) {
-            if let Value::Str(s) = v {
-                if !out.contains(&s) {
-                    out.push(s);
-                }
+        if let Some(Value::Str(s)) = row_field_value(r, name) {
+            if !out.contains(&s) {
+                out.push(s);
             }
         }
     }

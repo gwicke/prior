@@ -651,26 +651,26 @@ pub fn get_filtered_catalog(params: &ModelFilterParams) -> Vec<ModelEntry> {
 
     // Apply filters
     if let Some(max_price) = params.price_input {
-        entries.retain(|e| e.prompt_cost.map_or(false, |p| p <= max_price));
+        entries.retain(|e| e.prompt_cost.is_some_and(|p| p <= max_price));
     }
     if let Some(max_output_price) = params.price_output {
-        entries.retain(|e| e.completion_cost.map_or(false, |c| c <= max_output_price));
+        entries.retain(|e| e.completion_cost.is_some_and(|c| c <= max_output_price));
     }
     if let Some(min_coding) = params.min_coding_index {
-        entries.retain(|e| e.coding_index.map_or(false, |v| v >= min_coding));
+        entries.retain(|e| e.coding_index.is_some_and(|v| v >= min_coding));
     }
     if let Some(min_intel) = params.min_intelligence_index {
-        entries.retain(|e| e.intelligence_index.map_or(false, |v| v >= min_intel));
+        entries.retain(|e| e.intelligence_index.is_some_and(|v| v >= min_intel));
     }
     if let Some(min_agentic) = params.min_agentic_index {
-        entries.retain(|e| e.agentic_index.map_or(false, |v| v >= min_agentic));
+        entries.retain(|e| e.agentic_index.is_some_and(|v| v >= min_agentic));
     }
     if let Some(max_age) = params.max_age_days {
         let cutoff = chrono::Utc::now().timestamp() - (max_age as i64 * 86400);
-        entries.retain(|e| e.created.map_or(false, |c| c as i64 >= cutoff));
+        entries.retain(|e| e.created.is_some_and(|c| c as i64 >= cutoff));
     }
     if let Some(min_ctx) = params.min_context {
-        entries.retain(|e| e.context_length.map_or(false, |c| c >= min_ctx as u64));
+        entries.retain(|e| e.context_length.is_some_and(|c| c >= min_ctx as u64));
     }
 
     // Apply sort
@@ -680,7 +680,7 @@ pub fn get_filtered_catalog(params: &ModelFilterParams) -> Vec<ModelEntry> {
                 // Already sorted by popularity from API fetch
             }
             "created" => {
-                entries.sort_by(|a, b| b.created.unwrap_or(0).cmp(&a.created.unwrap_or(0)));
+                entries.sort_by_key(|b| std::cmp::Reverse(b.created.unwrap_or(0)));
             }
             "coding" => {
                 entries.sort_by(|a, b| {
@@ -942,7 +942,7 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
         entries.retain(|e| {
             if e.provider == openrouter_provider(provider) {
                 // Extract model name from "provider:model" format.
-                let model = e.id.splitn(2, ':').nth(1).unwrap_or(&e.id);
+                let model = e.id.split_once(':').map(|x| x.1).unwrap_or(&e.id);
                 live_set.contains(model)
             } else {
                 true
@@ -1057,7 +1057,7 @@ pub async fn catalog() -> Vec<ModelEntry> {
             entries.len()
         );
     }
-    if let Some(mut m) = CACHE.get_or_init(|| Mutex::new(None)).lock().ok() {
+    if let Ok(mut m) = CACHE.get_or_init(|| Mutex::new(None)).lock() {
         *m = Some(CacheEntry {
             at: Instant::now(),
             entries: entries.clone(),
@@ -1169,17 +1169,12 @@ fn dedupe(entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
                 out.push(e);
             }
             Some(&idx) => {
-                // Prefer Direct-priced entries over estimates.
+                // Prefer Direct-priced entries over estimates, or prefer
+                // non-OpenRouter provider when cost source is equal.
                 if e.cost_source == CostSource::Direct && out[idx].cost_source != CostSource::Direct
-                {
-                    out[idx] = e;
-                }
-                // When both have the same cost source, prefer the direct
-                // (non-OpenRouter) entry so the model appears as
-                // `provider:model` rather than `openrouter:provider/model`.
-                else if e.cost_source == out[idx].cost_source
-                    && e.provider != "openrouter"
-                    && out[idx].provider == "openrouter"
+                    || e.cost_source == out[idx].cost_source
+                        && e.provider != "openrouter"
+                        && out[idx].provider == "openrouter"
                 {
                     out[idx] = e;
                 }

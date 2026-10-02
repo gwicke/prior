@@ -189,13 +189,12 @@ fn emit(body: &str) {
     if !should_spool(body, std::io::stdout().is_terminal()) {
         return;
     }
-    match spool(body) {
-        Some(path) => eprintln!(
+    if let Some(path) = spool(body) {
+        eprintln!(
             "bsed: wrote a copy to {}\n      edit it, then apply with: bsed apply -i < {}",
             path.display(),
             path.display()
-        ),
-        None => {}
+        )
     }
 }
 
@@ -578,10 +577,7 @@ fn recursive_preview(
     // Same matcher and the same semantics as picocode's `find` tool: the pattern
     // is matched against the path *relative to the walk root*, so a recursive
     // match is written `**/*.rs`.
-    let matcher = match build_matcher(globs) {
-        Ok(m) => m,
-        Err(e) => return Err(e),
-    };
+    let matcher = build_matcher(globs)?;
     let opts = Options {
         context: ctx,
         // Unbounded: see above. `Options` still needs *a* value; the renderer
@@ -610,7 +606,7 @@ fn recursive_preview(
     // Deterministic order, so two runs over the same tree are diffable.
     files.sort();
     if let Some(m) = &matcher {
-        files.retain(|f| m.is_match(&relative_to(root, f)));
+        files.retain(|f| m.is_match(relative_to(root, f)));
     }
 
     let mut blob = String::new();
@@ -935,7 +931,7 @@ fn apply(args: &[String]) -> Result<Out, Failure> {
     // read this precedence as the tool's.) Parse first, because the headers are
     // where the fallback comes from and because a blob may span many files.
     let named = match path {
-        Some(p) if p.as_os_str().is_empty() || p == PathBuf::from("-") => None,
+        Some(p) if p.as_os_str().is_empty() || p == *"-" => None,
         Some(p) => Some(p),
         None => None,
     };

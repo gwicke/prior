@@ -22,8 +22,8 @@ use uuid::Uuid;
 /// real CWD lives in the session header JSON.
 pub fn encode_cwd(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();
-    let stripped = s.trim_start_matches(|c| c == '/' || c == '\\');
-    let encoded = stripped.replace(|c: char| c == '/' || c == '\\' || c == ':', "-");
+    let stripped = s.trim_start_matches(['/', '\\']);
+    let encoded = stripped.replace(['/', '\\', ':'], "-");
     format!("--{}--", encoded)
 }
 
@@ -448,15 +448,10 @@ impl SessionIndex {
     pub fn get_path_to_root(&self, leaf_id: &str) -> Vec<SessionEntry> {
         let mut path: Vec<SessionEntry> = Vec::new();
         let mut current_id = leaf_id.to_string();
-        loop {
-            match self.entries.get(&current_id) {
-                Some(entry) => {
-                    path.push(entry.clone());
-                    match &entry.parent_id {
-                        Some(pid) => current_id = pid.clone(),
-                        None => break,
-                    }
-                }
+        while let Some(entry) = self.entries.get(&current_id) {
+            path.push(entry.clone());
+            match &entry.parent_id {
+                Some(pid) => current_id = pid.clone(),
                 None => break,
             }
         }

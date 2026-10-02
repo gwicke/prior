@@ -122,7 +122,7 @@ impl SlashDotNode for ReasoningEnumNode {
                 // Descriptions carry where the level actually lands, so the
                 // answer shows while scanning rows, not only in `header()`.
                 let desc = match self.level_context() {
-                    Some(c) => match landing(*l, &c) {
+                    Some(c) => match landing(l, &c) {
                         Some(landed) if landed != *l => format!("{d} → {landed}"),
                         _ => (*d).to_string(),
                     },
@@ -197,9 +197,7 @@ mod tests {
                     reader.reasoning().unwrap_or_else(|| "off".to_string())
                 }),
                 submit_fn: Box::new(move |level| {
-                    let parsed = level
-                        .parse::<crate::params::ReasoningLevel>()
-                        .map_err(|e| e)?;
+                    let parsed = level.parse::<crate::params::ReasoningLevel>()?;
                     writer.set_reasoning(Some(parsed));
                     Ok(())
                 }),

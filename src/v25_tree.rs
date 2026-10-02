@@ -709,7 +709,7 @@ fn entry_display_label_ext(
             let kept = labels
                 .get(first_kept_entry_id)
                 .map(|t| sanitise_single_line(t))
-                .or_else(|| label.map(|l| sanitise_single_line(l)));
+                .or_else(|| label.map(sanitise_single_line));
             match kept {
                 Some(t) if !t.is_empty() => format!("[COMPACT] {}", t),
                 _ => format!("[COMPACT] before {}", first_kept_entry_id),
@@ -739,7 +739,7 @@ fn entry_row_desc(
             let kept = labels
                 .get(first_kept_entry_id)
                 .map(|t| sanitise_single_line(t))
-                .or_else(|| label.map(|l| sanitise_single_line(l)));
+                .or_else(|| label.map(sanitise_single_line));
             let head = match kept {
                 Some(t) if !t.is_empty() => format!("from {}", truncate_chars(&t, 300)),
                 _ => format!("before {}", first_kept_entry_id),

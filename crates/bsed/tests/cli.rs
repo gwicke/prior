@@ -190,7 +190,7 @@ fn a_tree_of_only_crlf_files_says_why() {
 #[test]
 fn previewing_needs_no_subcommand() {
     let d = tempfile::tempdir().unwrap();
-    write(&d.path().to_path_buf(), "a.rs", "one\ntwo\n");
+    write(d.path(), "a.rs", "one\ntwo\n");
     for args in [
         &["s/one/1/", "a.rs"][..],
         &["s/one/1/", "-p", "a.rs"][..],
@@ -209,7 +209,7 @@ fn previewing_needs_no_subcommand() {
 #[test]
 fn an_option_may_lead_the_command_line() {
     let d = tempfile::tempdir().unwrap();
-    write(&d.path().to_path_buf(), "a.rs", "one\ntwo\n");
+    write(d.path(), "a.rs", "one\ntwo\n");
     let o = run_in(d.path(), None, &["-c", "1", "-p", "a.rs", "s/one/1/"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(stdout(&o).contains("a.rs:1"), "{}", stdout(&o));
@@ -233,7 +233,7 @@ fn an_unknown_option_is_still_refused() {
 fn unified_emits_a_unified_diff() {
     let d = tempfile::tempdir().unwrap();
     write(
-        &d.path().to_path_buf(),
+        d.path(),
         "a.rs",
         "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
     );
@@ -261,7 +261,7 @@ fn unified_emits_a_unified_diff() {
 #[test]
 fn unified_takes_the_context_flags_and_honours_c_zero() {
     let d = tempfile::tempdir().unwrap();
-    write(&d.path().to_path_buf(), "a.rs", "a\nb\nc\nd\ne\nf\n");
+    write(d.path(), "a.rs", "a\nb\nc\nd\ne\nf\n");
     let s = "3s/c/C/";
     let def = stdout(&run_in(d.path(), None, &["-u", "-p", "a.rs", s]));
     assert!(
@@ -299,8 +299,8 @@ fn unified_takes_the_context_flags_and_honours_c_zero() {
 #[test]
 fn unified_separates_files_in_a_recursive_run() {
     let d = tempfile::tempdir().unwrap();
-    write(&d.path().to_path_buf(), "one.rs", "a\nb\n");
-    write(&d.path().to_path_buf(), "two.rs", "b\nc\n");
+    write(d.path(), "one.rs", "a\nb\n");
+    write(d.path(), "two.rs", "b\nc\n");
     let o = run_in(d.path(), None, &["-u", "-r", "-p", ".", "s/b/B/"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
@@ -322,7 +322,7 @@ fn unified_separates_files_in_a_recursive_run() {
 #[test]
 fn unified_with_no_change_is_silent() {
     let d = tempfile::tempdir().unwrap();
-    write(&d.path().to_path_buf(), "a.rs", "a\n");
+    write(d.path(), "a.rs", "a\n");
     let o = run_in(d.path(), None, &["-u", "-p", "a.rs", "s/zzz/yyy/"]);
     assert_eq!(code(&o), 0);
     assert!(stdout(&o).is_empty(), "{}", stdout(&o));
@@ -333,7 +333,7 @@ fn unified_with_no_change_is_silent() {
 #[test]
 fn unified_refuses_a_crlf_file() {
     let d = tempfile::tempdir().unwrap();
-    write(&d.path().to_path_buf(), "crlf.txt", "a\r\nb\r\n");
+    write(d.path(), "crlf.txt", "a\r\nb\r\n");
     let o = run_in(d.path(), None, &["-u", "-p", "crlf.txt", "s/b/B/"]);
     assert_eq!(code(&o), 2);
     assert!(stderr(&o).contains("carriage returns"), "{}", stderr(&o));
@@ -344,7 +344,7 @@ fn unified_refuses_a_crlf_file() {
 #[test]
 fn the_old_preview_subcommand_says_what_changed() {
     let d = tempfile::tempdir().unwrap();
-    write(&d.path().to_path_buf(), "a.rs", "one\n");
+    write(d.path(), "a.rs", "one\n");
     let o = run_in(d.path(), None, &["preview", "s/one/1/", "-p", "a.rs"]);
     assert_eq!(code(&o), 2);
     let err = stderr(&o);
@@ -386,7 +386,7 @@ fn recursive_preview_walks_the_tree_and_reports_counts() {
 fn context_is_symmetric_and_trailing_is_a_bonus() {
     let d = tempfile::tempdir().unwrap();
     let big: String = (1..=20).map(|i| format!("L{i}\n")).collect();
-    write(&d.path().to_path_buf(), "big.txt", &big);
+    write(d.path(), "big.txt", &big);
     let s = "10s/L10/CHANGED/";
 
     // Returns (leading, trailing) as the block actually came out.
@@ -459,7 +459,7 @@ fn an_unterminated_file_round_trips_through_gnu() {
         ("$d", "a\nb\n"),
         ("$a app", "a\nb\nc\napp\n"),
     ] {
-        write(&d.path().to_path_buf(), "u.txt", body);
+        write(d.path(), "u.txt", body);
         let want = want.to_string();
         let blocks = run_in(d.path(), None, &["-p", "u.txt", script]);
         if stdout(&blocks).is_empty() {

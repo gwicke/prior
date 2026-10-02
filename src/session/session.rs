@@ -389,9 +389,9 @@ pub(crate) fn collect_touched_files(
 /// - every **user prompt** (full text),
 /// - the assistant's **text responses** for that turn (one block per turn;
 ///   reasoning and tool-call syntax are skipped),
-/// and ends with a **touched-files list** (`read` / `write` / `edit` paths,
-/// modified files marked) — but no reasoning content, no tool calls, and no
-/// tool output.
+/// - and ends with a **touched-files list** (`read` / `write` / `edit` paths,
+///   modified files marked) — but no reasoning content, no tool calls, and no
+///   tool output.
 ///
 /// Deterministic (no LLM). Used as the `summary` of a `Compaction` entry
 /// ("text only" mode). Empty when the dropped span has no renderable text.
@@ -424,10 +424,10 @@ pub(crate) fn build_text_only_summary(
     };
 
     for entry in dropped {
-        match &entry.content {
-            SessionEntryContent::Message { message } => {
-                match message.get("role").and_then(|r| r.as_str()) {
-                    Some("user") => {
+        if let SessionEntryContent::Message { message } = &entry.content {
+            if let Some(role) = message.get("role").and_then(|r| r.as_str()) {
+                match role {
+                    "user" => {
                         // A new user prompt closes the previous turn.
                         flush_turn(&mut out, &mut turn_assistant);
                         if let Some(text) = summary_message_text(message) {
@@ -435,7 +435,7 @@ pub(crate) fn build_text_only_summary(
                             out.push_str(&text);
                         }
                     }
-                    Some("assistant") => {
+                    "assistant" => {
                         collect_touched_files(message, &mut files, session_dir);
                         if let Some(text) = summary_message_text(message) {
                             turn_assistant.push(text);
@@ -448,7 +448,6 @@ pub(crate) fn build_text_only_summary(
             }
             // Meta entries (model/thinking changes, earlier compactions,
             // labels, …): excluded from the text-only summary.
-            _ => {}
         }
     }
     flush_turn(&mut out, &mut turn_assistant);
@@ -566,7 +565,7 @@ pub(crate) fn build_manual_template(
     out.push_str("# Compaction notes\n\n");
     for (i, para) in seed_text.iter().enumerate() {
         if i > 0 {
-            out.push_str("\n");
+            out.push('\n');
         }
         out.push_str(para);
     }
@@ -681,7 +680,7 @@ impl<'a> Extractor<'a> {
         // - absent or "read" → descriptor=Some("read"), modified=false
         // - "modified" → descriptor=Some("modified"), modified=true
         // - anything else → descriptor=Some(custom), modified=false (custom is preserved verbatim)
-        let descriptor = match descriptor.as_deref() {
+        let descriptor = match descriptor {
             Some("read") => Some("read".to_string()),
             Some("modified") => Some("modified".to_string()),
             Some(d) => Some(d.to_string()),
@@ -725,7 +724,7 @@ fn split_sections(input: &str) -> (String, HashMap<String, String>) {
                     || rest_stripped
                         .chars()
                         .next()
-                        .map_or(false, |c| c.is_alphabetic()))
+                        .is_some_and(|c| c.is_alphabetic()))
             {
                 // Flush previous section.
                 if let Some(label) = current_label.take() {
@@ -1700,12 +1699,9 @@ fn pi_content_to_user_content(content: &serde_json::Value) -> Option<Vec<UserCon
     let mut items = Vec::new();
     for item in array {
         let type_str = item.get("type")?.as_str()?;
-        match type_str {
-            "text" => {
-                let text = item.get("text")?.as_str()?;
-                items.push(UserContent::Text(Text::new(text)));
-            }
-            _ => {}
+        if type_str == "text" {
+            let text = item.get("text")?.as_str()?;
+            items.push(UserContent::Text(Text::new(text)));
         }
     }
     Some(items)
@@ -1728,7 +1724,7 @@ fn pi_content_to_assistant_content(content: &serde_json::Value) -> Option<Vec<As
                     .get("thinkingSignature")
                     .and_then(|s| s.as_str().map(String::from));
                 items.push(AssistantContent::Reasoning(Reasoning::new_with_signature(
-                    &thinking, signature,
+                    thinking, signature,
                 )));
             }
             "toolCall" => {
@@ -1756,12 +1752,9 @@ fn pi_content_to_toolresult_content(content: &serde_json::Value) -> Option<Vec<T
     let mut items = Vec::new();
     for item in array {
         let type_str = item.get("type")?.as_str()?;
-        match type_str {
-            "text" => {
-                let text = item.get("text")?.as_str()?;
-                items.push(ToolResultContent::Text(Text::new(text)));
-            }
-            _ => {}
+        if type_str == "text" {
+            let text = item.get("text")?.as_str()?;
+            items.push(ToolResultContent::Text(Text::new(text)));
         }
     }
     Some(items)
@@ -2133,7 +2126,7 @@ mod tests {
                     },
                     _ => panic!("expected Reasoning"),
                 }
-                match content.iter().nth(1).unwrap() {
+                match content.get(1).unwrap() {
                     AssistantContent::Text(t) => assert_eq!(t.text, "the answer is 42"),
                     _ => panic!("expected Text"),
                 }
@@ -2240,7 +2233,7 @@ mod tests {
                 UserContent::ToolResult(tr) => assert_eq!(tr.call.as_str(), "tc_1"),
                 _ => panic!("expected ToolResult"),
             }
-            match content.iter().nth(1).unwrap() {
+            match content.get(1).unwrap() {
                 UserContent::ToolResult(tr) => assert_eq!(tr.call.as_str(), "tc_2"),
                 _ => panic!("expected ToolResult"),
             }
@@ -2548,7 +2541,7 @@ mod tests {
                     },
                     _ => panic!("expected Reasoning"),
                 }
-                match content.iter().nth(1).unwrap() {
+                match content.get(1).unwrap() {
                     AssistantContent::Text(t) => assert_eq!(t.text, "done"),
                     _ => panic!("expected Text"),
                 }
@@ -4714,7 +4707,7 @@ mod tests {
     fn relativize_path_returns_relative_for_sub_path() {
         // Paths below session_dir become compact relative (no leading ./)
         // Use a temp dir + file so canonicalize works on both sides.
-        let tmp = std::path::PathBuf::from(std::env::temp_dir()).join("picocode_relpath_test");
+        let tmp = std::env::temp_dir().join("picocode_relpath_test");
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("marker"), b"").unwrap();
         // Create the nested file so canonicalize resolves the path.
@@ -4730,7 +4723,7 @@ mod tests {
 
     #[test]
     fn relativize_path_returns_none_for_parent_path() {
-        let tmp = std::path::PathBuf::from(std::env::temp_dir()).join("picocode_relpath_test2");
+        let tmp = std::env::temp_dir().join("picocode_relpath_test2");
         std::fs::create_dir_all(&tmp).unwrap();
         // The parent of session_dir is not a sub-path.
         std::fs::write(tmp.join("marker"), b"").unwrap();
@@ -4742,7 +4735,7 @@ mod tests {
 
     #[test]
     fn relativize_path_returns_none_for_equal_path() {
-        let tmp = std::path::PathBuf::from(std::env::temp_dir()).join("picocode_relpath_test3");
+        let tmp = std::env::temp_dir().join("picocode_relpath_test3");
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("marker"), b"").unwrap();
         // The path itself is the session_dir; strip_prefix succeeds but yields "".
@@ -4753,7 +4746,7 @@ mod tests {
 
     #[test]
     fn relativize_path_returns_none_for_nonexistent() {
-        let tmp = std::path::PathBuf::from(std::env::temp_dir()).join("picocode_relpath_test4");
+        let tmp = std::env::temp_dir().join("picocode_relpath_test4");
         std::fs::create_dir_all(&tmp).unwrap();
         // A nonexistent file inside the session_dir -> relativizes successfully.
         std::fs::write(tmp.join("marker"), b"").unwrap();

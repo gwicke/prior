@@ -180,8 +180,8 @@ pub(crate) fn spawn_in_flight_reader(
             thread::sleep(Duration::from_millis(10));
             continue;
         }
-        match event::poll(Duration::from_millis(50)) {
-            Ok(true) => match event::read() {
+        if let Ok(true) = event::poll(Duration::from_millis(50)) {
+            match event::read() {
                 // U4.2: edit keys this thread used to drop now go to the turn.
                 // `send` on an unbounded tokio mpsc never blocks, so this is
                 // safe from a plain OS thread — and being non-blocking is the
@@ -210,8 +210,7 @@ pub(crate) fn spawn_in_flight_reader(
                     }
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
     })
 }
@@ -222,6 +221,12 @@ pub(crate) fn spawn_in_flight_reader(
 pub struct TermGuard {
     active: AtomicBool,
     saved_paste: AtomicBool,
+}
+
+impl Default for TermGuard {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TermGuard {
@@ -418,7 +423,6 @@ pub struct ModelFilter {
 }
 
 /// Model filter state for the `/model` overlay.
-
 impl ModelFilter {
     /// Convert to ModelFilterParams for API calls.
     pub fn to_params(&self) -> model_catalog::ModelFilterParams {
@@ -1448,6 +1452,12 @@ impl PromptSession {
             return KeyOutcome::Action(a);
         }
         KeyOutcome::Continue
+    }
+}
+
+impl Default for Repl {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

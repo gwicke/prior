@@ -102,6 +102,7 @@ mod tests {
     }
 
     /// `rows` data rows, each wrapping to `lines` visual rows.
+    #[allow(dead_code)]
     fn wrapped_rows(rows: usize, lines: usize) -> Vec<LogicalLine> {
         (0..rows)
             .map(|i| {

@@ -100,7 +100,7 @@ pub fn split_modifiers<'a>(
     space: &FieldSpace,
 ) -> (Vec<ModifierToken>, Vec<&'a str>) {
     let names = space.names(true);
-    let valid = |key: &str| key == "sort" || names.iter().any(|n| *n == key);
+    let valid = |key: &str| key == "sort" || names.contains(&key);
     let mut mods = Vec::new();
     let mut terms = Vec::new();
     for r in words {

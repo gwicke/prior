@@ -185,10 +185,6 @@ mod tests {
         split(s).overrides
     }
 
-    fn warns(s: &str) -> Vec<String> {
-        split(s).warnings
-    }
-
     // ---- the grammar ----
 
     #[test]

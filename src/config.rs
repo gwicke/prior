@@ -1039,10 +1039,7 @@ impl SandboxConfig {
     /// [`DEFAULT_MAX_OUTPUT_BYTES`]. Used by the bash and grep/rg reader paths
     /// to bound how much child output is kept in memory.
     pub fn max_output_bytes(&self) -> usize {
-        self.max_output_bytes
-            .clone()
-            .map(|v| v.into())
-            .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
+        self.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
     }
 }
 
@@ -1201,7 +1198,7 @@ impl RemapTable {
             .map(|b| (b.to.clone(), b.from.clone()))
             .collect();
         // Longest `to` first so the most specific remap wins on overlap.
-        entries.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.0.as_os_str().len()));
         RemapTable { entries }
     }
 

@@ -141,12 +141,10 @@ fn marker_of(line: &str) -> Option<&'static str> {
 /// `oldText` match fails loudly if it was a slip. Rejecting it there would
 /// block a legitimate insert without preventing any real damage.
 fn near_miss_marker(line: &str) -> Option<&'static str> {
-    for m in [SEARCH_MARKER, DIVIDER, REPLACE_MARKER] {
-        if line != m && line.starts_with(m) {
-            return Some(m);
-        }
-    }
-    None
+    [SEARCH_MARKER, DIVIDER, REPLACE_MARKER]
+        .into_iter()
+        .find(|&m| line != m && line.starts_with(m))
+        .map(|v| v as _)
 }
 
 /// The error for a line that starts a marker but does not end there.
@@ -323,9 +321,9 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
             if let Some((mk, bad)) = near_miss_in(&lines[i + 1..j]) {
                 return Err(malformed_marker_error(mk, bad));
             }
-            return Err(ParseError(format!(
-                "an edit block is missing its `@@@NEW` section"
-            )));
+            return Err(ParseError(
+                "an edit block is missing its `@@@NEW` section".to_string(),
+            ));
         }
 
         // Collect NEW content up to the closing marker.
@@ -354,9 +352,9 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
             if let Some((mk, bad)) = near_miss_in(&lines[j + 1..k]) {
                 return Err(malformed_marker_error(mk, bad));
             }
-            return Err(ParseError(format!(
-                "an `@@@OLD` section is missing its `@@@END` marker"
-            )));
+            return Err(ParseError(
+                "an `@@@OLD` section is missing its `@@@END` marker".to_string(),
+            ));
         }
 
         let old_text = search_lines.join("\n");
@@ -389,7 +387,9 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         {
             return Err(malformed_marker_error(marker, line));
         }
-        return Err(ParseError(format!("no `@@@OLD` / `@@@NEW` blocks found")));
+        return Err(ParseError(
+            "no `@@@OLD` / `@@@NEW` blocks found".to_string(),
+        ));
     }
 
     let multi_file = distinct_headers.len() > 1;

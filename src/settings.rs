@@ -521,18 +521,11 @@ impl SettingsStore {
             SettingKey::DefaultReasoning => value
                 .trim()
                 .parse::<crate::params::ReasoningLevel>()
-                .map(|_| ())
-                .map_err(|e| e),
-            SettingKey::ShowReasoning => value
-                .trim()
-                .parse::<ShowReasoning>()
-                .map(|_| ())
-                .map_err(|e| e),
-            SettingKey::ReasoningInContext => value
-                .trim()
-                .parse::<ReasoningInContextMode>()
-                .map(|_| ())
-                .map_err(|e| e),
+                .map(|_| ()),
+            SettingKey::ShowReasoning => value.trim().parse::<ShowReasoning>().map(|_| ()),
+            SettingKey::ReasoningInContext => {
+                value.trim().parse::<ReasoningInContextMode>().map(|_| ())
+            }
             SettingKey::SessionResumeReplayTurns => {
                 value.trim().parse::<usize>().map_err(|_| {
                     format!(

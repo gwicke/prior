@@ -79,7 +79,7 @@ pub fn apply_to_text(text: &str, edits: &[EditOp]) -> ApplyOutcome {
     }
 
     // Sort by start position descending so we can apply from end to start.
-    replacements.sort_by(|a, b| b.0.cmp(&a.0));
+    replacements.sort_by_key(|b| std::cmp::Reverse(b.0));
     let mut result = text.to_string();
     for (start, end, new_text) in replacements {
         result.replace_range(start..end, &new_text);

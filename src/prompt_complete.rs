@@ -116,6 +116,12 @@ pub struct PromptCompletion {
     dead: bool,
 }
 
+impl Default for PromptCompletion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PromptCompletion {
     /// Spawn the completion worker for one prompt session. The worker
     /// exits when this (and its `Sender`) drops.
@@ -171,7 +177,7 @@ impl PromptCompletion {
         let mut word: Option<(Range<usize>, String)> =
             word_at_cursor(editor.chars(), editor.cursor()).and_then(|r| {
                 let w: String = editor.chars()[r.clone()].iter().collect();
-                completable(&w).then(|| (r, w))
+                completable(&w).then_some((r, w))
             });
 
         // 2. A pending Tab-expansion counts only while the word under

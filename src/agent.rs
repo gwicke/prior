@@ -415,12 +415,11 @@ impl CodeAgent {
                                     self.output.stream_thinking(&t);
                                 }
                             }
-                            StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
-                                if !reasoning.is_empty() {
+                            StreamedAssistantContent::ReasoningDelta { reasoning, .. }
+                                if !reasoning.is_empty() => {
                                     reasoning_buffer.push_str(&reasoning); // Accumulate for partial persistence
                                     self.output.stream_thinking(&reasoning);
                                 }
-                            }
                             _ => {}
                         },
                         Some(Ok(MultiTurnStreamItem::StreamUserItem(
@@ -1285,7 +1284,7 @@ fn retry_delay_secs(e: &crate::PicocodeError, consecutive_failures: u8) -> u64 {
     // while still growing on a string of consecutive 429s.
     if let Some(hint) = e.retry_after_secs() {
         let n = consecutive_failures.saturating_sub(1).min(63) as u32;
-        return (hint as u64).saturating_mul(1u64 << n);
+        return hint.saturating_mul(1u64 << n);
     }
     // No provider hint: pure 2^(n-1) seconds, no cap.
     let n = consecutive_failures.saturating_sub(1).min(63) as u32;
@@ -2643,7 +2642,7 @@ impl AgentHook for LoggingHook {
         // shape. This hook is the one place that sees the whole request history,
         // so it covers prior and within-turn messages alike.
         let stripped_history = maybe_strip_reasoning(
-            event.history.iter().cloned().collect(),
+            event.history.to_vec(),
             self.reasoning_in_context,
             &self.provider,
             &self.model,
@@ -3574,7 +3573,7 @@ pub(crate) fn parse_replay_len_arg(arg: &str, default: usize) -> (usize, bool) {
         return (default, false);
     }
     if arg.ends_with('l') {
-        let n: usize = arg[..arg.len() - 1].trim().parse().unwrap_or(0);
+        let n: usize = arg.trim_end_matches('l').trim().parse().unwrap_or(0);
         if n == 0 {
             (usize::MAX, false)
         } else {
@@ -3600,7 +3599,7 @@ pub(crate) async fn handle_replay(
     let units = build_replay_units(&branch);
     let total = count_turns(&units);
     if arg.ends_with('l') {
-        let n: usize = arg[..arg.len() - 1].trim().parse().unwrap_or(0);
+        let n: usize = arg.trim_end_matches('l').trim().parse().unwrap_or(0);
         if n > 0 {
             if total == 0 {
                 output.display_text("Session is empty");
@@ -4643,9 +4642,9 @@ pub(crate) async fn fork_session_at(
 
 /// Load a session by meta and switch to it (the `/session <id> resume`
 /// action — used by the session node's `submit`).
+///
 /// Migrates to the current cwd when the session lives elsewhere (fork
-/// + delete original), replays `(count, is_lines)` through `output`,
-/// and computes the `/model` prefill against `qualified_id`.
+/// + delete original), replays `(count, is_lines)` through `output` and then computes the `/model` prefill against `qualified_id`.
 ///
 /// No silent restore of provider/model/thinking on resume: mutating
 /// config and rebuilding the agent behind the user's back would remove
@@ -5363,10 +5362,12 @@ pub async fn run_interactive(
                 // required: the user typed it explicitly, unlike the
                 // LLM-initiated tool call. This skips the LLM prompt entirely.
                 if input.starts_with("!!") || input.starts_with('!') {
-                    let (capture, cmd) = if input.starts_with("!!") {
-                        (false, &input[2..])
+                    let (capture, cmd) = if let Some(rest) = input.strip_prefix("!!") {
+                        (false, rest)
+                    } else if let Some(rest) = input.strip_prefix('!') {
+                        (true, rest)
                     } else {
-                        (true, &input[1..])
+                        unreachable!()
                     };
                     let cmd = cmd.trim();
                     // Reprint the submitted command (cleared by `read_input`),
@@ -5496,7 +5497,7 @@ pub async fn run_interactive(
                     // already in `next_input`), while a synthetic re-prompt
                     // below resets them, since an override belongs to the
                     // user's dispatch and not to the model's own feedback.
-                    let mut turn_params = effective_params.clone();
+                    let mut turn_params = effective_params;
                     // Per-turn persistence flag. Reset once per user prompt
                     // (NOT per retry): the retry loop below reuses it across
                     // `prompt()` attempts so a pre-persisted `user(input)` is

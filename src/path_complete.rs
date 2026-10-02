@@ -199,6 +199,12 @@ pub struct FileCompleter {
     last: Option<(String, CompletionRows)>,
 }
 
+impl Default for FileCompleter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileCompleter {
     pub fn new() -> Self {
         Self { last: None }

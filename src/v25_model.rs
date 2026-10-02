@@ -144,7 +144,7 @@ impl SlashDotNode for ModelNode {
             Vec::new()
         };
 
-        let rows: Vec<Row> = ordered.iter().map(|e| model_row(e)).collect();
+        let rows: Vec<Row> = ordered.iter().map(model_row).collect();
         let response = Rc::new(DataResponse { rows, active_ids });
         self.cached_response = Some(Rc::clone(&response));
         self.cached_generation = gen;
@@ -1173,10 +1173,9 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = model_menu(&app_state);
         let mut h = menu.get_handle();
-        for prompt in [format!("model {TEST_MODEL} ")] {
-            let (_, rows) = rows_at(&mut h, &prompt, crate::slashdot_menu::HostKey::None);
-            assert_eq!(rows, vec!["activate".to_string(), "save".to_string()]);
-        }
+        let prompt = format!("model {TEST_MODEL} ");
+        let (_, rows) = rows_at(&mut h, &prompt, crate::slashdot_menu::HostKey::None);
+        assert_eq!(rows, vec!["activate".to_string(), "save".to_string()]);
     }
 
     /// The one-keystroke path is preserved: the cursor starts on `activate`, so
