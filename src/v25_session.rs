@@ -831,21 +831,23 @@ mod tests {
     }
 
     /// Write a minimal session `.jsonl` (header + one user message) into a
-    /// fresh temp repo, returning `(app_state, uuid, temp_dir)`.
-    fn temp_repo_with_session() -> (Arc<AppState>, String, std::path::PathBuf) {
+    /// fresh temp repo, returning `(guard, app_state, uuid)`.
+    ///
+    /// The repo lives in a [`tempfile::TempDir`] rather than a hand-named
+    /// `temp_dir()/v25-session-test-<nanos>` directory: a `TempDir` is unique
+    /// per call (so concurrent runs over a shared `TMPDIR` cannot collide) and
+    /// is removed on drop — *including* on unwind. The hand-named version only
+    /// cleaned up on the happy path, so every failing or panicking run left a
+    /// directory behind, and those accumulate in whatever `TMPDIR` was current
+    /// at the time.
+    fn temp_repo_with_session() -> (tempfile::TempDir, Arc<AppState>, String) {
         use crate::session::types::{encode_cwd, session_filename, SessionHeader};
 
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("v25-session-test-{nanos}"));
+        let base_guard = tempfile::tempdir().unwrap();
+        let base = base_guard.path().to_path_buf();
         // A synthetic cwd: nothing creates it, and only `encode_cwd` and the
-        // session header ever see it. Named per-run so that if anything did
-        // resolve or create it, two checkouts sharing a `/tmp` still could not
-        // collide — a fixed name would be one that *looks* safe and is not.
-        let cwd =
-            std::path::Path::new("/tmp").join(format!("v25-cwd-{}-{nanos}", std::process::id()));
+        // session header ever see it, so it never needs to exist on disk.
+        let cwd = base.join("synthetic-cwd");
         let dir = base.join(encode_cwd(&cwd));
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -875,7 +877,7 @@ mod tests {
         let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
         let app_state = crate::app_state::AppState::for_test(test_settings());
         app_state.set_repo(Some(repo));
-        (app_state, uuid, base)
+        (base_guard, app_state, uuid)
     }
 
     /// End-to-end traversal: `/session ` listing → drill into the session →
@@ -883,7 +885,7 @@ mod tests {
     /// control target carrying the drilled UUID (not the action name).
     #[test]
     fn session_resume_full_traversal_sets_op_with_uuid() {
-        let (app_state, uuid, base) = temp_repo_with_session();
+        let (_repo, app_state, uuid) = temp_repo_with_session();
         // Not the current session, so resume is visible.
         app_state.set_current_session_id(String::new());
 
@@ -938,8 +940,6 @@ mod tests {
         );
         // The (migrated) header records no model → no `/model` prefill.
         assert!(app_state.take_prefill().is_none());
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn session_resume_submit_switches_session() {
-        let (app_state, uuid, base) = temp_repo_with_session();
+        let (_repo, app_state, uuid) = temp_repo_with_session();
         let mut node = SessionResumeNode {
             app_state: app_state.clone(),
         };
@@ -1041,12 +1041,11 @@ mod tests {
         // the original, and the slot id tracks it.
         assert_ne!(s.get_session_id(), uuid, "migrated session has its own id");
         assert_eq!(app_state.current_session_id(), s.get_session_id());
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn session_fork_submit_switches_to_fork() {
-        let (app_state, uuid, base) = temp_repo_with_session();
+        let (_repo, app_state, uuid) = temp_repo_with_session();
         let mut node = SessionForkNode {
             app_state: app_state.clone(),
         };
@@ -1070,7 +1069,6 @@ mod tests {
             2,
             "source + fork on disk"
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1161,7 +1159,7 @@ mod tests {
 
     #[test]
     fn session_delete_submit_removes_file() {
-        let (app_state, uuid, base) = temp_repo_with_session();
+        let (_repo, app_state, uuid) = temp_repo_with_session();
         let repo = app_state.repo().expect("fixture repo in the slot");
         assert_eq!(repo.list_sessions_sync(None).len(), 1, "fixture present");
         let mut node = SessionDeleteNode {
@@ -1181,7 +1179,6 @@ mod tests {
             repo.list_sessions_sync(None).is_empty(),
             "the file must be gone from disk"
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

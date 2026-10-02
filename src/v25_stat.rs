@@ -126,20 +126,21 @@ mod tests {
     /// pre-migration files whose header lacks the field. An empty `name` is
     /// the "never named" case `SessionHeader::new` itself writes.
     ///
-    /// Returns the state, the session uuid, the session's cwd, and the temp
-    /// root to clean up.
-    fn temp_repo_with_session(name: &str) -> (Arc<AppState>, String, String, std::path::PathBuf) {
+    /// Returns the state, the session uuid, and the session's cwd.
+    ///
+    /// The repo lives in a [`tempfile::TempDir`]: unique per call (so
+    /// concurrent runs sharing a `TMPDIR` cannot collide) and removed on drop,
+    /// including on unwind. A hand-named `temp_dir()/v25-stat-test-<nanos>`
+    /// directory is only ever removed on the happy path, so a failing run
+    /// leaves one behind.
+    fn temp_repo_with_session(name: &str) -> (tempfile::TempDir, Arc<AppState>, String, String) {
         use crate::session::types::{encode_cwd, session_filename, SessionHeader};
 
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("v25-stat-test-{nanos}"));
-        // A synthetic cwd nothing creates. Named per-run so two checkouts
-        // sharing a /tmp still cannot collide on a name that only looks safe.
-        let cwd = std::path::Path::new("/tmp")
-            .join(format!("v25-stat-cwd-{}-{nanos}", std::process::id()));
+        let base_guard = tempfile::tempdir().unwrap();
+        let base = base_guard.path().to_path_buf();
+        // A synthetic cwd nothing creates; only `encode_cwd` and the session
+        // header ever see it.
+        let cwd = base.join("synthetic-cwd");
         let dir = base.join(encode_cwd(&cwd));
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -170,7 +171,7 @@ mod tests {
         let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
         let app_state = test_app_state();
         app_state.set_repo(Some(repo));
-        (app_state, uuid, header.cwd, base)
+        (base_guard, app_state, uuid, header.cwd)
     }
 
     fn stat_header_text(app_state: &Arc<AppState>) -> String {
@@ -195,10 +196,9 @@ mod tests {
     /// `session_stats_lines` would pass even if the call site dropped them.
     #[test]
     fn stat_header_shows_the_session_name_and_cwd() {
-        let (app_state, uuid, cwd, base) = temp_repo_with_session("deploy work");
+        let (_repo, app_state, uuid, cwd) = temp_repo_with_session("deploy work");
         app_state.set_current_session_id(uuid.clone());
         let header_text = stat_header_text(&app_state);
-        let _ = std::fs::remove_dir_all(&base);
 
         assert!(
             header_text.contains(&format!("session: {}", uuid)),
@@ -222,10 +222,9 @@ mod tests {
     /// exists.
     #[test]
     fn stat_header_omits_an_unset_name() {
-        let (app_state, uuid, _cwd, base) = temp_repo_with_session("");
+        let (_repo, app_state, uuid, _cwd) = temp_repo_with_session("");
         app_state.set_current_session_id(uuid.clone());
         let header_text = stat_header_text(&app_state);
-        let _ = std::fs::remove_dir_all(&base);
 
         assert!(
             !header_text.contains("name:"),
