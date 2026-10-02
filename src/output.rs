@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use termimad;
 use unicode_width::UnicodeWidthStr;
 
-use crate::row_count::{RowCounter, StreamTail};
+use crate::row_count::RowCounter;
 
 #[derive(Debug, PartialEq)]
 pub enum Confirmation {
@@ -241,9 +241,6 @@ struct HoldTrailing<'a, W: io::Write + ?Sized> {
     /// Whether any byte at all passed — the difference between a write with
     /// nothing in it and one whose only content was newlines.
     wrote_any: bool,
-    /// Last bytes of real content that passed through (excluding what is
-    /// parked in `pending`), for dumping what a block actually ended with.
-    tail: Vec<u8>,
 }
 
 impl<W: io::Write + ?Sized> HoldTrailing<'_, W> {
@@ -287,8 +284,6 @@ impl<W: io::Write + ?Sized> io::Write for HoldTrailing<'_, W> {
                     self.inner.write_all(&blank)?;
                 }
                 self.inner.write_all(&buf[..=i])?;
-                self.tail.extend_from_slice(&buf[..=i]);
-                self.tail.truncate(400);
                 self.pending += buf.len() - i - 1;
             }
             // All newlines: trailing until something says otherwise.
@@ -892,17 +887,6 @@ pub struct ConsoleOutput {
     /// and pick a syntax-highlight language). The hook always fires a call
     /// immediately before its result, so this is safe to read on the result.
     last_tool: Mutex<Option<(String, Value)>>,
-    /// Whether the content stream currently ends with a *blank* line —
-    /// derived from the bytes every write passes through, not set by hand
-    /// (doc/row_accounting_b3.md B3d). [`Self::boundary`] consults it so two
-    /// consecutive separators collapse into one empty line: the rule is one
-    /// blank between non-blank lines, never two.
-    ///
-    /// Derived rather than kept because the markdown renderer ends its own
-    /// blocks with a blank line. A flag written by hand disagrees with the
-    /// screen at exactly those points, and the boundary then emits a second
-    /// blank — which is the class of bug the separator matrix pinned.
-    stream_tail: StreamTail,
     /// The status line's content (an all-empty `StatusText` is off). Content
     /// rather than rendered bytes, because the width is this layer's to know:
     /// see [`status_bar`].
@@ -1723,7 +1707,6 @@ impl ConsoleOutput {
             show_reasoning,
 
             last_tool: Mutex::new(None),
-            stream_tail: StreamTail::new(),
             status_text: Arc::new(Mutex::new(StatusText::default())),
             streaming: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             held_blank: std::sync::atomic::AtomicUsize::new(0),
@@ -1955,6 +1938,16 @@ impl ConsoleOutput {
 
     fn write_content_block(&self, bytes: &[u8], kind: Option<ContentDisplayKind>, closes: bool) {
         let width = term_width();
+        // Wrap over-long lines before they meet the overwrite rule — see
+        // `row_count::wrap_to_width`: a row the terminal wraps into without a
+        // byte is a row `LineClear` never clears, and the frame's cells (the
+        // status bar's right margin, after a sharing commit) survive in it.
+        // Valid UTF-8 only: a chunk split mid-character is not where an
+        // overflowing line's break point lives.
+        let wrapped = std::str::from_utf8(bytes)
+            .ok()
+            .map(|t| crate::row_count::wrap_to_width(t, width));
+        let bytes = wrapped.as_ref().map_or(bytes, |s| s.as_bytes());
         self.with_content_writer(width, kind, closes, |out| {
             let _ = out.write_all(bytes);
         });
@@ -2062,19 +2055,13 @@ impl ConsoleOutput {
             pending: true,
             enabled: !capturing,
         };
-        // The counter updates the shared tail per byte, so a boundary
-        // *inside* this block (a committed paragraph before the block that
-        // follows it) sees the state those bytes produced, not the state from
-        // before the block — and so the tail describes the content, and nothing
-        // else. It sits *below* the line-clear (the codes are added to the
-        // stream after it counts) and *above* the buffer. The consume's walk,
-        // when there is one, still goes straight to the writer, ahead of all
-        // of this: it is cursor movement, not content, and letting
-        // `RowCounter` see it was a real bug — `StreamTail::note` clears both
-        // its bits on any non-newline byte, so the walk's `CR` and escapes
-        // would read as "the stream does not end with a blank line" and every
-        // `boundary()` inside the write would emit a blank line of its own.
-        let mut counter = RowCounter::new(&mut clear, width, &self.stream_tail);
+        // The counter sits *below* the line-clear (the codes are added to the
+        // stream after it counts) and *above* the buffer, so it counts the
+        // bytes as the terminal will receive them. The consume's walk, when
+        // there is one, still goes straight to the writer, ahead of all of
+        // this: it is cursor movement, not content, and never passes through
+        // the counter or the clear.
+        let mut counter = RowCounter::new(&mut clear, width);
         // The rows that belong *between* blocks — the matrix's boundary line,
         // and whatever the previous block held back — are pending content, not
         // something drawn on the way in. They go to the same mechanism that
@@ -2102,7 +2089,6 @@ impl ConsoleOutput {
             pending: 0,
             wrote_content: false,
             wrote_any: false,
-            tail: Vec::new(),
         };
         // Seeded as pending state rather than written through: a boundary row
         // is not content, and a write that adds nothing of its own must still
@@ -2127,7 +2113,6 @@ impl ConsoleOutput {
         // lines, so what is left is either content or nothing.
         let wrote_any = hold.wrote_any;
         let wrote_content = hold.wrote_content;
-        let tail = std::mem::take(&mut hold.tail);
         let carried = hold.finish();
         drop(hold);
         // Blame where the content is written, not where it lands: a block that
@@ -5325,21 +5310,6 @@ mod tests {
             via_tail, via_hand,
             "the tail is the old path, byte for byte — not a second behaviour"
         );
-    }
-
-    /// A status only goes out at the start of a line, so this is asserted
-    /// where the fact lives — the tail the counter maintains. (No current
-    /// writer can produce a mid-line tail: every content write ends with a
-    /// newline. It is the guard for a writer that does not, and for the status
-    /// itself, which by design has no trailing newline.)
-    #[test]
-    fn the_tail_reports_whether_the_cursor_is_at_a_line_start() {
-        let tail = crate::row_count::StreamTail::new();
-        let mut counter = RowCounter::new(Vec::new(), 40, &tail);
-        counter.write_all(b"alpha").unwrap();
-        assert!(!tail.at_line_start(), "mid-line: the status must wait");
-        counter.write_all(b"\n").unwrap();
-        assert!(tail.at_line_start());
     }
 
     /// Content written while a frame is live takes the frame's rows — and the
