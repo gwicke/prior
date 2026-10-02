@@ -7793,7 +7793,13 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     /// attempts the Esc sat unread until the next `prompt()` started, so the
     /// full delay always ran — the reported "the session only aborts once the
     /// timeout has elapsed".
+    // `#[serial]`: an `Esc` pumped through the window reaches
+    // `pump_window_key`, which broadcasts on the process-global
+    // `TOOL_CANCEL_SENDERS` registry — killing the child of *every*
+    // in-flight command in this process, including one another test's.
+    // These must not overlap a test running a real sandboxed command.
     #[tokio::test]
+    #[serial]
     async fn backoff_pump_cancels_promptly_on_queued_esc() {
         let app_state = crate::app_state::AppState::for_test(test_settings());
         let (mut session, mut history, guard) = backoff_pump_parts(&app_state);
@@ -7960,7 +7966,13 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     /// summarization request is in flight cancels it. Before the pump,
     /// nothing read stdin during the window and the attempt always ran to
     /// completion.
+    // `#[serial]`: an `Esc` pumped through the window reaches
+    // `pump_window_key`, which broadcasts on the process-global
+    // `TOOL_CANCEL_SENDERS` registry — killing the child of *every*
+    // in-flight command in this process, including one another test's.
+    // These must not overlap a test running a real sandboxed command.
     #[tokio::test]
+    #[serial]
     async fn window_pump_esc_cancels_the_inflight_attempt() {
         let keys = FakeWindow::new();
         keys.push(esc_event());
@@ -7988,7 +8000,13 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     /// The reported bug shape: an `Esc` during a *retry back-off* cuts the
     /// wait instead of letting the provider-hint floor (10s) run out.
+    // `#[serial]`: an `Esc` pumped through the window reaches
+    // `pump_window_key`, which broadcasts on the process-global
+    // `TOOL_CANCEL_SENDERS` registry — killing the child of *every*
+    // in-flight command in this process, including one another test's.
+    // These must not overlap a test running a real sandboxed command.
     #[tokio::test]
+    #[serial]
     async fn window_pump_esc_cuts_the_retry_backoff() {
         let keys = std::sync::Arc::new(FakeWindow::new());
         let keys2 = keys.clone();
@@ -9453,7 +9471,12 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     // the remap is visible and `cat` prints the file's content; if it runs
     // unsandboxed, the path is absent and `cat` errors with "No such file".
     #[cfg(unix)]
+    // `#[serial]`: this test runs a real sandboxed command, so it holds a
+    // `TOOL_CANCEL_SENDERS` registration. The Esc-pump tests above
+    // broadcast to every registration in the process, so without this the
+    // two classes of test kill each other's children at random.
     #[tokio::test]
+    #[serial]
     async fn bang_command_uses_sandbox_before_agent_created() {
         use std::collections::VecDeque;
         use std::sync::{Arc, Mutex};
