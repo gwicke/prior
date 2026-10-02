@@ -166,7 +166,7 @@ fn split_edit_tool_results(msg: &Message) -> Option<Message> {
 /// The compaction entry is never sent to the LLM as itself; when its `summary`
 /// is non-empty it is projected into a synthetic user message wrapped as below.
 const COMPACTION_SUMMARY_PREFIX: &str =
-    "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+    "Compaction summary:\n\n<summary>\n";
 const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 
 /// Build the synthetic user-message entry that stands in for a `Compaction`
@@ -3166,7 +3166,7 @@ mod tests {
         assert_eq!(ids[1..], ["m1", "m2", "m3"]);
         assert_eq!(
             first_user_text(&extract_messages(&out)),
-            "The conversation history before this point was compacted into the following summary:\n\n<summary>\nS\n</summary>"
+            "Compaction summary:\n\n<summary>\nS\n</summary>"
         );
     }
 
@@ -4435,7 +4435,7 @@ mod tests {
         use rig_core::message::{Message, Text, UserContent};
         let summary_text = "Summary body content";
         // Reconstruct the exact wrapper used by compaction_summary_message.
-        let prefix = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+        let prefix = "Compaction summary:\n\n<summary>\n";
         let suffix = "\n</summary>";
         let wrapped = format!("{}{}{}", prefix, summary_text, suffix);
         let ctx = SessionContext {

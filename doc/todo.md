@@ -12,7 +12,7 @@
         (UI TBD; the old `CompactionTarget::Abandoned` backend hook was
         deleted in editor cleanup E3 — a menu version would add a target
         kind to `generate_compaction`)
-        `/tree <id> switch`, `/tree <id> switch llm <prompt>`, `/tree <id> switch simple`
+        `/tree <id> switch cursor`, `/tree <id> switch summarize prompt <prompt>`, `/tree <id> switch summarize manual`
 - [x] Non-REPL slash input (in-process / non-tty hosts) — routed through the
       v2.5 menu eval (`Repl::batch_slash`: passive derive + virtual Enter,
       drawing ignored); the four typed arms are deleted
@@ -52,8 +52,8 @@
 - [x] Input field content loss on key-down
 - [ ] U4.4 — the ordering question you answered.
   content write vs. frame update synchronization
-- [ ] R5's staleness half — batching turns N stale menu re-emits into 1; still
-  one wrong redraw if the recipe outlived its menu.
-
-- [ ] Cancelling a turn when it is being retried does not seem to work
+- [x] Cancelling a turn when it is being retried does not seem to work
   reliably any more - related to event pumps 
+- [ ] lift overlay composition and -windowing into vertical render stack
+  - [ ] restore fixed table headers
+  - have one place doing all vertical scaling
