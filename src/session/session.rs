@@ -196,14 +196,16 @@ fn compaction_summary_message(summary: &str) -> SessionEntry {
     }
 }
 
-/// pi's branch-summary message wrapper (core/messages.ts `BRANCH_SUMMARY_PREFIX`
-/// / `BRANCH_SUMMARY_SUFFIX`) — byte-exact, including the suffix's **missing**
-/// leading newline (the compaction suffix has one). A `BranchSummary` entry on
-/// the active path is projected into a synthetic user message wrapped as below,
-/// so a summary written when switching away from a spur is what the model sees
-/// on the branch that continues from the switch target.
-pub(crate) const BRANCH_SUMMARY_PREFIX: &str =
-    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+/// The branch-summary message wrapper, mirroring [`COMPACTION_SUMMARY_PREFIX`]:
+/// a short label rather than pi's `BRANCH_SUMMARY_PREFIX` sentence ("The
+/// following is a summary of a branch that this conversation came back
+/// from…"), for the same reason `78c7e7a` shortened the compaction one. Note
+/// the suffix's **missing** leading newline — the compaction suffix has one.
+///
+/// A `BranchSummary` entry on the active path is projected into a synthetic user
+/// message wrapped as below, so a summary written when switching away from a
+/// spur is what the model sees on the branch that continues from the target.
+pub(crate) const BRANCH_SUMMARY_PREFIX: &str = "Branch summary:\n\n<summary>\n";
 pub(crate) const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
 
 /// The LLM-visible text of a `BranchSummary` entry: pi's wrapper around the
@@ -2386,7 +2388,7 @@ mod tests {
     fn branch_summary_becomes_a_user_message_with_pi_wrapper() {
         // pi converts a `branch_summary` entry on the path into a
         // `branchSummary` message, which `convertToLlm` renders as a **user**
-        // message wrapped in BRANCH_SUMMARY_PREFIX/SUFFIX (messages.ts:170).
+        // message (pi's own wrapper text, ours shortened — see the const).
         let entries = vec![
             user_msg("m0", "start", None),
             branch_summary_entry("s1", "m0", "Tried the wrong approach", Some("m0")),
@@ -2402,17 +2404,20 @@ mod tests {
         };
         assert_eq!(
             text.text.as_str(),
-            "The following is a summary of a branch that this conversation came back from:\n\n<summary>\nTried the wrong approach</summary>"
+            "Branch summary:\n\n<summary>\nTried the wrong approach</summary>"
         );
     }
 
     #[test]
-    fn branch_summary_wrapper_is_byte_exact_with_pi() {
-        // The suffix has NO leading newline (the compaction one does) — pi's
-        // two wrappers differ, so pin both.
+    fn branch_summary_wrapper_matches_the_short_house_style() {
+        // Both wrappers are short labels (`78c7e7a` shortened the compaction
+        // one from pi's sentence; the branch one follows it), and the branch
+        // suffix has NO leading newline while the compaction one does — pin
+        // both, since the difference is what a nested compaction looks like
+        // inside a serialized spur.
         assert_eq!(
             branch_summary_message_text("S"),
-            "The following is a summary of a branch that this conversation came back from:\n\n<summary>\nS</summary>"
+            "Branch summary:\n\n<summary>\nS</summary>"
         );
         let compaction_entry = SessionEntry {
             id: "c1".into(),

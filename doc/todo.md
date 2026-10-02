@@ -17,9 +17,9 @@
         `branchWithSummary`: move the leaf to the target, then append a
         `branch_summary` parented there, so the digest is inline on the branch
         the conversation continues on). `BranchSummary` → user message in
-        `extract_messages` (pi `sessionEntryToContextMessages`; the branch
-        wrapper is pi's byte-exact text — the *compaction* wrapper was shortened
-        by `78c7e7a`). Same pass added `/tree <id> edit` — pi's user-message
+        `extract_messages` (pi `sessionEntryToContextMessages`; the wrapper
+        text is ours — `Branch summary:` — matching the house style `78c7e7a`
+        set for the compaction wrapper). Same pass added `/tree <id> edit` — pi's user-message
         re-edit (leaf = the prompt's parent + input prefill) as its own row, so
         `switch cursor` keeps its "continue after this prompt" meaning.
         Design + parity record + divergences: `doc/branch_summary.md`.

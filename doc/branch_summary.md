@@ -56,9 +56,13 @@ the **spur tip** with `from_id` = the **common ancestor**):
 
 So the summary reaches the model without any traversal: it is on the path
 because of where it is written. Our `session::extract_messages` mirrors
-`sessionEntryToContextMessages` exactly (same non-empty guard, same wrapper —
-byte-exact, including the branch suffix's **missing** leading newline that the
-compaction suffix has).
+`sessionEntryToContextMessages` (same non-empty guard, same position in the
+path). The *wrapper text* is ours, not pi's: `78c7e7a` shortened
+`COMPACTION_SUMMARY_PREFIX` from pi's sentence to `Compaction summary:`, and the
+branch wrapper follows that house style (`Branch summary:`). The one detail
+kept from pi is structural — the branch suffix has **no** leading newline while
+the compaction suffix has one, so a nested compaction inside a serialized spur
+still reads as two distinct wrappers.
 
 ### Summarization pipeline (ported)
 

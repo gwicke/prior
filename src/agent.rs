@@ -8199,10 +8199,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            joined.contains(
-                "The following is a summary of a branch that this conversation came back from"
-            ),
-            "pi's wrapper must be the LLM-visible form: {joined}"
+            joined.contains("Branch summary:"),
+            "the wrapper must be the LLM-visible form: {joined}"
         );
         assert!(joined.contains("abandoned work"), "{joined}");
         // The abandoned spur itself is NOT in the new branch's context.
@@ -8393,8 +8391,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             "tool results are skipped (their content is in the call): {text}"
         );
         assert!(
-            text.contains("[User]: The following is a summary of a branch"),
-            "a nested digest survives as the user message pi would send: {text}"
+            text.contains("[User]: Branch summary:"),
+            "a nested digest survives as the wrapped user message: {text}"
         );
     }
 
