@@ -800,12 +800,9 @@ pub(crate) enum EvalOutcome {
 /// afterwards (so the in-progress one keeps its view restore and armed
 /// confirm).
 pub struct PromptSession {
-    /// The input buffer, cursor and wrap layout.
+    /// The input buffer, cursor, wrap layout, and the `Up`/`Down` history-recall
+    /// position (which lives on the editor — see [`LineEditor::nav`]).
     editor: LineEditor,
-    /// History navigation: `Some(index)` while paging back through it.
-    nav: Option<usize>,
-    /// The line history was on before `nav` started, so leaving it restores.
-    draft: String,
     /// Selected row of the current overlay.
     sel: usize,
     /// Overlay discriminant, for resetting `sel` when the overlay *kind*
@@ -876,8 +873,6 @@ impl PromptSession {
         }
         Self {
             editor,
-            nav: None,
-            draft: String::new(),
             sel: 0,
             last_disc: 0,
             prose: crate::prompt_complete::PromptCompletion::new(),
@@ -968,9 +963,18 @@ impl PromptSession {
                     // Apply the engine's prompt — but only when it actually
                     // changed: an unchanged passive eval must not reset a
                     // mid-line text cursor (`LineEditor::set` jumps to EOL).
+                    //
+                    // `set_derived`, not `set`: the text here is re-derived from
+                    // the buffer already on screen, not typed by the user, so it
+                    // must not look like an edit. That matters most for recall —
+                    // history holds `/`-commands, so recalling `/model` opens the
+                    // menu and expands the line to `/model `, and a plain `set`
+                    // would end the walk on that rewrite, leaving the user stuck
+                    // in the recalled prompt with `Up`/`Down` refusing to
+                    // browse. Derived writes keep them walking.
                     let new_buf = format!("/{}", prompt);
                     if new_buf != editor.text() {
-                        editor.set(&new_buf);
+                        editor.set_derived(&new_buf);
                     }
                     ActiveOverlay::V25Menu { plan }
                 }
@@ -1234,8 +1238,6 @@ impl PromptSession {
     ) -> KeyOutcome {
         let Self {
             editor,
-            nav,
-            draft,
             sel,
             pending_key,
             ..
@@ -1367,7 +1369,7 @@ impl PromptSession {
                     // Prose dialog: Enter bypasses completion — submit the raw
                     // line (Shift+Enter inserts a newline). Tab is the only
                     // expansion key.
-                    if let Some(a) = Repl::edit_key(key, editor, history, nav, draft, prompt) {
+                    if let Some(a) = Repl::edit_key(key, editor, history, prompt) {
                         return KeyOutcome::Action(a);
                     }
                     return KeyOutcome::Continue;
@@ -1386,7 +1388,7 @@ impl PromptSession {
                     // Editing keys pass through in both cases; dismissal is
                     // stateless — the next eval re-derives the dialog from
                     // the buffer.
-                    if let Some(a) = Repl::edit_key(key, editor, history, nav, draft, prompt) {
+                    if let Some(a) = Repl::edit_key(key, editor, history, prompt) {
                         return KeyOutcome::Action(a);
                     }
                 }
@@ -1396,7 +1398,7 @@ impl PromptSession {
         // No overlay: normal editing (Tab with no dialog is inert — implicit
         // open means the dialog is already up whenever there is anything to
         // complete).
-        if let Some(a) = Repl::edit_key(key, editor, history, nav, draft, prompt) {
+        if let Some(a) = Repl::edit_key(key, editor, history, prompt) {
             return KeyOutcome::Action(a);
         }
         KeyOutcome::Continue
@@ -2065,8 +2067,6 @@ impl Repl {
         key: event::KeyEvent,
         editor: &mut LineEditor,
         history: &mut History,
-        nav: &mut Option<usize>,
-        draft: &mut String,
         prompt: &str,
     ) -> Option<InputAction> {
         match key.code {
@@ -2146,18 +2146,19 @@ impl Repl {
             }
             KeyCode::Up => {
                 let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
+                // Not on the first visual row: this is cursor movement inside a
+                // multi-line line, not recall.
                 if !editor.visual_up(w as usize, prompt) {
-                    // Only fall through to history when there is no unsubmitted
-                    // draft in the buffer. Otherwise, a stray Up at the top of the
-                    // prompt would silently stash the in-progress text and
-                    // replace it with the previous history entry — a destructive
-                    // action that's easy to trigger when reaching for Home.
-                    // When a draft *does* exist (the user already navigated
-                    // back), keep the existing behavior so they can still step
-                    // through history.
-                    if editor.text().is_empty() || nav.is_some() {
-                        if let Some(s) = history.prev(&editor.text(), nav, draft) {
-                            editor.set(&s);
+                    // History is browsed only from an *empty* line, plus while a
+                    // walk is in progress — the recalled entry on screen is not
+                    // a draft, so `Up` keeps stepping back through it. Any text
+                    // the user typed ends the walk (every content write does), so
+                    // `nav.is_some()` and "the buffer is the user's" can never
+                    // both be true, and a draft is never replaced.
+                    let browsable = editor.text().is_empty() || editor.nav.is_some();
+                    if browsable {
+                        if let Some(s) = history.prev(editor) {
+                            editor.set_recalled(&s);
                         }
                     }
                 }
@@ -2166,8 +2167,14 @@ impl Repl {
             KeyCode::Down => {
                 let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
                 if !editor.visual_down(w as usize, prompt) {
-                    if let Some(s) = history.next(nav, draft) {
-                        editor.set(&s);
+                    // Forward-only: `Down` moves through a walk that `Up` began,
+                    // and does nothing at all otherwise. With no walk in progress
+                    // `nav` is `None` — the line is either empty or the user's own
+                    // draft, and neither may be overwritten by an entry here.
+                    if editor.nav.is_some() {
+                        if let Some(s) = history.next(editor) {
+                            editor.set_recalled(&s);
+                        }
                     }
                 }
                 None
@@ -2177,12 +2184,30 @@ impl Repl {
     }
 }
 
-/// A flat character buffer + cursor for multi-line editing. All methods are pure
-/// (no terminal access) and unit-tested in [`tests`].
+/// A flat character buffer + cursor for multi-line editing, plus the `Up`/`Down`
+/// history-recall position that describes what the buffer currently holds. All
+/// methods are pure (no terminal access) and unit-tested in [`tests`].
 #[derive(Default)]
 pub struct LineEditor {
     buf: Vec<char>,
     cursor: usize, // char index into `buf`
+    /// Where the line sits in the `Up`/`Down` recall walk: `Some(index)` while
+    /// the buffer holds an untouched history entry, `None` while it holds the
+    /// user's own text.
+    ///
+    /// Lives here rather than on the session because the rule that maintains it
+    /// is about *this buffer*: any content write ends the walk (see
+    /// [`LineEditor::wrote`]), and every write goes through a method below.
+    /// Session-level writers — prefill, `Ctrl-E`, submit, a `/`-commit — end it
+    /// for free, where a flag cleared at each call site would rot.
+    nav: Option<usize>,
+    /// The line as it was before the walk started, restored when `Down` steps
+    /// past the newest entry.
+    ///
+    /// Always empty today: recall only starts on an empty line, so there is
+    /// nothing to stash. Kept because it is the restore path the moment recall
+    /// is ever allowed to start over a draft.
+    draft: String,
 }
 
 impl LineEditor {
@@ -2190,10 +2215,48 @@ impl LineEditor {
         Self::default()
     }
 
-    /// Replace the whole buffer (used by history navigation). Cursor → end.
+    /// Any content write ends the recall walk: the line is the user's again, so
+    /// `Up`/`Down` must not go on replacing it. One line, called at the end of
+    /// every mutator below, is the whole rule — no key arm can forget it.
+    ///
+    /// The two writes that are *not* the user's own text say so by not coming
+    /// through here: [`set_recalled`](Self::set_recalled) for history, and
+    /// [`set_derived`](Self::set_derived) for the `/`-engine's rewrite of a
+    /// prompt that recall brought back.
+    fn wrote(&mut self) {
+        self.nav = None;
+        self.draft.clear();
+    }
+
+    /// Replace the whole buffer. Cursor → end.
+    ///
+    /// Ends recall: the buffer is no longer the entry the walk landed on, so
+    /// `Up`/`Down` stop browsing until the line is cleared again.
     pub fn set(&mut self, s: &str) {
+        self.set_derived(s);
+        self.wrote();
+    }
+
+    /// Replace the whole buffer without ending recall — for writes whose text
+    /// comes *from* the line already on screen rather than from the user.
+    ///
+    /// Two callers, and both need it: history navigation ([`set_recalled`]),
+    /// and the `/`-menu's rewrite of a recalled `/`-command, which re-derives
+    /// the prompt from the buffer the walk put there. Without this second one,
+    /// recalling `/model` would expand to `/model `, the rewrite would look like
+    /// an edit, and the walk would end with the menu open — locking the user
+    /// into the prompt they just recalled, unable to reach `Up`/`Down` again
+    /// short of clearing the line.
+    fn set_derived(&mut self, s: &str) {
         self.buf = s.chars().collect();
         self.cursor = self.buf.len();
+    }
+
+    /// Replace the whole buffer with a history entry (cursor → end), staying in
+    /// the recall walk. The counterpart to [`wrote`](Self::wrote): this is the
+    /// write that *moves* the walk rather than ending it.
+    pub fn set_recalled(&mut self, s: &str) {
+        self.set_derived(s);
     }
 
     /// Replace the char range `[start, end)` with `repl` and position the
@@ -2209,6 +2272,7 @@ impl LineEditor {
         self.buf.splice(start..end, new_chars.iter().copied());
         // Position cursor after the replacement.
         self.cursor = start + new_chars.len();
+        self.wrote();
     }
 
     /// Current buffer as a `String` (newlines preserved).
@@ -2230,6 +2294,7 @@ impl LineEditor {
     pub fn insert(&mut self, c: char) {
         self.buf.insert(self.cursor, c);
         self.cursor += 1;
+        self.wrote();
     }
 
     pub fn insert_str(&mut self, s: &str) {
@@ -2237,6 +2302,7 @@ impl LineEditor {
             self.buf.insert(self.cursor, c);
             self.cursor += 1;
         }
+        self.wrote();
     }
 
     /// Character immediately before the cursor (`None` at buffer start).
@@ -2255,12 +2321,14 @@ impl LineEditor {
             self.buf.remove(self.cursor - 1);
             self.cursor -= 1;
         }
+        self.wrote();
     }
 
     pub fn delete(&mut self) {
         if self.cursor < self.buf.len() {
             self.buf.remove(self.cursor);
         }
+        self.wrote();
     }
 
     pub fn left(&mut self) {
@@ -2322,6 +2390,7 @@ impl LineEditor {
     pub fn insert_newline(&mut self) {
         self.buf.insert(self.cursor, '\n');
         self.cursor += 1;
+        self.wrote();
     }
 
     /// Delete from the cursor to the start of the logical line (`Ctrl-U`).
@@ -2344,6 +2413,7 @@ impl LineEditor {
             // There is content before the cursor on this line: delete it.
             self.buf.drain(line_start..self.cursor);
             self.cursor = line_start;
+            self.wrote();
             return;
         }
         // Cursor is at the start of a line that follows a '\n': clear the
@@ -2358,6 +2428,7 @@ impl LineEditor {
         };
         self.buf.drain(prev_start..self.cursor);
         self.cursor = prev_start;
+        self.wrote();
     }
 
     /// Delete from the cursor to the end of the logical line (`Ctrl-K`).
@@ -2370,6 +2441,7 @@ impl LineEditor {
         if end > self.cursor {
             self.buf.drain(self.cursor..end);
         }
+        self.wrote();
     }
 
     /// Move up one logical line (to the end of the previous line). Returns
@@ -2719,43 +2791,55 @@ impl History {
         }
     }
 
-    /// Step backward through history; first call stashes `current` as the draft.
-    pub fn prev(
-        &self,
-        current: &str,
-        nav: &mut Option<usize>,
-        draft: &mut String,
-    ) -> Option<String> {
+    /// Step backward through history; the first call stashes the current line as
+    /// the draft and the last step leaves the walk entirely.
+    ///
+    /// Takes the editor rather than a `nav`/`draft` pair because the walk *is*
+    /// the editor's [`nav`](LineEditor::nav) plus its stashed
+    /// [`draft`](LineEditor::draft) — splitting them out let a caller write to
+    /// the buffer and leave them behind, which is how a recalled prompt ended
+    /// up with a stale position and a `Down` that overwrote the user's text.
+    ///
+    /// Returns the text to show; the caller installs it with
+    /// [`set_recalled`](LineEditor::set_recalled), the one write that keeps the
+    /// walk alive. Writing it with plain `set` would end the walk on the very
+    /// keystroke that started it.
+    pub fn prev(&self, editor: &mut LineEditor) -> Option<String> {
         let n = self.entries.len();
         if n == 0 {
             return None;
         }
-        if nav.is_none() {
-            *draft = current.to_string();
-            *nav = Some(n); // point just past the newest entry
+        if editor.nav.is_none() {
+            editor.draft = editor.text();
+            editor.nav = Some(n); // point just past the newest entry
         }
-        let i = nav.unwrap();
+        let i = editor.nav.unwrap();
         if i == 0 {
             return None;
         }
         let new_i = i - 1;
-        *nav = Some(new_i);
+        editor.nav = Some(new_i);
         Some(self.entries[new_i].clone())
     }
 
-    /// Step forward; past the newest entry restores the stashed `draft`.
-    pub fn next(&self, nav: &mut Option<usize>, draft: &mut String) -> Option<String> {
+    /// Step forward through a walk [`prev`](Self::prev) started; past the newest
+    /// entry it restores the stashed draft and leaves the walk.
+    ///
+    /// `None` when no walk is in progress — the caller gates on
+    /// `editor.nav.is_some()` too, so that "Down only ever moves forward
+    /// through a walk Up began" is stated at the key as well as here.
+    pub fn next(&self, editor: &mut LineEditor) -> Option<String> {
         let n = self.entries.len();
-        match nav {
+        match editor.nav {
             None => None,
             Some(i) => {
-                if *i + 1 >= n {
-                    let d = std::mem::take(draft);
-                    *nav = None;
+                if i + 1 >= n {
+                    let d = std::mem::take(&mut editor.draft);
+                    editor.nav = None;
                     return Some(d);
                 }
-                let new_i = *i + 1;
-                *nav = Some(new_i);
+                let new_i = i + 1;
+                editor.nav = Some(new_i);
                 Some(self.entries[new_i].clone())
             }
         }
@@ -3531,29 +3615,80 @@ mod tests {
         assert_eq!((layout.cursor_row, layout.cursor_col), (1, 2));
     }
 
-    #[test]
-    fn history_navigation_with_draft_restore() {
+    /// Three entries, no disk file — the walk needs something to walk.
+    fn recall_hist() -> History {
         let mut h = History {
             entries: Vec::new(),
             file: None,
         };
         h.add("first");
         h.add("second");
-        let mut nav: Option<usize> = None;
-        let mut draft = String::new();
-        assert_eq!(
-            h.prev("draft", &mut nav, &mut draft),
-            Some("second".to_string())
-        );
-        assert_eq!(
-            h.prev("draft", &mut nav, &mut draft),
-            Some("first".to_string())
-        );
-        assert_eq!(h.prev("draft", &mut nav, &mut draft), None);
+        h.add("third");
+        h
+    }
+
+    fn up_key() -> event::KeyEvent {
+        event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)
+    }
+
+    fn down_key() -> event::KeyEvent {
+        event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+    }
+
+    /// A recall that lands on the newest entry, with the editor holding it —
+    /// the state every `Up`/`Down` question below starts from.
+    fn recalled_newest() -> (History, LineEditor) {
+        let mut h = recall_hist();
+        let mut ed = LineEditor::new();
+        Repl::edit_key(up_key(), &mut ed, &mut h, "");
+        assert_eq!(ed.text(), "third");
+        (h, ed)
+    }
+
+    #[test]
+    fn history_navigation_with_draft_restore() {
+        // The walk itself, with no key handler around it: `prev`/`next` move the
+        // editor's position and hand back the text for the caller to install
+        // with `set_recalled`. Written against a buffer that already holds a
+        // draft so the stash is exercised; recall from the key handler only
+        // ever starts on an empty line (see `draft_is_always_empty`).
+        let mut h = History {
+            entries: Vec::new(),
+            file: None,
+        };
+        h.add("first");
+        h.add("second");
+        let mut ed = LineEditor::new();
+        ed.insert_str("draft");
+        ed.nav = Some(2); // as if `prev` had already stashed "draft"
+        ed.draft = "draft".to_string();
+        assert_eq!(h.prev(&mut ed), Some("second".to_string()));
+        ed.set_recalled("second");
+        assert_eq!(h.prev(&mut ed), Some("first".to_string()));
+        ed.set_recalled("first");
+        assert_eq!(h.prev(&mut ed), None);
         // stepping forward restores the stashed draft past the newest entry
-        assert_eq!(h.next(&mut nav, &mut draft), Some("second".to_string()));
-        assert_eq!(h.next(&mut nav, &mut draft), Some("draft".to_string()));
-        assert!(nav.is_none());
+        assert_eq!(h.next(&mut ed), Some("second".to_string()));
+        assert_eq!(h.next(&mut ed), Some("draft".to_string()));
+        assert!(ed.nav.is_none());
+    }
+
+    #[test]
+    fn draft_is_always_empty() {
+        // `draft` looks vestigial because it is, under the current policy:
+        // recall only starts on an empty line, so there is nothing to stash.
+        // Pinned so that stays true — the moment recall is allowed to start
+        // over a draft, this is the test that has to be re-read.
+        let mut h = recall_hist();
+        let mut ed = LineEditor::new();
+        Repl::edit_key(up_key(), &mut ed, &mut h, "");
+        assert_eq!(
+            ed.draft, "",
+            "recall starts on an empty line, so nothing to stash"
+        );
+        ed.set_recalled("second");
+        Repl::edit_key(up_key(), &mut ed, &mut h, "");
+        assert_eq!(ed.draft, "");
     }
 
     #[test]
@@ -3564,25 +3699,20 @@ mod tests {
         // and destructive enough to lose the whole prompt. Up should now be a
         // no-op while the buffer is non-empty and the user hasn't started
         // navigating history yet.
-        let mut h = History {
-            entries: Vec::new(),
-            file: None,
-        };
-        h.add("first");
-        h.add("second");
-        let mut nav: Option<usize> = None;
-        let mut draft = String::new();
+        let mut h = recall_hist();
         let mut editor = LineEditor::from_text("in progress");
         editor.end();
-        let key = event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-        let _ = Repl::edit_key(key, &mut editor, &mut h, &mut nav, &mut draft, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
         assert_eq!(
             editor.text(),
             "in progress",
             "Up must not clobber the unsubmitted prompt"
         );
-        assert!(nav.is_none(), "history navigation must not have started");
-        assert!(draft.is_empty(), "no draft should have been stashed");
+        assert!(
+            editor.nav.is_none(),
+            "history navigation must not have started"
+        );
+        assert_eq!(editor.draft, "", "no draft should have been stashed");
     }
 
     #[test]
@@ -3590,51 +3720,238 @@ mod tests {
         // Counterpart to the regression test: an empty buffer should still
         // navigate history on Up so the previous-entry recall behavior
         // (the original reason Up-on-top exists) is preserved.
-        let mut h = History {
-            entries: Vec::new(),
-            file: None,
-        };
-        h.add("first");
-        h.add("second");
-        let mut nav: Option<usize> = None;
-        let mut draft = String::new();
+        let mut h = recall_hist();
         let mut editor = LineEditor::new();
-        let key = event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-        let _ = Repl::edit_key(key, &mut editor, &mut h, &mut nav, &mut draft, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
         assert_eq!(
             editor.text(),
-            "second",
+            "third",
             "empty buffer should load latest history entry"
         );
-        assert!(nav.is_some());
-        assert!(draft.is_empty());
+        assert!(editor.nav.is_some());
+        assert_eq!(editor.draft, "");
     }
 
     #[test]
     fn up_continues_history_navigation_when_already_inside() {
-        // Once the user has already navigated back (nav is Some), they are
-        // intentionally walking the history; Up must keep advancing even if
-        // the buffer is non-empty (it now holds a history entry, not a fresh
-        // draft), and Down must keep restoring.
+        // Once the user has already navigated back, they are intentionally
+        // walking the history; Up must keep advancing even though the buffer is
+        // non-empty (it holds a history entry, not a fresh draft), and Down
+        // must keep restoring. This is the whole content of
+        // `browsable = text.is_empty() || nav.is_some()`.
+        let mut h = recall_hist();
+        let mut editor = LineEditor::new();
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        assert_eq!(editor.text(), "third");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        assert_eq!(editor.text(), "second");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        assert_eq!(editor.text(), "third");
+    }
+
+    #[test]
+    fn down_does_not_clobber_a_draft_typed_after_recall() {
+        // Regression: Down consulted the recall position alone, so a line
+        // edited after a recall was still "inside history" as far as it was
+        // concerned — Down replaced the edit with the next entry, and at the
+        // newest entry with the (empty) stash, so the prompt went blank. The
+        // edit has to survive.
+        let (mut h, mut editor) = recalled_newest();
+        editor.insert_str(" EDITED");
+        assert_eq!(editor.text(), "third EDITED");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        assert_eq!(
+            editor.text(),
+            "third EDITED",
+            "Down must not replace a draft with a history entry"
+        );
+        assert!(editor.nav.is_none(), "the edit ended the walk");
+    }
+
+    #[test]
+    fn down_does_not_clobber_a_draft_on_a_fresh_line() {
+        // The same guarantee with no recall in progress at all — Down is
+        // forward-only, so an untouched draft is unreachable by definition.
+        let mut h = recall_hist();
+        let mut editor = LineEditor::from_text("half-written thought");
+        editor.end();
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        assert_eq!(editor.text(), "half-written thought");
+    }
+
+    #[test]
+    fn down_on_a_cleared_line_does_not_pull_history() {
+        // Regression: clearing the buffer (here `Ctrl-U`) used to leave the
+        // recall position behind, so Down on the now-empty line pulled an entry
+        // in — history browsing the user had not asked for. Clearing the line
+        // ends the walk, so the next Down does nothing.
+        let mut h = recall_hist();
+        let mut editor = LineEditor::new();
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        assert_eq!(editor.text(), "second");
+        Repl::edit_key(
+            event::KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &mut editor,
+            &mut h,
+            "",
+        );
+        assert_eq!(editor.text(), "");
+        assert!(editor.nav.is_none(), "clearing the line ends the walk");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        assert_eq!(
+            editor.text(),
+            "",
+            "Down on an empty line must not pull an entry in"
+        );
+    }
+
+    #[test]
+    fn up_after_editing_a_recalled_line_keeps_the_edit() {
+        // Regression (the Up direction): once inside history, an edit used to
+        // be overwritten by the next `Up` with nothing stashed to recover it.
+        let (mut h, mut editor) = recalled_newest();
+        editor.insert_str(" EDITED");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        assert_eq!(editor.text(), "third EDITED");
+    }
+
+    #[test]
+    fn every_content_write_ends_the_walk() {
+        // The invariant the key handler leans on: with `nav` cleared, `Up`
+        // cannot browse over a line the user owns. One case per writer that can
+        // change the text without the user typing a printable char, plus the
+        // two session-level ones (`set` for prefill/`Ctrl-E`/submit,
+        // `replace_range` for the prose completion splice).
+        let mut h = recall_hist();
+        let mut editor = LineEditor::new();
+        Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        assert!(editor.nav.is_some());
+        // Cursor moves are not content writes and must keep the walk alive —
+        // this is what lets `Up`/`Down` move the caret inside a recalled
+        // multi-line entry without dropping out of history.
+        editor.left();
+        editor.end();
+        editor.move_down_line();
+        assert!(editor.nav.is_some(), "cursor movement keeps the walk");
+        editor.insert_newline();
+        assert!(editor.nav.is_none(), "insert_newline ends the walk");
+
+        for (what, f) in [
+            ("insert_str", 1usize),
+            ("backspace", 2),
+            ("delete", 3),
+            ("delete_line_start", 4),
+            ("delete_line_end", 5),
+            ("replace_range", 6),
+            ("set", 7),
+        ] {
+            let mut ed = LineEditor::new();
+            Repl::edit_key(up_key(), &mut ed, &mut h, "");
+            assert!(ed.nav.is_some(), "{what}: recall to start from");
+            match f {
+                1 => ed.insert_str("x"),
+                2 => ed.backspace(),
+                3 => {
+                    ed.left();
+                    ed.delete();
+                }
+                4 => ed.delete_line_start(),
+                5 => {
+                    ed.home();
+                    ed.delete_line_end();
+                }
+                6 => ed.replace_range(0, 1, "y"),
+                _ => ed.set("z"),
+            }
+            assert!(ed.nav.is_none(), "{what} must end the walk");
+        }
+    }
+
+    #[test]
+    fn recall_starts_at_the_newest_entry_after_a_submit() {
+        // Regression: the recall position lived on the session and outlived the
+        // prompt, so after submitting a recalled line the next prompt's first
+        // `Up` resumed from the stale index and offered an *older* entry. The
+        // editor that `read_input` clears on submit now carries the reset.
+        let mut h = recall_hist();
+        let mut editor = LineEditor::new();
+        Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        // Submit: the buffer is cleared and the line recorded (repl.rs:1707).
+        editor.set("");
+        h.add("third");
+        assert!(editor.nav.is_none());
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        assert_eq!(editor.text(), "third", "recall starts at the newest entry");
+    }
+
+    #[test]
+    fn a_derived_rewrite_keeps_the_walk() {
+        // History holds `/`-commands, so recalling one re-opens its menu and
+        // the `/`-engine rewrites the line from what recall put there
+        // (`/model` → `/model `). That rewrite is not the user typing, so it
+        // must not look like an edit: if it ended the walk, `Up`/`Down` would
+        // refuse to browse with the menu open and the user would be locked into
+        // the prompt they had just recalled until they cleared it.
+        let (mut h, mut editor) = recalled_newest();
+        editor.set_recalled("/model");
+        editor.set_derived("/model ");
+        assert_eq!(editor.text(), "/model ");
+        assert!(
+            editor.nav.is_some(),
+            "the engine's rewrite of a recalled prompt keeps the walk"
+        );
+        // …and the walk still works: `Up` steps one entry further back.
+        h.add("/model");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        assert_eq!(editor.text(), "second", "Up still walks the history");
+        // `Down` likewise, and back to the newest entry rather than locking.
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        assert_eq!(editor.text(), "third");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        assert_eq!(editor.text(), "/model", "Down reaches the newest entry");
+    }
+
+    #[test]
+    fn a_recalled_slash_command_still_browses_when_its_menu_reopens() {
+        // The same lock-in, end to end through the real `/`-engine. History
+        // holds the `/`-commands the menu commits, so recalling one re-opens its
+        // menu, and opening it rewrites the prompt it was recalled from
+        // (`/model` → `/model `). That rewrite is the engine talking about the
+        // line already on screen, not the user typing, so the walk survives it
+        // — otherwise `Up`/`Down` would go dead with the menu open and the user
+        // would have to clear the prompt to get history back.
+        //
+        // `Tab` is what opens the option list, so it is the key that makes the
+        // engine rewrite; a passive eval of `/model` alone derives no options
+        // and leaves the text alone.
         let mut h = History {
             entries: Vec::new(),
             file: None,
         };
-        h.add("first");
-        h.add("second");
-        let mut nav: Option<usize> = None;
-        let mut draft = String::new();
-        let mut editor = LineEditor::new();
-        let up = event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-        let _ = Repl::edit_key(up, &mut editor, &mut h, &mut nav, &mut draft, "");
-        assert_eq!(editor.text(), "second");
-        // second Up while buffer is non-empty should still navigate (nav != None)
-        let _ = Repl::edit_key(up, &mut editor, &mut h, &mut nav, &mut draft, "");
-        assert_eq!(editor.text(), "first");
-        // Down restores the previous entry
-        let down = event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-        let _ = Repl::edit_key(down, &mut editor, &mut h, &mut nav, &mut draft, "");
-        assert_eq!(editor.text(), "second");
+        h.add("older line");
+        h.add("/model");
+        let mut sess = PromptSession::new(None, &batch_state());
+        Repl::edit_key(up_key(), &mut sess.editor, &mut h, "");
+        assert_eq!(sess.editor.text(), "/model");
+        sess.pending_key = Some(crate::slashdot_menu::HostKey::Tab);
+        let outcome = crate::agent::block_on_test(sess.eval());
+        assert!(
+            matches!(outcome, EvalOutcome::Frame),
+            "opening the menu is a frame, not a commit"
+        );
+        assert!(
+            matches!(sess.overlay, ActiveOverlay::V25Menu { .. }),
+            "recalling a `/`-command re-opens its menu"
+        );
+        assert_eq!(sess.editor.text(), "/model ", "the menu rewrote the prompt");
+        assert!(
+            sess.editor.nav.is_some(),
+            "the rewrite must not end the walk"
+        );
+        // …and history still answers.
+        let _ = Repl::edit_key(up_key(), &mut sess.editor, &mut h, "");
+        assert_eq!(sess.editor.text(), "older line", "Up still walks history");
     }
 
     #[test]
