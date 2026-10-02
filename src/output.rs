@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use termimad;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::row_count::RowCounter;
 
@@ -136,6 +136,182 @@ fn at_line_start(bytes: &[u8]) -> Vec<u8> {
         out.push(b'\n');
     }
     out
+}
+
+/// Where inside an escape sequence the byte stream is, so escape bytes are
+/// passed through without counting as cells. `St` is the string-terminator
+/// tail (`ESC \`) of OSC/DCS families.
+#[derive(PartialEq, Clone, Copy)]
+enum EscState {
+    None,
+    /// The `ESC` itself has been seen; the next byte picks the family.
+    Escape,
+    Csi,
+    Osc,
+    Str,
+    OscSt,
+    StrSt,
+}
+
+/// Content's width guard — the safety net under the renderer's own wrapping
+/// (`codewandler-markdown` wraps code and prose at the source) and the last
+/// thing before the terminal would wrap on its own.
+///
+/// Any line wider than `width` gets a newline inserted at the cell where the
+/// terminal would have wrapped, so the continuation row is **entered by a
+/// byte** and the [`LineClear`] below arms its `EL` there (ui_draw_261001: a
+/// natural wrap crosses rows with no byte between, and the continuation
+/// keeps whatever the frame below painted — the status-bar remnant). The
+/// break is cell-exact only: no word preference, no indent — that is the
+/// renderer's job; this struct's job is that *nothing* over-wide escapes.
+///
+/// Colors survive by construction: escapes pass through whole (and are never
+/// counted), SGR state belongs to the terminal, and an inserted newline does
+/// not touch it. Sits **above the counter** (the inserted `\n` counts as the
+/// row move it replaces — `rows_of` counts a wrap and a `\n` alike, so
+/// `note_lines` does not move) and **above the line-clear**, **below the
+/// hold** (held newlines reset `col`). A capture passes through raw
+/// (`enabled == false`) — captured bytes are assertions against content, not
+/// against a screen.
+///
+/// State is per write *call*: the content contract opens every call at line
+/// start (blocks are line-terminated, and the renderer flushes only complete
+/// lines — split-equivalence), so `col` seeds at 0.
+struct WrapLines<'a, W: io::Write + ?Sized> {
+    inner: &'a mut W,
+    width: usize,
+    enabled: bool,
+    /// Display columns since the line's last newline.
+    col: usize,
+    /// Bytes of a multi-byte char split across writes. Held, not emitted:
+    /// the wrap decision must be made before the char's first byte.
+    partial: Vec<u8>,
+    esc: EscState,
+}
+
+/// Display width of a complete (valid UTF-8) byte sequence: one char's
+/// width, zero-width for anything undecodable.
+fn bytes_width(b: &[u8]) -> usize {
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| s.chars().next())
+        .and_then(UnicodeWidthChar::width)
+        .unwrap_or(0)
+}
+
+impl<W: io::Write + ?Sized> WrapLines<'_, W> {
+    /// Emit one visible unit (already width-measured), inserting the wrap
+    /// newline first when it would cross the edge.
+    fn put(&mut self, bytes: &[u8], cw: usize) -> io::Result<()> {
+        if self.col > 0 && self.col + cw > self.width {
+            self.inner.write_all(b"\n")?;
+            self.col = 0;
+        }
+        self.inner.write_all(bytes)?;
+        self.col += cw;
+        Ok(())
+    }
+}
+
+impl<W: io::Write + ?Sized> io::Write for WrapLines<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.enabled {
+            return self.inner.write(buf);
+        }
+        let mut i = 0usize;
+        // A char held from the previous write completes here: decide the wrap
+        // before its bytes move.
+        if !self.partial.is_empty() {
+            let need = utf8_len(self.partial[0]);
+            while self.partial.len() < need && i < buf.len() {
+                self.partial.push(buf[i]);
+                i += 1;
+            }
+            if self.partial.len() < need {
+                return Ok(i);
+            }
+            let cw = bytes_width(&self.partial);
+            let done = std::mem::take(&mut self.partial);
+            self.put(&done, cw)?;
+        }
+        while i < buf.len() {
+            let b = buf[i];
+            match self.esc {
+                EscState::None => {
+                    if b == 0x1b {
+                        self.esc = EscState::Escape;
+                    } else if b == b'\n' {
+                        self.inner.write_all(&buf[i..i + 1])?;
+                        self.col = 0;
+                        i += 1;
+                        continue;
+                    } else if b < 0x80 {
+                        let cw = UnicodeWidthChar::width(b as char).unwrap_or(0);
+                        self.put(&buf[i..i + 1], cw)?;
+                        i += 1;
+                        continue;
+                    } else {
+                        let need = utf8_len(b);
+                        if i + need > buf.len() {
+                            self.partial.extend_from_slice(&buf[i..]);
+                            return Ok(buf.len());
+                        }
+                        let cw = bytes_width(&buf[i..i + need]);
+                        let end = i + need;
+                        self.put(&buf[i..end], cw)?;
+                        i = end;
+                        continue;
+                    }
+                }
+                EscState::Escape => {
+                    self.esc = match b {
+                        b'[' => EscState::Csi,
+                        b']' => EscState::Osc,
+                        b'P' | b'X' | b'^' | b'_' => EscState::Str,
+                        _ => EscState::None,
+                    };
+                }
+                EscState::Csi => {
+                    if (0x40..=0x7e).contains(&b) {
+                        self.esc = EscState::None;
+                    }
+                }
+                EscState::Osc => {
+                    if b == 0x07 {
+                        self.esc = EscState::None;
+                    } else if b == 0x1b {
+                        self.esc = EscState::OscSt;
+                    }
+                }
+                EscState::OscSt => {
+                    self.esc = if b == b'\\' {
+                        EscState::None
+                    } else {
+                        EscState::Osc
+                    };
+                }
+                EscState::Str => {
+                    if b == 0x1b {
+                        self.esc = EscState::StrSt;
+                    }
+                }
+                EscState::StrSt => {
+                    self.esc = if b == b'\\' {
+                        EscState::None
+                    } else {
+                        EscState::Str
+                    };
+                }
+            }
+            self.inner.write_all(&buf[i..i + 1])?;
+            i += 1;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Content's line-clear transform: emits `\x1b[K` on **row entry** — before
@@ -1991,17 +2167,11 @@ impl ConsoleOutput {
     }
 
     fn write_content_block(&self, bytes: &[u8], kind: Option<ContentDisplayKind>, closes: bool) {
+        // No wrapping here: `with_content_writer`'s `WrapLines` is the one
+        // choke every writer passes — batch strings, streamed renderer
+        // output, everything — so a line can no longer reach the terminal
+        // wider than the terminal.
         let width = term_width();
-        // Wrap over-long lines before they meet the overwrite rule — see
-        // `row_count::wrap_to_width`: a row the terminal wraps into without a
-        // byte is a row `LineClear` never clears, and the frame's cells (the
-        // status bar's right margin, after a sharing commit) survive in it.
-        // Valid UTF-8 only: a chunk split mid-character is not where an
-        // overflowing line's break point lives.
-        let wrapped = std::str::from_utf8(bytes)
-            .ok()
-            .map(|t| crate::row_count::wrap_to_width(t, width));
-        let bytes = wrapped.as_ref().map_or(bytes, |s| s.as_bytes());
         self.with_content_writer(width, kind, closes, |out| {
             let _ = out.write_all(bytes);
         });
@@ -2125,6 +2295,18 @@ impl ConsoleOutput {
         // this: it is cursor movement, not content, and never passes through
         // the counter or the clear.
         let mut counter = RowCounter::new(&mut clear, width);
+        // The width guard goes between the hold and the counter: held
+        // newlines reset its column, its inserted newline reaches the
+        // counter (counted as the row move it replaces) and the line-clear
+        // (armed for the continuation row). See `WrapLines`.
+        let mut wrap = WrapLines {
+            inner: &mut counter,
+            width: width.max(1),
+            enabled: !capturing,
+            col: 0,
+            partial: Vec::new(),
+            esc: EscState::None,
+        };
         // The rows that belong *between* blocks — the matrix's boundary line,
         // and whatever the previous block held back — are pending content, not
         // something drawn on the way in. They go to the same mechanism that
@@ -2148,7 +2330,7 @@ impl ConsoleOutput {
         // content that over-emitted (blamed above), never something to draw.
         let pending = rows_due.max(held).min(1);
         let mut hold = HoldTrailing {
-            inner: &mut counter,
+            inner: &mut wrap,
             pending: 0,
             wrote_content: false,
             wrote_any: false,
@@ -4068,6 +4250,20 @@ mod tests {
         (out, reasoning)
     }
 
+    /// A cloneable byte sink: swapped into `ConsoleOutput::writer` so a test
+    /// can read what the content path emitted without a terminal.
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// Tracked cursor row of `out` (0-based, as the screen reports it).
     fn tracked_row(out: &ConsoleOutput) -> usize {
         out.draw.lock().unwrap().tracked_row() - 1
@@ -5317,6 +5513,112 @@ mod tests {
         assert!(
             !lines[idx - 2].trim().is_empty(),
             "exactly ONE blank line before answer two (no double gap)"
+        );
+    }
+
+    /// Option 2 — the choke: `with_content_writer` wraps, so the
+    /// renderer-direct feed path can no longer hand the terminal a line wider
+    /// than itself. The break is at the cell edge and the continuation is
+    /// entered by a byte — the `\x1b[K` after each `\n` in the expectation is
+    /// the line-clear arming there. Pre-fix: one 120-cell run, no arm, and
+    /// whatever the frame below painted survived in the continuation.
+    #[test]
+    #[serial]
+    fn content_choke_wraps_an_overwide_line_before_the_line_clear() {
+        let (mut out, _reasoning) = capturing_output(60);
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        out.writer = Mutex::new(Box::new(sink.clone()));
+        let y = "y".repeat(120);
+        out.with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
+            w.write_all(y.as_bytes()).unwrap();
+            w.write_all(b"\n").unwrap();
+        });
+        let bytes = sink.0.lock().unwrap().clone();
+        let text = String::from_utf8(bytes).expect("utf-8 content");
+        let expect = format!("\x1b[K{}\n\x1b[K{}\n", &y[..60], &y[60..]);
+        assert_eq!(
+            text, expect,
+            "wrap at the cell edge, clear armed on the continuation"
+        );
+    }
+
+    /// The safety net never splits an escape: the color opens before the
+    /// inserted newline and closes after it — SGR state is the terminal's and
+    /// carries the green across the continuation row.
+    #[test]
+    #[serial]
+    fn wrapped_content_keeps_its_sgr_across_the_inserted_newline() {
+        let (mut out, _reasoning) = capturing_output(60);
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        out.writer = Mutex::new(Box::new(sink.clone()));
+        let y = "y".repeat(120);
+        let input = format!("\x1b[32m{y}\x1b[0m\n");
+        out.with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
+            w.write_all(input.as_bytes()).unwrap();
+        });
+        let bytes = sink.0.lock().unwrap().clone();
+        let text = String::from_utf8(bytes).expect("utf-8 content");
+        let expect = format!("\x1b[K\x1b[32m{}\n\x1b[K{}\x1b[0m\n", &y[..60], &y[60..]);
+        assert_eq!(text, expect, "escape intact, wrap inside the color");
+    }
+
+    /// A capture is an assertion against content, not a screen: the width
+    /// guard steps aside and the bytes come back as they went in.
+    #[test]
+    #[serial]
+    fn captures_stay_raw_no_wrap_no_clear() {
+        let (out, _reasoning) = capturing_output(60);
+        let y = "y".repeat(120);
+        out.begin_capture();
+        out.with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
+            w.write_all(y.as_bytes()).unwrap();
+            w.write_all(b"\n").unwrap();
+        });
+        let cap = out.end_capture();
+        let mut expect = y.into_bytes();
+        expect.push(b'\n');
+        assert_eq!(cap, expect, "captured bytes are the raw content");
+    }
+
+    /// The width guard's own edges: escape bytes never count as cells, and a
+    /// multi-byte char split across writes is held whole until the wrap
+    /// decision it belongs to has been made.
+    #[test]
+    fn wrap_lines_counts_escapes_and_carries_split_chars() {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut w = WrapLines {
+            inner: &mut sink,
+            width: 10,
+            enabled: true,
+            col: 0,
+            partial: Vec::new(),
+            esc: EscState::None,
+        };
+        w.write_all(b"\x1b[38;5;12maaaaaaaaaaaaaaa").unwrap();
+        w.write_all(b"\n").unwrap();
+        assert_eq!(
+            String::from_utf8(sink.clone()).unwrap(),
+            "\x1b[38;5;12maaaaaaaaaa\naaaaa\n",
+            "escape params are zero cells; the wrap lands at 10"
+        );
+
+        let mut sink: Vec<u8> = Vec::new();
+        let mut w = WrapLines {
+            inner: &mut sink,
+            width: 6,
+            enabled: true,
+            col: 0,
+            partial: Vec::new(),
+            esc: EscState::None,
+        };
+        let s = "日日日日".as_bytes();
+        w.write_all(&s[..5]).unwrap(); // one char whole, the next split
+        w.write_all(&s[5..]).unwrap();
+        w.write_all(b"\n").unwrap();
+        assert_eq!(
+            String::from_utf8(sink).unwrap(),
+            "日日日\n日\n",
+            "the held char completes, then wraps before the fourth"
         );
     }
 
