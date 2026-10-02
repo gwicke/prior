@@ -319,7 +319,12 @@ impl RenderAt for RowsItem {
                 .active
                 .iter()
                 .filter(|i| in_window(i))
-                .copied()
+                // Rebased like the cursor, not just filtered: `active_rows`
+                // index the *plan's* rows, while `paint_rows` is handed the
+                // window and reads them as offsets into it. Without the
+                // `- start` an active row at index 7 in a window starting at
+                // 5 marks offset 7 — i.e. plan row 12.
+                .map(|i| i - start)
                 .collect::<Vec<_>>(),
             tw,
         );
@@ -488,6 +493,73 @@ fn quick_key_index(spec: &ConfirmSpec<'_>, c: char) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// An active row keeps its `*` after the rows have scrolled.
+    ///
+    /// The active indices are *absolute* — they index the plan's rows —
+    /// while `paint_rows` is handed the window and reads them as offsets
+    /// into it, so they have to be rebased by the window's start exactly
+    /// as the cursor is. With a short menu the window starts at 0 and the
+    /// two agree by accident; only a list long enough to scroll shows the
+    /// difference.
+    ///
+    /// Driven through [`overlay_elements`] rather than `Element::data_rows`
+    /// directly, so the composition path is covered too — a plan whose
+    /// active rows are mis-wired on the way in would pass a test that
+    /// skipped it.
+    #[test]
+    fn active_markers_survive_a_scrolled_window() {
+        let n = 40usize;
+        let rows: Vec<LogicalLine> = (0..n)
+            .map(|i| LogicalLine::new(format!("item {i}")))
+            .collect();
+        // Visible text of a painted row: drop the SGR runs, then trim.
+        let plain = |row: &str| {
+            let mut out = String::new();
+            let mut chars = row.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for e in chars.by_ref() {
+                        if e.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out.trim().to_string()
+        };
+        let stars = |sel: usize, active: Vec<usize>| {
+            let plan = RenderPlan {
+                rows: Arc::new(rows.clone()),
+                selected: Some(sel),
+                active_rows: active,
+                ..Default::default()
+            };
+            let els = overlay_elements(&plan, 20, Some(sel));
+            let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
+            let heights = allocate(&extents, live_budget(24));
+            let f = render(&els, &heights, 20);
+            (0..f.height())
+                .filter(|i| f.row(*i).contains('*'))
+                .map(|i| plain(f.row(i)))
+                .collect::<Vec<_>>()
+        };
+        // Cursor deep in the list, so the window starts well above row 0.
+        // Active row 31 is inside it; active row 7 is not, and must not be
+        // marked — an unmarked row outside the window cannot be mistaken for a
+        // mis-placed one.
+        assert_eq!(
+            stars(30, vec![31]),
+            vec!["* item 31".to_string()],
+            "the `*` must land on the row it names"
+        );
+        assert_eq!(
+            stars(30, vec![7]),
+            Vec::<String>::new(),
+            "an active row outside the window must not be marked in it"
+        );
+    }
     use super::*;
     use crate::output::NoOutput;
     use std::sync::Mutex;
