@@ -1,7 +1,7 @@
-- [x] Non-REPL slash input (in-process / non-tty hosts) — routed through the
-      v2.5 menu eval (`Repl::batch_slash`: passive derive + virtual Enter,
-      drawing ignored); the four typed arms are deleted
-      (doc/editor_cleanup.md §9 E5).
+# TODO
+NOTE: Keep things tight - normally no more than 1-2 lines per bullet point.
+More detail -> create and link a doc/ and/or commit hash
+
 - [ ] `--quiet` with no positional prompt spins: the non-REPL input arm
       (`repl == None`) pairs a `QuietOutput::get_user_input` that always
       returns `""` with `if input.is_empty() { continue }` — a pre-existing
@@ -35,16 +35,3 @@
 
 - [ ] tool errors: split the operator's view from the model's, then unredact —
   path_leak_risks.md (`edit` done; `read`/`write`/`glob`/`grep`/`list`/`sed` open)
-- [x] re-accept `edits: [{oldText,newText}]` — accepted, never advertised;
-  stringified arrays recovered; `edit` errors no longer redacted to
-  "the tool failed". doc/edits_readd_and_arg_errors.md
-
-## Drawing / doc/ui_draw_v2.md
-- [x] Input field content loss on key-down
-- [ ] U4.4 — the ordering question you answered.
-  content write vs. frame update synchronization
-- [x] Cancelling a turn when it is being retried does not seem to work
-  reliably any more - related to event pumps 
-- [x] lift overlay composition and -windowing into vertical render stack
-  - [x] restore fixed table headers
-  - have one place doing all vertical scaling
