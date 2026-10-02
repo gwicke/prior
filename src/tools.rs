@@ -496,20 +496,21 @@ const BSED_BIN: &str = "bsed";
 
 #[rig_tool(
     name = "sed",
-    description = "Safe GNU sed batch editing. Returns editable @@@OLD / @@@NEW blocks for the edit tool. \
-NEVER writes the file: it returns the change as @@@OLD / @@@NEW blocks, each \
-anchored to a line with a `path:LINE` header. Review the changes, edit @@@NEW text if necessary, \
-then pass blocks to the `edit` tool as its `blocks` argument to apply. \
-Point `path` at a directory to preview every text file under it (hidden and \
-ignored files are skipped); a file path previews just that file. The payload is \
-budgeted, so a tree that matches in many places returns ONE batch, cut at a \
-file boundary and saying so: when the summary says `returned N of M`, apply the \
-batch, then run the same call again for the rest. Re-running is how a wide \
+    description = "Safe `sed` batch preview. Returns clean, line-disambiguated @@@OLD / @@@NEW blocks \
+for the edit tool, never modifies files. Review the blocks, tweak @@@NEW text if necessary, \
+then pass them to the `edit` tool as its `blocks` string argument to apply. \
+**Auto multi-line context**: Automatically widens context to multiple lines for unbalanced structures. \
+Target `someFunction(`, get multi-line context including `someFunction(\n...\n)`. Edit @@@NEW to add \
+or remove wrappers etc.\
+**path**: Point at file for single-file operation, directory for *recursive* traversal (hidden and \
+ignored files are skipped). The payload is budgeted, so a tree that matches in many places \
+returns ONE batch, cut at a file boundary and saying so: when the summary says `returned N of M`, \
+apply the batch, then run the same call again for the rest. Re-running is how a wide \
 refactor finishes, and it costs nothing to re-run on a tree that is already \
 done — you get `no lines matched` back. \
-Syntax: One expression per line, GNU sed syntax (s///, d, a, i, c, \
+**Syntax**: One expression per line, GNU sed syntax (s///, d, a, i, c, \
 y///, addresses, ranges) — `c` works over an address range, replacing it with one copy of the \
-text. `w`, `e` and `q` are refused: use the `edit` or `bash` tools for those.",
+text. `w`, `e` and `q` are refused: use the `edit` or (very carefully) `bash` tools for those.",
     required(path, expressions)
 )]
 pub async fn sed_preview(

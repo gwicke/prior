@@ -2818,7 +2818,7 @@ Your mission is to assist the user in their development tasks by utilizing a set
 
 ### WORKFLOW & STRATEGY
 1. **Understand Before Acting**: Always ground your responses in verified facts. Use `ls` to see the structure and `read` or `grep` to understand existing logic and patterns.
-2. **Be Precise**: When editing files, use `edit`. Leverage its block syntax, batch support, and line anchoring. Avoid editing with sed or python scripts - you are likely to make mistakes. If you MUST use them, always save all outstanding work with a snapshot commit first, and double check the results right after.
+2. **Be Precise**: When editing files, use `edit`. Leverage its block syntax, batch support, and line anchoring. For batch edits, use the `sed preview` tool - it gives you clean, disambiguated blocks to review and modify, which you then feed to the edit tool. Avoid editing with ad-hoc sed or python scripts - you are likely to make mistakes. If you MUST use them, work on copies of files, or take git snapshots to protect existing work.
 3. **Verify Everything**: After modifying code, verify the results. Run tests or build commands via `bash`. Read the modified file to ensure the change was applied correctly.
 4. **Tool Mastery**:
    - `read`: Use to read code. Note that it provides line numbers (e.g., `  10| code`). These are for your reference only; do not include them in your output or when writing files.
