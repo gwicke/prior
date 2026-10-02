@@ -1850,7 +1850,8 @@ src/x.rs:9
             serde_json::json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@END"}),
             serde_json::json!({"oldText": "a", "newText": "b"}),
             serde_json::json!({"path": "src/x.rs:10", "startLine": 3, "oldText": "a", "newText": "b"}),
-            serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]}),
+            serde_json::json!({"edits": [{"path": "a.rs", "oldText": "a", "newText": "b"},
+                                          {"path": "b.rs", "oldText": "a", "newText": "b"}]}),
         ] {
             let msg = crate::tools::EditArgs::from_wire(&raw).expect_err("must fail");
             assert!(
@@ -6143,7 +6144,8 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
             // `Actual` is a JSON echo, and an echo elided to a single line.
             serde_json::json!({"oldText": "a", "newText": "b"}),
             serde_json::json!({"path": "src/x.rs:10", "startLine": 3, "oldText": "a", "newText": "b"}),
-            serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]}),
+            serde_json::json!({"edits": [{"path": "a.rs", "oldText": "a", "newText": "b"},
+                                          {"path": "b.rs", "oldText": "a", "newText": "b"}]}),
             serde_json::json!({"blocks": "@@ -10,1 +10,1 @@\n- a\n+ b"}),
         ] {
             let err = crate::tools::EditArgs::from_wire(&raw).expect_err("must fail");

@@ -1735,10 +1735,12 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
 
 /// Render `edit` tool-call arguments in the model-facing block form.
 ///
-/// The transcript is stored canonically (a pi-compatible `edits` array), but
-/// the model is shown the block form **consistently** so it keeps emitting the
-/// reliable shape and is not nudged back toward the array (the form weak
-/// harnesses mangle). Idempotent and allocation-light: non-`edit` calls and
+/// The transcript is stored canonically (a pi-compatible `edits` array) and the
+/// wire *accepts* that array too, but the schema does not advertise it — so the
+/// history normalizes it back to blocks and the model sees **one** shape. That
+/// is still the right call with two shapes accepted: the block form is the one
+/// weak harnesses can encode, and a history that mixes both teaches the model to
+/// alternate between them. Idempotent and allocation-light: non-`edit` calls and
 /// already-block arguments pass through unchanged.
 fn blob_edit_tool_calls(messages: Vec<Message>) -> Vec<Message> {
     messages
@@ -2958,7 +2960,7 @@ fn build_rig_agent(
     builder.build()
 }
 
-use rig_core::tool::{Tool, ToolErrorKind, ToolExecutionError};
+use rig_core::tool::{Tool, ToolExecutionError};
 
 struct Guard<T: Tool> {
     tool: T,
@@ -2987,26 +2989,11 @@ impl<T: Tool<Error = crate::tools::ToolError>> Tool for Guard<T> {
     /// model and hooks receive a meaningful classification instead of always
     /// `ToolErrorKind::Other` (which renders as the generic "the tool failed").
     ///
-    /// - `ToolError::Io` → `Other` (infrastructure failure, not auto-retryable)
-    /// - `ToolError::Generic` containing "timed out" → `Timeout` (auto-retryable)
-    /// - `ToolError::Generic` containing "cancelled" → `Cancelled` (not retryable)
-    /// - everything else → `Other` with the specific message preserved
+    /// One table, shared with the tools that are registered without a guard
+    /// (`EditFile`): a wrapped and an unwrapped tool must not classify the same
+    /// error differently.
     fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        use crate::tools::ToolError;
-
-        match error {
-            ToolError::Io(msg) => ToolExecutionError::other(msg),
-            ToolError::Generic(msg) => {
-                let kind = if msg.contains("timed out") {
-                    ToolErrorKind::Timeout
-                } else if msg.contains("cancelled") {
-                    ToolErrorKind::Cancelled
-                } else {
-                    ToolErrorKind::Other
-                };
-                ToolExecutionError::new(kind, msg)
-            }
-        }
+        crate::tools::map_tool_error(error)
     }
 
     async fn call(

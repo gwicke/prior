@@ -21,16 +21,24 @@
 //!   from each block's `path:LINE` header; a top-level `startLine` is ignored
 //!   in this shape.
 //!
-//! # The `edits` array is not a wire shape
+//! # The `edits` array is accepted, and never advertised
 //!
-//! `{path, edits: [{oldText, newText}]}` was accepted here for pi parity, and
-//! is gone: the whole reason this module exists is that weak tool-calling
-//! harnesses mangle nested arrays — most often by *stringifying* them, which
-//! turns a batch into a JSON string and loses the edit entirely. `edits` is now
-//! storage-only, where nothing has to encode it for a provider: pi's canonical
-//! array, written to and read back from the session file. A model that still
-//! sends one gets a named correction rather than a generic "no recognizable
-//! edit arguments", because pi-shaped training makes that a likely slip.
+//! `{path, edits: [{oldText, newText, startLine?}]}` is pi's canonical form and
+//! the one a pi-trained model reaches for by reflex. It is accepted here for
+//! that reason alone, and it is **not** in the tool's `parameters()`: weak
+//! tool-calling harnesses mangle nested arrays — most often by *stringifying*
+//! them — and an advertised array is an invitation to keep producing them. The
+//! advertised shape stays a flat bag of optional scalars whose one string field
+//! is [`blob::BLOCKS_FIELD`].
+//!
+//! Accepting a shape and advertising it are separate decisions, and only the
+//! first one is made here. `src/tools.rs` pins the second with tests: no
+//! advertised property is an array, and `edits` is absent from the schema.
+//!
+//! The hazard the blob form exists to kill is still handled rather than
+//! assumed away: an `edits` **string** whose first non-space character is `[`
+//! is an array a harness stringified, and it is *recovered* (see
+//! [`stringified_array`]) instead of being handed to the block parser.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -269,6 +277,44 @@ fn actual_summary(raw: &Value) -> String {
     truncate_wire_repr(raw)
 }
 
+/// Every field name this module reads off the raw `arguments` object, whether
+/// advertised or not.
+///
+/// Drives the catch-all's "unrecognized: …" line. Kept beside the parser
+/// rather than beside the schema because *this* list is the one that decides
+/// whether a name is understood; `src/tools.rs` holds the separate, opposite
+/// question (whether everything advertised is in here).
+const READ_FIELDS: &[&str] = &[
+    "path",
+    "startLine",
+    "oldText",
+    "newText",
+    BLOCKS_FIELD,
+    LEGACY_BLOCKS_FIELD,
+];
+
+/// Foreign field names worth *naming*, mapped to this tool's spelling of the
+/// same idea. The most common dialects a model arrives with.
+///
+/// Consulted only to build the catch-all's correction line — a name this tool
+/// has never published is a name it does not read, and accepting an alias would
+/// make it one. The payoff is that "unrecognized: `old_string`" becomes
+/// "`old_string` → `oldText`", which is the whole fix, instead of a field name
+/// the model must guess the counterpart of.
+const FIELD_ALIASES: &[(&str, &str)] = &[
+    ("file_path", "`path`"),
+    ("old_string", "`oldText`"),
+    ("new_string", "`newText`"),
+    ("old_text", "`oldText`"),
+    ("new_text", "`newText`"),
+    ("start_line", "`startLine`"),
+    ("content", "`newText`"),
+    (
+        "replace_all",
+        "not a field — every edit matches exactly once",
+    ),
+];
+
 /// The shape the call came in through, which decides the `Expected:` example.
 ///
 /// Deliberately the same order [`actual_summary`] uses to pick its echo, so the
@@ -277,8 +323,71 @@ fn actual_summary(raw: &Value) -> String {
 /// reads the blob first and *that* is what failed), otherwise the single-edit
 /// fields are, otherwise neither is present and the block form is the shape worth
 /// teaching.
+///
+/// A call carrying a *translatable* alias pair (`old_string` + `new_string`)
+/// counts as the single-edit shape: its correction is a rename inside the shape
+/// it already used, and the JSON example is the renamed shape. An example in
+/// another shape would answer a question nobody asked — see [`Self::invalid`].
 fn is_single_edit_shape(raw: &Value) -> bool {
+    if let Some(obj) = raw.as_object() {
+        if alias_of(obj, "`oldText`").is_some() && alias_of(obj, "`newText`").is_some() {
+            return true;
+        }
+    }
     blob::blob_text(raw).is_none() && (raw.get("oldText").is_some() || raw.get("newText").is_some())
+}
+
+/// This tool's name for `ours`, if the call used a known alias for it.
+///
+/// `ours` is the *rendered* spelling, because the table's right-hand side is the
+/// text the message prints — one string, compared and displayed, so the two
+/// cannot drift.
+fn alias_of<'a>(obj: &'a serde_json::Map<String, Value>, ours: &str) -> Option<&'a str> {
+    let alias: &str = FIELD_ALIASES.iter().find(|(_, to)| *to == ours)?.0;
+    obj.get(alias).and_then(Value::as_str)
+}
+
+/// The `why` line for a call that matched no shape at all.
+///
+/// The base sentence is the standing one, so a shape with nothing to add reads
+/// exactly as it always has. Two lines are added when there are facts worth
+/// spending tokens on: which fields actually arrived (so the model can match
+/// names instead of guessing), and the correct spelling for the ones that are a
+/// known alias of something this tool reads.
+fn unrecognized_why(raw: &Value) -> String {
+    const BASE: &str = "no recognizable edit arguments (expected `oldText`+`newText`, or `blocks`)";
+    let Some(obj) = raw.as_object() else {
+        return BASE.to_string();
+    };
+    let unknown: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !READ_FIELDS.contains(k))
+        .collect();
+    if unknown.is_empty() {
+        return BASE.to_string();
+    }
+    let mut why = format!(
+        "{BASE}\nunrecognized: {}",
+        unknown
+            .iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let fixes: Vec<String> = unknown
+        .iter()
+        .filter_map(|k| {
+            FIELD_ALIASES
+                .iter()
+                .find(|(from, _)| from == k)
+                .map(|(from, to)| format!("`{from}` → {to}"))
+        })
+        .collect();
+    if !fixes.is_empty() {
+        why.push_str(&format!("\nthis tool spells them {}", fixes.join(", ")));
+    }
+    why
 }
 
 impl EditArgs {
@@ -326,6 +435,8 @@ impl EditArgs {
     ///
     /// - single edit: anchors come from `path:LINE` and/or `startLine` (they
     ///   must agree if both are present);
+    /// - array form: each entry anchors itself (`path:LINE`, else `startLine`),
+    ///   falling back to the call's, most specific first;
     /// - blob form: anchors come *only* from each block's `path:LINE` header —
     ///   the top-level `startLine` and any `path:LINE` are ignored, so a stray
     ///   call-wide anchor cannot silently aim an unrelated block.
@@ -356,35 +467,42 @@ impl EditArgs {
 
         // Block form: `blocks` is a string of @@@OLD/@@@NEW blocks.
         // Anchors come solely from each block's `path:LINE` header.
-        if let Some(text) = blob::blob_text(raw) {
-            let parsed = blob::parse_blocks(text)
-                .map_err(|e| Self::invalid(raw, &format!("Invalid block: {e}")))?;
-            // One policy for every block blob, single-file or multi-file: every
-            // block names its own file, and `json_path` is not consulted at all
-            // (block paths are authoritative; `path` is the single-edit form's
-            // argument). Consistency here is free — a block already carries its
-            // `path:LINE` — and it removes a rule the model has to learn twice.
-            let files = blob::split_by_file(parsed).map_err(|e| Self::invalid(raw, &e))?;
-            return Ok(EditArgs {
-                files: files
-                    .into_iter()
-                    .map(|b| FileEdit {
-                        path: b.path,
-                        edits: blob::to_ops(&b.edits),
-                    })
-                    .collect(),
-            });
+        //
+        // `blocks` is consulted first and on its own, so a call carrying both
+        // shapes commits to the advertised one — a *malformed* `blocks` must not
+        // fall through to a healthy `edits`, which would apply an edit the model
+        // did not ask for.
+        if let Some(text) = obj.get(BLOCKS_FIELD).and_then(Value::as_str) {
+            return Self::from_blob(text, raw);
         }
 
-        // `edits` as an array is the canonical *storage* form, not a wire one.
-        // A model that sends it (pi-shaped training makes that likely) gets a
-        // correction naming the field it should use instead of a dead end.
-        if obj.get("edits").map(Value::is_array).unwrap_or(false) {
-            return Err(Self::invalid(
-                raw,
-                "`edits` is a list; it is not a form this tool accepts. Use `blocks` \
-                 (a block string) or the single-edit fields `oldText` + `newText`",
-            ));
+        // Under the old name, a *string* is either a pre-rename blob (`blocks`
+        // is the name we ask for, not one we require) or an array a harness
+        // stringified. Recover the second rather than feeding it to the block
+        // parser, which is exactly the mangling this shape's existence was
+        // meant to route around.
+        if let Some(text) = obj.get(LEGACY_BLOCKS_FIELD).and_then(Value::as_str) {
+            if stringified_array(text) {
+                let entries = match serde_json::from_str::<Value>(text) {
+                    Ok(Value::Array(entries)) => entries,
+                    _ => {
+                        return Err(Self::invalid(
+                            raw,
+                            "`edits` arrived as a string holding JSON that is not a list. \
+                             Send `edits` as a real JSON array, or use `blocks` (a block string)",
+                        ))
+                    }
+                };
+                return Self::from_edits_array(&entries, json_path, start_line, path_anchor, raw);
+            }
+            return Self::from_blob(text, raw);
+        }
+
+        // `edits` as an array: pi's canonical form, accepted because pi-shaped
+        // training makes a model send it by reflex — and never advertised, since
+        // it is the one shape a weak harness cannot encode. See the module docs.
+        if let Some(entries) = obj.get(LEGACY_BLOCKS_FIELD).and_then(Value::as_array) {
+            return Self::from_edits_array(entries, json_path, start_line, path_anchor, raw);
         }
 
         // Single form: top-level oldText/newText. Both `path:LINE` and
@@ -395,21 +513,12 @@ impl EditArgs {
         ) {
             let path =
                 json_path.ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
-            let anchor = match (start_line, path_anchor) {
-                (Some(s), Some(p)) if s.0 != p => {
-                    return Err(Self::invalid(
-                        raw,
-                        &format!(
-                            "the `path` argument anchors line {p} but `startLine` is {}; \
-                             they must agree",
-                            s.0
-                        ),
-                    ));
-                }
-                (Some(s), _) => Some(s),
-                (None, Some(p)) => Some(EditStartLine(p)),
-                (None, None) => None,
-            };
+            let anchor = agree_anchors(path_anchor, start_line.map(|s| s.0), raw, |p, s| {
+                format!(
+                    "the `path` argument anchors line {p} but `startLine` is {s}; \
+                     they must agree"
+                )
+            })?;
             // The origin string for this shape is a *reconstruction*, not a
             // capture: there is no header line in the single-edit form. Rebuild
             // the closest thing to what the model wrote — the `path` as spelled
@@ -449,22 +558,220 @@ impl EditArgs {
                         raw,
                         &format!(
                             "`{field}` is {}; it must be a string of `@@@OLD`/`@@@NEW`/`@@@END` \
-                             blocks, or the canonical `edits` array",
-                            match v {
-                                Value::Object(_) => "an object",
-                                Value::Array(_) => "a list",
-                                _ => "a non-string value",
-                            }
+                             blocks",
+                            json_type(v)
                         ),
                     ));
                 }
             }
         }
 
-        Err(Self::invalid(
+        Err(Self::invalid(raw, &unrecognized_why(raw)))
+    }
+
+    /// The blob form, shared by both names the blob has ever had.
+    fn from_blob(text: &str, raw: &Value) -> Result<Self, String> {
+        let parsed = blob::parse_blocks(text)
+            .map_err(|e| Self::invalid(raw, &format!("Invalid block: {e}")))?;
+        // One policy for every block blob, single-file or multi-file: every
+        // block names its own file, and the `path` argument is not consulted at
+        // all (block paths are authoritative; `path` is the single-edit form's
+        // argument). Consistency here is free — a block already carries its
+        // `path:LINE` — and it removes a rule the model has to learn twice.
+        let files = blob::split_by_file(parsed).map_err(|e| Self::invalid(raw, &e))?;
+        Ok(EditArgs {
+            files: files
+                .into_iter()
+                .map(|b| FileEdit {
+                    path: b.path,
+                    edits: blob::to_ops(&b.edits),
+                })
+                .collect(),
+        })
+    }
+
+    /// The `edits` array: pi's canonical form, one file per call.
+    ///
+    /// **One rule decides the file.** Every path the call names — the `path`
+    /// argument and each entry's own `path`, both with any `:LINE` peeled off —
+    /// must be the same one. That single rule is the whole policy, and it does
+    /// the work of three: a redundant per-entry path is harmless, an array with
+    /// no `path` argument is fine when its entries agree, and the multi-file
+    /// pi form (`[{path: "a"}, {path: "b"}]`) is refused by naming `blocks`. It
+    /// is also the policy the blob form already uses — a `path` argument
+    /// disagreeing with a block header is a hard error — so there is nothing new
+    /// to learn, and no path is ever written that the model did not name.
+    ///
+    /// Anchors are per entry, most specific first: the entry's `path:LINE`, else
+    /// its `startLine`, else the call's. A call-wide anchor reaching several
+    /// entries cannot disambiguate between them, and that is not this layer's
+    /// problem to solve — each `oldText` still has to resolve to a free range,
+    /// and an entry that cannot says so.
+    fn from_edits_array(
+        entries: &[Value],
+        call_path: Option<&str>,
+        call_start_line: Option<EditStartLine>,
+        call_path_anchor: Option<u64>,
+        raw: &Value,
+    ) -> Result<Self, String> {
+        if entries.is_empty() {
+            return Err(Self::invalid(
+                raw,
+                "`edits` is an empty list; it carries no edit. Use `blocks` (a block string) \
+                 or the single-edit fields `oldText` + `newText`",
+            ));
+        }
+
+        // Pass 1: every entry must be an object, and the call must name one file.
+        // Shape first, so a malformed entry is named rather than reported as a
+        // missing `path` it never had a chance to supply.
+        let mut file: Option<String> = call_path.map(str::to_string);
+        for (i, entry) in entries.iter().enumerate() {
+            let Some(obj) = entry.as_object() else {
+                return Err(Self::invalid(
+                    raw,
+                    &format!(
+                        "`edits[{i}]` is {}; every entry must be an object with `oldText` and \
+                         `newText`",
+                        json_type(entry)
+                    ),
+                ));
+            };
+            let Some(named) = entry_path(obj) else {
+                continue;
+            };
+            if let Some(f) = file.as_deref() {
+                if f != named.path {
+                    return Err(Self::invalid(
+                        raw,
+                        &format!(
+                            "`edits` names more than one file (`{f}`, `{}`); one `edits` call is \
+                             one file. Use the `blocks` string for a batch across files",
+                            named.path
+                        ),
+                    ));
+                }
+            } else {
+                file = Some(named.path);
+            }
+        }
+        let path = file.ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
+        let call_anchor = agree_anchors(
+            call_path_anchor,
+            call_start_line.map(|s| s.0),
             raw,
-            "no recognizable edit arguments (expected `oldText`+`newText`, or `blocks`)",
-        ))
+            |p, s| {
+                format!(
+                    "the `path` argument anchors line {p} but `startLine` is {s}; \
+                     they must agree"
+                )
+            },
+        )?;
+
+        // Pass 2: the edits themselves.
+        let mut edits = Vec::with_capacity(entries.len());
+        for (i, entry) in entries.iter().enumerate() {
+            let obj = entry.as_object().expect("pass 1 rejected non-objects");
+            let (old, new) = match (
+                obj.get("oldText").and_then(Value::as_str),
+                obj.get("newText").and_then(Value::as_str),
+            ) {
+                (Some(o), Some(n)) => (o, n),
+                _ => {
+                    return Err(Self::invalid(
+                        raw,
+                        &format!("`edits[{i}]` needs both `oldText` and `newText`"),
+                    ))
+                }
+            };
+            let anchor = match entry_path(obj) {
+                Some(named) => {
+                    agree_anchors(named.anchor, obj.get("startLine").and_then(|v| v.as_u64()), raw, |p, s| {
+                        format!("`edits[{i}]`'s `path` anchors line {p} but its `startLine` is {s}; they must agree")
+                    })?
+                }
+                None => obj.get("startLine").and_then(|v| v.as_u64()).map(EditStartLine),
+            }
+            .or(call_anchor);
+            // The origin identifies a failed entry back to the model, so it is
+            // whatever that entry spelled: its own `path:LINE` verbatim, or the
+            // call's path with the resolved anchor appended.
+            let origin = match (obj.get("path").and_then(Value::as_str), anchor) {
+                (Some(spelled), _) => spelled.to_string(),
+                (None, Some(EditStartLine(l))) => format!("{path}:{l}"),
+                (None, None) => path.clone(),
+            };
+            edits.push(EditOp {
+                old_text: old.to_string(),
+                new_text: new.to_string(),
+                start_line: anchor,
+                origin: Some(origin),
+            });
+        }
+        Ok(EditArgs {
+            files: vec![FileEdit { path, edits }],
+        })
+    }
+}
+
+/// One `path` as an entry spelled it: the file, and the `:LINE` it carried.
+struct NamedPath {
+    path: String,
+    anchor: Option<u64>,
+}
+
+/// An entry's `path` field, peeled. `None` for an entry that names no file —
+/// which is the normal case, since pi puts the path on the call and leaves the
+/// entries bare.
+fn entry_path(obj: &serde_json::Map<String, Value>) -> Option<NamedPath> {
+    let spelled = obj
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let (path, anchor) = blob::split_line_anchor(spelled);
+    Some(NamedPath { path, anchor })
+}
+
+/// Reconcile the two spellings of one anchor — a `:LINE` suffix and a
+/// `startLine` field — which must name the same line when both are present.
+///
+/// Shared by the single-edit and array forms so the disagreement is reported in
+/// one wording (`why` supplies the shape-specific nouns) instead of two that
+/// drift apart.
+fn agree_anchors(
+    from_path: Option<u64>,
+    from_field: Option<u64>,
+    raw: &Value,
+    why: impl FnOnce(u64, u64) -> String,
+) -> Result<Option<EditStartLine>, String> {
+    match (from_path, from_field) {
+        (Some(p), Some(f)) if p != f => Err(EditArgs::invalid(raw, &why(p, f))),
+        (Some(p), _) => Ok(Some(EditStartLine(p))),
+        (None, f) => Ok(f.map(EditStartLine)),
+    }
+}
+
+/// An `edits` **string** holding a JSON array: a harness that stringified the
+/// canonical form instead of nesting it.
+///
+/// Recognized by its first non-space `[` *and* the absence of a block marker.
+/// The second half is what makes it safe: [`blob::blob_text`] hands any string
+/// under `edits` to the block parser, and a real blob opens with a header line
+/// or `@@@OLD` — never a bracket — so the two readings cannot collide.
+fn stringified_array(text: &str) -> bool {
+    text.trim_start().starts_with('[') && !text.contains(blob::SEARCH_MARKER)
+}
+
+/// The word for a JSON value's type, for an error that has to name what arrived.
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
     }
 }
 
@@ -601,19 +908,192 @@ mod tests {
     }
 
     #[test]
-    fn the_edits_array_is_rejected_with_a_named_correction() {
-        // The array is pi's storage form, not a wire one. A model that sends it
-        // must be told which field to use, not left at "unrecognized args".
-        let e = EditArgs::from_wire(&json!({
+    fn the_edits_array_batches_onto_one_file() {
+        // pi's canonical form, accepted because a pi-trained model sends it by
+        // reflex. Single-file batching is the whole of it: N entries, one file,
+        // applied together (all-or-nothing is `apply_to_text`'s business, not
+        // this layer's).
+        let a = EditArgs::from_wire(&json!({
             "path": "src/x.rs",
-            "edits": [{"oldText": "a", "newText": "b", "startLine": 3}]
+            "edits": [
+                {"oldText": "a", "newText": "b"},
+                {"oldText": "c", "newText": "d", "startLine": 9}
+            ]
+        }))
+        .expect("the pi array is accepted");
+        assert_eq!(a.files.len(), 1, "one call is one file");
+        assert_eq!(a.files[0].path, "src/x.rs");
+        assert_eq!(a.files[0].edits.len(), 2);
+        // Per-entry anchors are carried through, and an entry without one has
+        // none — the call carries no anchor to inherit.
+        assert_eq!(a.files[0].edits[0].start_line, None);
+        assert_eq!(a.files[0].edits[1].start_line, Some(EditStartLine(9)));
+    }
+
+    /// One rule decides the file: every path the call names must be the same
+    /// one. These are the three things that rule has to get right, and they are
+    /// the reason it is one rule rather than a per-field check.
+    #[test]
+    fn the_array_names_exactly_one_file() {
+        // (a) A redundant, *agreeing* entry path is harmless — a model that
+        // repeats the path on every entry is not making a mistake.
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/x.rs",
+            "edits": [
+                {"path": "src/x.rs", "oldText": "a", "newText": "b"},
+                {"path": "src/x.rs", "oldText": "c", "newText": "d"}
+            ]
+        }))
+        .expect("agreeing entry paths are fine");
+        assert_eq!(a.files[0].path, "src/x.rs");
+
+        // (b) No `path` argument at all is fine when the entries agree.
+        let a = EditArgs::from_wire(&json!({
+            "edits": [
+                {"path": "src/x.rs", "oldText": "a", "newText": "b"},
+                {"path": "src/x.rs", "oldText": "c", "newText": "d"}
+            ]
+        }))
+        .expect("entries may supply the file");
+        assert_eq!(a.files[0].path, "src/x.rs");
+        assert_eq!(a.files[0].edits.len(), 2);
+
+        // (c) Two files is the multi-file pi form, which pi itself cannot
+        // express — so the correction names the shape that can, and writes
+        // nothing.
+        let e = EditArgs::from_wire(&json!({
+            "edits": [
+                {"path": "a.rs", "oldText": "x", "newText": "y"},
+                {"path": "b.rs", "oldText": "z", "newText": "w"}
+            ]
         }))
         .unwrap_err();
-        assert!(e.contains("`edits` is a list"), "{e}");
+        assert!(e.contains("more than one file"), "{e}");
         assert!(e.contains("`blocks`"), "{e}");
-        // The self-correcting envelope is intact around the correction.
-        assert!(e.contains("Expected:"), "{e}");
+
+        // (d) An entry that disagrees with the call is the same fault seen from
+        // the other side, and equally refused.
+        let e = EditArgs::from_wire(&json!({
+            "path": "a.rs", "edits": [{"path": "b.rs", "oldText": "x", "newText": "y"}]
+        }))
+        .unwrap_err();
+        assert!(e.contains("more than one file"), "{e}");
+
+        // (e) And a call that names no file at all still says so.
+        let e = EditArgs::from_wire(&json!({ "edits": [{"oldText": "x", "newText": "y"}] }))
+            .unwrap_err();
+        assert!(e.contains("missing required field 'path'"), "{e}");
+    }
+
+    /// The anchor an entry resolves to, most specific first. A call-wide anchor
+    /// is the weakest source and only reaches an entry that names none itself.
+    #[test]
+    fn array_anchors_fall_back_from_the_entry_to_the_call() {
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/x.rs:40",
+            "edits": [
+                {"oldText": "a", "newText": "b"},
+                {"startLine": 7, "oldText": "c", "newText": "d"},
+                {"path": "src/x.rs:99", "oldText": "e", "newText": "f"},
+                {"path": "src/x.rs:99", "startLine": 99, "oldText": "g", "newText": "h"}
+            ]
+        }))
+        .expect("four ways of anchoring, one file");
+        let anchors: Vec<_> = a.files[0].edits.iter().map(|e| e.start_line).collect();
+        assert_eq!(
+            anchors,
+            vec![
+                Some(EditStartLine(40)), // inherits the call's `path:LINE`
+                Some(EditStartLine(7)),  // its own `startLine` wins over it
+                Some(EditStartLine(99)), // its own `path:LINE`
+                Some(EditStartLine(99)), // both spellings, agreeing
+            ]
+        );
+        // The `:LINE` on the call is peeled off the path it resolves to.
+        assert_eq!(a.files[0].path, "src/x.rs");
+    }
+
+    #[test]
+    fn an_entry_whose_two_anchor_spellings_disagree_is_refused() {
+        let e = EditArgs::from_wire(&json!({
+            "path": "src/x.rs",
+            "edits": [{"path": "src/x.rs:9", "startLine": 20, "oldText": "a", "newText": "b"}]
+        }))
+        .unwrap_err();
+        assert!(e.contains("edits[0]"), "{e}");
+        assert!(e.contains("they must agree"), "{e}");
+    }
+
+    /// A bad entry is named by index, because "some entry is malformed" out of
+    /// ten is not something a model can act on.
+    #[test]
+    fn a_malformed_entry_is_named_by_index() {
+        let e = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}, "not an object"]
+        }))
+        .unwrap_err();
+        assert!(e.contains("`edits[1]`"), "{e}");
+        assert!(e.contains("is a string"), "{e}");
+
+        let e = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "edits": [{"oldText": "a"}]
+        }))
+        .unwrap_err();
+        assert!(e.contains("`edits[0]`"), "{e}");
+        assert!(e.contains("both `oldText` and `newText`"), "{e}");
+    }
+
+    /// A malformed array must not fall through to a healthy single edit riding
+    /// along beside it — that would apply an edit the model did not ask for.
+    /// Same rule as `blocks` over a legacy `edits` string, one shape up.
+    #[test]
+    fn a_malformed_array_never_falls_through_to_the_single_edit_fields() {
+        let e = EditArgs::from_wire(&json!({
+            "path": "src/x.rs",
+            "edits": [{"oldText": "a"}],
+            "oldText": "a", "newText": "b"
+        }))
+        .unwrap_err();
+        assert!(e.contains("`edits[0]`"), "{e}");
+    }
+
+    /// The shape the whole blob form exists to route around: a harness that
+    /// cannot nest an array and stringifies it instead. Recovered, because the
+    /// entries are validated and applied exactly as a real array's are.
+    #[test]
+    fn a_stringified_array_is_recovered() {
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/x.rs",
+            "edits": "[{\"oldText\": \"a\", \"newText\": \"b\"}, {\"oldText\": \"c\", \"newText\": \"d\"}]"
+        }))
+        .expect("a stringified array is recovered, not misparsed as a blob");
+        assert_eq!(a.files[0].path, "src/x.rs");
+        assert_eq!(a.files[0].edits.len(), 2);
+        assert_eq!(a.files[0].edits[1].new_text, "d");
+    }
+
+    /// ...and a string that only *looks* like one is named rather than fed to
+    /// the block parser, which would have opinions about `[` it cannot use.
+    #[test]
+    fn a_string_that_is_neither_blob_nor_array_is_named() {
+        let e = EditArgs::from_wire(&json!({ "path": "src/x.rs", "edits": "[{\"oldText\":" }))
+            .unwrap_err();
+        assert!(e.contains("not a list"), "{e}");
+        assert!(e.contains("real JSON array"), "{e}");
         assert!(e.contains("Actual:"), "{e}");
+    }
+
+    /// The array is a JSON list, never a block blob — so a *real* blob under the
+    /// old field name keeps winning over it, and the recovery test above cannot
+    /// have swallowed a block string that opens with `[`.
+    #[test]
+    fn a_blob_string_under_the_old_name_is_still_a_blob() {
+        let a = EditArgs::from_wire(&json!({
+            "edits": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
+        }))
+        .unwrap();
+        assert_eq!(a.files[0].path, "src/x.rs");
+        assert_eq!(a.files[0].edits.len(), 1);
     }
 
     #[test]
@@ -629,7 +1109,8 @@ mod tests {
         assert_eq!(a.files[0].edits.len(), 1);
 
         // `blocks` as an array is not the block form, and not the single-edit
-        // form either, so it is simply unrecognised.
+        // form either, so it is simply unrecognised — the advertised field is a
+        // string, and an array there is a mangled call.
         let e = EditArgs::from_wire(&json!({
             "path": "src/x.rs", "blocks": [{"oldText": "a", "newText": "b"}]
         }))
@@ -657,19 +1138,13 @@ mod tests {
         // Still a self-correcting envelope, and still not a batch failure.
         assert!(e.contains("Expected:"), "{e}");
 
-        // The same for the current name, and for a scalar.
+        // The same for the current name, and for a scalar — which is named by
+        // its type, because "not a string" is true of everything below it.
         let e = EditArgs::from_wire(&json!({
             "path": "src/x.rs", "blocks": 42
         }))
         .unwrap_err();
-        assert!(e.contains("non-string value"), "{e}");
-
-        // A list is the canonical form and keeps its own, different correction.
-        let e = EditArgs::from_wire(&json!({
-            "path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]
-        }))
-        .unwrap_err();
-        assert!(e.contains("`edits` is a list"), "{e}");
+        assert!(e.contains("is a number"), "{e}");
 
         // And the object case does not swallow a *valid* single edit.
         let a = EditArgs::from_wire(&json!({
@@ -691,10 +1166,16 @@ mod tests {
     /// *did every caller I never migrated stop working?*
     ///
     /// So the contract is a table here rather than something re-derived per
-    /// change. The rule is narrow and worth stating: a field name this tool
-    /// has published is either still **accepted**, or **refused by name** —
-    /// never silently unrecognised. The array is the only shape allowed to be
-    /// removed, and it paid for that with a correction naming the field to use.
+    /// change. The rule is narrow and worth stating: a field name this tool has
+    /// published is either still **accepted**, or **refused by name** — never
+    /// silently unrecognised.
+    ///
+    /// The array's row has been through both answers. It was removed on purpose
+    /// and paid for that with a correction naming `blocks`; it is accepted
+    /// again now, because a pi-trained model's reflexive call is worth more than
+    /// the strictness — and it is still **not advertised**, which is the part
+    /// that actually does the work. Accepting a shape and encouraging it are
+    /// separate decisions and only the second one is withheld.
     #[test]
     fn every_wire_shape_this_tool_has_ever_accepted_is_accounted_for() {
         // (1) `edits` as a blob string — the name from before the rename.
@@ -706,12 +1187,12 @@ mod tests {
         .expect("a pre-rename blob must still be accepted");
         assert_eq!(a.files[0].edits.len(), 1);
 
-        // (2) `edits` as an array — removed on purpose, refused by name.
-        let e = EditArgs::from_wire(&json!({
+        // (2) `edits` as an array — pi's canonical form. Accepted, unadvertised.
+        let a = EditArgs::from_wire(&json!({
             "path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]
         }))
-        .unwrap_err();
-        assert!(e.contains("`blocks`"), "a removal must name the field: {e}");
+        .expect("the pi array must be accepted");
+        assert_eq!(a.files[0].edits.len(), 1);
 
         // (3) the single-edit scalars — never touched.
         let a = EditArgs::from_wire(&json!({
@@ -733,7 +1214,46 @@ mod tests {
         // Belt and braces: a mangled array must never produce zero EditOps and
         // a vacuous "success".
         let e = EditArgs::from_wire(&json!({ "path": "src/x.rs", "edits": [] })).unwrap_err();
+        assert!(e.contains("empty list"), "{e}");
         assert!(e.contains("`blocks`"), "{e}");
+    }
+
+    /// The catch-all is the last thing a confused model reaches, so it spends
+    /// its tokens on the only facts it can use: what it sent, and what this tool
+    /// calls the same idea.
+    #[test]
+    fn the_catch_all_names_the_fields_that_arrived() {
+        let e = EditArgs::from_wire(&json!({
+            "file_path": "src/x.rs", "old_string": "a", "new_string": "b"
+        }))
+        .unwrap_err();
+        // Order-independent: `serde_json` sorts object keys and the message
+        // follows whatever order it is handed. What is asserted is that each
+        // unknown field is named, and that each one is given its counterpart.
+        let (why, _) = e.split_once("\n\nExpected:\n").expect("shape");
+        for name in ["file_path", "old_string", "new_string"] {
+            assert!(why.contains(&format!("`{name}`")), "{why}");
+        }
+        assert!(why.contains("`file_path` → `path`"), "{why}");
+        assert!(e.contains("`old_string` → `oldText`"), "{e}");
+        assert!(e.contains("`new_string` → `newText`"), "{e}");
+        // ...and the example is the *renamed* shape, because the whole fix is a
+        // rename: a block template would answer a question nobody asked.
+        assert!(e.contains(SINGLE_EDIT_ARGS_EXAMPLE), "{e}");
+    }
+
+    /// …and it says nothing extra when there is nothing to say. `blocks` and the
+    /// single-edit fields are all understood names, so a call carrying only
+    /// those gets the standing sentence and the block example, unchanged.
+    #[test]
+    fn the_catch_all_stays_terse_for_names_it_reads() {
+        let e = EditArgs::from_wire(&json!({ "path": "src/x.rs" })).unwrap_err();
+        let (why, rest) = e.split_once("\n\nExpected:\n").expect("shape");
+        assert_eq!(
+            why,
+            "no recognizable edit arguments (expected `oldText`+`newText`, or `blocks`)"
+        );
+        assert!(rest.starts_with(EDIT_ARGS_EXAMPLE), "{e}");
     }
 
     #[test]
