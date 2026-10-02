@@ -1630,6 +1630,22 @@ impl Repl {
                 session.prose.poll_timeout()
             };
             let ev: Option<Event> = loop {
+                // Keys a window pump parked while nobody could read stdin
+                // (the compaction LLM window — `WindowKeySource`) dispatch
+                // exactly as if they arrived just now: same Resize
+                // handling, same Ctrl-C/Z below, one per iteration so the
+                // settle cadence is the typing cadence. Drain before
+                // blocking — parked events are older than anything still
+                // waiting in the tty.
+                if let Some(parked) = app_state.take_parked_key() {
+                    match parked {
+                        Event::Resize(w, _) => {
+                            TERMINAL_WIDTH.store(w as usize, Ordering::SeqCst);
+                            continue;
+                        }
+                        e => break Some(e),
+                    }
+                }
                 let e = match prose_wait {
                     Some(d) => match event::poll(d) {
                         Ok(true) => event::read(),

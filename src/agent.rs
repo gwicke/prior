@@ -1,4 +1,4 @@
-use crate::app_state::AppState;
+use crate::app_state::{AppState, WindowKeySource};
 use crate::model_catalog;
 use crate::output::{Confirmation, StatusText};
 use crate::params;
@@ -958,28 +958,6 @@ async fn cancel_observed(user_cancel: &Arc<AtomicBool>, cancel_notify: &Arc<toki
     }
 }
 
-/// Wait `secs` seconds, but break early on user cancel. Returns `true` if the
-/// wait completed, `false` if the user pressed `<Esc>`.
-///
-/// Signal only — no key pump: this is the wait for windows that have no turn
-/// key queue to dispatch (the summarization retrier, which runs without an
-/// in-flight reader). The turn's own back-off waits use
-/// [`cancellable_sleep_pumped`].
-async fn cancellable_sleep(
-    user_cancel: &Arc<AtomicBool>,
-    cancel_notify: &Arc<tokio::sync::Notify>,
-    secs: u64,
-) -> bool {
-    if secs == 0 {
-        return true;
-    }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
-    tokio::select! {
-        _ = tokio::time::sleep_until(deadline) => true,
-        _ = cancel_observed(user_cancel, cancel_notify) => false,
-    }
-}
-
 /// What dispatching one turn-key event did.
 #[derive(Debug, PartialEq, Eq)]
 enum InTurnDispatch {
@@ -1083,7 +1061,8 @@ struct TurnPump<'a> {
 /// Assemble the pump for a back-off wait, or `None` where the interactive
 /// pieces don't exist — the same `zip` shape the `InTurnInput` construction
 /// uses: piped/batch input has no prompt session and no reader, so there is no
-/// key to pump and the wait is the plain [`cancellable_sleep`] one.
+/// key to pump and the wait is [`cancellable_sleep_pumped`] with `None` —
+/// deadline and cancel signal only.
 fn turn_backoff_pump<'a>(
     prompt_session: &'a mut Option<crate::repl::PromptSession>,
     keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
@@ -1105,9 +1084,8 @@ fn turn_backoff_pump<'a>(
     }
 }
 
-/// [`cancellable_sleep`] with the turn's key pump running: the same wait, but
-/// every key in the queue is dispatched through [`dispatch_in_turn_event`] for
-/// as long as it lasts. A root `Esc` fires the cancel signal immediately and
+/// The back-off wait with the turn's key pump running: every key in the queue
+/// is dispatched through [`dispatch_in_turn_event`] for as long as it lasts. A root `Esc` fires the cancel signal immediately and
 /// ends the wait (`false`); menus step their ladder; edits settle into the
 /// input row — identical to the streaming window. The deadline is absolute, so
 /// dispatched keys never extend the back-off.
@@ -1124,6 +1102,15 @@ async fn cancellable_sleep_pumped(
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
     loop {
+        // Prose's wake-up for this iteration, resolved *before* the select
+        // rather than inside the timer's async block — the same contract
+        // `prompt()`'s loop has: without this arm prose goes inert for the
+        // whole back-off (its debounce, its in-flight slices and its dialog
+        // all fire on it). U4.3's timer rationale, extended from the
+        // streaming window to the wait between attempts.
+        let prose_deadline = pump
+            .as_ref()
+            .and_then(|p| crate::repl::PromptSession::prose_timeout(&*p.session));
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return true,
             _ = cancel_observed(user_cancel, cancel_notify) => return false,
@@ -1153,6 +1140,104 @@ async fn cancellable_sleep_pumped(
                 }
                 // Handled / Ignored: keep waiting out the rest of the
                 // deadline — the loop re-selects with the same deadline.
+            }
+            // Prose wake: settle so the debounce/slice/dialog fires without
+            // a keystroke, exactly as `prompt()`'s timer arm does.
+            _ = async {
+                match prose_deadline {
+                    Some(d) => tokio::time::sleep(d).await,
+                    // `None`: nothing pending, and no timer to wake for.
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(p) = pump.as_mut() {
+                    let dims = p.output.frame_size();
+                    let _ = p
+                        .session
+                        .settle(p.output, p.label, &mut *p.history, dims)
+                        .await;
+                }
+            }
+        }
+    }
+}
+
+/// Next event for a window pump, paced: polls the source without blocking
+/// and yields between tries, so an idle window costs one `poll(0)` per tick
+/// instead of a reader thread. `None` source, or an inactive window
+/// (piped/batch — the script owns stdin): never completes, exactly like the
+/// turn pump's missing-queue arm.
+async fn next_window_key(src: Option<&dyn WindowKeySource>) -> Option<crossterm::event::Event> {
+    let Some(src) = src else {
+        return std::future::pending().await;
+    };
+    if !src.window_active() {
+        return std::future::pending().await;
+    }
+    loop {
+        if let Some(ev) = src.poll_key() {
+            return Some(ev);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Route one window-pump event: a root `Esc` fires the cancel signal — the
+/// same flag + notify + tool watchdogs the turn's dispatcher raises, which
+/// is the whole point of the window — and reports it; anything else is
+/// parked for `read_input`. Returns whether the cancel signal fired.
+fn pump_window_key(
+    ev: Option<crossterm::event::Event>,
+    src: &dyn WindowKeySource,
+    user_cancel: &Arc<AtomicBool>,
+    cancel_notify: &Arc<tokio::sync::Notify>,
+) -> bool {
+    let Some(ev) = ev else {
+        return false;
+    };
+    if let crossterm::event::Event::Key(key) = &ev {
+        if key.code == crossterm::event::KeyCode::Esc {
+            user_cancel.store(true, Ordering::SeqCst);
+            cancel_notify.notify_one();
+            // Identical signal set to the turn dispatcher; no tool runs
+            // during a compaction window, so the send is inert there.
+            // Unbounded mpsc, so this cannot block the caller.
+            for tx in crate::tools::TOOL_CANCEL_SENDERS.lock().unwrap().iter() {
+                let _ = tx.send(());
+            }
+            return true;
+        }
+    }
+    src.defer_event(ev);
+    false
+}
+
+/// The back-off wait with the window pump live: the wait is part of the
+/// operation, so an `Esc` typed during it ends the wait immediately
+/// (`false`) and every other key is parked for `read_input`. The deadline
+/// stays absolute — parked keys never extend the delay. `keys: None`, or an
+/// inactive window, degrades to the plain signal-only wait.
+async fn cancellable_sleep_windowed(
+    user_cancel: &Arc<AtomicBool>,
+    cancel_notify: &Arc<tokio::sync::Notify>,
+    secs: u64,
+    keys: Option<&dyn WindowKeySource>,
+) -> bool {
+    if secs == 0 {
+        return true;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return true,
+            _ = cancel_observed(user_cancel, cancel_notify) => return false,
+            ev = next_window_key(keys) => {
+                if let Some(src) = keys {
+                    if pump_window_key(ev, src, user_cancel, cancel_notify) {
+                        return false;
+                    }
+                }
+                // Parked: keep waiting out the rest of the deadline.
             }
         }
     }
@@ -3885,12 +3970,15 @@ async fn draft_at_pivot(
             let (user_cancel, cancel_notify) =
                 app_state.with_config(|c| (c.user_cancel.clone(), c.cancel_notify.clone()));
             let instruction = instruction.clone();
-            let reply =
-                retry_summarization(output.as_ref(), &user_cancel, &cancel_notify, &mut || {
-                    a.summarize_with_session_context(session, &instruction)
-                })
-                .await
-                .map_err(|e| format!("Summary failed: {}", e))?;
+            let reply = retry_summarization(
+                output.as_ref(),
+                &user_cancel,
+                &cancel_notify,
+                Some(app_state),
+                &mut || a.summarize_with_session_context(session, &instruction),
+            )
+            .await
+            .map_err(|e| format!("Summary failed: {}", e))?;
             let summary = reply.trim().to_string();
             if summary.is_empty() {
                 return Err("Summary was empty; nothing written.".to_string());
@@ -3923,10 +4011,21 @@ pub(crate) async fn apply_compaction(
 /// cancel behaviour as a regular user prompt (`prompt()`'s retry loop in
 /// `run_interactive`).
 ///
+/// `keys` is the window pump's source (see [`WindowKeySource`]): while the
+/// caller awaits this future, the REPL loop is suspended inside `settle` —
+/// no `read_input`, no in-flight reader — so *nothing* reads stdin unless
+/// this future polls it. The pump runs beside both phases: a root `Esc`
+/// cancels the in-flight attempt (the select arm fires the signal; the rig
+/// hook and this loop's `cancel_observed` both watch it) *and* any back-off
+/// (`cancellable_sleep_windowed`); other keys are parked for `read_input`'s
+/// next iteration. `None` (tests) and inactive windows (piped/batch) leave
+/// the arms pending — the signal-only behaviour, stdin untouched.
+///
 /// `build` produces the summarization request and returns the model's reply
 /// (or a classified `PicocodeError`). On a retryable failure it is re-invoked
 /// (previous `build` again) after `retry_delay_secs` seconds of
-/// `cancellable_sleep`; non-retryable errors and cancellation propagate out.
+/// [`cancellable_sleep_windowed`]; non-retryable errors and cancellation
+/// propagate out.
 ///
 /// The leaf dance (if any) is the caller's responsibility: `build` reads the
 /// session's *current* leaf to assemble context but must NOT move it, so the
@@ -3937,24 +4036,53 @@ async fn retry_summarization<F, Fut>(
     output: &dyn Output,
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
+    keys: Option<&dyn WindowKeySource>,
     build: &mut F,
 ) -> std::result::Result<String, crate::PicocodeError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<String, crate::PicocodeError>>,
 {
+    // Fresh operation: a stale cancel flag from a previous abort must not
+    // cancel this one before the pump has read anything. `prompt()` applies
+    // the same fresh-request rule; nothing else clears the flag on this
+    // path (compaction runs between turns).
+    user_cancel.store(false, Ordering::SeqCst);
     let mut consecutive_failures: u8 = 0;
     loop {
-        match build().await {
-            Ok(text) => return Ok(text),
-            Err(crate::PicocodeError::Cancelled(_)) => {
+        // One attempt with the pump live beside it. The attempt future is
+        // pinned: a key press polls *it* again rather than dropping the
+        // in-flight request on the floor.
+        let attempt = build();
+        tokio::pin!(attempt);
+        let outcome: Option<std::result::Result<String, crate::PicocodeError>> = loop {
+            tokio::select! {
+                r = &mut attempt => break Some(r),
+                _ = cancel_observed(user_cancel, cancel_notify) => break None,
+                ev = next_window_key(keys) => {
+                    if let Some(src) = keys {
+                        if pump_window_key(ev, src, user_cancel, cancel_notify) {
+                            break None;
+                        }
+                    }
+                }
+            }
+        };
+        match outcome {
+            // Cancelled — a window `Esc` (signalled above) or the flag from
+            // elsewhere. Nothing in flight to persist: a summarization has
+            // no partial turn.
+            None => return Err(crate::PicocodeError::Cancelled("Aborted.".into())),
+            Some(Ok(text)) => return Ok(text),
+            Some(Err(crate::PicocodeError::Cancelled(_))) => {
                 return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
             }
-            Err(e) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
+            Some(Err(e)) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 let secs = retry_delay_secs(&e, consecutive_failures);
                 output.display_text(&format!("Error: {}. Retrying in {secs}s...", e));
-                let slept = cancellable_sleep(user_cancel, cancel_notify, secs).await;
+                let slept =
+                    cancellable_sleep_windowed(user_cancel, cancel_notify, secs, keys).await;
                 if !slept {
                     return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
                 }
@@ -3966,7 +4094,7 @@ where
                 }
                 continue;
             }
-            Err(e) => return Err(e),
+            Some(Err(e)) => return Err(e),
         }
     }
 }
@@ -5095,9 +5223,9 @@ pub async fn run_interactive(
                                     turn.mark_new_dispatch();
                                 }
                                 // Race window: cancel could fire after
-                                // `cancellable_sleep` returned but before
-                                // `prompt()` clears its flag. Bail out
-                                // here so the retry respects `Esc`.
+                                // `cancellable_sleep_pumped` returned but
+                                // before `prompt()` clears its flag. Bail
+                                // out here so the retry respects `Esc`.
                                 if cancel.load(Ordering::SeqCst) {
                                     break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
                                 }
@@ -6844,7 +6972,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let output = null_output();
         let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
-        let r = retry_summarization(output.as_ref(), cancel, notify, &mut || {
+        let r = retry_summarization(output.as_ref(), cancel, notify, None, &mut || {
             calls += 1;
             async { Ok::<_, crate::PicocodeError>("summary".to_string()) }
         })
@@ -6862,7 +6990,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let output = null_output();
         let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
-        let r = retry_summarization(output.as_ref(), cancel, notify, &mut || {
+        let r = retry_summarization(output.as_ref(), cancel, notify, None, &mut || {
             calls += 1;
             async move {
                 if calls == 1 {
@@ -6885,7 +7013,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let output = null_output();
         let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
-        let r = retry_summarization(output.as_ref(), cancel, notify, &mut || {
+        let r = retry_summarization(output.as_ref(), cancel, notify, None, &mut || {
             calls += 1;
             async { Err(crate::PicocodeError::Llm("permanent".to_string())) }
         })
@@ -6896,9 +7024,9 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     #[tokio::test]
     async fn retry_summarization_cancels_after_esc_sleep() {
-        // A provider hint of 1s: set the cancel flag so
-        // `cancellable_sleep` returns immediately and the retrier
-        // surfaces `Cancelled` without a second attempt.
+        // A provider hint of 5s: set the cancel flag so the windowed
+        // sleep's signal arm ends the wait and the retrier surfaces
+        // `Cancelled` without a second attempt.
         let mut calls = 0;
         let output = null_output();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -6911,7 +7039,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             cancel2.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        let r = retry_summarization(output.as_ref(), &cancel_out, &notify, &mut || {
+        let r = retry_summarization(output.as_ref(), &cancel_out, &notify, None, &mut || {
             calls += 1;
             async {
                 Err(crate::PicocodeError::LlmRateLimited {
@@ -7044,6 +7172,211 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             "the signal branch must still fire without a pump"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// Fake window source for the compaction pump: events waiting to be
+    /// read, and the park where keys the window cannot act on land.
+    struct FakeWindow {
+        ready: std::sync::Mutex<std::collections::VecDeque<crossterm::event::Event>>,
+        parked: std::sync::Mutex<std::collections::VecDeque<crossterm::event::Event>>,
+        active: bool,
+    }
+
+    impl FakeWindow {
+        fn new() -> Self {
+            Self {
+                ready: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                parked: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                active: true,
+            }
+        }
+
+        /// Piped/batch shape: stdin belongs to the script.
+        fn inactive() -> Self {
+            Self {
+                active: false,
+                ..Self::new()
+            }
+        }
+
+        fn push(&self, ev: crossterm::event::Event) {
+            self.ready.lock().unwrap().push_back(ev);
+        }
+
+        fn ready_len(&self) -> usize {
+            self.ready.lock().unwrap().len()
+        }
+
+        fn parked_len(&self) -> usize {
+            self.parked.lock().unwrap().len()
+        }
+    }
+
+    impl WindowKeySource for FakeWindow {
+        fn window_active(&self) -> bool {
+            self.active
+        }
+        fn poll_key(&self) -> Option<crossterm::event::Event> {
+            self.ready.lock().unwrap().pop_front()
+        }
+        fn defer_event(&self, ev: crossterm::event::Event) {
+            self.parked.lock().unwrap().push_back(ev);
+        }
+    }
+
+    fn esc_event() -> crossterm::event::Event {
+        crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    fn char_event(c: char) -> crossterm::event::Event {
+        crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(c),
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    /// The compaction window's core promise: an `Esc` while the
+    /// summarization request is in flight cancels it. Before the pump,
+    /// nothing read stdin during the window and the attempt always ran to
+    /// completion.
+    #[tokio::test]
+    async fn window_pump_esc_cancels_the_inflight_attempt() {
+        let keys = FakeWindow::new();
+        keys.push(esc_event());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let output = null_output();
+        let started = std::time::Instant::now();
+        let r = retry_summarization(
+            output.as_ref(),
+            &cancel,
+            &notify,
+            Some(&keys),
+            &mut || async {
+                std::future::pending::<std::result::Result<String, crate::PicocodeError>>().await
+            },
+        )
+        .await;
+        assert!(matches!(r, Err(crate::PicocodeError::Cancelled(_))));
+        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the in-flight attempt ignored the Esc"
+        );
+    }
+
+    /// The reported bug shape: an `Esc` during a *retry back-off* cuts the
+    /// wait instead of letting the provider-hint floor (10s) run out.
+    #[tokio::test]
+    async fn window_pump_esc_cuts_the_retry_backoff() {
+        let keys = std::sync::Arc::new(FakeWindow::new());
+        let keys2 = keys.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            keys2.push(esc_event());
+        });
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let output = null_output();
+        let mut calls = 0;
+        let started = std::time::Instant::now();
+        let r = retry_summarization(
+            output.as_ref(),
+            &cancel,
+            &notify,
+            Some(keys.as_ref()),
+            &mut || {
+                calls += 1;
+                async {
+                    Err(crate::PicocodeError::LlmRateLimited {
+                        retry_after_secs: Some(10),
+                    })
+                }
+            },
+        )
+        .await;
+        let _ = handle.await;
+        assert!(matches!(r, Err(crate::PicocodeError::Cancelled(_))));
+        assert_eq!(calls, 1, "no retry attempt may start after the Esc");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the 10s back-off ran its course instead of yielding to the Esc"
+        );
+        assert_eq!(keys.parked_len(), 0, "an Esc is consumed, not parked");
+    }
+
+    /// A plain key during the window must NOT cancel: it is parked for
+    /// `read_input` and the operation completes normally.
+    #[tokio::test]
+    async fn window_pump_plain_key_is_parked_and_not_cancelled() {
+        let keys = FakeWindow::new();
+        keys.push(char_event('x'));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let output = null_output();
+        let r = retry_summarization(
+            output.as_ref(),
+            &cancel,
+            &notify,
+            Some(&keys),
+            &mut || async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok("done".to_string())
+            },
+        )
+        .await;
+        assert_eq!(r.unwrap(), "done");
+        assert_eq!(
+            keys.parked_len(),
+            1,
+            "the key must wait parked for read_input's drain"
+        );
+        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// An inactive window (piped/batch — no REPL) must not touch its source
+    /// at all: the arms stay pending, the ready event is never consumed.
+    #[tokio::test]
+    async fn window_pump_inactive_never_polls() {
+        let keys = FakeWindow::inactive();
+        keys.push(esc_event());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let output = null_output();
+        let r = retry_summarization(
+            output.as_ref(),
+            &cancel,
+            &notify,
+            Some(&keys),
+            &mut || async { Ok("fine".to_string()) },
+        )
+        .await;
+        assert_eq!(r.unwrap(), "fine");
+        assert_eq!(
+            keys.ready_len(),
+            1,
+            "an inactive window must never read its source"
+        );
+        assert_eq!(keys.parked_len(), 0);
+        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The real source on a test state: no term guard was published, so the
+    /// window is inactive (poll yields nothing — stdin untouched), and the
+    /// park round-trips in order: that queue is what `read_input` drains.
+    #[test]
+    fn appstate_window_gate_and_park_roundtrip() {
+        let app_state = crate::app_state::AppState::for_test(test_settings());
+        assert!(!app_state.window_pump_active());
+        assert!(app_state.poll_key().is_none(), "inactive must not read");
+        app_state.park_key(char_event('a'));
+        app_state.park_key(char_event('b'));
+        assert_eq!(app_state.take_parked_key(), Some(char_event('a')));
+        assert_eq!(app_state.take_parked_key(), Some(char_event('b')));
+        assert_eq!(app_state.take_parked_key(), None);
     }
 
     /// Build a writable `Session` from `entries` for the compaction

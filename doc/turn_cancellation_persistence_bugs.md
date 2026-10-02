@@ -103,12 +103,14 @@ source of the context loss.
 (completion call, completion response, model-turn finished, tool call, tool
 result) whenever `user_cancel` is set.
 
-> **Update (U4.3 + U4.5).** The reader no longer sets the flag: `Esc` rides
+> **Update (U4.3 + U4.5 + U4.6).** The reader no longer sets the flag: `Esc` rides
 > the forwarded queue (menu-first needs a session to look at) and the turn's
 > key dispatcher sets it — `prompt()`'s key branch while an attempt streams,
 > the back-off pump (`cancellable_sleep_pumped`) while a retry delay runs
-> between attempts. The mechanism below (flag → `LoggingHook` → rig `Stop`)
-> is unchanged; only who *raises* the flag moved.
+> between attempts, and the compaction window's `WindowKeySource` poll
+> (`retry_summarization`) during a summarization, which has no reader at
+> all. The mechanism below (flag → `LoggingHook` → rig `Stop`) is unchanged;
+> only who *raises* the flag moved.
 
 In the rig streaming driver, **every** `Stop`/`Terminate` path terminates the
 run as a terminal **error** and never emits a `FinalResponse`:

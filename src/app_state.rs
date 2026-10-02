@@ -35,7 +35,7 @@
 //! The active `Session` object itself is the loop's applied layer; the menu
 //! sees [`SessionSlot`] (`repo` handle + current id) only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -179,6 +179,10 @@ pub struct State {
     /// the compaction review closure clones it out to suspend raw mode
     /// around `$EDITOR` (same pattern as the Ctrl-E path).
     pub(crate) term_guard: Option<Arc<crate::repl::TermGuard>>,
+    /// Key events captured by a window pump while nobody could read stdin
+    /// (the compaction LLM window), parked for `read_input` to dispatch on
+    /// its next iteration — never dropped, never leaked into `$EDITOR`.
+    pub(crate) parked_keys: VecDeque<crossterm::event::Event>,
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +193,53 @@ pub struct State {
 /// `Arc<AppState>`; the REPL loop clones the same `Arc`.
 pub struct AppState {
     state: Mutex<State>,
+}
+
+// ---------------------------------------------------------------------------
+// Window key pump — the input side of an LLM window nobody else can read
+// ---------------------------------------------------------------------------
+
+/// Who feeds a key pump while an LLM operation runs *outside* a turn — the
+/// compaction summarization, whose await spans requests and back-offs with
+/// the REPL loop suspended inside `settle` (no `read_input`, no in-flight
+/// reader). Implemented by [`AppState`] (polls stdin — nobody else can while
+/// the window lasts — and parks what it cannot act on) and by tests' fakes.
+///
+/// A root `Esc` is *not* dispatched through the session here: the engine is
+/// mid-`prepare()` and cannot evaluate a key, and the node's own two-phase
+/// contract makes `Esc` mean "abort" the moment `prepare()` returns — so the
+/// pump turns it straight into the cancel signal (the same flag + notify
+/// `prompt()`'s dispatcher raises). Everything else is parked for
+/// `read_input`, which drains the queue through the normal dispatch.
+pub trait WindowKeySource: Sync {
+    /// May this window read keys at all? `false` for piped/batch stdin (the
+    /// script owns it) and for states with no REPL — those never touch
+    /// stdin.
+    fn window_active(&self) -> bool;
+    /// The next event ready right now — must not block.
+    fn poll_key(&self) -> Option<crossterm::event::Event>;
+    /// Park an event the window cannot act on for later dispatch.
+    fn defer_event(&self, ev: crossterm::event::Event);
+}
+
+impl WindowKeySource for AppState {
+    fn window_active(&self) -> bool {
+        self.window_pump_active()
+    }
+    fn poll_key(&self) -> Option<crossterm::event::Event> {
+        // Belt and braces: `window_active` is the caller's gate; this keeps
+        // a stray live reference in piped mode off stdin entirely.
+        if !self.window_pump_active() {
+            return None;
+        }
+        match crossterm::event::poll(std::time::Duration::ZERO) {
+            Ok(true) => crossterm::event::read().ok(),
+            _ => None,
+        }
+    }
+    fn defer_event(&self, ev: crossterm::event::Event) {
+        self.park_key(ev);
+    }
 }
 
 impl AppState {
@@ -226,6 +277,7 @@ impl AppState {
                 control: ControlConfig::default(),
                 prefill: None,
                 term_guard: None,
+                parked_keys: VecDeque::new(),
             }),
         })
     }
@@ -576,6 +628,29 @@ impl AppState {
     /// next `read_input`.
     pub fn take_prefill(&self) -> Option<String> {
         self.state.lock().prefill.take()
+    }
+
+    /// Park a key event captured while nobody could read stdin (a window
+    /// pump — see [`WindowKeySource`]). `read_input` drains the queue on
+    /// its next iteration through the normal dispatch, so the event lands
+    /// exactly as if it had arrived a moment later: same Ctrl-C/Z, same
+    /// Resize handling, same dispatcher — and *after* any `$EDITOR` the
+    /// window opened, instead of leaking into its stdin.
+    pub fn park_key(&self, ev: crossterm::event::Event) {
+        self.state.lock().parked_keys.push_back(ev);
+    }
+
+    /// Oldest parked key, if any — one per `read_input` iteration.
+    pub fn take_parked_key(&self) -> Option<crossterm::event::Event> {
+        self.state.lock().parked_keys.pop_front()
+    }
+
+    /// Is stdin owned by the interactive REPL? True iff the term guard was
+    /// published (interactive tty, non-quiet) — a window pump may read keys
+    /// only then: piped/batch stdin belongs to the script, and test states
+    /// have no guard at all.
+    pub fn window_pump_active(&self) -> bool {
+        self.state.lock().term_guard.is_some()
     }
 
     /// Publish the REPL's term guard (set once at startup).
