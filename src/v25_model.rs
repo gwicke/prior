@@ -47,6 +47,18 @@ pub struct ModelNode {
     /// active one, so a change reorders the listing and moves the active
     /// row's index.
     cached_recent: Vec<String>,
+    /// The resolved entry list the rows were built from.
+    ///
+    /// Held so the memo can compare *identity* rather than a revision counter:
+    /// `AppState::resolved_models` hands back a fresh `Arc` exactly when the
+    /// overlay was rebuilt (a catalog fetch or a settings write), so
+    /// `Arc::ptr_eq` is the invalidation signal, and holding the `Arc` is what
+    /// keeps it alive to compare against. Without this the rows outlived a
+    /// Ctrl-E edit of a per-model record — the generation, the active model and
+    /// the recency list are all unchanged by such an edit, so the memo missed
+    /// and, because `refresh_data` gates on `Rc::ptr_eq`, the view never
+    /// refreshed either.
+    cached_resolved: Option<Arc<Vec<crate::model_catalog::ModelEntry>>>,
 }
 
 /// A Ctrl-E result waiting to be committed by the confirm's accept arm.
@@ -148,6 +160,7 @@ impl ModelNode {
             cached_generation: u64::MAX,
             cached_active: String::new(),
             cached_recent: Vec::new(),
+            cached_resolved: None,
             pending_edit: std::cell::RefCell::new(None),
         }
     }
@@ -156,9 +169,10 @@ impl ModelNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for ModelNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        // Read every input *above* the early return: all three decide reuse,
-        // and reading them once is cheaper than reading them on a miss and
-        // again here.
+        // Read every input *above* the early return: all four decide reuse, and
+        // reading them once is cheaper than reading them on a miss and again
+        // here. `resolved_models` is itself memoized on (generation, models
+        // revision), so this is a cheap identity read in the common case.
         let gen = crate::model_catalog::catalog_generation();
         let active_id = (self.active_fn)();
         let recent: Vec<String> = self
@@ -166,6 +180,7 @@ impl SlashDotNode for ModelNode {
             .as_ref()
             .map(|r| r.recent_models())
             .unwrap_or_default();
+        let resolved = self.live.as_ref().map(|r| r.resolved_models());
 
         // Reuse only while every input the rows derive from still holds. The
         // generation is not enough on its own: `order_models` also hoists the
@@ -179,9 +194,15 @@ impl SlashDotNode for ModelNode {
         // 0 — stale, but self-consistent enough to look like a stray marker
         // rather than a missing one.
         if let Some(ref cached) = self.cached_response {
+            let overlay_same = match (&self.cached_resolved, &resolved) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            };
             if self.cached_generation == gen
                 && self.cached_active == active_id
                 && self.cached_recent == recent
+                && overlay_same
             {
                 return Ok(Rc::clone(cached));
             }
@@ -194,8 +215,8 @@ impl SlashDotNode for ModelNode {
         // `None` under `/set default_model`, which has no store to read, so
         // that node keeps the raw catalog — the same trade it already makes
         // for recency.
-        let entries: Vec<crate::model_catalog::ModelEntry> = match self.live.as_ref() {
-            Some(app) => app.resolved_models().as_ref().clone(),
+        let entries: Vec<crate::model_catalog::ModelEntry> = match &resolved {
+            Some(list) => list.as_ref().clone(),
             None => crate::model_catalog::catalog_cached(),
         };
         let active = if active_id.is_empty() {
@@ -221,6 +242,7 @@ impl SlashDotNode for ModelNode {
         self.cached_generation = gen;
         self.cached_active = active_id;
         self.cached_recent = recent;
+        self.cached_resolved = resolved;
         Ok(response)
     }
 
@@ -1903,5 +1925,68 @@ mod tests {
                 "overflowed: {l:?}"
             );
         }
+    }
+
+    /// A Ctrl-E edit at `/model <id>` must reach the listing behind it.
+    ///
+    /// `data()` memoizes on the catalog generation, the active model and the
+    /// recency list. A per-model record edit changes *none* of those, so the
+    /// memo used to hit and hand back the pre-edit rows - and because
+    /// `refresh_data` gates on `Rc::ptr_eq`, a response that never changed never
+    /// refreshed the view either. Only visible through a *reused* node, which
+    /// is why the sibling test (a fresh node each time) passed throughout.
+    #[test]
+    fn a_ctrl_e_edit_invalidates_the_reused_listing_memo() {
+        let app_state = test_app_state();
+        let (provider, model) = match app_state
+            .resolved_models()
+            .first()
+            .map(|e| e.qualified_parts())
+        {
+            Some(p) => p,
+            None => return, // no catalog in this environment
+        };
+        let qualified = format!("{provider}:{model}");
+        let ctx_of = |r: &DataResponse| {
+            r.rows
+                .iter()
+                .find(|r| r.id == qualified)
+                .and_then(|r| r.field_value("context").and_then(|v| v.as_num()))
+        };
+        let pa = PathArgs::new(vec!["model".into()], " ");
+
+        // One node throughout: reusing it is what makes this a test of the memo
+        // rather than of the overlay.
+        let mut node = test_model_node(&app_state);
+        let before = ctx_of(&futures::executor::block_on(node.data(1, &pa)).unwrap())
+            .expect("the model is listed");
+        assert_ne!(before, 4242421.0, "pick a model not already at 4242421");
+
+        // A second read with nothing touched must still be served from the memo.
+        assert_eq!(
+            ctx_of(&futures::executor::block_on(node.data(1, &pa)).unwrap()),
+            Some(before),
+            "an untouched read must hit the memo"
+        );
+
+        // The edit, through the same door the Ctrl-E accept arm uses.
+        app_state
+            .update_settings(|s| {
+                s.apply_model_settings(
+                    &qualified,
+                    &crate::model_settings::ModelSettings {
+                        context_length: Some(4242421),
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            ctx_of(&futures::executor::block_on(node.data(1, &pa)).unwrap()),
+            Some(4242421.0),
+            "the reused node must rebuild after the edit"
+        );
     }
 }
