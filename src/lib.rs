@@ -307,6 +307,13 @@ impl PicocodeError {
 
 pub type Result<T> = std::result::Result<T, PicocodeError>;
 
+/// Write-back callback for a menu node: takes the value the user selected and
+/// commits it, `Ok(())` on success and an `Err` message to show on failure.
+///
+/// Every select-one node (model, persona, reasoning level) takes the same
+/// shape, so it is spelled once here rather than repeated at each field.
+pub type SubmitFn = Box<dyn FnMut(&str) -> std::result::Result<(), String>>;
+
 pub mod ui;
 
 #[cfg(test)]

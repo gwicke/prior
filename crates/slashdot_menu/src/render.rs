@@ -513,11 +513,11 @@ pub fn window_heights(heights: &[usize], selected: usize, budget: usize) -> (usi
     // Walk forward from start, filling the full budget.
     let mut count = 0;
     let mut vis_total = 0;
-    for i in start..total {
-        if vis_total + heights[i] > budget {
+    for &h in heights.iter().take(total).skip(start) {
+        if vis_total + h > budget {
             break;
         }
-        vis_total += heights[i];
+        vis_total += h;
         count += 1;
     }
 

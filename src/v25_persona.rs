@@ -23,7 +23,7 @@ pub struct PersonaEnumNode {
     /// Read the current persona name (None = no persona).
     pub active_fn: Box<dyn Fn() -> Option<String>>,
     /// Write the selected persona. `Ok(())` on success.
-    pub submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
+    pub submit_fn: crate::SubmitFn,
 }
 
 #[async_trait::async_trait(?Send)]

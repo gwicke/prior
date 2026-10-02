@@ -29,7 +29,7 @@ pub struct ReasoningEnumNode {
     /// Read the current thinking level.
     pub active_fn: Box<dyn Fn() -> String>,
     /// Write the selected reasoning level. `Ok(())` on success.
-    pub submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
+    pub submit_fn: crate::SubmitFn,
     /// The active `provider:model`, when this node is the live `/reasoning`
     /// one. `None` under `/set default_reasoning_level`.
     pub active_model_fn: Option<Box<dyn Fn() -> String>>,

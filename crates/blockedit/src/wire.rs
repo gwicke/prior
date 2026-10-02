@@ -158,8 +158,8 @@ fn elide_string(s: &str) -> String {
         }
         let lo = i.saturating_sub(ELIDE_CONTEXT);
         let hi = (i + ELIDE_CONTEXT).min(lines.len() - 1);
-        for k in lo..=hi {
-            keep[k] = true;
+        for slot in keep.iter_mut().take(hi + 1).skip(lo) {
+            *slot = true;
         }
     }
 

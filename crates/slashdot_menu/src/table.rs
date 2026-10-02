@@ -216,14 +216,15 @@ impl Table {
 
         // Natural content max per column (header included).
         let mut nat = min.clone();
-        for col in 0..n {
-            let mut w = display_width(&self.headers[col]);
-            for r in &self.rows {
-                if let Some(c) = r.get(col) {
-                    w = w.max(display_width(c));
-                }
-            }
-            nat[col] = w;
+        for (col, (slot, header)) in nat.iter_mut().zip(&self.headers).enumerate() {
+            let w = self
+                .rows
+                .iter()
+                .fold(display_width(header), |w, r| match r.get(col) {
+                    Some(c) => w.max(display_width(c)),
+                    None => w,
+                });
+            *slot = w;
         }
 
         let total_min: usize = min.iter().sum::<usize>() + gaps;

@@ -23,7 +23,7 @@ pub struct ModelNode {
     /// Read the active model id (empty string = none).
     active_fn: Box<dyn Fn() -> String>,
     /// Write the selected model id on submit. `Ok(())` on success.
-    submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
+    submit_fn: crate::SubmitFn,
     /// The live `/model` node's app handle: recency ordering in `data()`
     /// AND the journal record in `submit()`. `None` for
     /// `/set default_model` — a settings write is not a model change and
@@ -103,7 +103,7 @@ fn fmt_opt(v: Option<f64>) -> String {
 impl ModelNode {
     pub fn new(
         active_fn: Box<dyn Fn() -> String>,
-        submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
+        submit_fn: crate::SubmitFn,
         live: Option<Arc<AppState>>,
     ) -> Self {
         ModelNode {
@@ -675,7 +675,7 @@ pub struct ModelActionNode {
     live: Option<Arc<AppState>>,
     /// Write the chosen id on activate. `None` for `save`, which writes
     /// settings rather than a model id.
-    activate_fn: Option<Box<dyn FnMut(&str) -> Result<(), String>>>,
+    activate_fn: Option<crate::SubmitFn>,
     /// The store handle `save` needs. `None` hides the row entirely: there is
     /// no meaningful "save live settings" under `/set default_model`.
     store: Option<Arc<AppState>>,
@@ -709,7 +709,7 @@ impl ModelAction {
 impl ModelActionNode {
     pub fn activate(
         live: Option<Arc<AppState>>,
-        activate_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
+        activate_fn: crate::SubmitFn,
         above: usize,
     ) -> Self {
         ModelActionNode {

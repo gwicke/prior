@@ -1185,15 +1185,6 @@ fn strip_read_lineno(line: &str) -> &str {
     line
 }
 
-/// Build a human-readable one-line *label* for a tool call plus any optional
-/// *trailing* lines (e.g. a diff preview for edits).
-///
-/// The label replaces the old generic first-argument dump with purpose-built
-/// summaries:
-///   - `read_file`  -> `read <path> [start..end]`   (line range optional)
-///   - `bash`       -> the full command line, untruncated
-///   - `edit_file`  -> `edit <path> [start..end]`   (+ a best-effort diff)
-///   - anything else falls back to `Name <first-arg>` (truncated to 50 cols).
 /// Per-file call arguments for a multi-file `edit` block, or `None` if the
 /// arguments are not one.
 ///
@@ -1414,9 +1405,7 @@ fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec<String>) {
         let Ok(content) = std::fs::read_to_string(path) else {
             return None;
         };
-        let Some(idx) = content.find(&first.old_text) else {
-            return None;
-        };
+        let idx = content.find(&first.old_text)?;
         // 1-based line number of the first line of `old_text`.
         let start = content[..idx].matches('\n').count() + 1;
         let end = start + first.old_text.matches('\n').count();
@@ -2467,17 +2456,12 @@ impl ConsoleOutput {
         } else {
             width.saturating_sub(vis)
         };
-        let row = format!(
-            "{}{}{}{}",
-            if indent {
-                format!("{BG} ")
-            } else {
-                String::new()
-            },
-            painted,
-            format!("{BG}"),
-            format!("{}{}", " ".repeat(pad), RESET),
-        );
+        let lead = if indent {
+            format!("{BG} ")
+        } else {
+            String::new()
+        };
+        let row = format!("{lead}{painted}{BG}{}{RESET}", " ".repeat(pad));
         // Hard-coded `ResponseTool`: a panel is a tool block, and tool blocks
         // only ever occur between `begin_response` and `end_response`. Nothing
         // here is ever drawn as anything else, so there is no caller to pass a
@@ -3485,8 +3469,10 @@ impl Output for ConsoleOutput {
             *parser = StreamParser::new_gfm_stream();
             let mut renderer = self.renderer.lock().unwrap();
             let _ = renderer.feed(&events, &mut answer);
-            let mut theme = Theme::default();
-            theme.clickable_links = true; // real TTY path
+            let theme = Theme {
+                clickable_links: true, // real TTY path
+                ..Default::default()
+            };
             *renderer = Renderer::new(theme, current_width);
         }
         // Commit thinking (the thinking renderer is kept — post-tool
