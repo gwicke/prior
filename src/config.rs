@@ -1967,4 +1967,65 @@ model = "claude-3-5-sonnet-20241022"
         assert_eq!(cfg.tool_call_limit, Some(50));
         assert_eq!(cfg.security_mode.as_deref(), Some("confirm"));
     }
+
+    /// The example's `[models.*]` tables are commented out, so
+    /// `example_toml_file_parses` never sees them — and `deny_unknown_fields`
+    /// only fires on real content. Uncomment them here and parse, so a typo in
+    /// the documented example is a failing test rather than a startup error the
+    /// first user hits.
+    #[test]
+    fn the_examples_per_model_tables_are_real_and_valid() {
+        let content =
+            std::fs::read_to_string("settings.toml.example").expect("example file present");
+        // Take just the per-model section and strip its comment markers. A
+        // blanket uncomment would be wrong: the prose in the example is not
+        // TOML, and `deny_unknown_fields` would rightly reject it.
+        let lines: Vec<&str> = content.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("# [models."))
+            .expect("the example should document a [models.*] table");
+        let uncommented: String = lines[start..]
+            .iter()
+            .take_while(|l| l.trim_start().starts_with('#'))
+            .map(|l| {
+                // Keep only what is actually TOML — a table header or a
+                // `key = value`. The prose between them documents the
+                // section and would be a parse error uncommented.
+                let body = l.trim_start().strip_prefix('#').unwrap_or("").trim();
+                let is_toml = body.starts_with('[')
+                    || body.split_once('=').is_some_and(|(k, _)| {
+                        let k = k.trim();
+                        !k.is_empty()
+                            && k.chars().next().is_some_and(char::is_alphabetic)
+                            && k.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    });
+                if is_toml {
+                    format!("{body}\n")
+                } else {
+                    "\n".to_string()
+                }
+            })
+            .collect();
+        let cfg: Config = toml_edit::de::from_str(&uncommented)
+            .unwrap_or_else(|e| panic!("the example's uncommented lines must parse: {e}"));
+        assert!(
+            !cfg.models.is_empty(),
+            "the example should document at least one model table"
+        );
+        for (id, _record) in &cfg.models {
+            assert!(id.contains(':'), "a model key must be provider:model: {id}");
+        }
+        // Spot-check that the two kinds of setting are both documented, since
+        // they behave differently and that distinction is the whole point of
+        // the section.
+        assert!(
+            cfg.models.values().any(|r| r.reasoning.is_some()),
+            "a default should be shown"
+        );
+        assert!(
+            cfg.models.values().any(|r| r.context_length.is_some()),
+            "a display override should be shown"
+        );
+    }
 }

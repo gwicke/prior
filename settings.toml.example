@@ -22,6 +22,45 @@ reasoning_in_context = "never"     # always | never | aborted_turns_only
 # Or load from a file:
 # agent_prompt_file = "prompts/custom_agent.txt"
 
+# --- Per-model defaults ---
+# One table per model, keyed by the same "provider:model" id as `default_model`.
+# The key must be quoted: the colon is not legal in a bare TOML key.
+#
+# Two kinds of setting live here, and they do different things:
+#
+#   reasoning / temperature / top_p  are DEFAULTS for that model. They are
+#     applied the first time you activate it in a session, and only if you have
+#     not set the value yourself with /reasoning, /temperature or /top_p. A
+#     runtime change is remembered for the session but is NOT written back here
+#     unless you run `/model <id> save`, which copies your live values in.
+#     A per-model default therefore beats `default_reasoning_level` above: once
+#     a model's table exists, a later change to the global will not reach it.
+#
+#   context_length / *_cost / *_index / description  are DISPLAY overrides. They
+#     change what the `/model` listing and `/stat` report for that model, and
+#     nothing else — no provider is told about them.
+#
+# `Ctrl-E` on `/model <id> edit` edits exactly this table. It is the most direct
+# way to set a value you would otherwise have to remember.
+#
+# Unknown keys are a startup error naming the key and suggesting the closest
+# match, so a typo is loud rather than silently ignored.
+#
+# [models."anthropic:claude-3-5-sonnet-20241022"]
+# reasoning = "high"          # off | low | med | high | max
+# temperature = 0.2           # 0.0 - 2.0; omit to leave the provider's default
+# top_p = 0.9                 # 0.0 - 1.0; omit to leave the provider's default
+#
+# [models."openrouter:stealth/space-bunny-alpha"]
+# reasoning = "max"
+# A display override, for a model the catalog describes poorly or not at all.
+# The app uses this everywhere it shows the model's context window, including
+# the status bar's context percentage — which is why it is worth setting when
+# the published number is wrong.
+# context_length = 1048576
+# prompt_cost = 0.10
+# completion_cost = 0.30
+
 # Tool-specific configurations
 [tool_config.bash]
 # Commands that will be automatically allowed without prompting (when yolo is false)
