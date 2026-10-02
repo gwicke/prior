@@ -37,12 +37,31 @@ jobs:
       - name: Build project
         run: cargo build --verbose
 
+      - name: Install cargo-nextest
+        # Needed because `cargo test` runs test binaries one at a time, and the
+        # suite is lopsided: `mock_turn` alone is ~31s and `retry_backoff`
+        # ~27s, so the binaries' runtimes add up rather than overlap. Roughly
+        # 79s of work sat behind a 90s wall clock; nextest runs each binary as
+        # its own process so the floor becomes the slowest single binary
+        # (~32s) instead of the sum. Measured 1052/1052 passing, 90.7s -> 37.9s.
+        uses: taiki-e/install-action@nextest
+
       - name: Run tests
         # `--features test-utils` is not optional: `confirm_raw_mode` is gated
         # behind it, and plain `cargo test` silently skips it — which is how a
         # missing quick key survived three implementation phases (ui_draw_v2
         # §9 #9). Keep the two in one step so they cannot drift apart.
-        run: cargo test --verbose --features test-utils
+        #
+        # nextest runs each test in its OWN process, which also removes a whole
+        # class of flakiness for free: the suite leans on process globals
+        # (`TERMINAL_WIDTH`, `set_current_dir`, the `SANDBOX` and
+        # `sandbox_state` statics, env vars), and several of those are mutated
+        # by `#[serial]` tests purely to keep neighbours off them.
+        #
+        # Deliberately NOT adding `--no-fail-fast`, and no retries: a retry here
+        # would mask exactly the cross-test interference that the `#[serial]`
+        # annotations were added to expose.
+        run: cargo nextest run --features test-utils
 
   # Clippy job: ADVISORY ONLY. Reports warnings, never fails the workflow, so
   # it cannot block a push while a lint backlog is being worked down. Runs as
