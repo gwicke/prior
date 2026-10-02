@@ -477,8 +477,7 @@ impl JsonlSessionRepo {
                 if let Some(new_header_line) = new_header_line {
                     lines[0] = &new_header_line;
                     if let Some(parent) = path.parent() {
-                        let temp_path =
-                            parent.join(format!(".{}.tmp", uuid::Uuid::now_v7().to_string()));
+                        let temp_path = parent.join(format!(".{}.tmp", uuid::Uuid::now_v7()));
                         if tokio::fs::write(&temp_path, lines.join("\n") + "\n")
                             .await
                             .is_ok()
@@ -740,7 +739,7 @@ impl SessionRepo for JsonlSessionRepo {
             };
             while let Some(entry) = read_dir.next_entry().await? {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "jsonl") {
+                if path.extension().is_some_and(|e| e == "jsonl") {
                     if let Some(meta) = Self::read_metadata_listing(&path).await {
                         // Migrate: ensure header has name if we found one from session_info
                         // We need to re-read header to get the current state
@@ -1088,7 +1087,7 @@ impl JsonlSessionRepo {
             if let Ok(read_dir) = std::fs::read_dir(dir) {
                 for entry in read_dir.filter_map(|e| e.ok()) {
                     let path = entry.path();
-                    if !path.extension().map_or(false, |e| e == "jsonl") {
+                    if !path.extension().is_some_and(|e| e == "jsonl") {
                         continue;
                     }
                     let file_mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
@@ -1204,7 +1203,7 @@ impl JsonlSessionRepo {
             if let Ok(mut read_dir) = tokio::fs::read_dir(dir).await {
                 while let Ok(Some(entry)) = read_dir.next_entry().await {
                     let path = entry.path();
-                    if !path.extension().map_or(false, |e| e == "jsonl") {
+                    if !path.extension().is_some_and(|e| e == "jsonl") {
                         continue;
                     }
                     let file_mtime = entry.metadata().await.ok().and_then(|m| m.modified().ok());

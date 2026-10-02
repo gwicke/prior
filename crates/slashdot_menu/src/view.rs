@@ -198,6 +198,12 @@ pub struct RowView {
     render: RenderCache,
 }
 
+impl Default for RowView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RowView {
     pub fn new() -> Self {
         RowView {

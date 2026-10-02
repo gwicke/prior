@@ -485,12 +485,12 @@ mod tests {
 
         exclude(&ps).unwrap();
         assert!(
-            list_excluded().iter().any(|p| *p == path),
+            list_excluded().contains(&path),
             "must be excluded after exclude()"
         );
         restore(&ps).unwrap();
         assert!(
-            !list_excluded().iter().any(|p| *p == path),
+            !list_excluded().contains(&path),
             "must be re-enabled after restore()"
         );
     }

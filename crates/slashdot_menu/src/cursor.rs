@@ -43,7 +43,7 @@ pub fn rank_and_pin(rows: &[Row], terms: &str, selection: Option<&str>) -> RankR
                 scored.push((score, r));
             }
         }
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|b| std::cmp::Reverse(b.0));
         scored.into_iter().map(|(_, r)| r.clone()).collect()
     };
 
@@ -110,24 +110,24 @@ pub(crate) fn rank_row_refs(
     let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>)> =
         display_fields
             .iter()
-            .filter_map(|f| {
+            .map(|f| {
                 match f.as_str() {
-                    "id" => Some((
+                    "id" => (
                         "id".to_string(),
                         Box::new(|(_, row): &(RowRef, &Row)| row.id.clone())
                             as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>,
-                    )),
-                    "description" => Some((
+                    ),
+                    "description" => (
                         "description".to_string(),
                         Box::new(|(_, row): &(RowRef, &Row)| {
                             row.description.clone().unwrap_or_default()
                         })
                             as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>,
-                    )),
+                    ),
                     _ => {
                         // Custom field - extract from row.fields
                         let field_name = f.clone();
-                        Some((
+                        (
                             f.clone(),
                             Box::new(move |(_, row): &(RowRef, &Row)| {
                                 row.fields
@@ -140,7 +140,7 @@ pub(crate) fn rank_row_refs(
                                     .unwrap_or_default()
                             })
                                 as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>,
-                        ))
+                        )
                     }
                 }
             })

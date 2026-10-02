@@ -192,11 +192,11 @@ impl JsonlSessionStorage {
         let mut guard = self.file.lock().await;
 
         // Check if file exists and get its current inode
-        let current_inode = tokio::fs::metadata(&self.path).await.ok().and_then(|m| {
+        let current_inode = tokio::fs::metadata(&self.path).await.ok().map(|m| {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                Some(m.ino())
+                m.ino()
             }
             #[cfg(not(unix))]
             {
@@ -297,12 +297,12 @@ impl JsonlSessionStorage {
             crate::PicocodeError::Other("Session file has no parent directory".into())
         })?;
 
-        let temp_path = parent_dir.join(format!(".{}.tmp", Uuid::now_v7().to_string()));
+        let temp_path = parent_dir.join(format!(".{}.tmp", Uuid::now_v7()));
 
         // Write new content to temp file
         {
             let mut temp_file = fs::File::create(&temp_path)?;
-            for (_i, line) in lines.iter().enumerate() {
+            for line in lines.iter() {
                 temp_file.write_all(line.as_bytes())?;
                 temp_file.write_all(b"\n")?;
             }

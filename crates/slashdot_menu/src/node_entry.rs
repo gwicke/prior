@@ -96,6 +96,7 @@ impl Default for ContentCache {
 
 // --- Epoch state (user-intent, reset on new activation) ---
 
+#[derive(Default)]
 struct EpochState {
     /// Last rendered section for this node — the §5.1 restore source
     /// (traversal memory; kept in sync with the rows-pipeline key).
@@ -118,18 +119,6 @@ struct EpochState {
     /// time so every frame of one confirm renders the same text
     /// without re-asking the node.
     confirm_labels: Option<ConfirmLabels>,
-}
-
-impl Default for EpochState {
-    fn default() -> Self {
-        EpochState {
-            view_args: String::new(),
-            should_restore_view_args: false,
-            confirm_pending: false,
-            confirm_prompt: String::new(),
-            confirm_labels: None,
-        }
-    }
 }
 
 // --- Internal traversal result ---
@@ -1310,11 +1299,11 @@ impl NodeEntry {
                     }
                     Some(map)
                 };
-                return Ok(Rc::new(CompletionRows {
+                Ok(Rc::new(CompletionRows {
                     rows,
                     labels: None,
                     match_indices,
-                }));
+                }))
             }
             Some(c) => {
                 let key = &body[..c];
@@ -1418,11 +1407,11 @@ impl NodeEntry {
                     }
                     (rows, Some(map))
                 };
-                return Ok(Rc::new(CompletionRows {
+                Ok(Rc::new(CompletionRows {
                     rows: final_rows,
                     labels: None,
                     match_indices: final_match_indices,
-                }));
+                }))
             }
         }
     }

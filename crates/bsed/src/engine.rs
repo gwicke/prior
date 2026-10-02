@@ -140,8 +140,8 @@ fn collapse_case(input: &str) -> Result<String, EngineError> {
     // character into the file, or lose a transform the model asked for.
     let mut out = String::with_capacity(input.len());
     let mut mode: Option<bool> = None; // Some(true) = upper, Some(false) = lower
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
+    let chars = input.chars().peekable();
+    for ch in chars {
         match ch {
             '\u{e001}' => {
                 if mode.is_some() {

@@ -475,6 +475,7 @@ fn blanks_above_error(data: &[u8]) -> usize {
 // via `screen_rows`.)
 
 /// Remove ANSI escape sequences (CSI `ESC [ params final`) from a line.
+#[allow(dead_code)]
 fn strip_ansi(l: &str) -> String {
     let mut out = String::new();
     let mut chars = l.chars().peekable();
@@ -498,6 +499,7 @@ fn strip_ansi(l: &str) -> String {
 /// Every `CSI … H` (CUP) in a string: the parameters between the `ESC [` and
 /// the `H`. Scans for the real sequence rather than the letter, so the status
 /// text itself could contain an `H` without passing for an address.
+#[allow(dead_code)]
 fn cups(s: &str) -> Vec<String> {
     let b: Vec<char> = s.chars().collect();
     let mut out = Vec::new();
@@ -634,7 +636,7 @@ fn the_status_line_keeps_one_blank_row_above_it() {
 /// and it is worth keeping in the same shape (one screen-based count per
 /// scenario) because it is the thing that regresses when a block's trailing blank
 /// goes missing.
-
+///
 /// **The area follows the content; it is not parked at the screen's bottom.**
 ///
 /// Every other layout test here drives a turn that fills the screen, which is

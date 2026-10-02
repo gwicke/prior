@@ -151,7 +151,7 @@ mod tests {
         match eval(&mut h, "reasoning ", HostKey::Tab) {
             MenuResult::Continue(plan, prompt) => {
                 assert!(
-                    plan.rows.len() == 0 || plan.rows.iter().any(|l| l.0.contains("off")),
+                    plan.rows.is_empty() || plan.rows.iter().any(|l| l.0.contains("off")),
                     "should show leaf content, got {:?}",
                     plan.rows
                 );

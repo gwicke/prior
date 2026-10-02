@@ -123,13 +123,12 @@ pub fn scan(text: &str) -> Balance {
                     stack.push('<');
                 }
             }
-            '>' => {
+            '>'
                 // Only pop if an angle bracket is actually open, so `a > b`
                 // does not consume an unrelated `(`.
-                if stack.last() == Some(&'<') {
+                if stack.last() == Some(&'<') => {
                     stack.pop();
                 }
-            }
             _ => {}
         }
         prev = c;
@@ -140,9 +139,7 @@ pub fn scan(text: &str) -> Balance {
     // growth pass is a nicety — refusing to grow because of one is worse than
     // skipping a growth that might have helped. Every other unclosed opener is
     // believed.
-    if stack.iter().all(|c| *c == '<') {
-        Balance::Balanced
-    } else if stack.is_empty() {
+    if stack.iter().all(|c| *c == '<') || stack.is_empty() {
         Balance::Balanced
     } else {
         Balance::Unbalanced

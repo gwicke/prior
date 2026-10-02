@@ -39,9 +39,7 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
                     // Rows are the canonical five, so this cannot fail in
                     // practice — but the config is typed now, so an
                     // unparsable value must be reported rather than stored.
-                    let parsed = level
-                        .parse::<crate::params::ReasoningLevel>()
-                        .map_err(|e| e)?;
+                    let parsed = level.parse::<crate::params::ReasoningLevel>()?;
                     writer.set_reasoning(Some(parsed));
                     Ok(())
                 }),

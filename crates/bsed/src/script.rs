@@ -99,8 +99,13 @@ pub fn build(expressions: &str) -> Result<Script, ScriptError> {
     for (i, cmd) in cmds.iter().enumerate() {
         let expr_num = (i % expr_count) + 1;
         let line = expr_lines.get(i).unwrap_or(&expressions);
-        extract_change_ranges(&[cmd.clone()], expr_num, line, &mut change_ranges)?;
-        screen(&[cmd.clone()], expr_num, line)?;
+        extract_change_ranges(
+            std::slice::from_ref(cmd),
+            expr_num,
+            line,
+            &mut change_ranges,
+        )?;
+        screen(std::slice::from_ref(cmd), expr_num, line)?;
         if cmd_has_case_escape(cmd) {
             used_case_sentinels = true;
         }
@@ -726,8 +731,8 @@ fn render_command(c: &SedCommand, out: &mut String) {
             out.push('/');
             out.push_str(&rewrite_replacement(&s.replacement));
             out.push('/');
-            if s.nth.is_some() {
-                out.push_str(&s.nth.unwrap().to_string());
+            if let Some(nth) = s.nth {
+                out.push_str(&nth.to_string());
             }
             if s.global {
                 out.push('g');

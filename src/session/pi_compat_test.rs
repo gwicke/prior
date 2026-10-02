@@ -47,12 +47,12 @@ fn enumerate_session_files(root: &PathBuf) -> Vec<PathBuf> {
             if let Ok(sub_read) = std::fs::read_dir(&path) {
                 for sub_entry in sub_read.flatten() {
                     let sub_path = sub_entry.path();
-                    if sub_path.extension().map_or(false, |e| e == "jsonl") {
+                    if sub_path.extension().is_some_and(|e| e == "jsonl") {
                         files.push(sub_path);
                     }
                 }
             }
-        } else if path.extension().map_or(false, |e| e == "jsonl") {
+        } else if path.extension().is_some_and(|e| e == "jsonl") {
             files.push(path);
         }
     }

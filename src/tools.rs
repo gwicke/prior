@@ -470,7 +470,7 @@ pub(crate) fn use_internal_bsed() -> Option<impl Drop> {
     }
     let previous = {
         let mut slot = TEST_BSED.lock().expect("TEST_BSED lock");
-        std::mem::replace(&mut *slot, Some(bin))
+        slot.replace(bin)
     };
     Some(TestBsedRestores { previous })
 }
@@ -549,7 +549,7 @@ pub async fn sed_preview(
 
     let cfg = sandbox_config();
     let cfg = cfg.as_ref().as_ref().cloned().unwrap_or_default();
-    let timeout: Option<u64> = cfg.timeout_secs.map(|v| v.into());
+    let timeout: Option<u64> = cfg.timeout_secs.into();
 
     // Model-supplied text rides as ONE argv element: data, never structure. No
     // shell is involved, so a metacharacter in an expression is just a character.
@@ -676,7 +676,7 @@ pub async fn grep_text(pattern: String, path: String) -> Result<String, ToolErro
 
     let cfg = sandbox_config();
     let cfg = cfg.as_ref().as_ref().cloned().unwrap_or_default();
-    let timeout: Option<u64> = cfg.timeout_secs.map(|v| v.into());
+    let timeout: Option<u64> = cfg.timeout_secs.into();
 
     // Constrained ripgrep, passed as a discrete argv list (no shell, no string
     // construction). The pattern and path are argv elements, so regex
@@ -743,7 +743,7 @@ impl rig_core::tool::Tool for Bash {
         args: Self::Args,
     ) -> std::result::Result<Self::Output, Self::Error> {
         let (out, exit_code) =
-            run_sandboxed_with_status(&args.command, args.timeout.map(|v| v.into())).await?;
+            run_sandboxed_with_status(&args.command, args.timeout.into()).await?;
         // The bash tool result is shown verbatim to the user (via
         // `LoggingHook::on_tool_result` → `display_tool_result`) AND handed
         // straight back to the LLM as the tool message. An empty stdout
@@ -881,10 +881,7 @@ pub(crate) async fn run_sandboxed(
     // The LLM may override the configured default timeout per command. The
     // timeout is enforced whenever the command actually runs; an unset sandbox
     // config is refused before the timeout is relevant (see the closure below).
-    let configured = cfg
-        .as_ref()
-        .as_ref()
-        .and_then(|c| c.timeout_secs.clone().map(|v| v.into()));
+    let configured = cfg.as_ref().as_ref().and_then(|c| c.timeout_secs.into());
     let timeout = resolve_timeout(override_timeout, configured)?;
 
     // Move owned copies into the blocking task (`cmd` cloned to a String, the
@@ -941,10 +938,7 @@ pub(crate) async fn run_sandboxed_with_status(
     // The LLM may override the configured default timeout per command. The
     // timeout is enforced whenever the command actually runs; an unset sandbox
     // config is refused before the timeout is relevant (see the closure below).
-    let configured = cfg
-        .as_ref()
-        .as_ref()
-        .and_then(|c| c.timeout_secs.clone().map(|v| v.into()));
+    let configured = cfg.as_ref().as_ref().and_then(|c| c.timeout_secs.into());
     let timeout = resolve_timeout(override_timeout, configured)?;
 
     // Move owned copies into the blocking task (`cmd` cloned to a String, the
@@ -1141,7 +1135,7 @@ fn capture_bounded(
             .expect("sandbox timeout thread")
     });
 
-    let mut out: Vec<u8> = Vec::with_capacity(max_bytes.min(8192).max(1));
+    let mut out: Vec<u8> = Vec::with_capacity(max_bytes.clamp(1, 8192));
     let mut buf = [0u8; 8192];
     let mut total: usize = 0;
     let mut exceeded = false;
@@ -1441,7 +1435,7 @@ fn build_bwrap_args(
     });
     if !tmp_covered {
         let tmp_size = cfg.tmp_size_mb.unwrap_or(256);
-        let tmp_bytes = tmp_size as u64 * 1024 * 1024;
+        let tmp_bytes = tmp_size * 1024 * 1024;
         args.push("--size".into());
         args.push(tmp_bytes.to_string());
         args.push("--tmpfs".into());
@@ -1497,7 +1491,7 @@ fn build_bwrap_expr(
     // interprets the (single-quoted) user command, so pipes/redirections inside
     // it work. `exec` replaces the outer shell so only one shell process runs
     // the command. Output is captured by the caller (direct stdout reads).
-    let cmd_quoted = sh_single_quote(&cmd);
+    let cmd_quoted = sh_single_quote(cmd);
     let payload = format!("exec sh -c {cmd_quoted}");
     let target: Vec<String> = vec!["sh".into(), "-c".into(), payload];
 

@@ -431,7 +431,7 @@ impl StaticListingNode {
     /// Create from a static slice of rows.
     pub fn new(rows: &[StaticRow]) -> Self {
         StaticListingNode {
-            rows: rows.iter().cloned().collect(),
+            rows: rows.to_vec(),
             header_lines: Vec::new(),
             active_ids: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::new())),
             field_specs: Vec::new(),
