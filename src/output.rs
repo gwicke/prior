@@ -241,9 +241,6 @@ struct HoldTrailing<'a, W: io::Write + ?Sized> {
     /// Whether any byte at all passed — the difference between a write with
     /// nothing in it and one whose only content was newlines.
     wrote_any: bool,
-    /// Last bytes of real content that passed through (excluding what is
-    /// parked in `pending`), for dumping what a block actually ended with.
-    tail: Vec<u8>,
 }
 
 impl<W: io::Write + ?Sized> HoldTrailing<'_, W> {
@@ -287,8 +284,6 @@ impl<W: io::Write + ?Sized> io::Write for HoldTrailing<'_, W> {
                     self.inner.write_all(&blank)?;
                 }
                 self.inner.write_all(&buf[..=i])?;
-                self.tail.extend_from_slice(&buf[..=i]);
-                self.tail.truncate(400);
                 self.pending += buf.len() - i - 1;
             }
             // All newlines: trailing until something says otherwise.
@@ -2099,7 +2094,6 @@ impl ConsoleOutput {
             pending: 0,
             wrote_content: false,
             wrote_any: false,
-            tail: Vec::new(),
         };
         // Seeded as pending state rather than written through: a boundary row
         // is not content, and a write that adds nothing of its own must still
@@ -2124,7 +2118,6 @@ impl ConsoleOutput {
         // lines, so what is left is either content or nothing.
         let wrote_any = hold.wrote_any;
         let wrote_content = hold.wrote_content;
-        let tail = std::mem::take(&mut hold.tail);
         let carried = hold.finish();
         drop(hold);
         // Blame where the content is written, not where it lands: a block that
