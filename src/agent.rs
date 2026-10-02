@@ -7753,9 +7753,12 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // Cancel fires right after the first (failed) call, via a spawned
         // task that races the sleep.
         let cancel2 = cancel.clone();
+        let notify2 = notify.clone();
+        let started = std::time::Instant::now();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             cancel2.store(true, std::sync::atomic::Ordering::SeqCst);
+            notify2.notify_one();
         });
         let r = retry_summarization(output.as_ref(), &cancel_out, &notify, None, &mut || {
             calls += 1;
@@ -7769,6 +7772,10 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let _ = handle.await;
         assert!(matches!(r, Err(crate::PicocodeError::Cancelled(_))));
         assert_eq!(calls, 1, "cancelled during back-off must not retry");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the 5s back-off ran its course instead of yielding to the signal"
+        );
     }
 
     /// The pieces a back-off pump needs: a prompt session over the test app
