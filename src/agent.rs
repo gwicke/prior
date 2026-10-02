@@ -4997,7 +4997,7 @@ pub async fn run_interactive(
     // overlay is populated within a few seconds *without* blocking the
     // first prompt. The overlay falls back to the cached/static list
     // until the fetch completes.
-    let _ = tokio::task::spawn(async {
+    tokio::task::spawn(async {
         let _ = model_catalog::catalog().await;
     });
     // One-shot input buffer preload. A `/session <id> resume` may compute a
