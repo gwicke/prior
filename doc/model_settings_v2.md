@@ -489,11 +489,22 @@ edits of a model's params are the global `/reasoning`, `/temperature`,
 - The cursor starts on `activate`, so `/model <id>` + `Enter` still activates
   in one keystroke — the current behavior is preserved. `↓` then `Enter` picks
   `save`.
-- `save` is only offered when the node is the **live** one (`live.is_some()`);
-  under `/set default_model` the same `ModelNode` is reused (`v25_set.rs:160`),
-  where "activate" means "set as default model" and saving live params is
-  meaningless. On the live node it accepts any model *used* this session, not
-  only the current one (see A.5).
+- `save` is only offered on the **live** node; on that node it accepts any model
+  *used* this session, not only the current one (see A.5).
+- `activate` takes one optional trailing argument, a reasoning level:
+  `/model <id> activate [off|low|med|high|max]`. It is applied **after**
+  `activate_model_params`, which installs the model's own level from its record
+  — seeding after the write would overwrite the user's choice. A word that is
+  not a level is `SubmitResult::Error` *before* the switch, so a typo activates
+  nothing and stays in the buffer to edit. The leaf's `header()` advertises the
+  ladder (built from `ReasoningEnumNode::LEVELS`, so it cannot drift from
+  `/reasoning`) and what happens when the argument is left off. No
+  `drill_rewrite`: the one-keystroke activate is worth more than a prefill.
+- `/set default_model` shares the catalog listing but **not** the leaf —
+  `DefaultModelActivateNode` (`v25_model.rs`) writes `default_model` and nothing
+  else. The two used to be one node, whose writer was `set_model`: choosing a
+  default switched the *running* model, seeded its live params and journaled a
+  `ModelChange`, all of which A.8 says must not happen off the live node.
 - The model's `header()` renders: display name, OpenRouter description, ctx /
   $/M in / $/M out / coding / intelligence / agentic, `supported efforts: …`
   when known, whether temperature/top_p are supported, and the **current**
@@ -501,6 +512,23 @@ edits of a model's params are the global `/reasoning`, `/temperature`,
   `ctrl-e to edit`.
 - `ModelNode::edit()` (Ctrl-E) runs the TOML editor of A.9 for the drilled id —
   it works for **inactive** models too.
+
+**Resume prefill.** `compute_resume_model_prefill` (`agent.rs`) now carries the
+session's reasoning level too, on the `activate` leaf — but only when
+activating that model would not produce that level anyway, which is the common
+case: a session that never changed its level is already reproduced by the
+model's record or the global default, and spelling it out would be a longer
+line saying nothing. The comparison is `AppState::peek_model_reasoning(id)`
+against the session's recorded level, so it is the *runtime* level being
+restored, not a default one, and a level that does not parse is dropped rather
+than pre-filled. Outcomes:
+
+| model vs live | level vs what activation installs | prefill |
+|---|---|---|
+| differs | reproduces it (or none recorded) | `/model <id>` |
+| differs | differs | `/model <id> activate <level>` |
+| same | differs | `/model <id> activate <level>` |
+| same | reproduces it | *(none)* |
 
 ### `/reasoning`, `/temperature`, `/top_p`
 

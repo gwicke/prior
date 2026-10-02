@@ -719,25 +719,23 @@ pub fn build_model_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu
         Some(app_state.clone()),
     )
     .into();
-    add_model_actions(&mut model_menu, app_state, true, 1);
+    add_live_model_actions(&mut model_menu, app_state);
     node.add_child(model_menu);
     node
 }
 
-/// Attach the action rows to a model node.
+/// Attach the live `/model` action rows to a model node.
 ///
 /// `activate` goes first so it carries the initial cursor: `/model <id>` +
 /// Enter still activates in one keystroke, exactly as it did before the
 /// actions existed.
 ///
-/// `with_save` is false for `/set default_model`, which reuses this same node:
-/// there "activate" already writes the setting, and a default is not a live
-/// model with params to save.
-pub fn add_model_actions(
+/// Only the live mount. `/set default_model` reuses the catalog listing but
+/// brings its own leaf ([`DefaultModelActivateNode`]): there "activate" writes
+/// a setting rather than switching the running model.
+fn add_live_model_actions(
     node: &mut crate::slashdot_menu::menu::SlashDotMenuNode,
     app_state: &Arc<AppState>,
-    with_save: bool,
-    above: usize,
 ) {
     let writer = app_state.clone();
     node.add_child(
@@ -747,13 +745,11 @@ pub fn add_model_actions(
                 writer.set_model(model);
                 Ok(())
             }),
-            above,
+            1,
         )
         .into(),
     );
-    if with_save {
-        node.add_child(ModelActionNode::save(app_state.clone(), above).into());
-    }
+    node.add_child(ModelActionNode::save(app_state.clone(), 1).into());
 }
 
 // ---------------------------------------------------------------------------
@@ -901,19 +897,36 @@ impl SlashDotNode for ModelActionNode {
                 let Some(write) = self.activate_fn.as_mut() else {
                     return SubmitResult::Handled;
                 };
+                // The optional level is parsed before anything is touched: a
+                // level that is not one leaves the model un-switched, and
+                // `Error` keeps the menu open with the bad word still in the
+                // buffer to edit rather than discarding the whole line.
+                let level = match path_args.suffix.trim() {
+                    "" => None,
+                    raw => match raw.parse() {
+                        Ok(level) => Some(level),
+                        Err(msg) => return SubmitResult::Error(msg),
+                    },
+                };
                 match write(&model) {
                     Ok(()) => {
                         // Load-or-seed this model's live params. Here, on the
-                        // action, and not inside `set_model`: `/set
-                        // default_model` shares that writer but is not an
-                        // activation, and seeding there would install the
-                        // default model's record as the live params of
+                        // action, and not inside `set_model`: nothing else
+                        // switches models, and seeding there would install
+                        // the switched model's record as the live params of
                         // whatever is actually running. Doing it before
                         // returning also means the loop's `params_changed`
                         // comparison already sees the final values, so the
                         // switch costs one rebuild rather than two.
                         if let Some(app) = self.live.as_ref() {
                             app.activate_model_params(&model);
+                        }
+                        // After the seed, never before it: activation installs
+                        // the model's own level, and the level the user typed
+                        // is the one they want *for this switch*. Setting it
+                        // first would have the seed overwrite it.
+                        if let (Some(app), Some(level)) = (self.live.as_ref(), level) {
+                            app.set_reasoning(Some(level));
                         }
                         // Journaled at the commit, not on rebuild: the explicit
                         // user action is what is worth recording, and the
@@ -931,6 +944,106 @@ impl SlashDotNode for ModelActionNode {
             }
             ModelAction::Save => self.save_live(&model),
         }
+    }
+
+    /// What `activate` does, and the one thing it takes beyond the model id.
+    ///
+    /// Only on the leaf (`/model <id> activate `), which is the only level
+    /// where the argument exists: at the action listing there is nothing typed
+    /// yet, and a header advertising a parameter would be describing a prompt
+    /// the user is not on yet.
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+        if self.action != ModelAction::Activate {
+            return Vec::new();
+        }
+        let Some(model) = drilled_model(path_args, self.above) else {
+            return Vec::new();
+        };
+        // The ladder comes from `/reasoning` itself, so the two can never
+        // disagree about which levels exist.
+        let ladder = crate::v25_reasoning::ReasoningEnumNode::LEVELS
+            .iter()
+            .map(|(level, _)| *level)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let mut lines = vec![
+            format!("activate: switch to {model}"),
+            format!("usage: /model {model} activate [{ladder}]"),
+        ];
+        // "what would activating do to my reasoning level" — the same question
+        // the resume prefill asks, so both answer it with one value.
+        if let Some(app) = self.live.as_ref() {
+            let now = app
+                .peek_model_reasoning(&model)
+                .map(|l| l.as_str())
+                .unwrap_or("off");
+            lines.push(
+                "optional: a reasoning level after `activate`, applied on Enter;".to_string(),
+            );
+            lines.push(format!(
+                "          omitted keeps this model's own level ({now})"
+            ));
+        }
+        lines
+    }
+}
+
+/// `/set default_model <id>`'s action leaf — the setting write, and nothing
+/// else.
+///
+/// Deliberately not [`ModelActionNode`]: there is no running model to switch,
+/// no live params to load, no session event to journal, and no reasoning level
+/// to set. The catalog listing above it is shared with `/model` (a default is
+/// chosen from the same catalog); only this leaf differs, so only this leaf is
+/// separate.
+pub struct DefaultModelActivateNode {
+    app_state: Arc<AppState>,
+}
+
+impl DefaultModelActivateNode {
+    pub fn new(app_state: &Arc<AppState>) -> Self {
+        DefaultModelActivateNode {
+            app_state: app_state.clone(),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl SlashDotNode for DefaultModelActivateNode {
+    /// One row, and only once a model is drilled — at the `default_model`
+    /// level the listing must stay the catalog, or every entry would grow the
+    /// same action.
+    async fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
+        if drilled_model(path_args, 2).is_none() {
+            return Ok(Rc::new(DataResponse {
+                rows: Vec::new(),
+                active_ids: Vec::new(),
+            }));
+        }
+        Ok(Rc::new(DataResponse {
+            rows: vec![Row::new("activate").desc("make this the default model")],
+            active_ids: Vec::new(),
+        }))
+    }
+
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let Some(model) = drilled_model(path_args, 2) else {
+            return SubmitResult::Done(None);
+        };
+        match self
+            .app_state
+            .set_setting(crate::settings::SettingKey::DefaultModel, &model)
+        {
+            Ok(()) => SubmitResult::Done(Some(format!("default model is now {model}"))),
+            Err(msg) => SubmitResult::Done(Some(msg)),
+        }
+    }
+
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+        vec![
+            "Activate: make this the model new sessions start with.".to_string(),
+            "The running model is not changed.".to_string(),
+        ]
     }
 }
 
@@ -1736,6 +1849,216 @@ mod tests {
         let outcome = futures::executor::block_on(node.submit(1, &pa));
         assert!(matches!(outcome, SubmitResult::Done(None)));
         assert_eq!(app_state.model(), TEST_MODEL);
+    }
+
+    // ---- `/model <id> activate <level>` ----
+
+    /// The shortcut: the level lands *after* the switch, so activation's own
+    /// seeding cannot overwrite it. Setting it before `activate_model_params`
+    /// would pass the model the outgoing level instead of the typed one.
+    #[test]
+    fn activate_with_a_level_sets_it_after_the_switch() {
+        let app_state = test_app_state();
+        // A stored level the seed would install if the order were wrong.
+        app_state
+            .update_settings(|s| {
+                s.apply_model_settings(
+                    TEST_MODEL,
+                    &crate::model_settings::ModelSettings {
+                        reasoning: Some(crate::params::ReasoningLevel::Low),
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        app_state.set_model("anthropic:something-else");
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        let prompt = format!("model {TEST_MODEL} activate high");
+        match futures::executor::block_on(h.eval_prompt_resolved(
+            &prompt,
+            crate::slashdot_menu::HostKey::Enter,
+            80,
+        )) {
+            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {}
+            other => panic!("expected the activate action to commit, got {other:?}"),
+        }
+        assert_eq!(app_state.model(), TEST_MODEL);
+        assert_eq!(app_state.reasoning().as_deref(), Some("high"));
+    }
+
+    /// Without a level the model's own level stands — the switch keeps the
+    /// seed. `off` here is the built-in seed (no record, no global default),
+    /// which is what "leaves it alone" looks like in the params.
+    #[test]
+    fn activate_without_a_level_keeps_the_models_own() {
+        let app_state = test_app_state();
+        app_state
+            .update_settings(|s| {
+                s.apply_model_settings(
+                    TEST_MODEL,
+                    &crate::model_settings::ModelSettings {
+                        reasoning: Some(crate::params::ReasoningLevel::Med),
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        app_state.set_model("anthropic:something-else");
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        match futures::executor::block_on(h.eval_prompt_resolved(
+            &format!("model {TEST_MODEL} activate"),
+            crate::slashdot_menu::HostKey::Enter,
+            80,
+        )) {
+            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {}
+            other => panic!("expected the activate action to commit, got {other:?}"),
+        }
+        assert_eq!(app_state.model(), TEST_MODEL);
+        assert_eq!(
+            app_state.reasoning().as_deref(),
+            Some("med"),
+            "the stored level, not a forced one"
+        );
+    }
+
+    /// A word that is not a level is refused *before* anything is written:
+    /// the model must not switch on a typo, and the frame must keep the bad
+    /// word so it can be corrected rather than retyped.
+    #[test]
+    fn a_level_that_is_not_one_activates_nothing() {
+        let app_state = test_app_state();
+        app_state.set_model("anthropic:something-else");
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        let prompt = format!("model {TEST_MODEL} activate ultra");
+        let plan = match futures::executor::block_on(h.eval_prompt_resolved(
+            &prompt,
+            crate::slashdot_menu::HostKey::Enter,
+            80,
+        )) {
+            crate::slashdot_menu::node_impl::MenuResult::Continue(plan, kept) => {
+                assert_eq!(kept, prompt, "the bad word must stay in the buffer");
+                plan
+            }
+            other => panic!("a bad level must stay open, got {other:?}"),
+        };
+        let detail = plan
+            .detail
+            .iter()
+            .map(|l| l.0.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(detail.contains("unknown reasoning level"), "{detail}");
+        assert!(
+            detail.contains("off | low | med | high | max"),
+            "the error must say what is accepted: {detail}"
+        );
+        assert_eq!(
+            app_state.model(),
+            "anthropic:something-else",
+            "nothing may be activated on a bad level"
+        );
+    }
+
+    /// The header advertises the parameter, and only at the leaf: the actions
+    /// listing has nothing typed yet, so describing a word that does not exist
+    /// there would be describing a prompt the user is not on.
+    #[test]
+    fn the_activate_header_advertises_the_level_only_on_the_leaf() {
+        let app_state = test_app_state();
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        let mut detail = |prompt: &str| match futures::executor::block_on(h.eval_prompt_resolved(
+            prompt,
+            crate::slashdot_menu::HostKey::None,
+            80,
+        )) {
+            crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => plan
+                .detail
+                .iter()
+                .map(|l| l.0.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => panic!("expected Continue at {prompt:?}, got {other:?}"),
+        };
+        let leaf = detail(&format!("model {TEST_MODEL} activate "));
+        assert!(leaf.contains("activate:"), "{leaf}");
+        assert!(
+            leaf.contains("off | low | med | high | max"),
+            "the ladder must be spelled out: {leaf}"
+        );
+        assert!(
+            leaf.contains("omitted keeps this model's own level"),
+            "the header must say what happens without one: {leaf}"
+        );
+        let listing = detail(&format!("model {TEST_MODEL} "));
+        assert!(
+            !listing.contains("usage:"),
+            "the actions listing must not advertise the leaf's parameter: {listing}"
+        );
+    }
+
+    /// `/set default_model <id> activate` writes the *setting*. It used to run
+    /// the live action node, whose writer was `set_model` — so choosing a
+    /// default switched the running model and journaled a `ModelChange` for it,
+    /// the opposite of what A.8 specifies.
+    #[test]
+    fn set_default_model_activate_writes_the_setting_and_leaves_the_model_alone() {
+        let app_state = test_app_state();
+        app_state.set_model("anthropic:something-else");
+        let before = app_state.model();
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        let prompt = format!("set default_model {TEST_MODEL} activate");
+        match futures::executor::block_on(h.eval_prompt_resolved(
+            &prompt,
+            crate::slashdot_menu::HostKey::Enter,
+            80,
+        )) {
+            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {}
+            other => panic!("expected the default to be written, got {other:?}"),
+        }
+        assert_eq!(
+            app_state.with_settings(|s| s.default_model.clone()),
+            TEST_MODEL,
+            "the setting is what this path writes"
+        );
+        assert_eq!(app_state.model(), before, "the running model must not move");
+    }
+
+    /// The `/set` leaf takes no level and takes no params at all: a level typed
+    /// there is not a thing the leaf accepts, so it commits the setting and
+    /// says nothing about reasoning.
+    #[test]
+    fn set_default_model_takes_no_reasoning_level() {
+        let app_state = test_app_state();
+        let mut node = DefaultModelActivateNode::new(&app_state);
+        let pa = PathArgs::new(
+            vec![
+                "set".into(),
+                "default_model".into(),
+                TEST_MODEL.into(),
+                "activate".into(),
+            ],
+            " high",
+        );
+        assert!(matches!(
+            futures::executor::block_on(node.submit(1, &pa)),
+            SubmitResult::Done(Some(_))
+        ));
+        assert_eq!(
+            app_state.with_settings(|s| s.default_model.clone()),
+            TEST_MODEL
+        );
+        assert_eq!(
+            app_state.reasoning(),
+            None,
+            "a default model is not a reasoning level"
+        );
     }
 
     /// The whole reported path, through the menu: `/model <id> save` writes the

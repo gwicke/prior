@@ -520,7 +520,20 @@ impl SlashDotNode for SessionResumeNode {
         };
         let out = self.app_state.with_config(|c| c.output.clone());
         let qualified = self.app_state.with_config(|c| c.qualified_model_id());
-        match crate::agent::resume_session(&repo, &meta, replay, out.as_ref(), &qualified).await {
+        // Read beside the id: this is the level activating the running model
+        // would install, which is what decides whether the session's own
+        // level still needs saying in the prefill.
+        let level_on_activate = self.app_state.peek_model_reasoning(&qualified);
+        match crate::agent::resume_session(
+            &repo,
+            &meta,
+            replay,
+            out.as_ref(),
+            &qualified,
+            level_on_activate,
+        )
+        .await
+        {
             Ok((new_session, id, prefill)) => {
                 self.app_state.activate_session(Some(new_session), id);
                 if let Some(p) = prefill {

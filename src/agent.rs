@@ -3888,17 +3888,45 @@ async fn record_reasoning_change(session: &Session, level: &str) {
 /// Looks at the active leaf→root branch first (a `ModelChange` entry is
 /// authoritative for mid-session `/model` switches); falls back to the
 /// session header's `provider`/`modelId`; returns `None` when the session
-/// records no model or when it matches the live model.
+/// records no model, or when it matches the live model *and* ran the level it
+/// would run anyway.
 ///
 /// The full `provider:model_id` form is intentional: pre-filling the
 /// unqualified `model_id` might surface multiple catalog entries that
 /// share a short name under different providers.
-async fn compute_resume_model_prefill(session: &Session, live_model_id: &str) -> Option<String> {
+///
+/// `level_on_activate` is what activating `recorded` would install as its
+/// reasoning level (call it with `AppState::peek_model_reasoning`). The
+/// session's level joins the prefill **only** when it differs from that: a
+/// session whose level came from this model's own record — the common case, as
+/// most sessions never change it — is already reproduced by the activation, and
+/// spelling it out would be a longer line saying nothing. The parameter rides
+/// the `activate` leaf, which is where `/model <id> activate <level>` exists,
+/// so the short `/model <id>` stays for the no-level case.
+async fn compute_resume_model_prefill(
+    session: &Session,
+    live_model_id: &str,
+    level_on_activate: Option<crate::params::ReasoningLevel>,
+) -> Option<String> {
     let recorded = session_recorded_model_id(session).await?;
-    if recorded == live_model_id {
-        return None; // session already runs the live model — no prefill
+    // A level the frontend cannot name is dropped rather than pre-filled: the
+    // `activate` leaf would refuse it, and a prefill that only errors is worse
+    // than no prefill.
+    let recorded_level = session_recorded_reasoning(session)
+        .await
+        .and_then(|l| l.trim().parse::<crate::params::ReasoningLevel>().ok());
+    let level = match recorded_level {
+        Some(level) if Some(level) != level_on_activate => Some(level),
+        _ => None,
+    };
+    match (recorded == live_model_id, level) {
+        // Session already runs the live model at the live level — nothing to
+        // accept, and committing a matching prefill would only churn the
+        // menu sync.
+        (true, None) => None,
+        (_, Some(level)) => Some(format!("/model {recorded} activate {}", level.as_str())),
+        (false, None) => Some(format!("/model {recorded}")),
     }
-    Some(format!("/model {}", recorded))
 }
 
 /// Summary mode for `/tree compact`.
@@ -4805,15 +4833,19 @@ pub(crate) async fn fork_session_at(
 /// the chance to accept/abort/choose a model. The decision is surfaced
 /// via the returned prefill instead when the session records a model
 /// that DIFFERS from `qualified_id` (full `provider:model_id` form —
-/// what the v2.5 `/model` node resolves directly); when they match or
-/// the session records nothing, no prefill is returned. Errors are
-/// caller-displayed messages (same texts the old arm printed).
+/// what the v2.5 `/model` node resolves directly), when it ran a
+/// reasoning level that activating `qualified_id` would not reproduce,
+/// or when both hold; when neither does, no prefill is returned.
+/// `level_on_activate` is what activating `qualified_id` would install
+/// (`AppState::peek_model_reasoning`). Errors are caller-displayed
+/// messages (same texts the old arm printed).
 pub(crate) async fn resume_session(
     repo: &crate::session::repo::JsonlSessionRepo,
     meta: &crate::session::SessionMetadata,
     replay: (usize, bool),
     output: &dyn Output,
     qualified_id: &str,
+    level_on_activate: Option<crate::params::ReasoningLevel>,
 ) -> std::result::Result<(Arc<Session>, String, Option<String>), String> {
     use crate::session::repo::SessionRepo;
     let (count, is_lines) = replay;
@@ -4870,7 +4902,7 @@ pub(crate) async fn resume_session(
             replay_last_turns(output, &units, count.min(total));
         }
     }
-    let prefill = compute_resume_model_prefill(&new_session, qualified_id).await;
+    let prefill = compute_resume_model_prefill(&new_session, qualified_id, level_on_activate).await;
     Ok((Arc::new(new_session), id, prefill))
 }
 
@@ -7400,7 +7432,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         ];
         let (_guard, session, path) = build_session_with_entries(entries).await;
         // Live model differs from the session's recorded model → prefill.
-        let prefill = compute_resume_model_prefill(&session, "openai:gpt-4o").await;
+        let prefill = compute_resume_model_prefill(&session, "openai:gpt-4o", None).await;
         assert_eq!(
             prefill.as_deref(),
             Some("/model anthropic:claude-sonnet-4-5")
@@ -7433,7 +7465,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             },
         ];
         let (_guard, session, path) = build_session_with_entries(entries).await;
-        let prefill = compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet").await;
+        let prefill =
+            compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet", None).await;
         assert_eq!(prefill.as_deref(), Some("/model openai:gpt-4o"));
         let _ = std::fs::remove_file(&path);
     }
@@ -7468,7 +7501,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             .unwrap();
         let index = ro.build_index().await.unwrap();
         let session = Session::new_persisted(ro, index);
-        let prefill = compute_resume_model_prefill(&session, "openai:gpt-4o").await;
+        let prefill = compute_resume_model_prefill(&session, "openai:gpt-4o", None).await;
         assert_eq!(
             prefill.as_deref(),
             Some("/model openrouter:anthropic/claude-sonnet-4")
@@ -7481,7 +7514,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // No `ModelChange`, no header metadata → empty prompt (no nudge).
         let (_guard, session, path) = build_session_with_entries(vec![]).await;
         let prefill =
-            compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet-20241022").await;
+            compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet-20241022", None)
+                .await;
         assert_eq!(prefill, None);
         let _ = std::fs::remove_file(&path);
     }
@@ -7502,8 +7536,155 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             },
         }];
         let (_guard, session, path) = build_session_with_entries(entries).await;
-        let prefill = compute_resume_model_prefill(&session, "anthropic:claude-sonnet-4-5").await;
+        let prefill =
+            compute_resume_model_prefill(&session, "anthropic:claude-sonnet-4-5", None).await;
         assert_eq!(prefill, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A session that switched model *and* left a level behind: both halves of
+    /// the decision ride one line, on the `activate` leaf (the only place a
+    /// level parameter exists).
+    #[tokio::test]
+    async fn resume_prefill_carries_the_level_when_activation_would_not() {
+        use crate::params::ReasoningLevel;
+        let entries = vec![
+            crate::session::SessionEntry {
+                id: "m1".into(),
+                parent_id: None,
+                timestamp: "t1".into(),
+                content: crate::session::SessionEntryContent::ModelChange {
+                    provider: "anthropic".into(),
+                    model_id: "claude-3-5-sonnet".into(),
+                },
+            },
+            crate::session::SessionEntry {
+                id: "t2".into(),
+                parent_id: Some("m1".into()),
+                timestamp: "t2".into(),
+                content: crate::session::SessionEntryContent::ThinkingLevelChange {
+                    thinking_level: "high".into(),
+                },
+            },
+        ];
+        let (_guard, session, path) = build_session_with_entries(entries).await;
+        // Activating that model would seed `med` (its record), so `high` is
+        // only in the prefill because the session ran it deliberately.
+        let prefill =
+            compute_resume_model_prefill(&session, "openai:gpt-4o", Some(ReasoningLevel::Med))
+                .await;
+        assert_eq!(
+            prefill.as_deref(),
+            Some("/model anthropic:claude-3-5-sonnet activate high")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The common case stays short: the session's level is what activating its
+    /// model would produce anyway (almost always — the record, else the global
+    /// default), and spelling it out would be a longer line saying nothing.
+    #[tokio::test]
+    async fn resume_prefill_omits_a_level_the_activation_reproduces() {
+        use crate::params::ReasoningLevel;
+        let entries = vec![
+            crate::session::SessionEntry {
+                id: "m1".into(),
+                parent_id: None,
+                timestamp: "t1".into(),
+                content: crate::session::SessionEntryContent::ModelChange {
+                    provider: "anthropic".into(),
+                    model_id: "claude-3-5-sonnet".into(),
+                },
+            },
+            crate::session::SessionEntry {
+                id: "t2".into(),
+                parent_id: Some("m1".into()),
+                timestamp: "t2".into(),
+                content: crate::session::SessionEntryContent::ThinkingLevelChange {
+                    thinking_level: "high".into(),
+                },
+            },
+        ];
+        let (_guard, session, path) = build_session_with_entries(entries).await;
+        let prefill =
+            compute_resume_model_prefill(&session, "openai:gpt-4o", Some(ReasoningLevel::High))
+                .await;
+        assert_eq!(
+            prefill.as_deref(),
+            Some("/model anthropic:claude-3-5-sonnet")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The model matches but the level does not: resuming still has something
+    /// to decide, and `activate` is the leaf that carries it — re-activating the
+    /// running model installs no level of its own.
+    #[tokio::test]
+    async fn resume_prefill_nudges_for_a_level_alone() {
+        use crate::params::ReasoningLevel;
+        let entries = vec![
+            crate::session::SessionEntry {
+                id: "m1".into(),
+                parent_id: None,
+                timestamp: "t1".into(),
+                content: crate::session::SessionEntryContent::ModelChange {
+                    provider: "anthropic".into(),
+                    model_id: "claude-3-5-sonnet".into(),
+                },
+            },
+            crate::session::SessionEntry {
+                id: "t2".into(),
+                parent_id: Some("m1".into()),
+                timestamp: "t2".into(),
+                content: crate::session::SessionEntryContent::ThinkingLevelChange {
+                    thinking_level: "max".into(),
+                },
+            },
+        ];
+        let (_guard, session, path) = build_session_with_entries(entries).await;
+        let prefill = compute_resume_model_prefill(
+            &session,
+            "anthropic:claude-3-5-sonnet",
+            Some(ReasoningLevel::Med),
+        )
+        .await;
+        assert_eq!(
+            prefill.as_deref(),
+            Some("/model anthropic:claude-3-5-sonnet activate max")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A level the frontend cannot name is dropped, not pre-filled: the
+    /// `activate` leaf would refuse it, and a prefill that only errors is worse
+    /// than none. The model half still stands.
+    #[tokio::test]
+    async fn resume_prefill_drops_an_unnameable_level() {
+        let entries = vec![
+            crate::session::SessionEntry {
+                id: "m1".into(),
+                parent_id: None,
+                timestamp: "t1".into(),
+                content: crate::session::SessionEntryContent::ModelChange {
+                    provider: "anthropic".into(),
+                    model_id: "claude-3-5-sonnet".into(),
+                },
+            },
+            crate::session::SessionEntry {
+                id: "t2".into(),
+                parent_id: Some("m1".into()),
+                timestamp: "t2".into(),
+                content: crate::session::SessionEntryContent::ThinkingLevelChange {
+                    thinking_level: "turbo".into(),
+                },
+            },
+        ];
+        let (_guard, session, path) = build_session_with_entries(entries).await;
+        let prefill = compute_resume_model_prefill(&session, "openai:gpt-4o", None).await;
+        assert_eq!(
+            prefill.as_deref(),
+            Some("/model anthropic:claude-3-5-sonnet")
+        );
         let _ = std::fs::remove_file(&path);
     }
 
