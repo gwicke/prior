@@ -47,11 +47,11 @@
 - [ ] tool errors: split the operator's view from the model's, then unredact — ./doc/path_leak_risks.md
 
 ## Drawing / doc/ui_draw_v2.md
-- Input field content loss on key-down
-- U4.4 — the ordering question you answered.
+- [ ] Input field content loss on key-down
+- [ ] U4.4 — the ordering question you answered.
   content write vs. frame update synchronization
-- R5's staleness half — batching turns N stale menu re-emits into 1; still one
-  wrong redraw if the recipe outlived its menu.
+- [ ] R5's staleness half — batching turns N stale menu re-emits into 1; still
+  one wrong redraw if the recipe outlived its menu.
 
 - Cancelling a turn when it is being retried does not seem to work reliably
   any more

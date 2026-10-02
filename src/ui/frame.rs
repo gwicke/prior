@@ -719,29 +719,6 @@ pub(crate) fn plan_apply(
         .live
         .as_ref()
         .is_some_and(|live| live.term_w == tw && live.term_h == th);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/held.log")
-    {
-        let info = match cache.live.as_ref() {
-            Some(l) => format!(
-                "top={} h={} dims={}x{}",
-                l.frame_top_row,
-                l.frame.height(),
-                l.term_w,
-                l.term_h
-            ),
-            None => "none".to_string(),
-        };
-        let _ = std::io::Write::write_all(
-            &mut f,
-            format!(
-                "APPLY h={h} tw={tw} th={th} anchor={anchor} live=[{info}] dims_ok={dims_ok}\n"
-            )
-            .as_bytes(),
-        );
-    }
     // The diff path writes without newlines — it can never scroll — so the
     // frame must *fit* where it stands: a grow past the screen's bottom row
     // would write the new rows off the end (`CUD` clamps, and they land on the
@@ -822,17 +799,6 @@ fn paint_forward(
     debug_assert!(h > 0, "paint_forward needs rows to paint");
     let consumed = std::mem::take(&mut cache.consumed_rows);
     let orphan = old_h.saturating_sub(h + consumed);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/held.log")
-    {
-        let _ = std::io::Write::write_all(
-            &mut f,
-            format!("PAINT top={top} h={h} old_h={old_h} consumed={consumed} orphan={orphan}\n")
-                .as_bytes(),
-        );
-    }
     let mut s = String::new();
     // The block. `CR` + `EL` on entry is the overwrite rule: one line clear,
     // immediately followed by the row's bytes (the row is padded, so the pair
@@ -1019,20 +985,6 @@ pub(crate) fn plan_reposition(
     let h = frame.height();
     debug_assert!(h > 0, "reposition needs rows to paint");
     let top = cache.caret.0.clamp(1, th);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/held.log")
-    {
-        let _ = std::io::Write::write_all(
-            &mut f,
-            format!(
-                "REPOS old_h={old_h} consumed={} top={top} h={h} th={th}\n",
-                cache.consumed_rows
-            )
-            .as_bytes(),
-        );
-    }
     paint_forward(cache, frame, top, tw, th, old_h)
 }
 

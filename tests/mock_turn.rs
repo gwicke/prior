@@ -406,17 +406,6 @@ fn blanks_before_status(data: &[u8]) -> usize {
             break;
         }
     }
-    if blanks > 0 {
-        for (i, r) in rows.iter().enumerate() {
-            let t = r.trim();
-            let shown = if t.is_empty() {
-                "<blank>".to_string()
-            } else {
-                t.chars().take(50).collect()
-            };
-            eprintln!("ROW {i:02}: {shown}");
-        }
-    }
     blanks
 }
 
@@ -732,20 +721,20 @@ fn the_area_follows_the_content_rather_than_the_screen_bottom() {
 
 #[test]
 fn end_to_end_input_mode_layout() {
-    // Scenario 2: single text-only turn.
-    let b = run_turn(2, "text-only", false);
-    let blanks = blanks_before_status(&b);
-    assert_eq!(
-        blanks, 1,
-        "text-only turn must end with exactly ONE empty line before the bar (got {blanks})"
-    );
-
     // Scenario 0: text + tool + final text answer (the user's example).
     let a = run_turn(0, "text-tool-finaltext", false);
     let blanks = blanks_before_status(&a);
     assert_eq!(
         blanks, 1,
         "text+tool+final-answer turn must end with exactly ONE empty line before the bar (got {blanks})"
+    );
+
+    // Scenario 2: single text-only turn.
+    let b = run_turn(2, "text-only", false);
+    let blanks = blanks_before_status(&b);
+    assert_eq!(
+        blanks, 1,
+        "text-only turn must end with exactly ONE empty line before the bar (got {blanks})"
     );
 
     // Scenario 1: turn ends right after the tool result.
