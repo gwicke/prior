@@ -87,6 +87,38 @@ fn drilled_model(path_args: &PathArgs, above: usize) -> Option<String> {
         .cloned()
 }
 
+/// Lay out `label value` pairs onto as few lines as `width` allows.
+///
+/// Greedy and width-driven rather than hand-grouped: a fixed grouping has to
+/// pick a width to design for, and it is wrong everywhere else — too wide on an
+/// 80-column window, wasting the columns the facts could have used, and too
+/// narrow on a wide one, truncating instead of fitting. Here a pair is never
+/// split across lines, so each one stays readable, and the only thing that
+/// changes with the terminal is how many land on a line.
+fn pack_facts(facts: &[(String, String)], indent: &str, width: usize) -> Vec<String> {
+    const GAP: usize = 3;
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::from(indent);
+    for (label, value) in facts {
+        let piece = format!("{label} {value}");
+        let candidate_len = crate::slashdot_menu::table::display_width(&current)
+            + GAP
+            + crate::slashdot_menu::table::display_width(&piece);
+        if !current.trim_start_matches(' ').is_empty() && candidate_len > width {
+            lines.push(std::mem::take(&mut current));
+            current = format!("{indent}");
+        }
+        if current.len() > indent.len() {
+            current.push_str(&" ".repeat(GAP));
+        }
+        current.push_str(&piece);
+    }
+    if current.trim_start_matches(' ').len() > indent.len() {
+        lines.push(current);
+    }
+    lines
+}
+
 /// True for the action row ids this node's children contribute.
 fn is_action_id(id: &str) -> bool {
     matches!(id, "activate" | "save")
@@ -197,6 +229,12 @@ impl SlashDotNode for ModelNode {
     /// The resolved view — catalog overlaid with the stored per-model
     /// overrides — so these are the figures the app actually uses rather than
     /// what OpenRouter last published. Absent facts read as absent.
+    ///
+    /// Laid out by *packing* rather than by fixed positions: the facts are
+    /// built as `label value` pairs and wrapped to whatever the terminal has, so
+    /// an 80-column window shows most of them on one line and a narrow one
+    /// gives way field by field rather than truncating. Grouping them by hand
+    /// meant the widest case overflowed while narrow ones wasted the width.
     async fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
         let Some(model) = drilled_model(path_args, 1) else {
             return vec![
@@ -208,38 +246,62 @@ impl SlashDotNode for ModelNode {
             .as_ref()
             .and_then(|app| app.with_settings(|s| s.model_settings(&model).cloned()));
         let entry = crate::model_catalog::resolved_entry(&model, stored.as_ref());
+        let indent = "  ";
+        let width = render_ctx.term_width.max(40);
         let mut lines = vec![format!("model: {model}")];
+
+        // Facts, in the order they answer questions: how big, what it costs,
+        // how good, what it can do.
+        let mut facts: Vec<(String, String)> = Vec::new();
         if let Some(e) = entry.as_ref() {
-            if let Some(d) = e.description.as_deref() {
-                let width = render_ctx.term_width.saturating_sub(4).max(20);
-                lines.extend(
-                    crate::output::wrap(d, width)
-                        .into_iter()
-                        .map(|l| format!("  {l}")),
-                );
-            }
-            lines.push(format!(
-                "  ctx {}   cost ${:.2}/${:.2} per M",
+            facts.push((
+                "ctx".to_string(),
                 e.context_length
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "—".into()),
-                e.prompt_cost.unwrap_or(0.0),
-                e.completion_cost.unwrap_or(0.0),
+            ));
+            // `in`/`out` rather than a bare `$p/$c`: which is which is the part
+            // a reader has to guess otherwise.
+            facts.push((
+                "in".to_string(),
+                e.prompt_cost
+                    .map(|c| format!("${c:.2}/M"))
+                    .unwrap_or_else(|| "—".into()),
+            ));
+            facts.push((
+                "out".to_string(),
+                e.completion_cost
+                    .map(|c| format!("${c:.2}/M"))
+                    .unwrap_or_else(|| "—".into()),
             ));
             let idx = |v: Option<f32>| v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "—".into());
-            lines.push(format!(
-                "  coding {}   intel {}   agentic {}",
-                idx(e.coding_index),
-                idx(e.intelligence_index),
-                idx(e.agentic_index)
+            facts.push(("coding".to_string(), idx(e.coding_index)));
+            facts.push(("intel".to_string(), idx(e.intelligence_index)));
+            facts.push(("agentic".to_string(), idx(e.agentic_index)));
+            facts.push((
+                "efforts".to_string(),
+                if e.reasoning_levels.is_empty() {
+                    "not published".to_string()
+                } else {
+                    e.reasoning_levels.join(" ")
+                },
             ));
-            lines.push(if e.reasoning_levels.is_empty() {
-                "  reasoning: not published".to_string()
-            } else {
-                format!("  reasoning: {}", e.reasoning_levels.join(", "))
-            });
-        } else {
-            lines.push("  (no catalog entry — details unknown)".to_string());
+        }
+        if facts.is_empty() {
+            facts.push(("catalog".to_string(), "no entry".to_string()));
+        }
+        lines.extend(pack_facts(&facts, indent, width));
+
+        // The description is OpenRouter's prose and is kept in full: it is the
+        // only place the model's own summary appears anywhere in the app. It
+        // comes after the facts because the facts are what you came for, and
+        // the summary is what you read if one of them was unclear.
+        if let Some(d) = entry.as_ref().and_then(|e| e.description.as_deref()) {
+            lines.extend(
+                crate::output::wrap(d, width.saturating_sub(indent.len()).max(20))
+                    .into_iter()
+                    .map(|l| format!("{indent}{l}")),
+            );
         }
 
         // Current settings: live for the active model, stored for an inactive
@@ -247,24 +309,31 @@ impl SlashDotNode for ModelNode {
         if let Some(app) = self.live.as_ref() {
             if app.model() == model {
                 let p = app.params();
-                lines.push(format!(
-                    "  now: reasoning {}   temperature {}   top_p {}",
+                let mut live: Vec<(String, String)> = vec![(
+                    "reasoning".to_string(),
                     p.reasoning
                         .map(|l| l.as_str().to_string())
                         .unwrap_or_else(|| "off".into()),
-                    fmt_opt(p.temperature),
-                    fmt_opt(p.top_p),
-                ));
+                )];
+                live.push(("temperature".to_string(), fmt_opt(p.temperature)));
+                live.push(("top_p".to_string(), fmt_opt(p.top_p)));
+                let mut packed = pack_facts(&live, indent, width);
+                if let Some(first) = packed.first_mut() {
+                    first.insert_str(indent.len(), "now ");
+                }
+                lines.extend(packed);
             } else {
-                lines.push(format!(
-                    "  defaults: {}",
-                    stored
-                        .as_ref()
-                        .map(crate::settings_editor::summarize)
-                        .unwrap_or_else(|| "not configured".to_string())
-                ));
+                let summary = stored
+                    .as_ref()
+                    .map(crate::settings_editor::summarize)
+                    .unwrap_or_else(|| "not configured".to_string());
+                lines.extend(
+                    crate::output::wrap(&summary, width.saturating_sub(indent.len() + 7).max(20))
+                        .into_iter()
+                        .map(|l| format!("{indent}defaults: {l}")),
+                );
             }
-            lines.push("  ctrl-e to edit these settings".to_string());
+            lines.push(format!("{indent}ctrl-e to edit these settings"));
         }
         lines
     }
@@ -1503,7 +1572,7 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains(TEST_MODEL), "{joined}");
         assert!(joined.contains("ctx"), "{joined}");
-        assert!(joined.contains("now: reasoning"), "{joined}");
+        assert!(joined.contains("now reasoning"), "{joined}");
         assert!(joined.contains("0.6"), "the live value must show: {joined}");
         assert!(joined.contains("ctrl-e"), "{joined}");
     }
@@ -1733,5 +1802,106 @@ mod tests {
             Some(777_777.0),
             "the row must carry the override, not the catalog's number"
         );
+    }
+
+    // ---- the /model <id> header layout ----
+
+    fn header_for(app_state: &Arc<AppState>, width: usize) -> Vec<String> {
+        let reader = app_state.clone();
+        let writer = app_state.clone();
+        let mut node = ModelNode::new(
+            Box::new(move || reader.model()),
+            Box::new(move |m| {
+                writer.set_model(m);
+                Ok(())
+            }),
+            Some(app_state.clone()),
+        );
+        futures::executor::block_on(node.header(
+            &PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " "),
+            &RenderContext { term_width: width },
+        ))
+    }
+
+    /// Every line has to fit. A fixed grouping cannot promise this at more than
+    /// one width, which is the reason the layout is packed instead.
+    #[test]
+    fn no_header_line_exceeds_the_terminal_width() {
+        for width in [40usize, 60, 80, 120] {
+            let lines = header_for(&test_app_state(), width);
+            for l in &lines {
+                assert!(
+                    crate::slashdot_menu::table::display_width(l) <= width,
+                    "width {width}: {} columns in {l:?}",
+                    crate::slashdot_menu::table::display_width(l)
+                );
+            }
+        }
+    }
+
+    /// An 80-column window is the case that used to overflow: the facts were
+    /// grouped two-per-line while the width could hold them nearly all on one.
+    #[test]
+    fn the_facts_pack_onto_fewer_lines_at_80() {
+        let lines = header_for(&test_app_state(), 80);
+        let fact_lines = lines
+            .iter()
+            .filter(|l| l.trim_start().starts_with("ctx "))
+            .count();
+        assert_eq!(
+            fact_lines, 1,
+            "the facts should share a line at 80: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("in ")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("out ")), "{lines:?}");
+    }
+
+    /// A narrow terminal gives way a whole fact at a time rather than
+    /// truncating one mid-value.
+    #[test]
+    fn a_narrow_terminal_wraps_without_splitting_a_fact() {
+        let lines = header_for(&test_app_state(), 40);
+        for l in &lines {
+            for fact in ["ctx ", "coding ", "agentic "] {
+                if l.contains(fact) {
+                    assert!(
+                        l.trim_start().starts_with(fact) || l.contains(&format!(" {fact}")),
+                        "a fact was split across lines: {l:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            lines.len() > header_for(&test_app_state(), 120).len(),
+            "narrow must need more lines than wide"
+        );
+    }
+
+    /// The stored-defaults line wraps rather than running off the edge.
+    #[test]
+    fn a_long_defaults_summary_wraps() {
+        let app_state = test_app_state();
+        app_state.set_model("anthropic:another");
+        app_state
+            .update_settings(|s| {
+                s.apply_model_settings(
+                    TEST_MODEL,
+                    &crate::model_settings::ModelSettings {
+                        reasoning: Some(crate::params::ReasoningLevel::Max),
+                        temperature: Some(0.25),
+                        top_p: Some(0.9),
+                        context_length: Some(1_048_576),
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        for l in header_for(&app_state, 40) {
+            assert!(
+                crate::slashdot_menu::table::display_width(&l) <= 40,
+                "overflowed: {l:?}"
+            );
+        }
     }
 }
