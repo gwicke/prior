@@ -838,58 +838,6 @@ impl SlashDotNode for ModelActionNode {
 mod tests {
     use super::*;
 
-    #[test]
-    fn PROBE_fresh_menu_active_id() {
-        let app_state = test_app_state();
-        // Pick a model that IS in the catalog, make it active.
-        let mut menu = model_menu(&app_state);
-        let mut h = menu.get_handle();
-        let ids: Vec<String> = match futures::executor::block_on(h.eval_prompt_resolved(
-            "model ",
-            crate::slashdot_menu::HostKey::None,
-            80,
-        )) {
-            crate::slashdot_menu::node_impl::MenuResult::Continue(p, _) => p
-                .rows
-                .iter()
-                .map(|l| l.0.split_whitespace().next().unwrap().to_string())
-                .collect(),
-            o => panic!("{o:?}"),
-        };
-        let target = ids.first().cloned().expect("at least one model");
-        app_state.set_model(&target);
-        println!(
-            "PROBE app_state.model()={:?} target={:?}",
-            app_state.model(),
-            target
-        );
-
-        // FRESH menu: no cached DataResponse from before the switch.
-        let mut menu2 = model_menu(&app_state);
-        let mut h2 = menu2.get_handle();
-        let plan = match futures::executor::block_on(h2.eval_prompt_resolved(
-            "model ",
-            crate::slashdot_menu::HostKey::None,
-            80,
-        )) {
-            crate::slashdot_menu::node_impl::MenuResult::Continue(p, _) => p,
-            o => panic!("{o:?}"),
-        };
-        let row_ids: Vec<String> = plan
-            .rows
-            .iter()
-            .map(|l| l.0.split_whitespace().next().unwrap().to_string())
-            .collect();
-        println!(
-            "PROBE fresh plan.active_rows={:?} rows={:?}",
-            plan.active_rows, row_ids
-        );
-        println!(
-            "PROBE expected active index = {:?}",
-            row_ids.iter().position(|r| r == &target)
-        );
-    }
-
     fn eval(
         h: &mut crate::slashdot_menu::SlashDotHandle<'_>,
         prompt: &str,
@@ -1229,9 +1177,6 @@ mod tests {
         }
     }
 
-    /// At the top level the listing is the catalog, not the actions — every
-    /// model row carrying `activate`/`save` would make it unusable.
-    #[test]
     /// The `*` follows the active model **through a reused handle** — the case
     /// the cache key got wrong.
     ///
