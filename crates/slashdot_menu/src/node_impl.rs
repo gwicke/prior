@@ -363,7 +363,8 @@ mod tests {
         assert_eq!(pa.word_before(0), None);
         // Trailing space: dismissed (no in-flight word).
         let mut pb = PathArgs::new(vec![], "ro ");
-        pb.args = vec![0..2];
+        let range: Range<usize> = 0..2;
+        pb.args = vec![range];
         assert_eq!(pb.word_before(3), None);
     }
 
