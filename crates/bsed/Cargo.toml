@@ -25,3 +25,6 @@ serde_json = "1.0"
 tempfile = "3.24.0"
 # For the pty test: "is stdout a terminal" is the question under test.
 portable-pty = "0.8"
+# `emit_tests::spool_respects_the_directory_override` overrides `BSED_SPOOL_DIR`,
+# which is process-global, so it must not run beside another thread reading it.
+serial_test = "3.1"

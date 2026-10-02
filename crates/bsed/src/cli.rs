@@ -1132,11 +1132,13 @@ mod emit_tests {
         assert!(!should_spool("no lines matched -- nothing changed", true));
     }
 
+    /// `#[serial]`: `BSED_SPOOL_DIR` is read from the process environment, so
+    /// this test is only isolated if it is the one thread touching that
+    /// variable — which `cargo test` does not give us by default.
     #[test]
+    #[serial_test::serial]
     fn spool_respects_the_directory_override() {
         let dir = tempfile::tempdir().unwrap();
-        // Safety: single-threaded test, and the variable is only read by a
-        // child process this test makes itself.
         std::env::set_var("BSED_SPOOL_DIR", dir.path());
         let p = spool("body").expect("spooled");
         std::env::remove_var("BSED_SPOOL_DIR");
