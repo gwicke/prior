@@ -34,11 +34,19 @@ pub struct ModelNode {
     /// moved under us, and writing it would store settings against a model
     /// the user is no longer looking at.
     pending_edit: std::cell::RefCell<Option<PendingEdit>>,
-    /// Last generated DataResponse, reused via Rc::ptr_eq when the catalog
-    /// generation hasn't changed.
+    /// Last generated DataResponse, reused via `Rc::ptr_eq` when nothing the rows
+    /// derive from has changed. The three fields below *are* that condition —
+    /// `data()` reuses only while all of them still hold.
     cached_response: Option<Rc<DataResponse>>,
-    /// The catalog generation at the time cached_response was built.
+    /// Catalog generation at build time: the entry set and its base order.
     cached_generation: u64,
+    /// The active model id at build time. It is both hoisted to row 0 by
+    /// [`order_models`] and named in `active_ids`, so a switch must rebuild.
+    cached_active: String,
+    /// Recently-used models at build time: they fill the rows after the
+    /// active one, so a change reorders the listing and moves the active
+    /// row's index.
+    cached_recent: Vec<String>,
 }
 
 /// A Ctrl-E result waiting to be committed by the confirm's accept arm.
@@ -103,7 +111,11 @@ impl ModelNode {
             submit_fn,
             live,
             cached_response: None,
-            cached_generation: u64::MAX, // force first rebuild
+            // `u64::MAX` is unreachable as a generation, so the first build
+            // always misses the cache.
+            cached_generation: u64::MAX,
+            cached_active: String::new(),
+            cached_recent: Vec::new(),
             pending_edit: std::cell::RefCell::new(None),
         }
     }
@@ -112,26 +124,44 @@ impl ModelNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for ModelNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        // Read every input *above* the early return: all three decide reuse,
+        // and reading them once is cheaper than reading them on a miss and
+        // again here.
         let gen = crate::model_catalog::catalog_generation();
-        if let Some(ref cached) = self.cached_response {
-            if self.cached_generation == gen {
-                return Ok(Rc::clone(cached));
-            }
-        }
-
-        // Catalog changed (or first call) — rebuild rows.
-        let entries = crate::model_catalog::catalog_cached();
         let active_id = (self.active_fn)();
-        let active = if active_id.is_empty() {
-            None
-        } else {
-            Some(active_id)
-        };
         let recent: Vec<String> = self
             .live
             .as_ref()
             .map(|r| r.recent_models())
             .unwrap_or_default();
+
+        // Reuse only while every input the rows derive from still holds. The
+        // generation is not enough on its own: `order_models` also hoists the
+        // *active* model and boosts recently-used ones, and `active_ids` is
+        // what the `*` marker lands on. Keying on the generation alone served
+        // a stale `active_ids` after a model switch — and because
+        // `refresh_data` gates on `Rc::ptr_eq`, the stale `Rc` also stopped
+        // `content.active_ids` and `slots_dirty` from refreshing, so the memo
+        // in `ensure_rows` returned the stale view too. The marker then sat on
+        // the *previous* active model, which `order_models` had hoisted to row
+        // 0 — stale, but self-consistent enough to look like a stray marker
+        // rather than a missing one.
+        if let Some(ref cached) = self.cached_response {
+            if self.cached_generation == gen
+                && self.cached_active == active_id
+                && self.cached_recent == recent
+            {
+                return Ok(Rc::clone(cached));
+            }
+        }
+
+        // An input changed (or first call) — rebuild rows.
+        let entries = crate::model_catalog::catalog_cached();
+        let active = if active_id.is_empty() {
+            None
+        } else {
+            Some(active_id.clone())
+        };
 
         // Build rows in the same order as the legacy ModelProvider:
         // active first, then up to 4 recent in LRU order, then server
@@ -148,6 +178,8 @@ impl SlashDotNode for ModelNode {
         let response = Rc::new(DataResponse { rows, active_ids });
         self.cached_response = Some(Rc::clone(&response));
         self.cached_generation = gen;
+        self.cached_active = active_id;
+        self.cached_recent = recent;
         Ok(response)
     }
 
@@ -806,6 +838,58 @@ impl SlashDotNode for ModelActionNode {
 mod tests {
     use super::*;
 
+    #[test]
+    fn PROBE_fresh_menu_active_id() {
+        let app_state = test_app_state();
+        // Pick a model that IS in the catalog, make it active.
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        let ids: Vec<String> = match futures::executor::block_on(h.eval_prompt_resolved(
+            "model ",
+            crate::slashdot_menu::HostKey::None,
+            80,
+        )) {
+            crate::slashdot_menu::node_impl::MenuResult::Continue(p, _) => p
+                .rows
+                .iter()
+                .map(|l| l.0.split_whitespace().next().unwrap().to_string())
+                .collect(),
+            o => panic!("{o:?}"),
+        };
+        let target = ids.first().cloned().expect("at least one model");
+        app_state.set_model(&target);
+        println!(
+            "PROBE app_state.model()={:?} target={:?}",
+            app_state.model(),
+            target
+        );
+
+        // FRESH menu: no cached DataResponse from before the switch.
+        let mut menu2 = model_menu(&app_state);
+        let mut h2 = menu2.get_handle();
+        let plan = match futures::executor::block_on(h2.eval_prompt_resolved(
+            "model ",
+            crate::slashdot_menu::HostKey::None,
+            80,
+        )) {
+            crate::slashdot_menu::node_impl::MenuResult::Continue(p, _) => p,
+            o => panic!("{o:?}"),
+        };
+        let row_ids: Vec<String> = plan
+            .rows
+            .iter()
+            .map(|l| l.0.split_whitespace().next().unwrap().to_string())
+            .collect();
+        println!(
+            "PROBE fresh plan.active_rows={:?} rows={:?}",
+            plan.active_rows, row_ids
+        );
+        println!(
+            "PROBE expected active index = {:?}",
+            row_ids.iter().position(|r| r == &target)
+        );
+    }
+
     fn eval(
         h: &mut crate::slashdot_menu::SlashDotHandle<'_>,
         prompt: &str,
@@ -1147,6 +1231,92 @@ mod tests {
 
     /// At the top level the listing is the catalog, not the actions — every
     /// model row carrying `activate`/`save` would make it unusable.
+    #[test]
+    /// The `*` follows the active model **through a reused handle** — the case
+    /// the cache key got wrong.
+    ///
+    /// `data()` used to reuse its `Rc<DataResponse>` whenever the *catalog
+    /// generation* was unchanged, but the rows also depend on the active model
+    /// (hoisted to row 0, and named in `active_ids`) and on recency. Switching
+    /// the model changed neither, so the stale `Rc` came back — and because
+    /// `refresh_data` gates on `Rc::ptr_eq`, that stale response also stopped
+    /// `content.active_ids` and `slots_dirty` from refreshing, so `ensure_rows`
+    /// returned a stale view as well. The marker stayed on the *previous*
+    /// model, which row 0 still held, so it looked plausible rather than
+    /// obviously broken.
+    ///
+    /// Reads a model off the listing rather than hardcoding one, so it holds
+    /// whatever the catalog happens to contain.
+    #[test]
+    fn the_active_marker_follows_a_model_switch_on_a_reused_handle() {
+        use crate::slashdot_menu::node_impl::MenuResult;
+        use crate::slashdot_menu::HostKey;
+
+        let app_state = test_app_state();
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        let eval = |h: &mut crate::slashdot_menu::SlashDotHandle<'_>| {
+            futures::executor::block_on(h.eval_prompt_resolved("model ", HostKey::None, 80))
+        };
+        let plan = |out: crate::slashdot_menu::node_impl::MenuResult| match out {
+            MenuResult::Continue(p, _) => p,
+            other => panic!("expected Continue, got {other:?}"),
+        };
+
+        // Prime the cache with an active model that is *not* in the catalog,
+        // so nothing is starred — the state the bug was stuck in.
+        app_state.set_model("slashdot:nonexistent-model");
+        let first = plan(eval(&mut h));
+        let ids: Vec<String> = first
+            .rows
+            .iter()
+            .map(|l| l.0.split_whitespace().next().unwrap().to_string())
+            .collect();
+        assert!(!ids.contains(&"slashdot:nonexistent-model".to_string()));
+        assert_eq!(
+            first.active_rows,
+            Vec::<usize>::new(),
+            "nothing is active yet"
+        );
+
+        // Switch to a model that *is* in the catalog, same handle.
+        let target = ids.first().cloned().expect("catalog has a model");
+        app_state.set_model(&target);
+        let second = plan(eval(&mut h));
+        let want = second
+            .rows
+            .iter()
+            .position(|l| l.0.split_whitespace().next() == Some(target.as_str()))
+            .expect("target is listed");
+        assert_eq!(
+            second.active_rows,
+            vec![want],
+            "the marker must move to the newly active model"
+        );
+
+        // And the `*` is actually painted on that row.
+        let els = crate::ui::overlay_elements(&second, 80, second.selected);
+        let extents: Vec<crate::ui::frame::Extent> =
+            els.iter().map(crate::ui::frame::Element::extent).collect();
+        let heights = crate::ui::frame::allocate(&extents, crate::ui::frame::live_budget(24));
+        let f = crate::ui::frame::render(&els, &heights, 80);
+        let starred: Vec<bool> = (0..f.height()).map(|i| f.row(i).contains('*')).collect();
+        assert_eq!(
+            starred.iter().filter(|s| **s).count(),
+            1,
+            "exactly one row is starred: {starred:?}"
+        );
+
+        // Switch away again — the marker must go with it.
+        app_state.set_model("slashdot:nonexistent-model");
+        let third = plan(eval(&mut h));
+        assert_eq!(
+            third.active_rows,
+            Vec::<usize>::new(),
+            "the marker must clear when nothing in the catalog is active"
+        );
+    }
+
     #[test]
     fn the_top_level_listing_shows_models_not_actions() {
         let app_state = test_app_state();
