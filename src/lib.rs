@@ -11,6 +11,7 @@ pub mod platform;
 pub mod tools;
 pub use slashdot_menu;
 pub mod app_state;
+pub mod confirm;
 pub mod model_catalog;
 pub mod model_settings;
 pub mod params;

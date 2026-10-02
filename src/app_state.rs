@@ -743,6 +743,7 @@ impl AppState {
             model: "model".to_string(),
             output,
             yolo: false,
+            confirm_port: None,
             quiet: true,
             params: Default::default(),
             context_limit: None,

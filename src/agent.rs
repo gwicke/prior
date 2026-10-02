@@ -361,16 +361,25 @@ impl CodeAgent {
         // scopes its futures to their own block ("a scope to separate polling
         // from handling the output"), so by the time a handler runs these are
         // free again for the handler to take.
-        let (mut it_keys, mut it_session, it_label, mut it_history, it_guard) = match in_turn {
-            Some(crate::repl::InTurnInput {
-                session,
-                keys,
-                label,
-                history,
-                guard,
-            }) => (Some(keys), Some(session), label, Some(history), Some(guard)),
-            None => (None, None, "", None, None),
-        };
+        let (mut it_keys, mut it_confirms, mut it_session, it_label, mut it_history, it_guard) =
+            match in_turn {
+                Some(crate::repl::InTurnInput {
+                    session,
+                    keys,
+                    confirms,
+                    label,
+                    history,
+                    guard,
+                }) => (
+                    Some(keys),
+                    Some(confirms),
+                    Some(session),
+                    label,
+                    Some(history),
+                    Some(guard),
+                ),
+                None => (None, None, None, "", None, None),
+            };
         // The area has to say the turn started *now*. `begin_response` above
         // flipped `streaming`, and the frame on screen was composed while it was
         // false — so until some keystroke happened to compose again, the input
@@ -717,6 +726,27 @@ impl CodeAgent {
                     }
                 }
 
+                // A gated tool call parked on the port. The tool future is
+                // inside the stream arm above, so this request is what makes
+                // the arm go `Pending` while the loop stays free to serve keys
+                // (doc/confirm_as_menu_261002.md). The session holds the
+                // dialog as an overlay element; the tool waits on the reply.
+                //
+                // Only here, not in the back-off pump: a confirm blocks its
+                // own tool, so by the time a retry back-off runs the dialog is
+                // resolved and the tool has returned.
+                Some(req) = async {
+                    match it_confirms.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(sess) = it_session.as_deref_mut() {
+                        sess.open_confirm(req, self.confirm_approvals.clone());
+                        sess.paint(self.output.as_ref(), it_label, self.output.frame_size());
+                    }
+                }
+
                 // U4.3: a key typed during the turn, evaluated as it arrives —
                 // no queue, no holding back (ui_draw_v2 §4.5). This is
                 // `read_input`'s loop minus its wait: dispatch, then settle.
@@ -1007,6 +1037,32 @@ async fn dispatch_in_turn_event(
     let dims = output.frame_size();
     match ev {
         crossterm::event::Event::Key(key) => {
+            // The confirm is **modal**, and this is the top of the `Esc` ladder:
+            // dialog first, menu second, turn third. The root-`Esc` cancel below
+            // is unconditional, so without this precedence one `Esc` would
+            // dismiss the dialog *and* kill the turn.
+            if sess.confirm_open() {
+                return match sess.confirm_key(key) {
+                    // Resolved: paint the area back (dropping the element is the
+                    // erase — no `Frame::empty()`), then record the decision
+                    // where the dialog's rows were.
+                    Some(decision) => {
+                        let subject = sess.confirm_subject().unwrap_or_default();
+                        sess.clear_confirm();
+                        crate::confirm::resolve(
+                            output,
+                            || sess.paint(output, label, dims),
+                            &subject,
+                            decision,
+                        );
+                        InTurnDispatch::Handled
+                    }
+                    None => {
+                        sess.paint(output, label, dims);
+                        InTurnDispatch::Handled
+                    }
+                };
+            }
             if key.code == crossterm::event::KeyCode::Esc && !sess.menu_open() {
                 user_cancel.store(true, Ordering::SeqCst);
                 cancel_notify.notify_one();
@@ -1038,6 +1094,12 @@ async fn dispatch_in_turn_event(
             InTurnDispatch::Handled
         }
         crossterm::event::Event::Paste(text) => {
+            // A confirm has no text field, so a paste has nowhere to go; drop
+            // it rather than pushing it into the prompt the dialog is layered
+            // over, which would change the menu's meaning behind the modal.
+            if sess.confirm_open() {
+                return InTurnDispatch::Ignored;
+            }
             sess.paste(&text);
             let _ = sess.settle(output, label, history, dims).await;
             InTurnDispatch::Handled
@@ -2106,6 +2168,13 @@ pub struct CodeAgent {
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
+    /// Session tool approvals, the REPL's half of the confirm port.
+    ///
+    /// Held here so the turn can hand the *same* store to the dialog it opens
+    /// for a gated call — an *always* answer is recorded by the REPL, and the
+    /// guards read it back through the port (`Guard::already_approved`).
+    /// Empty without a port (piped/batch), where nothing is ever approved.
+    confirm_approvals: crate::confirm::Approvals,
     /// Event-based cancel signal. The turn's key dispatcher — the prompt's
     /// key branch, or the back-off pump between attempts — calls
     /// `notify_one()` when a root `<Esc>` is dispatched; the streaming loop
@@ -2128,6 +2197,15 @@ pub struct AgentConfig {
     pub output: Arc<dyn Output>,
     pub yolo: bool,
     pub quiet: bool,
+    /// The REPL's end of the confirm port, cloned into every guarded tool.
+    ///
+    /// `None` means "nobody to ask", and the tools fall back to the output's
+    /// synchronous confirm policy — the correct behaviour for piped/batch input
+    /// and for one-shot `run_once`, where there is no key pump to drive a
+    /// dialog. Set once by `run_interactive` before the agent is built, so a
+    /// `/model` rebuild (which clones this config) keeps the same port and the
+    /// same session approvals.
+    pub confirm_port: Option<crate::confirm::ConfirmPort>,
     /// The request-shaping knobs for this model: reasoning level, temperature,
     /// top_p. Each is `None` = "unspecified, leave the provider's default".
     /// Replaces the old `reasoning_level: Option<String>`
@@ -2386,6 +2464,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
                 $builder,
                 config.yolo,
                 config.output.clone(),
+                config.confirm_port.clone(),
                 config.system_message_extension,
                 config.persona_prompt,
                 config.bash_auto_allow.unwrap_or_default(),
@@ -2412,6 +2491,11 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
                 config.yolo,
                 config.persona_name,
                 config.user_cancel.clone(),
+                config
+                    .confirm_port
+                    .as_ref()
+                    .map(|p| p.approvals().clone())
+                    .unwrap_or_default(),
                 config.cancel_notify.clone(),
                 config.reasoning_in_context,
                 message_logger,
@@ -2868,6 +2952,7 @@ fn build_rig_agent(
     builder: AgentBuilder<NoToolConfig>,
     yolo: bool,
     output: Arc<dyn Output>,
+    confirm_port: Option<crate::confirm::ConfirmPort>,
     system_message_extension: Option<String>,
     persona_prompt: Option<String>,
     bash_auto_allow: Vec<String>,
@@ -2928,11 +3013,36 @@ fn build_rig_agent(
         builder = builder.temperature(t);
     }
 
+    let confirm_port = confirm_port.clone();
     builder = builder
-        .tool(guard(MakeDir, yolo, output.clone(), None))
-        .tool(guard(Remove, yolo, output.clone(), None))
-        .tool(guard(MoveFile, yolo, output.clone(), None))
-        .tool(guard(CopyFile, yolo, output.clone(), None));
+        .tool(guard(
+            MakeDir,
+            yolo,
+            output.clone(),
+            None,
+            confirm_port.clone(),
+        ))
+        .tool(guard(
+            Remove,
+            yolo,
+            output.clone(),
+            None,
+            confirm_port.clone(),
+        ))
+        .tool(guard(
+            MoveFile,
+            yolo,
+            output.clone(),
+            None,
+            confirm_port.clone(),
+        ))
+        .tool(guard(
+            CopyFile,
+            yolo,
+            output.clone(),
+            None,
+            confirm_port.clone(),
+        ));
 
     let auto_allow = bash_auto_allow.clone();
     // Publish the resolved sandbox config for the shell tools. picocode runs a
@@ -2950,10 +3060,17 @@ fn build_rig_agent(
                     .unwrap_or(false)
             })
         })),
+        confirm_port.clone(),
     ));
 
     if is_tool_available("agent-browser") {
-        builder = builder.tool(guard(AgentBrowser, yolo, output.clone(), None));
+        builder = builder.tool(guard(
+            AgentBrowser,
+            yolo,
+            output.clone(),
+            None,
+            confirm_port.clone(),
+        ));
     }
     builder.build()
 }
@@ -2964,8 +3081,31 @@ struct Guard<T: Tool> {
     tool: T,
     yolo: bool,
     output: Arc<dyn Output>,
+    /// The REPL's end of the confirm port, `None` where there is no REPL to
+    /// ask (piped/batch, one-shot `run_once`).
+    ///
+    /// With a port, a gated call *awaits* the REPL's answer and the turn's
+    /// `select!` keeps running throughout (doc/confirm_as_menu_261002.md).
+    confirm: Option<crate::confirm::ConfirmPort>,
+    /// Session approval for the no-port path only — see [`Self::call`]. The
+    /// port carries its own (`Approvals`), so with a REPL this is never read.
     always: Arc<AtomicBool>,
     auto_approve: Option<Arc<dyn Fn(&T::Args) -> bool + Send + Sync>>,
+}
+
+impl<T: Tool> Guard<T> {
+    /// Whether this tool is already cleared for the session.
+    ///
+    /// With a port that is the REPL's `Approvals` store — the one place an
+    /// *always* choice is recorded, so the agent never sees the third option.
+    /// Without one it falls back to this guard's own flag, which is what keeps
+    /// the piped `Always` answer meaningful now that there is no dialog.
+    fn already_approved(&self) -> bool {
+        match &self.confirm {
+            Some(port) => port.approvals().is_approved(T::NAME),
+            None => self.always.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl<T: Tool<Error = crate::tools::ToolError>> Tool for Guard<T> {
@@ -3020,20 +3160,30 @@ impl<T: Tool<Error = crate::tools::ToolError>> Tool for Guard<T> {
             .map(|f| f(&args))
             .unwrap_or(false);
 
-        if !self.yolo && !self.always.load(Ordering::Relaxed) && !should_auto_approve {
-            match self
-                .output
-                .confirm(&format!("Confirm tool {} call?", Self::NAME.to_uppercase()))
-            {
-                Confirmation::Always => {
-                    self.always.store(true, Ordering::Relaxed);
-                }
-                Confirmation::Yes => {}
-                Confirmation::No => {
-                    return Err(crate::tools::ToolError::Generic(
-                        "Action cancelled by user".into(),
-                    ));
-                }
+        if !self.yolo && !should_auto_approve && !self.already_approved() {
+            let message = format!("Confirm tool {} call?", Self::NAME.to_uppercase());
+            let decision = match &self.confirm {
+                // The REPL decides, and it answers `Accept` for *both* `yes`
+                // and `always` — the approval it records never reaches this
+                // side. Nothing here blocks: the turn's loop keeps pumping
+                // keys while this call is parked.
+                Some(port) => port.request(Self::NAME, message).await,
+                // No REPL: the output's own synchronous policy, and *this* flag
+                // is the only thing that can remember an `Always` — a piped
+                // session's "s" (session) has no port to record it in.
+                None => match self.output.confirm_default(&message) {
+                    Confirmation::Always => {
+                        self.always.store(true, Ordering::Relaxed);
+                        crate::confirm::ConfirmDecision::Accept
+                    }
+                    Confirmation::Yes => crate::confirm::ConfirmDecision::Accept,
+                    Confirmation::No => crate::confirm::ConfirmDecision::Deny,
+                },
+            };
+            if decision == crate::confirm::ConfirmDecision::Deny {
+                return Err(crate::tools::ToolError::Generic(
+                    "Action cancelled by user".into(),
+                ));
             }
         }
         self.tool.call(context, args).await
@@ -3045,11 +3195,13 @@ fn guard<T: Tool>(
     yolo: bool,
     output: Arc<dyn Output>,
     auto_approve: Option<Arc<dyn Fn(&T::Args) -> bool + Send + Sync>>,
+    confirm: Option<crate::confirm::ConfirmPort>,
 ) -> Guard<T> {
     Guard {
         tool,
         yolo,
         output,
+        confirm,
         always: Arc::new(AtomicBool::new(false)),
         auto_approve,
     }
@@ -4900,6 +5052,20 @@ pub async fn run_interactive(
     // ragged). Mirrors pi's left-aligned input region.
     let prompt_str = String::new();
     let use_repl = std::io::stdin().is_terminal() && !config.quiet;
+    // The confirm port, built here and *before* any agent exists, because the
+    // guards capture the sender half at build time and a `/model` rebuild
+    // re-captures this same one — so a session approval survives the rebuild.
+    // The receiver half is borrowed per turn below (it cannot outlive the pump
+    // that answers it).
+    //
+    // The bridge itself is built unconditionally so the receiver always exists;
+    // only the *port* is conditional. Without a REPL there is no key pump to
+    // draw a dialog, so no guard holds the sender and this receiver simply
+    // never yields — the same degradation `InTurnInput::keys` already uses.
+    let mut confirm_bridge = crate::confirm::ConfirmBridge::new();
+    if use_repl {
+        config.confirm_port = Some(confirm_bridge.port.clone());
+    }
     let mut repl = if use_repl { Some(Repl::new()) } else { None };
     if let Some(r) = repl.as_mut() {
         let _ = r.start();
@@ -5561,6 +5727,7 @@ pub async fn run_interactive(
                                     .map(|(sess, g)| crate::repl::InTurnInput {
                                         session: sess,
                                         keys: &mut in_turn_keys,
+                                        confirms: &mut confirm_bridge.requests,
                                         label: &prompt_str,
                                         history: &mut line_history,
                                         guard: g,
@@ -6607,6 +6774,7 @@ impl CodeAgent {
         yolo: bool,
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
+        confirm_approvals: crate::confirm::Approvals,
         cancel_notify: Arc<tokio::sync::Notify>,
         reasoning_in_context: crate::settings::ReasoningInContextMode,
         message_logger: Option<Arc<MessageLogger>>,
@@ -6622,6 +6790,7 @@ impl CodeAgent {
             yolo,
             persona_name,
             user_cancel,
+            confirm_approvals,
             cancel_notify,
             reasoning_in_context,
             message_logger,
@@ -9359,6 +9528,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             model: "gpt-4o".into(),
             output: Arc::new(out),
             yolo: true,
+            confirm_port: None,
             quiet: true,
             params: Default::default(),
             context_limit: None,
@@ -9472,6 +9642,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             model: "gpt-4o".into(),
             output: Arc::new(out),
             yolo: true,
+            confirm_port: None,
             quiet: true,
             params: Default::default(),
             context_limit: None,
@@ -10707,6 +10878,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             model: model.into(),
             output: Arc::new(crate::output::NoOutput),
             yolo: false,
+            confirm_port: None,
             quiet: true,
             params,
             context_limit: None,

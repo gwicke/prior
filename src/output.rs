@@ -582,10 +582,15 @@ pub trait Output: Send + Sync {
     fn display_error(&self, error: &str);
     fn display_system(&self, text: &str);
     fn confirm(&self, message: &str) -> Confirmation;
-    /// Non-interactive policy for confirm dialogs. Used by the async confirm
-    /// driver when `confirm_gate()` is `None`. Default implementations
-    /// return their existing `confirm` behavior (e.g. `Yes` for QuietOutput,
-    /// `No` for LogOutput).
+    /// The **no-pump** policy for a gated tool call: what to answer when there
+    /// is no REPL to draw a dialog and no key to draw it with (piped/batch
+    /// input, one-shot `run_once`, `--quiet`).
+    ///
+    /// Defaults to the output's own `confirm` behavior, which is the right
+    /// answer for every output that *can* ask — `QuietOutput` reads a line from
+    /// stdin, `NoOutput` says yes. It is `confirm_default` that an interactive
+    /// session reaches only if the port failed to install, because with a port
+    /// the REPL's dialog answers instead.
     fn confirm_default(&self, message: &str) -> Confirmation {
         self.confirm(message)
     }
@@ -827,12 +832,23 @@ pub trait Output: Send + Sync {
     }
 
     /// Gate the background in-flight reader should honor. While it is `true`,
-    /// the reader must not read stdin, because a confirmation dialog on the
-    /// main task owns stdin. `ui::confirm` raises it on entry and releases it
-    /// in `resolve()` — every post-pause exit — so a gate left raised would
-    /// freeze every later in-flight reader (plan §9 latent issue 1). Returns
-    /// `None` for outputs that don't run the raw-mode REPL (so there is no
-    /// background reader to coordinate with).
+    /// the reader must not read stdin, because **something else owns stdin**.
+    ///
+    /// That used to mean a confirmation dialog: `ui::confirm` was a blocking
+    /// loop on the main task, so the reader had to stand down or it would
+    /// swallow the dialog's keystrokes — and a gate left raised froze every
+    /// later in-flight reader for the rest of the session (plan §9 latent issue
+    /// 1, which is why the release discipline was spread across every exit).
+    ///
+    /// A confirmation is no longer that thing. It is session state in the
+    /// REPL's own pump, so there is one stdin consumer and the gate is never
+    /// touched (doc/confirm_as_menu_261002.md). **The remaining user is
+    /// `$EDITOR`** ([`crate::editor::run_editor`]), which genuinely hands the
+    /// tty to a foreground child — and whose DSR reply arrives on stdin, so the
+    /// reader must stay down across that query too.
+    ///
+    /// Returns `None` for outputs that don't run the raw-mode REPL (so there is
+    /// no background reader to coordinate with).
     fn confirm_gate(&self) -> Option<Arc<AtomicBool>> {
         None
     }
@@ -1028,6 +1044,8 @@ pub struct ConsoleOutput {
     draw: Mutex<DrawCache>,
     /// Set `true` while `confirm` is reading a keystroke, so the background
     /// in-flight reader thread backs off and doesn't swallow the input.
+    /// The in-flight reader's stdin gate, for `$EDITOR`'s takeover — see
+    /// [`Output::confirm_gate`]. A confirmation no longer touches it.
     reader_paused: Arc<AtomicBool>,
     /// Whether the current response is being rendered live (TTY) or buffered
     /// (non-TTY). Decided once per response in `begin_response`.
@@ -3795,35 +3813,19 @@ impl Output for ConsoleOutput {
         );
     }
 
-    fn confirm(&self, message: &str) -> Confirmation {
-        use crate::slashdot_menu::node_impl::StaticRow;
-        use crate::ui::ConfirmSpec;
-
-        let spec = ConfirmSpec {
-            header: message,
-            options: &[
-                StaticRow::new("yes", "Yes"),
-                StaticRow::new("no", "No"),
-                StaticRow::new("always", "Always (session)"),
-            ],
-            quick_keys: Some(&[('y', 0), ('n', 1), ('s', 2)]),
-            default_sel: 1, // No
-            // The divider that separates a mid-turn dialog from the streamed
-            // output above is the composer's rule now, not a flag here (§5.1.1).
-            // What stays spec-side is the decision line: `accepted tool X` /
-            // `denied tool X`, recorded when the dialog resolves.
-            subject: Some(crate::ui::confirm_subject(message)),
-        };
-
-        // Run the sync dialog.
-        let result = crate::ui::confirm(self, &spec);
-
-        // Map result to Confirmation. Esc/dismiss -> No (safe default).
-        match result {
-            crate::ui::ConfirmResult::Selected(0) => Confirmation::Yes,
-            crate::ui::ConfirmResult::Selected(2) => Confirmation::Always,
-            _ => Confirmation::No,
-        }
+    /// The **no-pump** confirm policy: nobody is driving keys, so there is no
+    /// dialog to show, and this output denies.
+    ///
+    /// This used to open the blocking dialog in `ui::confirm`. That path is
+    /// gone — a confirmation is session state in the REPL's pump now
+    /// (doc/confirm_as_menu_261002.md) — so the only callers left here are the
+    /// ones with no REPL to ask: one-shot `run_once`, piped/batch input, and
+    /// `--quiet`. Denying is the safe direction for all of them: it is what
+    /// `Esc` meant, and it cannot run a tool the user never agreed to. An
+    /// interactive session reaches this only if the port failed to install,
+    /// which is a bug worth seeing rather than papering over.
+    fn confirm(&self, _message: &str) -> Confirmation {
+        Confirmation::No
     }
 
     fn display_separator(&self) {

@@ -892,6 +892,19 @@ pub struct PromptSession {
     /// against. Recomputed every iteration; held here so `handle_key` sees the
     /// same frame that was just painted.
     overlay: ActiveOverlay,
+    /// A gated tool call's confirmation, if one is on screen.
+    ///
+    /// Not an `ActiveOverlay` variant and not `None`-when-absent by design: a
+    /// confirm is **modal over** whatever menu is open (it appends below it), so
+    /// it is a separate layer rather than a replacement — clearing the overlay
+    /// to make room would destroy the prompt the menu is driven from
+    /// (doc/confirm_as_menu_261002.md §3).
+    ///
+    /// Only ever `Some` during a turn: the port is installed by
+    /// `run_interactive` and its receiver is borrowed per turn, so nothing can
+    /// open a confirm at the prompt. A dropped `ConfirmPrompt` denies — see
+    /// its reply channel.
+    confirm: Option<crate::confirm::ConfirmPrompt>,
 }
 
 /// Everything the turn needs to put a key back into the prompt
@@ -913,6 +926,11 @@ pub struct InTurnInput<'a> {
     /// filled would block the reader at the moment it most needs to deliver
     /// `Ctrl-C` (see `route_event`).
     pub keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    /// Confirmation requests from gated tool calls, answered by the session's
+    /// own dialog (doc/confirm_as_menu_261002.md). Borrowed per turn for the
+    /// same reason `keys` is: a request must not outlive the pump that would
+    /// answer it, and the reply sender failing is a `Deny`.
+    pub confirms: &'a mut tokio::sync::mpsc::UnboundedReceiver<crate::confirm::ConfirmRequest>,
     /// What the input row says — `read_input`'s `prompt` argument.
     pub label: &'a str,
     /// History the Up/Down keys page through.
@@ -942,7 +960,55 @@ impl PromptSession {
             menu: crate::v25_menu::build_menu(app_state),
             epoch_active: false,
             overlay: ActiveOverlay::None,
+            confirm: None,
         }
+    }
+
+    /// Open a gated tool call's confirmation.
+    ///
+    /// Replaces any confirm already on screen rather than queueing: rig
+    /// dispatches tool calls through `buffer_unordered(concurrency)` and the
+    /// default concurrency is 1, so two at once needs `tool_concurrency` set
+    /// explicitly. When it is, the second request waits in the channel and is
+    /// picked up as soon as the first resolves — still one dialog, still one
+    /// modal layer.
+    pub(crate) fn open_confirm(
+        &mut self,
+        req: crate::confirm::ConfirmRequest,
+        approvals: crate::confirm::Approvals,
+    ) {
+        self.confirm = Some(crate::confirm::ConfirmPrompt::new(req, approvals));
+    }
+
+    /// Is a confirmation on screen? The dispatcher asks *before* the `Esc`
+    /// ladder, so `Esc` dismisses the dialog rather than stepping the menu or
+    /// cancelling the turn.
+    pub(crate) fn confirm_open(&self) -> bool {
+        self.confirm.is_some()
+    }
+
+    /// Feed one key to an open confirmation, answering with the decision when
+    /// the dialog resolved.
+    ///
+    /// The caller then paints the area back and writes the decision line — the
+    /// order `emit_commit` uses, and the reason there is no second erase:
+    /// dropping the element *is* the erase.
+    pub(crate) fn confirm_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Option<crate::confirm::ConfirmDecision> {
+        self.confirm.as_mut()?.handle_key(key)
+    }
+
+    /// The subject of the open confirmation, for its decision line.
+    pub(crate) fn confirm_subject(&self) -> Option<String> {
+        self.confirm.as_ref().map(|c| c.subject().to_string())
+    }
+
+    /// Drop a resolved confirmation. The caller paints afterwards, which is
+    /// what erases its rows.
+    pub(crate) fn clear_confirm(&mut self) {
+        self.confirm = None;
     }
 
     /// Seed the editor with a prefill.
@@ -1255,9 +1321,24 @@ impl PromptSession {
             }
         }
         self.sync_selection();
-        let overlay = overlay_elements(&self.overlay, dims.0);
-        paint_prompt(output, prompt, &self.editor, overlay, dims);
+        self.paint(output, prompt, dims);
         None
+    }
+
+    /// The session's frame, as one composition: the open overlay and then — if a
+    /// gated tool is waiting — the confirmation below it.
+    ///
+    /// The single place the area is composed from session state, so `settle`
+    /// and the turn's confirm arm cannot disagree about what the screen shows.
+    /// A confirm *appends* rather than replaces (§3 of
+    /// doc/confirm_as_menu_261002.md): it is modal over the menu, and the
+    /// prompt that drives that menu stays exactly where it was.
+    pub(crate) fn paint(&self, output: &dyn Output, prompt: &str, dims: (usize, usize)) {
+        let mut overlay = overlay_elements(&self.overlay, dims.0);
+        if let Some(confirm) = &self.confirm {
+            overlay.extend(confirm.elements(dims.0));
+        }
+        paint_prompt(output, prompt, &self.editor, overlay, dims);
     }
 
     /// Apply one key to the session.
@@ -4923,5 +5004,226 @@ mod tests {
         };
         assert_eq!(height(true), 0, "a hidden input paints no row at all");
         assert_eq!(height(false), 1, "a resting input paints its row");
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    //! The three things the pty probe cannot reach, because each needs a real
+    //! `PromptSession` (and therefore an `AppState`): the confirm **appending**
+    //! below an open menu, the `Esc` ladder's new top rung, and the option
+    //! rows' starvation floor. See doc/confirm_as_menu_261002.md §9.
+    use super::*;
+    use crate::confirm::{ConfirmBridge, ConfirmDecision, ConfirmRequest};
+    use crate::slashdot_menu::render::LogicalLine;
+
+    fn batch_state() -> Arc<AppState> {
+        // Same helper the prompt tests use; duplicated rather than shared
+        // because that one is private to the `tests` module above.
+        let settings = crate::settings::SettingsStore {
+            default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_reasoning_level: None,
+            show_reasoning: "content".into(),
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            models: Default::default(),
+            path: None,
+        };
+        AppState::for_test(settings)
+    }
+
+    fn session() -> PromptSession {
+        PromptSession::new(None, &batch_state())
+    }
+
+    /// A confirm arriving while a menu is open must land **below** it, with the
+    /// prompt and the menu untouched — the menu is driven from that prompt, so
+    /// replacing the overlay would strand the very thing the user is looking at.
+    #[test]
+    fn a_confirm_appends_below_an_open_menu() {
+        let mut sess = session();
+        sess.overlay = ActiveOverlay::V25Menu {
+            plan: crate::slashdot_menu::render::RenderPlan {
+                table_header: None,
+                detail: vec![LogicalLine::new("pick a model")],
+                rows: std::sync::Arc::new(vec![LogicalLine::new("menu-row")]),
+                selected: Some(0),
+                active_rows: vec![],
+            },
+        };
+        let bridge = ConfirmBridge::new();
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        sess.open_confirm(
+            ConfirmRequest {
+                tool: "bash".into(),
+                header: "Confirm tool BASH call?".into(),
+                subject: "tool BASH".into(),
+                reply,
+            },
+            bridge.port.approvals().clone(),
+        );
+
+        // Compose the whole stack the way `paint` does, then read the frame:
+        // element order is the row order, so "where in the stack" is exactly
+        // "where on screen".
+        let mut els = overlay_elements(&sess.overlay, 40);
+        els.extend(sess.confirm.as_ref().unwrap().elements(40));
+        let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
+        let heights = crate::ui::frame::allocate(&extents, 40);
+        let frame = crate::ui::frame::render(&els, &heights, 40);
+        let joined = (0..frame.height())
+            .map(|i| frame.row(i).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let menu_at = joined.find("menu-row").expect("the menu row survives");
+        let confirm_at = joined
+            .find("Confirm tool BASH call?")
+            .expect("the dialog is composed at all");
+        assert!(
+            menu_at < confirm_at,
+            "the dialog goes below the menu, not over it:\\n{joined}"
+        );
+    }
+
+    /// `Esc` is the dialog's first: it must resolve to a denial rather than
+    /// falling through to the menu ladder or the turn cancel.
+    #[test]
+    fn esc_resolves_the_confirm_before_anything_else() {
+        let mut sess = session();
+        let bridge = ConfirmBridge::new();
+        let (reply, mut rx) = tokio::sync::oneshot::channel();
+        sess.open_confirm(
+            ConfirmRequest {
+                tool: "bash".into(),
+                header: "Confirm tool BASH call?".into(),
+                subject: "tool BASH".into(),
+                reply,
+            },
+            bridge.port.approvals().clone(),
+        );
+        let decision = sess.confirm_key(key(KeyCode::Esc));
+        assert_eq!(decision, Some(ConfirmDecision::Deny));
+        sess.clear_confirm();
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(ConfirmDecision::Deny),
+            "the waiting tool is told Deny, not left hanging"
+        );
+    }
+
+    /// An unmapped key is a denial too. A consent prompt that treats a stray
+    /// keystroke as consent is not one.
+    #[test]
+    fn an_unmapped_key_denies_rather_than_accepting() {
+        let mut sess = session();
+        let bridge = ConfirmBridge::new();
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        sess.open_confirm(
+            ConfirmRequest {
+                tool: "bash".into(),
+                header: "Confirm tool BASH call?".into(),
+                subject: "tool BASH".into(),
+                reply,
+            },
+            bridge.port.approvals().clone(),
+        );
+        assert_eq!(
+            sess.confirm_key(key(KeyCode::Char('z'))),
+            Some(ConfirmDecision::Deny)
+        );
+    }
+
+    /// A dialog that opens on "run it" gets muscle-memory'd into running
+    /// things, so the default row is *no*.
+    #[test]
+    fn the_dialog_opens_on_no() {
+        let mut sess = session();
+        let bridge = ConfirmBridge::new();
+        let (reply, mut rx) = tokio::sync::oneshot::channel();
+        sess.open_confirm(
+            ConfirmRequest {
+                tool: "bash".into(),
+                header: "Confirm tool BASH call?".into(),
+                subject: "tool BASH".into(),
+                reply,
+            },
+            bridge.port.approvals().clone(),
+        );
+        assert_eq!(
+            sess.confirm_key(key(KeyCode::Enter)),
+            Some(ConfirmDecision::Deny),
+            "Enter on the default row must deny"
+        );
+        assert_eq!(rx.try_recv().ok(), Some(ConfirmDecision::Deny));
+    }
+
+    /// The option rows carry `must = 3`, so a starved budget cannot squeeze the
+    /// choices away — the whole point of the floor. Verified through
+    /// `allocate`, the same way the header/rows priority test does.
+    #[test]
+    fn the_option_rows_survive_a_starved_budget() {
+        let bridge = ConfirmBridge::new();
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let prompt = crate::confirm::ConfirmPrompt::new(
+            ConfirmRequest {
+                tool: "bash".into(),
+                header: "Confirm tool BASH call?".into(),
+                subject: "tool BASH".into(),
+                reply,
+            },
+            bridge.port.approvals().clone(),
+        );
+        let els = prompt.elements(40);
+        let rows_el = els.last().expect("the rows element");
+        assert_eq!(
+            rows_el.extent().must,
+            3,
+            "all three options are pinned, not just one row"
+        );
+        // Under a budget that cannot fit the header, the rows still get their
+        // three: `allocate` serves every `must` before any `might`.
+        let all: Vec<_> = els.iter().map(Element::extent).collect();
+        let heights = crate::ui::frame::allocate(&all, 3);
+        assert_eq!(
+            heights[heights.len() - 1],
+            3,
+            "a 3-row budget still shows every option"
+        );
+    }
+
+    fn key(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    /// The session owns the dialog now, so a turn ending with one open drops it
+    /// — and with it the reply sender, without ever having answered. The waiting
+    /// tool must read that as a denial instead of parking forever.
+    ///
+    /// Asserted through the port, not the raw channel: a dropped sender
+    /// surfaces as *disconnected*, and it is `ConfirmPort::request` that turns
+    /// that into `Deny`. Testing the channel would pin the wrong layer.
+    #[tokio::test]
+    async fn a_dropped_confirm_denies_rather_than_hanging() {
+        let mut bridge = ConfirmBridge::new();
+        let port = bridge.port.clone();
+        let ask = tokio::spawn({
+            let port = port.clone();
+            async move { port.request("bash", "Confirm tool BASH call?".into()).await }
+        });
+        let req = bridge.requests.recv().await.expect("a request arrives");
+        let mut sess = session();
+        sess.open_confirm(req, port.approvals().clone());
+        assert!(sess.confirm_open());
+        // The turn is cancelled: the session goes, dialog and all.
+        drop(sess);
+        assert_eq!(
+            ask.await.unwrap(),
+            ConfirmDecision::Deny,
+            "a dialog torn down unanswered must fail closed"
+        );
     }
 }

@@ -1,18 +1,19 @@
 //! Regression test for the tool-confirmation hang.
 //!
 //! Root cause: while the interactive REPL is in raw mode, a tool confirmation
-//! dialog (`ConsoleOutput::confirm`) used `std::io::read_line`, which waits
-//! for a `\n` (0x0A). But `cfmakeraw` disables `ICRNL`, so the Enter key
-//! delivers `\r` (0x0D) and `read_line` blocks forever — the client appears
-//! frozen with no echoed input. The fix renders the choice as an overlay and
-//! reads a single key via crossterm's raw-mode event reader (which understands
-//! raw-mode Enter), and asks the background in-flight reader to stand down so
-//! it doesn't swallow the keystrokes.
+//! dialog used `std::io::read_line`, which waits for a `\n` (0x0A). But
+//! `cfmakeraw` disables `ICRNL`, so the Enter key delivers `\r` (0x0D) and
+//! `read_line` blocks forever — the client appears frozen with no echoed input.
+//! The dialog now reads whole key events through crossterm's raw-mode reader.
 //!
-//! This test spawns the `confirm_probe` child through a *real* pty (so the
-//! child's controlling terminal — and thus crossterm's `/dev/tty` event
-//! reader — is the pty), feeds a key from the pty master, and asserts the
-//! dialog returns promptly with the right answer (i.e. it does not hang).
+//! The dialog is no longer a blocking driver of its own, so this file's subject
+//! changed shape rather than disappearing: what it pins now is that the *real*
+//! reducer resolves every key the way it used to, on a real pty, and that the
+//! frame it applies is the real one. See doc/confirm_as_menu_261002.md §9.
+//!
+//! The probe drives production code — the port, `ConfirmPrompt::handle_key`
+//! and `confirm::paint` — so a divergence between the dialog and the drawing
+//! shows up here rather than only in the REPL.
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,10 +88,11 @@ fn run_confirm(key: &[u8]) -> (String, Vec<u8>, Vec<u8>) {
         }
     });
 
-    // Wait until the overlay is drawn and the DSR query window (first ~60ms of
-    // `confirm`) has passed before typing, so the key reaches `event::read`
-    // rather than the DSR read. Snapshot the bytes first: this is the screen
-    // *while the dialog is up* (ui_draw_v2 P4 pins it below).
+    // Wait until the dialog is drawn before typing. There is no DSR query
+    // window any more — the dialog no longer re-anchors, it is an overlay in
+    // the area the pump already maintains — so the sleep only has to cover the
+    // frame. Snapshot the bytes first: this is the screen *while the dialog is
+    // up* (ui_draw_v2 P4 pins it below).
     thread::sleep(Duration::from_millis(400));
     let mid = bytes.lock().unwrap().clone();
     let _ = writer.write_all(key);
@@ -145,8 +147,10 @@ fn confirm_yes_returns_without_hang() {
 }
 
 #[test]
-fn confirm_session_returns_always() {
-    assert_eq!(run_confirm(b"s").0, "Always");
+fn confirm_session_answers_accept() {
+    // The *decision* is one bit now; "always" is an approval the REPL records,
+    // not a value the agent sees (pinned separately below).
+    assert_eq!(run_confirm(b"s").0, "Yes");
 }
 
 #[test]
@@ -160,26 +164,79 @@ fn confirm_n_returns_no() {
     assert_eq!(run_confirm(b"n").0, "No");
 }
 
-/// ui_draw_v2 §9 latent issue 1: on resolve the dialog must release the
-/// in-flight reader gate it raised on entry. A gate left raised makes every
-/// *later* in-flight reader born paused — it would ignore Esc/Ctrl-C for the
-/// rest of the session (the mid-turn Esc handler died exactly this way when
-/// the confirm driver moved to `ui::confirm` without the release).
+/// The old dialog had to pause the in-flight reader, because it was a blocking
+/// loop reading stdin itself — a second consumer. That made "a gate left raised"
+/// a live hazard: every *later* in-flight reader would be born paused and ignore
+/// Esc/Ctrl-C for the rest of the session.
+///
+/// The dialog is session state in the REPL's pump now, so there is one consumer
+/// and the gate is never touched at all. That is a stronger claim than the old
+/// "released it on the way out", so it is asserted as one: sampled while the
+/// dialog is *up*, not after it resolved.
 #[test]
-fn confirm_releases_reader_gate_on_resolve() {
+fn confirm_never_touches_the_reader_gate() {
+    // Read from `final_bytes`, not `mid`: the probe samples the gate while the
+    // dialog is up but prints after it resolves, because a write now would land
+    // on the dialog's own rows.
     let (result, _, final_bytes) = run_confirm(b"y");
     assert_eq!(result, "Yes");
     assert_eq!(
-        find_field(&final_bytes, "GATE_RELEASED=").as_deref(),
+        find_field(&final_bytes, "GATE_WHILE_UP=").as_deref(),
+        Some("false"),
+        "the dialog must not pause the in-flight reader while it is up"
+    );
+    assert_eq!(
+        find_field(&final_bytes, "GATE_AFTER=").as_deref(),
+        Some("false"),
+        "and must not have raised it either"
+    );
+}
+
+/// *Always* is recorded by the REPL and answered as a plain accept, so the
+/// waiting tool call cannot tell it from *yes* — and the tool name is derived
+/// from the header, not guessed at paint time.
+#[test]
+fn confirm_always_is_recorded_and_answers_accept() {
+    let (result, _, final_bytes) = run_confirm(b"s");
+    assert_eq!(result, "Yes", "always answers the same bit as yes");
+    assert_eq!(
+        find_field(&final_bytes, "APPROVED=").as_deref(),
         Some("true"),
-        "confirm gate left raised after resolve"
+        "the approval should be recorded under the tool's own name"
+    );
+}
+
+/// A plain *yes* must not leave an approval behind, or one acceptance would
+/// silently authorise the rest of the session.
+#[test]
+fn confirm_yes_does_not_record_an_approval() {
+    let (result, _, final_bytes) = run_confirm(b"y");
+    assert_eq!(result, "Yes");
+    assert_eq!(
+        find_field(&final_bytes, "APPROVED=").as_deref(),
+        Some("false"),
+        "yes is a one-off; only always approves for the session"
+    );
+}
+
+/// The dialog's reducer and the answer the waiting tool call receives are two
+/// paths to the same fact; disagreement is the worst failure available here.
+#[test]
+fn the_reducers_answer_and_the_callers_answer_agree() {
+    let (result, _, final_bytes) = run_confirm(b"\r");
+    assert_eq!(result, "No");
+    assert_eq!(
+        find_field(&final_bytes, "MISMATCH=").as_deref(),
+        Some("false"),
+        "the dialog resolved differently from the answer it sent"
     );
 }
 
 #[test]
-fn confirm_arrow_down_then_enter_selects_always() {
-    // Down arrow moves the selection from the default (No) to Always.
-    assert_eq!(run_confirm(b"\x1b[B\r").0, "Always");
+fn confirm_arrow_down_then_enter_answers_accept() {
+    // Down arrow moves the selection from the default (No) to Always, which is
+    // the *accepting* bit — the approval it records is pinned separately.
+    assert_eq!(run_confirm(b"\x1b[B\r").0, "Yes");
 }
 
 #[test]

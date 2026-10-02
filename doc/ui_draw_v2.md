@@ -1,7 +1,10 @@
 # UI Draw v2 — unified frame composition for REPL, menus & dialogs
 
 **Status:** Design settled — implemented (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 ✅, P5 ✅;
-§4.5 U1/U2 ✅ in the API fold, U3–U6 not started). One end-to-end layout
+§4.5 U1/U2 ✅ in the API fold, U4.1–U4.3/U4.5–U4.6 ✅, U5–U6 not started; **U3's
+composition half is ✅ but its delivery half is not** — moved to
+[`confirm_as_menu_261002.md`](./confirm_as_menu_261002.md), which supersedes
+§4.5.6's U3 entry). One end-to-end layout
 assertion is off by one row — see §5.2; the design to close it (paint-forward)
 moved to [`ui_draw_261001.md`](./ui_draw_261001.md), which supersedes §5.2's
 "Proposed change" and its open questions.
@@ -309,7 +312,7 @@ derived as `frame_top_row + frame.caret.row`; never stored twice. `frame_anchor(
 | `$EDITOR` wrapper (`run_editor`: Ctrl-E prompt edit, compaction draft edit) | `cursor_row()` (DSR) after exit → `caret`; `live = None` |
 | Resize | `cursor_row()` (DSR) re-anchor; `live = None` |
 | Ctrl-Z resume | `cursor_row()` (DSR) re-anchor; `live = None` |
-| Dialog entry (`ui::confirm`) | `cursor_row()` (DSR) re-anchor; `live = None`. Afterwards the dialog itself maintains the cache through `draw_frame`. (The reason used to be "the tracked caret does not follow streamed content" — false since the streaming writers started counting, see #10. Kept as a cheap confirmation on a path where a wrong anchor strands the dialog; §4.5 U5 revisits it.) |
+| Dialog entry (`ui::confirm`) | `cursor_row()` (DSR) re-anchor; `live = None`. Afterwards the dialog itself maintains the cache through `draw_frame`. (The reason used to be "the tracked caret does not follow streamed content" — false since the streaming writers started counting, see #10. Kept as a cheap confirmation on a path where a wrong anchor strands the dialog; §4.5 U5 revisits it, and [`confirm_as_menu_261002.md`](./confirm_as_menu_261002.md) removes it outright as a consequence of U3.) |
 
 `live = None` forces the full path on the next apply. Any uncertainty → clear it.
 
@@ -659,17 +662,17 @@ readable below a tool panel).
   mid-turn re-flows the area; `plan_clear_live_frame` has no production callers
   and is removed.
 
-**U3 — Dialogs are menus in the area.**
-`ui::confirm` composes `[Status, Input?, Divider?, Overlay]` through the same path
-as the REPL, below the status and below the input. The two areas of duplicated
-logic §1 named — the dialog's own anchor and its `\x1b[0J` — go away, and so does
-its entry DSR.
-- Establishes I1 for dialogs, and closes half of P5.
-- Verify: a mid-turn tool approval shows the input row above it; the dialog's
-  rows are erased through the pipeline on resolve and the area comes back as
-  `[Status, Input]`; **a positional assertion is required** — the confirm suite
-  asserts behaviour (which option was chosen) and not the dialog's row, so
-  "green" is not evidence for anything here.
+**U3 — Dialogs are menus in the area.** → **moved to
+[`confirm_as_menu_261002.md`](confirm_as_menu_261002.md)**, which carries the
+design, the settled decisions and the test plan. Summary: `ui::confirm` composes
+`[Status, Input?, Divider?, Overlay]` through the same path as the REPL, below
+the status and below the input; the two areas of duplicated logic §1 named — the
+dialog's own anchor and its `\x1b[0J` — go away, and so does its entry DSR.
+Establishes I1 for dialogs, and closes half of P5. Verify: a mid-turn tool
+approval shows the input row above it; the dialog's rows are erased through the
+pipeline on resolve and the area comes back as `[Status, Input]`; **a positional
+assertion is required** — the confirm suite asserts behaviour (which option was
+chosen) and not the dialog's row, so "green" is not evidence for anything here.
 
 **U4 — In-turn input. (Unblocked by OQ2; depends on U1–U3.)**
 The read loop stays alive while the turn runs: the input row is part of the area,
@@ -1142,9 +1145,9 @@ Every claim below was checked against the code, not against the phase list.
 |---|---|---|
 | ✅ | **U1** contraction | Landed. `with_content_writer` consumes the area instead of retiring it, and `plan_reposition` is the third apply case. **But** it places the area by its bottom edge, which §4.5.7 rules out — see §5.2's known gap. Implemented, and wrong in the one respect §4.5.7 settled. |
 | ✅ | **U2** area survives the turn | Landed. The bar is a composed row resolved from `status_text` + `streaming`; the transient-bar machinery is gone. |
-| ✅ | **U3** dialogs are menus | Landed. `ui::confirm` composes `[Divider?, Overlay]` through the same composer. |
+| ✅ | **U3** dialogs are menus | Landed, in two halves that this row used to conflate (which is why it read ✅ while the delivery half was untouched). The *composition* half was P3/P5: `ui::confirm` composing `[Divider?, Overlay]` through the same composer. The *delivery* half landed in [`confirm_as_menu_261002.md`](confirm_as_menu_261002.md): the confirm is session state in the REPL's pump, composed into the **live** area mid-turn as an ordinary overlay element, with its own anchor, its entry DSR, its reader gate and its `Frame::empty()` erase all gone. A gated tool call now *awaits* an answer instead of blocking the `select!`. |
 | 🔶 | **U4** in-turn input | **U4.1–U4.3 + U4.5–U4.6 landed; U4.4 open.** The plan is recorded under U4 itself. Landed: `PromptSession` owns `editor`, `nav`, `draft`, `sel`, `last_disc`, `prose`, `pending_key`, the `SlashDotMenu` and the overlay, and `read_input` takes it by `&mut`, so the state outlives the call; `handle_key` is the draw-free dispatcher (`Continue` / `RunEditor` / `Action`), generalising the `edit_key` split; `slashdot_menu` gained `continuation_handle` so a `/`-session keeps its epoch across evals. The in-flight reader no longer drops edit keys — `route_event` routes each one `Inline` (Ctrl-C, Ctrl-Z, Resize) or `Forward` (every other key, **`Esc` among them**, plus paste) onto an unbounded mpsc, unbounded precisely so a full queue can never block the thread at the moment it must deliver Ctrl-C. **The receiver is drained:** `prompt()`'s `select!` grew a key branch that runs `handle_key` → `settle` — eval, outcome, sync, paint, the sequence `read_input` runs minus its wait — plus a prose timer for `prose.poll_timeout()`, without which prose would go inert mid-turn. Submit is blocked and silent, as settled. `Esc` is menu-first: the ladder runs while a v2.5 menu is open and the turn stops only at root, which is *why* it moved to `Forward` — the reader has no session to look at, so routing it inline was routing it to "abort" unconditionally. `eval` is out of `read_input` and into `settle`, so the session is self-driving. **U4.5 makes the pump turn-scoped, not attempt-scoped:** `cancellable_sleep_pumped` runs the same dispatcher over the same queue during retry back-offs — a root `Esc` ends a back-off immediately instead of after the delay elapsed, keys/menus stay live between attempts (the receiver was otherwise unread while `prompt()` had returned), and the prose timer ticks through the wait. **U4.6 gives the compaction window its own pump:** `retry_summarization` polls a `WindowKeySource` beside the attempt and the sleep — an `Esc` cancels a summarization or its back-off instead of waiting the provider floor out, and keys typed during the window are parked on `AppState` and drained by `read_input`'s normal dispatch afterwards. **Still open: U4.4**, the ordering between the key branch's compose and the content branch's write + `reposition_area`. |
-| ❌ | **U5** retire the entry DSRs | **Not started.** `read_input`'s entry DSR is live at `repl.rs:683` and `ui::confirm`'s at `ui.rs:92`, both marked for removal. The three sanctioned sites are correctly still there (Ctrl-Z resume `repl.rs:806`, the width-change `ESC[0J` + replay `repl.rs:841`, and the confirm error path `repl.rs:942`). |
+| ❌ | **U5** retire the entry DSRs | **Not started.** `read_input`'s entry DSR is live at `repl.rs:683` and `ui::confirm`'s at `ui.rs:92`, both marked for removal. The three sanctioned sites are correctly still there (Ctrl-Z resume `repl.rs:806`, the width-change `ESC[0J` + replay `repl.rs:841`, and the confirm error path `repl.rs:942`). **Done** by [`confirm_as_menu_261002.md`](confirm_as_menu_261002.md) (U3): `ui::confirm`'s entry DSR went when the confirm became session state rather than a blocking loop with its own anchor. `read_input`'s half was already retired by `ENTRY_DSR_DONE`. |
 | ⏸ | **U6** scroll region | Optional, gates nothing, not started. |
 
 **Two things this audit changes about the plan.**
