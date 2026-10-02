@@ -1991,9 +1991,14 @@ mod tests {
 
     /// Write entries to a temp session file, then open it read-only and build
     /// a Session for context-building tests.
-    async fn build_session_for_test(entries: Vec<SessionEntry>) -> (Session, PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("picocode-session2-test-{}", std::process::id()));
+    async fn build_session_for_test(
+        entries: Vec<SessionEntry>,
+    ) -> (tempfile::TempDir, Session, PathBuf) {
+        // A `TempDir` (returned first so the caller keeps it alive past the
+        // `Session`, whose storage re-opens by path). Removed on drop instead of
+        // leaking an empty directory.
+        let dir_guard = tempfile::tempdir().unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -2016,8 +2021,8 @@ mod tests {
 
         let session = Session::new_persisted(ro, index);
 
-        // Cleanup marker
-        (session, path)
+        // `dir_guard` first so the caller drops it last (outlives the session).
+        (dir_guard, session, path)
     }
 
     fn cleanup(path: &PathBuf) {
@@ -2074,7 +2079,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_context_empty_session() {
-        let (session, path) = build_session_for_test(vec![]).await;
+        let (_guard, session, path) = build_session_for_test(vec![]).await;
         let ctx = session.build_context().await.unwrap();
         assert!(ctx.messages.is_empty());
         assert!(ctx.thinking_level.is_none());
@@ -2600,7 +2605,7 @@ mod tests {
             SessionEntry::new_leaf(Some("e4".into()), Some("e3".into())),
         ];
 
-        let (session, path) = build_session_for_test(entries).await;
+        let (_guard, session, path) = build_session_for_test(entries).await;
         let ctx = session.build_context().await.unwrap();
 
         assert_eq!(ctx.messages.len(), 4);
@@ -2798,7 +2803,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_saved_jsonl_holds_n_calls_and_n_results_pairing_by_id() {
-        let dir = std::env::temp_dir().join(format!("picocode-w8-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let path = dir.join(session_filename(&chrono::Utc::now()));
         let storage = JsonlSessionStorage::open_or_create(path.clone())
             .await
@@ -2887,8 +2893,8 @@ mod tests {
     #[tokio::test]
     async fn test_append_and_reread() {
         // Create a fresh session, append a message, then re-open and verify.
-        let dir =
-            std::env::temp_dir().join(format!("picocode-session2-append-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -2920,8 +2926,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_model_and_thinking() {
-        let dir =
-            std::env::temp_dir().join(format!("picocode-session2-metadata-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -2959,8 +2965,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_session_name() {
-        let dir =
-            std::env::temp_dir().join(format!("picocode-session2-name-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -2991,8 +2997,8 @@ mod tests {
         // IN-MEMORY index (without re-opening from disk). The bug was that
         // append operations wrote to disk and updated leaf_id but never
         // inserted entries into index.entries, so get_branch() returned empty.
-        let dir =
-            std::env::temp_dir().join(format!("picocode-session2-inmem-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -3073,10 +3079,8 @@ mod tests {
     async fn test_multiple_tool_results_all_preserved() {
         use rig_core::message::{ToolResult, ToolResultContent};
 
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-session2-toolresults-{}",
-            std::process::id()
-        ));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -3205,8 +3209,8 @@ mod tests {
     /// without creating dangling tool_calls on the next turn.
     #[tokio::test]
     async fn test_tool_call_round_trip() {
-        let dir =
-            std::env::temp_dir().join(format!("picocode-session-toolrt-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -3527,7 +3531,8 @@ mod tests {
         // End-to-end: append a compaction entry (empty summary, firstKept=m1),
         // then a follow-up message, and verify build_context() on a RE-OPENED
         // session (simulating resume) exposes only the scoped prefix.
-        let dir = std::env::temp_dir().join(format!("picocode-cmp-resume-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -3598,7 +3603,8 @@ mod tests {
         // [u0 a0 c1 u1 a1]; latest compaction on that prefix is c1, so the
         // context must be [summary(S1)] + [u1 a1] (c1 itself stepped over,
         // u0 a0 covered by the summary).
-        let dir = std::env::temp_dir().join(format!("picocode-cmp-prefix-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -3690,10 +3696,13 @@ mod tests {
         // Session: u0 a0 c1{firstKept:u0} (leaf=c1). Re-compact at target=u0
         // -> predecessor = (root, none?) u0 has no predecessor -> guard
         // triggers. Use the MEANINGFUL case: target = a0 -> predecessor = u0.
-        let dir =
-            std::env::temp_dir().join(format!("picocode-cmp-boundary-{}", std::process::id()));
+        // A `tempfile::TempDir`, not a hand-named path under `temp_dir()`: it
+        // is removed on drop, so a passing test leaves nothing in `/tmp` and
+        // the hundreds of `picocode-cmp-boundary-*` directories that pattern
+        // accumulated stop growing.
+        let dir = tempfile::tempdir().unwrap();
         let filename = session_filename(&chrono::Utc::now());
-        let path = dir.join(&filename);
+        let path = dir.path().join(&filename);
 
         let storage = JsonlSessionStorage::open_or_create(path.clone())
             .await
@@ -3728,14 +3737,12 @@ mod tests {
             .collect();
         // No compaction is on the [u0] prefix -> NO summary wrapper, just u0.
         assert_eq!(texts, vec!["u0"], "context at u0: {texts:?}");
-
-        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]
     async fn test_toolname_in_toolresult() {
-        let dir =
-            std::env::temp_dir().join(format!("picocode-toolname-test-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -3807,8 +3814,8 @@ mod tests {
     async fn test_edit_block_form_persisted_as_canonical_array() {
         // The model emits the Aider block string; the persisted JSONL must be
         // the canonical pi-compatible array.
-        let dir =
-            std::env::temp_dir().join(format!("picocode-edit-canon-test-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -3863,8 +3870,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_toolname_multiple_tools() {
-        let dir =
-            std::env::temp_dir().join(format!("picocode-multitool-test-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -3970,14 +3977,8 @@ mod tests {
         // for the retry de-dup guard: it must count genuine user prompts
         // (role "user") and EXCLUDE tool-result batches (role
         // "toolResult"), assistant messages, and non-message entries.
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-count-user-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
         let storage = JsonlSessionStorage::open_or_create(path.clone())
@@ -4707,7 +4708,8 @@ mod tests {
     fn relativize_path_returns_relative_for_sub_path() {
         // Paths below session_dir become compact relative (no leading ./)
         // Use a temp dir + file so canonicalize works on both sides.
-        let tmp = std::env::temp_dir().join("picocode_relpath_test");
+        let _tmpdir = tempfile::tempdir().unwrap();
+        let tmp = _tmpdir.path().to_path_buf();
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("marker"), b"").unwrap();
         // Create the nested file so canonicalize resolves the path.
@@ -4723,7 +4725,8 @@ mod tests {
 
     #[test]
     fn relativize_path_returns_none_for_parent_path() {
-        let tmp = std::env::temp_dir().join("picocode_relpath_test2");
+        let _tmpdir = tempfile::tempdir().unwrap();
+        let tmp = _tmpdir.path().to_path_buf();
         std::fs::create_dir_all(&tmp).unwrap();
         // The parent of session_dir is not a sub-path.
         std::fs::write(tmp.join("marker"), b"").unwrap();
@@ -4735,7 +4738,8 @@ mod tests {
 
     #[test]
     fn relativize_path_returns_none_for_equal_path() {
-        let tmp = std::env::temp_dir().join("picocode_relpath_test3");
+        let _tmpdir = tempfile::tempdir().unwrap();
+        let tmp = _tmpdir.path().to_path_buf();
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("marker"), b"").unwrap();
         // The path itself is the session_dir; strip_prefix succeeds but yields "".
@@ -4746,7 +4750,8 @@ mod tests {
 
     #[test]
     fn relativize_path_returns_none_for_nonexistent() {
-        let tmp = std::env::temp_dir().join("picocode_relpath_test4");
+        let _tmpdir = tempfile::tempdir().unwrap();
+        let tmp = _tmpdir.path().to_path_buf();
         std::fs::create_dir_all(&tmp).unwrap();
         // A nonexistent file inside the session_dir -> relativizes successfully.
         std::fs::write(tmp.join("marker"), b"").unwrap();

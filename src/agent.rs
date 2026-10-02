@@ -6561,6 +6561,7 @@ impl CodeAgent {
 /// caller removes it.
 #[cfg(test)]
 pub(crate) fn test_repo_with_session() -> (
+    tempfile::TempDir,
     crate::session::repo::JsonlSessionRepo,
     String,
     std::path::PathBuf,
@@ -6571,15 +6572,18 @@ pub(crate) fn test_repo_with_session() -> (
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let base = std::env::temp_dir().join(format!(
-        "picocode-repo-test-{}-{}",
-        std::process::id(),
-        nanos
-    ));
-    let cwd = std::path::Path::new("/tmp/v25-cwd");
-    let dir = base.join(encode_cwd(cwd));
+    // A `TempDir` (returned first so the caller keeps it alive past the repo
+    // and session). Removed on drop instead of leaking an empty directory.
+    let base_guard = tempfile::tempdir().unwrap();
+    let base = base_guard.path().to_path_buf();
+    // A synthetic cwd: nothing creates it, and only `encode_cwd` and the
+    // session header ever see it. Named per-run so that if anything did
+    // resolve or create it, two checkouts sharing a `/tmp` still could not
+    // collide.
+    let cwd = std::path::Path::new("/tmp").join(format!("v25-cwd-{}-{nanos}", std::process::id()));
+    let dir = base.join(encode_cwd(&cwd));
     std::fs::create_dir_all(&dir).unwrap();
-    let header = SessionHeader::new(cwd);
+    let header = SessionHeader::new(&cwd);
     let uuid = header.id.clone();
     let path = dir.join(session_filename(&chrono::Utc::now()));
     let user_entry = serde_json::json!({
@@ -6602,7 +6606,7 @@ pub(crate) fn test_repo_with_session() -> (
     );
     std::fs::write(&path, contents).unwrap();
     let repo = JsonlSessionRepo::new(base.clone());
-    (repo, uuid, base)
+    (base_guard, repo, uuid, base)
 }
 
 /// Test helper: drive a future on a fresh current-thread tokio runtime.
@@ -6626,7 +6630,7 @@ pub(crate) fn block_on_test<F: std::future::Future>(f: F) -> F::Output {
 #[cfg(test)]
 pub(crate) fn test_session_with_entries(
     entries: Vec<crate::session::SessionEntry>,
-) -> Arc<Session> {
+) -> (tempfile::TempDir, Arc<Session>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -6634,14 +6638,8 @@ pub(crate) fn test_session_with_entries(
     rt.block_on(async move {
         use crate::session::storage::JsonlSessionStorage;
         use crate::session::types::session_filename;
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-slot-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir_guard = tempfile::tempdir().unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let path = dir.join(session_filename(&chrono::Utc::now()));
         let storage = JsonlSessionStorage::open_or_create(path)
             .await
@@ -6656,7 +6654,7 @@ pub(crate) fn test_session_with_entries(
             storage.append_entry(&leaf).await.expect("append leaf");
         }
         let index = storage.build_index().await.expect("build index");
-        Arc::new(Session::new_persisted(storage, index))
+        (dir_guard, Arc::new(Session::new_persisted(storage, index)))
     })
 }
 
@@ -7073,18 +7071,12 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     /// session test helpers (different visibility / layering).
     async fn build_session_with_entries(
         entries: Vec<crate::session::SessionEntry>,
-    ) -> (Session, std::path::PathBuf) {
+    ) -> (tempfile::TempDir, Session, std::path::PathBuf) {
         use crate::session::storage::JsonlSessionStorage;
         use crate::session::types::session_filename;
         use std::path::Path;
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-resume-prefill-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir_guard = tempfile::tempdir().unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -7102,7 +7094,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             .await
             .unwrap();
         let index = ro.build_index().await.unwrap();
-        (Session::new_persisted(ro, index), path)
+        (dir_guard, Session::new_persisted(ro, index), path)
     }
 
     #[tokio::test]
@@ -7132,7 +7124,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                 },
             },
         ];
-        let (session, path) = build_session_with_entries(entries).await;
+        let (_guard, session, path) = build_session_with_entries(entries).await;
         // Live model differs from the session's recorded model → prefill.
         let prefill = compute_resume_model_prefill(&session, "openai:gpt-4o").await;
         assert_eq!(
@@ -7166,7 +7158,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                 },
             },
         ];
-        let (session, path) = build_session_with_entries(entries).await;
+        let (_guard, session, path) = build_session_with_entries(entries).await;
         let prefill = compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet").await;
         assert_eq!(prefill.as_deref(), Some("/model openai:gpt-4o"));
         let _ = std::fs::remove_file(&path);
@@ -7181,14 +7173,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         use crate::session::storage::JsonlSessionStorage;
         use std::path::Path;
 
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-resume-prefill-header-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = crate::session::types::session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
         let storage = JsonlSessionStorage::open_or_create(path.clone())
@@ -7219,7 +7205,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     #[tokio::test]
     async fn resume_model_prefill_returns_none_when_nothing_known() {
         // No `ModelChange`, no header metadata → empty prompt (no nudge).
-        let (session, path) = build_session_with_entries(vec![]).await;
+        let (_guard, session, path) = build_session_with_entries(vec![]).await;
         let prefill =
             compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet-20241022").await;
         assert_eq!(prefill, None);
@@ -7241,7 +7227,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                 model_id: "claude-sonnet-4-5".into(),
             },
         }];
-        let (session, path) = build_session_with_entries(entries).await;
+        let (_guard, session, path) = build_session_with_entries(entries).await;
         let prefill = compute_resume_model_prefill(&session, "anthropic:claude-sonnet-4-5").await;
         assert_eq!(prefill, None);
         let _ = std::fs::remove_file(&path);
@@ -7254,19 +7240,17 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     /// Build an UNPERSISTED fresh session (no file on disk) via
     /// `repo.create()` + the `ensure_session` fallback header, like
     /// `run_interactive` does at startup. Returns `(session, file path)`.
-    async fn fresh_unpersisted_session() -> (crate::session::Session, std::path::PathBuf) {
+    async fn fresh_unpersisted_session() -> (
+        tempfile::TempDir,
+        crate::session::Session,
+        std::path::PathBuf,
+    ) {
         use crate::session::repo::SessionRepo;
         use crate::session::storage::SessionStorage;
         use std::path::PathBuf;
 
-        let base: PathBuf = std::env::temp_dir().join(format!(
-            "picocode-record-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let base_guard = tempfile::tempdir().unwrap();
+        let base: PathBuf = base_guard.path().to_path_buf();
         let repo = crate::session::repo::JsonlSessionRepo::new(base);
         let cwd = std::path::Path::new("/home/test/record");
         let storage = repo.create(cwd).await.unwrap();
@@ -7286,7 +7270,11 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                 children: std::collections::HashMap::new(),
                 session_name: None,
             });
-        (crate::session::Session::new(storage, index), path)
+        (
+            base_guard,
+            crate::session::Session::new(storage, index),
+            path,
+        )
     }
 
     /// The core "empty session" regression: recording model/thinking
@@ -7298,7 +7286,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     /// (e.g. on `/quit`, whose DoneSuccess ran the menu sync one last time).
     #[tokio::test]
     async fn record_metadata_on_unpersisted_session_creates_no_file() {
-        let (session, path) = fresh_unpersisted_session().await;
+        let (_guard, session, path) = fresh_unpersisted_session().await;
         assert!(
             !session.is_persisted(),
             "fresh session must start unpersisted"
@@ -7338,16 +7326,9 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     #[tokio::test]
     async fn record_model_change_on_persisted_session_skips_duplicate() {
         use crate::session::storage::SessionStorage;
-        use std::path::PathBuf;
 
-        let dir: PathBuf = std::env::temp_dir().join(format!(
-            "picocode-record-persisted-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.jsonl");
 
@@ -7847,18 +7828,14 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     /// opens the storage as read-only because it only tests reading
     /// (resume prefill); `apply_compaction` calls `append_compaction`,
     /// which needs a writable handle, so we use `open_or_create` here.
-    async fn build_writable_session_with(entries: Vec<crate::session::SessionEntry>) -> Session {
+    async fn build_writable_session_with(
+        dir: &Path,
+        entries: Vec<crate::session::SessionEntry>,
+    ) -> Session {
         use crate::session::storage::JsonlSessionStorage;
         use crate::session::types::session_filename;
-        use std::path::Path;
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-run-compaction-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // The caller owns the directory (and keeps it alive for the whole test):
+        // the returned `Session` re-opens by path, so the dir must outlive it.
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
         let storage = JsonlSessionStorage::open_or_create(path.clone())
@@ -7987,11 +7964,15 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // Manual on a span that touched no files: generate → empty draft;
         // apply → Compaction entry with empty summary, firstKept=u1, and
         // the tokens_before snapshot generate took pre-pivot.
+        let _g = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u1", None, "user", "first prompt"),
-                message_entry("a1", Some("u1"), "assistant", "first reply"),
-            ])
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u1", None, "user", "first prompt"),
+                    message_entry("a1", Some("u1"), "assistant", "first reply"),
+                ],
+            )
             .await,
         );
         let app_state = compaction_app_state(s.clone());
@@ -8029,11 +8010,15 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // TextOnly over an empty dropped span (target = first entry)
         // yields the empty deterministic summary; apply still writes a
         // legal entry.
+        let _g = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u1", None, "user", "first prompt"),
-                message_entry("a1", Some("u1"), "assistant", "first reply"),
-            ])
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u1", None, "user", "first prompt"),
+                    message_entry("a1", Some("u1"), "assistant", "first reply"),
+                ],
+            )
             .await,
         );
         let app_state = compaction_app_state(s.clone());
@@ -8066,11 +8051,15 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     async fn generate_compaction_llm_root_target_refuses() {
         // Llm at the branch root has nothing before the target: the one
         // "nothing before" guard refuses before any agent work.
+        let _g = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u1", None, "user", "first prompt"),
-                message_entry("a1", Some("u1"), "assistant", "first reply"),
-            ])
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u1", None, "user", "first prompt"),
+                    message_entry("a1", Some("u1"), "assistant", "first reply"),
+                ],
+            )
             .await,
         );
         let app_state = compaction_app_state(s.clone());
@@ -8098,15 +8087,18 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     /// Switching to `u1` abandons `a1` + `a2` (a spur); `a3` is *ahead* of the
     /// leaf, so switching to it abandons nothing. The builder parks the leaf on
     /// the last entry, so it is moved to `a2` explicitly.
-    async fn branch_summarize_session() -> std::sync::Arc<Session> {
+    async fn branch_summarize_session(dir: &std::path::Path) -> std::sync::Arc<Session> {
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u1", None, "user", "first prompt"),
-                message_entry("a1", Some("u1"), "assistant", "first reply"),
-                message_entry("u2", Some("u1"), "user", "sibling path"),
-                message_entry("a2", Some("a1"), "assistant", "abandoned work"),
-                message_entry("a3", Some("a2"), "assistant", "the next turn"),
-            ])
+            build_writable_session_with(
+                dir,
+                vec![
+                    message_entry("u1", None, "user", "first prompt"),
+                    message_entry("a1", Some("u1"), "assistant", "first reply"),
+                    message_entry("u2", Some("u1"), "user", "sibling path"),
+                    message_entry("a2", Some("a1"), "assistant", "abandoned work"),
+                    message_entry("a3", Some("a2"), "assistant", "the next turn"),
+                ],
+            )
             .await,
         );
         s.move_leaf(Some("a2".to_string())).await.expect("leaf");
@@ -8119,7 +8111,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     #[tokio::test]
     async fn abandoned_spur_is_what_the_switch_leaves_behind() {
-        let s = branch_summarize_session().await;
+        let _g = tempfile::tempdir().unwrap();
+        let s = branch_summarize_session(_g.path()).await;
         let index = s.index().lock().await;
         // Switching to a sibling: everything after the common ancestor (u1).
         assert_eq!(
@@ -8159,7 +8152,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                 "x",
             ));
         }
-        let s = std::sync::Arc::new(build_writable_session_with(entries).await);
+        let _g = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(build_writable_session_with(_g.path(), entries).await);
         let index = s.index().lock().await;
         let spur = abandoned_spur(&index, &format!("e{}", n - 1), "e0");
         assert_eq!(spur.len(), n - 1, "the whole tail past e0");
@@ -8167,7 +8161,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     #[tokio::test]
     async fn generate_branch_summary_text_only_and_apply_moves_the_leaf() {
-        let s = branch_summarize_session().await;
+        let _g = tempfile::tempdir().unwrap();
+        let s = branch_summarize_session(_g.path()).await;
         let app_state = compaction_app_state(s.clone());
         let draft = generate_branch_summary(&app_state, "u1", CompactSummaryMode::TextOnly, "")
             .await
@@ -8211,7 +8206,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     #[tokio::test]
     async fn branch_summary_reaches_the_context_of_the_branch_it_was_written_on() {
-        let s = branch_summarize_session().await;
+        let _g = tempfile::tempdir().unwrap();
+        let s = branch_summarize_session(_g.path()).await;
         let app_state = compaction_app_state(s.clone());
         let draft = generate_branch_summary(&app_state, "u1", CompactSummaryMode::TextOnly, "")
             .await
@@ -8247,7 +8243,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     #[tokio::test]
     async fn generate_branch_summary_refuses_without_a_spur_or_a_move() {
-        let s = branch_summarize_session().await;
+        let _g = tempfile::tempdir().unwrap();
+        let s = branch_summarize_session(_g.path()).await;
         let app_state = compaction_app_state(s.clone());
         for (target, needle) in [
             ("a2", "Already at this entry"), // the leaf itself
@@ -8268,7 +8265,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     #[tokio::test]
     async fn apply_branch_summary_refuses_a_moved_leaf_and_an_empty_summary() {
-        let s = branch_summarize_session().await;
+        let _g = tempfile::tempdir().unwrap();
+        let s = branch_summarize_session(_g.path()).await;
         let app_state = compaction_app_state(s.clone());
         let draft = CompactionDraft {
             summary: "digest".into(),
@@ -8305,12 +8303,16 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                  "arguments": {"path": "notes.md", "content": "hi"}},
             ]);
         }
+        let _g = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u1", None, "user", "first prompt"),
-                assistant,
-                message_entry("a2", Some("a1"), "assistant", "abandoned work"),
-            ])
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u1", None, "user", "first prompt"),
+                    assistant,
+                    message_entry("a2", Some("a1"), "assistant", "abandoned work"),
+                ],
+            )
             .await,
         );
         let app_state = compaction_app_state(s.clone());
@@ -8328,12 +8330,15 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     // ── `/tree <id> edit` (pi's user-message re-edit) ─────────────────────
 
     /// A session whose leaf is at `a1`: `u1` (user) ─ `a1` (assistant).
-    async fn reask_session() -> std::sync::Arc<Session> {
+    async fn reask_session(dir: &std::path::Path) -> std::sync::Arc<Session> {
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u1", None, "user", "the original prompt"),
-                message_entry("a1", Some("u1"), "assistant", "the reply"),
-            ])
+            build_writable_session_with(
+                dir,
+                vec![
+                    message_entry("u1", None, "user", "the original prompt"),
+                    message_entry("a1", Some("u1"), "assistant", "the reply"),
+                ],
+            )
             .await,
         );
         s.move_leaf(Some("a1".to_string())).await.expect("leaf");
@@ -8342,7 +8347,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     #[tokio::test]
     async fn reask_moves_to_the_parent_and_prefills_the_prompt() {
-        let s = reask_session().await;
+        let _g = tempfile::tempdir().unwrap();
+        let s = reask_session(_g.path()).await;
         let app_state = compaction_app_state(s.clone());
         assert!(is_reaskable_entry(&s, "u1").await, "a user prompt");
         assert!(
@@ -8368,7 +8374,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     #[tokio::test]
     async fn reask_refuses_a_non_prompt_entry_without_moving_the_leaf() {
-        let s = reask_session().await;
+        let _g = tempfile::tempdir().unwrap();
+        let s = reask_session(_g.path()).await;
         let app_state = compaction_app_state(s.clone());
         let err = reask_from_entry(&app_state, "a1")
             .await
@@ -8435,11 +8442,15 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     async fn generate_compaction_llm_without_agent_errors() {
         // A non-root target passes the guard; agent creation then fails
         // (provider `test` is unsupported) → structured error, no write.
+        let _g = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u1", None, "user", "first prompt"),
-                message_entry("a1", Some("u1"), "assistant", "first reply"),
-            ])
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u1", None, "user", "first prompt"),
+                    message_entry("a1", Some("u1"), "assistant", "first reply"),
+                ],
+            )
             .await,
         );
         let app_state = compaction_app_state(s.clone());
@@ -8454,11 +8465,15 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     async fn generate_apply_text_only_nonzero_dropped_span() {
         // target a1, dropped = [u1]: the summary carries the dropped
         // user prompt; apply stores it with firstKept=a1.
+        let _g = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u1", None, "user", "the question"),
-                message_entry("a1", Some("u1"), "assistant", "the answer"),
-            ])
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u1", None, "user", "the question"),
+                    message_entry("a1", Some("u1"), "assistant", "the answer"),
+                ],
+            )
             .await,
         );
         let app_state = compaction_app_state(s.clone());
@@ -8497,12 +8512,16 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // Branch [u0, a0, C1{firstKept:u0}] with leaf C1: manual generate
         // at u0 (no predecessor — root-level pivot) must restore the leaf
         // it pivoted before returning; apply then appends a fresh entry.
+        let _g = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u0", None, "user", "prompt one"),
-                message_entry("a0", Some("u0"), "assistant", "reply one"),
-                compaction_entry("c1", Some("a0"), "earlier summary", "u0", 50),
-            ])
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u0", None, "user", "prompt one"),
+                    message_entry("a0", Some("u0"), "assistant", "reply one"),
+                    compaction_entry("c1", Some("a0"), "earlier summary", "u0", 50),
+                ],
+            )
             .await,
         );
         assert_eq!(s.get_leaf_id().await.as_deref(), Some("c1"));
@@ -8543,14 +8562,18 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // [u0, a0, u1, a1, C1{firstKept:u0, "EARLY SECRET SUMMARY"}],
         // leaf C1; target u1 → dropped [u0, a0]: the new summary includes
         // the raw dropped text but never the earlier compaction's text.
+        let _g = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u0", None, "user", "first question"),
-                message_entry("a0", Some("u0"), "assistant", "first answer"),
-                message_entry("u1", Some("a0"), "user", "second question"),
-                message_entry("a1", Some("u1"), "assistant", "second answer"),
-                compaction_entry("c1", Some("a1"), "EARLY SECRET SUMMARY", "u0", 80),
-            ])
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u0", None, "user", "first question"),
+                    message_entry("a0", Some("u0"), "assistant", "first answer"),
+                    message_entry("u1", Some("a0"), "user", "second question"),
+                    message_entry("a1", Some("u1"), "assistant", "second answer"),
+                    compaction_entry("c1", Some("a1"), "EARLY SECRET SUMMARY", "u0", 80),
+                ],
+            )
             .await,
         );
         assert_eq!(s.get_leaf_id().await.as_deref(), Some("c1"));
@@ -8601,11 +8624,15 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // The UI review step hands an edited draft to apply: generate →
         // (the node's $EDITOR swaps the text) → apply stores the EDITED
         // summary, not the generated one.
+        let _g = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u1", None, "user", "the question"),
-                message_entry("a1", Some("u1"), "assistant", "the answer"),
-            ])
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u1", None, "user", "the question"),
+                    message_entry("a1", Some("u1"), "assistant", "the answer"),
+                ],
+            )
             .await,
         );
         let app_state = compaction_app_state(s.clone());
@@ -8646,11 +8673,15 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // submit) = simply not applying: generate leaves the session
         // byte-identical — leaf unchanged, no compaction entry, branch
         // length untouched.
+        let _g = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u1", None, "user", "the question"),
-                message_entry("a1", Some("u1"), "assistant", "the answer"),
-            ])
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u1", None, "user", "the question"),
+                    message_entry("a1", Some("u1"), "assistant", "the answer"),
+                ],
+            )
             .await,
         );
         let app_state = compaction_app_state(s.clone());
@@ -8670,12 +8701,16 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // the guard): generation must return a structured error (no
         // agent can be built in tests) and never panic, even when the
         // leaf is already a compaction.
+        let _g = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(
-            build_writable_session_with(vec![
-                message_entry("u0", None, "user", "prompt one"),
-                message_entry("a0", Some("u0"), "assistant", "reply one"),
-                compaction_entry("c1", Some("a0"), "earlier summary", "u0", 50),
-            ])
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u0", None, "user", "prompt one"),
+                    message_entry("a0", Some("u0"), "assistant", "reply one"),
+                    compaction_entry("c1", Some("a0"), "earlier summary", "u0", 50),
+                ],
+            )
             .await,
         );
         assert_eq!(s.get_leaf_id().await.as_deref(), Some("c1"));
@@ -8723,7 +8758,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     /// the logger being wired but never called (no file created).
     #[tokio::test]
     async fn message_logger_writes_jsonl_file() {
-        let dir = std::env::temp_dir().join(format!("picocode-msglog-test-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let path = dir.join("messages.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
 
@@ -8807,8 +8843,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
         use super::LoggingHook;
 
-        let dir =
-            std::env::temp_dir().join(format!("picocode-msglog-stream-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let path = dir.join("messages.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
 
@@ -8884,8 +8920,10 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     #[test]
     fn create_private_dir_sets_0700() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("picocode_token_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().unwrap();
+        // A child that does not exist yet: `create_private_dir` creates it with
+        // mode 0700, so the directory must be absent before the call.
+        let dir = _tmp.path().join("private_0700");
         create_private_dir(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
@@ -9171,8 +9209,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
         // Host file we remap into the sandbox at a path absent on the host.
         let sentinel = "SANDBOX_REGRESSION_MARKER_12345";
-        let host_path =
-            std::env::temp_dir().join(format!("picocode_sandbox_regr_{}.txt", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let host_path = _tmp.path().join("picocode_sandbox_regr.txt");
         std::fs::write(&host_path, sentinel).unwrap();
         let probe = "/sandbox_probe_xyz".to_string();
 
@@ -10283,14 +10321,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         use rig_core::message::Message;
         use std::path::PathBuf;
 
-        let base: PathBuf = std::env::temp_dir().join(format!(
-            "picocode-new-fix-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let _tmp = tempfile::tempdir().unwrap();
+        let base: PathBuf = _tmp.path().to_path_buf();
         let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
         let cwd = std::path::Path::new("/home/test/regression");
 
@@ -10399,15 +10431,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         use std::path::PathBuf;
 
         for cmd in ["/new", "/clear"] {
-            let base: PathBuf = std::env::temp_dir().join(format!(
-                "picocode-new-name-{}-{}-{}",
-                cmd.replace('/', "_"),
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .subsec_nanos()
-            ));
+            let _tmp = tempfile::tempdir().unwrap();
+            let base: PathBuf = _tmp.path().to_path_buf();
             let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
             let cwd = std::path::Path::new("/home/test/regression");
 

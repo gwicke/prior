@@ -2705,6 +2705,12 @@ mod edit_file_tests {
     #[tokio::test]
     #[serial]
     async fn sed_preview_reports_a_rejected_expression_without_failing() {
+        // Taken before the `TMPDIR` redirect below, so the canary lives in the
+        // real temp dir and outside the cwd. It is a tempdir rather than a
+        // fixed `/tmp` path so the assertion cannot trip over a concurrent
+        // checkout, and so a regression that did write leaves nothing behind.
+        let canary = tempfile::tempdir().unwrap();
+        let canary_path = canary.path().join("pwned");
         let _tmpdir = tmpdir_inside_repo();
         // A refused expression is the model's to fix, so it comes back as a
         // normal result (exit 2), not as a tool error.
@@ -2714,11 +2720,12 @@ mod edit_file_tests {
             eprintln!("skipping: no workspace bsed; run `cargo build` first");
             return;
         };
-        let out = sed_preview("a.txt".into(), "1w /tmp/pwned".into(), ContextLines(0))
+        let script = format!("1w {}", canary_path.display());
+        let out = sed_preview("a.txt".into(), script, ContextLines(0))
             .await
             .expect("preview returns the message");
         assert!(out.contains("never writes"), "{out}");
-        assert!(!std::path::Path::new("/tmp/pwned").exists());
+        assert!(!canary_path.exists(), "bsed wrote {canary_path:?}");
     }
 
     #[tokio::test]

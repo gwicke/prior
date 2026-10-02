@@ -992,7 +992,7 @@ mod tests {
     #[test]
     fn model_submit_records_model_change_inline() {
         let app_state = test_app_state();
-        let session = crate::agent::test_session_with_entries(vec![]);
+        let (_guard, session) = crate::agent::test_session_with_entries(vec![]);
         app_state.set_session(Some(session.clone()));
         let mut node = test_model_node(&app_state);
         let path_args = PathArgs {

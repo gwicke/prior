@@ -1542,8 +1542,8 @@ mod tests {
     /// above this line would have caught the bug.
     #[test]
     fn a_real_settings_file_survives_the_whole_startup_chain() {
-        let dir = std::env::temp_dir().join("picocode-startup-test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let path = dir.join("settings.toml");
         std::fs::write(
             &path,

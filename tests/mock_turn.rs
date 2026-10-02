@@ -7,12 +7,15 @@
 //! exact number of empty lines between the last message of a turn and the
 //! horizontal separator — including the error path (429 on the second request).
 
+mod common;
+
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use common::Dumps;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use vt100::Parser;
 
@@ -242,8 +245,8 @@ fn wait_for(bytes: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) -> boo
 /// Run one full turn against the mock and print the vt100 screen.
 /// Returns the raw byte stream for analysis. When `thinking` is set, the agent
 /// runs with `default_reasoning_level = "high"` (answer-hold / reasoning path).
-fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
-    run_turn_typing(scenario, label, thinking, "run the command", ROWS)
+fn run_turn(dumps: &Dumps, scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
+    run_turn_typing(dumps, scenario, label, thinking, "run the command", ROWS)
 }
 
 /// As [`run_turn`], but the `DSR` reply puts the input row at `dsr_row` instead
@@ -256,8 +259,8 @@ fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
 /// the steady state — a turn long enough to fill the screen — the two converge
 /// and every screen looks identical, which is why `end_to_end_input_mode_layout`
 /// could not arbitrate the placement arithmetic.
-fn run_turn_at(scenario: u32, label: &str, dsr_row: u16) -> Vec<u8> {
-    run_turn_typing(scenario, label, false, "run the command", dsr_row)
+fn run_turn_at(dumps: &Dumps, scenario: u32, label: &str, dsr_row: u16) -> Vec<u8> {
+    run_turn_typing(dumps, scenario, label, false, "run the command", dsr_row)
 }
 
 /// As [`run_turn`], but types `typed` instead of a prompt.
@@ -277,6 +280,7 @@ fn run_turn_at(scenario: u32, label: &str, dsr_row: u16) -> Vec<u8> {
 /// pinned by a unit test in `repl.rs` instead, at the level the contract lives
 /// at.
 fn run_turn_typing(
+    dumps: &Dumps,
     scenario: u32,
     label: &str,
     thinking: bool,
@@ -357,7 +361,7 @@ fn run_turn_typing(
     thread::sleep(Duration::from_millis(1200));
 
     let data = bytes.lock().unwrap().clone();
-    std::fs::write(format!("/tmp/mock_turn_{label}.bin"), &data).unwrap();
+    dumps.write(&format!("{label}.bin"), &data);
     let tail: String =
         String::from_utf8_lossy(&data[data.len().saturating_sub(3000)..]).to_string();
     eprintln!("[{label}] raw tail = {:?}", tail);
@@ -533,7 +537,8 @@ fn cups(s: &str) -> Vec<String> {
 /// read off the screen.
 #[test]
 fn the_status_line_keeps_one_blank_row_above_it() {
-    let bytes = run_turn(4, "fenced-code", false);
+    let dumps = Dumps::new("status-line");
+    let bytes = run_turn(&dumps, 4, "fenced-code", false);
     // The offsets index the **raw transcript**, so the search is a byte search:
     // `\r\n` collapsing shifts every position after the first line, and
     // `from_utf8_lossy` shifts them again wherever a byte is not valid UTF-8.
@@ -656,6 +661,7 @@ fn the_status_line_keeps_one_blank_row_above_it() {
 /// while that decision is open.
 #[test]
 fn the_area_follows_the_content_rather_than_the_screen_bottom() {
+    let dumps = Dumps::new("area-follows-content");
     // Mid-screen, with `ROWS / 2` rows left beneath the area — more than the
     // turn below will ever push it down.
     let dsr = ROWS / 2;
@@ -666,7 +672,7 @@ fn the_area_follows_the_content_rather_than_the_screen_bottom() {
     // difference in where the area lands is the design, not the data — and if
     // this control ever stopped landing at the bottom, the `dsr` parameter would
     // have gone dead and every assertion below would be vacuous.
-    let pinned = screen_rows(&run_turn_at(0, "control-bottom", ROWS));
+    let pinned = screen_rows(&run_turn_at(&dumps, 0, "control-bottom", ROWS));
     let pinned_bar = pinned
         .iter()
         .position(|r| is_status_row(r))
@@ -678,7 +684,7 @@ fn the_area_follows_the_content_rather_than_the_screen_bottom() {
          there, filling the screen; bar={pinned_bar} Screen:\n{pinned:?}"
     );
 
-    let data = run_turn_at(0, "mid-screen-area", dsr);
+    let data = run_turn_at(&dumps, 0, "mid-screen-area", dsr);
     let rows = screen_rows(&data);
 
     // The area is `[status bar, input]`, so the bar is its first row and the
@@ -723,8 +729,9 @@ fn the_area_follows_the_content_rather_than_the_screen_bottom() {
 
 #[test]
 fn end_to_end_input_mode_layout() {
+    let dumps = Dumps::new("input-mode-layout");
     // Scenario 0: text + tool + final text answer (the user's example).
-    let a = run_turn(0, "text-tool-finaltext", false);
+    let a = run_turn(&dumps, 0, "text-tool-finaltext", false);
     let blanks = blanks_before_status(&a);
     assert_eq!(
         blanks, 1,
@@ -732,7 +739,7 @@ fn end_to_end_input_mode_layout() {
     );
 
     // Scenario 2: single text-only turn.
-    let b = run_turn(2, "text-only", false);
+    let b = run_turn(&dumps, 2, "text-only", false);
     let blanks = blanks_before_status(&b);
     assert_eq!(
         blanks, 1,
@@ -740,7 +747,7 @@ fn end_to_end_input_mode_layout() {
     );
 
     // Scenario 1: turn ends right after the tool result.
-    let c = run_turn(1, "tool-result-end", false);
+    let c = run_turn(&dumps, 1, "tool-result-end", false);
     let blanks = blanks_before_status(&c);
     assert_eq!(
         blanks, 1,
@@ -748,7 +755,7 @@ fn end_to_end_input_mode_layout() {
     );
 
     // Scenario 0 + thinking on: answer-hold path (reasoning model).
-    let h = run_turn(0, "held-answer", true);
+    let h = run_turn(&dumps, 0, "held-answer", true);
     let blanks = blanks_before_status(&h);
     assert_eq!(
         blanks, 1,
@@ -756,7 +763,7 @@ fn end_to_end_input_mode_layout() {
     );
 
     // Scenario 3: second request 429 -> display_text("Error: ...").
-    let d = run_turn(3, "error-429", false);
+    let d = run_turn(&dumps, 3, "error-429", false);
     let above = blanks_above_error(&d);
     assert_eq!(
         above, 1,
@@ -783,7 +790,8 @@ fn end_to_end_input_mode_layout() {
 /// green state had nowhere to be seen, because the bar only existed mid-turn.
 #[test]
 fn the_status_bar_is_permanent_and_the_dot_says_which_state() {
-    let bytes = run_turn(2, "text-only", false);
+    let dumps = Dumps::new("status-bar-permanent");
+    let bytes = run_turn(&dumps, 2, "text-only", false);
     let text = String::from_utf8_lossy(&bytes);
     let grey = "\x1b[48;5;237m \x1b[38;5;245m●";
     let green = "\x1b[48;5;237m \x1b[38;5;41m●";
@@ -815,7 +823,8 @@ fn the_status_bar_is_permanent_and_the_dot_says_which_state() {
 /// the bar was, with no bar left stranded above it.
 #[test]
 fn the_idle_bar_is_frame_owned_so_submit_leaves_nothing_behind() {
-    let bytes = run_turn(2, "text-only", false);
+    let dumps = Dumps::new("idle-bar-frame-owned");
+    let bytes = run_turn(&dumps, 2, "text-only", false);
     let rows = screen_rows(&bytes);
     let bar = rows
         .iter()

@@ -161,7 +161,7 @@ mod tests {
     fn replay_with_suffix_renders_history() {
         let (out, lines) = crate::output::RecordingOutput::new();
         let app_state = test_app_state_with(out);
-        let session = crate::agent::test_session_with_entries(vec![replay_entry()]);
+        let (_guard, session) = crate::agent::test_session_with_entries(vec![replay_entry()]);
         app_state.set_session(Some(session));
         let mut menu = build_replay_menu(&app_state);
         let mut handle = menu.get_handle();

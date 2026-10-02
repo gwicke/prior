@@ -4873,8 +4873,8 @@ mod tests {
         // raw source, preserving any leading indentation. Each line is then
         // routed through `wrap_with_diff_markers` (via `tool_panel`), which
         // must not collapse that indentation when reflowing.
-        let dir = std::env::temp_dir().join("picocode_edit_indent_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let path = dir.join("sample.rs");
         // Use a unique content so a leftover file from a previous run
         // can't change the diff shape. Clean up before and after.

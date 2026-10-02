@@ -31,12 +31,15 @@
 //! asserted at the end of `settings_string_hierarchy_saves_and_errors`, and the
 //! apply/validate behaviour itself is covered by the `v25_set` unit tests.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use common::Dumps;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use vt100::Parser;
 
@@ -90,6 +93,7 @@ fn wait_for(bytes: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) -> boo
 
 #[test]
 fn popup_scroll_does_not_duplicate_input() {
+    let dumps = Dumps::new("popup-scroll");
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -185,7 +189,7 @@ fn popup_scroll_does_not_duplicate_input() {
     stop.store(true, Ordering::SeqCst);
 
     let data = bytes.lock().unwrap().clone();
-    std::fs::write("/tmp/picocode_raw.txt", &data).unwrap();
+    dumps.write("raw.txt", &data);
     let tail = &data[data.len().saturating_sub(400)..];
     eprintln!(
         "[test] raw tail: {}",
@@ -277,6 +281,7 @@ fn popup_scroll_does_not_duplicate_input() {
 /// asserts a newline was inserted (the input becomes two rows).
 #[test]
 fn shift_enter_inserts_newline_without_kitty() {
+    let dumps = Dumps::new("shift-enter");
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -329,7 +334,7 @@ fn shift_enter_inserts_newline_without_kitty() {
     stop.store(true, Ordering::SeqCst);
 
     let data = bytes.lock().unwrap().clone();
-    std::fs::write("/tmp/picocode_shiftenter.txt", &data).unwrap();
+    dumps.write("shiftenter.txt", &data);
     let mut parser = Parser::new(ROWS, COLS, 1000);
     parser.process(&data);
     let visible: Vec<String> = parser
@@ -364,6 +369,7 @@ fn shift_enter_inserts_newline_without_kitty() {
 /// lines, submit, and read the screen.
 #[test]
 fn committed_multiline_prompt_clears_the_bar_row() {
+    let dumps = Dumps::new("commit-clear");
     const ROWS: u16 = 16;
     const COLS: u16 = 60;
     let pty_system = native_pty_system();
@@ -426,7 +432,7 @@ fn committed_multiline_prompt_clears_the_bar_row() {
     stop.store(true, Ordering::SeqCst);
 
     let data = bytes.lock().unwrap().clone();
-    std::fs::write("/tmp/picocode_commit_clear.txt", &data).unwrap();
+    dumps.write("commit_clear.txt", &data);
     let mut parser = Parser::new(ROWS, COLS, 1000);
     parser.process(&data);
     let visible: Vec<String> = parser
@@ -472,6 +478,7 @@ fn committed_multiline_prompt_clears_the_bar_row() {
 /// is entered — and cleared — by a byte.
 #[test]
 fn sharing_commit_with_a_wrapped_line_still_clears_the_bar_row() {
+    let dumps = Dumps::new("commit-share");
     const ROWS: u16 = 16;
     const COLS: u16 = 60;
     let pty_system = native_pty_system();
@@ -550,7 +557,7 @@ fn sharing_commit_with_a_wrapped_line_still_clears_the_bar_row() {
     stop.store(true, Ordering::SeqCst);
 
     let data = bytes.lock().unwrap().clone();
-    std::fs::write("/tmp/picocode_commit_share.txt", &data).unwrap();
+    dumps.write("commit_share.txt", &data);
     let mut parser = Parser::new(ROWS, COLS, 1000);
     parser.process(&data);
     let visible: Vec<String> = parser

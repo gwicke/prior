@@ -840,11 +840,16 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         let base = std::env::temp_dir().join(format!("v25-session-test-{nanos}"));
-        let cwd = std::path::Path::new("/tmp/v25-cwd");
-        let dir = base.join(encode_cwd(cwd));
+        // A synthetic cwd: nothing creates it, and only `encode_cwd` and the
+        // session header ever see it. Named per-run so that if anything did
+        // resolve or create it, two checkouts sharing a `/tmp` still could not
+        // collide — a fixed name would be one that *looks* safe and is not.
+        let cwd =
+            std::path::Path::new("/tmp").join(format!("v25-cwd-{}-{nanos}", std::process::id()));
+        let dir = base.join(encode_cwd(&cwd));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let header = SessionHeader::new(cwd);
+        let header = SessionHeader::new(&cwd);
         let uuid = header.id.clone();
         let path = dir.join(session_filename(&chrono::Utc::now()));
         let user_entry = serde_json::json!({
@@ -1071,7 +1076,7 @@ mod tests {
     #[test]
     fn session_rename_submit_renames_active_session() {
         let app_state = test_app_state();
-        let session = crate::agent::test_session_with_entries(vec![]);
+        let (_guard, session) = crate::agent::test_session_with_entries(vec![]);
         let sid = session.get_session_id().to_string();
         app_state.set_session(Some(session.clone()));
         let mut node = SessionRenameNode {

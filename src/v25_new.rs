@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn new_submit_creates_fresh_session() {
         let app_state = test_app_state();
-        let (repo, outgoing, base) = crate::agent::test_repo_with_session();
+        let (_guard, repo, outgoing, base) = crate::agent::test_repo_with_session();
         app_state.set_repo(Some(repo));
         let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn new_with_name_names_session() {
         let app_state = test_app_state();
-        let (repo, _outgoing, base) = crate::agent::test_repo_with_session();
+        let (_guard, repo, _outgoing, base) = crate::agent::test_repo_with_session();
         app_state.set_repo(Some(repo));
         let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();

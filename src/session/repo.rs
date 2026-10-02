@@ -1306,28 +1306,19 @@ mod tests {
     }
 
     /// Create a temporary repo for testing.
-    async fn create_test_repo() -> (JsonlSessionRepo, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-repo-test-{}-{}",
-            std::process::id(),
-            rand_name(),
-        ));
+    async fn create_test_repo() -> (tempfile::TempDir, JsonlSessionRepo, PathBuf) {
+        // A `TempDir` (returned first so the caller keeps it alive past the
+        // repo, which addresses the directory by path). Removed on drop instead
+        // of leaking an empty directory.
+        let dir_guard = tempfile::tempdir().unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let repo = JsonlSessionRepo::new(dir.clone());
-        (repo, dir)
-    }
-
-    fn rand_name() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        format!("{:09x}", nanos)
+        (dir_guard, repo, dir)
     }
 
     #[tokio::test]
     async fn test_create_and_list() {
-        let (repo, base_dir) = create_test_repo().await;
+        let (_guard, repo, base_dir) = create_test_repo().await;
         let cwd = Path::new("/home/test/project");
 
         // Create a session and write header explicitly (repo.create no longer
@@ -1348,7 +1339,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_all_cwds() {
-        let (repo, base_dir) = create_test_repo().await;
+        let (_guard, repo, base_dir) = create_test_repo().await;
 
         // Create sessions in different CWDs
         let _ = create_persisted(&repo, Path::new("/home/test/a")).await;
@@ -1363,7 +1354,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_non_existent_cwd_returns_empty() {
-        let (repo, base_dir) = create_test_repo().await;
+        let (_guard, repo, base_dir) = create_test_repo().await;
         let sessions = repo.list(Some(Path::new("/nonexistent"))).await.unwrap();
         assert!(sessions.is_empty());
         let _ = tokio::fs::remove_dir_all(&base_dir).await;
@@ -1371,7 +1362,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_session() {
-        let (repo, base_dir) = create_test_repo().await;
+        let (_guard, repo, base_dir) = create_test_repo().await;
         let cwd = Path::new("/home/test");
 
         let storage = create_persisted(&repo, cwd).await;
@@ -1395,7 +1386,7 @@ mod tests {
     /// appeared to have done nothing.
     #[tokio::test]
     async fn test_delete_invalidates_sync_listing_cache() {
-        let (repo, base_dir) = create_test_repo().await;
+        let (_guard, repo, base_dir) = create_test_repo().await;
         let cwd = Path::new("/home/test");
 
         let _storage = create_persisted(&repo, cwd).await;
@@ -1417,7 +1408,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fork_session() {
-        let (repo, base_dir) = create_test_repo().await;
+        let (_guard, repo, base_dir) = create_test_repo().await;
         let cwd = Path::new("/home/test");
 
         // Create source session with a few entries.
@@ -1477,7 +1468,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fork_session_full_tree() {
-        let (repo, base_dir) = create_test_repo().await;
+        let (_guard, repo, base_dir) = create_test_repo().await;
         let cwd = Path::new("/home/test");
 
         // Create source session with a few entries + a branch.
@@ -1551,7 +1542,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fork_session_full_tree_with_fork_point() {
-        let (repo, base_dir) = create_test_repo().await;
+        let (_guard, repo, base_dir) = create_test_repo().await;
         let cwd = Path::new("/home/test");
 
         // Create source session with a few entries.
@@ -1606,7 +1597,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_metadata_includes_message_count() {
-        let (repo, base_dir) = create_test_repo().await;
+        let (_guard, repo, base_dir) = create_test_repo().await;
         let cwd = Path::new("/home/test");
 
         let storage = create_persisted(&repo, cwd).await;

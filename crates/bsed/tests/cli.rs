@@ -681,8 +681,20 @@ fn a_refused_expression_exits_two_and_writes_nothing() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path().to_path_buf();
     write(&root, "a.rs", "one\n");
-    for script in ["1w /tmp/bsed-should-not-exist", "1e touch /tmp/x", "1q"] {
-        let o = run_in(&root, None, &["-p", "a.rs", script]);
+    // The refused commands name paths inside their own tempdir, not fixed ones
+    // in `/tmp`. A fixed name is shared by every checkout on the machine, so the
+    // assertions below would trip over a neighbour's leftover — and a
+    // regression that *did* write would leave its evidence in `/tmp` for good.
+    // A tempdir is removed either way, and nothing here can collide.
+    let canary = tempfile::tempdir().unwrap();
+    let write_target = canary.path().join("bsed-should-not-exist");
+    let exec_target = canary.path().join("x");
+    for script in [
+        format!("1w {}", write_target.display()),
+        format!("1e touch {}", exec_target.display()),
+        "1q".to_string(),
+    ] {
+        let o = run_in(&root, None, &["-p", "a.rs", script.as_str()]);
         assert_eq!(code(&o), 2, "{script}");
         assert!(
             stderr(&o).contains("never writes")
@@ -692,7 +704,8 @@ fn a_refused_expression_exits_two_and_writes_nothing() {
             stderr(&o)
         );
     }
-    assert!(!Path::new("/tmp/bsed-should-not-exist").exists());
+    assert!(!write_target.exists(), "`w` wrote {write_target:?}");
+    assert!(!exec_target.exists(), "`e` ran {exec_target:?}");
 }
 
 /// The property that matters most: a recursive preview, applied, produces

@@ -2402,7 +2402,7 @@ mod tests {
     #[test]
     fn tree_switch_cursor_submit_moves_leaf() {
         let app_state = test_app_state();
-        let session = crate::agent::test_session_with_entries(vec![make_entry(
+        let (_guard, session) = crate::agent::test_session_with_entries(vec![make_entry(
             "some-entry",
             None,
             "user",
@@ -2445,7 +2445,7 @@ mod tests {
             )],
         )];
         let app_state = app_state_with_tree(tree);
-        let session = crate::agent::test_session_with_entries(vec![make_entry(
+        let (_guard, session) = crate::agent::test_session_with_entries(vec![make_entry(
             "u1",
             None,
             "user",
@@ -2539,7 +2539,7 @@ mod tests {
             ],
         )];
         let app_state = app_state_with_tree(tree);
-        let session = crate::agent::test_session_with_entries(vec![
+        let (_guard, session) = crate::agent::test_session_with_entries(vec![
             make_entry("u1", None, "user", "first message"),
             make_entry("a1", Some("u1"), "assistant", "response"),
             make_entry("u2", Some("u1"), "user", "other path"),
@@ -2938,7 +2938,7 @@ mod tests {
         // draft and arms the confirm (Prepared — nothing written yet);
         // submit() applies the stashed draft.
         let app_state = test_app_state();
-        let session =
+        let (_guard, session) =
             crate::agent::test_session_with_entries(vec![make_entry("u1", None, "user", "hi")]);
         app_state.set_session(Some(session.clone()));
         let mut node = TreeCompactManualNode::new(app_state.clone());
@@ -2973,7 +2973,7 @@ mod tests {
     #[test]
     fn compact_text_only_prepare_then_submit_appends_compaction() {
         let app_state = test_app_state();
-        let session =
+        let (_guard, session) =
             crate::agent::test_session_with_entries(vec![make_entry("u1", None, "user", "hi")]);
         app_state.set_session(Some(session.clone()));
         let mut node = TreeCompactTextNode::new(app_state.clone());
@@ -3004,7 +3004,7 @@ mod tests {
         // Validation lives in prepare(): the unknown target closes the
         // menu with the data-level message before any agent/LLM work.
         let app_state = test_app_state();
-        let session =
+        let (_guard, session) =
             crate::agent::test_session_with_entries(vec![make_entry("other", None, "user", "hi")]);
         app_state.set_session(Some(session));
         let mut node = TreeCompactPromptNode::new(app_state.clone());
@@ -3061,7 +3061,7 @@ mod tests {
         // submit() applies a *stashed* draft: with nothing prepared the
         // stash key misses and nothing is written.
         let app_state = test_app_state();
-        let session =
+        let (_guard, session) =
             crate::agent::test_session_with_entries(vec![make_entry("u1", None, "user", "hi")]);
         app_state.set_session(Some(session.clone()));
         let mut node = TreeCompactManualNode::new(app_state.clone());
@@ -3090,7 +3090,7 @@ mod tests {
         // cannot feed a submit at epoch 2 — the data moved under us, so
         // submit errors and lets the next Enter regenerate.
         let app_state = test_app_state();
-        let session =
+        let (_guard, session) =
             crate::agent::test_session_with_entries(vec![make_entry("u1", None, "user", "hi")]);
         app_state.set_session(Some(session.clone()));
         let mut node = TreeCompactManualNode::new(app_state.clone());
@@ -3128,7 +3128,7 @@ mod tests {
             )],
         )];
         let app_state = app_state_with_tree(tree);
-        let session = crate::agent::test_session_with_entries(vec![make_entry(
+        let (_guard, session) = crate::agent::test_session_with_entries(vec![make_entry(
             "u1",
             None,
             "user",

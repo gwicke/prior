@@ -442,7 +442,8 @@ mod tests {
     fn read_commands_are_allowed() {
         // `r` splices a file in; the sandbox already bounds what is readable.
         // Use a file we wrote, so the test does not depend on host contents.
-        let f = std::env::temp_dir().join("bsed-r-test.txt");
+        let _tmp = tempfile::tempdir().unwrap();
+        let f = _tmp.path().join("bsed-r-test.txt");
         std::fs::write(&f, "SPLICED LINE\n").unwrap();
         let TextPreview { blob, .. } =
             preview_text(FILE, "f.rs", &format!("1r {}", f.display()), opts()).unwrap();

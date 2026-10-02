@@ -527,20 +527,23 @@ mod tests {
     }
 
     /// Helper: create a JsonlSessionStorage backed by a temp file.
-    async fn create_temp_storage() -> (JsonlSessionStorage, PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("picocode-session-test-{}", std::process::id()));
+    async fn create_temp_storage() -> (tempfile::TempDir, JsonlSessionStorage, PathBuf) {
+        // A `TempDir` (returned first so the caller keeps it alive past the
+        // storage, which re-opens by path). Removed on drop instead of leaking
+        // an empty directory.
+        let dir_guard = tempfile::tempdir().unwrap();
+        let dir = dir_guard.path().to_path_buf();
         let filename = session_filename(&Utc::now());
         let path = dir.join(&filename);
         let storage = JsonlSessionStorage::open_or_create(path.clone())
             .await
             .unwrap();
-        (storage, path)
+        (dir_guard, storage, path)
     }
 
     #[tokio::test]
     async fn test_write_and_read_header() {
-        let (storage, path) = create_temp_storage().await;
+        let (_guard, storage, path) = create_temp_storage().await;
         let header = SessionHeader::new(Path::new("/home/test"));
         storage.write_header(&header).await.unwrap();
 
@@ -555,8 +558,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_index_empty_file_errors() {
-        let dir =
-            std::env::temp_dir().join(format!("picocode-session-test-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let path = dir.join("empty.jsonl");
         // Create empty file
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -573,7 +576,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_entries_and_build_index() {
-        let (storage, path) = create_temp_storage().await;
+        let (_guard, storage, path) = create_temp_storage().await;
 
         // Write header
         let header = SessionHeader::new(Path::new("/test"));
@@ -616,7 +619,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_leaf_tracking() {
-        let (storage, path) = create_temp_storage().await;
+        let (_guard, storage, path) = create_temp_storage().await;
 
         let header = SessionHeader::new(Path::new("/test"));
         storage.write_header(&header).await.unwrap();
@@ -653,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_name_tracking() {
-        let (storage, path) = create_temp_storage().await;
+        let (_guard, storage, path) = create_temp_storage().await;
 
         let header = SessionHeader::new(Path::new("/test"));
         storage.write_header(&header).await.unwrap();
@@ -677,8 +680,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_truncated_last_line_skipped() {
-        let dir =
-            std::env::temp_dir().join(format!("picocode-session-test-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&Utc::now());
         let path = dir.join(&filename);
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -716,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_path_to_root() {
-        let (storage, path) = create_temp_storage().await;
+        let (_guard, storage, path) = create_temp_storage().await;
 
         let header = SessionHeader::new(Path::new("/test"));
         storage.write_header(&header).await.unwrap();
@@ -782,7 +785,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_pi_format_jsonl() {
-        let dir = std::env::temp_dir().join(format!("picocode-pi-compat-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
         let path = dir.join("pi-format.jsonl");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(&path, PI_FORMAT_JSONL).await.unwrap();
@@ -868,7 +872,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_picocode_output_is_pi_compatible() {
-        let (storage, path) = create_temp_storage().await;
+        let (_guard, storage, path) = create_temp_storage().await;
 
         // Write header
         let header = SessionHeader::new(std::path::Path::new("/test"));

@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn clear_submit_switches_and_deletes_outgoing() {
         let app_state = test_app_state();
-        let (repo, outgoing, base) = crate::agent::test_repo_with_session();
+        let (_guard, repo, outgoing, base) = crate::agent::test_repo_with_session();
         app_state.set_repo(Some(repo));
         app_state.set_current_session_id(outgoing.clone());
         let mut menu = build_clear_menu(&app_state);
@@ -157,7 +157,8 @@ mod tests {
     #[test]
     fn clear_with_name_names_fresh_session() {
         let app_state = test_app_state();
-        let base = std::env::temp_dir().join(format!("v25-clear-name-test-{}", std::process::id()));
+        let _tmp = tempfile::tempdir().unwrap();
+        let base = _tmp.path().to_path_buf();
         let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
         app_state.set_repo(Some(repo));
         let mut menu = build_clear_menu(&app_state);
