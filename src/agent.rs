@@ -3234,6 +3234,16 @@ pub(crate) enum ReplayUnit {
         tokens_before: u64,
         summary: String,
     },
+    /// A branch-summary marker: the digest `/tree <id> switch summarize`
+    /// writes when it moves the cursor off a spur. Not a turn — the marker
+    /// renders in path order with `summary` as markdown below it, exactly
+    /// like a compaction. `from_id` is the branch-from position (pi's
+    /// `fromId`), surfaced in the marker so the id is copy-pasteable into
+    /// `/tree <id>`.
+    BranchSummary {
+        from_id: String,
+        summary: String,
+    },
 }
 
 /// Build replay units from the raw session branch (root->leaf).
@@ -3334,6 +3344,23 @@ fn build_replay_units(branch: &[crate::session::SessionEntry]) -> Vec<ReplayUnit
                 }
                 units.push(ReplayUnit::Compaction {
                     tokens_before: *tokens_before,
+                    summary: summary.clone(),
+                });
+            }
+            // Same placement rule as a compaction: the marker sits after the
+            // turn it follows, before the prompt that continues on this branch.
+            // A blank digest matches no arm — pi's context mapping skips an
+            // empty summary, a marker with no body would be a fiction, and
+            // `apply_branch_summary` refuses a blank draft anyway.
+            SessionEntryContent::BranchSummary { from_id, summary }
+                if !summary.trim().is_empty() =>
+            {
+                flush_pending_tools(&mut pending_tools, &mut open);
+                if let Some(t) = open.take() {
+                    units.push(ReplayUnit::Turn(t));
+                }
+                units.push(ReplayUnit::BranchSummary {
+                    from_id: from_id.clone(),
                     summary: summary.clone(),
                 });
             }
@@ -3484,6 +3511,13 @@ fn replay_units(output: &dyn Output, units: &[ReplayUnit], start: usize) {
                 if !summary.is_empty() {
                     output.display_markdown(summary);
                 }
+            }
+            ReplayUnit::BranchSummary { from_id, summary } => {
+                // The id is opaque but copy-pasteable: `/tree <id>` switches
+                // there. Same shape as a compaction marker — dim system line,
+                // then the digest as markdown.
+                output.display_system(&format!("[branch summary from {}]", from_id));
+                output.display_markdown(summary);
             }
         }
     }
@@ -9390,6 +9424,23 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         }
     }
 
+    fn pi_branch_summary_entry(
+        id: &str,
+        parent: Option<&str>,
+        from_id: &str,
+        summary: &str,
+    ) -> crate::session::SessionEntry {
+        crate::session::SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(|p| p.to_string()),
+            timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+            content: crate::session::SessionEntryContent::BranchSummary {
+                from_id: from_id.to_string(),
+                summary: summary.to_string(),
+            },
+        }
+    }
+
     fn pi_compaction_entry(
         id: &str,
         parent: Option<&str>,
@@ -9432,6 +9483,66 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         assert!(matches!(units[2], ReplayUnit::Turn(_)));
         // Both turns present → full history replays to the beginning.
         assert_eq!(count_turns(&units), 2);
+    }
+
+    #[test]
+    fn build_replay_units_marks_a_branch_summary_in_path_order() {
+        // A switch-summarize session: the abandoned turn, then the digest at
+        // the switch target, then the prompt that continues on that branch.
+        let branch = vec![
+            pi_user_entry("m0", None, "try the side quest"),
+            pi_assistant_entry("a0", Some("m0"), "working on it"),
+            pi_branch_summary_entry("s1", Some("a0"), "m0", "## Goal\nship the thing"),
+            pi_user_entry("m1", Some("s1"), "back to the main line"),
+        ];
+        let units = build_replay_units(&branch);
+        assert_eq!(units.len(), 3, "[Turn, BranchSummary, Turn]");
+        assert!(matches!(units[0], ReplayUnit::Turn(_)));
+        match &units[1] {
+            ReplayUnit::BranchSummary { from_id, summary } => {
+                assert_eq!(from_id, "m0", "fromId is the branch-from position");
+                assert_eq!(summary, "## Goal\nship the thing");
+            }
+            _ => panic!("expected a branch-summary marker"),
+        }
+        assert!(matches!(units[2], ReplayUnit::Turn(_)));
+        // A marker is not a turn: the Nt/Nl windows count turns only.
+        assert_eq!(count_turns(&units), 2);
+    }
+
+    #[test]
+    fn build_replay_units_skips_an_empty_branch_summary() {
+        // Nothing to say → no marker, matching pi's context mapping (which
+        // skips an empty summary) rather than showing an empty notice.
+        let branch = vec![
+            pi_user_entry("m0", None, "hello"),
+            pi_branch_summary_entry("s1", Some("m0"), "m0", "   "),
+            pi_user_entry("m1", Some("s1"), "again"),
+        ];
+        let units = build_replay_units(&branch);
+        assert_eq!(units.len(), 2, "an empty digest emits no marker");
+        assert!(units.iter().all(|u| matches!(u, ReplayUnit::Turn(_))));
+    }
+
+    #[test]
+    fn replay_units_renders_the_branch_summary_marker_and_digest() {
+        let branch = vec![
+            pi_user_entry("m0", None, "hello"),
+            pi_branch_summary_entry("s1", Some("m0"), "m0", "## Goal\nship it"),
+            pi_user_entry("m1", Some("s1"), "continue"),
+        ];
+        let units = build_replay_units(&branch);
+        let (out, lines) = crate::output::RecordingOutput::new();
+        replay_units(out.as_ref(), &units, 0);
+        let captured = crate::output::RecordingOutput::joined(&lines);
+        assert!(
+            captured.contains("[branch summary from m0]"),
+            "marker carries the copy-pasteable id: {captured}"
+        );
+        assert!(
+            captured.contains("ship it"),
+            "the digest renders below the marker: {captured}"
+        );
     }
 
     #[test]

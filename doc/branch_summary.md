@@ -143,7 +143,23 @@ own leaf node rather than as a mode of `switch`:
   (`interactive-mode.ts` guards on `!editor.getText().trim()`). Unconditional is
   this repo's register contract for handler writes (`Repl::apply_prefill`).
 
+## Replay
+
+`ReplayUnit::BranchSummary { from_id, summary }` — the digest renders in `/replay`
+and in the resume prefill (both go through `replay_units`) as a dim system line
+followed by the markdown body, exactly like a compaction marker:
+
+```
+[branch summary from u1]
+## Goal
+…
+```
+
+The id is opaque but copy-pasteable — `/tree <id>` switches right there. A
+blank digest emits no marker at all (pi's context mapping skips it too, and
+`apply_branch_summary` refuses to write one).
+
 ## Not done
 
-- `/replay` has no marker for a `BranchSummary` entry (only `Compaction` has
-  one), so a digest is invisible in replay — it shows as `[SUMMARY]` in `/tree`.
+- Nothing outstanding for the feature itself; see **Deliberate divergences**
+  above for the ones that are deliberate.
