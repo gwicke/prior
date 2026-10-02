@@ -312,6 +312,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         output,
         yolo,
         quiet,
+        // Installed by `run_interactive` before the agent is built, so every
+        // guarded tool gets the REPL's confirm port; one-shot `Recipe` /
+        // `Input` runs have no key pump and keep the synchronous policy.
+        confirm_port: None,
         tool_call_limit,
         // Filled from the resolved catalog once `AppState` exists; there is no
         // store to read here, and one-shot commands draw no status bar.

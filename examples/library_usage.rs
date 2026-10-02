@@ -11,7 +11,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider: "anthropic".into(),
         model: "claude-3-5-sonnet-latest".into(),
         output,
-        yolo: true, // Auto-confirm everything since there's no output
+        yolo: true,         // Auto-confirm everything since there's no output
+        confirm_port: None, // No REPL to ask, so nothing drives a confirm dialog
         context_limit: None,
         tool_call_limit: 5,
         quiet: false,

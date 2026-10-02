@@ -297,14 +297,6 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// A frame with no rows. Applying it with [`ApplyPolicy::Frame`] is the
-    /// "erase the live region" operation: the union clear erases every row
-    /// the previous frame painted and the caret parks on the region's first
-    /// row — ready for the next write (dialog dismissal, plan §5.3).
-    pub(crate) fn empty() -> Frame {
-        render(&[], &[], 1)
-    }
-
     pub(crate) fn height(&self) -> usize {
         self.extents.len()
     }

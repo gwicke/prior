@@ -1,169 +1,31 @@
-//! Confirmation dialog driver using the v2.5 RenderPlan renderer.
+//! The overlay elements a menu — or a confirmation — is built from, and the
+//! frame pipeline they render through.
 //!
-//! This module provides a shared driver for standalone confirmation
-//! dialogs (tool confirm, compaction review). It builds a RenderPlan from a
-//! simple spec and draws it through the unified frame pipeline
-//! (`doc/ui_draw_v2.md` §5.3): compose `[Divider?, Overlay]` → allocate →
-//! render → `Output::draw_frame`, key input via crossterm's blocking
-//! `event::read()` (compatible with the sync `Output::confirm` trait
-//! method). The dialog has no input segment; on resolve its region is
-//! erased through the same pipeline and the decision (if the spec asks for
-//! one) is written where the dialog was.
+//! This module used to hold a standalone confirmation *driver* as well: a
+//! blocking `event::read()` loop with its own entry DSR, its own reader gate
+//! and its own `Frame::empty()` erase. All of that was overhead rather than
+//! drawing, and it existed only because a gated tool call runs inline inside
+//! the turn's `select!` and could not let the loop run. It no longer blocks, so
+//! the dialog is session state owned by the REPL and composed by the very same
+//! [`overlay_elements`] the slash menu uses
+//! ([`doc/confirm_as_menu_261002.md`](../../doc/confirm_as_menu_261002.md)).
 
 pub mod frame;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-
-use crate::output::{Confirmation, Output};
-use crate::slashdot_menu::node_impl::StaticRow;
 use crate::slashdot_menu::render::{
     paint_detail, paint_header, paint_rows, visual_height, window_heights, LogicalLine,
     PaintedSection, RenderPlan,
 };
-use crate::ui::frame::{pad_row, ApplyPolicy, Element, Frame, RenderAt, Rendered};
+use crate::ui::frame::{pad_row, Element, RenderAt, Rendered};
+// The apply vocabulary is the tests' — they drive the pipeline directly rather
+// than through `Output::draw_elements`, which is the only production caller.
+#[cfg(test)]
+use crate::ui::frame::ApplyPolicy;
 // Only the element tests drive the pipeline themselves; naming these
 // unconditionally would trip `unused_imports` on a normal build.
 #[cfg(test)]
 use crate::ui::frame::{allocate, live_budget, render, Extent};
 use std::sync::Arc;
-
-/// Specification for a confirmation dialog.
-pub struct ConfirmSpec<'a> {
-    /// Header text shown above the options (can be multi-line).
-    pub header: &'a str,
-    /// Options as StaticRow (id + description).
-    pub options: &'a [StaticRow],
-    /// Optional quick-key overrides: `(char, option_index)`.
-    /// If None, derives from first letter of each id.
-    pub quick_keys: Option<&'a [(char, usize)]>,
-    /// Initial cursor position (default selection).
-    pub default_sel: usize,
-
-    /// Subject of the decision line recorded on resolve
-    /// (`accepted <subject>` / `denied <subject>`), or `None` to record
-    /// nothing: the compaction review records nothing because the committed
-    /// `/tree … compact` prompt is already self-documenting (plan §5.3).
-    pub subject: Option<String>,
-}
-
-/// Result of a confirmation dialog.
-pub enum ConfirmResult {
-    /// User selected an option (index into spec.options).
-    Selected(usize),
-    /// User dismissed with Esc.
-    Dismissed,
-}
-
-/// Run a confirmation dialog (synchronous, blocking).
-///
-/// Returns `ConfirmResult::Selected(idx)` on Enter/quick-key, or
-/// `ConfirmResult::Dismissed` on Esc.
-///
-/// For non-interactive outputs (where `confirm_gate()` is `None`), returns
-/// `Selected(out.confirm_default(header))` immediately without rendering.
-pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
-    // Non-interactive: delegate to trait's sync policy.
-    if out.confirm_gate().is_none() {
-        let c = out.confirm_default(spec.header);
-        let idx = spec
-            .options
-            .iter()
-            .position(|o| match c {
-                Confirmation::Yes => o.id == "yes",
-                Confirmation::No => o.id == "no",
-                Confirmation::Always => o.id == "always",
-            })
-            .unwrap_or(0);
-        return ConfirmResult::Selected(idx);
-    }
-
-    // Pause the background reader; `resolve()` releases it on every exit
-    // from the key loop (plan §9 latent issue 1: a gate left raised freezes
-    // every later in-flight reader).
-    if let Some(gate) = out.confirm_gate() {
-        gate.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    // Re-anchor (DSR) so the dialog starts at the real cursor row — right below
-    // the output above it — and scrolls itself into the live region if it does
-    // not fit (plan §4.2/§5.3).
-    //
-    // The comment here used to say "mid-turn the draw cache's caret does not
-    // follow streamed content row by row". That stopped being true when the
-    // streaming path started counting from the bytes it emits; the streamed
-    // answer and streamed thinking are both checked against a vt100 replay. The
-    // DSR is kept as the cheap confirmation on a path where a wrong anchor
-    // strands the dialog over the output — the confirm tests assert *behaviour*
-    // (which option was chosen) and not the dialog's row, so a regression here
-    // would not be caught by them.
-    let _ = out.cursor_row();
-
-    let plan = build_confirm_plan(spec);
-    // Initial size from the output's shared source (ui_draw_v2 §9 #3); every
-    // apply below gets this same pair (Resize replaces it and re-composes).
-    let mut size = out.frame_size();
-
-    // Initial render.
-    let mut sel: usize = spec.default_sel;
-    draw_dialog(out, &plan, sel, size);
-
-    loop {
-        match event::read() {
-            Ok(Event::Key(KeyEvent {
-                code: KeyCode::Up,
-                modifiers: KeyModifiers::NONE,
-                ..
-            })) => {
-                if sel > 0 {
-                    sel -= 1;
-                    draw_dialog(out, &plan, sel, size);
-                }
-            }
-            Ok(Event::Key(KeyEvent {
-                code: KeyCode::Down,
-                modifiers: KeyModifiers::NONE,
-                ..
-            })) => {
-                if sel + 1 < spec.options.len() {
-                    sel += 1;
-                    draw_dialog(out, &plan, sel, size);
-                }
-            }
-            Ok(Event::Key(KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers: KeyModifiers::NONE,
-                ..
-            })) => {
-                if let Some(idx) = quick_key_index(spec, c) {
-                    if idx < spec.options.len() {
-                        return resolve(out, spec, size, ConfirmResult::Selected(idx));
-                    }
-                }
-            }
-            Ok(Event::Key(KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
-            })) => {
-                return resolve(out, spec, size, ConfirmResult::Selected(sel));
-            }
-            Ok(Event::Key(KeyEvent {
-                code: KeyCode::Esc,
-                modifiers: KeyModifiers::NONE,
-                ..
-            })) => {
-                return resolve(out, spec, size, ConfirmResult::Dismissed);
-            }
-            Ok(Event::Resize(w, h)) => {
-                // Re-compose for the new size; the cached size mismatch
-                // forces a full repaint (no DSR: the dialog keeps its place).
-                size = (w.max(1) as usize, h.max(1) as usize);
-                draw_dialog(out, &plan, sel, size);
-            }
-            _ => {}
-        }
-    }
-}
 
 // --- the overlay element ----------------------------------------------------
 //
@@ -218,7 +80,30 @@ impl Element {
     /// actually on screen instead of all 1000 (measured 2.5ms → 19µs). The rows
     /// are already `Arc`-cached by the engine, so this shares the pointer and
     /// repaints nothing a cursor move did not change.
+    /// The menu's row element: show something when there is anything to show.
+    ///
+    /// `#[cfg(test)]` because production reaches the rows through
+    /// [`overlay_elements_with`], which chooses the floor per host. The window
+    /// tests here want the bare element, not a composed overlay.
+    #[cfg(test)]
     fn data_rows(rows: Arc<Vec<LogicalLine>>, selected: Option<usize>, active: Vec<usize>) -> Self {
+        Self::rows_pinned_to(rows, selected, active, 1)
+    }
+
+    /// Rows that must survive a starved budget, with `min` as the floor.
+    ///
+    /// A menu asks for `1`; a confirmation asks for its option count, because
+    /// a dialog whose options have been squeezed away is not a consent prompt.
+    /// `allocate` serves every `must` before any `might`
+    /// (`ui/frame.rs:219`), so this floor holds under pressure — with the
+    /// caveat that below the summed `must`s `fill` degrades to one row each in
+    /// element order, and this element is last.
+    fn rows_pinned_to(
+        rows: Arc<Vec<LogicalLine>>,
+        selected: Option<usize>,
+        active: Vec<usize>,
+        min: usize,
+    ) -> Self {
         // `might` is the height *if every row were shown*, measured the way the
         // engine wrote them ([`visual_height`]: embedded `\n` only). Painting
         // can make a row taller — one too wide for the terminal is split — so
@@ -226,7 +111,7 @@ impl Element {
         // direction: the allocator is never promised more rows than the element
         // can actually produce. `render_at` re-measures and fits `h` anyway.
         let might: usize = rows.iter().map(visual_height).sum();
-        let must = usize::from(might > 0);
+        let must = min.min(might);
         Element::new(
             must,
             might,
@@ -352,19 +237,34 @@ impl RenderAt for RowsItem {
 /// The frame elements a menu overlay composes into, in paint order: the node's
 /// detail, the table header, the scrollable rows.
 ///
-/// One builder for both hosts (`repl.rs`'s slash menu and this module's
-/// dialogs) so the two cannot drift on which sections exist, in what order, or
-/// with what paint. Empty sections are dropped rather than contributed as
-/// zero-height elements: a plan with no columns has no header, and an empty
-/// element would still ask the allocator for a divider.
+/// One builder for both hosts (`repl.rs`'s slash menu and the confirmation
+/// dialog in `confirm.rs`) so the two cannot drift on which sections exist, in
+/// what order, or with what paint. Empty sections are dropped rather than
+/// contributed as zero-height elements: a plan with no columns has no header,
+/// and an empty element would still ask the allocator for a divider.
 ///
 /// `selected` is passed separately from `plan.selected` so a dialog with its
-/// own cursor (`draw_dialog`'s `sel`) does not have to clone the plan to move
-/// it — cheap now that `rows` is an `Arc`, but clearer not to.
+/// own cursor does not have to clone the plan to move it — cheap now that
+/// `rows` is an `Arc`, but clearer not to.
 pub(crate) fn overlay_elements(
     plan: &RenderPlan,
     term_w: usize,
     selected: Option<usize>,
+) -> Vec<Element> {
+    overlay_elements_with(plan, term_w, selected, 1)
+}
+
+/// [`overlay_elements`] with a floor on the rows element's `must`.
+///
+/// `1` is the menu's answer — show something if there is anything to show. A
+/// confirmation passes its option count, because `allocate` will happily
+/// starve a dialog down to nothing and a consent prompt with no visible options
+/// is not one.
+pub(crate) fn overlay_elements_with(
+    plan: &RenderPlan,
+    term_w: usize,
+    selected: Option<usize>,
+    row_min: usize,
 ) -> Vec<Element> {
     let mut els = Vec::with_capacity(3);
     let detail = paint_detail(&plan.detail, term_w);
@@ -376,119 +276,14 @@ pub(crate) fn overlay_elements(
         els.push(Element::table_header(header));
     }
     if !plan.rows.is_empty() {
-        els.push(Element::data_rows(
+        els.push(Element::rows_pinned_to(
             Arc::clone(&plan.rows),
             selected.filter(|s| *s < plan.rows.len()),
             plan.active_rows.clone(),
+            row_min,
         ));
     }
     els
-}
-
-/// Compose `[Divider?, Overlay]` and apply it as a frame: the first draw
-/// anchors at the cursor row, every later one at the live frame's top
-/// (an intact live frame → partial row-diff). Re-composed per key and per
-/// resize — cheap, and the one place the dialog's bytes come from.
-fn draw_dialog(out: &dyn Output, plan: &RenderPlan, sel: usize, size: (usize, usize)) {
-    let (term_w, _) = size;
-    // The dialog's cursor is its own (`sel`), so the selection is handed over
-    // rather than written into a clone of the plan.
-    let overlay = overlay_elements(plan, term_w, Some(sel));
-    // Through the tail, not a second pipeline. This builder used to hand-roll
-    // `extent → allocate → render` and call `draw_frame`, which meant two places
-    // in the crate decided how the terminal's rows were divided (ui_draw_v2 §5.1.1).
-    //
-    // Pieces in, nothing back: the composer owns the divider rule ("a menu
-    // brings a separator" — an overlay is present, so one appears) and the
-    // status row. `ConfirmSpec.divider` is what this used to consult; the rule
-    // is now the composer's, and the field is left unread.
-    out.draw_elements(None, overlay, ApplyPolicy::Frame, size);
-}
-
-/// Resolve the dialog: erase its region through the frame pipeline — a
-/// Frame apply's union clear takes care of the rows the (taller) dialog
-/// painted, so nothing needs a second clear, and the bottom space stays
-/// clean for whatever the caller appends next (plan §4.3/§5.3). The clear
-/// parks the cursor on the region's first row, so the optional decision
-/// line lands exactly where the dialog was.
-fn resolve(
-    out: &dyn Output,
-    spec: &ConfirmSpec<'_>,
-    size: (usize, usize),
-    result: ConfirmResult,
-) -> ConfirmResult {
-    // Release the in-flight reader gate raised on entry: the dialog is done
-    // with stdin, and a gate left raised would leave every later in-flight
-    // reader born paused — Esc/Ctrl-C dead for the rest of the session
-    // (plan §9 latent issue 1). Idempotent for dialogs that never paused
-    // anything (non-interactive outputs return before this point anyway).
-    if let Some(gate) = out.confirm_gate() {
-        gate.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-    out.draw_frame(&Frame::empty(), ApplyPolicy::Frame, size);
-    if let Some(subject) = &spec.subject {
-        // `yes` / `always` / `accept` record; `no` / `cancel` and a dismiss
-        // record the refusal.
-        let accepted = match &result {
-            ConfirmResult::Selected(i) => !matches!(
-                spec.options.get(*i).map(|o| o.id.as_str()),
-                Some("no") | Some("cancel")
-            ),
-            ConfirmResult::Dismissed => false,
-        };
-        out.display_plain(&format!(
-            "{} {subject}",
-            if accepted { "accepted" } else { "denied" }
-        ));
-    }
-    result
-}
-
-/// Subject of a tool-confirmation decision line: the caller's message
-/// follows the `Confirm tool {NAME} call?` convention (the confirm gate in
-/// `agent.rs`) → `tool {NAME}`. Surrounding convention furniture is stripped
-/// independently; anything left over passes through unchanged.
-pub(crate) fn confirm_subject(header: &str) -> String {
-    let s = header.strip_prefix("Confirm ").unwrap_or(header);
-    s.strip_suffix(" call?").unwrap_or(s).to_string()
-}
-
-/// Build a RenderPlan from a ConfirmSpec.
-fn build_confirm_plan(spec: &ConfirmSpec<'_>) -> RenderPlan {
-    let detail = spec
-        .header
-        .split('\n')
-        .map(LogicalLine::new)
-        .collect::<Vec<_>>();
-
-    let rows: Arc<Vec<LogicalLine>> = Arc::new(
-        spec.options
-            .iter()
-            .map(|r| LogicalLine::new(format!("{}  {}", r.id, r.desc)))
-            .collect(),
-    );
-
-    RenderPlan {
-        table_header: None,
-        detail,
-        rows,
-        selected: Some(spec.default_sel),
-        active_rows: vec![],
-    }
-}
-
-/// Resolve quick-key char to option index.
-fn quick_key_index(spec: &ConfirmSpec<'_>, c: char) -> Option<usize> {
-    let c = c.to_ascii_lowercase();
-    if let Some(keys) = spec.quick_keys {
-        keys.iter()
-            .find(|(k, _)| k.to_ascii_lowercase() == c)
-            .map(|(_, i)| *i)
-    } else {
-        spec.options
-            .iter()
-            .position(|o| o.id.chars().next().map(|fc| fc.to_ascii_lowercase()) == Some(c))
-    }
 }
 
 #[cfg(test)]
@@ -561,102 +356,21 @@ mod tests {
         );
     }
     use super::*;
-    use crate::output::NoOutput;
-    use std::sync::Mutex;
-
-    #[test]
-    fn confirm_subject_follows_the_tool_confirm_convention() {
-        assert_eq!(confirm_subject("Confirm tool BASH call?"), "tool BASH");
-        assert_eq!(confirm_subject("Confirm tool EDIT call?"), "tool EDIT");
-    }
-
-    #[test]
-    fn confirm_subject_strips_convention_furniture_independently() {
-        // Suffix only (the probe's message), prefix only, neither.
-        assert_eq!(confirm_subject("tool BASH call?"), "tool BASH");
-        assert_eq!(confirm_subject("Confirm tool BASH"), "tool BASH");
-        assert_eq!(confirm_subject("something else"), "something else");
-    }
+    use crate::output::{NoOutput, Output};
 
     // --- composed dims reach the apply (ui_draw_v2 §9 #3) ---
-
-    /// Records the dims it was asked to apply; everything else no-ops.
-    struct SizeRecorder(Mutex<Option<(usize, usize)>>);
-
-    impl Output for SizeRecorder {
-        fn draw_frame(
-            &self,
-            _frame: &Frame,
-            _policy: ApplyPolicy,
-            dims: (usize, usize),
-        ) -> (usize, usize) {
-            *self.0.lock().unwrap() = Some(dims);
-            (dims.0.max(1), dims.1.max(1))
-        }
-        fn display_text(&self, _text: &str) {}
-        fn display_tool_call(&self, _name: &str, _args: &serde_json::Value) {}
-        fn display_tool_result(&self, _result: &str) {}
-        fn get_user_input(&self) -> String {
-            String::new()
-        }
-        fn display_error(&self, _error: &str) {}
-        fn display_system(&self, _text: &str) {}
-        fn confirm(&self, _message: &str) -> Confirmation {
-            Confirmation::No
-        }
-        fn display_separator(&self) {}
-        fn display_header(
-            &self,
-            _provider: &str,
-            _model: &str,
-            _yolo: bool,
-            _limit: usize,
-            _persona: Option<&str>,
-        ) {
-        }
-    }
-
-    fn spec<'a>(opts: &'a [StaticRow]) -> ConfirmSpec<'a> {
-        ConfirmSpec {
-            header: "Confirm?",
-            options: opts,
-            quick_keys: None,
-            default_sel: 0,
-
-            subject: None,
-        }
-    }
-
-    fn recorder() -> SizeRecorder {
-        SizeRecorder(Mutex::new(None))
-    }
-
-    #[test]
-    fn draw_dialog_applies_at_the_dims_it_composed_for() {
-        let opts = [StaticRow::new("yes", "do it")];
-        let s = spec(&opts);
-        let plan = build_confirm_plan(&s);
-        let rec = recorder();
-        draw_dialog(&rec, &plan, 0, (42, 11));
-        assert_eq!(*rec.0.lock().unwrap(), Some((42, 11)));
-    }
-
-    #[test]
-    fn resolve_clears_at_the_dims_the_dialog_used() {
-        let opts = [StaticRow::new("yes", "do it")];
-        let s = spec(&opts);
-        let rec = recorder();
-        resolve(&rec, &s, (42, 11), ConfirmResult::Dismissed);
-        assert_eq!(*rec.0.lock().unwrap(), Some((42, 11)));
-    }
 
     #[test]
     fn default_draw_frame_reports_clamped_dims() {
         // `NoOutput` doesn't override `draw_frame`, so this exercises the
         // trait default: it applies nothing but still reports the clamped
         // dims it was asked to apply.
+        // `Frame::empty()` went with the blocking dialog that was its only
+        // caller (its erase is now "drop the element and repaint"), so this
+        // drives the pipeline for an empty stack instead.
+        let empty = render(&[], &[], 1);
         assert_eq!(
-            NoOutput.draw_frame(&Frame::empty(), ApplyPolicy::Frame, (0, 7)),
+            NoOutput.draw_frame(&empty, ApplyPolicy::Frame, (0, 7)),
             (1, 7)
         );
     }
