@@ -313,6 +313,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         yolo,
         quiet,
         tool_call_limit,
+        // Filled from the resolved catalog once `AppState` exists; there is no
+        // store to read here, and one-shot commands draw no status bar.
+        context_limit: None,
         system_message_extension,
         persona_prompt,
         persona_name,

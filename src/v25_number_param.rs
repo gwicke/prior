@@ -156,7 +156,11 @@ fn catalog_notes(p: NumberParam, app_state: &AppState) -> Vec<String> {
     let Some((provider, model)) = active.split_once(':') else {
         return Vec::new();
     };
-    let Some(entry) = crate::model_catalog::lookup(provider, model) else {
+    let resolved = app_state.resolved_models();
+    let Some(entry) = resolved.iter().find(|e| {
+        let (p, m) = e.qualified_parts();
+        p.eq_ignore_ascii_case(provider) && m.eq_ignore_ascii_case(model)
+    }) else {
         return Vec::new();
     };
     let (supported, published) = match p {

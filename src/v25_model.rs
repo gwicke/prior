@@ -156,7 +156,16 @@ impl SlashDotNode for ModelNode {
         }
 
         // An input changed (or first call) — rebuild rows.
-        let entries = crate::model_catalog::catalog_cached();
+        //
+        // The *resolved* list, so a Ctrl-E'd override of cost or an index shows
+        // in the row rather than only in the `/model <id>` header. `live` is
+        // `None` under `/set default_model`, which has no store to read, so
+        // that node keeps the raw catalog — the same trade it already makes
+        // for recency.
+        let entries: Vec<crate::model_catalog::ModelEntry> = match self.live.as_ref() {
+            Some(app) => app.resolved_models().as_ref().clone(),
+            None => crate::model_catalog::catalog_cached(),
+        };
         let active = if active_id.is_empty() {
             None
         } else {
@@ -1262,6 +1271,8 @@ mod tests {
         );
     }
 
+    /// At the top level the listing is the catalog, not the actions — every
+    /// model row carrying `activate`/`save` would make it unusable.
     #[test]
     fn the_top_level_listing_shows_models_not_actions() {
         let app_state = test_app_state();
@@ -1676,6 +1687,51 @@ mod tests {
             app2.params().reasoning,
             Some(crate::params::ReasoningLevel::Max),
             "a new session must start at the model's stored level, not the global's"
+        );
+    }
+
+    /// The reported bug: a stored override of cost showed in the `/model <id>`
+    /// header but not in the listing, because the listing read the raw catalog
+    /// while the header read the resolved view. Both read `resolved_models` now.
+    #[test]
+    fn the_listing_rows_carry_a_stored_override() {
+        let app_state = test_app_state();
+        // Pick a model the test catalog actually offers, then override its
+        // context window and check the row reflects it.
+        let (provider, model) = match app_state
+            .resolved_models()
+            .first()
+            .map(|e| e.qualified_parts())
+        {
+            Some(p) => p,
+            None => return, // no catalog in this environment
+        };
+        let qualified = format!("{provider}:{model}");
+        app_state
+            .update_settings(|s| {
+                s.apply_model_settings(
+                    &qualified,
+                    &crate::model_settings::ModelSettings {
+                        context_length: Some(777_777),
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let mut node = test_model_node(&app_state);
+        let pa = PathArgs::new(vec!["model".into()], " ");
+        let response = futures::executor::block_on(node.data(1, &pa)).unwrap();
+        let row = response
+            .rows
+            .iter()
+            .find(|r| r.id == qualified)
+            .unwrap_or_else(|| panic!("{qualified} must be listed"));
+        assert_eq!(
+            row.field_value("context").and_then(|v| v.as_num()),
+            Some(777_777.0),
+            "the row must carry the override, not the catalog's number"
         );
     }
 }

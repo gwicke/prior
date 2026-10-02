@@ -154,6 +154,14 @@ pub struct State {
     /// record, so a value changed at runtime is forgotten by a restart, while
     /// one written by `save` survives.
     pub(crate) model_param_map: HashMap<String, crate::params::ModelParams>,
+    /// Bumped on every settings write, so `resolved_models` can tell a stale
+    /// overlay from a current one. Over-invalidates deliberately: any setting
+    /// change rebuilds the list, which is cheaper than proving the change was
+    /// not a per-model record.
+    pub(crate) models_revision: u64,
+    /// Memo for `AppState::resolved_models`, keyed by
+    /// `(catalog generation, models_revision)`.
+    pub(crate) resolved_cache: Option<(u64, u64, Arc<Vec<crate::model_catalog::ModelEntry>>)>,
     /// The durable-target settings store — the one copy (was `MenuShared`'s
     /// cloned cell).
     pub(crate) settings: SettingsStore,
@@ -261,6 +269,8 @@ impl AppState {
                 // by that first call, or by the first `set_param`; nothing
                 // reads the map before one of them.
                 model_param_map: HashMap::new(),
+                models_revision: 0,
+                resolved_cache: None,
                 config,
                 settings,
                 session: SessionSlot {
@@ -442,9 +452,38 @@ impl AppState {
         let snapshot = {
             let mut st = self.state.lock();
             f(&mut st.settings)?;
+            st.models_revision += 1;
             st.settings.clone()
         };
         snapshot.save().map_err(|e| e.to_string())
+    }
+
+    /// The catalog with every stored per-model record applied — the list every
+    /// model path should read.
+    ///
+    /// Memoized on `(catalog generation, models_revision)`, so a fetch or a
+    /// settings write invalidates it and nothing else does. The catalog module
+    /// stays pure: it cannot reach the store, which is why the composition
+    /// lives here, where both sources are already in hand.
+    ///
+    /// Reading this instead of `catalog_cached()` is what keeps the `/model`
+    /// listing, the status bar's context percentage and the `/temperature`
+    /// header from quoting OpenRouter's numbers where the user has overrides.
+    pub fn resolved_models(&self) -> Arc<Vec<crate::model_catalog::ModelEntry>> {
+        let gen = crate::model_catalog::catalog_generation();
+        let mut st = self.state.lock();
+        if let Some((g, r, list)) = &st.resolved_cache {
+            if *g == gen && *r == st.models_revision {
+                return Arc::clone(list);
+            }
+        }
+        let entries = crate::model_catalog::overlay(
+            crate::model_catalog::catalog_cached(),
+            &st.settings.models,
+        );
+        let list = Arc::new(entries);
+        st.resolved_cache = Some((gen, st.models_revision, Arc::clone(&list)));
+        list
     }
 
     /// Mutate + persist a setting. Validate + in-memory apply under the
@@ -706,6 +745,7 @@ impl AppState {
             yolo: false,
             quiet: true,
             params: Default::default(),
+            context_limit: None,
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,

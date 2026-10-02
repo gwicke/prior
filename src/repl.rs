@@ -384,6 +384,8 @@ pub struct ReplCtx {
     /// the `/tree compact` sub-menu header; the compact handler writes the
     /// same estimate as `tokensBefore` (same `estimate_context_tokens` call).
     pub context_tokens: u64,
+    /// The resolved context window for the prompt-side bar's percentage.
+    pub context_limit: Option<u64>,
     /// Current model filter/sort state for the `/model` overlay.
     pub model_filter: ModelFilter,
     /// Currently-active reasoning level (for the `*` marker in `/reasoning`).
@@ -1563,6 +1565,7 @@ impl Repl {
                 model: &ctx.model,
                 thinking: ctx.reasoning_level.as_deref(),
                 context_tokens: ctx.context_tokens,
+                context_limit: ctx.context_limit,
             },
         ));
         // The session's state, as the loop's own bindings. Destructuring a
@@ -3139,6 +3142,7 @@ mod tests {
                 model: "test",
                 thinking: None,
                 context_tokens: 0,
+                context_limit: None,
             },
         ));
         (out, LineEditor::new())

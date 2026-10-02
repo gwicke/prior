@@ -15,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model: "claude-3-5-sonnet-latest".into(),
         output,
         yolo: false,
+        context_limit: None,
         tool_call_limit: 10,
         quiet: false,
         params: Default::default(),

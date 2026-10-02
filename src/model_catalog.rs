@@ -114,6 +114,29 @@ impl ModelEntry {
     }
 }
 
+/// The catalog with every stored per-model record applied.
+///
+/// The single place the two sources are combined for a *list*. Pure — it takes
+/// the records rather than reading them — because the store belongs to
+/// `AppState` and this module must not reach for it.
+/// `AppState::resolved_models` is the one caller holding both, and every model
+/// path reads the list it returns, so no path can show OpenRouter's numbers
+/// where another shows the user's overrides.
+pub fn overlay(
+    entries: Vec<ModelEntry>,
+    stored: &std::collections::HashMap<String, crate::model_settings::ModelSettings>,
+) -> Vec<ModelEntry> {
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            if let Some(settings) = stored.get(&entry.qualified()) {
+                settings.apply_to_entry(&mut entry);
+            }
+            entry
+        })
+        .collect()
+}
+
 /// Curated fallback: **direct-access** pricing per million tokens.
 /// Used when offline or for providers OpenRouter doesn't surface.
 const DIRECT_PRICING: &[(&str, &str, u64, f64, f64, bool)] = &[
@@ -641,146 +664,6 @@ pub fn fmt_iso_date(unix_secs: u64) -> String {
     match chrono::Utc.timestamp_opt(unix_secs as i64, 0).single() {
         Some(d) => d.format("%Y-%m-%d").to_string(),
         None => unix_secs.to_string(),
-    }
-}
-
-/// Apply client-side filters and sorting to the cached catalog.
-/// This is the main entry point for the `/model` overlay.
-pub fn get_filtered_catalog(params: &ModelFilterParams) -> Vec<ModelEntry> {
-    let mut entries = catalog_cached();
-
-    // Apply filters
-    if let Some(max_price) = params.price_input {
-        entries.retain(|e| e.prompt_cost.is_some_and(|p| p <= max_price));
-    }
-    if let Some(max_output_price) = params.price_output {
-        entries.retain(|e| e.completion_cost.is_some_and(|c| c <= max_output_price));
-    }
-    if let Some(min_coding) = params.min_coding_index {
-        entries.retain(|e| e.coding_index.is_some_and(|v| v >= min_coding));
-    }
-    if let Some(min_intel) = params.min_intelligence_index {
-        entries.retain(|e| e.intelligence_index.is_some_and(|v| v >= min_intel));
-    }
-    if let Some(min_agentic) = params.min_agentic_index {
-        entries.retain(|e| e.agentic_index.is_some_and(|v| v >= min_agentic));
-    }
-    if let Some(max_age) = params.max_age_days {
-        let cutoff = chrono::Utc::now().timestamp() - (max_age as i64 * 86400);
-        entries.retain(|e| e.created.is_some_and(|c| c as i64 >= cutoff));
-    }
-    if let Some(min_ctx) = params.min_context {
-        entries.retain(|e| e.context_length.is_some_and(|c| c >= min_ctx as u64));
-    }
-
-    // Apply sort
-    if let Some(sort) = &params.sort {
-        match sort.as_str() {
-            "most-popular" => {
-                // Already sorted by popularity from API fetch
-            }
-            "created" => {
-                entries.sort_by_key(|b| std::cmp::Reverse(b.created.unwrap_or(0)));
-            }
-            "coding" => {
-                entries.sort_by(|a, b| {
-                    b.coding_index
-                        .unwrap_or(0.0)
-                        .partial_cmp(&a.coding_index.unwrap_or(0.0))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            "intelligence" => {
-                entries.sort_by(|a, b| {
-                    b.intelligence_index
-                        .unwrap_or(0.0)
-                        .partial_cmp(&a.intelligence_index.unwrap_or(0.0))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            "agentic" => {
-                entries.sort_by(|a, b| {
-                    b.agentic_index
-                        .unwrap_or(0.0)
-                        .partial_cmp(&a.agentic_index.unwrap_or(0.0))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            "price_input" => {
-                entries.sort_by(|a, b| {
-                    a.prompt_cost
-                        .unwrap_or(f64::MAX)
-                        .partial_cmp(&b.prompt_cost.unwrap_or(f64::MAX))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            "price_output" => {
-                entries.sort_by(|a, b| {
-                    a.completion_cost
-                        .unwrap_or(f64::MAX)
-                        .partial_cmp(&b.completion_cost.unwrap_or(f64::MAX))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            "price" => {
-                entries.sort_by(|a, b| {
-                    combined_price(a)
-                        .unwrap_or(f64::MAX)
-                        .partial_cmp(&combined_price(b).unwrap_or(f64::MAX))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            "coding_price" => {
-                entries.sort_by(|a, b| {
-                    price_to_index_ratio(b, b.coding_index)
-                        .unwrap_or(0.0)
-                        .partial_cmp(&price_to_index_ratio(a, a.coding_index).unwrap_or(0.0))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            "intelligence_price" => {
-                entries.sort_by(|a, b| {
-                    price_to_index_ratio(b, b.intelligence_index)
-                        .unwrap_or(0.0)
-                        .partial_cmp(&price_to_index_ratio(a, a.intelligence_index).unwrap_or(0.0))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            "agentic_price" => {
-                entries.sort_by(|a, b| {
-                    price_to_index_ratio(b, b.agentic_index)
-                        .unwrap_or(0.0)
-                        .partial_cmp(&price_to_index_ratio(a, a.agentic_index).unwrap_or(0.0))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            _ => {}
-        }
-    }
-
-    entries
-}
-
-/// Compute combined price (input + output) for a model entry.
-fn combined_price(e: &ModelEntry) -> Option<f64> {
-    match (e.prompt_cost, e.completion_cost) {
-        (Some(p), Some(c)) => Some(p + c),
-        _ => None,
-    }
-}
-
-/// Compute price-to-index ratio for a model entry.
-/// Uses a nominal minimal fee (0.0000001) for free models so they sort before paid models
-/// but still have relative ordering based on their indices.
-fn price_to_index_ratio(e: &ModelEntry, index: Option<f32>) -> Option<f64> {
-    let total_price = combined_price(e);
-    match (total_price, index) {
-        (Some(p), Some(i)) if p <= 0.0 && i > 0.0 => {
-            // Free model with index: use nominal minimal fee for sorting
-            Some(i as f64 / 0.0000001)
-        }
-        (Some(p), Some(i)) if p > 0.0 => Some(i as f64 / p),
-        _ => None,
     }
 }
 
@@ -1670,5 +1553,56 @@ mod tests {
         let entries = catalog().await;
         assert!(!entries.is_empty());
         assert!(entries.iter().any(|e| e.provider == "deepseek"));
+    }
+
+    // ---- overlay: the one place the catalog meets the stored records ----
+
+    /// A record must win over the catalog, which is the whole point of having
+    /// one list for every model path.
+    #[test]
+    fn overlay_applies_a_record_to_its_own_model_only() {
+        use crate::model_settings::ModelSettings;
+        let mut stored = std::collections::HashMap::new();
+        stored.insert(
+            "testprov:alpha".to_string(),
+            ModelSettings {
+                prompt_cost: Some(9.99),
+                ..Default::default()
+            },
+        );
+        let entries = vec![
+            ModelEntry {
+                provider: "testprov".into(),
+                id: "testprov:alpha".into(),
+                prompt_cost: Some(0.5),
+                ..Default::default()
+            },
+            ModelEntry {
+                provider: "testprov".into(),
+                id: "testprov:beta".into(),
+                prompt_cost: Some(0.5),
+                ..Default::default()
+            },
+        ];
+        let out = overlay(entries, &stored);
+        assert_eq!(out[0].prompt_cost, Some(9.99), "the record wins");
+        assert_eq!(
+            out[1].prompt_cost,
+            Some(0.5),
+            "the other model is untouched"
+        );
+    }
+
+    #[test]
+    fn overlay_leaves_a_catalog_without_records_intact() {
+        let entries = vec![ModelEntry {
+            provider: "testprov".into(),
+            id: "testprov:alpha".into(),
+            prompt_cost: Some(0.5),
+            ..Default::default()
+        }];
+        let out = overlay(entries.clone(), &Default::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].prompt_cost, entries[0].prompt_cost);
     }
 }

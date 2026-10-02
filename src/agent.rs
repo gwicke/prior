@@ -343,6 +343,7 @@ impl CodeAgent {
                 // The status bar's own field is upstream's `thinking`; the
                 // value it reads is now the renamed reasoning level.
                 thinking: self.live_params.reasoning_str().as_deref(),
+                context_limit: self.context_limit,
                 // Reported wins: it is the provider's own count of what it was
                 // sent. The estimate only stands in while there is none — turn
                 // one, where the alternative is no figure at all.
@@ -2099,6 +2100,9 @@ pub struct CodeAgent {
     /// The live params this agent was built with: the default for a turn with
     /// no per-turn override, and the status bar's reasoning level.
     live_params: crate::params::ModelParams,
+    /// The resolved context window, so the per-turn status bar divides by the
+    /// number in force rather than looking one up per paint.
+    context_limit: Option<u64>,
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
@@ -2130,6 +2134,16 @@ pub struct AgentConfig {
     /// (doc/model_settings_v2.md A.2); `PartialEq` here is what the rebuild
     /// gate compares.
     pub params: crate::params::ModelParams,
+    /// The target model's context window, *resolved* — the catalog overlaid
+    /// with any stored per-model override.
+    ///
+    /// Carried here rather than looked up per status-bar paint, for two
+    /// reasons: `status_text` is a pure function with no store to read, and a
+    /// raw-catalog lookup there divided the context percentage by
+    /// OpenRouter's number even when the user had overridden it. Set by
+    /// `run_interactive` from `AppState::resolved_models`; `None` where there
+    /// is no session to draw a bar for.
+    pub context_limit: Option<u64>,
     pub tool_call_limit: usize,
     pub system_message_extension: Option<String>,
     pub persona_prompt: Option<String>,
@@ -2390,6 +2404,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
             CodeAgent::new(
                 rig_agent,
                 config.output,
+                config.context_limit,
                 config.tool_call_limit,
                 config.provider,
                 model,
@@ -4956,6 +4971,9 @@ pub async fn run_interactive(
     let initial_model = config.qualified_model_id();
     app_state.activate_model_params(&initial_model);
     config.params = app_state.params();
+    // The resolved context window, read once here and carried on the config so
+    // the status bar can divide by it without a store lookup per paint.
+    config.context_limit = resolved_context_limit(&app_state);
     // First session — created up front so the `/session` overlay can mark
     // it from the start (the file itself is written lazily on the first
     // `append_message`, so no empty session is created for a user who
@@ -5081,6 +5099,9 @@ pub async fn run_interactive(
                     // P1's accessor (the level now lives in `ModelParams`)
                     // plus upstream's two new status-bar fields.
                     reasoning_level: config.params.reasoning_str(),
+                    // The resolved context window, so the prompt-side bar's
+                    // percentage uses the same denominator as the mid-turn one.
+                    context_limit: resolved_context_limit(&app_state),
                     // The prompt-side bar names the session the same way the
                     // mid-turn one does: off the session index, with the opening
                     // message as the fallback when it has no name. Read here, at
@@ -5183,6 +5204,10 @@ pub async fn run_interactive(
             if params_changed {
                 new_cfg.params = target.params;
             }
+            // Re-read on every rebuild: the window moves when the model does,
+            // and also when the user Ctrl-E's a `context_length` override and
+            // then switches away and back.
+            new_cfg.context_limit = resolved_context_limit(&app_state);
             if persona_changed {
                 new_cfg.persona_name = target.persona_name.clone();
                 new_cfg.persona_prompt = target
@@ -5758,13 +5783,22 @@ pub struct BarModel<'a> {
     /// Context tokens in use. `0` means "not known yet" and drops the figure
     /// rather than showing a zero.
     pub context_tokens: u64,
+    /// The model's context window, already *resolved* (catalog overlaid with any
+    /// stored per-model override).
+    ///
+    /// Supplied by the caller rather than looked up here: `status_text` is a
+    /// pure function with no store to read, and the raw-catalog lookup it used
+    /// to do divided the percentage by OpenRouter's number even when the user
+    /// had overridden it. `None` renders the bare token count, which is what an
+    /// unknown window always did.
+    pub context_limit: Option<u64>,
 }
 
 /// The transient status line: `● session | provider:model thinking 34% 78k`.
 ///
 /// The mid-turn readout (doc/row_accounting.md, zone 2). Built from the same
-/// pieces `session_stats_lines` uses — `model_catalog` for the context window,
-/// the caller's token count for the usage — so the two cannot disagree about
+/// pieces `session_stats_lines` uses — the caller for the resolved context
+/// window, its own token count for the usage — so the two cannot disagree about
 /// what the context figure means. Fields that are unknown are dropped rather
 /// than shown empty.
 ///
@@ -5787,6 +5821,26 @@ pub struct BarModel<'a> {
 /// right: the context figure first, because it changes every turn and a missing
 /// one reads as "no context yet" rather than as a wrong model; then the thinking
 /// level; the model name last, because it is what identifies who is answering.
+/// The context window in force for the current model, resolved: the catalog
+/// overlaid with any stored per-model override.
+///
+/// Read from `AppState::resolved_models` rather than looked up per status-bar
+/// paint, so the percentage uses the number the app actually enforces and the
+/// prompt-side and mid-turn bars cannot disagree.
+pub fn resolved_context_limit(app_state: &crate::app_state::AppState) -> Option<u64> {
+    let qualified = app_state.model();
+    let (provider, model) = qualified.split_once(':')?;
+    app_state
+        .resolved_models()
+        .iter()
+        .find(|e| {
+            let (p, m) = e.qualified_parts();
+            p.eq_ignore_ascii_case(provider) && m.eq_ignore_ascii_case(model)
+        })
+        .and_then(|e| e.context_length)
+        .filter(|max| *max > 0)
+}
+
 pub fn status_text(
     session_name: Option<&str>,
     first_message: Option<&str>,
@@ -5797,6 +5851,7 @@ pub fn status_text(
         model,
         thinking,
         context_tokens,
+        context_limit,
     } = m;
     let mut fields: Vec<String> = Vec::new();
     if !provider.is_empty() || !model.is_empty() {
@@ -5810,9 +5865,7 @@ pub fn status_text(
         // missing from it is normal (a local endpoint, a new release). So the
         // count stands alone rather than the whole figure disappearing: no
         // window known means no percentage, not no context figure.
-        let window = model_catalog::lookup(provider, model)
-            .and_then(|e| e.context_length)
-            .filter(|max| *max > 0);
+        let window = context_limit.filter(|max| *max > 0);
         fields.push(match window {
             Some(max) => {
                 let pct = (context_tokens as f64 / max as f64) * 100.0;
@@ -5897,12 +5950,14 @@ mod status_bar_tests {
         model: &'a str,
         thinking: Option<&'a str>,
         context_tokens: u64,
+        context_limit: Option<u64>,
     ) -> BarModel<'a> {
         BarModel {
             provider,
             model,
             thinking,
             context_tokens,
+            context_limit,
         }
     }
 
@@ -5920,7 +5975,13 @@ mod status_bar_tests {
         let text = "run the command | llamacpp:test";
         for extra in 0..6_usize {
             let w = text.chars().count() + 2 + extra;
-            let s = bar(None, None, model("llamacpp", "test", None, 0), w, true);
+            let s = bar(
+                None,
+                None,
+                model("llamacpp", "test", None, 0, None),
+                w,
+                true,
+            );
             let visible = crate::output::strip_ansi(&s);
             assert_eq!(display(&s), w, "width {w}: one row: {visible:?}");
             assert!(
@@ -5949,7 +6010,7 @@ mod status_bar_tests {
         let s = bar(
             Some("main"),
             None,
-            model("llamacpp", "test", None, 0),
+            model("llamacpp", "test", None, 0, None),
             40,
             true,
         );
@@ -5989,7 +6050,7 @@ mod status_bar_tests {
     fn the_bar_never_moves_the_cursor_down() {
         let long = "x".repeat(200);
         for w in [1_usize, 10, 40, 200] {
-            let s = bar(Some(&long), None, model("p", "m", None, 0), w, true);
+            let s = bar(Some(&long), None, model("p", "m", None, 0, None), w, true);
             assert_eq!(
                 crate::row_count::rows_of(&s, w),
                 0,
@@ -6004,7 +6065,7 @@ mod status_bar_tests {
         let s = bar(
             Some(&"n".repeat(100)),
             None,
-            model("p", "m", None, 0),
+            model("p", "m", None, 0, None),
             20,
             true,
         );
@@ -6019,7 +6080,7 @@ mod status_bar_tests {
         let s = bar(
             None,
             Some("fix the flaky resize test"),
-            model("llamacpp", "test", None, 0),
+            model("llamacpp", "test", None, 0, None),
             60,
             true,
         );
@@ -6028,7 +6089,7 @@ mod status_bar_tests {
         let named = bar(
             Some("main"),
             Some("fix the flaky resize test"),
-            model("llamacpp", "test", None, 0),
+            model("llamacpp", "test", None, 0, None),
             60,
             true,
         );
@@ -6056,7 +6117,7 @@ mod status_bar_tests {
         let s = bar(
             Some("main"),
             None,
-            model("ollama", "llama3", Some("high"), 5_000),
+            model("ollama", "llama3", Some("high"), 5_000, Some(8_192)),
             60,
             true,
         );
@@ -6084,7 +6145,7 @@ mod status_bar_tests {
         let s = bar(
             Some("main"),
             None,
-            model("llamacpp", "test", Some("high"), 78_000),
+            model("llamacpp", "test", Some("high"), 78_000, None),
             60,
             true,
         );
@@ -6110,7 +6171,7 @@ mod status_bar_tests {
             let s = bar(
                 Some(&long),
                 None,
-                model("ollama", "llama3", Some("high"), 5_000),
+                model("ollama", "llama3", Some("high"), 5_000, Some(8_192)),
                 w,
                 true,
             );
@@ -6172,7 +6233,7 @@ mod status_bar_tests {
             let s = bar(
                 None,
                 None,
-                model("ollama", "llama3", Some("high"), 5_000),
+                model("ollama", "llama3", Some("high"), 5_000, Some(8_192)),
                 w,
                 true,
             );
@@ -6206,7 +6267,13 @@ mod status_bar_tests {
     /// line.
     #[test]
     fn no_name_and_no_message_still_shows_the_model() {
-        let s = bar(None, None, model("llamacpp", "test", None, 0), 40, true);
+        let s = bar(
+            None,
+            None,
+            model("llamacpp", "test", None, 0, None),
+            40,
+            true,
+        );
         let visible = crate::output::strip_ansi(&s);
         assert!(visible.ends_with("llamacpp:test"), "{visible:?}");
         assert_eq!(display(&s), 40, "{visible:?}");
@@ -6224,8 +6291,14 @@ mod status_bar_tests {
     /// green lands on nothing, and the dot reads as default bright white.
     #[test]
     fn the_dot_is_green_while_streaming_and_grey_when_not() {
-        let streaming = bar(Some("main"), None, model("p", "m", None, 0), 40, true);
-        let idle = bar(Some("main"), None, model("p", "m", None, 0), 40, false);
+        let streaming = bar(Some("main"), None, model("p", "m", None, 0, None), 40, true);
+        let idle = bar(
+            Some("main"),
+            None,
+            model("p", "m", None, 0, None),
+            40,
+            false,
+        );
         assert!(
             streaming.contains("\x1b[38;5;41m"),
             "a streaming bar should carry a green dot: {streaming:?}"
@@ -6263,7 +6336,7 @@ mod status_bar_tests {
     /// A leading full reset is what makes the bar self-contained.
     #[test]
     fn the_bar_resets_first_so_ambient_dim_cannot_reach_it() {
-        let s = bar(Some("main"), None, model("p", "m", None, 0), 40, true);
+        let s = bar(Some("main"), None, model("p", "m", None, 0, None), 40, true);
         let body = s.trim_start_matches("\x1b[0m");
         assert!(
             s.starts_with("\x1b[0m"),
@@ -6306,7 +6379,7 @@ mod status_bar_tests {
         let s = bar(
             None,
             Some(&"a".repeat(80)),
-            model("", "", None, 0),
+            model("", "", None, 0, None),
             20,
             true,
         );
@@ -6324,7 +6397,7 @@ mod status_bar_tests {
         let wide = bar(
             None,
             Some(&"\u{4f60}\u{597d}".repeat(20)),
-            model("", "", None, 0),
+            model("", "", None, 0, None),
             20,
             true,
         );
@@ -6526,6 +6599,7 @@ impl CodeAgent {
     pub fn new(
         agent: Agent,
         output: Arc<dyn Output>,
+        context_limit: Option<u64>,
         tool_call_limit: usize,
         provider: String,
         model: String,
@@ -6540,6 +6614,7 @@ impl CodeAgent {
         Self {
             agent,
             output,
+            context_limit,
             tool_call_limit,
             provider,
             model,
@@ -9286,6 +9361,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             yolo: true,
             quiet: true,
             params: Default::default(),
+            context_limit: None,
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
@@ -9398,6 +9474,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             yolo: true,
             quiet: true,
             params: Default::default(),
+            context_limit: None,
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
@@ -10632,6 +10709,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             yolo: false,
             quiet: true,
             params,
+            context_limit: None,
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
