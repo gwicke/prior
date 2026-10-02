@@ -9,9 +9,10 @@
 //! one line).
 //!
 //! It deliberately does *not* draw its own borders or move the cursor; callers
-//! (e.g. `render::paint_plan`, which paints backgrounds, selection markers,
-//! and windows the rows) own the presentation. Use [`Table::render`] for
-//! selectable lists and [`Table::render_with_header`] for static summaries.
+//! (e.g. `render::paint_rows`, which paints backgrounds and selection markers,
+//! and `ui::Element::data_rows`, which windows them) own the presentation. Use
+//! [`Table::render`] for selectable lists and [`Table::render_with_header`]
+//! for static summaries.
 
 use unicode_width::UnicodeWidthChar;
 

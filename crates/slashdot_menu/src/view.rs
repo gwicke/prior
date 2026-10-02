@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::fields::ColumnDef;
 use crate::fields::{row_field_value, Row};
@@ -137,7 +138,11 @@ impl ViewRows {
 #[derive(Default)]
 struct RenderCache {
     table_header: Option<LogicalLine>,
-    rows: Rc<Vec<LogicalLine>>,
+    /// `Arc` because this is the *plan's* rows, which a host holds in a frame
+    /// element — and elements are `Send + Sync` (stashed in the draw cache
+    /// behind a `Mutex`). `ViewRows`' own slots stay `Rc`: they never leave
+    /// this thread.
+    rows: Arc<Vec<LogicalLine>>,
     active_rows: Vec<usize>,
 }
 
@@ -256,7 +261,7 @@ impl RowView {
             plan: RenderPlan {
                 table_header: self.render.table_header.clone(),
                 detail: req.detail.clone(),
-                rows: Rc::clone(&self.render.rows),
+                rows: Arc::clone(&self.render.rows),
                 selected,
                 active_rows: self.render.active_rows.clone(),
             },
@@ -430,7 +435,7 @@ impl RowView {
         .map(LogicalLine::new)
         .collect();
         self.render.table_header = table_header;
-        self.render.rows = Rc::new(lines);
+        self.render.rows = Arc::new(lines);
         self.render.active_rows = active_rows;
     }
 }

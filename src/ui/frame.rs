@@ -1263,30 +1263,6 @@ mod tests {
     }
 
     #[test]
-    fn render_overlay_pads_short_rows_before_reset() {
-        let rows = vec!["ab".to_string()];
-        let els = [Element::overlay(rows, 0)];
-        let f = render(&els, &[1], 5);
-        // Padding lands inside the styled span so backgrounds reach the edge.
-        assert_eq!(f.row(0), "ab   ");
-        // Full-width row passes through untouched.
-        let els = [Element::overlay(vec!["abcde".to_string()], 0)];
-        let f = render(&els, &[1], 5);
-        assert_eq!(f.row(0), "abcde");
-    }
-
-    #[test]
-    fn render_overlay_windows_around_focus() {
-        let rows: Vec<String> = (0..20).map(|i| format!("item {i}")).collect();
-        let els = [Element::overlay(rows, 10)];
-        let f = render(&els, &[4], 20);
-        assert_eq!(f.height(), 4);
-        // Centered: focus 10 with 4 visible → start 8 (prefer h/2 = 2).
-        assert_eq!(f.row(0).trim_end(), "item 8");
-        assert_eq!(f.row(3).trim_end(), "item 11");
-    }
-
-    #[test]
     fn render_lines_keeps_the_first_h_rows() {
         let rows: Vec<String> = (1..=5).map(|i| format!("line {i}")).collect();
         let f = render(&[Element::lines(rows)], &[3], 20);
@@ -1324,16 +1300,6 @@ mod tests {
             Element::divider().extent(),
             Extent { must: 1, might: 1 },
             "a rule is all-or-nothing"
-        );
-        assert_eq!(
-            Element::overlay(vec!["a".to_string(), "b".to_string()], 0).extent(),
-            Extent { must: 1, might: 2 },
-            "an overlay always keeps a row and wants its painted height"
-        );
-        assert_eq!(
-            Element::overlay(Vec::new(), 0).extent(),
-            Extent { must: 0, might: 0 },
-            "nothing to show asks for nothing"
         );
         assert_eq!(
             Element::lines(vec!["a".to_string(), "b".to_string(), "c".to_string()]).extent(),
@@ -1382,7 +1348,7 @@ mod tests {
         let els = [
             Element::input(layout, "> ".to_string()),
             Element::divider(),
-            Element::overlay(vec!["one".to_string(), "two".to_string()], 0),
+            Element::lines(vec!["one".to_string(), "two".to_string()]),
         ];
         let heights = allocate(
             &els.iter().map(Element::extent).collect::<Vec<_>>(),
@@ -1403,7 +1369,7 @@ mod tests {
         assert_eq!(f.height(), 4);
         assert_eq!(f.row(0), "> ls -la\x1b[K");
         assert!(f.row(1).starts_with("\x1b[2m"));
-        assert_eq!(f.row(3).trim_end(), "two");
+        assert_eq!(f.row(3), "two\x1b[K", "`lines` ends a short row with EL");
         // Caret follows the input element, prompt-inclusive column.
         assert_eq!(f.caret, Some((0, 8)));
     }

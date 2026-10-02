@@ -44,10 +44,10 @@ pub enum Confirmation {
 /// `overlay` is `None` when there is no menu: a separator with nothing below it
 /// is a rule nobody wanted, and the empty overlay case has no element to draw
 /// either.
-pub(crate) fn area_body(input: Option<Element>, overlay: Option<Element>) -> Vec<Element> {
+pub(crate) fn area_body(input: Option<Element>, overlay: Vec<Element>) -> Vec<Element> {
     let mut items = Vec::new();
     items.extend(input);
-    if overlay.is_some() {
+    if !overlay.is_empty() {
         items.push(Element::divider());
     }
     items.extend(overlay);
@@ -530,7 +530,7 @@ pub trait Output: Send + Sync {
     /// clear takes it, at the one moment the cursor is where the frame says it
     /// is — and the partial row-diff redraws it per keystroke, so the figures
     /// are never stale.
-    fn compose_area(&self, input: Option<Element>, overlay: Option<Element>) -> Vec<Element> {
+    fn compose_area(&self, input: Option<Element>, overlay: Vec<Element>) -> Vec<Element> {
         let mut items = Vec::new();
         if let Some(row) = self.status_row() {
             // The row between the last content and the bar is the **frame's**,
@@ -603,13 +603,17 @@ pub trait Output: Send + Sync {
     fn draw_elements(
         &self,
         input: Option<Element>,
-        overlay: Option<Element>,
+        overlay: Vec<Element>,
         policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
         let (tw, th) = (dims.0.max(1), dims.1.max(1));
         let stack = self.compose_area(input, overlay);
         let extents: Vec<Extent> = stack.iter().map(Element::extent).collect();
+        // The page-scroll path needs the rows element's grant *before* the
+        // frame is rendered, and this is the only place `allocate` runs for a
+        // composition — so a caller that has to know re-runs it over the same
+        // extents rather than asking the painter to guess twice.
         let heights = allocate(&extents, live_budget(th));
         let frame = render(&stack, &heights, tw);
         let applied = self.draw_frame(&frame, policy, dims);
@@ -3913,7 +3917,7 @@ mod tests {
         // Composed while idle — the REPL composes once per keystroke, and the
         // turn's flag flips *after* that (agent.rs `begin_response`), so a row
         // baked at compose time would show the previous turn's dot.
-        let area = out.compose_area(None, None);
+        let area = out.compose_area(None, Vec::new());
         out.begin_response();
         let during = compose_rows(&area, 60);
         out.end_response();
@@ -3965,15 +3969,18 @@ mod tests {
         };
 
         // Nothing supplied: the gap and the status, and they come first.
-        assert_eq!(compose_rows(&out.compose_area(None, None), 60).len(), 2);
+        assert_eq!(
+            compose_rows(&out.compose_area(None, Vec::new()), 60).len(),
+            2
+        );
 
         // Input only: no separator, because a separator is for a menu.
-        let rows = compose_rows(&out.compose_area(Some(input()), None), 60);
+        let rows = compose_rows(&out.compose_area(Some(input()), Vec::new()), 60);
         assert_eq!(rows.len(), 3, "gap, status, input: {rows:?}");
 
         // Both: the divider arrives *with* the overlay, not from the caller.
-        let overlay = Element::overlay(vec!["row".to_string()], 0);
-        let rows = compose_rows(&out.compose_area(Some(input()), Some(overlay)), 60);
+        let overlay = crate::repl::test_overlay(&["row"], 0, 60);
+        let rows = compose_rows(&out.compose_area(Some(input()), overlay), 60);
         assert_eq!(
             rows.len(),
             5,
@@ -4003,7 +4010,7 @@ mod tests {
     fn compose_area_reads_streaming_rather_than_being_told_it() {
         let (out, _reasoning) = capturing_output(60);
         out.set_status(&bar_of("[bar]"));
-        let idle = compose_rows(&out.compose_area(None, None), 60);
+        let idle = compose_rows(&out.compose_area(None, Vec::new()), 60);
         assert!(
             !idle[1].contains(DOT_STREAMING),
             "no turn in flight, so the frame bar is idle: {:?}",
@@ -4013,7 +4020,7 @@ mod tests {
         out.begin_capture();
         out.begin_response();
         let _ = out.end_capture();
-        let during = compose_rows(&out.compose_area(None, None), 60);
+        let during = compose_rows(&out.compose_area(None, Vec::new()), 60);
         assert!(
             during[1].contains(DOT_STREAMING),
             "mid-turn the frame bar goes green: {:?}",
@@ -4034,7 +4041,7 @@ mod tests {
     fn compose_area_drops_a_status_that_has_nothing_to_say() {
         let (out, _reasoning) = capturing_output(60);
         assert!(
-            out.compose_area(None, None).is_empty(),
+            out.compose_area(None, Vec::new()).is_empty(),
             "never set: there is no bar to show"
         );
         out.set_status(&StatusText {
@@ -4042,14 +4049,18 @@ mod tests {
             group: Vec::new(),
         });
         assert!(
-            out.compose_area(None, None).is_empty(),
+            out.compose_area(None, Vec::new()).is_empty(),
             "explicitly off: there is no bar to show"
         );
         out.set_status(&bar_of("[bar]"));
-        assert_eq!(out.compose_area(None, None).len(), 2, "gap, then a bar");
+        assert_eq!(
+            out.compose_area(None, Vec::new()).len(),
+            2,
+            "gap, then a bar"
+        );
 
         assert!(
-            NoOutput.compose_area(None, None).is_empty(),
+            NoOutput.compose_area(None, Vec::new()).is_empty(),
             "an output with no screen composes no status"
         );
     }
@@ -5333,6 +5344,7 @@ mod tests {
     #[serial]
     fn draw_elements_paints_exactly_what_the_hand_rolled_path_paints() {
         let tall: Vec<String> = (0..16).map(|i| format!("row {i}")).collect();
+        let tall: Vec<&str> = tall.iter().map(|s| s.as_str()).collect();
         // The pieces, freshly built per call: `draw_elements` moves them in, so
         // each path needs its own. The composer is the shared thing now — both
         // outputs are given the same status, so `compose_area` yields the same
@@ -5341,7 +5353,7 @@ mod tests {
         let pieces = || {
             let layout = crate::repl::LineEditor::new().layout(60, "> ");
             let input = Element::input(layout, "> ".to_string());
-            let overlay = (!tall.is_empty()).then(|| Element::overlay(tall.clone(), 0));
+            let overlay = crate::repl::test_overlay(&tall, 0, 60);
             (Some(input), overlay)
         };
         let dims = (60, 20);
@@ -5390,17 +5402,21 @@ mod tests {
         // A menu frame, as `/session` has open when a commit happens: the
         // input, a divider, and overlay rows — the table header is what the
         // report saw survive.
-        let overlay = vec![
-            "MODEL            CTX    PRICE".to_string(),
-            "  gpt-5          400k   1.00".to_string(),
-            "  claude-opus    200k   3.00".to_string(),
-        ];
+        let overlay = crate::repl::test_overlay_parts(
+            Some("MODEL            CTX    PRICE"),
+            &[],
+            &[
+                "  gpt-5          400k   1.00",
+                "  claude-opus    200k   3.00",
+            ],
+            Some(0),
+            40,
+        );
         let frame = crate::repl::Repl::compose_frame(
             &crate::repl::LineEditor::new(),
             "",
             None,
-            &overlay,
-            0,
+            overlay,
             40,
             10,
         );
@@ -5475,7 +5491,13 @@ mod tests {
         // Streaming with an empty buffer is R1's `input_hidden`: no input row,
         // and so no caret to place.
         out.begin_response();
-        crate::repl::paint_prompt(&out, "", &crate::repl::LineEditor::new(), &[], 0, (40, 24));
+        crate::repl::paint_prompt(
+            &out,
+            "",
+            &crate::repl::LineEditor::new(),
+            Vec::new(),
+            (40, 24),
+        );
         let bytes = out.end_capture();
         assert!(
             String::from_utf8_lossy(&bytes).contains("\x1b[?25l"),
@@ -5486,7 +5508,7 @@ mod tests {
         out.begin_capture();
         let mut editor = crate::repl::LineEditor::new();
         editor.set("hi");
-        crate::repl::paint_prompt(&out, "", &editor, &[], 0, (40, 24));
+        crate::repl::paint_prompt(&out, "", &editor, Vec::new(), (40, 24));
         let text = String::from_utf8_lossy(&out.end_capture()).into_owned();
         assert!(
             text.contains("\x1b[?25h"),
@@ -5532,16 +5554,18 @@ mod tests {
     fn a_content_batch_emits_the_frame_once_at_the_end() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
-        let overlay = vec![
-            "MODEL            CTX    PRICE".to_string(),
-            "  gpt-5          400k   1.00".to_string(),
-        ];
+        let overlay = crate::repl::test_overlay_parts(
+            Some("MODEL            CTX    PRICE"),
+            &[],
+            &["  gpt-5          400k   1.00"],
+            Some(0),
+            40,
+        );
         let frame = crate::repl::Repl::compose_frame(
             &crate::repl::LineEditor::new(),
             "",
             None,
-            &overlay,
-            0,
+            overlay,
             40,
             10,
         );
