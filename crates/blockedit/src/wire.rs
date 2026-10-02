@@ -64,6 +64,17 @@ const ELIDE_CONTEXT: usize = 1;
 /// matters (which marker is malformed).
 const EDIT_ARGS_EXAMPLE: &str = "some/path:1234\n@@@OLD\nold text\n@@@NEW\nnew text\n@@@END";
 
+/// The single-edit shape, rendered as the one-line JSON call the model should
+/// write: `path` + the anchor + the exact text and its replacement.
+///
+/// The counterpart to [`EDIT_ARGS_EXAMPLE`] for a call that came in through the
+/// `oldText`/`newText` fields. One line, no markers, and the same four values the
+/// tool advertises for that form — so against the `Actual:` echo (which for this
+/// shape is the received JSON) it reads as a definition list: here is the call
+/// that works, here is the call that arrived.
+const SINGLE_EDIT_ARGS_EXAMPLE: &str =
+    r#"{"path": "some/path.rs", "startLine": 1234, "oldText": "old text", "newText": "new text"}"#;
+
 /// Arguments accepted by the `edit` tool, after normalization to the execution
 /// form: one [`FileEdit`] per file, each a resolved path plus its edits.
 ///
@@ -258,19 +269,47 @@ fn actual_summary(raw: &Value) -> String {
     truncate_wire_repr(raw)
 }
 
+/// The shape the call came in through, which decides the `Expected:` example.
+///
+/// Deliberately the same order [`actual_summary`] uses to pick its echo, so the
+/// two halves of the message always describe the same call: a blob string is the
+/// blob form (even when the single-edit fields came along too, since the parser
+/// reads the blob first and *that* is what failed), otherwise the single-edit
+/// fields are, otherwise neither is present and the block form is the shape worth
+/// teaching.
+fn is_single_edit_shape(raw: &Value) -> bool {
+    blob::blob_text(raw).is_none() && (raw.get("oldText").is_some() || raw.get("newText").is_some())
+}
+
 impl EditArgs {
     /// Build the self-correcting error: what went wrong, the one accepted shape
-    /// (line-based block syntax), and the structure actually received.
+    /// — written in the form the caller is already using — and the structure
+    /// actually received.
     ///
-    /// Deliberately terse. This string is the *model's* correction, and every
-    /// token spent on ceremony — restating the tool name, listing the
-    /// single-edit JSON shape, apologizing about sed — competes with the one
-    /// fact the model must act on (which marker is malformed). The model-facing
-    /// text is a raw, unredacted copy of this (see the note in the module
-    /// docs); keep it free of anything the model does not need to self-correct.
+    /// The example follows the shape: a call that arrived through `oldText` /
+    /// `newText` is shown [`SINGLE_EDIT_ARGS_EXAMPLE`], a blob-shaped one
+    /// [`EDIT_ARGS_EXAMPLE`]. A correction in the other shape is an answer to a
+    /// question nobody asked — a model that sent JSON cannot act on a block
+    /// template, and the block form's markers are exactly the thing it is not
+    /// using. It also makes the message self-consistent: for the single-edit
+    /// shape both halves are JSON, so `Expected:` / `Actual:` reads as a
+    /// definition list (and the panel can show it stacked — see
+    /// `arg_error_view`, which renders a table only for the block example).
+    ///
+    /// Deliberately terse otherwise. This string is the *model's* correction, and
+    /// every token spent on ceremony — restating the tool name, apologizing
+    /// about sed — competes with the one fact the model must act on (which field
+    /// or marker is wrong). The model-facing text is a raw, unredacted copy of
+    /// this (see the note in the module docs); keep it free of anything the model
+    /// does not need to self-correct.
     fn invalid(raw: &Value, why: &str) -> String {
+        let example = if is_single_edit_shape(raw) {
+            SINGLE_EDIT_ARGS_EXAMPLE
+        } else {
+            EDIT_ARGS_EXAMPLE
+        };
         format!(
-            "{why}\n\nExpected:\n{EDIT_ARGS_EXAMPLE}\n\nActual:\n{}",
+            "{why}\n\nExpected:\n{example}\n\nActual:\n{}",
             actual_summary(raw),
         )
     }
@@ -707,6 +746,51 @@ mod tests {
         .unwrap_err();
         assert!(e.contains("@@@OLD section"), "{e}");
         assert!(e.contains("Actual:"), "{e}");
+    }
+
+    /// The correction is written in the shape the caller used. A model that sent
+    /// `oldText`/`newText` cannot act on a block template, and vice versa.
+    #[test]
+    fn the_expected_example_follows_the_shape_the_caller_used() {
+        // Single-edit: JSON on both sides, so the message is a definition list.
+        let e = EditArgs::from_wire(&json!({ "oldText": "a", "newText": "b" })).unwrap_err();
+        let (why, rest) = e.split_once("\n\nExpected:\n").expect("shape");
+        let (expected, actual) = rest.split_once("\n\nActual:\n").expect("shape");
+        assert!(why.contains("missing required field 'path'"), "{why}");
+        assert_eq!(expected, SINGLE_EDIT_ARGS_EXAMPLE);
+        // The echo is serde's compact rendering of the raw arguments.
+        assert_eq!(actual, "{\"newText\":\"b\",\"oldText\":\"a\"}");
+        assert!(!e.contains("@@@OLD"), "block syntax leaked in: {e}");
+
+        // Blob: the block template, as before.
+        let b = EditArgs::from_wire(&json!({ "blocks": "@@ -1 +1 @@\n- a\n+ b" })).unwrap_err();
+        assert!(
+            b.contains(&format!("\nExpected:\n{EDIT_ARGS_EXAMPLE}\n")),
+            "{b}"
+        );
+    }
+
+    /// The blob is read first, so a call carrying both shapes is told about the
+    /// one that failed — and the single-edit fields riding along must not flip
+    /// the example to JSON, which would be a correction the caller cannot use.
+    #[test]
+    fn a_blob_alongside_single_edit_fields_still_gets_the_block_example() {
+        let e = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "blocks": "no markers here", "oldText": "a", "newText": "b"
+        }))
+        .unwrap_err();
+        assert!(
+            e.contains(&format!("\nExpected:\n{EDIT_ARGS_EXAMPLE}\n")),
+            "{e}"
+        );
+    }
+
+    /// One field of the pair is enough: `{"oldText": …}` with no `newText` is the
+    /// most common single-edit mistake, and the JSON example is the fix.
+    #[test]
+    fn a_half_written_single_edit_gets_the_json_example() {
+        let e = EditArgs::from_wire(&json!({ "path": "src/x.rs", "oldText": "a" })).unwrap_err();
+        assert!(e.contains(SINGLE_EDIT_ARGS_EXAMPLE), "{e}");
     }
 
     #[test]

@@ -38,6 +38,16 @@
 //! Truncation is width-aware, and when the terminal cannot fit the template plus
 //! a usable `Actual` column the renderer returns `None` so the caller falls back
 //! to the stacked message rather than emit a mangled table.
+//!
+//! # Which messages get a table at all
+//!
+//! The table pairs *block markers* against the lines the model sent, so it only
+//! applies when `Expected:` is the block example. A single-edit failure carries
+//! [`crate::wire`]'s one-line JSON example instead, and there the stacked form
+//! is better anyway: `Expected:` / `Actual:` are then two JSON values, a
+//! definition list, where the table would set five `@@@OLD`-style rows against
+//! one row of JSON. `render_arg_error_table` returns `None` for those, so one
+//! decision covers both the too-narrow and the wrong-shape case.
 
 use unicode_width::UnicodeWidthStr;
 
@@ -129,31 +139,42 @@ fn wrap_to_width(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Split a rendered argument error into its problem statement and the `Actual:`
-/// lines.
+/// Split a rendered argument error into its problem statement, the `Expected:`
+/// section, and the `Actual:` lines.
 ///
-/// The `Expected:` side is deliberately *not* taken from the message: it is
-/// regenerated from [`TEMPLATE`] so the column width cannot drift with the
-/// content. Returns `None` unless the message has the `Expected:` / `Actual:`
+/// The `Expected:` side is returned but deliberately *not* rendered from: the
+/// table regenerates it from [`TEMPLATE`] so the column width cannot drift with
+/// the content. Returns `None` unless the message has the `Expected:` / `Actual:`
 /// shape this module renders, so an unrelated tool result is left alone.
-pub fn split_arg_error(msg: &str) -> Option<(&str, Vec<&str>)> {
+pub fn split_arg_error(msg: &str) -> Option<(&str, &str, Vec<&str>)> {
     let (why, rest) = msg.split_once("\n\nExpected:\n")?;
-    let (_expected, actual) = rest.split_once("\n\nActual:\n")?;
+    let (expected, actual) = rest.split_once("\n\nActual:\n")?;
     let actual: Vec<&str> = actual.lines().collect();
     if actual.is_empty() {
         return None;
     }
-    Some((why, actual))
+    Some((why, expected, actual))
 }
 
 /// Render the message as a two-column table sized to fit `avail` display cells.
 ///
 /// Every returned line is at most `avail` cells wide and must be emitted
 /// *without* re-wrapping (see the module docs on `wrap` collapsing padding).
-/// Returns `None` when the terminal is too narrow for the template plus a
-/// usable `Actual` column, so the caller can fall back to the stacked message.
+///
+/// Returns `None` — leaving the caller the stacked message — in both of the
+/// cases where this table would be wrong rather than merely wide:
+///
+/// - the `Expected:` section is not the block template, so this is a
+///   single-edit failure carrying [`crate::wire`]'s one-line JSON example.
+///   Putting that beside block markers would be a row of `@@@OLD` against a row
+///   of JSON; the stacked form is a definition list instead, which is what that
+///   message is.
+/// - the terminal is too narrow for the template plus a usable `Actual` column.
 pub fn render_arg_error_table(msg: &str, avail: usize) -> Option<Vec<String>> {
-    let (why, actual) = split_arg_error(msg)?;
+    let (why, expected, actual) = split_arg_error(msg)?;
+    if expected.trim_end() != TEMPLATE.join("\n") {
+        return None;
+    }
 
     let w = template_width();
     let right = avail.checked_sub(w + GUTTER.chars().count())?;
@@ -267,7 +288,8 @@ src/x.rs
     #[test]
     fn a_long_actual_value_is_truncated_to_its_column() {
         let long = format!(
-            "Invalid\n\nExpected:\nx\n\nActual:\nsrc/very/long/path/{}.rs",
+            "Invalid\n\nExpected:\n{}\n\nActual:\nsrc/very/long/path/{}.rs",
+            TEMPLATE.join("\n"),
             "a".repeat(300)
         );
         let table = render_arg_error_table(&long, 60).expect("table");
@@ -281,6 +303,32 @@ src/x.rs
             .map(|l| l.find('|').unwrap())
             .collect();
         assert!(columns.iter().all(|c| *c == gutter_column()), "{columns:?}");
+    }
+
+    /// A single-edit failure carries the JSON example, and gets no table: the
+    /// stacked `Expected:` / `Actual:` is two JSON values side by side in
+    /// reading order, where a table would be five `@@@OLD` rows against one row
+    /// of JSON.
+    #[test]
+    fn a_json_shaped_message_gets_no_table() {
+        let json_msg = "missing required field 'path'\n\nExpected:\n\
+            {\"path\": \"some/path.rs\", \"startLine\": 1234, \"oldText\": \"old text\", \
+             \"newText\": \"new text\"}\n\nActual:\n{\"newText\": \"b\", \"oldText\": \"a\"}";
+        assert!(render_arg_error_table(json_msg, 80).is_none());
+        // It is still an argument error — it splits, it just has no table.
+        let (why, expected, actual) = split_arg_error(json_msg).expect("splits");
+        assert_eq!(why, "missing required field 'path'");
+        assert!(expected.starts_with("{\"path\""), "{expected}");
+        assert_eq!(actual, vec!["{\"newText\": \"b\", \"oldText\": \"a\"}"]);
+    }
+
+    /// The gate is the *content* of `Expected:`, not its presence: any message
+    /// whose example is not the block template is left stacked, so a future
+    /// third shape inherits the behavior instead of getting a mismatched table.
+    #[test]
+    fn an_unrecognized_expected_section_gets_no_table() {
+        let other = "why\n\nExpected:\nsomething else entirely\n\nActual:\na";
+        assert!(render_arg_error_table(other, 80).is_none());
     }
 
     #[test]

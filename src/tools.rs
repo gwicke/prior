@@ -3136,7 +3136,10 @@ mod edit_args_wire_tests {
         let raw = result.output().render();
         let msg = blockedit::strip_arg_error_prefixes(&raw);
         assert!(msg.contains("Expected:"), "got: {msg}");
-        assert!(msg.contains("@@@OLD"), "got: {msg}");
+        // The correction is in the shape the caller used: this call is
+        // `oldText`-shaped, so it is shown the JSON call that works, not the
+        // block template.
+        assert!(msg.contains("\"oldText\": \"old text\""), "got: {msg}");
     }
 
     #[tokio::test]

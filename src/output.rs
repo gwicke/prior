@@ -1556,7 +1556,7 @@ fn short_banner(banner: &str) -> String {
 
 #[cfg(test)]
 mod sed_preview_body_tests {
-    use super::{get_preview, sed_preview_body, short_banner};
+    use super::{get_preview, sed_preview_body, short_banner, SED_PREVIEW_BANNER};
 
     const RESULT: &str = "sed preview: 2 blocks for src/x.rs (1 expression). Review the blocks below, then pass them to the `edit` tool as its `blocks` argument.
 src/x.rs:5
@@ -1683,23 +1683,26 @@ src/x.rs:9
     }
 
     /// An `edit` argument error is not a preview, however block-shaped it looks.
-    /// Every one of them embeds the `Expected:` example, and that example *is* a
-    /// well-formed block — so this is the case the `@@@OLD` sniff used to claim,
-    /// rendering the example as a diff and hiding the error behind it.
+    ///
+    /// A blob-shaped one used to be claimed by a content sniff for `@@@OLD`: its
+    /// `Expected:` example *is* a well-formed block, so the panel drew the
+    /// example as a diff and hid the error behind it. The gate is the
+    /// `sed preview:` banner now; no argument error carries one.
     #[test]
     fn an_edit_argument_error_is_not_mistaken_for_a_preview() {
-        // Four error shapes whose `Actual:` echo does not itself break the
-        // example block: a JSON echo, and an echo elided to one line.
+        // Blob shapes (once drawn as a phantom diff) and single-edit shapes
+        // alike: none of them is a preview.
         for raw in [
+            serde_json::json!({"blocks": "@@ -10,1 +10,1 @@\n- a\n+ b"}),
+            serde_json::json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@END"}),
             serde_json::json!({"oldText": "a", "newText": "b"}),
             serde_json::json!({"path": "src/x.rs:10", "startLine": 3, "oldText": "a", "newText": "b"}),
             serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]}),
-            serde_json::json!({"blocks": "@@ -10,1 +10,1 @@\n- a\n+ b"}),
         ] {
             let msg = crate::tools::EditArgs::from_wire(&raw).expect_err("must fail");
             assert!(
-                msg.contains("@@@OLD"),
-                "fixture must embed the example: {msg}"
+                !msg.starts_with(SED_PREVIEW_BANNER),
+                "claimed as a preview:\n{msg}"
             );
             assert!(
                 sed_preview_body(&msg).is_none(),
@@ -5874,6 +5877,37 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
                 flat.contains(&problem),
                 "problem line lost for {raw}: {problem:?}\n{text}"
             );
+        }
+    }
+
+    /// A single-edit failure shows a definition list, not the block table.
+    ///
+    /// The `Expected:` section follows the shape the caller used (see
+    /// `blockedit::wire`), so this message is JSON on both sides; `arg_error_view`
+    /// returns `None` for it and the panel stacks it. The table pairs *block
+    /// markers* against what the model sent, so against a JSON `Actual:` it was five
+    /// `@@@OLD` rows with one row of JSON beside them.
+    #[test]
+    #[serial_test::serial]
+    fn a_single_edit_failure_renders_as_a_definition_list() {
+        let (out, _reasoning) = capturing_output(80);
+        out.begin_capture_inner();
+        out.display_tool_result(
+            "missing required field 'path'\n\nExpected:\n\
+             {\"path\": \"some/path.rs\", \"startLine\": 1234, \"oldText\": \"old text\", \
+             \"newText\": \"new text\"}\n\nActual:\n{\"newText\":\"b\",\"oldText\":\"a\"}",
+        );
+        let bytes = out.end_capture_inner();
+        let text = strip_ansi(&String::from_utf8_lossy(&bytes));
+
+        assert!(!text.contains("|"), "a table was drawn:\n{text}");
+        assert!(!text.contains("@@@OLD"), "block markers leaked in:\n{text}");
+        assert!(text.contains("Expected:"), "{text}");
+        assert!(text.contains("Actual:"), "{text}");
+        // Both values survive to the screen, wrapped but intact.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for want in ["\"oldText\": \"old text\"", "\"oldText\":\"a\""] {
+            assert!(flat.contains(want), "{want:?} lost:\n{text}");
         }
     }
 
