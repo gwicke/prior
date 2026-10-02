@@ -1260,6 +1260,10 @@ impl NodeEntry {
             None => {
                 // Key mode: field names containing the typed prefix;
                 // `sort` injected so it shows up like any modifier key.
+                // The exactness contract (`value_completion`) cannot fire
+                // here by construction: a key-mode word has no `:`, while
+                // every candidate id ends with one — never byte-equal, and
+                // the next Tab step is the key → value progression.
                 let prefix = body;
                 let mut names: Vec<String> = field_space
                     .names(true)
@@ -1333,22 +1337,14 @@ impl NodeEntry {
                         .iter()
                         .map(|f| Row::new(format!(".sort:{}", f)).desc(field_desc(f)))
                         .collect();
-                    let match_indices = if rows.is_empty() {
-                        None
-                    } else {
-                        let mut map = HashMap::new();
-                        for (idx, fm) in match_by_rank.into_iter().enumerate() {
-                            if !fm.is_empty() {
-                                map.insert(idx, fm);
-                            }
-                        }
-                        Some(map)
-                    };
-                    return Ok(Rc::new(CompletionRows {
-                        rows,
-                        labels: None,
-                        match_indices,
-                    }));
+                    // `.sort:<field>` is a terminal token — nothing is left
+                    // to drill into after the field name (the `>`/`<`
+                    // direction suffix is free-form). The exactness
+                    // contract is what lets `Tab` commit it: on the
+                    // expanded word the candidate set is exactly the word
+                    // itself, so the completer reports nothing left and the
+                    // engine appends the trailing space.
+                    return Ok(Self::value_completion(rows, match_by_rank, word));
                 }
                 // Unknown key → no dialog (word stays positional).
                 let Some(spec) = field_space.spec(key) else {
@@ -1393,27 +1389,43 @@ impl NodeEntry {
                     .map(|v| Row::new(format!(".{}:{}", key, v)).desc("string"))
                     .collect();
                 // Exact match check: if all rows have the same id as the typed word, return empty (closes dialog).
-                let all_exact = !rows.is_empty() && rows.iter().all(|r| r.id == word);
-                let (final_rows, final_match_indices) = if all_exact {
-                    (Vec::new(), None)
-                } else if rows.is_empty() {
-                    (rows, None)
-                } else {
-                    let mut map = HashMap::new();
-                    for (idx, fm) in match_by_rank.into_iter().enumerate() {
-                        if !fm.is_empty() {
-                            map.insert(idx, fm);
-                        }
-                    }
-                    (rows, Some(map))
-                };
-                Ok(Rc::new(CompletionRows {
-                    rows: final_rows,
-                    labels: None,
-                    match_indices: final_match_indices,
-                }))
+                Ok(Self::value_completion(rows, match_by_rank, word))
             }
         }
+    }
+
+    /// The exactness contract, shared by every value-mode branch of
+    /// [`NodeEntry::default_complete`]: an empty match set, or one in
+    /// which *every* candidate is byte-equal to the typed word, means
+    /// nothing is left to complete — the completer answers with **no
+    /// rows**, so the dialog closes and the `Tab` arm's same-turn re-run
+    /// sees that empty result and appends the trailing space which
+    /// commits the token. Any non-exact candidate keeps the full set
+    /// (exact matches included) with its match indices for highlighting.
+    fn value_completion(
+        rendered: Vec<Row>,
+        match_by_rank: Vec<crate::fuzzy::MatchIndices>,
+        word: &str,
+    ) -> Rc<CompletionRows> {
+        let all_exact = !rendered.is_empty() && rendered.iter().all(|r| r.id == word);
+        if rendered.is_empty() || all_exact {
+            return Rc::new(CompletionRows {
+                rows: Vec::new(),
+                labels: None,
+                match_indices: None,
+            });
+        }
+        let mut indices = HashMap::new();
+        for (idx, fm) in match_by_rank.into_iter().enumerate() {
+            if !fm.is_empty() {
+                indices.insert(idx, fm);
+            }
+        }
+        Rc::new(CompletionRows {
+            rows: rendered,
+            labels: None,
+            match_indices: Some(indices),
+        })
     }
 
     /// Sort ranked_rows by a field value. Missing-field rows go last.
@@ -3628,6 +3640,73 @@ mod tests {
             MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, ".tier:free "),
             other => panic!("expected ContinuePrompt expansion, got {:?}", other),
         }
+    }
+
+    /// `.sort:<field>` is terminal, so the exactness contract is the only
+    /// thing that lets `Tab` commit it: the expanded word must report
+    /// "nothing left to complete", else the re-run keeps the dialog up and
+    /// Tab degenerates into a no-op that rewrites the prompt unchanged.
+    #[test]
+    fn completion_tab_final_sort_field_appends_trailing_space() {
+        let mut root = fielded_root();
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        // `.sort:t` → Tab expands to `.sort:tier`; the same-turn re-run
+        // over the expanded word finds only the word itself → trailing
+        // space (commits the modifier, closes the dialog).
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Tab,
+            Vec::new(),
+            ".sort:t",
+            &rctx(),
+        ));
+        match result {
+            MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, ".sort:tier "),
+            other => panic!("expected ContinuePrompt expansion, got {:?}", other),
+        }
+    }
+
+    /// The committed word must not re-open the dialog: `.sort:tier` is an
+    /// exact match, so the passive frame falls through to the listing
+    /// (sorted by `tier`) rather than offering the modifier again.
+    #[test]
+    fn completion_exact_sort_field_closes_dialog() {
+        let mut root = fielded_root();
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".sort:tier",
+            &rctx(),
+        ));
+        let dialog = match &result {
+            MenuResult::Continue(plan, _) => plan.table_header.is_some(),
+            other => panic!("expected Continue, got {:?}", other),
+        };
+        assert!(!dialog, "an exact sort field must not re-open the dialog");
+        let rows = rows_of(result);
+        assert!(rows.iter().any(|r| r.contains("m1")), "{rows:?}");
+    }
+
+    /// A direction suffix is free-form and matches no field name, so the
+    /// dialog is already down there — Tab must fall through to the
+    /// ordinary listing Tab (drill), never a rewrite.
+    #[test]
+    fn completion_sort_direction_suffix_is_terminal() {
+        let mut root = fielded_root();
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".sort:tier>",
+            &rctx(),
+        )));
+        assert!(
+            !rows.iter().any(|r| r.starts_with('.')),
+            "`>` matches no field name: {rows:?}"
+        );
     }
 
     #[test]
