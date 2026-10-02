@@ -161,11 +161,13 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
             Box::new(move |model| writer.set_setting(SettingKey::DefaultModel, model)),
             None, // no recent models for /set
         );
-        // Same actions as the live `/model`, minus `save`: here "activate"
-        // already writes the setting, and a default is not a live model with
-        // params to save.
+        // Same catalog listing as the live `/model`, but its own action leaf:
+        // here "activate" writes `default_model` in settings.toml. It must not
+        // reuse the live action node — that one switches the running model,
+        // loads its live params and journals a `ModelChange`, none of which
+        // belong to choosing a default.
         let mut child_menu: crate::slashdot_menu::menu::SlashDotMenuNode = child.into();
-        crate::v25_model::add_model_actions(&mut child_menu, app_state, false, 2);
+        child_menu.add_child(crate::v25_model::DefaultModelActivateNode::new(app_state).into());
         let mut wrapper: SlashDotMenuNode = ListingNode::new(
             app_state,
             &[StaticRow::new(

@@ -375,6 +375,33 @@ impl AppState {
             Self::write_live_params(&mut st, id, memory);
             return;
         }
+        let seeded = Self::seeded_params(&st, id);
+        Self::write_live_params(&mut st, id, seeded);
+    }
+
+    /// The reasoning level `id` would run at if it were activated right now,
+    /// without writing anything.
+    ///
+    /// The read-only half of [`Self::activate_model_params`]: both sides
+    /// resolve through [`Self::seeded_params`], so a preview can never drift
+    /// from the activation it is previewing. Asked wherever the answer must be
+    /// known *before* committing — the `activate` header ("omitted keeps this
+    /// level") and the resume prefill, which only carries a level when
+    /// activating would not produce that level by itself.
+    pub fn peek_model_reasoning(&self, id: &str) -> Option<crate::params::ReasoningLevel> {
+        let st = self.state.lock();
+        match st.model_param_map.get(id) {
+            Some(memory) => memory.reasoning,
+            None => Self::seeded_params(&st, id).reasoning,
+        }
+    }
+
+    /// Load-or-seed params for a model this session has not run yet, per A.6:
+    /// each field from its stored record, then the global default, then the
+    /// built-in. Per field, so a record that sets only `reasoning` still gets
+    /// the provider's own temperature rather than inheriting the outgoing
+    /// model's.
+    fn seeded_params(st: &State, id: &str) -> crate::params::ModelParams {
         let stored = st.settings.model_settings(id).cloned().unwrap_or_default();
         // `value()` returns the stored string, defaulting to "off" when the
         // key was never written.
@@ -387,12 +414,11 @@ impl AppState {
         // `Some(Off)`, so folding that to `None` here would make the seeded
         // value differ from the one the menu produces, and `params_changed`
         // would fire a rebuild for a value the user never touched.
-        let seeded = crate::params::ModelParams {
+        crate::params::ModelParams {
             reasoning: stored.reasoning.or(global_reasoning),
             temperature: stored.temperature,
             top_p: stored.top_p,
-        };
-        Self::write_live_params(&mut st, id, seeded);
+        }
     }
 
     /// The single writer of the live params: sets `config.params` and records
@@ -1034,5 +1060,43 @@ mod tests {
         let app = seeded_app(crate::model_settings::ModelSettings::default());
         app.activate_model_params("");
         assert!(app.state.lock().model_param_map.is_empty());
+    }
+
+    /// `peek_model_reasoning` is a *preview* of `activate_model_params`, so the
+    /// two must agree in every case the preview is asked about: a first visit
+    /// (the stored record), a re-visit (the session memory), and a model with
+    /// no record at all (the global). The resume prefill decides whether to
+    /// spell out a level by asking exactly this, and a preview that disagreed
+    /// with the activation would prefill a level the activation then overwrites.
+    #[test]
+    fn peeking_a_level_matches_what_activation_installs() {
+        let app = seeded_app(crate::model_settings::ModelSettings {
+            reasoning: Some(ReasoningLevel::Med),
+            ..Default::default()
+        });
+        // First visit: the record.
+        assert_eq!(
+            app.peek_model_reasoning("test:model"),
+            Some(ReasoningLevel::Med)
+        );
+        app.activate_model_params("test:model");
+        assert_eq!(
+            app.peek_model_reasoning("test:model"),
+            app.params().reasoning
+        );
+        // Re-visit: the runtime value, which the record no longer describes.
+        app.set_reasoning(Some(ReasoningLevel::Max));
+        assert_eq!(
+            app.peek_model_reasoning("test:model"),
+            Some(ReasoningLevel::Max),
+            "a visited model previews its runtime level, not its record"
+        );
+        // A model with no record previews the global default.
+        assert_eq!(
+            app.peek_model_reasoning("test:other"),
+            Some(ReasoningLevel::Low)
+        );
+        // Peeking writes nothing.
+        assert!(!app.state.lock().model_param_map.contains_key("test:other"));
     }
 }

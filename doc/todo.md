@@ -1,30 +1,3 @@
-- [x] Compaction unification (Phase 7)
-  - [x] /compact command — same as `/tree <id> compact` but at current position.
-        Resolves `target_id` to the last user message on the active branch and
-        commits a canonical `/tree <last_user_id> compact <mode>` line so the
-        existing /tree handler is the single entry point. Three modes
-        (manual / text-only / llm; `truncate` aliases `manual`); same
-        `llm_compact_prompt` setting; same prompt-customization path.
-        Backend: the Phase-7 `run_compaction` was replaced by the
-        editor-cleanup E3 `generate_compaction` / `apply_compaction` split
-        (doc/editor_cleanup.md §6).
-- [x] `/tree <id> switch summarize` — the `switch` leaf became a sub-menu:
-        `cursor` (today's behavior) and `summarize` → `manual` / `text-only` /
-        `prompt` (`switch summarize prompt <prompt>` for a custom focus),
-        reusing the compaction nodes' generate → $EDITOR → confirm flow. Backend:
-        `agent::generate_branch_summary` (pi's spur +
-        `BRANCH_SUMMARY_PROMPT`) and `apply_branch_summary` (pi's
-        `branchWithSummary`: move the leaf to the target, then append a
-        `branch_summary` parented there, so the digest is inline on the branch
-        the conversation continues on). `BranchSummary` → user message in
-        `extract_messages` (pi `sessionEntryToContextMessages`; the wrapper
-        text is ours — `Branch summary:` — matching the house style `78c7e7a`
-        set for the compaction wrapper). Same pass added `/tree <id> edit` — pi's user-message
-        re-edit (leaf = the prompt's parent + input prefill) as its own row, so
-        `switch cursor` keeps its "continue after this prompt" meaning.
-        Design + parity record + divergences: `doc/branch_summary.md`.
-        (The old typed arm's version — parented at the spur tip with `from_id`
-        = the common ancestor — was **not** pi's shape.)
 - [x] Non-REPL slash input (in-process / non-tty hosts) — routed through the
       v2.5 menu eval (`Repl::batch_slash`: passive derive + virtual Enter,
       drawing ignored); the four typed arms are deleted
@@ -36,10 +9,13 @@
       source — one-shots go through `Commands::Input`/the positional prompt).
       Either make `QuietOutput` read lines (batch-friendly: pairs with
       `Repl::batch_slash`) or stop the loop on empty input.
-- [ ] Thinking-level restore on `/session <id> resume` (single input field
-      currently can only carry one prefill — model or thinking. Bundle both
-      into a slug syntax like `/thinking <level> & /model <slug>` or a new
-      `/resume-config <slug>` once the need arises.)
+- [x] Reasoning level restore on `/session <id> resume`
+      `/model <id> activate [off|low|med|high|max]` — the optional level is set
+      after the activation seeds the model's own; advertised in the activate
+      leaf's `header()`. The resume prefill carries the session's level only
+      when activating that model would not reproduce it (`AppState::
+      peek_model_reasoning`), else the short `/model <id>` stands.
+      Deferred: a level auto-completion dialog on the activate leaf.
 - [x] Address resume stack overflow in debug builds: resume_stack_overflow_audit.md
 - [ ] table rendering and filtering: dynamic columns
   - Include filter / sort columns in layout (.columns)
