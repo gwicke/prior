@@ -154,6 +154,11 @@ pub fn rows_of(text: &str, term_w: usize) -> usize {
 /// break columns, wide glyphs moved whole, escapes never split), and the row
 /// count does not move: `rows_of` counts a wrap and a `\n` the same way —
 /// pinned by `wrap_to_width_keeps_rows_of_honest`.
+///
+/// The batch form of the guard: production wraps incrementally in
+/// `output::WrapLines` (the one choke `with_content_writer` puts under every
+/// writer). This stays as the readable specification of the break rule and
+/// the accounting pin both forms share.
 pub fn wrap_to_width(text: &str, width: usize) -> String {
     if width == 0 {
         return text.to_string();

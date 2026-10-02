@@ -71,7 +71,12 @@ fn term_gate(term: &str) -> (usize, usize) {
 /// chars containing at least `required` matches. This is the density gate that
 /// suppresses scattered single-char subsequence noise; a fully dense cell
 /// (every char matched) always survives.
-fn qualify_positions(n_chars: usize, matched: &[usize], min_term: usize, required: usize) -> Vec<usize> {
+fn qualify_positions(
+    n_chars: usize,
+    matched: &[usize],
+    min_term: usize,
+    required: usize,
+) -> Vec<usize> {
     if matched.is_empty() || n_chars == 0 {
         return Vec::new();
     }
