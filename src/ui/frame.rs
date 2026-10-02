@@ -719,29 +719,6 @@ pub(crate) fn plan_apply(
         .live
         .as_ref()
         .is_some_and(|live| live.term_w == tw && live.term_h == th);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/held.log")
-    {
-        let info = match cache.live.as_ref() {
-            Some(l) => format!(
-                "top={} h={} dims={}x{}",
-                l.frame_top_row,
-                l.frame.height(),
-                l.term_w,
-                l.term_h
-            ),
-            None => "none".to_string(),
-        };
-        let _ = std::io::Write::write_all(
-            &mut f,
-            format!(
-                "APPLY h={h} tw={tw} th={th} anchor={anchor} live=[{info}] dims_ok={dims_ok}\n"
-            )
-            .as_bytes(),
-        );
-    }
     // The diff path writes without newlines — it can never scroll — so the
     // frame must *fit* where it stands: a grow past the screen's bottom row
     // would write the new rows off the end (`CUD` clamps, and they land on the
@@ -822,17 +799,6 @@ fn paint_forward(
     debug_assert!(h > 0, "paint_forward needs rows to paint");
     let consumed = std::mem::take(&mut cache.consumed_rows);
     let orphan = old_h.saturating_sub(h + consumed);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/held.log")
-    {
-        let _ = std::io::Write::write_all(
-            &mut f,
-            format!("PAINT top={top} h={h} old_h={old_h} consumed={consumed} orphan={orphan}\n")
-                .as_bytes(),
-        );
-    }
     let mut s = String::new();
     // The block. `CR` + `EL` on entry is the overwrite rule: one line clear,
     // immediately followed by the row's bytes (the row is padded, so the pair
@@ -900,6 +866,10 @@ fn plan_partial(cache: &mut DrawCache, frame: &Frame, top: usize, th: usize) -> 
     let (to_r, to_c) = frame_caret(frame);
     let mut s = String::new();
     let mut at = from.0;
+    // Did this apply move a single byte? With `touched` false the cursor is
+    // still *at* the old caret — row `at`, column `from.1` — which is what
+    // makes the caret-only emit below worth deciding on.
+    let mut touched = false;
     {
         let old = &cache
             .live
@@ -919,13 +889,21 @@ fn plan_partial(cache: &mut DrawCache, frame: &Frame, top: usize, th: usize) -> 
             s.push('\r');
             s.push_str(bytes);
             at = i;
+            touched = true;
         }
     }
     move_rows(&mut s, at, to_r);
-    // `CR` first, for the same reason as `push_caret`: the last repainted row
-    // left the cursor at its end, and `CUF` walks from the current column.
-    s.push('\r');
-    cuf(&mut s, to_c);
+    // Caret-only moves (ui_draw_261001's open question, answered): the diff
+    // subsumes them — nothing painted means the column is still `from.1`, so
+    // a caret that didn't move writes **zero bytes** (an apply that changes
+    // nothing is a no-op on the wire), and one that only moved across columns
+    // writes this `CR` + `CUF` and nothing else. `CR` first, for the same
+    // reason as `push_caret`: a repainted row left the cursor at its end, and
+    // `CUF` walks from the current column.
+    if touched || to_c != from.1 {
+        s.push('\r');
+        cuf(&mut s, to_c);
+    }
     let (term_w, term_h) = {
         let live = cache.live.as_ref().expect("partial needs a live frame");
         (live.term_w, live.term_h)
@@ -1019,20 +997,6 @@ pub(crate) fn plan_reposition(
     let h = frame.height();
     debug_assert!(h > 0, "reposition needs rows to paint");
     let top = cache.caret.0.clamp(1, th);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/held.log")
-    {
-        let _ = std::io::Write::write_all(
-            &mut f,
-            format!(
-                "REPOS old_h={old_h} consumed={} top={top} h={h} th={th}\n",
-                cache.consumed_rows
-            )
-            .as_bytes(),
-        );
-    }
     paint_forward(cache, frame, top, tw, th, old_h)
 }
 
@@ -1793,6 +1757,39 @@ mod apply_tests {
         assert_eq!(rows[4], "aa");
         assert_eq!(rows[5], "XX");
         assert_eq!(rows[6], "cc");
+    }
+
+    /// The caret-only question (ui_draw_261001) — the steady half: an apply
+    /// that changes no row bytes and wants the caret where it already is
+    /// writes nothing at all.
+    #[test]
+    fn identical_apply_with_a_steady_caret_emits_nothing() {
+        let mut cache = DrawCache::new(10);
+        let f = lines_frame(&["row a", "row b"], 20);
+        cursor_to(&mut cache, 5, 10);
+        let first = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
+        assert!(!first.is_empty(), "the first paint writes: {first:?}");
+        let second = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
+        assert_eq!(
+            second, "",
+            "identical frame, steady caret: nothing to emit: {second:?}"
+        );
+    }
+
+    /// The caret-only question — the moving half: same rows, caret in a new
+    /// column, is only its relative walk — no row bytes, no clears.
+    #[test]
+    fn caret_only_change_walks_without_row_bytes() {
+        let mut cache = DrawCache::new(10);
+        let mut f = lines_frame(&["row a"], 20);
+        f.caret = Some((0, 1));
+        cursor_to(&mut cache, 5, 10);
+        let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
+        let mut g = lines_frame(&["row a"], 20);
+        g.caret = Some((0, 4));
+        let s = plan_apply(&mut cache, &g, ApplyPolicy::Frame, 20, 10);
+        assert_eq!(s, "\r\x1b[4C", "CR + CUF and nothing else: {s:?}");
+        assert_eq!(cache.caret, (5, 4), "and the tracked caret follows");
     }
 
     #[test]

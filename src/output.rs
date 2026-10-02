@@ -2046,10 +2046,6 @@ impl ConsoleOutput {
             std::backtrace::Backtrace::force_capture()
         );
 
-        let dbg_caret_before = {
-            let cache = self.draw.lock().unwrap();
-            cache.anchor()
-        };
         // Content goes to a buffer first, through the line-clear transform
         // (a line clear with each line the write enters — overwrite, one pass,
         // ui_draw_261001). Nothing reaches the stream until the write is known
@@ -2167,21 +2163,6 @@ impl ConsoleOutput {
             cache.last_content_closes_segment = closed || closes_segment;
         }
         let rows = counter.rows();
-        let dbg_caret_after = self.draw.lock().unwrap().anchor();
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/held.log")
-        {
-            let _ = writeln!(
-                f,
-                "old={old:?} kind={kind:?} closes={closes_segment} opener={opener} \
-                 held={held} rows_due={rows_due} content={wrote_content} \
-                 rows={rows} anchor={dbg_caret_before}->{dbg_caret_after} \
-                 carried={carried} tail={:?}",
-                String::from_utf8_lossy(&tail).replace('\x1b', "\\e")
-            );
-        }
         let _ = counter.flush();
         drop(counter);
         drop(clear);
