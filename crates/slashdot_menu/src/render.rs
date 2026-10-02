@@ -306,6 +306,171 @@ mod tests {
         let painted = paint_overlay(&plan, 40, 24);
         assert_eq!(paint_plan(&plan, 40, 24), painted.rows.join("\n"));
     }
+
+    // --- the three section painters ---------------------------------------
+    //
+    // Each section paints on its own, from a width and nothing else — no
+    // budget, no `term_h`, no knowledge of what will be shown. That is what
+    // lets a host compose the sections as separate frame elements and let the
+    // frame do the budgeting once.
+
+    /// A section's rows are already split, and `heights` is parallel to the
+    /// source lines: `sum(heights) == rows.len()`, and `offset_at` is the
+    /// running sum. The invariant every windowing caller leans on.
+    #[test]
+    fn section_heights_are_parallel_to_the_source_lines() {
+        let lines = vec![
+            LogicalLine::new("one"),
+            LogicalLine::new("two\nwrapped\nlines"),
+            LogicalLine::new("three"),
+        ];
+        let s = paint_detail(&lines, 40);
+        assert_eq!(s.heights, vec![1, 3, 1]);
+        assert_eq!(s.height(), s.rows.len());
+        assert_eq!(s.height(), s.heights.iter().sum::<usize>());
+        assert_eq!(s.offset_at(0), 0);
+        assert_eq!(s.offset_at(1), 1, "row 1 starts after row 0");
+        assert_eq!(s.offset_at(2), 4, "row 2 starts after the 3-line row");
+        assert_eq!(s.offset_at(99), 5, "past the end clamps to the total");
+    }
+
+    /// A multi-line logical row stays *whole*: `slice` hands back exactly that
+    /// row's painted rows, so a window can never cut one in half.
+    #[test]
+    fn section_slice_returns_whole_logical_rows() {
+        let lines = vec![
+            LogicalLine::new("a"),
+            LogicalLine::new("b1\nb2\nb3"),
+            LogicalLine::new("c"),
+            LogicalLine::new("d"),
+        ];
+        let s = paint_detail(&lines, 40);
+        assert_eq!(s.heights, vec![1, 3, 1, 1]);
+        assert_eq!(s.slice(1, 1).len(), 3, "the wrapped row is all 3 rows");
+        assert!(s.slice(1, 1)[0].contains("b1"), "{:?}", s.slice(1, 1)[0]);
+        assert!(s.slice(1, 1)[2].contains("b3"), "{:?}", s.slice(1, 1)[2]);
+        assert_eq!(s.slice(2, 2).len(), 2, "two one-line rows");
+        assert_eq!(s.slice(0, 99).len(), 6, "an over-long count clamps");
+        assert!(s.slice(99, 1).is_empty(), "an empty slice past the end");
+    }
+
+    /// The table header is one logical row in and one terminal row out — the
+    /// property that lets a host make it a frame element whose whole height is
+    /// known up front, and so budget it as one row. `None` paints nothing, so a
+    /// plan without columns contributes no rows.
+    #[test]
+    fn header_paints_one_row_or_nothing() {
+        let none = paint_header(None, 60);
+        assert!(none.rows.is_empty() && none.heights.is_empty());
+
+        let some = paint_header(Some(&LogicalLine::new("MODEL      CTX")), 60);
+        assert_eq!(some.heights, vec![1]);
+        assert_eq!(some.height(), 1);
+        assert_eq!(display_width(&some.rows[0]), 60, "padded to full width");
+    }
+
+    /// Rows get their markers from `selected` / `active_rows`, and the section
+    /// measures each one — an over-long row is taller here too.
+    #[test]
+    fn row_section_carries_markers_and_measures_split_rows() {
+        let rows = vec![
+            LogicalLine::new("plain"),
+            LogicalLine::new("active"),
+            LogicalLine::new("selected"),
+            LogicalLine::new("w".repeat(200)),
+        ];
+        let s = paint_rows(&rows, Some(2), &[1], 60);
+        assert!(s.rows[0].contains("  plain"));
+        assert!(
+            s.rows[1].contains("* active"),
+            "active marker: {:?}",
+            s.rows[1]
+        );
+        assert!(s.rows[2].contains("> selected"));
+        assert_eq!(s.heights[3], 4, "the over-long row was split and measured");
+        assert_eq!(s.height(), s.rows.len());
+    }
+
+    /// A selected *and* active row shows `*` — active wins. Pinned on the
+    /// section painter because that is where the style is now decided.
+    #[test]
+    fn row_section_active_marker_beats_cursor() {
+        let rows = vec![LogicalLine::new("both")];
+        let s = paint_rows(&rows, Some(0), &[0], 60);
+        assert!(s.rows[0].contains("* both"), "{:?}", s.rows[0]);
+        assert!(
+            !s.rows[0].contains(">"),
+            "no cursor marker: {:?}",
+            s.rows[0]
+        );
+    }
+
+    /// The detail section does not truncate — a caller budgets it. Every line
+    /// survives painting; an over-long one is split so the caller can still cut
+    /// at a line boundary.
+    #[test]
+    fn detail_paints_every_line_and_leaves_the_cut_to_the_caller() {
+        let long = "d".repeat(150);
+        let lines = vec![
+            LogicalLine::new("first"),
+            LogicalLine::new(long.clone()),
+            LogicalLine::new("last"),
+        ];
+        let s = paint_detail(&lines, 60);
+        assert_eq!(s.heights.len(), 3, "all three logical lines kept");
+        assert_eq!(s.heights[0], 1);
+        assert!(s.heights[1] > 1, "the long line was split");
+        assert_eq!(s.heights[2], 1);
+        assert_eq!(s.height(), s.rows.len());
+    }
+
+    /// Composing the sections by hand is exactly what `paint_overlay` does, so
+    /// a host building separate frame elements gets the same bytes.
+    #[test]
+    fn composing_sections_by_hand_matches_paint_overlay() {
+        let plan = RenderPlan {
+            table_header: Some(LogicalLine::new("MODEL")),
+            detail: vec![LogicalLine::new("pick one")],
+            rows: Rc::new(
+                (0..20)
+                    .map(|i| LogicalLine::new(format!("model-{i}")))
+                    .collect(),
+            ),
+            selected: Some(15),
+            active_rows: vec![3],
+        };
+        let detail = paint_detail(&plan.detail, 60);
+        let header = paint_header(plan.table_header.as_ref(), 60);
+        let rows = paint_rows(&plan.rows, plan.selected, &plan.active_rows, 60);
+        // detail, then header, then the data rows from the top: the section
+        // order, painted but not windowed.
+        let mut hand: Vec<String> = Vec::new();
+        hand.extend_from_slice(&detail.rows);
+        hand.extend_from_slice(&header.rows);
+        hand.extend_from_slice(&rows.rows);
+
+        let painted = paint_overlay(&plan, 60, 24);
+        assert_eq!(hand[..2], painted.rows[..2], "detail + header come first");
+        assert!(hand[2].contains("model-0"), "the section starts at row 0");
+        // The hand-built section has every row; `paint_overlay` windowed them
+        // to the budget, so it is strictly shorter — and the window *contains*
+        // the selection (it fills past it, which is `window_heights`' rule).
+        assert_eq!(rows.height(), 20);
+        assert!(painted.rows.len() < hand.len(), "the plan was windowed");
+        let focus = painted.focus.expect("the selection is painted");
+        assert!(
+            painted.rows[focus].contains("> model-15"),
+            "the focus row is the selection: {:?}",
+            painted.rows[focus]
+        );
+        // Detail + header sit above the window, so the focus index carries them.
+        assert_eq!(focus, 2 + 9, "2 fixed rows + 9 into the data window");
+        assert!(
+            painted.rows.last().unwrap().contains("model-19"),
+            "the window reaches the last row: {:?}",
+            painted.rows.last().unwrap()
+        );
+    }
 }
 
 use crate::table::display_width;
@@ -376,13 +541,6 @@ pub fn paint_row(content: &str, style: RowStyle, tw: usize) -> String {
         out.push(format!("{bg}{fg}{text}{}\x1b[0m", " ".repeat(pad)));
     }
     out.join("\n")
-}
-
-/// Append one painted block's terminal rows to `rows`.
-fn push_block(block: &str, rows: &mut Vec<String>) {
-    for line in block.split('\n') {
-        rows.push(line.to_string());
-    }
 }
 
 /// Visual rows a `LogicalLine` occupies *as the engine wrote it*: its
@@ -557,61 +715,141 @@ pub struct PaintedOverlay {
     pub data_budget: usize,
 }
 
+/// One overlay section painted into terminal rows, with the per-logical-row
+/// heights that let a caller window or truncate it afterwards.
+///
+/// The rows are **already split** — one `String` per terminal row, no embedded
+/// newline — so a caller never re-derives a row count, and
+/// `heights.iter().sum() == rows.len()` holds by construction. `heights` is
+/// what keeps a multi-line logical row (a wrapped description, or a row the
+/// painter split because it was too wide) *together*: `offset_at(i)` is where
+/// logical row `i` starts, so `rows[offset_at(i) .. offset_at(i) + heights[i]]`
+/// is that row and nothing else.
+///
+/// Keeping the height bookkeeping beside the painted rows is what lets the
+/// three painters below take a width and nothing else — no budget, no
+/// `term_h`, no knowledge of what will be shown. Budgeting and windowing stay
+/// with the caller, which is where they already live ([`window_heights`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaintedSection {
+    /// Painted terminal rows, one per screen row, in order.
+    pub rows: Vec<String>,
+    /// Painted height of each logical row this section was built from;
+    /// parallel to the source `LogicalLine`s.
+    pub heights: Vec<usize>,
+}
+
+impl PaintedSection {
+    /// Terminal-row offset at which logical row `i` starts — the running sum
+    /// of the heights before it. An `i` past the end clamps to `rows.len()`.
+    pub fn offset_at(&self, i: usize) -> usize {
+        self.heights[..i.min(self.heights.len())].iter().sum()
+    }
+
+    /// The painted rows of logical rows `[start, start + count)`, clamped to
+    /// what exists — the window a caller chose out of [`Self::heights`].
+    pub fn slice(&self, start: usize, count: usize) -> &[String] {
+        let from = self.offset_at(start);
+        let to = self.offset_at(start.saturating_add(count));
+        &self.rows[from..to]
+    }
+
+    /// Total painted height — the same number as `rows.len()`, named for what
+    /// it is used for: space budgets.
+    pub fn height(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+/// Paint a slice of logical lines, one `style(i)` per line, and measure each
+/// line's painted height. The shared body of the three painters below — they
+/// differ only in which style a line gets.
+fn paint_section(
+    lines: &[LogicalLine],
+    tw: usize,
+    style: impl Fn(usize) -> RowStyle,
+) -> PaintedSection {
+    let mut rows = Vec::new();
+    let mut heights = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let block = paint_row(&line.0, style(i), tw);
+        heights.push(block.split('\n').count());
+        for r in block.split('\n') {
+            rows.push(r.to_string());
+        }
+    }
+    PaintedSection { rows, heights }
+}
+
+/// Paint the **detail** section — the node's `header()` output: plain text, no
+/// background, indented to line up with the data rows.
+///
+/// Nothing is dropped here. A detail line wider than the terminal is *split*
+/// (so the section can be cut at a line boundary); deciding *how many* detail
+/// lines fit is the caller's budget, not the painter's.
+pub fn paint_detail(detail: &[LogicalLine], term_w: usize) -> PaintedSection {
+    paint_section(detail, term_w.max(1), |_| RowStyle::Detail)
+}
+
+/// Paint the **table header** — the column-label line, on its own background.
+///
+/// At most one logical row in, and one terminal row out (a label line too wide
+/// for the terminal is split, not wrapped, per [`paint_row`]). `None` — a plan
+/// with no columns to label — paints nothing.
+pub fn paint_header(table_header: Option<&LogicalLine>, term_w: usize) -> PaintedSection {
+    let tw = term_w.max(1);
+    match table_header {
+        Some(th) => paint_section(std::slice::from_ref(th), tw, |_| RowStyle::TableHeader),
+        None => PaintedSection::default(),
+    }
+}
+
+/// Paint the **data rows**, each with its own marker (`>` selected, `*` active,
+/// two spaces otherwise) and background.
+///
+/// Every row is painted, including rows no window will show: this is
+/// O(rows), not O(window). A caller that wants only the window should window
+/// the `LogicalLine`s first and paint that — which is what [`PaintedSection`]
+/// makes expressible.
+pub fn paint_rows(
+    rows: &[LogicalLine],
+    selected: Option<usize>,
+    active_rows: &[usize],
+    term_w: usize,
+) -> PaintedSection {
+    let tw = term_w.max(1);
+    paint_section(rows, tw, |i| RowStyle::Data {
+        selected: selected == Some(i),
+        active: active_rows.contains(&i),
+    })
+}
+
 /// Paint an engine `RenderPlan` into terminal rows: detail lines, table
 /// header, then data rows windowed around `selected` within the 2/3-height
 /// overlay budget. Shared by the plan-carrying overlay variants (slash
 /// `V25Menu`, prose `PathComplete`) — the one place a `RenderPlan` becomes
 /// display rows, and the only place that knows the resulting geometry.
 ///
-/// Everything is painted first, then budgeted in *painted* rows: the painter
-/// owns both the fitting ([`paint_row`]) and the measurement, so `rows.len()`
-/// is the number of terminal rows the overlay occupies, and every budget,
-/// window and page size below is in that same unit.
+/// Composes the three section painters, so section order, styles and
+/// measurement are defined once and shared with any caller that composes
+/// sections itself. Budgeting happens here, in painted rows: the painter owns
+/// both the fitting ([`paint_row`]) and the measurement, so `rows.len()` is the
+/// number of terminal rows the overlay occupies, and every budget, window and
+/// page size below is in that same unit.
 pub fn paint_overlay(plan: &RenderPlan, term_w: usize, term_h: usize) -> PaintedOverlay {
-    let tw = term_w.max(1);
     // `term_h` is the full terminal height; 2/3 is the overlay budget.
     let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
     let min_rows = 3usize;
 
-    // --- Paint every section, then budget what was painted. ---
-    // 1. Detail (header() output — no background, stands out), each block
-    //    kept whole so it can be truncated as a unit.
-    let detail_blocks: Vec<String> = plan
-        .detail
-        .iter()
-        .map(|d| paint_row(&d.0, RowStyle::Detail, tw))
-        .collect();
-    // 2. Table header (column labels, grey background) — never truncated.
-    let header_block = plan
-        .table_header
-        .as_ref()
-        .map(|th| paint_row(&th.0, RowStyle::TableHeader, tw));
-    // 3. Data rows, each painted with its own marker and background.
-    let row_blocks: Vec<String> = plan
-        .rows
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            paint_row(
-                &r.0,
-                RowStyle::Data {
-                    selected: plan.selected == Some(i),
-                    active: plan.active_rows.contains(&i),
-                },
-                tw,
-            )
-        })
-        .collect();
+    let detail = paint_detail(&plan.detail, term_w);
+    let header = paint_header(plan.table_header.as_ref(), term_w);
+    let data = paint_rows(&plan.rows, plan.selected, &plan.active_rows, term_w);
 
-    let block_height = |b: &str| b.split('\n').count();
-    let detail_heights: Vec<usize> = detail_blocks.iter().map(|b| block_height(b)).collect();
-    let data_heights: Vec<usize> = row_blocks.iter().map(|b| block_height(b)).collect();
-    let header_height = header_block.as_ref().map_or(0, |b| block_height(b));
     let (detail_budget, data_budget) = compute_space_budget(
         SectionHeights {
-            detail: detail_heights.iter().sum(),
-            table_header: header_height,
-            data: data_heights.iter().sum(),
+            detail: detail.height(),
+            table_header: header.height(),
+            data: data.height(),
         },
         max_pop,
         min_rows,
@@ -620,50 +858,53 @@ pub fn paint_overlay(plan: &RenderPlan, term_w: usize, term_h: usize) -> Painted
     // --- Emit. ---
     let mut rows: Vec<String> = Vec::new();
 
-    // 1. Detail, truncated from the bottom to its budget.
+    // 1. Detail, truncated from the bottom to its budget. Lines stay whole:
+    //    the cut lands between detail lines, never inside one.
     let mut detail_used = 0usize;
-    for (block, &height) in detail_blocks.iter().zip(&detail_heights) {
+    let mut detail_end = 0usize;
+    for &height in &detail.heights {
         if detail_used + height > detail_budget {
             break;
         }
-        push_block(block, &mut rows);
         detail_used += height;
+        detail_end += height;
     }
+    rows.extend_from_slice(&detail.rows[..detail_end]);
     // Detail that did not use its budget gives the surplus to the rows.
     let data_budget = data_budget + (detail_budget - detail_used);
 
     // 2. Table header.
-    if let Some(block) = &header_block {
-        push_block(block, &mut rows);
-    }
+    rows.extend_from_slice(&header.rows);
 
     // 3. Data rows, windowed around `selected` in painted rows. The focus is
     //    the painted index of the selection's first row, so it survives a
     //    truncated detail section, a table header, a multi-row selection, and
     //    the `*` active marker that hides the `>` cursor marker.
-    let total = row_blocks.len();
+    let total = data.heights.len();
     let mut focus = None;
     if total > 0 {
         let sel_idx = plan.selected.unwrap_or(0);
-        let (win_start, win_count) = window_heights(&data_heights, sel_idx, data_budget);
+        let (win_start, win_count) = window_heights(&data.heights, sel_idx, data_budget);
         let win_count = win_count.min(total.saturating_sub(win_start));
-        for (i, block) in row_blocks
+        for (i, height) in data
+            .heights
             .iter()
             .enumerate()
             .skip(win_start)
             .take(win_count)
         {
+            let start = data.offset_at(i);
             if plan.selected == Some(i) {
                 focus = Some(rows.len());
             }
-            push_block(block, &mut rows);
+            rows.extend_from_slice(&data.rows[start..start + height]);
         }
     }
 
     PaintedOverlay {
         rows,
         focus,
-        data_heights,
+        data_heights: data.heights,
         data_budget,
     }
 }
