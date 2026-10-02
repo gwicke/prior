@@ -5922,8 +5922,19 @@ pub async fn run_interactive(
 /// function stays pure / easily testable.
 #[derive(Debug, Clone)]
 pub struct SessionStatsInfo {
-    /// User-assigned display name, if any. Falls back to the session id.
-    pub display_name: String,
+    /// The session UUID. Always shown: it is the one identifier every session
+    /// has, and it is what `/session <id>` takes.
+    pub id: String,
+    /// User-assigned name, if any. `None` (or empty) drops the line — a name
+    /// the user never set is not the same fact as a name that happens to be
+    /// blank, and printing `name:` with nothing after it says neither.
+    pub name: Option<String>,
+    /// Working directory recorded in the session header. `None` (or empty)
+    /// drops the line rather than printing a blank path: the header's `cwd`
+    /// is a required field, but a hand-written or foreign session file can
+    /// still leave it empty, and a bare `cwd:` reads as a bug rather than
+    /// as "unknown".
+    pub cwd: Option<String>,
     /// ISO 8601 creation timestamp (from the session header).
     pub created: String,
     /// ISO 8601 timestamp of the most recent user message, if any.
@@ -6649,7 +6660,20 @@ pub fn session_stats_lines(
     // ── session section ─────────────────────────────────────────────────
     match session {
         Some(s) => {
-            lines.push(format!("session: {}", s.display_name));
+            // The id, not the name-or-id fallback the `/session` header uses:
+            // here the name gets its own line below, so folding it into the
+            // headline would print the same string twice and leave the reader
+            // unable to tell a name from a UUID.
+            lines.push(format!("session: {}", s.id));
+            if let Some(name) = s.name.as_deref().filter(|n| !n.is_empty()) {
+                lines.push(format!("  name: {}", name));
+            }
+            // The full path, not the session listing's `relativize_for_display`
+            // form: the overlay lists sessions from *every* cwd, so a
+            // cwd-relative rendering would not say which tree this one is in.
+            if let Some(cwd) = s.cwd.as_deref().filter(|c| !c.is_empty()) {
+                lines.push(format!("  cwd: {}", cwd));
+            }
             let created = format_stat_ts(&s.created);
             let last = s
                 .last_updated
@@ -10799,7 +10823,9 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         use super::{session_stats_lines, SessionStatsInfo, SessionUsage};
 
         let info = SessionStatsInfo {
-            display_name: "my-session".into(),
+            id: "0199f3c1-7a2e-7000-8000-000000000000".into(),
+            name: Some("my-session".into()),
+            cwd: Some("/home/gabriel/src/picocode2".into()),
             created: "2025-01-02T03:04:05.000Z".into(),
             last_updated: Some("2025-01-02T10:11:12.000Z".into()),
             message_count: 14,
@@ -10816,24 +10842,25 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             &Default::default(),
         );
 
-        // The first three lines are the new "session:" section.
+        // The first five lines are the "session:" section.
+        assert_eq!(lines[0], "session: 0199f3c1-7a2e-7000-8000-000000000000");
+        // The name is its own line, not folded into the headline — otherwise
+        // a reader cannot tell a name from a UUID.
+        assert_eq!(lines[1], "  name: my-session");
+        // The cwd is quoted whole: the overlay lists sessions from every
+        // cwd, so a shortened form would not say which tree this is in.
+        assert_eq!(lines[2], "  cwd: /home/gabriel/src/picocode2");
         assert!(
-            lines[0].starts_with("session:"),
-            "expected session header, got {:?}",
-            lines[0]
-        );
-        assert!(lines[0].contains("my-session"));
-        assert!(
-            lines[1].starts_with("  created:") && lines[1].contains("last update"),
+            lines[3].starts_with("  created:") && lines[3].contains("last update"),
             "expected created/last update line, got {:?}",
-            lines[1]
+            lines[3]
         );
         // Both turn and message counts must be shown — the former is the
         // number of user prompts (= turns), the latter the total entries
         // (user + assistant + toolResult).
-        assert_eq!(lines[2], "  size: 7 turns (14 messages)");
+        assert_eq!(lines[4], "  size: 7 turns (14 messages)");
         // New line: estimated context tokens
-        assert_eq!(lines[3], "  estimated context tokens: 42000");
+        assert_eq!(lines[5], "  estimated context tokens: 42000");
 
         // Then the "model:" section starts on the next line, with the rest
         // of the existing context-window / usage / cost / cache rows.
@@ -10841,9 +10868,85 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             .iter()
             .position(|l| l.starts_with("model:"))
             .expect("model section must be present");
-        assert!(model_idx >= 4, "model section must follow session section");
+        assert!(model_idx >= 6, "model section must follow session section");
         assert!(lines[model_idx].contains("openrouter:minimax/minimax-m3:free"));
         assert!(lines.iter().any(|l| l.contains("context window limit")));
+    }
+
+    /// A session with no recorded cwd drops the line. `cwd` is a required
+    /// header field, so an empty one means a malformed or hand-written
+    /// session file — printing `cwd: ` would read as a rendering bug, and
+    /// inventing a value would be a lie about where the session was started.
+    #[test]
+    fn session_stats_lines_omits_an_empty_cwd() {
+        use super::{session_stats_lines, SessionStatsInfo, SessionUsage};
+
+        for cwd in [None, Some(String::new())] {
+            let info = SessionStatsInfo {
+                id: "0199f3c1-7a2e-7000-8000-000000000000".into(),
+                name: Some("my-session".into()),
+                cwd,
+                created: "2025-01-02T03:04:05.000Z".into(),
+                last_updated: None,
+                message_count: 1,
+                user_message_count: 1,
+            };
+            let lines = session_stats_lines(
+                "openrouter",
+                "some/model",
+                SessionUsage::default(),
+                Some(info),
+                0,
+                None,
+                &Default::default(),
+            );
+            assert!(
+                lines.iter().all(|l| !l.contains("cwd")),
+                "no cwd line expected, got {lines:?}"
+            );
+            // The rest of the section still renders.
+            assert!(
+                lines[2].starts_with("  created:"),
+                "expected the section to continue, got {:?}",
+                lines[2]
+            );
+        }
+    }
+
+    /// An unnamed session shows the id and nothing where the name would go.
+    /// A blank name line would read as a name the user chose, and a name
+    /// substituted for the id would be indistinguishable from a real one.
+    #[test]
+    fn session_stats_lines_omits_an_unset_name_but_keeps_the_id() {
+        use super::{session_stats_lines, SessionStatsInfo, SessionUsage};
+
+        for name in [None, Some(String::new())] {
+            let info = SessionStatsInfo {
+                id: "0199f3c1-7a2e-7000-8000-000000000000".into(),
+                name,
+                cwd: Some("/tmp".into()),
+                created: "2025-01-02T03:04:05.000Z".into(),
+                last_updated: None,
+                message_count: 1,
+                user_message_count: 1,
+            };
+            let lines = session_stats_lines(
+                "openrouter",
+                "some/model",
+                SessionUsage::default(),
+                Some(info),
+                0,
+                None,
+                &Default::default(),
+            );
+            assert_eq!(lines[0], "session: 0199f3c1-7a2e-7000-8000-000000000000");
+            assert!(
+                lines.iter().all(|l| !l.contains("name")),
+                "no name line expected, got {lines:?}"
+            );
+            // The next rendered row is the cwd, not a hole where name was.
+            assert_eq!(lines[1], "  cwd: /tmp");
+        }
     }
 
     #[test]

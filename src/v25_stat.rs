@@ -49,10 +49,11 @@ impl SlashDotNode for StatNode {
             } else if let Some(repo) = self.app_state.repo() {
                 let all = repo.list_sessions_overlay(None).await;
                 all.into_iter().find(|m| m.id == session_id).map(|meta| {
-                    let display_name = meta.name.unwrap_or_else(|| meta.id.clone());
                     let detail = meta.detail.as_ref();
                     crate::agent::SessionStatsInfo {
-                        display_name,
+                        id: meta.id,
+                        name: meta.name.filter(|n| !n.is_empty()),
+                        cwd: Some(meta.cwd).filter(|c| !c.is_empty()),
                         created: meta.timestamp,
                         last_updated: detail.and_then(|d| d.last_prompt_timestamp.clone()),
                         message_count: detail.map(|d| d.message_count).unwrap_or(0),
@@ -117,6 +118,125 @@ mod tests {
             .into(),
         );
         SlashDotMenu::from_root_node(root)
+    }
+
+    /// A repo holding one session under a synthetic cwd. `name` goes on the
+    /// *header*, which is where `set_name` puts it — not in a trailing
+    /// `session_info` entry, which the listing read only consults for
+    /// pre-migration files whose header lacks the field. An empty `name` is
+    /// the "never named" case `SessionHeader::new` itself writes.
+    ///
+    /// Returns the state, the session uuid, the session's cwd, and the temp
+    /// root to clean up.
+    fn temp_repo_with_session(name: &str) -> (Arc<AppState>, String, String, std::path::PathBuf) {
+        use crate::session::types::{encode_cwd, session_filename, SessionHeader};
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("v25-stat-test-{nanos}"));
+        // A synthetic cwd nothing creates. Named per-run so two checkouts
+        // sharing a /tmp still cannot collide on a name that only looks safe.
+        let cwd = std::path::Path::new("/tmp")
+            .join(format!("v25-stat-cwd-{}-{nanos}", std::process::id()));
+        let dir = base.join(encode_cwd(&cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut header = SessionHeader::new(&cwd);
+        header.name = Some(name.to_string());
+        let uuid = header.id.clone();
+        let path = dir.join(session_filename(&chrono::Utc::now()));
+        let user_entry = serde_json::json!({
+            "id": "e1",
+            "timestamp": "2025-01-01T00:00:00.000Z",
+            "type": "message",
+            "message": {"role": "user", "content": [{"type": "text", "text": "hello world"}]},
+        });
+        let leaf = serde_json::json!({
+            "id": "leaf1",
+            "timestamp": "2025-01-01T00:00:01.000Z",
+            "type": "leaf",
+            "targetId": "e1",
+        });
+        let contents = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&user_entry).unwrap(),
+            serde_json::to_string(&leaf).unwrap(),
+        );
+        std::fs::write(&path, contents).unwrap();
+
+        let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
+        let app_state = test_app_state();
+        app_state.set_repo(Some(repo));
+        (app_state, uuid, header.cwd, base)
+    }
+
+    fn stat_header_text(app_state: &Arc<AppState>) -> String {
+        let mut menu = build_stat_menu(app_state);
+        let mut handle = menu.get_handle();
+        match crate::agent::block_on_test(handle.eval_prompt("stat ", HostKey::None, 80)) {
+            MenuResult::Continue(plan, _) => plan
+                .detail
+                .iter()
+                .map(|l| l.0.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => panic!(
+                "expected Continue, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    /// The name and cwd the repo holds must reach the overlay: both are read
+    /// out of session metadata at the call site, and a pure-function test on
+    /// `session_stats_lines` would pass even if the call site dropped them.
+    #[test]
+    fn stat_header_shows_the_session_name_and_cwd() {
+        let (app_state, uuid, cwd, base) = temp_repo_with_session("deploy work");
+        app_state.set_current_session_id(uuid.clone());
+        let header_text = stat_header_text(&app_state);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(
+            header_text.contains(&format!("session: {}", uuid)),
+            "the id should head the section: {header_text}"
+        );
+        assert!(
+            header_text.contains("  name: deploy work"),
+            "the user-assigned name should be listed: {header_text}"
+        );
+        // The cwd is quoted whole, not relativized: the overlay lists
+        // sessions from every cwd, so a short form would be ambiguous.
+        assert!(
+            header_text.contains(&format!("  cwd: {}", cwd)),
+            "the session cwd should be listed: {header_text}"
+        );
+    }
+
+    /// A session the user never named shows the id and no `name:` line.
+    /// `SessionHeader::new` seeds `name: Some("")` and the listing read
+    /// turns that into `None`; a bare `name:` would read as a name that
+    /// exists.
+    #[test]
+    fn stat_header_omits_an_unset_name() {
+        let (app_state, uuid, _cwd, base) = temp_repo_with_session("");
+        app_state.set_current_session_id(uuid.clone());
+        let header_text = stat_header_text(&app_state);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(
+            !header_text.contains("name:"),
+            "an unnamed session must not grow a name line: {header_text}"
+        );
+        // The id is still there: dropping the name must not cost the reader
+        // the one identifier every session has.
+        assert!(
+            header_text.contains(&format!("session: {}", uuid)),
+            "the id should still head the section: {header_text}"
+        );
     }
 
     #[test]
