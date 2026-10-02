@@ -574,10 +574,20 @@ pub fn edit_fragment(
     `deny_unknown_fields` plus a Levenshtein suggestion;
   - wrong type / out of range → the key, the found value, the expected range;
   - all errors are collected and shown together, not one at a time.
-- **Outcome**: the node's `edit()` returns `Done(msg)` on commit. The editor
-  round-trip *is* the confirmation — unlike compaction, nothing is destroyed
-  and nothing is written before the user quits the editor. (A
-  `Prepared` → confirm variant stays available if we later want it.)
+- **Outcome**: the node's `edit()` returns `Prepared(Some((accept, cancel)))`
+  on commit, and `submit()` does the write once the accept arm is chosen. The
+  editor is the *review* and the dialog is the *commit point* — see the P5
+  addendum for why this reversed the original decision. Both steps write
+  `settings.toml`, so there is no undo; §A.6's rule that a record is only
+  consulted on a model's first visit in a session means an accepted edit to an
+  already-visited model does not change the running level until the next
+  activation, which is intended.
+- An error in the fragment (unparsable, unknown key, out of range) is
+  `Error(msg)`: the frame keeps the menu open with the text still in the
+  buffer, so the user edits rather than retypes. No change is
+  `Handled`. An editor that cannot run at all (no interactive tty — quiet mode,
+  a pipe) is `Unavailable`, which the node reports as an error rather than
+  silently treating it as "nothing changed".
 
 ## A.10 Per-turn overrides
 
