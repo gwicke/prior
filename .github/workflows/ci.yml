@@ -44,3 +44,44 @@ jobs:
         # §9 #9). Keep the two in one step so they cannot drift apart.
         run: cargo test --verbose --features test-utils
 
+  # Clippy job: ADVISORY ONLY. Reports warnings, never fails the workflow, so
+  # it cannot block a push while a lint backlog is being worked down. Runs as
+  # its own job rather than a third step in `test` so it checks in parallel
+  # instead of adding to the critical path.
+  #
+  # `continue-on-error` is on the job, not the step, so the job still reports
+  # as failed-but-allowed in the checks list — a real clippy failure (not a
+  # lint, but e.g. a broken manifest) is visible instead of silently green.
+  #
+  # No `-D warnings` yet. The workspace already silences `type_complexity` and
+  # `too_many_arguments` via `[workspace.lints]`; promote to a hard gate once
+  # the remaining warnings are down to zero.
+  clippy:
+    name: Clippy (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run clippy
+        # Mirrors the test step's `--features test-utils` for the same reason:
+        # without it the confirm_probe binary and its lints are never checked.
+        run: cargo clippy --workspace --all-targets --features test-utils
+

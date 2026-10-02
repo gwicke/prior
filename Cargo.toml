@@ -2,6 +2,21 @@
 members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/bsed"]
 resolver = "2"
 
+# Two lints that fire on shape rather than on correctness. Both are answered by
+# "extract a type", and here the extraction would cost more than it buys: the
+# signatures are internal and single-site, and the fields are already
+# individually named and documented. `type_complexity` is kept honest the way
+# that matters — a *shape that recurs* gets an alias (see `crate::SubmitFn`,
+# which replaced six copies of the same boxed callback).
+#
+# Deliberately not workspace-wide: lints whose advice is wrong for this code
+# are allowed at the site, with a reason, so a genuine occurrence elsewhere is
+# still reported. `drop_non_drop` on `ConsoleOutput::with_content_writer` is
+# the case in point.
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+
 [package]
 name = "picocode"
 version = "0.6.0"
@@ -16,6 +31,9 @@ readme = "README.md"
 keywords = ["cli", "ai", "coding-assistant", "llm", "agent", "rust", "claude"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["picocode.gif", ".github/"]
+
+[lints]
+workspace = true
 
 [dependencies]
 rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }

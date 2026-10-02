@@ -4,6 +4,11 @@
 //! See `doc/session_storage.md` for the full design.
 
 pub mod repo;
+// `session::session` is not a mistake: the module mirrors the on-disk session
+// layout described in `doc/session_storage.md`, so the path a reader expects
+// for session files is the path the types live at. Renaming it would churn
+// every `use` to buy a lint that has no bearing on the code being correct.
+#[allow(clippy::module_inception)]
 pub mod session;
 pub mod storage;
 pub mod types;

@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 description = "Preview a GNU sed script as line-anchored @@@OLD/@@@NEW/@@@END block edits. Ships the `bsed` binary."
 
+[lints]
+workspace = true
+
 [dependencies]
 blockedit = { path = "../blockedit" }
 # The walker for `preview -r`: .gitignore-aware, skips hidden files, and

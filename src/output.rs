@@ -2036,6 +2036,15 @@ impl ConsoleOutput {
     /// asked, because a row held back has not reached the stream and a question
     /// about a row it cannot see is what the old boundary logic kept getting
     /// wrong.
+    // `drop_non_drop`: the `drop()`s on `hold`/`counter`/`clear` below are
+    // deliberate borrow-shortening, not disposal — each of those wrappers holds
+    // a `&mut` into `buf` that has to be released at an exact point in the
+    // sequence, well before the end of the function. Clippy's advice (that the
+    // call "only extends its contained lifetimes") describes the opposite of
+    // the intent: `drop()` moves the value and ends the borrow, which is the
+    // only way to release it early. Scoped here rather than at crate level so
+    // an accidental `drop()` elsewhere is still reported.
+    #[allow(clippy::drop_non_drop)]
     fn with_content_writer<T, F>(
         &self,
         width: usize,

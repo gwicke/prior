@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 description = "Data-driven slash-menu engine: descriptors, path grammar, filter/sort, and overlay interpreter."
 
+[lints]
+workspace = true
+
 [dependencies]
 fuzzy-matcher = "0.3"
 unicode-width = "0.1"

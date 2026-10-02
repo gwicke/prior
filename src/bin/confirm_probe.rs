@@ -27,7 +27,7 @@ fn main() {
     // line has been captured too.
     let gate_released = out
         .confirm_gate()
-        .map_or(true, |g| !g.load(std::sync::atomic::Ordering::SeqCst));
+        .is_none_or(|g| !g.load(std::sync::atomic::Ordering::SeqCst));
     println!("GATE_RELEASED={}", gate_released);
 
     // Print the resolved choice on its own line so the test can read it back.
