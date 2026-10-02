@@ -66,6 +66,6 @@
   content write vs. frame update synchronization
 - [x] Cancelling a turn when it is being retried does not seem to work
   reliably any more - related to event pumps 
-- [ ] lift overlay composition and -windowing into vertical render stack
-  - [ ] restore fixed table headers
+- [x] lift overlay composition and -windowing into vertical render stack
+  - [x] restore fixed table headers
   - have one place doing all vertical scaling
