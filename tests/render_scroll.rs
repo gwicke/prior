@@ -355,6 +355,232 @@ fn shift_enter_inserts_newline_without_kitty() {
     );
 }
 
+/// On submit the committed prompt is content written *through* the consumed
+/// frame — the status bar's row among them. Every line the write enters is
+/// cleared on entry (ui_draw_261001's overwrite rule), so a row holding the
+/// committed echo cannot also hold bar cells from the frame that used to be
+/// there. This pins it for a **multi-line** input with the prompt high in the
+/// terminal (the consume regime, not the bottom-row append one): type two
+/// lines, submit, and read the screen.
+#[test]
+fn committed_multiline_prompt_clears_the_bar_row() {
+    const ROWS: u16 = 16;
+    const COLS: u16 = 60;
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: ROWS,
+            cols: COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free"]);
+    let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
+    cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let _config_tempdir = config_tempdir;
+
+    let reader = pair.master.try_clone_reader().expect("clone reader");
+    let (bytes, stop) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take writer");
+
+    assert!(
+        wait_for(&bytes, "picocode -", Duration::from_secs(5)),
+        "picocode did not start the REPL (no greeter)"
+    );
+    // Prompt high in the terminal: the frame starts at row 3, so submit runs
+    // in the consume regime with the bar's row inside the committed span.
+    let _ = writer.write_all(b"\x1b[3;1R");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(400));
+
+    // Two input lines (legacy Shift+Enter = newline), then submit.
+    let _ = writer.write_all(b"one");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(150));
+    let _ = writer.write_all(b"\x1b[13;2~");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(250));
+    let _ = writer.write_all(b"two");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(150));
+    let _ = writer.write_all(b"\r");
+    let _ = writer.flush();
+    // The commit writes synchronously on Enter and brackets the echo with a
+    // full-width rule — the greeter's dashes are far shorter, so COLS-many
+    // `─` in a row only exist once the commit landed.
+    let rule_marker = "─".repeat(COLS as usize);
+    assert!(
+        wait_for(&bytes, &rule_marker, Duration::from_secs(5)),
+        "the commit's rule never appeared"
+    );
+    // Let the turn start (no key — it errors or streams; either way the bar
+    // settles below the content) before reading the screen.
+    thread::sleep(Duration::from_millis(1500));
+
+    drop(writer);
+    let _ = child.kill();
+    stop.store(true, Ordering::SeqCst);
+
+    let data = bytes.lock().unwrap().clone();
+    std::fs::write("/tmp/picocode_commit_clear.txt", &data).unwrap();
+    let mut parser = Parser::new(ROWS, COLS, 1000);
+    parser.process(&data);
+    let visible: Vec<String> = parser
+        .screen()
+        .rows(0, COLS)
+        .map(|s| s.to_string())
+        .collect();
+    eprintln!("[test] final screen:\n{:#?}", visible);
+
+    // The committed echo rows are content now: they must hold no bar cells.
+    // The bar's identity is its model group text.
+    for (i, row) in visible.iter().enumerate() {
+        let committed = row.contains("one") || row.contains("two");
+        let bar_cells = row.contains("tencent/hy3:free") || row.contains('●');
+        assert!(
+            !(committed && bar_cells),
+            "row {i} mixes the committed prompt with status-bar remnants: {row:?}\n{visible:#?}"
+        );
+    }
+    // And the bar exists exactly once (its current home, below the content) —
+    // a second appearance is the old row surviving.
+    let bar_rows: Vec<usize> = visible
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.contains("tencent/hy3:free"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        bar_rows.len(),
+        1,
+        "exactly one status bar on screen: rows {bar_rows:?}\n{visible:#?}"
+    );
+}
+
+/// The reported bug shape: a **sharing** commit (ui_draw_v2 R4) with a first
+/// line wider than the terminal. A quiet `/set` commit leaves
+/// `last_content_display_kind == Prompt`, so the next commit shares its rule
+/// and the block starts *directly with the line* — at the frame's gap row.
+/// The line's natural wrap lands on the status bar's row with **no byte
+/// between the rows**, and `LineClear` arms on `\n` only: before the fix the
+/// bar's right margin survived into the committed input; the write now wraps
+/// long lines itself (`row_count::wrap_to_width`), so every row it occupies
+/// is entered — and cleared — by a byte.
+#[test]
+fn sharing_commit_with_a_wrapped_line_still_clears_the_bar_row() {
+    const ROWS: u16 = 16;
+    const COLS: u16 = 60;
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: ROWS,
+            cols: COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+
+    // A config file the `/set` leaf can write to (settings-test pattern).
+    let cfg_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
+    let cfg = cfg_tempdir.path().join("picocode.toml");
+    std::fs::write(&cfg, "\n").expect("write temp config");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free", "-c"]);
+    cmd.arg(cfg.to_str().unwrap());
+    cmd.env("XDG_CONFIG_HOME", cfg_tempdir.path());
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let _cfg_tempdir = cfg_tempdir;
+
+    let reader = pair.master.try_clone_reader().expect("clone reader");
+    let (bytes, stop) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take writer");
+
+    assert!(
+        wait_for(&bytes, "picocode -", Duration::from_secs(5)),
+        "picocode did not start the REPL (no greeter)"
+    );
+    // Prompt high in the terminal (consume regime, bar's row inside the
+    // committed span).
+    let _ = writer.write_all(b"\x1b[3;1R");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(400));
+
+    // Quiet slash commit: success emits no message, so the last content kind
+    // stays `Prompt` and the commit below will share its rule.
+    for ch in "/set security_mode yolo".chars() {
+        let _ = writer.write_all(&[ch as u8]);
+        let _ = writer.flush();
+        thread::sleep(Duration::from_millis(80));
+    }
+    let _ = writer.write_all(b"\r");
+    let _ = writer.flush();
+    // The commit brackets itself with a full-width rule (the greeter's dashes
+    // are far shorter), and nothing after it writes content — so this marker
+    // lands exactly on the quiet commit whose `Prompt` kind the next commit
+    // will share.
+    let rule_marker = "─".repeat(COLS as usize);
+    assert!(
+        wait_for(&bytes, &rule_marker, Duration::from_secs(5)),
+        "the quiet slash commit never landed"
+    );
+    thread::sleep(Duration::from_millis(400));
+
+    // Multi-line prompt whose first line is wider than the terminal.
+    let long: String = "x".repeat(COLS as usize + 10);
+    let _ = writer.write_all(long.as_bytes());
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(250));
+    let _ = writer.write_all(b"\x1b[13;2~");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(250));
+    let _ = writer.write_all(b"two");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(150));
+    let _ = writer.write_all(b"\r");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(1500));
+
+    drop(writer);
+    let _ = child.kill();
+    stop.store(true, Ordering::SeqCst);
+
+    let data = bytes.lock().unwrap().clone();
+    std::fs::write("/tmp/picocode_commit_share.txt", &data).unwrap();
+    let mut parser = Parser::new(ROWS, COLS, 1000);
+    parser.process(&data);
+    let visible: Vec<String> = parser
+        .screen()
+        .rows(0, COLS)
+        .map(|s| s.to_string())
+        .collect();
+    eprintln!("[test] sharing-commit final screen:\n{:#?}", visible);
+
+    for (i, row) in visible.iter().enumerate() {
+        let committed = row.contains('x') || row.contains("two");
+        let bar_cells = row.contains("tencent/hy3:free") || row.contains('●');
+        assert!(
+            !(committed && bar_cells),
+            "row {i} mixes the committed prompt with status-bar remnants: {row:?}\n{visible:#?}"
+        );
+    }
+    let bar_rows: Vec<usize> = visible
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.contains("tencent/hy3:free"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        bar_rows.len(),
+        1,
+        "exactly one status bar on screen: rows {bar_rows:?}\n{visible:#?}"
+    );
+}
+
 /// Phase 2 integration: the `/set` string hierarchy — the list
 /// appears, a valid value is saved (and the overlay reverts to top
 /// `/set`), and an invalid value shows the error message

@@ -140,6 +140,77 @@ pub fn rows_of(text: &str, term_w: usize) -> usize {
     rows
 }
 
+/// Wrap `text`'s lines at `width` display columns — the terminal's own wrap
+/// points, made explicit as `\n` bytes.
+///
+/// The overwrite rule (ui_draw_261001) needs every terminal row a content
+/// line occupies to be **entered by a byte**: [`crate::output`]'s line-clear
+/// transform arms on `\n` and at write start only, so a row the terminal
+/// wraps into *without* a byte never gets its entry `EL` and keeps whatever
+/// the frame before it painted — the reported committed-prompt remnant in
+/// the right margin (a sharing commit starts its block directly with the
+/// line, at the frame's gap row, whose natural wrap lands on the status
+/// bar's row). Wrapping here is cell-identical to the natural wrap (same
+/// break columns, wide glyphs moved whole, escapes never split), and the row
+/// count does not move: `rows_of` counts a wrap and a `\n` the same way —
+/// pinned by `wrap_to_width_keeps_rows_of_honest`.
+pub fn wrap_to_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let mut rest = line;
+        while display_width_ansi(rest) > width {
+            let (head, tail) = split_at_width(rest, width);
+            out.push_str(head);
+            if tail.is_empty() {
+                // The head swallowed the remainder — a glyph wider than the
+                // budget. The line ends here; a break after it would invent
+                // an empty row the terminal never shows.
+                rest = "";
+                break;
+            }
+            out.push('\n');
+            rest = tail;
+        }
+        out.push_str(rest);
+    }
+    out
+}
+
+/// Byte index at which `s` first exceeds `width` display columns: escapes
+/// are carried whole (they hold no width), and a wide glyph that would
+/// straddle the edge moves to the next row whole — where the terminal would
+/// move it, too. Never returns an empty head for non-empty input.
+fn split_at_width(s: &str, width: usize) -> (&str, &str) {
+    let bytes = s.as_bytes();
+    let mut used = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i = escape_end(bytes, i);
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap_or('\0');
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > width {
+            if i == 0 {
+                // Degenerate budget (a wide glyph against a 1-column edge):
+                // take it anyway — a byte must leave the head for progress.
+                i = ch.len_utf8();
+            }
+            break;
+        }
+        used += cw;
+        i += ch.len_utf8();
+    }
+    (&s[..i], &s[i..])
+}
+
 /// A writer that counts the terminal rows passing through it.
 ///
 /// Wrap the real writer, render into this, and ask [`RowCounter::rows`] for
@@ -351,6 +422,84 @@ mod tests {
                     .sum::<usize>(),
                 "width mismatch for {s:?}"
             );
+        }
+    }
+
+    #[test]
+    fn wrap_to_width_breaks_where_the_terminal_wraps() {
+        // Short lines pass through untouched — no invented breaks.
+        assert_eq!(wrap_to_width("abc", 5), "abc");
+        // Exactly the budget: the terminal would leave the row wrap-pending,
+        // and the caller's own `\n` resolves that — nothing to add.
+        assert_eq!(wrap_to_width("abcde", 5), "abcde");
+        // One byte over: the break is exactly where the terminal wraps.
+        assert_eq!(wrap_to_width("abcdef", 5), "abcde\nf");
+        // Existing newlines are line boundaries, not wrap points.
+        assert_eq!(wrap_to_width("abc\nde", 5), "abc\nde");
+        assert_eq!(wrap_to_width("abcdefgh\nij", 5), "abcde\nfgh\nij");
+        // A wide glyph straddling the edge moves whole, leaving the gap the
+        // terminal would leave.
+        assert_eq!(wrap_to_width("abcd日", 5), "abcd\n日");
+        assert_eq!(wrap_to_width("日日日", 4), "日日\n日");
+        // Escapes ride with the head and are never split: zero-width, they
+        // are consumed even at the budget, so the reset lands before the break
+        // — same cells, same styles after it.
+        let styled = "\x1b[1mabcde\x1b[0mf";
+        assert_eq!(wrap_to_width(styled, 5), "\x1b[1mabcde\x1b[0m\nf");
+    }
+
+    /// The accounting contract: the row count a writer hands `note_lines`
+    /// must not move when a line is wrapped at write time — `rows_of` counts
+    /// a natural wrap and an inserted `\n` the same way.
+    ///
+    /// Invariance holds where `rows_of`'s column arithmetic and real cell
+    /// breaks agree — narrow glyphs, which is every byte a renderer or a
+    /// message actually emits. (Wide glyphs at a non-dividing width wrap
+    /// earlier than `(cols - 1) / term_w` predicts: `rows_of` idealizes.
+    /// Explicit wrapping moves the count *toward* the terminal, not away
+    /// from it — that standing question is not this pin's to settle.)
+    #[test]
+    fn wrap_to_width_keeps_rows_of_honest() {
+        let long = "x".repeat(100);
+        let texts = [
+            "abcdef",
+            "abcdefghij",
+            "a\nbcdefghijkl",
+            long.as_str(),
+            "\x1b[1mabcdefgh\x1b[0m and more",
+            "",
+            "exact",
+        ];
+        for w in [3usize, 5, 10, 80] {
+            for text in texts {
+                assert_eq!(
+                    rows_of(text, w),
+                    rows_of(&wrap_to_width(text, w), w),
+                    "rows_of moved for {text:?} at width {w}"
+                );
+            }
+        }
+    }
+
+    /// Every row the wrap produces fits the terminal — the whole point: a
+    /// part wider than the budget would wrap naturally again, and land back
+    /// on an uncleared row.
+    #[test]
+    fn wrap_to_width_never_emits_an_overwide_row() {
+        for w in [1usize, 3, 4, 5, 10] {
+            for text in [
+                "x".repeat(97).as_str(),
+                "abcd日日日ef",
+                "\x1b[1mabc\x1b[0mdefghijklmn",
+                "a\nbb\nccc\ndddd",
+            ] {
+                for part in wrap_to_width(text, w).split('\n') {
+                    assert!(
+                        crate::row_count::display_width_ansi(part) <= w.max(2),
+                        "part wider than {w} for {text:?}: {part:?}"
+                    );
+                }
+            }
         }
     }
 

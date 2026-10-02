@@ -1935,6 +1935,16 @@ impl ConsoleOutput {
 
     fn write_content_block(&self, bytes: &[u8], kind: Option<ContentDisplayKind>, closes: bool) {
         let width = term_width();
+        // Wrap over-long lines before they meet the overwrite rule — see
+        // `row_count::wrap_to_width`: a row the terminal wraps into without a
+        // byte is a row `LineClear` never clears, and the frame's cells (the
+        // status bar's right margin, after a sharing commit) survive in it.
+        // Valid UTF-8 only: a chunk split mid-character is not where an
+        // overflowing line's break point lives.
+        let wrapped = std::str::from_utf8(bytes)
+            .ok()
+            .map(|t| crate::row_count::wrap_to_width(t, width));
+        let bytes = wrapped.as_ref().map_or(bytes, |s| s.as_bytes());
         self.with_content_writer(width, kind, closes, |out| {
             let _ = out.write_all(bytes);
         });
