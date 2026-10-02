@@ -243,6 +243,23 @@ Net for the phase: the separator rule is one function and one derived fact, the
 render path is one path, and the reason they can be is that the row counter
 already sees every byte.
 
+## 2d. The tail itself retired (2026-10-01)
+
+Nothing read it anymore, and the two readers left by design, one at a time:
+
+- `boundary()` became the kind/closed matrix (`boundary_spacer` decides from
+  what the writer declares about itself, never from the stream — its doc says
+  so outright).
+- The transient status line's `at_line_start` guard left with the frame-owned
+  bar: `set_status` is now data, and the compose path renders the row.
+
+So `StreamTail`, its per-byte `note`, and `RowCounter`'s shared reference are
+deleted (ui_draw_261001 efficiency round). The separator *rule* now lives only
+in the matrix, in `HoldTrailing`'s one-newline hold, and in the
+strip-then-add-by-rule normalization — the ui_draw_v2 R2/R3 note predicted
+exactly this: *"a byte-level guess at a structural fact stops being
+necessary."*
+
 ## 3. What each commit is gated on
 
 | Commit | Gate |

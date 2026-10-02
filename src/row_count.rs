@@ -140,77 +140,6 @@ pub fn rows_of(text: &str, term_w: usize) -> usize {
     rows
 }
 
-/// The tail of the content stream: does it currently end with a blank line?
-///
-/// This is the separator state, and it is *derived from the bytes* rather than
-/// maintained by hand (doc/row_accounting_b3.md, B3d). A writer cannot forget
-/// to update it, and it cannot disagree with the screen — which matters
-/// because the markdown renderer also ends blocks with blank lines, so a
-/// hand-kept flag drifts out of step with what the terminal shows and the
-/// boundary writes a second blank.
-///
-/// A stream that has not written anything does not yet end in a blank line, so
-/// the first `\n` a response writes is its leading separator rather than a
-/// second one.
-///
-/// Shared and lock-free on purpose: the counter updates it *per byte*, so a
-/// reader inside the same block — a boundary between two sub-blocks of one
-/// counted write — sees the state the bytes have actually produced. Holding
-/// it in a mutex would either deadlock or hand back the value from before the
-/// block, which is how a committed paragraph ended up with no blank after it.
-#[derive(Debug)]
-pub struct StreamTail {
-    /// bit 0: the previous byte was a newline. bit 1: the stream ends blank.
-    bits: std::sync::atomic::AtomicU8,
-}
-
-impl Default for StreamTail {
-    fn default() -> Self {
-        StreamTail::new()
-    }
-}
-
-impl StreamTail {
-    pub const fn new() -> Self {
-        StreamTail {
-            // An unwritten stream counts as "previous byte was a newline", so
-            // its first `\n` reads as the leading separator.
-            bits: std::sync::atomic::AtomicU8::new(0b01),
-        }
-    }
-
-    /// Fold one byte into the tail.
-    fn note(&self, b: u8) {
-        use std::sync::atomic::Ordering::SeqCst;
-        let last_nl = u8::from(b == b'\n');
-        let blank = if last_nl == 1 {
-            // A newline leaves a blank line behind only if the line it closed
-            // was itself empty, i.e. the previous byte was one too.
-            (self.bits.load(SeqCst) & 0b01) != 0
-        } else {
-            false
-        };
-        self.bits.store(last_nl | u8::from(blank) << 1, SeqCst);
-    }
-
-    /// Does the stream end with a blank line — i.e. is the cursor sitting on a
-    /// row nothing was written to?
-    pub fn ends_blank(&self) -> bool {
-        (self.bits.load(std::sync::atomic::Ordering::SeqCst) & 0b10) != 0
-    }
-
-    /// Is the cursor at the start of a line? True when nothing has been written
-    /// yet, or the last byte was a newline.
-    ///
-    /// The precondition for writing a *transient* line (the status readout):
-    /// it is erased by the next content write, and erasing a line that holds
-    /// part of a block would destroy that block. So the check is the whole
-    /// guard, and it is free — it is the same bit the counter maintains.
-    pub fn at_line_start(&self) -> bool {
-        (self.bits.load(std::sync::atomic::Ordering::SeqCst) & 0b01) != 0
-    }
-}
-
 /// A writer that counts the terminal rows passing through it.
 ///
 /// Wrap the real writer, render into this, and ask [`RowCounter::rows`] for
@@ -223,7 +152,7 @@ impl StreamTail {
 /// the next one. (If a caller ever handed the terminal a split character, the
 /// terminal would render the replacement glyph — the carry is here so the count
 /// stays right regardless.)
-pub struct RowCounter<'a, W: Write> {
+pub struct RowCounter<W: Write> {
     inner: W,
     term_w: usize,
     /// Rows closed so far: one per `\n`, plus the wraps of the lines they end.
@@ -232,21 +161,16 @@ pub struct RowCounter<'a, W: Write> {
     col: usize,
     /// Bytes of an incomplete character or escape sequence, carried forward.
     pending: Vec<u8>,
-    /// The stream's blank-line tail, shared with whoever asks about it: the
-    /// counter updates it per byte, and a reader inside the same block sees
-    /// what the bytes have actually produced.
-    tail: &'a StreamTail,
 }
 
-impl<'a, W: Write> RowCounter<'a, W> {
-    pub fn new(inner: W, term_w: usize, tail: &'a StreamTail) -> Self {
+impl<W: Write> RowCounter<W> {
+    pub fn new(inner: W, term_w: usize) -> Self {
         RowCounter {
             inner,
             term_w: term_w.max(1),
             rows: 0,
             col: 0,
             pending: Vec::new(),
-            tail,
         }
     }
 
@@ -284,10 +208,9 @@ impl<'a, W: Write> RowCounter<'a, W> {
                     self.pending = buf[i..].to_vec();
                     return;
                 }
-                i = end; // zero width, and no effect on the tail
+                i = end; // zero width
                 continue;
             }
-            self.tail.note(buf[i]);
             match std::str::from_utf8(&buf[i..]) {
                 Ok(rest) => {
                     let ch = rest.chars().next().unwrap_or('\0');
@@ -316,7 +239,7 @@ impl<'a, W: Write> RowCounter<'a, W> {
     }
 }
 
-impl<W: Write> Write for RowCounter<'_, W> {
+impl<W: Write> Write for RowCounter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(buf)?;
         self.count(&buf[..n]);
@@ -432,56 +355,10 @@ mod tests {
     }
 
     #[test]
-    fn tail_tracks_whether_the_stream_ends_blank() {
-        let tail = StreamTail::new();
-        let mut counter = RowCounter::new(Vec::new(), 80, &tail);
-        assert!(
-            !tail.ends_blank(),
-            "an empty stream is not yet a blank line"
-        );
-        counter.write_all(b"text\n").unwrap();
-        assert!(!tail.ends_blank(), "one newline closes the line");
-        counter.write_all(b"\n").unwrap();
-        assert!(tail.ends_blank(), "two in a row leave a blank");
-        counter.write_all(b"more").unwrap();
-        assert!(!tail.ends_blank(), "text closes the blank");
-        // An escape is zero width, so it must not close a blank line either.
-        counter.write_all(b"\x1b[0m").unwrap();
-        assert!(!tail.ends_blank());
-    }
-
-    #[test]
-    fn a_fresh_streams_first_newline_is_its_leading_separator() {
-        // A response that starts with `\n` (its leading blank) must leave the
-        // tail blank, so the first block's boundary adds nothing on top.
-        let tail = StreamTail::new();
-        let mut counter = RowCounter::new(Vec::new(), 80, &tail);
-        counter.write_all(b"\n").unwrap();
-        assert!(tail.ends_blank());
-    }
-
-    #[test]
-    fn the_tail_is_shared_across_writes_and_readable_mid_block() {
-        // The property the host relies on: a second write continues the same
-        // tail, and a reader *between* the two writes sees what the first
-        // produced. Copying the tail in and out at block boundaries is what
-        // made a committed paragraph lose the blank after it.
-        let tail = StreamTail::new();
-        let mut first = RowCounter::new(Vec::new(), 80, &tail);
-        first.write_all(b"a\n\n").unwrap();
-        assert!(tail.ends_blank(), "carried across writes");
-
-        let mut second = RowCounter::new(Vec::new(), 80, &tail);
-        second.write_all(b"b\n").unwrap();
-        assert!(!tail.ends_blank(), "the second block closed the blank line");
-    }
-
-    #[test]
     fn counter_counts_what_it_writes() {
         let mut buf: Vec<u8> = Vec::new();
         {
-            let tail = StreamTail::new();
-            let mut counter = RowCounter::new(&mut buf, 10, &tail);
+            let mut counter = RowCounter::new(&mut buf, 10);
             counter.write_all(b"abc\nde\n").unwrap();
             assert_eq!(counter.rows(), 2, "before the tail is written");
             counter.write_all(b"0123456789").unwrap();
@@ -492,8 +369,7 @@ mod tests {
 
     #[test]
     fn counter_sees_a_wrapped_tail() {
-        let tail = StreamTail::new();
-        let mut counter = RowCounter::new(Vec::new(), 4, &tail);
+        let mut counter = RowCounter::new(Vec::new(), 4);
         counter.write_all(b"abcdefghij").unwrap();
         assert_eq!(counter.rows(), 2, "10 columns at width 4 wrap twice");
         counter.write_all(b"klmno").unwrap();
@@ -509,8 +385,7 @@ mod tests {
             ("a\nbb\nccc", 2),
             ("\x1b[1mx\x1b[0m\ny", 80),
         ] {
-            let tail = StreamTail::new();
-            let mut counter = RowCounter::new(Vec::new(), w, &tail);
+            let mut counter = RowCounter::new(Vec::new(), w);
             counter.write_all(text.as_bytes()).unwrap();
             assert_eq!(
                 counter.rows(),
@@ -528,8 +403,7 @@ mod tests {
         let text =
             "\u{1b}[1m日\u{1b}[0m本\u{1b}]8;;https://x.example/y\u{1b}\\ok\u{1b}]8;;\u{1b}\\";
         for chunk in [1usize, 2, 3, 5, 7] {
-            let tail = StreamTail::new();
-            let mut counter = RowCounter::new(Vec::new(), 40, &tail);
+            let mut counter = RowCounter::new(Vec::new(), 40);
             for part in text.as_bytes().chunks(chunk) {
                 counter.write_all(part).unwrap();
             }
@@ -545,8 +419,7 @@ mod tests {
     fn counter_ignores_a_truncated_escape_until_it_completes() {
         // Width 3, so a phantom column from the partial escape would wrap and
         // show up in the count rather than hide in the slack.
-        let tail = StreamTail::new();
-        let mut counter = RowCounter::new(Vec::new(), 3, &tail);
+        let mut counter = RowCounter::new(Vec::new(), 3);
         counter.write_all(b"ab\x1b[3").unwrap();
         assert_eq!(counter.rows(), 0, "the partial escape is not text yet");
         counter.write_all(b"1mcd\n").unwrap();
@@ -558,8 +431,7 @@ mod tests {
     fn counter_and_rows_of_agree_on_long_text() {
         let text = "alpha beta\n\ngamma delta epsilon\nzeta";
         for w in [1usize, 2, 7, 40, 200] {
-            let tail = StreamTail::new();
-            let mut counter = RowCounter::new(Vec::new(), w, &tail);
+            let mut counter = RowCounter::new(Vec::new(), w);
             for chunk in text.as_bytes().chunks(3) {
                 counter.write_all(chunk).unwrap();
             }

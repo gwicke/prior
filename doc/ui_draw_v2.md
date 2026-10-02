@@ -1261,6 +1261,10 @@ transcript-level composer rather than a change to the fold. Once the composer
 sees every block and knows what it wrote, `StreamTail` and `ends_blank` can go —
 a byte-level guess at a structural fact stops being necessary.
 
+> **Happened (2026-10-01).** The composer arrived as the kind/closed matrix and
+> the frame-owned bar; `StreamTail`, `ends_blank` and `at_line_start` had no
+> production reader left and were deleted — row_accounting_b3 §2d.
+
 Worth doing while in there, though minor: `batch_commit` (`repl.rs:1482`) renders
 a commit as a bare `display_plain` line with no rules and no boundary, while
 `emit_commit` brackets it — so a startup replay looks different from the same
