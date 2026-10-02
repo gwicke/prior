@@ -1426,14 +1426,30 @@ fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec<String>) {
     (range, diff)
 }
 
+/// The opening words of every `bsed` preview result (`crates/bsed` emits two
+/// banner shapes — "N blocks for PATH" and "N block(s) in M of K file(s) under
+/// DIR" — and both start with this).
+const SED_PREVIEW_BANNER: &str = "sed preview: ";
+
 /// Render a `sed` preview result as diff lines, or `None` if it is not one.
+///
+/// Identified by that banner, **not** by "the text happens to contain
+/// `@@@OLD`". This renderer is applied to *every* tool result before the
+/// result-specific ones, and the `edit` tool's own argument errors embed the
+/// fixed `Expected:` example (`blockedit::wire::EDIT_ARGS_EXAMPLE`) — which is a
+/// well-formed block. So a content sniff parsed the example out of the error,
+/// drew it as a phantom `-`/`+` diff, and returned before the error itself was
+/// ever rendered; its trailing "summary" was the error's first line cut at the
+/// first `@@@OLD`, which is the one *inside backticks* mid-sentence. The banner
+/// is a property of the result rather than of panel state (a replayed result
+/// arrives with no `last_tool`), so it is what this keys on.
 ///
 /// The banner is kept verbatim (it is the part that says how many blocks are
 /// shown, whether growth ran, and what was *not* included) and each block's
 /// contents become `-`/`+` pairs under a hunk header carrying its anchor. An
 /// empty `NEW` — a deletion — simply has no `+` lines.
 fn sed_preview_body(result: &str) -> Option<Vec<String>> {
-    if !result.contains("@@@OLD") {
+    if !result.starts_with(SED_PREVIEW_BANNER) {
         return None;
     }
     let parsed = crate::edit_blocks::parse_blocks(result).ok()?;
@@ -1524,7 +1540,7 @@ fn short_banner(banner: &str) -> String {
 
 #[cfg(test)]
 mod sed_preview_body_tests {
-    use super::{get_preview, sed_preview_body, short_banner};
+    use super::{get_preview, sed_preview_body, short_banner, SED_PREVIEW_BANNER};
 
     const RESULT: &str = "sed preview: 2 blocks for src/x.rs (1 expression). Review the blocks below, then pass them to the `edit` tool as its `blocks` argument.
 src/x.rs:5
@@ -1632,6 +1648,51 @@ src/x.rs:9
         // Not a sed preview: the caller falls through to the generic renderer.
         assert!(sed_preview_body("Replaced 1 block(s) in src/x.rs").is_none());
         assert!(sed_preview_body("").is_none());
+    }
+
+    /// The banner has two shapes in `bsed` — "N blocks for PATH" (the library)
+    /// and "N block(s) in M of K file(s) under DIR" (the CLI). The gate keys on
+    /// their shared prefix, so both must still render.
+    #[test]
+    fn both_banner_shapes_are_still_recognized() {
+        let multi = "sed preview: 4 block(s) in 2 of 3 file(s) under /tmp/x. \
+             Check and apply them with `edit`.\n\
+             a/x.rs:5\n@@@OLD\n    run();\n@@@NEW\n    walk();\n@@@END\n";
+        let joined = sed_preview_body(multi).expect("body").join("\n");
+        assert!(joined.contains("@@ -5,1 +5,1 @@"), "{joined}");
+        assert!(
+            joined.contains("4 block(s) in 2 of 3 file(s)"),
+            "counts lost: {joined}"
+        );
+    }
+
+    /// An `edit` argument error is not a preview, however block-shaped it looks.
+    ///
+    /// A blob-shaped one used to be claimed by a content sniff for `@@@OLD`: its
+    /// `Expected:` example *is* a well-formed block, so the panel drew the
+    /// example as a diff and hid the error behind it. The gate is the
+    /// `sed preview:` banner now; no argument error carries one.
+    #[test]
+    fn an_edit_argument_error_is_not_mistaken_for_a_preview() {
+        // Blob shapes (once drawn as a phantom diff) and single-edit shapes
+        // alike: none of them is a preview.
+        for raw in [
+            serde_json::json!({"blocks": "@@ -10,1 +10,1 @@\n- a\n+ b"}),
+            serde_json::json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@END"}),
+            serde_json::json!({"oldText": "a", "newText": "b"}),
+            serde_json::json!({"path": "src/x.rs:10", "startLine": 3, "oldText": "a", "newText": "b"}),
+            serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]}),
+        ] {
+            let msg = crate::tools::EditArgs::from_wire(&raw).expect_err("must fail");
+            assert!(
+                !msg.starts_with(SED_PREVIEW_BANNER),
+                "claimed as a preview:\n{msg}"
+            );
+            assert!(
+                sed_preview_body(&msg).is_none(),
+                "claimed as a preview:\n{msg}"
+            );
+        }
     }
 }
 
@@ -5742,6 +5803,130 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
             "{text}"
         );
         let _ = row;
+    }
+
+    /// The rendered panel for an `edit` argument error is the `Expected`/`Actual`
+    /// table — never a diff.
+    ///
+    /// Regression, and the reason the test above could pass while the screen was
+    /// broken: the `sed`-preview renderer runs first on *every* result, and it
+    /// used to sniff for `@@@OLD`. Every argument error embeds the `Expected:`
+    /// example, which is a well-formed block, so the panel drew the example as a
+    /// phantom diff and returned before the error was rendered. That test's
+    /// fixture only escaped because its `Actual:` leaves a dangling `@@@NEW`,
+    /// which breaks the parse. These fixtures are the shapes that do not.
+    #[test]
+    #[serial_test::serial]
+    fn an_edit_arg_error_is_never_rendered_as_a_diff() {
+        for raw in [
+            // `Actual` is a JSON echo, and an echo elided to a single line.
+            serde_json::json!({"oldText": "a", "newText": "b"}),
+            serde_json::json!({"path": "src/x.rs:10", "startLine": 3, "oldText": "a", "newText": "b"}),
+            serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]}),
+            serde_json::json!({"blocks": "@@ -10,1 +10,1 @@\n- a\n+ b"}),
+        ] {
+            let err = crate::tools::EditArgs::from_wire(&raw).expect_err("must fail");
+            let (out, _reasoning) = capturing_output(80);
+            out.begin_capture_inner();
+            out.display_tool_result(&format!("failed to parse tool arguments: {err}"));
+            let bytes = out.end_capture_inner();
+            let text = strip_ansi(&String::from_utf8_lossy(&bytes));
+
+            assert!(!text.contains("@@ -"), "phantom diff for {raw}:\n{text}");
+            assert!(
+                text.contains("Expected") && text.contains("Actual"),
+                "no table for {raw}:\n{text}"
+            );
+            // The problem itself reaches the screen, not just the shape. The
+            // panel word-wraps it at the terminal width, so compare with runs of
+            // whitespace collapsed on both sides.
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let problem = err.lines().next().unwrap();
+            let problem = problem.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                flat.contains(&problem),
+                "problem line lost for {raw}: {problem:?}\n{text}"
+            );
+        }
+    }
+
+    /// A single-edit failure shows a definition list, not the block table.
+    ///
+    /// The `Expected:` section follows the shape the caller used (see
+    /// `blockedit::wire`), so this message is JSON on both sides; `arg_error_view`
+    /// returns `None` for it and the panel stacks it. The table pairs *block
+    /// markers* against what the model sent, so against a JSON `Actual:` it was five
+    /// `@@@OLD` rows with one row of JSON beside them.
+    #[test]
+    #[serial_test::serial]
+    fn a_single_edit_failure_renders_as_a_definition_list() {
+        let (out, _reasoning) = capturing_output(80);
+        out.begin_capture_inner();
+        out.display_tool_result(
+            "missing required field 'path'\n\nExpected:\n\
+             {\"path\": \"some/path.rs\", \"startLine\": 1234, \"oldText\": \"old text\", \
+             \"newText\": \"new text\"}\n\nActual:\n{\"newText\":\"b\",\"oldText\":\"a\"}",
+        );
+        let bytes = out.end_capture_inner();
+        let text = strip_ansi(&String::from_utf8_lossy(&bytes));
+
+        assert!(!text.contains("|"), "a table was drawn:\n{text}");
+        assert!(!text.contains("@@@OLD"), "block markers leaked in:\n{text}");
+        assert!(text.contains("Expected:"), "{text}");
+        assert!(text.contains("Actual:"), "{text}");
+        // Both values survive to the screen, wrapped but intact.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for want in ["\"oldText\": \"old text\"", "\"oldText\":\"a\""] {
+            assert!(flat.contains(want), "{want:?} lost:\n{text}");
+        }
+    }
+
+    /// The other half of the guard above: gating the result-side `sed` renderer
+    /// must not cost the `edit` tool its own blocks-as-diff rendering. That is
+    /// the *call* half — `get_preview` → `edit_preview`, fed from the arguments —
+    /// and it is a different function on a different input, which is why the two
+    /// renderings can be gated independently.
+    #[test]
+    #[serial_test::serial]
+    fn an_edit_call_still_renders_its_blocks_as_a_diff() {
+        let (out, _reasoning) = capturing_output(80);
+        out.begin_capture_inner();
+        out.display_tool_call(
+            "edit",
+            &serde_json::json!({"blocks": "src/x.rs:5\n@@@OLD\n    run();\n@@@NEW\n    walk();\n@@@END"}),
+        );
+        let bytes = out.end_capture_inner();
+        let text = strip_ansi(&String::from_utf8_lossy(&bytes));
+
+        assert!(text.contains("edit src/x.rs"), "no label:\n{text}");
+        assert!(text.contains("@@ -1 +1 @@"), "no hunk header:\n{text}");
+        assert!(text.contains("-     run();"), "no removed line:\n{text}");
+        assert!(text.contains("+     walk();"), "no added line:\n{text}");
+    }
+
+    /// And a `sed` preview still renders as a diff *with no call context*: a
+    /// replayed result arrives without a preceding `display_tool_call`, so the
+    /// gate has to rest on the result's own banner rather than on panel state.
+    #[test]
+    #[serial_test::serial]
+    fn a_sed_preview_renders_without_a_call_context() {
+        let (out, _reasoning) = capturing_output(80);
+        out.begin_capture_inner();
+        out.display_tool_result(
+            "sed preview: 1 block for src/x.rs (1 expression). Review the blocks below, \
+             then pass them to the `edit` tool as its `blocks` argument.\n\
+             src/x.rs:5\n@@@OLD\n    run();\n@@@NEW\n    walk();\n@@@END\n",
+        );
+        let bytes = out.end_capture_inner();
+        let text = strip_ansi(&String::from_utf8_lossy(&bytes));
+
+        assert!(
+            text.contains("@@ -5,1 +5,1 @@"),
+            "no anchored hunk:\n{text}"
+        );
+        assert!(text.contains("-     run();"), "no removed line:\n{text}");
+        assert!(text.contains("+     walk();"), "no added line:\n{text}");
+        assert!(text.contains("1 block in src/x.rs"), "banner lost:\n{text}");
     }
 
     #[test]
