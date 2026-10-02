@@ -453,6 +453,19 @@ impl AppState {
             let mut st = self.state.lock();
             f(&mut st.settings)?;
             st.models_revision += 1;
+            // Keep the *target* config's window in step with the record just
+            // written. `plan_rebuild` compares the target against the running
+            // agent, and the mid-turn status bar reads the window off the agent,
+            // so a Ctrl-E of `context_length` only reaches it if the target
+            // moves. Resolved for the one model rather than via
+            // `resolved_models`, which would deadlock on the lock already held.
+            let qualified = st.config.qualified_model_id();
+            st.config.context_limit = crate::model_catalog::resolved_entry(
+                &qualified,
+                st.settings.models.get(&qualified),
+            )
+            .and_then(|e| e.context_length)
+            .filter(|max| *max > 0);
             st.settings.clone()
         };
         snapshot.save().map_err(|e| e.to_string())

@@ -4831,6 +4831,11 @@ pub(crate) struct RebuildFingerprint {
     pub model: String,
     pub params: params::ModelParams,
     pub persona: Option<String>,
+    /// Part of the identity, not just the comparison: a Ctrl-E that changes the
+    /// context window is a new target, so a *previous* failed attempt must not
+    /// dedupe it away — the user edited something, which is exactly the signal
+    /// the dedupe is meant to wait for.
+    pub context_limit: Option<u64>,
 }
 
 /// Decide whether the convergence step should rebuild the agent this cycle.
@@ -4857,7 +4862,11 @@ pub(crate) fn plan_rebuild(
 ) -> Option<RebuildFingerprint> {
     let changed = applied.qualified_model_id() != target.qualified_model_id()
         || applied.params != target.params
-        || applied.persona_name != target.persona_name;
+        || applied.persona_name != target.persona_name
+        // The window is compared because it reaches the mid-turn status bar
+        // only through a rebuild, and a per-model `context_length` override
+        // moves nothing else here.
+        || applied.context_limit != target.context_limit;
     if !changed {
         return None;
     }
@@ -4865,6 +4874,7 @@ pub(crate) fn plan_rebuild(
         model: target.qualified_model_id(),
         params: target.params,
         persona: target.persona_name.clone(),
+        context_limit: target.context_limit,
     };
     if last_attempt == Some(&attempt) {
         return None;
@@ -4974,6 +4984,10 @@ pub async fn run_interactive(
     // The resolved context window, read once here and carried on the config so
     // the status bar can divide by it without a store lookup per paint.
     config.context_limit = resolved_context_limit(&app_state);
+    // Onto the target too, or the two sides disagree at startup and the
+    // convergence step rebuilds the agent once for nothing.
+    let startup_limit = config.context_limit;
+    app_state.update_config(|c| c.context_limit = startup_limit);
     // First session — created up front so the `/session` overlay can mark
     // it from the start (the file itself is written lazily on the first
     // `append_message`, so no empty session is created for a user who
@@ -5799,7 +5813,10 @@ pub struct BarModel<'a> {
 /// The mid-turn readout (doc/row_accounting.md, zone 2). Built from the same
 /// pieces `session_stats_lines` uses — the caller for the resolved context
 /// window, its own token count for the usage — so the two cannot disagree about
-/// what the context figure means. Fields that are unknown are dropped rather
+/// what the context figure means. That holds because a per-model
+/// `context_length` edit moves both: the prompt-side bar re-reads it every
+/// cycle, and `plan_rebuild` compares it so the mid-turn agent is rebuilt with
+/// the new one. Adding a term to that gate is what keeps the claim true. Fields that are unknown are dropped rather
 /// than shown empty.
 ///
 /// **This is the data half.** A struct rather than a rendered string because the
@@ -5826,7 +5843,9 @@ pub struct BarModel<'a> {
 ///
 /// Read from `AppState::resolved_models` rather than looked up per status-bar
 /// paint, so the percentage uses the number the app actually enforces and the
-/// prompt-side and mid-turn bars cannot disagree.
+/// prompt-side and mid-turn bars cannot disagree. The mid-turn bar gets it
+/// through `plan_rebuild`, which compares this value to decide whether to
+/// rebuild — hence the window's place in that gate.
 pub fn resolved_context_limit(app_state: &crate::app_state::AppState) -> Option<u64> {
     let qualified = app_state.model();
     let (provider, model) = qualified.split_once(':')?;
@@ -10744,6 +10763,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                 model: "openai:gpt-4o".into(),
                 params: p,
                 persona: None,
+                context_limit: None,
             })
         )
         .is_none());
@@ -11204,6 +11224,86 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             reasoning_remap_note(crate::params::ReasoningLevel::Max, &support),
             None
         );
+    }
+
+    /// A Ctrl-E of `context_length` moves nothing else `plan_rebuild` looks at,
+    /// but the mid-turn status bar reads the window off the running agent, so
+    /// without this term the edit would not reach it until an unrelated rebuild.
+    #[test]
+    fn a_context_window_change_rebuilds() {
+        use super::plan_rebuild;
+        let mut base = gate_cfg("openai", "gpt-4o", crate::params::ModelParams::default());
+        base.context_limit = Some(200_000);
+        let mut next = base.clone();
+        next.context_limit = Some(1_048_576);
+        assert!(
+            plan_rebuild(&base, &next, None).is_some(),
+            "a Ctrl-E'd context_length must arm a rebuild"
+        );
+        // ...and is not a loop: once applied, the two sides agree again.
+        assert!(plan_rebuild(&next, &next, None).is_none());
+    }
+
+    /// The dedupe waits for a *distinct* target, so a window edit is a fresh
+    /// attempt even when a previous one failed — otherwise the user edits
+    /// something, the fix lands, and the gate still refuses to retry.
+    #[test]
+    fn a_window_change_is_not_deduped_against_a_failed_attempt() {
+        use super::plan_rebuild;
+        let mut base = gate_cfg("openai", "gpt-4o", crate::params::ModelParams::default());
+        base.context_limit = Some(200_000);
+        let mut next = base.clone();
+        next.context_limit = Some(1_048_576);
+        let prior = plan_rebuild(&base, &next, None).expect("first attempt is armed");
+        assert!(
+            plan_rebuild(&base, &next, Some(&prior)).is_none(),
+            "the same target must not re-arm"
+        );
+        // Same model, params and persona; only the window differs.
+        let after_fix = gate_cfg("openai", "gpt-4o", crate::params::ModelParams::default());
+        assert!(
+            plan_rebuild(&base, &after_fix, Some(&prior)).is_some(),
+            "a new window is a new target and must re-arm"
+        );
+    }
+
+    /// The other half of option A: a settings write has to move the *target*
+    /// config's window, or `plan_rebuild` has nothing to notice.
+    ///
+    /// Goes through `update_settings` because that is the path the Ctrl-E
+    /// accept arm takes, and reads the target back with `config_snapshot`,
+    /// because that is what the convergence step compares against.
+    #[test]
+    fn a_record_write_moves_the_target_configs_window() {
+        let mut store =
+            crate::settings::SettingsStore::from_config(&crate::Config::default(), None);
+        store.default_model = "openai:gpt-4o".into();
+        let app = crate::app_state::AppState::new(
+            gate_cfg("openai", "gpt-4o", crate::params::ModelParams::default()),
+            store,
+            None,
+        );
+        let before = app.config_snapshot().context_limit;
+
+        app.update_settings(|s| {
+            s.apply_model_settings(
+                "openai:gpt-4o",
+                &crate::model_settings::ModelSettings {
+                    context_length: Some(123_456),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let after = app.config_snapshot().context_limit;
+        assert_eq!(
+            after,
+            Some(123_456),
+            "the target must carry the window so the rebuild gate can see it"
+        );
+        assert_ne!(after, before, "so a rebuild is armed, not suppressed");
     }
 }
 
