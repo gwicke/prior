@@ -31,6 +31,16 @@ moving the leaf to the entry just before the compaction point; the leaf is
 restored before the compaction entry is appended, leaving the session
 file byte-compatible with the other modes.
 
+**Superseded (the `switch --summarize` grammar below):** `switch` is now a
+sub-menu (`cursor` / `summarize`) and the abandoned-branch summary lives in
+`/tree <id> switch summarize <mode>` — `agent::generate_branch_summary` +
+`apply_branch_summary` write a `branch_summary` entry, not a compaction one.
+The command grammar and the "`--summarize` = existing branch-summarization"
+paragraphs below describe the design as first specced; see
+`doc/branch_summary.md` for the shipped shape and the pi-parity record (in
+particular: pi parents the summary at the **switch target**, and `fromId` is
+the branch-from position, not the common ancestor).
+
 **Text-only mode** (`/tree <entry-id> compact text-only`) builds a summary
 from the dropped span containing every **user prompt**, the assistant's
 **text responses per turn**, and a trailing **files-touched list**

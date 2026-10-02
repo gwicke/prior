@@ -4007,6 +4007,434 @@ pub(crate) async fn apply_compaction(
         .map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Branch summarization — `/tree <id> switch summarize`
+//
+// pi parity, verified against ~/src/pi @ this change:
+//   - `collectEntriesForBranchSummary` (core/compaction/branch-summarization.ts)
+//     collects the spur; `navigateTree` (core/agent-session.ts) summarizes it
+//     and calls `branchWithSummary(newLeafId, …)` (core/session-manager.ts),
+//     which sets `leafId = target` FIRST and then appends the
+//     `branch_summary` entry with `parentId = target`, `fromId = target`.
+//     The entry is therefore *inline on the branch the conversation continues
+//     on* — not parked on the abandoned spur — and `buildSessionContext`'s
+//     per-entry mapping turns it into a user message (see
+//     `session::branch_summary_message_text`). pi's context build walks only
+//     the leaf path, so nothing has to go looking for summaries in side spurs.
+// ---------------------------------------------------------------------------
+
+/// Prepended to the **stored** summary text by pi's `generateBranchSummary`,
+/// so the framing ("…before returning here") travels with the entry and is
+/// visible in `/tree` too, not only inside the LLM wrapper.
+const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
+
+/// pi's `BRANCH_SUMMARY_PROMPT` (core/compaction/branch-summarization.ts),
+/// byte-exact. The `## Goal / ## Constraints / ## Progress / ## Key Decisions
+/// / ## Next Steps` shape is what makes the stored summary useful as *context*
+/// later — a prose recap does not tell the next turn what is unfinished.
+/// pi sends it with `maxTokens: 2048` alongside `SUMMARIZATION_SYSTEM_PROMPT`;
+/// our summarizer (`CodeAgent::summarize`) is a single user-message request with
+/// no system prompt, and the text above is self-contained, so it all lives in
+/// the prompt instead.
+pub(crate) const DEFAULT_BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+
+/// The entries a switch from `old_leaf` to `target` leaves behind: everything
+/// after the deepest common ancestor on the old leaf's path, in chronological
+/// order (pi `collectEntriesForBranchSummary`). Empty when the target is
+/// already on the current path (i.e. navigating forward/down) — pi skips
+/// summarization in that case and just branches.
+///
+/// Iterative (two `get_path_to_root` walks); no recursion, so a 1000-entry
+/// linear session cannot overflow the stack. The caller holds the index lock.
+pub(crate) fn abandoned_spur(
+    index: &crate::session::SessionIndex,
+    old_leaf: &str,
+    target: &str,
+) -> Vec<crate::session::SessionEntry> {
+    let old_path = index.get_path_to_root(old_leaf);
+    let target_path = index.get_path_to_root(target);
+    let target_ids: std::collections::HashSet<&str> =
+        target_path.iter().map(|e| e.id.as_str()).collect();
+    // The **deepest** shared entry is the branch point (pi walks
+    // `oldLeafId → …` *until* it, so the ancestor itself is not in the span).
+    // `rposition`, not `position`: when the target is a *descendant* of the
+    // old leaf, the deepest shared entry IS the old leaf, which makes the spur
+    // empty — forward navigation abandons nothing. And the ancestor is
+    // excluded by `skip(i + 1)`: skipping `i` would fold the shared prefix into
+    // the spur and have the summarizer re-summarize what the new branch keeps.
+    match old_path
+        .iter()
+        .rposition(|e| target_ids.contains(e.id.as_str()))
+    {
+        Some(i) => old_path.into_iter().skip(i + 1).collect(),
+        // No shared ancestor (an id that is not in this tree): the whole old
+        // path is the spur. Callers validate the target first.
+        None => old_path,
+    }
+}
+
+/// Serialize spur entries to the text body of pi's `<conversation>` block
+/// (`serializeConversation`, core/compaction/utils.ts): one line per message,
+/// role-tagged, with tool calls rendered as `name(arg=value, …)`.
+///
+/// Deliberate divergences, both consistent with `build_text_only_summary`:
+/// tool *results* are skipped (their content is already in the assistant's
+/// tool call) and reasoning blocks are omitted (pi includes them; our
+/// `reasoning_in_context` setting says reasoning does not belong in context).
+/// `Compaction` / `BranchSummary` entries inside the spur are serialized as
+/// the user message pi's conversion would produce, so a nested summary
+/// survives into the outer summary.
+fn serialize_spur(entries: &[crate::session::SessionEntry]) -> String {
+    use crate::session::SessionEntryContent as C;
+    let mut parts: Vec<String> = Vec::new();
+    for entry in entries {
+        match &entry.content {
+            C::Message { message } => {
+                let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                let content = message.get("content").and_then(|c| c.as_array());
+                let Some(items) = content else { continue };
+                match role {
+                    "user" => {
+                        let text = items
+                            .iter()
+                            .filter_map(|i| {
+                                (i.get("type").and_then(|t| t.as_str()) == Some("text"))
+                                    .then(|| i.get("text").and_then(|t| t.as_str()))
+                                    .flatten()
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        if !text.is_empty() {
+                            parts.push(format!("[User]: {}", text));
+                        }
+                    }
+                    "assistant" => {
+                        let text = items
+                            .iter()
+                            .filter_map(|i| {
+                                (i.get("type").and_then(|t| t.as_str()) == Some("text"))
+                                    .then(|| i.get("text").and_then(|t| t.as_str()))
+                                    .flatten()
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !text.is_empty() {
+                            parts.push(format!("[Assistant]: {}", text));
+                        }
+                        let calls = items
+                            .iter()
+                            .filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("toolCall"))
+                            .map(|call| {
+                                let name =
+                                    call.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                                let args = match call.get("arguments").and_then(|a| a.as_object()) {
+                                    Some(map) if !map.is_empty() => map
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            format!(
+                                                "{}={}",
+                                                k,
+                                                serde_json::to_string(v).unwrap_or_default()
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                    _ => String::new(),
+                                };
+                                format!("{}({})", name, args)
+                            })
+                            .collect::<Vec<_>>();
+                        if !calls.is_empty() {
+                            parts.push(format!("[Assistant tool calls]: {}", calls.join("; ")));
+                        }
+                    }
+                    // toolResult: context is in the assistant's tool call.
+                    _ => {}
+                }
+            }
+            C::Compaction { summary, .. } if !summary.is_empty() => {
+                parts.push(format!(
+                    "[User]: {}{}{}",
+                    crate::session::COMPACTION_SUMMARY_PREFIX,
+                    summary,
+                    crate::session::COMPACTION_SUMMARY_SUFFIX
+                ));
+            }
+            C::BranchSummary { summary, .. } if !summary.is_empty() => {
+                parts.push(format!(
+                    "[User]: {}",
+                    crate::session::branch_summary_message_text(summary)
+                ));
+            }
+            // Meta entries (model/thinking/labels/custom): no conversation content.
+            _ => {}
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// The `Documents` / `Files` section pi appends to every generated branch
+/// summary (its `formatFileOperations`), built from the same collector the
+/// text-only summary uses. `None` when the spur touched no files — nothing to
+/// append.
+fn spur_files_section(
+    entries: &[crate::session::SessionEntry],
+    session_dir: &Path,
+) -> Option<String> {
+    let mut files: Vec<crate::session::TouchedFile> = Vec::new();
+    for entry in entries {
+        if let crate::session::SessionEntryContent::Message { message } = &entry.content {
+            crate::session::collect_touched_files(message, &mut files, session_dir);
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    crate::session::render_files_section(&mut out, &files, "Documents");
+    crate::session::render_files_section(&mut out, &files, "Files");
+    (!out.is_empty()).then_some(out)
+}
+
+/// Generate a branch summary draft for the spur left behind by switching from
+/// the current leaf to `target_id` — the `/tree <id> switch summarize` twin of
+/// [`generate_compaction`], with the same three modes and the same "no writes,
+/// errors as strings" contract (doc/editor_cleanup.md §6).
+///
+/// 1. validate: active session, known target, target ≠ leaf, non-empty spur;
+/// 2. build the mode's draft from the spur entries (never from the live
+///    conversation prefix — a spur is off-path, so there is no prefix to
+///    summarize; pi sends it as a standalone request too);
+/// 3. `Llm` only: prepend pi's preamble and append the touched-files section,
+///    so the stored summary carries its own framing.
+///
+/// `tokens_before` is left at 0: a `BranchSummary` entry has no such field
+/// (pi's is `fromId` + `summary`), so nothing consumes it.
+pub(crate) async fn generate_branch_summary(
+    app_state: &AppState,
+    target_id: &str,
+    mode: CompactSummaryMode,
+    llm_payload: &str,
+) -> std::result::Result<CompactionDraft, String> {
+    let session = app_state
+        .session()
+        .ok_or_else(|| "Cannot summarize: no active session".to_string())?;
+    if session.get_entry(target_id).await.is_none() {
+        return Err(format!(
+            "Cannot summarize: unknown tree entry {}",
+            &target_id[..target_id.len().min(12)]
+        ));
+    }
+    let old_leaf = session
+        .get_leaf_id()
+        .await
+        .ok_or_else(|| "Cannot summarize: no current position".to_string())?;
+    if old_leaf == target_id {
+        return Err("Already at this entry — nothing to summarize.".to_string());
+    }
+    // One index lock, one collection — the spur is a snapshot; nothing below
+    // mutates the index (the LLM request is the only await).
+    let spur: Vec<crate::session::SessionEntry> = {
+        let index = session.index().lock().await;
+        abandoned_spur(&index, &old_leaf, target_id)
+    };
+    if spur.is_empty() {
+        return Err("Nothing to summarize: this entry is ahead on the current branch.".to_string());
+    }
+    let session_dir = std::path::PathBuf::from(session.index().lock().await.header.cwd.clone());
+
+    let mut agent = app_state.agent();
+    if matches!(mode, CompactSummaryMode::Llm) && agent.is_none() {
+        let cfg = app_state.config_snapshot();
+        match create_agent(cfg).await {
+            Ok(a) => {
+                let a: Arc<CodeAgent> = Arc::from(a);
+                app_state.activate_agent(a.clone());
+                agent = Some(a);
+            }
+            Err(e) => return Err(format!("Cannot start agent: {}", e)),
+        }
+    }
+
+    let summary = match mode {
+        // The deterministic modes are the compaction ones verbatim — they
+        // take the dropped entries and touch no LLM. The manual template's
+        // seed (a previous compaction summary) has no analogue here: a spur
+        // carries no compaction boundary, so the file list stands alone.
+        CompactSummaryMode::Manual => {
+            crate::session::build_manual_template(&spur, None, &session_dir)
+        }
+        CompactSummaryMode::TextOnly => {
+            crate::session::build_text_only_summary(&spur, &session_dir)
+        }
+        CompactSummaryMode::Llm => {
+            let conversation = serialize_spur(&spur);
+            // pi appends custom instructions rather than replacing the
+            // structured-format prompt (`Additional focus:`), so a user
+            // instruction can never break the required `##` sections.
+            let instructions = if llm_payload.trim().is_empty() {
+                DEFAULT_BRANCH_SUMMARY_PROMPT.to_string()
+            } else {
+                format!(
+                    "{}\n\nAdditional focus: {}",
+                    DEFAULT_BRANCH_SUMMARY_PROMPT,
+                    llm_payload.trim()
+                )
+            };
+            let prompt = format!(
+                "<conversation>\n{}\n</conversation>\n\n{}",
+                conversation, instructions
+            );
+            let Some(a) = agent.as_ref() else {
+                return Err("no agent".to_string());
+            };
+            let output = app_state.with_config(|c| c.output.clone());
+            let (user_cancel, cancel_notify) =
+                app_state.with_config(|c| (c.user_cancel.clone(), c.cancel_notify.clone()));
+            let reply = retry_summarization(
+                output.as_ref(),
+                &user_cancel,
+                &cancel_notify,
+                Some(app_state),
+                &mut || a.summarize(&prompt),
+            )
+            .await
+            .map_err(|e| format!("Summary failed: {}", e))?;
+            let reply = reply.trim();
+            if reply.is_empty() {
+                return Err("Summary was empty; nothing written.".to_string());
+            }
+            let mut summary = format!("{}{}", BRANCH_SUMMARY_PREAMBLE, reply);
+            if let Some(files) = spur_files_section(&spur, &session_dir) {
+                summary.push_str(&files);
+            }
+            summary
+        }
+    };
+
+    Ok(CompactionDraft {
+        summary,
+        tokens_before: 0,
+    })
+}
+
+/// Whether `target_id` names an entry `/tree <id> edit` can re-ask: a user
+/// `Message` or a `CustomMessage` — pi's two cases
+/// (`agent-session.ts:2950`/`:2954`). Read from the **session**, not the tree
+/// listing, so the node's row cannot go stale against it.
+pub(crate) async fn is_reaskable_entry(session: &Session, target_id: &str) -> bool {
+    let Some(entry) = session.get_entry(target_id).await else {
+        return false;
+    };
+    match &entry.content {
+        crate::session::SessionEntryContent::Message { message } => {
+            message.get("role").and_then(|r| r.as_str()) == Some("user")
+        }
+        crate::session::SessionEntryContent::CustomMessage { .. } => true,
+        _ => false,
+    }
+}
+
+/// `/tree <id> edit` — pi's user-message re-edit: move the leaf to the entry's
+/// **parent** (so the prompt leaves the active branch) and put its text in the
+/// input buffer for re-asking (`agent-session.ts:2950-2953`).
+///
+/// Distinct from `/tree <id> switch cursor`, which moves the leaf *to* the
+/// entry — that keeps the prompt in context and continues after it. Both are
+/// useful, so they are separate menu rows rather than one overloaded action.
+///
+/// The prefill goes through the one-shot register the loop pops before the next
+/// `read_input`; it replaces the buffer outright (unlike pi, which only fills an
+/// empty one) because that is the register's contract for handler writes.
+pub(crate) async fn reask_from_entry(
+    app_state: &AppState,
+    target_id: &str,
+) -> std::result::Result<(), String> {
+    let session = app_state
+        .session()
+        .ok_or_else(|| "Cannot edit: no active session".to_string())?;
+    let entry = session.get_entry(target_id).await.ok_or_else(|| {
+        format!(
+            "Cannot edit: unknown tree entry {}",
+            &target_id[..target_id.len().min(12)]
+        )
+    })?;
+    let text = match &entry.content {
+        crate::session::SessionEntryContent::Message { message } => {
+            if message.get("role").and_then(|r| r.as_str()) != Some("user") {
+                return Err("Only a user prompt can be edited — use `switch` to move here.".into());
+            }
+            crate::session::user_prompt_text(message)
+        }
+        crate::session::SessionEntryContent::CustomMessage { content, .. } => content
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        _ => return Err("Only a user prompt can be edited — use `switch` to move here.".into()),
+    };
+    let Some(text) = text else {
+        return Err("That prompt has no text to edit.".into());
+    };
+    // Parent, not the entry: re-asking forks a new turn in place of the old
+    // one, so the original prompt leaves the active branch (pi does the same,
+    // `parentId: null` for a root prompt).
+    session
+        .move_leaf(entry.parent_id.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    app_state.set_prefill(text);
+    Ok(())
+}
+
+/// Write a reviewed branch summary and move the leaf — the submit half of
+/// `/tree <id> switch summarize`, and the one place the two summary flows
+/// differ in their effect.
+///
+/// Order matters and follows pi's `navigateTree`: **move first, then append**.
+/// `append_branch_summary` parents to the current leaf and advances it, so
+/// moving to `target_id` first yields pi's exact shape — a `branch_summary`
+/// entry with `parentId = fromId = target_id`, sitting inline on the branch the
+/// conversation continues on, where `build_session_context` projects it into
+/// the LLM context.
+///
+/// The leaf-moved check is the guard against a draft prepared for a different
+/// spur: the summary only describes what was behind the leaf at generation
+/// time, so a leaf that moved since (the user switched elsewhere and came
+/// back mid-review) makes the draft stale.
+pub(crate) async fn apply_branch_summary(
+    app_state: &AppState,
+    target_id: &str,
+    expected_old_leaf: &str,
+    draft: &CompactionDraft,
+) -> std::result::Result<(), String> {
+    let session = app_state
+        .session()
+        .ok_or_else(|| "Cannot summarize: no active session".to_string())?;
+    let current = session
+        .get_leaf_id()
+        .await
+        .ok_or_else(|| "Cannot summarize: no current position".to_string())?;
+    if current != expected_old_leaf {
+        return Err(
+            "The session moved since this summary was generated — press Enter to regenerate."
+                .to_string(),
+        );
+    }
+    if draft.summary.trim().is_empty() {
+        return Err("Summary is empty; nothing written.".to_string());
+    }
+    // pi: leaf = branchFromId, then append parented to it.
+    session
+        .move_leaf(Some(target_id.to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
+    session
+        .append_branch_summary(target_id, &draft.summary)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Run a *summarization* request with the same auto-retry / back-off / Esc-
 /// cancel behaviour as a regular user prompt (`prompt()`'s retry loop in
 /// `run_interactive`).
@@ -7488,6 +7916,17 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         app_state
     }
 
+    /// True when the session has any `BranchSummary` entry.
+    async fn has_branch_summary_entry(s: &Session) -> bool {
+        let index = s.index().lock().await;
+        index.entries.values().any(|e| {
+            matches!(
+                e.content,
+                crate::session::SessionEntryContent::BranchSummary { .. }
+            )
+        })
+    }
+
     /// True when the session has any `Compaction` entry.
     async fn has_compaction_entry(s: &Session) -> bool {
         let index = s.index().lock().await;
@@ -7610,6 +8049,353 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             "leaf untouched"
         );
         assert!(!has_compaction_entry(&s).await, "no write");
+    }
+
+    // ── Branch summarization (`/tree <id> switch summarize`) ─────────────────
+
+    /// A spur session with the leaf at `a2`:
+    ///
+    /// ```text
+    /// u1 ─ a1 ─ a2 ─ a3
+    ///     └─ u2
+    /// ```
+    ///
+    /// Switching to `u1` abandons `a1` + `a2` (a spur); `a3` is *ahead* of the
+    /// leaf, so switching to it abandons nothing. The builder parks the leaf on
+    /// the last entry, so it is moved to `a2` explicitly.
+    async fn branch_summarize_session() -> std::sync::Arc<Session> {
+        let s = std::sync::Arc::new(
+            build_writable_session_with(vec![
+                message_entry("u1", None, "user", "first prompt"),
+                message_entry("a1", Some("u1"), "assistant", "first reply"),
+                message_entry("u2", Some("u1"), "user", "sibling path"),
+                message_entry("a2", Some("a1"), "assistant", "abandoned work"),
+                message_entry("a3", Some("a2"), "assistant", "the next turn"),
+            ])
+            .await,
+        );
+        s.move_leaf(Some("a2".to_string())).await.expect("leaf");
+        s
+    }
+
+    fn spur_ids(entries: &[crate::session::SessionEntry]) -> Vec<String> {
+        entries.iter().map(|e| e.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn abandoned_spur_is_what_the_switch_leaves_behind() {
+        let s = branch_summarize_session().await;
+        let index = s.index().lock().await;
+        // Switching to a sibling: everything after the common ancestor (u1).
+        assert_eq!(
+            spur_ids(&abandoned_spur(&index, "a2", "u2")),
+            vec!["a1", "a2"],
+            "chronological, common ancestor excluded"
+        );
+        // Switching to the branch point abandons the whole spur.
+        assert_eq!(spur_ids(&abandoned_spur(&index, "a2", "u1")), ["a1", "a2"]);
+        // Switching forward/down abandons nothing — pi skips the summary here.
+        assert!(abandoned_spur(&index, "a2", "a3").is_empty());
+        assert!(abandoned_spur(&index, "a2", "a2").is_empty(), "no move");
+        // An id outside the tree has no shared ancestor: the whole old path is the
+        // spur (no panic) — callers reject the unknown target first.
+        assert_eq!(
+            spur_ids(&abandoned_spur(&index, "a2", "nope")),
+            ["u1", "a1", "a2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_spur_handles_a_long_linear_session_without_recursing() {
+        // Large sessions are a linked list of depth N; the collection must be
+        // iterative (explicit walks, no recursion) to survive the stack.
+        let n = 20_000;
+        let mut entries = Vec::with_capacity(n);
+        for i in 0..n {
+            let parent = if i == 0 {
+                None
+            } else {
+                Some(format!("e{}", i - 1))
+            };
+            entries.push(message_entry(
+                &format!("e{}", i),
+                parent.as_deref(),
+                "user",
+                "x",
+            ));
+        }
+        let s = std::sync::Arc::new(build_writable_session_with(entries).await);
+        let index = s.index().lock().await;
+        let spur = abandoned_spur(&index, &format!("e{}", n - 1), "e0");
+        assert_eq!(spur.len(), n - 1, "the whole tail past e0");
+    }
+
+    #[tokio::test]
+    async fn generate_branch_summary_text_only_and_apply_moves_the_leaf() {
+        let s = branch_summarize_session().await;
+        let app_state = compaction_app_state(s.clone());
+        let draft = generate_branch_summary(&app_state, "u1", CompactSummaryMode::TextOnly, "")
+            .await
+            .expect("generate");
+        assert!(
+            draft.summary.contains("abandoned work"),
+            "the spur is what got summarized: {:?}",
+            draft.summary
+        );
+        assert!(
+            !draft.summary.contains("first prompt"),
+            "the kept prefix must not be summarized: {:?}",
+            draft.summary
+        );
+        assert_eq!(
+            draft.tokens_before, 0,
+            "BranchSummary entries carry no tokensBefore"
+        );
+        // Nothing written yet, and the leaf has not moved.
+        assert!(!has_branch_summary_entry(&s).await);
+        assert_eq!(s.get_leaf_id().await.as_deref(), Some("a2"));
+
+        apply_branch_summary(&app_state, "u1", "a2", &draft)
+            .await
+            .expect("apply");
+
+        // pi's `branchWithSummary`: parentId = fromId = the switch target, and
+        // the summary entry is the new leaf — inline on the branch the
+        // conversation continues on.
+        let leaf = s.get_leaf_id().await.expect("leaf");
+        let entry = s.get_entry(&leaf).await.expect("entry");
+        match entry.content {
+            crate::session::SessionEntryContent::BranchSummary { from_id, summary } => {
+                assert_eq!(from_id, "u1", "fromId is the branch-from position");
+                assert_eq!(summary, draft.summary);
+            }
+            other => panic!("expected BranchSummary, got {other:?}"),
+        }
+        assert_eq!(entry.parent_id.as_deref(), Some("u1"));
+    }
+
+    #[tokio::test]
+    async fn branch_summary_reaches_the_context_of_the_branch_it_was_written_on() {
+        let s = branch_summarize_session().await;
+        let app_state = compaction_app_state(s.clone());
+        let draft = generate_branch_summary(&app_state, "u1", CompactSummaryMode::TextOnly, "")
+            .await
+            .expect("generate");
+        apply_branch_summary(&app_state, "u1", "a2", &draft)
+            .await
+            .expect("apply");
+
+        let ctx = s.build_context().await.expect("context");
+        let joined: String = ctx
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } => match content.first() {
+                    Some(UserContent::Text(t)) => Some(t.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains(
+                "The following is a summary of a branch that this conversation came back from"
+            ),
+            "pi's wrapper must be the LLM-visible form: {joined}"
+        );
+        assert!(joined.contains("abandoned work"), "{joined}");
+        // The abandoned spur itself is NOT in the new branch's context.
+        assert!(
+            !joined.contains("abandoned work\n"),
+            "spur dropped: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_branch_summary_refuses_without_a_spur_or_a_move() {
+        let s = branch_summarize_session().await;
+        let app_state = compaction_app_state(s.clone());
+        for (target, needle) in [
+            ("a2", "Already at this entry"), // the leaf itself
+            ("a3", "ahead"),                 // forward navigation: nothing abandoned
+        ] {
+            let err = generate_branch_summary(&app_state, target, CompactSummaryMode::TextOnly, "")
+                .await
+                .expect_err("nothing to summarize");
+            assert!(err.contains(needle), "target {target}: {err}");
+        }
+        let err = generate_branch_summary(&app_state, "nope", CompactSummaryMode::TextOnly, "")
+            .await
+            .expect_err("unknown entry");
+        assert!(err.contains("unknown tree entry"), "{err}");
+        assert!(!has_branch_summary_entry(&s).await, "no write");
+        assert_eq!(s.get_leaf_id().await.as_deref(), Some("a2"), "leaf kept");
+    }
+
+    #[tokio::test]
+    async fn apply_branch_summary_refuses_a_moved_leaf_and_an_empty_summary() {
+        let s = branch_summarize_session().await;
+        let app_state = compaction_app_state(s.clone());
+        let draft = CompactionDraft {
+            summary: "digest".into(),
+            tokens_before: 0,
+        };
+        let err = apply_branch_summary(&app_state, "u1", "a1", &draft)
+            .await
+            .expect_err("leaf moved since generation");
+        assert!(err.contains("moved"), "{err}");
+        assert!(!has_branch_summary_entry(&s).await, "no write");
+        assert_eq!(s.get_leaf_id().await.as_deref(), Some("a2"), "leaf kept");
+
+        // An empty digest writes nothing either — the user discarded it.
+        let empty = CompactionDraft {
+            summary: "   ".into(),
+            tokens_before: 0,
+        };
+        let err = apply_branch_summary(&app_state, "u1", "a2", &empty)
+            .await
+            .expect_err("empty summary");
+        assert!(err.contains("empty"), "{err}");
+        assert!(!has_branch_summary_entry(&s).await, "no write");
+    }
+
+    #[tokio::test]
+    async fn generate_branch_summary_manual_mode_lists_the_spur_files() {
+        // A `write` tool call in the spur is the file provenance the manual
+        // template surfaces.
+        let mut assistant = message_entry("a1", Some("u1"), "assistant", "editing");
+        if let crate::session::SessionEntryContent::Message { message } = &mut assistant.content {
+            message["content"] = serde_json::json!([
+                {"type": "text", "text": "editing"},
+                {"type": "toolCall", "name": "write",
+                 "arguments": {"path": "notes.md", "content": "hi"}},
+            ]);
+        }
+        let s = std::sync::Arc::new(
+            build_writable_session_with(vec![
+                message_entry("u1", None, "user", "first prompt"),
+                assistant,
+                message_entry("a2", Some("a1"), "assistant", "abandoned work"),
+            ])
+            .await,
+        );
+        let app_state = compaction_app_state(s.clone());
+        let draft = generate_branch_summary(&app_state, "u1", CompactSummaryMode::Manual, "")
+            .await
+            .expect("generate");
+        assert!(draft.summary.contains("notes.md"), "{:?}", draft.summary);
+        assert!(
+            draft.summary.contains("modified"),
+            "a write is a modification: {:?}",
+            draft.summary
+        );
+    }
+
+    // ── `/tree <id> edit` (pi's user-message re-edit) ─────────────────────
+
+    /// A session whose leaf is at `a1`: `u1` (user) ─ `a1` (assistant).
+    async fn reask_session() -> std::sync::Arc<Session> {
+        let s = std::sync::Arc::new(
+            build_writable_session_with(vec![
+                message_entry("u1", None, "user", "the original prompt"),
+                message_entry("a1", Some("u1"), "assistant", "the reply"),
+            ])
+            .await,
+        );
+        s.move_leaf(Some("a1".to_string())).await.expect("leaf");
+        s
+    }
+
+    #[tokio::test]
+    async fn reask_moves_to_the_parent_and_prefills_the_prompt() {
+        let s = reask_session().await;
+        let app_state = compaction_app_state(s.clone());
+        assert!(is_reaskable_entry(&s, "u1").await, "a user prompt");
+        assert!(
+            !is_reaskable_entry(&s, "a1").await,
+            "not an assistant reply"
+        );
+        assert!(!is_reaskable_entry(&s, "nope").await, "unknown entry");
+
+        reask_from_entry(&app_state, "u1").await.expect("re-ask");
+
+        // The prompt leaves the active branch — re-asking replaces it.
+        assert_eq!(
+            s.get_leaf_id().await,
+            None,
+            "a root prompt's parent is the root, not the prompt"
+        );
+        assert_eq!(
+            app_state.take_prefill().as_deref(),
+            Some("the original prompt"),
+            "the prompt rides the one-shot prefill register"
+        );
+    }
+
+    #[tokio::test]
+    async fn reask_refuses_a_non_prompt_entry_without_moving_the_leaf() {
+        let s = reask_session().await;
+        let app_state = compaction_app_state(s.clone());
+        let err = reask_from_entry(&app_state, "a1")
+            .await
+            .expect_err("assistant replies cannot be re-asked");
+        assert!(err.contains("user prompt"), "{err}");
+        assert_eq!(
+            s.get_leaf_id().await.as_deref(),
+            Some("a1"),
+            "leaf untouched"
+        );
+        assert!(app_state.take_prefill().is_none(), "no prefill");
+        let err = reask_from_entry(&app_state, "nope")
+            .await
+            .expect_err("unknown entry");
+        assert!(err.contains("unknown tree entry"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn serialize_spur_uses_pi_role_tags_and_skips_tool_results() {
+        let mut assistant = message_entry("a1", Some("u1"), "assistant", "reply text");
+        if let crate::session::SessionEntryContent::Message { message } = &mut assistant.content {
+            message["content"] = serde_json::json!([
+                {"type": "text", "text": "reply text"},
+                {"type": "toolCall", "name": "read", "arguments": {"path": "src/lib.rs"}},
+            ]);
+        }
+        let mut tool_result = message_entry("t1", Some("a1"), "user", "");
+        if let crate::session::SessionEntryContent::Message { message } = &mut tool_result.content {
+            *message = serde_json::json!({
+                "role": "toolResult",
+                "toolCallId": "c1",
+                "toolName": "read",
+                "content": [{"type": "text", "text": "file contents"}],
+            });
+        }
+        let spur = vec![
+            message_entry("u1", None, "user", "do the thing"),
+            assistant,
+            tool_result,
+            crate::session::SessionEntry::new_branch_summary(
+                "x".into(),
+                "earlier digest".into(),
+                Some("a1".into()),
+            ),
+        ];
+        let text = serialize_spur(&spur);
+        assert!(text.contains("[User]: do the thing"), "{text}");
+        assert!(text.contains("[Assistant]: reply text"), "{text}");
+        assert!(
+            text.contains("[Assistant tool calls]: read(path=\"src/lib.rs\")"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("file contents"),
+            "tool results are skipped (their content is in the call): {text}"
+        );
+        assert!(
+            text.contains("[User]: The following is a summary of a branch"),
+            "a nested digest survives as the user message pi would send: {text}"
+        );
     }
 
     #[tokio::test]

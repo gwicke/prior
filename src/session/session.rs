@@ -162,12 +162,18 @@ fn split_edit_tool_results(msg: &Message) -> Option<Message> {
 // Compaction summary message (pi-compatible wrapper)
 // ---------------------------------------------------------------------------
 
-/// pi's compaction summary message wrapper (core/messages.ts).
-/// The compaction entry is never sent to the LLM as itself; when its `summary`
-/// is non-empty it is projected into a synthetic user message wrapped as below.
-const COMPACTION_SUMMARY_PREFIX: &str =
-    "Compaction summary:\n\n<summary>\n";
-const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
+/// The compaction summary message wrapper. The compaction entry is never sent to
+/// the LLM as itself; when its `summary` is non-empty it is projected into a
+/// synthetic user message wrapped as below.
+///
+/// pi's wording (`core/messages.ts` `COMPACTION_SUMMARY_PREFIX`) is the long
+/// "The conversation history before this point was compacted…" sentence;
+/// `78c7e7a` shortened it to `Compaction summary:` — shorter prompt text for
+/// the model, at the cost of byte-parity with the wrapper pi emits. `pub(crate)`
+/// so the branch-summary serializer can nest an existing compaction the same
+/// way pi does.
+pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "Compaction summary:\n\n<summary>\n";
+pub(crate) const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 
 /// Build the synthetic user-message entry that stands in for a `Compaction`
 /// entry in the LLM context (pi `compactionSummary` message, converted by
@@ -188,6 +194,51 @@ fn compaction_summary_message(summary: &str) -> SessionEntry {
             }),
         },
     }
+}
+
+/// pi's branch-summary message wrapper (core/messages.ts `BRANCH_SUMMARY_PREFIX`
+/// / `BRANCH_SUMMARY_SUFFIX`) — byte-exact, including the suffix's **missing**
+/// leading newline (the compaction suffix has one). A `BranchSummary` entry on
+/// the active path is projected into a synthetic user message wrapped as below,
+/// so a summary written when switching away from a spur is what the model sees
+/// on the branch that continues from the switch target.
+pub(crate) const BRANCH_SUMMARY_PREFIX: &str =
+    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+pub(crate) const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
+
+/// The LLM-visible text of a `BranchSummary` entry: pi's wrapper around the
+/// stored summary. Callers project only non-empty summaries (pi guards the
+/// entry type the same way — an empty summary contributes nothing).
+pub(crate) fn branch_summary_message_text(summary: &str) -> String {
+    format!(
+        "{}{}{}",
+        BRANCH_SUMMARY_PREFIX, summary, BRANCH_SUMMARY_SUFFIX
+    )
+}
+
+/// The text a **user** prompt carries — pi's `_extractUserMessageText`
+/// (`core/agent-session.ts:3040`): a plain string, else the `text` items of the
+/// content array concatenated. Returns `None` for an empty result.
+///
+/// Distinct from [`summary_message_text`] above, which is the *compaction*
+/// projection: it filters to text-only blocks by design and joins with newlines.
+/// This one exists for `/tree <id> edit`, which hands the prompt back to the
+/// user for re-asking — so it concatenates exactly what they typed, images and
+/// tool blocks excluded, and refuses an empty prompt.
+pub(crate) fn user_prompt_text(message: &serde_json::Value) -> Option<String> {
+    if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
+        let text = text.trim();
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    let text = message
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+        .collect::<String>();
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// A single file touched during the compacted span, for the text-only
@@ -289,7 +340,7 @@ pub(crate) fn relativize_path(session_dir: &std::path::Path, path: &str) -> Opti
 ///
 /// Paths below `session_dir` are stored as compact relative paths
 /// (no leading `./`). Paths outside `session_dir` are stored as-is.
-fn collect_touched_files(
+pub(crate) fn collect_touched_files(
     message: &serde_json::Value,
     files: &mut Vec<TouchedFile>,
     session_dir: &std::path::Path,
@@ -799,7 +850,7 @@ fn first_user_prompt(entries: &[SessionEntry]) -> Option<String> {
     None
 }
 
-fn render_files_section(out: &mut String, files: &[TouchedFile], label: &str) {
+pub(crate) fn render_files_section(out: &mut String, files: &[TouchedFile], label: &str) {
     // Preserve collection order (chronological). No sorting — the caller builds
     // the `files` vector in the desired order: previous-summary files first
     // (in their original order), then newly-touched files from the dropped
@@ -1461,13 +1512,40 @@ impl Session {
 /// results for a turn into a single `Message::User` with multiple
 /// `UserContent::ToolResult` items. This function scans ahead to group
 /// consecutive `toolResult` entries.
+///
+/// `BranchSummary` entries on the path become a user message carrying
+/// [`branch_summary_message_text`] — pi's per-entry mapping
+/// (`sessionEntryToContextMessages`), with the same non-empty guard. pi's
+/// context build walks only the leaf path, so a summary parked in a *side*
+/// spur contributes nothing here; that is exactly right, because
+/// `branchWithSummary` parents the entry to the switch target, putting it
+/// inline on the branch the conversation continues on.
 pub(crate) fn extract_messages(entries: &[SessionEntry]) -> Vec<Message> {
     let mut messages: Vec<Message> = Vec::new();
     let mut tool_results: Vec<serde_json::Value> = Vec::new();
 
+    // Flush buffered tool results before any user-role content, so a branch
+    // summary can never be appended *inside* a toolResult batch.
+    let flush_tool_results = |messages: &mut Vec<Message>, tool_results: &mut Vec<_>| {
+        if !tool_results.is_empty() {
+            if let Some(msg) = pi_toolresults_to_rig_message(std::mem::take(tool_results)) {
+                messages.push(msg);
+            }
+        }
+    };
+
     for entry in entries {
         let content = match &entry.content {
             SessionEntryContent::Message { message } => message,
+            SessionEntryContent::BranchSummary { summary, .. } if !summary.is_empty() => {
+                flush_tool_results(&mut messages, &mut tool_results);
+                messages.push(Message::User {
+                    content: vec![UserContent::Text(Text::new(branch_summary_message_text(
+                        summary,
+                    )))],
+                });
+                continue;
+            }
             _ => continue,
         };
 
@@ -1478,13 +1556,7 @@ pub(crate) fn extract_messages(entries: &[SessionEntry]) -> Vec<Message> {
             }
             Some("user") | Some("assistant") => {
                 // Flush any buffered tool results first.
-                if !tool_results.is_empty() {
-                    if let Some(msg) =
-                        pi_toolresults_to_rig_message(std::mem::take(&mut tool_results))
-                    {
-                        messages.push(msg);
-                    }
-                }
+                flush_tool_results(&mut messages, &mut tool_results);
 
                 if let Some(msg) = pi_message_to_rig(content) {
                     messages.push(msg);
@@ -1495,11 +1567,7 @@ pub(crate) fn extract_messages(entries: &[SessionEntry]) -> Vec<Message> {
     }
 
     // Flush any trailing tool results.
-    if !tool_results.is_empty() {
-        if let Some(msg) = pi_toolresults_to_rig_message(tool_results) {
-            messages.push(msg);
-        }
-    }
+    flush_tool_results(&mut messages, &mut tool_results);
 
     messages
 }
@@ -1991,6 +2059,24 @@ mod tests {
         }
     }
 
+    /// Helper: create a toolResult entry (pi stores each result separately).
+    fn tool_result_msg(id: &str, parent: &str, text: &str) -> SessionEntry {
+        SessionEntry {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            timestamp: "t".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "toolResult",
+                    "toolCallId": format!("{}-call", id),
+                    "toolName": "read",
+                    "content": [{"type": "text", "text": text}],
+                    "isError": false,
+                }),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn test_build_context_empty_session() {
         let (session, path) = build_session_for_test(vec![]).await;
@@ -2274,6 +2360,155 @@ mod tests {
             }
             _ => panic!("expected User"),
         }
+    }
+
+    // ── Branch summary projection (pi `sessionEntryToContextMessages`) ─────
+
+    /// Helper: create a BranchSummary entry.
+    fn branch_summary_entry(
+        id: &str,
+        from: &str,
+        summary: &str,
+        parent: Option<&str>,
+    ) -> SessionEntry {
+        SessionEntry {
+            id: id.into(),
+            parent_id: parent.map(String::from),
+            timestamp: "ts".into(),
+            content: SessionEntryContent::BranchSummary {
+                from_id: from.into(),
+                summary: summary.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn branch_summary_becomes_a_user_message_with_pi_wrapper() {
+        // pi converts a `branch_summary` entry on the path into a
+        // `branchSummary` message, which `convertToLlm` renders as a **user**
+        // message wrapped in BRANCH_SUMMARY_PREFIX/SUFFIX (messages.ts:170).
+        let entries = vec![
+            user_msg("m0", "start", None),
+            branch_summary_entry("s1", "m0", "Tried the wrong approach", Some("m0")),
+            user_msg("m1", "better approach", Some("s1")),
+        ];
+        let msgs = extract_messages(&entries);
+        assert_eq!(msgs.len(), 3);
+        let Message::User { content } = &msgs[1] else {
+            panic!("branch summary must project to a User message");
+        };
+        let UserContent::Text(text) = &content[0] else {
+            panic!("expected Text content");
+        };
+        assert_eq!(
+            text.text.as_str(),
+            "The following is a summary of a branch that this conversation came back from:\n\n<summary>\nTried the wrong approach</summary>"
+        );
+    }
+
+    #[test]
+    fn branch_summary_wrapper_is_byte_exact_with_pi() {
+        // The suffix has NO leading newline (the compaction one does) — pi's
+        // two wrappers differ, so pin both.
+        assert_eq!(
+            branch_summary_message_text("S"),
+            "The following is a summary of a branch that this conversation came back from:\n\n<summary>\nS</summary>"
+        );
+        let compaction_entry = SessionEntry {
+            id: "c1".into(),
+            parent_id: None,
+            timestamp: "ts".into(),
+            content: SessionEntryContent::Compaction {
+                summary: "S".into(),
+                first_kept_entry_id: "m1".into(),
+                tokens_before: 0,
+            },
+        };
+        // The compaction wrapper reaches the context via the *transform*
+        // (it replaces the entry), the branch one via `extract_messages`.
+        let scoped = apply_compaction_transforms(vec![compaction_entry, user_msg("m1", "x", None)]);
+        let msgs = extract_messages(&scoped);
+        let Message::User { content } = &msgs[0] else {
+            panic!("expected the compaction summary as a User message");
+        };
+        let UserContent::Text(text) = &content[0] else {
+            panic!("expected Text content");
+        };
+        assert!(
+            text.text.as_str().ends_with("\n</summary>"),
+            "compaction suffix keeps its leading newline: {:?}",
+            text.text
+        );
+    }
+
+    #[test]
+    fn empty_branch_summary_contributes_nothing() {
+        // pi guards the entry type: `if (type === "branch_summary" && summary)`.
+        let entries = vec![
+            user_msg("m0", "start", None),
+            branch_summary_entry("s1", "m0", "", Some("m0")),
+            user_msg("m1", "next", Some("s1")),
+        ];
+        let msgs = extract_messages(&entries);
+        assert_eq!(msgs.len(), 2, "empty summary emits no message");
+    }
+
+    #[test]
+    fn branch_summary_does_not_swallow_buffered_tool_results() {
+        // A branch summary is user-role content: tool results buffered before
+        // it must be flushed first, not appended after it inside one batch.
+        let entries = vec![
+            user_msg("m0", "start", None),
+            tool_result_msg("t1", "m0", "read it"),
+            branch_summary_entry("s1", "m0", "digest", Some("m0")),
+        ];
+        let msgs = extract_messages(&entries);
+        assert_eq!(msgs.len(), 3);
+        let Message::User { content } = &msgs[1] else {
+            panic!("tool results batch into a User message");
+        };
+        assert!(
+            matches!(content[0], UserContent::ToolResult(_)),
+            "tool result flushed first, got {:?}",
+            content[0]
+        );
+        let Message::User { content } = &msgs[2] else {
+            panic!("summary follows as its own User message");
+        };
+        let UserContent::Text(text) = &content[0] else {
+            panic!("expected Text content");
+        };
+        assert!(text.text.contains("digest"));
+    }
+
+    #[test]
+    fn branch_summary_before_the_compaction_boundary_is_dropped() {
+        // Parity with pi's `foundFirstKept` gate: entries before
+        // firstKeptEntryId are outside the context, summaries included.
+        let entries = vec![
+            user_msg("m0", "intro", None),
+            branch_summary_entry("s1", "m0", "stale digest", Some("m0")),
+            user_msg("m1", "kept", Some("s1")),
+            compaction_entry("c1", "compacted", "m1", 10, Some("m1")),
+            user_msg("m2", "after", Some("c1")),
+        ];
+        let out = apply_compaction_transforms(entries);
+        let msgs = extract_messages(&out);
+        let joined: Vec<String> = msgs
+            .iter()
+            .map(|m| match m {
+                Message::User { content } => match &content[0] {
+                    UserContent::Text(t) => t.text.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            })
+            .collect();
+        assert!(
+            !joined.iter().any(|t| t.contains("stale digest")),
+            "pre-boundary summary must not reach context: {:?}",
+            joined
+        );
     }
 
     #[test]

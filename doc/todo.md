@@ -8,11 +8,23 @@
         Backend: the Phase-7 `run_compaction` was replaced by the
         editor-cleanup E3 `generate_compaction` / `apply_compaction` split
         (doc/editor_cleanup.md §6).
-  - [ ] `/tree <id> switch --summarize` - use same menu / mechanism as others
-        (UI TBD; the old `CompactionTarget::Abandoned` backend hook was
-        deleted in editor cleanup E3 — a menu version would add a target
-        kind to `generate_compaction`)
-        `/tree <id> switch cursor`, `/tree <id> switch summarize prompt <prompt>`, `/tree <id> switch summarize manual`
+- [x] `/tree <id> switch summarize` — the `switch` leaf became a sub-menu:
+        `cursor` (today's behavior) and `summarize` → `manual` / `text-only` /
+        `prompt` (`switch summarize prompt <prompt>` for a custom focus),
+        reusing the compaction nodes' generate → $EDITOR → confirm flow. Backend:
+        `agent::generate_branch_summary` (pi's spur +
+        `BRANCH_SUMMARY_PROMPT`) and `apply_branch_summary` (pi's
+        `branchWithSummary`: move the leaf to the target, then append a
+        `branch_summary` parented there, so the digest is inline on the branch
+        the conversation continues on). `BranchSummary` → user message in
+        `extract_messages` (pi `sessionEntryToContextMessages`; the branch
+        wrapper is pi's byte-exact text — the *compaction* wrapper was shortened
+        by `78c7e7a`). Same pass added `/tree <id> edit` — pi's user-message
+        re-edit (leaf = the prompt's parent + input prefill) as its own row, so
+        `switch cursor` keeps its "continue after this prompt" meaning.
+        Design + parity record + divergences: `doc/branch_summary.md`.
+        (The old typed arm's version — parented at the spur tip with `from_id`
+        = the common ancestor — was **not** pi's shape.)
 - [x] Non-REPL slash input (in-process / non-tty hosts) — routed through the
       v2.5 menu eval (`Repl::batch_slash`: passive derive + virtual Enter,
       drawing ignored); the four typed arms are deleted

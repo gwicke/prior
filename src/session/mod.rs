@@ -14,7 +14,13 @@ pub mod pi_compat_test;
 pub use repo::{JsonlSessionRepo, SessionRepo};
 pub(crate) use session::build_manual_template;
 pub(crate) use session::build_text_only_summary;
+pub(crate) use session::collect_touched_files;
 pub use session::Session;
+pub(crate) use session::TouchedFile;
+pub(crate) use session::{
+    branch_summary_message_text, render_files_section, user_prompt_text, COMPACTION_SUMMARY_PREFIX,
+    COMPACTION_SUMMARY_SUFFIX,
+};
 pub(crate) use session::{pi_message_to_rig, pi_toolresults_to_rig_message};
 pub use storage::{JsonlSessionStorage, SessionStorage};
 pub use types::{

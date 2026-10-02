@@ -54,7 +54,7 @@ use crate::AgentConfig;
 /// Compaction mode for the `/tree … compact` menu: names the summary
 /// flavor `agent::generate_compaction` produces; the node's `prepare()`
 /// opens the generated draft in `$EDITOR` before the engine confirm.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactMode {
     /// User-editable touched-files list.
     Manual,

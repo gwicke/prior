@@ -184,7 +184,7 @@ Each entry has the base fields:
 | `"model_change"` | `provider: string, modelId: string` | Same field names |
 | `"active_tools_change"` | `activeToolNames: string[]` | Same field name |
 | `"compaction"` | `summary: string, firstKeptEntryId: string, tokensBefore: number` | Same names |
-| `"branch_summary"` | `fromId: string, summary: string` | Same names |
+| `"branch_summary"` | `fromId: string, summary: string` | Same names. `fromId` is the **branch-from position** (pi's `branchWithSummary`), not the common ancestor; `parentId` is the same id. Written parented at the `/tree` switch target, so it is inline on the branch the conversation continues on and projects into context. pi also writes optional `details` / `fromHook`, which we omit. See `doc/branch_summary.md`. |
 | `"label"` | `targetId: string, label?: string` | Same names |
 | `"session_info"` | `name?: string` | Same field name |
 | `"custom"` | `customType: string, data: object` | Same names |

@@ -1064,16 +1064,19 @@ impl SlashDotNode for TreeListNode {
 // TreeSwitchNode
 // ---------------------------------------------------------------------------
 
-/// Leaf node: moves the session leaf pointer to the selected entry.
-pub struct TreeSwitchNode {
+/// Leaf node: moves the session leaf pointer to the selected entry — the
+/// `cursor` row of the `/tree <id> switch` sub-menu. Carries no summary; the
+/// sibling `summarize` sub-menu is the two-phase variant
+/// (`TreeSwitchSummarizeNode`).
+pub struct TreeSwitchCursorNode {
     pub app_state: Arc<AppState>,
 }
 
 #[async_trait::async_trait(?Send)]
-impl SlashDotNode for TreeSwitchNode {
+impl SlashDotNode for TreeSwitchCursorNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
-            rows: vec![Row::new("switch").desc("continue from this entry")],
+            rows: vec![Row::new("cursor").desc("move the session cursor to this entry")],
             active_ids: Vec::new(),
         }))
     }
@@ -1092,17 +1095,11 @@ impl SlashDotNode for TreeSwitchNode {
     }
 
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        // In the action node's own context, the path is
-        // ["tree", "<entry-id>", "switch"]. The entry ID is the
-        // second-to-last element (matching SessionResumeNode's pattern).
-        let target_id = {
-            let ids = &path_args.ids;
-            if ids.len() >= 2 {
-                ids.get(ids.len() - 2).cloned().unwrap_or_default()
-            } else {
-                String::new()
-            }
-        };
+        // The path is ["tree", "<entry-id>", "switch", "cursor"]; the entry ID
+        // is always at index 1 — the same slot every `/tree` sub-menu reads, so
+        // the rule does not shift as rows are added (`cursor` here,
+        // `summarize <mode>` below).
+        let target_id = extract_target_id(path_args);
         // Data-plane inline: move the leaf directly — the session is
         // reachable via the slot. No session → nothing to move (same as
         // the old applier's silent no-op).
@@ -1201,8 +1198,11 @@ impl SlashDotNode for TreeCompactManualNode {
             &self.app_state,
             epoch,
             path_args,
-            CompactMode::Manual,
-            "",
+            SummaryPlan {
+                mode: CompactMode::Manual,
+                payload: "",
+                action: SummaryAction::Compact,
+            },
             &mut self.stash,
             false,
         )
@@ -1214,8 +1214,11 @@ impl SlashDotNode for TreeCompactManualNode {
             &self.app_state,
             epoch,
             path_args,
-            CompactMode::Manual,
-            "",
+            SummaryPlan {
+                mode: CompactMode::Manual,
+                payload: "",
+                action: SummaryAction::Compact,
+            },
             &mut self.stash,
             true,
         )
@@ -1230,7 +1233,14 @@ impl SlashDotNode for TreeCompactManualNode {
     }
 
     async fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        compact_submit(&self.app_state, epoch, path_args, &mut self.stash).await
+        compact_submit(
+            &self.app_state,
+            epoch,
+            path_args,
+            SummaryAction::Compact,
+            &mut self.stash,
+        )
+        .await
     }
 }
 
@@ -1268,8 +1278,11 @@ impl SlashDotNode for TreeCompactTextNode {
             &self.app_state,
             epoch,
             path_args,
-            CompactMode::TextOnly,
-            "",
+            SummaryPlan {
+                mode: CompactMode::TextOnly,
+                payload: "",
+                action: SummaryAction::Compact,
+            },
             &mut self.stash,
             false,
         )
@@ -1281,8 +1294,11 @@ impl SlashDotNode for TreeCompactTextNode {
             &self.app_state,
             epoch,
             path_args,
-            CompactMode::TextOnly,
-            "",
+            SummaryPlan {
+                mode: CompactMode::TextOnly,
+                payload: "",
+                action: SummaryAction::Compact,
+            },
             &mut self.stash,
             true,
         )
@@ -1298,7 +1314,14 @@ impl SlashDotNode for TreeCompactTextNode {
     }
 
     async fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        compact_submit(&self.app_state, epoch, path_args, &mut self.stash).await
+        compact_submit(
+            &self.app_state,
+            epoch,
+            path_args,
+            SummaryAction::Compact,
+            &mut self.stash,
+        )
+        .await
     }
 }
 
@@ -1338,8 +1361,11 @@ impl SlashDotNode for TreeCompactPromptNode {
             &self.app_state,
             epoch,
             path_args,
-            CompactMode::Prompt,
-            &path_args.suffix,
+            SummaryPlan {
+                mode: CompactMode::Prompt,
+                payload: &path_args.suffix,
+                action: SummaryAction::Compact,
+            },
             &mut self.stash,
             false,
         )
@@ -1351,8 +1377,11 @@ impl SlashDotNode for TreeCompactPromptNode {
             &self.app_state,
             epoch,
             path_args,
-            CompactMode::Prompt,
-            &path_args.suffix,
+            SummaryPlan {
+                mode: CompactMode::Prompt,
+                payload: &path_args.suffix,
+                action: SummaryAction::Compact,
+            },
             &mut self.stash,
             true,
         )
@@ -1383,7 +1412,206 @@ impl SlashDotNode for TreeCompactPromptNode {
     }
 
     async fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        compact_submit(&self.app_state, epoch, path_args, &mut self.stash).await
+        compact_submit(
+            &self.app_state,
+            epoch,
+            path_args,
+            SummaryAction::Compact,
+            &mut self.stash,
+        )
+        .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TreeEditNode
+// ---------------------------------------------------------------------------
+
+/// Leaf node: `/tree <id> edit` — re-ask a user prompt. pi's user-message
+/// re-edit (`agent-session.ts:2950`): the leaf moves to the prompt's **parent**
+/// and its text is pre-filled into the input buffer, so the next turn replaces
+/// the prompt instead of following it. The sibling `switch` row moves the leaf
+/// *to* the entry, which is the other (and also wanted) behavior.
+///
+/// The row only appears when the drilled entry is actually re-askable — a user
+/// message or a custom message — so `edit` is never a row that fails on submit.
+pub struct TreeEditNode {
+    pub app_state: Arc<AppState>,
+}
+
+impl TreeEditNode {
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl SlashDotNode for TreeEditNode {
+    async fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
+        let target_id = extract_target_id(path_args);
+        let Some(session) = self.app_state.session() else {
+            return Ok(Rc::new(DataResponse {
+                rows: Vec::new(),
+                active_ids: Vec::new(),
+            }));
+        };
+        if !crate::agent::is_reaskable_entry(&session, &target_id).await {
+            return Ok(Rc::new(DataResponse {
+                rows: Vec::new(),
+                active_ids: Vec::new(),
+            }));
+        }
+        Ok(Rc::new(DataResponse {
+            rows: vec![Row::new("edit").desc("re-ask this prompt (pre-filled)")],
+            active_ids: Vec::new(),
+        }))
+    }
+
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+        vec![
+            "Re-ask this prompt: the session moves to its parent and the".to_string(),
+            "text is pre-filled into the input for editing.".to_string(),
+            "The original prompt leaves the active branch.".to_string(),
+        ]
+    }
+
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let target_id = extract_target_id(path_args);
+        match crate::agent::reask_from_entry(&self.app_state, &target_id).await {
+            Ok(()) => SubmitResult::Done(None),
+            Err(msg) => SubmitResult::Done(Some(msg)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TreeSwitchSummarizeNode
+// ---------------------------------------------------------------------------
+
+/// Leaf node: `/tree <id> switch summarize <mode>` — summarize the spur left
+/// behind by the switch, then switch. One struct, three instances (manual /
+/// text-only / prompt): the modes differ only in how the draft is generated,
+/// so they share the whole two-phase flow with the compact nodes
+/// (`compact_prepare` / `edit_draft` / `compact_submit`) and differ only in
+/// [`SummaryAction::SwitchSummarize`] — the submit that writes a
+/// `BranchSummary` entry and moves the leaf, rather than a `Compaction` entry.
+///
+/// Path shape: `["tree", "<entry-id>", "switch", "summarize", "<mode>"]`, so
+/// the entry ID is at index 1 — the same slot `extract_target_id` reads.
+pub struct TreeSwitchSummarizeNode {
+    pub app_state: Arc<AppState>,
+    mode: CompactMode,
+    stash: std::cell::RefCell<Option<CompactStash>>,
+}
+
+impl TreeSwitchSummarizeNode {
+    /// One instance per mode of `/tree <id> switch summarize `.
+    pub fn new(app_state: Arc<AppState>, mode: CompactMode) -> Self {
+        Self {
+            app_state,
+            mode,
+            stash: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl SlashDotNode for TreeSwitchSummarizeNode {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        let (row, desc) = match self.mode {
+            CompactMode::Manual => ("manual", "touched files of the abandoned branch"),
+            CompactMode::TextOnly => ("text-only", "extracted text of the abandoned branch"),
+            CompactMode::Prompt => ("prompt", "LLM-generated digest of the abandoned branch"),
+        };
+        Ok(Rc::new(DataResponse {
+            rows: vec![Row::new(row).desc(desc)],
+            active_ids: Vec::new(),
+        }))
+    }
+
+    async fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_prepare(
+            &self.app_state,
+            epoch,
+            path_args,
+            SummaryPlan {
+                mode: self.mode,
+                // Only the LLM mode takes a trailing instruction.
+                payload: match self.mode {
+                    CompactMode::Prompt => path_args.suffix.as_str(),
+                    _ => "",
+                },
+                action: SummaryAction::SwitchSummarize,
+            },
+            &mut self.stash,
+            false,
+        )
+        .await
+    }
+
+    async fn edit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_prepare(
+            &self.app_state,
+            epoch,
+            path_args,
+            SummaryPlan {
+                mode: self.mode,
+                // Only the LLM mode takes a trailing instruction.
+                payload: match self.mode {
+                    CompactMode::Prompt => path_args.suffix.as_str(),
+                    _ => "",
+                },
+                action: SummaryAction::SwitchSummarize,
+            },
+            &mut self.stash,
+            true,
+        )
+        .await
+    }
+
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+        let mut out = vec![
+            "Summarize the branch you are leaving, then continue from the".to_string(),
+            "selected entry. The digest is written at the switch target, so the".to_string(),
+            "next prompt sees it (pi's branch summary).".to_string(),
+            "Enter opens $EDITOR; then Enter writes and switches, Esc aborts.".to_string(),
+        ];
+        if self.mode == CompactMode::Prompt {
+            let prompt = &path_args.suffix;
+            if prompt.is_empty() {
+                out.push("Type a custom focus after 'prompt', or use the default.".into());
+            } else {
+                out.push(format!("Custom focus: {}", prompt));
+            }
+        }
+        out
+    }
+
+    async fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
+        // Only the LLM mode takes a trailing instruction — the other two have
+        // nothing to parameterize.
+        if self.mode != CompactMode::Prompt {
+            return None;
+        }
+        // ids are ["tree", "<id>", "switch", "summarize", "prompt"].
+        Some(path_args.prompt_with("What was left unfinished, and what should happen next."))
+    }
+
+    async fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_submit(
+            &self.app_state,
+            epoch,
+            path_args,
+            SummaryAction::SwitchSummarize,
+            &mut self.stash,
+        )
+        .await
     }
 }
 
@@ -1403,18 +1631,61 @@ fn extract_target_id(path_args: &PathArgs) -> String {
     }
 }
 
+/// The session's authoritative leaf.
+///
+/// Deliberately **not** `AppState::leaf_id()`: that is the menu's cached view of
+/// the leaf, refreshed by the loop's convergence step, so it lags a switch the
+/// menu itself just performed (and is `None` in-process). The branch-summary
+/// stash key must name the leaf its spur was measured from, and the apply half
+/// compares against the same value — so both sides read the session.
+async fn session_leaf_id(app_state: &Arc<AppState>) -> Option<String> {
+    let session = app_state.session()?;
+    session.get_leaf_id().await
+}
+
+/// Which summary a shared two-phase node writes on `submit()`. The generate /
+/// edit / confirm half is identical (doc/editor_cleanup.md §6); only the
+/// effect differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SummaryAction {
+    /// `/tree <id> compact <mode>` — replace the prefix before the target with
+    /// a `Compaction` entry (the leaf stays put).
+    Compact,
+    /// `/tree <id> switch summarize <mode>` — write a `BranchSummary` entry
+    /// for the spur being left behind, parented to the switch target, and move
+    /// the leaf there (pi `branchWithSummary`).
+    SwitchSummarize,
+}
+
+/// What one two-phase node generates and writes: the draft flavor, the LLM
+/// instruction (`""` = the built-in default), and the effect on submit. Grouped
+/// into one value because the three always travel together — the six node
+/// instances are exactly the six combinations.
+struct SummaryPlan<'a> {
+    mode: CompactMode,
+    payload: &'a str,
+    action: SummaryAction,
+}
+
 /// Stashed result of a compact node's `prepare()`: the reviewed draft,
 /// keyed by the target it was generated for *and* the engine epoch it
 /// was made at (doc/editor_cleanup.md §4 — reused only while both
-/// match).
+/// match). The action and, for a branch summary, the leaf the spur was
+/// measured from are part of the key: the same draft means different
+/// things to different applies, and a spur summary is only valid for the
+/// leaf it was generated against.
 struct CompactStash {
     epoch: u64,
+    action: SummaryAction,
     target_id: String,
+    /// The session leaf when the draft was generated — `apply_branch_summary`
+    /// refuses a moved leaf rather than summarizing the wrong span.
+    source_leaf_id: Option<String>,
     draft: crate::agent::CompactionDraft,
 }
 
-/// `prepare()` / `edit()` body shared by the three compact mode nodes:
-/// generate the draft (data layer), open it in $EDITOR (UI layer),
+/// `prepare()` / `edit()` body shared by the compact and switch-summarize mode
+/// nodes: generate the draft (data layer), open it in $EDITOR (UI layer),
 /// stash the reviewed text, return `Prepared` — NodeEntry's two-phase
 /// confirm takes it from there (Enter → [`compact_submit`], Esc →
 /// abort; the stash then just waits for the next `prepare()` to
@@ -1434,28 +1705,57 @@ async fn compact_prepare(
     app_state: &Arc<AppState>,
     epoch: u64,
     path_args: &PathArgs,
-    mode: CompactMode,
-    payload: &str,
+    plan: SummaryPlan<'_>,
     stash: &mut std::cell::RefCell<Option<CompactStash>>,
     reuse_stash: bool,
 ) -> SubmitResult {
     let target_id = extract_target_id(path_args);
+    let source_leaf_id = session_leaf_id(app_state).await;
     if reuse_stash {
-        let fresh = stash
-            .borrow()
-            .as_ref()
-            .and_then(|s| (s.epoch == epoch && s.target_id == target_id).then(|| s.draft.clone()));
+        let fresh = stash.borrow().as_ref().and_then(|s| {
+            (s.epoch == epoch
+                && s.action == plan.action
+                && s.target_id == target_id
+                && s.source_leaf_id == source_leaf_id)
+                .then(|| s.draft.clone())
+        });
         if let Some(draft) = fresh {
-            return edit_draft(app_state, stash, epoch, target_id, draft);
+            return edit_draft(
+                app_state,
+                stash,
+                epoch,
+                plan.action,
+                target_id,
+                source_leaf_id,
+                draft,
+            );
         }
     }
-    let summary_mode = match mode {
+    let summary_mode = match plan.mode {
         CompactMode::Manual => crate::agent::CompactSummaryMode::Manual,
         CompactMode::TextOnly => crate::agent::CompactSummaryMode::TextOnly,
         CompactMode::Prompt => crate::agent::CompactSummaryMode::Llm,
     };
-    match crate::agent::generate_compaction(app_state, &target_id, summary_mode, payload).await {
-        Ok(draft) => edit_draft(app_state, stash, epoch, target_id, draft),
+    let generated = match plan.action {
+        SummaryAction::Compact => {
+            crate::agent::generate_compaction(app_state, &target_id, summary_mode, plan.payload)
+                .await
+        }
+        SummaryAction::SwitchSummarize => {
+            crate::agent::generate_branch_summary(app_state, &target_id, summary_mode, plan.payload)
+                .await
+        }
+    };
+    match generated {
+        Ok(draft) => edit_draft(
+            app_state,
+            stash,
+            epoch,
+            plan.action,
+            target_id,
+            source_leaf_id,
+            draft,
+        ),
         // Validation/generation failures close the menu with the
         // data-level message (the pre-split compact_inline shape).
         Err(msg) => SubmitResult::Done(Some(msg)),
@@ -1469,7 +1769,9 @@ fn edit_draft(
     app_state: &Arc<AppState>,
     stash: &mut std::cell::RefCell<Option<CompactStash>>,
     epoch: u64,
+    action: SummaryAction,
     target_id: String,
+    source_leaf_id: Option<String>,
     mut draft: crate::agent::CompactionDraft,
 ) -> SubmitResult {
     match app_state.edit_text(&draft.summary, crate::editor::EditorMode::Edit) {
@@ -1483,38 +1785,59 @@ fn edit_draft(
     }
     *stash.borrow_mut() = Some(CompactStash {
         epoch,
+        action,
         target_id,
+        source_leaf_id,
         draft,
     });
-    // The arms name what accepting does: `submit()` appends the drafted
-    // compaction to the session. Same text for all three modes — the
-    // effect is identical, only the draft's provenance differs.
+    // The arms name what accepting does — and they differ by action: a
+    // compaction rewrites history at the current position, a switch-summarize
+    // writes the digest of the abandoned spur and moves there.
+    let accept = match action {
+        SummaryAction::Compact => "Write this summary to the session",
+        SummaryAction::SwitchSummarize => "Write this summary and switch to the entry",
+    };
     SubmitResult::Prepared(Some((
-        "Write this summary to the session".into(),
+        accept.into(),
         "Discard it (regenerate with Enter)".into(),
     )))
 }
 
 /// `submit()` body: apply the stashed draft. The stash must still be
-/// keyed to this (target, epoch) — a stale one means the data epoch
-/// moved under us; error out and let the next Enter regenerate.
+/// keyed to this (action, target, source leaf, epoch) — a stale one means
+/// the data epoch or the session moved under us; error out and let the next
+/// Enter regenerate.
 async fn compact_submit(
     app_state: &Arc<AppState>,
     epoch: u64,
     path_args: &PathArgs,
+    action: SummaryAction,
     stash: &mut std::cell::RefCell<Option<CompactStash>>,
 ) -> SubmitResult {
     let target_id = extract_target_id(path_args);
-    let prepared = stash
-        .borrow()
-        .as_ref()
-        .and_then(|s| (s.epoch == epoch && s.target_id == target_id).then(|| s.draft.clone()));
+    let source_leaf_id = session_leaf_id(app_state).await;
+    let prepared = stash.borrow().as_ref().and_then(|s| {
+        (s.epoch == epoch
+            && s.action == action
+            && s.target_id == target_id
+            && s.source_leaf_id == source_leaf_id)
+            .then(|| s.draft.clone())
+    });
     let Some(draft) = prepared else {
         return SubmitResult::Error(
             "No fresh prepared summary — press Enter to generate one.".to_string(),
         );
     };
-    match crate::agent::apply_compaction(app_state, &target_id, &draft).await {
+    let applied = match action {
+        SummaryAction::Compact => {
+            crate::agent::apply_compaction(app_state, &target_id, &draft).await
+        }
+        SummaryAction::SwitchSummarize => {
+            let source = source_leaf_id.unwrap_or_default();
+            crate::agent::apply_branch_summary(app_state, &target_id, &source, &draft).await
+        }
+    };
+    match applied {
         Ok(()) => {
             *stash.borrow_mut() = None;
             // Silent: the user just reviewed the summary, and the
@@ -1547,12 +1870,46 @@ pub fn build_tree_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu:
     .into();
 
     let mut tree_node: SlashDotMenuNode = TreeListNode::new(app_state.clone()).into();
-    tree_node.add_child(
-        TreeSwitchNode {
+
+    // `switch` sub-menu: `cursor` (today's behavior) or `summarize` (digest
+    // the abandoned spur, then move there). Same shape as `compact` — a
+    // listing level whose rows come from its children.
+    let mut switch_node: SlashDotMenuNode = ListingNode::new(
+        app_state,
+        &[StaticRow::new(
+            "switch",
+            "move the session cursor to this entry",
+        )],
+    )
+    .into();
+    switch_node.add_child(
+        TreeSwitchCursorNode {
             app_state: app_state.clone(),
         }
         .into(),
     );
+    let mut summarize_node: SlashDotMenuNode = ListingNode::new(
+        app_state,
+        &[StaticRow::new(
+            "summarize",
+            "summarize the abandoned branch, then switch",
+        )],
+    )
+    .into();
+    for mode in [
+        CompactMode::Manual,
+        CompactMode::TextOnly,
+        CompactMode::Prompt,
+    ] {
+        summarize_node.add_child(TreeSwitchSummarizeNode::new(app_state.clone(), mode).into());
+    }
+    switch_node.add_child(summarize_node);
+    tree_node.add_child(switch_node);
+
+    // `edit` (re-ask a user prompt) — a sibling of `switch`, not a mode of it:
+    // it moves the leaf to the prompt's parent, where `switch` moves to the
+    // prompt. Its row only shows up for user/custom-message entries.
+    tree_node.add_child(TreeEditNode::new(app_state.clone()).into());
 
     // Compact subtree: a listing node with three mode children.
     let mut compact_node: SlashDotMenuNode = ListingNode::new(
@@ -1701,6 +2058,22 @@ mod tests {
             MenuResult::Continue(plan, prompt) => (plan, prompt),
             other => panic!("expected Continue, got {:?}", other),
         }
+    }
+
+    /// The leading id of each rendered row: a plan row is a `LogicalLine`
+    /// holding the whole cell (`<id>  <description>`, SGR-stripped by the
+    /// table), so the first whitespace-delimited token is the id.
+    fn row_ids(plan: &crate::slashdot_menu::render::RenderPlan) -> Vec<String> {
+        plan.rows
+            .iter()
+            .map(|line| {
+                line.0
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
     }
 
     /// Esc drill-out must restore the stored `view_args` (the filter)
@@ -2027,7 +2400,7 @@ mod tests {
     // --- Switch ---
 
     #[test]
-    fn tree_switch_submit_moves_leaf() {
+    fn tree_switch_cursor_submit_moves_leaf() {
         let app_state = test_app_state();
         let session = crate::agent::test_session_with_entries(vec![make_entry(
             "some-entry",
@@ -2036,12 +2409,18 @@ mod tests {
             "hi",
         )]);
         app_state.set_session(Some(session.clone()));
-        let mut tree_node = TreeSwitchNode {
+        let mut tree_node = TreeSwitchCursorNode {
             app_state: app_state.clone(),
         };
-        // Action node path: ["tree", "<entry-id>", "switch"]
+        // Leaf path: ["tree", "<entry-id>", "switch", "cursor"] — the entry ID
+        // is the second-to-last element.
         let path_args = PathArgs {
-            ids: vec!["tree".into(), "some-entry".into(), "switch".into()],
+            ids: vec![
+                "tree".into(),
+                "some-entry".into(),
+                "switch".into(),
+                "cursor".into(),
+            ],
             suffix: String::new(),
             args: Default::default(),
         };
@@ -2092,20 +2471,323 @@ mod tests {
         let r = futures::executor::block_on(handle.eval_prompt("tree u1 ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into entry");
 
-        // 3. Drill into switch.
+        // 3. Drill into switch → the cursor/summarize sub-menu.
         let r =
             futures::executor::block_on(handle.eval_prompt("tree u1 switch ", HostKey::None, 80));
-        assert!(matches!(r, MenuResult::Continue(_, _)), "drill into switch");
+        match &r {
+            MenuResult::Continue(plan, _) => {
+                assert_eq!(
+                    row_ids(plan),
+                    vec!["cursor", "summarize"],
+                    "switch sub-menu rows"
+                );
+            }
+            other => panic!(
+                "expected Continue at switch, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
 
-        // 4. Enter → submit.
-        let _ =
-            futures::executor::block_on(handle.eval_prompt("tree u1 switch ", HostKey::Enter, 80));
+        // 4. Drill into cursor, then Enter → submit.
+        let r = futures::executor::block_on(handle.eval_prompt(
+            "tree u1 switch cursor ",
+            HostKey::None,
+            80,
+        ));
+        assert!(matches!(r, MenuResult::Continue(_, _)), "drill into cursor");
+        let _ = futures::executor::block_on(handle.eval_prompt(
+            "tree u1 switch cursor ",
+            HostKey::Enter,
+            80,
+        ));
         let leaf = futures::executor::block_on(session.get_leaf_id());
         assert_eq!(
             leaf.as_deref(),
             Some("u1"),
             "switch must move the session leaf to the entry ID"
         );
+    }
+
+    // --- switch summarize ---
+
+    /// A spur session shaped
+    ///
+    /// ```text
+    /// u1 ─┬─ a1 ─ a2 ─ a3   (a3 is the leaf)
+    ///     └─ u2
+    /// ```
+    ///
+    /// Switching to `u1` abandons `a1` + `a2` (a spur); switching to `a3` (or
+    /// the leaf itself) abandons nothing, because `a3` is *ahead* on the
+    /// current branch. The entry order sets the leaf (`a3` is last) — the same
+    /// convention `test_session_with_entries` uses.
+    fn spur_app_state() -> (Arc<AppState>, Arc<crate::session::Session>) {
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first message"),
+            vec![
+                node(
+                    make_entry("a1", Some("u1"), "assistant", "response"),
+                    vec![node(
+                        make_entry("a2", Some("a1"), "assistant", "more work"),
+                        vec![node(
+                            make_entry("a3", Some("a2"), "assistant", "final turn"),
+                            vec![],
+                        )],
+                    )],
+                ),
+                node(make_entry("u2", Some("u1"), "user", "other path"), vec![]),
+            ],
+        )];
+        let app_state = app_state_with_tree(tree);
+        let session = crate::agent::test_session_with_entries(vec![
+            make_entry("u1", None, "user", "first message"),
+            make_entry("a1", Some("u1"), "assistant", "response"),
+            make_entry("u2", Some("u1"), "user", "other path"),
+            make_entry("a2", Some("a1"), "assistant", "more work"),
+            make_entry("a3", Some("a2"), "assistant", "final turn"),
+        ]);
+        app_state.set_session(Some(session.clone()));
+        (app_state, session)
+    }
+
+    /// The `BranchSummary` entries in `session` as
+    /// `(parent_id, from_id, summary)`.
+    fn branch_summaries(
+        session: &std::sync::Arc<crate::session::Session>,
+    ) -> Vec<(String, String, String)> {
+        let idx = session.index().blocking_lock();
+        let mut out: Vec<(String, String, String)> = idx
+            .entries
+            .values()
+            .filter_map(|e| match &e.content {
+                SessionEntryContent::BranchSummary { from_id, summary } => Some((
+                    e.parent_id.clone().unwrap_or_default(),
+                    from_id.clone(),
+                    summary.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    // --- /tree <id> edit (pi's user-message re-edit) ---
+
+    #[test]
+    fn edit_row_appears_only_for_prompt_entries() {
+        let (app_state, _session) = spur_app_state();
+        let mut menu = build_tree_menu(&app_state);
+        let mut handle = menu.get_handle();
+        // `u1` is a user message → the re-ask row is offered, next to switch.
+        let (plan, _) = expect_continue(futures::executor::block_on(handle.eval_prompt(
+            "tree u1 ",
+            HostKey::None,
+            80,
+        )));
+        assert_eq!(
+            row_ids(&plan),
+            vec!["switch", "edit", "compact"],
+            "u1 is a prompt"
+        );
+        // `a1` is an assistant reply → no re-ask row (switch still is).
+        let (plan, _) = expect_continue(futures::executor::block_on(handle.eval_prompt(
+            "tree a1 ",
+            HostKey::None,
+            80,
+        )));
+        assert_eq!(row_ids(&plan), vec!["switch", "compact"], "a1 is a reply");
+    }
+
+    #[test]
+    fn edit_traversal_moves_to_the_parent_and_prefills() {
+        let (app_state, session) = spur_app_state();
+        let mut menu = build_tree_menu(&app_state);
+        let mut handle = menu.get_handle();
+        let r = futures::executor::block_on(handle.eval_prompt("tree u1 edit ", HostKey::None, 80));
+        assert!(matches!(r, MenuResult::Continue(_, _)), "drill into edit");
+        // A tokio runtime: the submit writes the Leaf pointer record.
+        let r =
+            crate::agent::block_on_test(handle.eval_prompt("tree u1 edit ", HostKey::Enter, 80));
+        assert!(matches!(r, MenuResult::DoneSuccess(..)));
+        // u1's parent is the root, so re-asking it starts a fresh branch and
+        // the prompt comes back for editing.
+        assert_eq!(futures::executor::block_on(session.get_leaf_id()), None);
+        assert_eq!(
+            app_state.take_prefill().as_deref(),
+            Some("first message"),
+            "the prompt is pre-filled into the input"
+        );
+    }
+
+    #[test]
+    fn switch_summarize_lists_three_modes() {
+        let (app_state, _session) = spur_app_state();
+        let mut menu = build_tree_menu(&app_state);
+        let mut handle = menu.get_handle();
+        let r = futures::executor::block_on(handle.eval_prompt(
+            "tree u1 switch summarize ",
+            HostKey::None,
+            80,
+        ));
+        match &r {
+            MenuResult::Continue(plan, _) => {
+                assert_eq!(
+                    row_ids(plan),
+                    vec!["manual", "text-only", "prompt"],
+                    "the same three modes as /tree <id> compact"
+                );
+            }
+            other => panic!(
+                "expected Continue at summarize, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    #[test]
+    fn switch_summarize_full_traversal_writes_entry_at_the_target_and_moves_leaf() {
+        let (app_state, session) = spur_app_state();
+        let mut menu = build_tree_menu(&app_state);
+        let mut handle = menu.get_handle();
+
+        // Enter #1 → prepare(): generate + editor (accepted as-is without a
+        // tty) + stash → the engine's confirm is armed. Nothing is written.
+        let r = crate::agent::block_on_test(handle.eval_prompt_resolved(
+            "tree u1 switch summarize text-only ",
+            HostKey::Enter,
+            80,
+        ));
+        assert!(matches!(r, MenuResult::Continue(_, _)), "confirm armed");
+        assert!(
+            branch_summaries(&session).is_empty(),
+            "the first Enter must only arm the confirm"
+        );
+
+        // Enter #2 → submit(): append the digest and move the leaf.
+        let r = crate::agent::block_on_test(handle.eval_prompt_resolved(
+            "tree u1 switch summarize text-only ",
+            HostKey::Enter,
+            80,
+        ));
+        assert!(matches!(r, MenuResult::DoneSuccess(..)));
+
+        let written = branch_summaries(&session);
+        assert_eq!(written.len(), 1, "exactly one BranchSummary written");
+        let (parent, from_id, summary) = &written[0];
+        // pi's `branchWithSummary`: parentId = fromId = the switch target, and
+        // the entry is the new leaf.
+        assert_eq!(
+            parent, "u1",
+            "parented at the switch target, not the abandoned spur"
+        );
+        assert_eq!(from_id, "u1", "fromId is the branch-from position");
+        assert!(
+            summary.contains("more work"),
+            "the spur is what got summarized: {:?}",
+            summary
+        );
+        let idx = session.index().blocking_lock();
+        let summary_entry = idx
+            .entries
+            .values()
+            .find(|e| matches!(e.content, SessionEntryContent::BranchSummary { .. }))
+            .unwrap();
+        assert_eq!(idx.leaf_id.as_deref(), Some(summary_entry.id.as_str()));
+    }
+
+    #[test]
+    fn switch_summarize_context_carries_the_digest() {
+        // The point of the pi placement: the very next turn sees the digest.
+        let (app_state, session) = spur_app_state();
+        let draft = crate::agent::CompactionDraft {
+            summary: "Tried the wrong approach".into(),
+            tokens_before: 0,
+        };
+        crate::agent::block_on_test(crate::agent::apply_branch_summary(
+            &app_state, "u1", "a3", &draft,
+        ))
+        .expect("apply");
+        let ctx = crate::agent::block_on_test(session.build_context()).expect("context");
+        let joined = ctx
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                rig_core::message::Message::User { content } => match content.first() {
+                    Some(rig_core::message::UserContent::Text(t)) => Some(t.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("Tried the wrong approach"),
+            "digest must reach the LLM context: {:?}",
+            joined
+        );
+    }
+
+    #[test]
+    fn switch_summarize_refuses_a_stale_leaf() {
+        let (app_state, session) = spur_app_state();
+        let draft = crate::agent::CompactionDraft {
+            summary: "digest".into(),
+            tokens_before: 0,
+        };
+        // The leaf moved since generation (here: we assert against a leaf that
+        // is not the current one) — the apply refuses rather than summarizing
+        // the wrong span.
+        let err = crate::agent::block_on_test(crate::agent::apply_branch_summary(
+            &app_state,
+            "u1",
+            "some-other-leaf",
+            &draft,
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("moved"),
+            "expected a staleness error, got: {}",
+            err
+        );
+        assert!(branch_summaries(&session).is_empty(), "nothing written");
+        assert_eq!(
+            futures::executor::block_on(session.get_leaf_id()),
+            Some("a3".to_string()),
+            "the leaf must not move on a rejected apply"
+        );
+    }
+
+    #[test]
+    fn switch_summarize_without_spur_reports_an_error() {
+        // Target ahead on the current branch: nothing was abandoned, so there
+        // is nothing to summarize (pi skips the entry in the same case).
+        let (app_state, _session) = spur_app_state();
+        let err = crate::agent::block_on_test(crate::agent::generate_branch_summary(
+            &app_state,
+            "a3",
+            crate::agent::CompactSummaryMode::TextOnly,
+            "",
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("ahead") || err.contains("nothing"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn switch_summarize_at_the_current_leaf_reports_an_error() {
+        let (app_state, _session) = spur_app_state();
+        let err = crate::agent::block_on_test(crate::agent::generate_branch_summary(
+            &app_state,
+            "a3",
+            crate::agent::CompactSummaryMode::TextOnly,
+            "",
+        ))
+        .unwrap_err();
+        assert!(err.contains("Already at this entry"), "got: {}", err);
     }
 
     // --- Label rendering ---

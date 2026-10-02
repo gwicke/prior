@@ -317,8 +317,8 @@ and with-keys - so this change should not cause regressions.
 | ~~`Session`~~ | removed | **Done.** Removed (`48b17df`). |
 | ~~`SessionAction`~~ | removed | **Done.** Removed (`48b17df`). |
 | ~~`Confirm`~~ | removed | **Done.** Removed (`48b17df`). |
-| ~~`TreeAction`~~ | `/tree <id>` action menu | **Done.** Ported to v2.5 `TreeListNode` + action children. |
-| ~~`SwitchAction`~~ | `/tree <id> switch` | **Done.** `TreeSwitchNode` → `AsyncOp::TreeSwitch`. |
+| ~~`TreeAction`~~ | `/tree <id>` action menu | **Done.** Ported to v2.5 `TreeListNode` + action children (`switch` / `edit` / `compact`). |
+| ~~`SwitchAction`~~ | `/tree <id> switch` | **Done.** Now a sub-menu: `cursor` (`TreeSwitchCursorNode`) and `summarize` → the three mode nodes (`doc/branch_summary.md`). |
 | ~~`CompactSummary`~~ | `/tree <id> compact` summary | **Done.** Three compact nodes → `AsyncOp::TreeCompact`. |
 | ~~`Mod`~~ | Dotted modifier completion | **Done.** Relocated to `node_entry::default_complete`; overlay removed (cleanup P1/P2). |
 | `PathComplete` | Tab path completion | **Scoped out of cleanup** — lives until the prompt-completion step (`arg_and_modifier_autocomplete.md` §Prompt-line completion). |
