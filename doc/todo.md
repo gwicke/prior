@@ -40,7 +40,7 @@
       currently can only carry one prefill — model or thinking. Bundle both
       into a slug syntax like `/thinking <level> & /model <slug>` or a new
       `/resume-config <slug>` once the need arises.)
-- [ ] Address resume stack overflow in debug builds: resume_stack_overflow_audit.md
+- [x] Address resume stack overflow in debug builds: resume_stack_overflow_audit.md
 - [ ] table rendering and filtering: dynamic columns
   - Include filter / sort columns in layout (.columns)
   - [ ] Less misleading / confusing modifier value auto-complete - headers
