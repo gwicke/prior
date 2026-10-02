@@ -542,7 +542,7 @@ impl ActiveOverlay {
 
     /// Display parameters: `(logical options, active index)` for
     /// cursor/focus math. Both plan-carrying variants decompose the
-    /// same way; painting goes through `paint_plan` directly.
+    /// same way; painting goes through `overlay_elements`.
     fn display_rows(&self) -> (Vec<String>, Option<usize>) {
         match self {
             ActiveOverlay::None => (vec![], None),
@@ -3352,34 +3352,16 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn paint_plan_active_row_keeps_star_when_not_selected() {
-        // Port of the old `overlay_lines` marker tests (ui_draw_v2 P5):
-        // the `*` current-state marker owns the 2-char prefix and does not
-        // depend on the cursor — an active row that is NOT selected keeps
-        // `* `, and the cursor row keeps `> `. (active == selected, where
-        // `* ` wins over `> `, is pinned by
-        // `paint_plan_active_marker_beats_cursor`.)
-        //
-        // The old per-row BG override test went away with
-        // `overlay_lines_with_bgs`: paint_plan has fixed
-        // selected/default backgrounds and no override feature (nothing
-        // used it).
-        use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
-        let plan = RenderPlan {
-            rows: Arc::new(vec![LogicalLine::new("one"), LogicalLine::new("two")]),
-            selected: Some(0),
-            active_rows: vec![1],
-            ..Default::default()
-        };
-        let painted = paint_plan(&plan, 40, 20);
-        assert!(
-            painted.lines().any(|l| l.contains("* two")),
-            "got: {painted:?}"
-        );
-        assert!(
-            painted.lines().any(|l| l.contains("> one")),
-            "got: {painted:?}"
-        );
+    fn an_active_row_keeps_star_when_it_is_not_selected() {
+        // The `*` current-state marker owns the 2-char prefix and does not
+        // depend on the cursor: an active row that is NOT selected keeps `*`,
+        // and the cursor row keeps `>`. (active == selected, where `*` wins
+        // over `>`, is pinned by `an_active_marker_beats_the_cursor`.)
+        use crate::slashdot_menu::render::{paint_rows, LogicalLine};
+        let rows = vec![LogicalLine::new("one"), LogicalLine::new("two")];
+        let s = paint_rows(&rows, Some(0), &[1], 40);
+        assert!(s.rows[0].contains("> one"), "{:?}", s.rows[0]);
+        assert!(s.rows[1].contains("* two"), "{:?}", s.rows[1]);
     }
 
     #[test]
@@ -3982,53 +3964,45 @@ mod tests {
     }
 
     #[test]
-    fn render_select_title_appears_once() {
-        // Ported to paint_plan (ui_draw_v2 P5): the title lives in the
-        // plan's detail block, rows keep their `> `/`  ` markers.
-        use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
-        let plan = RenderPlan {
-            detail: vec![LogicalLine::new("Select a model:")],
-            rows: Arc::new(vec![
+    fn a_title_lives_in_the_detail_section_above_the_rows() {
+        // The title is the node's `header()` output, so it is the detail
+        // section; rows keep their `> `/`  ` markers beside it.
+        use crate::slashdot_menu::render::{paint_detail, paint_rows, LogicalLine};
+        let detail = paint_detail(&[LogicalLine::new("Select a model:")], 80);
+        assert_eq!(detail.height(), 1, "the title appears once");
+        let rows = paint_rows(
+            &[
                 LogicalLine::new("a: alpha model ctx 128000 $0.10/0.20 per M"),
                 LogicalLine::new("b: beta model ctx 200000 $0.30/0.40 per M"),
-            ]),
-            selected: Some(0),
-            ..Default::default()
-        };
-        let out = paint_plan(&plan, 80, 40);
-        assert_eq!(out.matches("Select a model:").count(), 1);
-        assert!(out.contains("> a: alpha"));
-        assert!(out.contains("  b: beta"));
+            ],
+            Some(0),
+            &[],
+            80,
+        );
+        assert!(rows.rows[0].contains("> a: alpha"), "{:?}", rows.rows[0]);
+        assert!(rows.rows[1].contains("  b: beta"), "{:?}", rows.rows[1]);
     }
 
     #[test]
-    fn render_select_wraps_long_option_with_aligned_continuation() {
-        // Ported to paint_plan (ui_draw_v2 P5): the option arrives
-        // pre-wrapped (word wrap now happens where the plan is built, as
-        // the v2.5 engine does); paint_plan must keep the first line
+    fn a_wrapped_option_keeps_its_first_line_marked() {
+        // The option arrives pre-wrapped (word wrap happens where the plan is
+        // built, as the v2.5 engine does): the painter must keep the first line
         // marked and every continuation indented under the option text.
-        use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
+        use crate::slashdot_menu::render::{paint_rows, LogicalLine};
         let long = "deepseek:deepseek-v4-flash ctx 1048576 $0.000000435/0.00000087 per M (est) and some extra trailing text to force a wrap";
         let wrapped = crate::output::wrap(long, 60);
         assert!(wrapped.len() > 1, "long option must wrap at 60 cols");
-        let plan = RenderPlan {
-            rows: Arc::new(vec![LogicalLine::new(wrapped.join("\n"))]),
-            selected: Some(0),
-            ..Default::default()
-        };
-        let out = paint_plan(&plan, 60, 20);
-        let lines: Vec<&str> = out.lines().collect();
+        let s = paint_rows(&[LogicalLine::new(wrapped.join("\n"))], Some(0), &[], 60);
+        assert!(s.heights[0] > 1, "the option wraps: {:?}", s.heights);
         assert!(
-            lines[0].contains("> "),
-            "first row is the marker row: {lines:?}"
+            s.rows[0].contains("> "),
+            "first row is the marker row: {:?}",
+            s.rows[0]
         );
-        let cont: Vec<&&str> = lines
-            .iter()
-            .filter(|l| l.contains("  ") && !l.contains("> "))
-            .collect();
         assert!(
-            !cont.is_empty(),
-            "expected a wrapped continuation line indented under the option text"
+            s.rows[1..].iter().all(|r| !r.contains('>')),
+            "continuations carry no cursor marker: {:?}",
+            &s.rows[1..]
         );
     }
 
@@ -4483,19 +4457,11 @@ mod tests {
     /// Paint precedence: an active row shows `*` even when it is also the
     /// cursor row (`>` loses to `*`, Marker contract).
     #[test]
-    fn paint_plan_active_marker_beats_cursor() {
-        use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
-        let plan = RenderPlan {
-            rows: Arc::new(vec![LogicalLine::new("x")]),
-            selected: Some(0),
-            active_rows: vec![0],
-            ..Default::default()
-        };
-        let painted = paint_plan(&plan, 80, 40);
-        assert!(
-            painted.contains("* x"),
-            "shared row shows `*`, not `>`: {painted:?}"
-        );
+    fn an_active_marker_beats_the_cursor() {
+        use crate::slashdot_menu::render::{paint_rows, LogicalLine};
+        let s = paint_rows(&[LogicalLine::new("x")], Some(0), &[0], 80);
+        assert!(s.rows[0].contains("* x"), "{:?}", s.rows[0]);
+        assert!(!s.rows[0].contains('>'), "{:?}", s.rows[0]);
     }
 
     // ===== vt100 terminal-emulator tests =====
@@ -4874,207 +4840,6 @@ mod tests {
             // Caret on the (single-row) input: 0-idx row 7, col 2 (prompt end).
             assert_eq!((cr, cc), (7, 2));
         }
-    }
-
-    // --- compute_space_budget tests ---
-    //
-    // The budget is computed from *painted* row counts (ui_draw_v2 §9 #7,
-    // #11): the painter supplies what it painted, the rule splits it. These
-    // pass the counts directly, so the numbers below are the original
-    // single-line expectations unchanged.
-
-    use crate::slashdot_menu::render::SectionHeights;
-
-    /// Painted heights of a plan with `detail` header rows, a table-header
-    /// line when `header` is set, and `rows` single-row data rows.
-    fn budget_heights(detail: usize, rows: usize, header: bool) -> SectionHeights {
-        SectionHeights {
-            detail,
-            table_header: usize::from(header),
-            data: rows,
-        }
-    }
-
-    #[test]
-    fn budget_both_fit() {
-        // Both detail (5 vis lines) and rows (3) fit in overlay.
-        // overlay_budget=20, table_header=1, available=19, half=9.
-        let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(budget_heights(5, 3, true), 20, 3);
-        assert_eq!(d, 5, "detail gets what it needs");
-        assert_eq!(r, 3, "rows get what they need");
-    }
-
-    #[test]
-    fn budget_both_overflow_50_50() {
-        // Detail has 30 vis lines, rows has 30. available=39, half=19.
-        // Both overflow: detail capped at 19, rows get 20.
-        let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(budget_heights(30, 30, true), 40, 3);
-        assert_eq!(d, 19);
-        assert_eq!(r, 20);
-    }
-
-    #[test]
-    fn budget_detail_overflows_rows_dont() {
-        // Detail has 20 vis lines, rows have 2. available=19, half=9.
-        // Rows fit (2 < 9), and their floor is min(3, 2) = 2.
-        // detail gets available - 2 = 17; rows capped at their total.
-        // (This also pins the min-rows floor: detail wanting all 20 lines
-        // still cannot squeeze rows below what they actually need.)
-        let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(budget_heights(20, 2, true), 20, 3);
-        assert_eq!(d, 17, "detail uses rows' surplus");
-        assert_eq!(r, 2, "rows capped at their total visual height");
-    }
-
-    #[test]
-    fn budget_rows_overflow_detail_doesnt() {
-        // Detail has 3 vis lines, rows has 30. available=19, half=9.
-        // Detail fits (3 < 9): detail gets 3, rows get 16.
-        let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(budget_heights(3, 30, true), 20, 3);
-        assert_eq!(d, 3, "detail gets what it needs");
-        assert_eq!(r, 16, "rows get the rest");
-    }
-
-    #[test]
-    fn budget_no_rows() {
-        // No rows: all space goes to detail.
-        let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(budget_heights(15, 0, true), 20, 3);
-        assert_eq!(d, 15);
-        assert_eq!(r, 0, "no rows to allocate");
-    }
-
-    #[test]
-    fn budget_no_table_header() {
-        // No table header: available = overlay_budget.
-        let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(budget_heights(5, 5, false), 18, 3);
-        assert_eq!(d, 5);
-        assert_eq!(r, 5);
-    }
-
-    #[test]
-    fn budget_small_terminal() {
-        // Tiny terminal: overlay_budget=6, table_header=1, available=5.
-        // Both overflow: half=2, detail=2, rows=3.
-        let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(budget_heights(10, 10, true), 6, 3);
-        assert_eq!(d, 2);
-        assert_eq!(r, 3, "min rows enforced");
-    }
-
-    /// §9 #7: the rows budget is measured in painted rows. 9 rows of 3
-    /// terminal rows each are 27 rows — budgeting them as 9 was the bug (a
-    /// bigger terminal then showed *less*).
-    #[test]
-    fn budget_wrapped_rows_are_measured_visually() {
-        // 9 rows, 3 visual rows each.
-        let heights = SectionHeights {
-            detail: 0,
-            table_header: 0,
-            data: 27,
-        };
-        // Room for the whole plan: rows get all 27 rows.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(heights, 27, 3);
-        assert_eq!(d, 0);
-        assert_eq!(r, 27, "wrapped rows are not budgeted as 9 single rows");
-        // Tight: the budget is whatever space is left, still in rows.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(heights, 16, 3);
-        assert_eq!(d, 0);
-        assert_eq!(r, 16);
-    }
-
-    // --- visual_row_window tests ---
-
-    #[test]
-    fn vw_single_line_rows() {
-        use crate::slashdot_menu::render::LogicalLine;
-        let rows: Vec<LogicalLine> = (0..10)
-            .map(|i| LogicalLine::new(format!("row {}", i)))
-            .collect();
-        // Budget 4: all single-line, window centered on sel=5.
-        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 5, 4);
-        assert_eq!(c, 4);
-        assert!(s <= 5 && s + c > 5, "selected must be in window");
-    }
-
-    #[test]
-    fn vw_multi_line_row_centered() {
-        use crate::slashdot_menu::render::LogicalLine;
-        // row2 is 3 lines tall, budget=4.
-        let rows = vec![
-            LogicalLine::new("a"),
-            LogicalLine::new("b"),
-            LogicalLine::new("x\ny\nz"), // 3 visual lines
-            LogicalLine::new("c"),
-            LogicalLine::new("d"),
-        ];
-        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 2, 4);
-        // Can fit: row2 (3 lines) + one 1-line row = 4 lines.
-        assert!(s <= 2 && s + c > 2, "selected must be in window");
-        let vis: usize = rows[s..s + c].iter().map(|r| r.0.split('\n').count()).sum();
-        assert!(vis <= 4, "window must fit budget: got {}", vis);
-    }
-
-    #[test]
-    fn vw_all_fit() {
-        use crate::slashdot_menu::render::LogicalLine;
-        let rows = vec![
-            LogicalLine::new("a"),
-            LogicalLine::new("b"),
-            LogicalLine::new("c"),
-        ];
-        // Budget is large enough for all rows.
-        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 0, 100);
-        assert_eq!(s, 0);
-        assert_eq!(c, 3);
-    }
-
-    #[test]
-    fn vw_very_tall_row_always_shown() {
-        use crate::slashdot_menu::render::LogicalLine;
-        // Single row taller than budget.
-        let rows = vec![LogicalLine::new("a\nb\nc\nd\ne")];
-        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 0, 2);
-        assert_eq!(s, 0);
-        assert_eq!(c, 1, "tall row is always included");
-    }
-
-    #[test]
-    fn vw_empty_rows() {
-        use crate::slashdot_menu::render::LogicalLine;
-        let rows: Vec<LogicalLine> = vec![];
-        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 0, 10);
-        assert_eq!(s, 0);
-        assert_eq!(c, 0);
-    }
-
-    #[test]
-    fn vw_selected_near_end_fills_downward() {
-        use crate::slashdot_menu::render::LogicalLine;
-        // 100 single-line rows, selected at end, budget=20.
-        // Window should extend backward to fill all 20 lines.
-        let rows: Vec<LogicalLine> = (0..100)
-            .map(|i| LogicalLine::new(format!("row {}", i)))
-            .collect();
-        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 99, 20);
-        assert_eq!(c, 20, "must use full budget");
-        assert_eq!(s, 80, "window starts 20 rows before end");
-        assert!(s <= 99 && s + c > 99, "selected in window");
-    }
-
-    #[test]
-    fn vw_selected_near_start_fills_forward() {
-        use crate::slashdot_menu::render::LogicalLine;
-        let rows: Vec<LogicalLine> = (0..100)
-            .map(|i| LogicalLine::new(format!("row {}", i)))
-            .collect();
-        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 0, 20);
-        assert_eq!(c, 20, "must use full budget");
-        assert_eq!(s, 0, "starts at 0");
     }
 
     /// **R1: the input is a row between turns and no row at all mid-turn.**

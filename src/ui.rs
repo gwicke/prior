@@ -760,4 +760,41 @@ mod tests {
     fn an_empty_plan_is_no_elements() {
         assert!(overlay_elements(&RenderPlan::default(), 60, None).is_empty());
     }
+    /// The three sections arrive in paint order — detail, header, rows — and
+    /// a section with nothing in it is dropped rather than contributed as a
+    /// zero-height element (which would still ask the composer for a divider).
+    #[test]
+    fn overlay_elements_are_in_paint_order_and_skip_empty_sections() {
+        let plan = RenderPlan {
+            table_header: Some(LogicalLine::new("MODEL")),
+            detail: vec![LogicalLine::new("pick one")],
+            rows: Arc::new(vec![LogicalLine::new("m0"), LogicalLine::new("m1")]),
+            selected: Some(1),
+            active_rows: vec![],
+        };
+        let els = overlay_elements(&plan, 40, plan.selected);
+        let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
+        let heights = allocate(&extents, live_budget(24));
+        let f = render(&els, &heights, 40);
+        assert_eq!(f.height(), 4, "detail + header + 2 rows: {:?}", f.row(0));
+        assert!(f.row(0).contains("pick one"), "{:?}", f.row(0));
+        assert!(f.row(1).contains("MODEL"), "{:?}", f.row(1));
+        assert!(
+            f.row(3).contains("> m1"),
+            "cursor on the last row: {:?}",
+            f.row(3)
+        );
+
+        // No header, no detail: just the rows.
+        let bare = RenderPlan {
+            rows: Arc::new(vec![LogicalLine::new("only")]),
+            selected: Some(0),
+            ..Default::default()
+        };
+        let els = overlay_elements(&bare, 40, Some(0));
+        assert_eq!(els.len(), 1, "only the rows element");
+        let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
+        let heights = allocate(&extents, live_budget(24));
+        assert_eq!(render(&els, &heights, 40).height(), 1);
+    }
 }
