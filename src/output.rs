@@ -138,6 +138,52 @@ fn at_line_start(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Content's line-clear transform: emits `\x1b[K` on **row entry** — before
+/// the first byte of every line the stream enters (at write start, and after
+/// every newline written). The pair "clear, then bytes" is the overwrite rule
+/// (ui_draw_261001): one pass, no separate clearing walk, and a content line
+/// shorter than the terminal can never leave the row's old tail showing.
+///
+/// Never mid-line: a wrap-pending row must not be cleared into (`EL` from the
+/// last written cell would eat it), so `pending` only arms at a line's start.
+/// A capture bypasses it (`enabled == false`) — captured bytes are assertions
+/// against content, not against a screen.
+struct LineClear<'a, W: io::Write + ?Sized> {
+    inner: &'a mut W,
+    /// True while the row the next byte would land on has not been cleared.
+    pending: bool,
+    enabled: bool,
+}
+
+impl<W: io::Write + ?Sized> io::Write for LineClear<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.enabled || buf.is_empty() {
+            return self.inner.write(buf);
+        }
+        let mut out = Vec::with_capacity(buf.len() + 6);
+        let mut rest = buf;
+        while !rest.is_empty() {
+            if self.pending {
+                out.extend_from_slice(b"\x1b[K");
+                self.pending = false;
+            }
+            let take = match rest.iter().position(|&b| b == b'\n') {
+                Some(i) => i + 1, // include the newline itself
+                None => rest.len(),
+            };
+            out.extend_from_slice(&rest[..take]);
+            self.pending = rest[take - 1] == b'\n';
+            rest = &rest[take..];
+        }
+        self.inner.write_all(&out)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Drops the leading blank lines of the block being written, passing the rest
 /// through untouched.
 ///
@@ -1997,48 +2043,39 @@ impl ConsoleOutput {
             std::backtrace::Backtrace::force_capture()
         );
 
-        // **Consume, do not erase** (§4.5 P1). The cursor is inside the live
-        // frame, so it walks up to the fold and the write takes those rows over
-        // from the top down. The frame's rows are about to hold content, not be
-        // cleared — which is the whole difference from the clear this replaces,
-        // and why the area now survives the turn instead of dying at its first
-        // write.
         let dbg_caret_before = {
             let cache = self.draw.lock().unwrap();
             cache.anchor()
         };
-        let (walk, taken) = {
-            let mut cache = self.draw.lock().unwrap();
-            match plan_consume(&mut cache) {
-                Some((walk, frame)) => (walk, Some(frame)),
-                // No live area: the cursor is wherever the last write left it,
-                // which is where the content belongs. Nothing to walk and no
-                // `CR` to emit — the column is the content path's own
-                // bookkeeping here, not something to reset.
-                None => (String::new(), None),
-            }
-        };
-        // The walk goes **ahead of the counter**, straight to the writer. It is
-        // cursor movement, not content, and letting `RowCounter` see it was a
-        // real bug: `StreamTail::note` clears *both* of its bits on any byte
-        // that is not a newline, so the walk's `CR` and escapes read as "the
-        // stream does not end with a blank line" and every `boundary()` inside
-        // the write then emitted a blank line of its own.
+        // Content goes to a buffer first, through the line-clear transform
+        // (a line clear with each line the write enters — overwrite, one pass,
+        // ui_draw_261001). Nothing reaches the stream until the write is known
+        // to *have* bytes, which defers the consume: a write that renders
+        // nothing (every empty delta) takes no frame and moves nothing, so the
+        // frame stays live and the next compose can still diff it.
         //
-        // Under the old scheme that never showed, because the frame was retired
-        // by the write and the walk was empty from then on — one corrupted tail
-        // per turn, at most. The area is re-emitted now, so *every* write carries
-        // a walk and every boundary doubled. The count was never wrong either
-        // way: the walk emits no newline.
-        if !walk.is_empty() {
-            let _ = out.write_all(walk.as_bytes());
-        }
+        // Captures get the raw bytes — they are assertions against content,
+        // not against a screen.
+        let capturing = self.saved_writer.lock().unwrap().is_some();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut clear = LineClear {
+            inner: &mut buf,
+            pending: true,
+            enabled: !capturing,
+        };
         // The counter updates the shared tail per byte, so a boundary
         // *inside* this block (a committed paragraph before the block that
         // follows it) sees the state those bytes produced, not the state from
         // before the block — and so the tail describes the content, and nothing
-        // else.
-        let mut counter = RowCounter::new(&mut **out, width, &self.stream_tail);
+        // else. It sits *below* the line-clear (the codes are added to the
+        // stream after it counts) and *above* the buffer. The consume's walk,
+        // when there is one, still goes straight to the writer, ahead of all
+        // of this: it is cursor movement, not content, and letting
+        // `RowCounter` see it was a real bug — `StreamTail::note` clears both
+        // its bits on any non-newline byte, so the walk's `CR` and escapes
+        // would read as "the stream does not end with a blank line" and every
+        // `boundary()` inside the write would emit a blank line of its own.
+        let mut counter = RowCounter::new(&mut clear, width, &self.stream_tail);
         // The rows that belong *between* blocks — the matrix's boundary line,
         // and whatever the previous block held back — are pending content, not
         // something drawn on the way in. They go to the same mechanism that
@@ -2144,6 +2181,37 @@ impl ConsoleOutput {
         }
         let _ = counter.flush();
         drop(counter);
+        drop(clear);
+        // Nothing reached the stream: no rows moved, nothing consumed, no
+        // reposition owed — and the frame stays *live*, so the next compose
+        // can still diff it. The kind/hold bookkeeping above already ran: an
+        // empty write is still a statement about the boundary.
+        if buf.is_empty() {
+            drop(out);
+            return r;
+        }
+        // **Consume, then write** (ui_draw_v2 §4.5 P1 / ui_draw_261001): the
+        // walk goes ahead of the bytes — cursor movement, straight to the
+        // writer, never through the counter (see above) — and the content
+        // follows, already carrying its per-line clears. No erase with the
+        // walk: each line clears the row it enters, and rows the content never
+        // reaches are the reposition's `old_h` tail to clear in its own pass.
+        let (walk, taken) = {
+            let mut cache = self.draw.lock().unwrap();
+            match plan_consume(&mut cache) {
+                Some((walk, frame)) => (walk, Some(frame)),
+                // No live area: the cursor is wherever the last write left it,
+                // which is where the content belongs. Nothing to walk and no
+                // `CR` to emit — the column is the content path's own
+                // bookkeeping here, not something to reset.
+                None => (String::new(), None),
+            }
+        };
+        if !walk.is_empty() {
+            let _ = out.write_all(walk.as_bytes());
+        }
+        let _ = out.write_all(&buf);
+        let _ = out.flush();
         drop(out);
         // Zero rows means nothing moved, and a frame stays live.
         if rows > 0 {
@@ -2152,30 +2220,32 @@ impl ConsoleOutput {
         // The area comes back below what was just written — re-rendered rather
         // than replayed, so its status row is whatever it is *now*: the turn's
         // `set_status` and the dot's flip both happen after the REPL composed.
-        // Done on every write with an area, including a zero-row one, because
-        // `plan_consume` already retired `live` and only a reposition puts it
-        // back (a missing `live` means the *next* write finds nothing to
-        // consume and the area never returns).
+        // The consume's rows ride along for the below-frame clear
+        // (`old_h - h_new - consumed_rows` in `paint_forward`), accumulated
+        // across a batch's writes and taken by whichever reposition follows.
         //
-        // Inside a batch that reposition waits: the frame stays consumed for
+        // Inside a batch the reposition waits: the frame stays consumed for
         // the whole burst and the guard's drop emits it once (ui_draw_v2 R5).
-        // The invariant above is not weakened — it is satisfied by the *final*
-        // reposition instead of by every intermediate one, and a write that
-        // finds no live area already takes the `None` path above, so content
-        // keeps flowing without a walk.
-        if let Some(taken) = taken {
-            {
-                let mut cache = self.draw.lock().unwrap();
-                if cache.batch_active {
+        let taken = {
+            let mut cache = self.draw.lock().unwrap();
+            if taken.is_some() || cache.deferred.is_some() {
+                cache.consumed_rows += rows;
+            }
+            match taken {
+                Some(taken) if !cache.batch_active => Some(taken),
+                Some(taken) => {
                     // Keep the *first* frame taken: it is `reposition_area`'s
                     // fallback when no recipe recorded itself, and a later
                     // write finds nothing to consume and so contributes none.
                     if cache.deferred.is_none() {
                         cache.deferred = Some(taken);
                     }
-                    return r;
+                    None
                 }
+                None => None,
             }
+        };
+        if let Some(taken) = taken {
             let bytes = self.reposition_area(width, taken);
             let mut out = self.writer.lock().unwrap();
             let _ = out.write_all(bytes.as_bytes());
@@ -2202,6 +2272,10 @@ impl ConsoleOutput {
         let tw = width.max(1);
         let th = term_height().max(1);
         let mut cache = self.draw.lock().unwrap();
+        // The consumed frame's height is the `old_h` of the below-frame clear
+        // (`old_h - h_new - consumed_rows`) — read before `taken` moves into
+        // the fallback below.
+        let old_h = taken.height();
         let frame = if cache.element_stack.is_empty() {
             taken
         } else {
@@ -2213,17 +2287,20 @@ impl ConsoleOutput {
             render(&cache.element_stack, &heights, tw)
         };
         // **A frame with no rows has nothing to put back.** `ui::resolve` clears
-        // a dialog by applying `Frame::empty()`, and `plan_full` records that as
-        // a live frame of height 0 — so a content write right after a resolve
-        // consumes a zero-height area. Repositioning it would ask
+        // a dialog by applying `Frame::empty()`, and `plan_apply` records that
+        // as a live frame of height 0 — so a content write right after a
+        // resolve consumes a zero-height area. Repositioning it would ask
         // `plan_reposition` to paint nothing, which is a no-op at best and a
         // `debug_assert!(h > 0)` panic in a debug build at worst. Returning
         // empty is the honest answer: there is no area to re-emit, and the
-        // tracked row already moved with the content that consumed it.
+        // tracked row already moved with the content that consumed it. The
+        // accumulator goes with it — a stale count would misplace the *next*
+        // reposition's below-frame clear.
         if frame.height() == 0 {
+            cache.consumed_rows = 0;
             return String::new();
         }
-        plan_reposition(&mut cache, &frame, tw, th)
+        plan_reposition(&mut cache, &frame, old_h, tw, th)
     }
 
     /// Commit all buffered *thinking* to the (dimmed) thinking renderer and
@@ -3016,10 +3093,11 @@ impl Output for ConsoleOutput {
         // ANSI escapes, and termimad-rendered responses). Fall back
         // to the tracked/ANSI-stripped prediction if the terminal
         // does not answer the Device Status Report (e.g. a headless pty).
-        // Both paths re-anchor and retire the frame region — the
-        // fallback too: a silent terminal offers no more guarantee than an
-        // answering one, so §4.2's "any uncertainty → clear it" applies to
-        // it as well (plan §9 latent issue 2).
+        // Neither path retires the frame by reflex: `reanchor` invalidates
+        // only on disagreement (a foreign cursor, a reflow); a silent
+        // terminal is no new information, and this query runs for exceptional
+        // events only, so between calls nothing external has run
+        // (ui_draw_261001).
         let row = query_real_cursor_row();
         // The re-anchor erases the live frame's rows, which is why it returns
         // bytes: a resize or a foreign writer can leave the cursor outside the
