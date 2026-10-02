@@ -2,7 +2,9 @@
 
 **Status:** Design settled — implemented (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 ✅, P5 ✅;
 §4.5 U1/U2 ✅ in the API fold, U3–U6 not started). One end-to-end layout
-assertion is off by one row — see §5.2.
+assertion is off by one row — see §5.2; the design to close it (paint-forward)
+moved to [`ui_draw_261001.md`](./ui_draw_261001.md), which supersedes §5.2's
+"Proposed change" and its open questions.
 Post-implementation follow-ups (§9): 7 done, 3 open, 1 accepted limitation —
 audited 2026-09-28, recommended order at the end of §9.
 **Supersedes:** the ad-hoc dialog renderer in `src/ui.rs`, the `redraw` closure in `src/repl.rs`
@@ -943,9 +945,13 @@ renders at, and width is composition, not budget.
 >
 > **Known gap:** `end_to_end_input_mode_layout` reports **two** blank rows
 > between a turn's last content and the status row, where it asserts one. Not
-> fixed. What follows is the diagnosis and the proposed change; it supersedes an
-> earlier note in this file that blamed the `cursor_row()` re-anchor, which is
-> innocent.
+> fixed. **The design to close it moved to
+> [`ui_draw_261001.md`](./ui_draw_261001.md)** (paint-forward + a stdout switch
+> at the bottom). What follows is kept as diagnosis history — why the arithmetic
+> resisted fixing — not as the change to make; the "Proposed change" bullets
+> below are superseded, and the two claims in them that the new doc corrects are
+> marked in place. It also supersedes an earlier note in this file that blamed
+> the `cursor_row()` re-anchor, which is innocent.
 >
 > **The cause is that `plan_reposition` places the area by its bottom edge,
 > which §4 and §4.5.7 rule out.** The model is settled: the area sits
@@ -988,10 +994,11 @@ renders at, and width is composition, not budget.
 >   because no vertical motion is left to be ambiguous about at the screen edge.
 > - **Spacing is the UI's, forced explicitly.** `\r\n` is well-defined from any
 >   cursor position — `CR` cancels the wrap-pending state left by a full-width
->   row — so the UI never has to ask where the content left the cursor, and the
->   content contract needs no trailing newline. (Forcing one there would make it
->   impossible to render content to the last row, which is the whole point of
->   this change.) The gap count becomes the deliberate value
+>   row — so the UI never has to ask where the content left the cursor.
+>   **Corrected by `ui_draw_261001.md`:** content keeps its contract — closed
+>   lines, full-width when styled — so rendering to the last row stays possible;
+>   what drops is the UI's *dependency* on the trailing newline for placement,
+>   not the newline itself. The gap count becomes the deliberate value
 >   `end_to_end_input_mode_layout` asserts, rather than a residue of scroll
 >   arithmetic.
 > - **Wipe only what the write will not overwrite.** Frame rows are padded to
@@ -1073,26 +1080,25 @@ Each phase: green build + `cargo test` + `cargo fmt`.
 P0 is not optional: it converts the existing carefully-tuned tests from "a copy of the
 emit logic" into a real safety net for P2–P3.
 
-#### Open before the §5.2 change (bottom-edge placement)
+#### Open before the §5.2 change — all three resolved
 
-The §5.2 diagnosis is settled; the change itself is not started. Three things
-have to land with it, and none of them is optional:
+The change itself moved to [`ui_draw_261001.md`](./ui_draw_261001.md); status
+of the three, for the record:
 
-1. **A regression test in the regime that distinguishes the two designs.**
-   Blocking. Every existing scenario fills the screen — the steady state, where
-   §4's reserved and unreserved designs are observationally identical, which is
-   precisely why `end_to_end_input_mode_layout` could not arbitrate the LF
-   arithmetic. The test has to hold the area **mid-screen**: a long, low-output
-   turn, or an area that changes height. In progress.
-2. **Does `CR` clear the wrap-pending state?** The proposed placement emits
-   `\r` + N newlines unconditionally, which is position-independent only if it
-   is. `frame.rs` already documents wrap-pending after a full-width row and
-   suppresses `EL` for it. Pin this with a vt100 replay rather than assuming it
-   — the whole no-descend design rests on this one question.
-3. **What draws the area when the content fills to the last row?** With
-   bottom-edge placement gone the area follows the content and the scroll is the
-   terminal's, unmodelled. The old `delta` was doing explicit work there. It is
-   not yet established that nothing is needed.
+1. **Mid-screen regression test** — exists: `end_to_end_input_mode_layout`
+   (its scenario sits mid-screen, rows 31–35 of 40). Currently **red
+   (`got 2`)** — it is paint-forward's driver test, expected red until the
+   change lands.
+2. **Does `CR` clear the wrap-pending state?** — **yes**, pinned by
+   `tests/cr_wrap_pending.rs`: `CR` cancels the deferred wrap on a full-width
+   row; `\r` + N newlines lands the paint exactly N rows down from a mid-row
+   and from a pending position; a write past the bottom row scrolls earlier
+   content up intact.
+3. **What draws the area when the content fills to the last row?** —
+   **answered: ordinary output does.** Writes past the bottom scroll the
+   transcript up — `ui_draw_261001.md`'s stdout switch ("regular stdout
+   writes … so that earlier content gets pushed up") makes that explicit. The
+   old `delta` was modelling what writing already does.
 
 Two more notes that are easy to lose:
 
@@ -1551,18 +1557,51 @@ still targeted (no blanket `allow(dead_code)` came back).
   `streamed_thinking_is_counted`. The DSRs stayed, for the reasons §4.2 now
   records. §4.5 is the remaining work, and it was never gated on this.)*
 
+## Segment boundary normalization, v2
+Replace the boundary() stuff that emits newlines after turn content with the
+opposite principle:
 
-## Backlog
+- Strip all leading / trailing blank lines from all content output at kind boundaries 
+  - begin_response and end_response strip leading / trailing newlines
+  - synthetic content never emits spacer lines at its boundaries
+- Single point emitting separator lines: Turn boundary() into
+  boundary(oldDisplayKind, newDisplayKind), and call it at the start of
+  `with_content_writer`. How it encodes its logic is internal (matrix,
+  conditions, whatever) - important is that it is the *only* point emitting
+  seprator lines at content bondaries. It owns the policy.
+- UI controls spacing at fold: Display a spacer line between last turn output and status
+  / input in the UI (frame content)- can change whether to display spacer(s),
+  separator lines etc - UI issue
+  - Provides the formatting, but does not force newlines into the content -
+    enables the "collapse newlines between prompts" behavior.
+- Segment boundaries between begin_response and end_response should follow the
+  same conventions: One trailing newline, NO trailing separator lines.
+  Following content is responsible for any separators.
 
-- Drawing efficiency
-  - Limit clearing:
-    - Overwrite only if frame height did not change, or if it increased. No
-      clearing.
-    - Only clear rows below frame if 
-      `old_frame_height - new_frame_height - content_rows_written > 0`, so if
-      old rows are not overwritten anyway, and the fold is now not at the
-      bottom-most possible position. Do this clearing *at the end* of the
-      regular output pass, to minimize flickering in new content.
-  - Caret-only moves: When only the caret moves (no row changes), is a
-    caret-only emit worth a special case, or is it subsumed by the diff (both
-    cheap)?
+### Initial ContentDisplayKind set
+
+```rust
+enum ContentDisplayKind {
+    /// `display_committed_prompt` — a line committed with Enter: a turn's
+    /// prompt, a slash command, a `!command`. Formats its own rules and
+    /// handles the collapse between consecutive ones.
+    Prompt,
+    /// `begin_response` … `end_response` — streamed model content
+    /// (text, reasoning, tool calls), one kind until the refinement below.
+    Response,
+    /// `display_text` — a discrete message or error block.
+    SystemMessage,
+    /// `display_system` — a marker or notice (`[compaction: …k tokens]`).
+    SystemContent,
+}
+```
+
+### Future refinements
+Pull streaming content boundary handling into the same layer:
+- Refine ContentDisplayKind to cover model content segments (text / reasoning / tool calls)
+- Maybe separately track streaming "first chunk" / "last chunk" status, since
+  each segment can be emitted in many delta chunks, without an actual
+  boundary.
+
+## Drawing efficiency
+See ./ui_draw_261001.md

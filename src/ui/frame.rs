@@ -465,6 +465,12 @@ pub(crate) struct DrawCache {
     /// transcript content, and treating it as such would let a frame's last
     /// row decide what a later commit may collapse against.
     pub(crate) last_content_display_kind: Option<ContentDisplayKind>,
+    /// True when that last write declared itself the last flush of its
+    /// segment, so the next content write opens a new block even under the
+    /// same kind. Read and cleared by `with_content_writer`, which is the only
+    /// consumer: like `last_content_display_kind`, it is not transcript
+    /// content and `draw_frame` leaves it alone.
+    pub(crate) last_content_closes_segment: bool,
     /// True while a content batch is open (`Output::begin_batch`). While set a
     /// content write consumes the frame and does **not** put it back — one
     /// re-emit when the guard drops, instead of one per write (ui_draw_v2 R5).
@@ -482,6 +488,12 @@ pub(crate) struct DrawCache {
     /// loud in debug builds and merely correct in release. The worst a
     /// mistimed end does is redraw once too often.
     pub(crate) batch_active: bool,
+    /// Content rows written since a consume — the `content_rows` term of the
+    /// below-frame clear (`old_h - h_new - consumed`), accumulated across a
+    /// batch's writes and taken by the next `paint_forward`. Only meaningful
+    /// while a consume is outstanding (deferred or awaiting reposition);
+    /// `paint_forward` zeroes it either way.
+    pub(crate) consumed_rows: usize,
     /// The frame taken by a batch's *first* consume, held until the batch
     /// ends.
     ///
@@ -503,7 +515,9 @@ impl DrawCache {
             element_stack: Vec::new(),
             applied: None,
             last_content_display_kind: None,
+            last_content_closes_segment: false,
             batch_active: false,
+            consumed_rows: 0,
             deferred: None,
         }
     }
@@ -534,22 +548,28 @@ impl DrawCache {
         self.live = None;
     }
 
-    /// Record a re-anchor attempt (plan §4.2) and retire the frame region,
-    /// returning the row to use and the bytes that erase it.
+    /// Record a re-anchor attempt (plan §4.2): sync the tracked row with the
+    /// terminal's answer and decide what the frame does about it, returning
+    /// the row to use and any bytes the decision needs.
     ///
     /// This is the one sanctioned absolute path (row_accounting §6b). A resize
     /// or a foreign writer can leave the cursor *outside* the live block, and
     /// then no relative walk can reach the block's rows — the erase that
     /// precedes every paint walks up from the cursor, so it would erase the
     /// wrong rows entirely. Here the block's row is still known and a DSR has
-    /// just confirmed where the cursor went, so the old region is addressed
-    /// and the cursor parked where the anchor says.
+    /// just confirmed where the cursor went, so when the answer *disagrees*
+    /// the old region is addressed and the cursor parked where the answer says.
     ///
-    /// "Any uncertainty → clear it" still holds: with an answer (`Some`) the
-    /// tracked row is replaced by it, and on fallback (`None` — a terminal that
-    /// never answered, e.g. a headless pty) the tracked row stands and the old
-    /// region is still erased, because a silent terminal offers no more
-    /// guarantee than an answering one (plan §9 latent issue 2).
+    /// **Invalidation is on disagreement only** (ui_draw_261001): an answer
+    /// that is not where the frame left the cursor (foreign writer), or a
+    /// reflow — dims changed, so `frame_top_row` is a pre-resize absolute.
+    /// A silent terminal (`None`) with no reflow is *no new information*: the
+    /// tracked row stands, the frame stays live, and the unverified cursor is
+    /// parked at the frame's caret, which is what makes `live`'s contract
+    /// hold. Plan §9 latent issue 2 recorded the old rule ("a silent terminal
+    /// offers no more guarantee than an answering one" → clear it); the
+    /// guarantee comes from *when* DSR runs instead — exceptional events only,
+    /// so between calls nothing external has run.
     pub(crate) fn reanchor(
         &mut self,
         row: Option<usize>,
@@ -557,9 +577,11 @@ impl DrawCache {
         term_h: usize,
     ) -> (usize, String) {
         let mut s = String::new();
+        let prev = self.caret.0;
         if let Some(r) = row {
             self.caret.0 = r.max(1);
         }
+        let mut skip_park = false;
         // Copy out before mutating: the borrow of `self.live` has to end before
         // the refresh below re-takes it.
         let info = self.live.as_ref().map(|l| {
@@ -612,11 +634,34 @@ impl DrawCache {
                 if let Some(l) = self.live.as_mut() {
                     l.frame_top_row = self.caret.0.saturating_sub(off).max(1);
                 }
+            } else if !reflowed && (row.is_none() || row == Some(prev)) {
+                // **Frame intact: leave it alone.** The answer confirms where
+                // the frame left the cursor (its caret), or there is no answer
+                // at all — a silent DSR is *no new information*, not bad
+                // information: between turns nothing external has run, and DSR
+                // belongs to exceptional events (startup, resume, resize,
+                // editor return, error/dialog entries), not to regular drawing
+                // (ui_draw_261001). No erase — the next paint overwrites the
+                // frame's rows as it enters them — and `live` stays, so
+                // `anchor()` keeps reading the frame's *top* and the next
+                // compose diffs in place instead of anchoring on the caret
+                // row: that anchoring is the down-a-row-per-re-anchor drift
+                // the reflow branch above fixes, and the region clear was a
+                // second wrong answer on top of it, at whatever rows the
+                // bookkeeping last believed.
+                //
+                // Park only when unverified: with no answer, parking puts the
+                // cursor at the frame's caret, which is what makes `live`'s
+                // contract true; a verified cursor is already there.
+                skip_park = row.is_some();
             } else {
-                // **No reflow, or a silent terminal.** The cursor may be
-                // *outside* the block — a foreign writer put it there — so a
-                // relative walk cannot reach the block's rows at all, and the
-                // pre-resize row is the only thing left to address. This is the
+                // **A cursor outside the block, or a reflow with no answer.**
+                // The answer *disagreed* with the frame — a foreign writer put
+                // the cursor elsewhere — or the dims changed with the terminal
+                // silent, where `frame_top_row` is a pre-resize absolute that
+                // addresses a row the area no longer occupies. Either way a
+                // relative walk cannot reach the block's rows reliably, and the
+                // believed row is the only thing left to address. This is the
                 // one absolute address in a frame apply (row_accounting §6b).
                 for i in 0..rows {
                     s.push_str(&cup(top + i, 1));
@@ -625,7 +670,14 @@ impl DrawCache {
                 self.live = None;
             }
         }
-        s.push_str(&cup(self.caret.0, self.caret.1 + 1));
+        // The park is for the paths that moved or lost the frame (the reflow
+        // path walked to the region to clear it; a silent intact frame parks
+        // to *make* the contract true) — a *verified* intact cursor is already
+        // where the frame says it is, and parking it would be the move, not
+        // the sync.
+        if !skip_park {
+            s.push_str(&cup(self.caret.0, self.caret.1 + 1));
+        }
         (self.caret.0, s)
     }
 }
@@ -649,128 +701,183 @@ pub(crate) fn plan_apply(
 ) -> String {
     let tw = term_w.max(1);
     let th = term_h.max(1);
-    // The block goes where the cursor is: the live frame's own top if one is
-    // intact, else the tracked cursor row. That is `DrawCache::anchor`, which
-    // used to be a parameter — a caller could name a row, and all it could do
-    // with it was contradict the block's own position (row_accounting §6b).
-    let anchor = cache.anchor().clamp(1, th);
     let h = frame.height();
+    // Where the next frame belongs: the intact frame's top, else the cursor.
+    let anchor = cache.anchor().clamp(1, th);
 
     if policy == ApplyPolicy::Append {
         return plan_append(cache, frame, anchor, th);
     }
 
-    // Bookkeeping only: the block's top row, for the tracked cursor row and the
-    // partial predicate below. The `delta` this computes is no longer emitted —
-    // step 2 of `plan_full` gets the terminal to do the scrolling instead.
-    let delta = (anchor + h).saturating_sub(1).saturating_sub(th);
-    let top = anchor.saturating_sub(delta).max(1);
-
-    let partial = cache.live.as_ref().is_some_and(|live| {
-        delta == 0 && top == live.frame_top_row && tw == live.term_w && th == live.term_h
-    });
-    if partial {
-        plan_partial(cache, frame, top, th)
-    } else {
-        plan_full(cache, frame, top, tw, th)
+    // Diff path (ui_draw_261001). A live frame with the dims it was painted
+    // at *is* at its own position: content can only move a frame by consuming
+    // it, and that clears `live` — so position identity is `live` itself, and
+    // the rows that differ (plus the rows an orphaned shrunken frame left) are
+    // the only bytes written. Rows appended by growth have no old counterpart
+    // and are written outright.
+    let dims_ok = cache
+        .live
+        .as_ref()
+        .is_some_and(|live| live.term_w == tw && live.term_h == th);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/held.log")
+    {
+        let info = match cache.live.as_ref() {
+            Some(l) => format!(
+                "top={} h={} dims={}x{}",
+                l.frame_top_row,
+                l.frame.height(),
+                l.term_w,
+                l.term_h
+            ),
+            None => "none".to_string(),
+        };
+        let _ = std::io::Write::write_all(
+            &mut f,
+            format!(
+                "APPLY h={h} tw={tw} th={th} anchor={anchor} live=[{info}] dims_ok={dims_ok}\n"
+            )
+            .as_bytes(),
+        );
     }
+    // The diff path writes without newlines — it can never scroll — so the
+    // frame must *fit* where it stands: a grow past the screen's bottom row
+    // would write the new rows off the end (`CUD` clamps, and they land on the
+    // rows below the frame instead of below the content). That grow goes
+    // through the full path, whose forward paint emits the `LF`s that scroll
+    // the frame into view — the same gate the old `delta == 0` predicate was.
+    let fits = cache
+        .live
+        .as_ref()
+        .is_some_and(|live| live.frame_top_row + h <= th + 1);
+    if dims_ok && fits {
+        return plan_partial(cache, frame, anchor, th);
+    }
+
+    // Full path: paint forward from the cursor — no descend, no bottom-up, no
+    // `delta` (ui_draw_261001). A live frame with changed dims still sits
+    // under the cursor, so walk to its top first; its height is what this pass
+    // may have to clear below the new block.
+    let mut s = String::new();
+    let (top, old_h) = match cache.live.take() {
+        Some(live) => {
+            let (cur, _) = frame_caret(&live.frame);
+            cuu(&mut s, cur);
+            s.push('\r');
+            (live.frame_top_row, live.frame.height())
+        }
+        // No frame: the cursor is wherever the last write left it, and that is
+        // where the block belongs.
+        None => (anchor, 0),
+    };
+    if h == 0 {
+        // The empty frame is "clear the region and park": the rows the old
+        // frame covered, erased in one downward pass, cursor back on the
+        // region's first row so whatever comes next lands where the frame was
+        // (plan §5.3). With nothing live there is nothing to clear — the park
+        // is the whole operation.
+        if old_h > 0 {
+            erase_down(&mut s, old_h);
+            cuu(&mut s, old_h - 1);
+        }
+        cache.live = Some(LiveFrame {
+            frame_top_row: top,
+            term_w: tw,
+            term_h: th,
+            frame: frame.clone(),
+        });
+        cache.screen_bottom = th;
+        cache.caret = (top.clamp(1, th), 0);
+        return s;
+    }
+    s.push_str(&paint_forward(cache, frame, top, tw, th, old_h));
+    s
 }
 
-/// Full apply: retire the previous frame's rows, descend to the block's last
-/// row, clear what the block leaves below, paint it bottom-up, place the caret.
-/// Every step is a walk from wherever the cursor already is.
-fn plan_full(cache: &mut DrawCache, frame: &Frame, top: usize, tw: usize, th: usize) -> String {
+/// Paint the block forward from the cursor's row: row 0 first, a line clear on
+/// each row's entry, `LF` between rows. At the bottom row the `LF`s scroll —
+/// which is the room the block needs, decided by the terminal rather than by a
+/// computed `delta` (ui_draw_261001: the fold is placed by content, never by
+/// the screen's bottom edge).
+///
+/// `old_h` is the height of the frame this pass replaces, `0` when there was
+/// none. Rows the old frame covered that neither this block's `h` rows nor the
+/// content that consumed it (`DrawCache::consumed_rows`, taken by this call)
+/// cover are the old frame's tail — erased here, in the same pass, after the
+/// block's rows and before the caret.
+///
+/// Precondition: the cursor is on row `top`. The column doesn't matter — row
+/// 0's own `CR` establishes it.
+fn paint_forward(
+    cache: &mut DrawCache,
+    frame: &Frame,
+    top: usize,
+    tw: usize,
+    th: usize,
+    old_h: usize,
+) -> String {
     let h = frame.height();
+    debug_assert!(h > 0, "paint_forward needs rows to paint");
+    let consumed = std::mem::take(&mut cache.consumed_rows);
+    let orphan = old_h.saturating_sub(h + consumed);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/held.log")
+    {
+        let _ = std::io::Write::write_all(
+            &mut f,
+            format!("PAINT top={top} h={h} old_h={old_h} consumed={consumed} orphan={orphan}\n")
+                .as_bytes(),
+        );
+    }
     let mut s = String::new();
-
-    // 1. Retire the previous frame, if one is still live.
-    //
-    //    `live` is set exactly when the cursor is still at that frame's caret,
-    //    so the walk to its first row is `CUU` by the caret's own offset — and
-    //    it is what the new block's top is measured from. Without it the block
-    //    creeps down by one row on every full apply, because the cursor rests
-    //    at the caret and a caret on the last row is a row below the top the
-    //    next apply would assume. (A cursor that has *left* the block is the
-    //    re-anchor's case, and `reanchor` clears `live`.)
-    //
-    //    Erasing here, before the scroll, also removes the residue the absolute
-    //    path reached by arithmetic: a scroll pushes the old rows *above* the
-    //    new block's top, where nothing can reach them afterwards. That was the
-    //    union clear's other job.
-    let old_cur = match cache.live.as_ref() {
-        Some(live) => {
-            let h_old = live.frame.height();
-            let (cur, _col) = frame_caret(&live.frame);
-            cuu(&mut s, cur);
-            erase_down(&mut s, h_old);
-            cuu(&mut s, h_old.saturating_sub(1));
-            cur
-        }
-        None => 0,
-    };
-
-    // **NOT the model — see `ui_draw_v2` §4/§4.5.7.** The area is not
-    // placed against the screen's last row; it sits below the content and is
-    // pushed down by it. This descend-to-fit belongs to the pending replacement.
-    // 2. Make room for the block and land on its last row. `h-1` bare LFs do
-    //    both: an LF at the bottom row scrolls, anywhere else it moves down
-    //    one. So the block's last row is the cursor's row afterwards, and
-    //    exactly `delta` lines reach scrollback — the same split the absolute
-    //    path computed from the tracked row, except the *terminal* decides it,
-    //    so the block fits even when the tracked row was wrong.
-    for _ in 0..h.saturating_sub(1) {
-        s.push('\n');
-    }
-
-    // 3. Clear the rest of the live region, floored so a maximize's revealed
-    //    rows survive. Nothing the block paints is touched — these are the rows
-    //    below its bottom. Done before the paint so the only walk back is the
-    //    one that follows.
-    let floor = th.min(cache.screen_bottom);
-    let below = (floor + 1).saturating_sub(top + h);
-    if below > 0 {
-        // Step down first: the cursor is on the block's *last* row, and the row
-        // about to be cleared is the one below it.
-        cud(&mut s, 1);
-        for i in 0..below {
-            s.push_str(EL);
-            if i + 1 < below {
-                cud(&mut s, 1);
-            }
-        }
-        cuu(&mut s, below);
-    }
-
-    // 4. Paint bottom-up: the cursor is on the block's last row, so every row
-    //    is one `CUU 1` below the one to paint. Walking down instead would not
-    //    work — `CUD` clamps at the bottom row rather than scrolling — and
-    //    painting down would need a walk to the top first.
-    for i in (0..h).rev() {
-        if i + 1 < h {
-            cuu(&mut s, 1);
+    // The block. `CR` + `EL` on entry is the overwrite rule: one line clear,
+    // immediately followed by the row's bytes (the row is padded, so the pair
+    // replaces the whole line). `CR` also cancels a wrap-pending left by the
+    // row above.
+    for i in 0..h {
+        if i > 0 {
+            s.push('\n');
         }
         s.push('\r');
+        s.push_str(EL);
         s.push_str(frame.row(i));
     }
-
-    // 5. Caret (absolute row returned for bookkeeping only), then the cache.
-    //    An empty frame is the "erase the region" operation: it parks the
-    //    cursor on the region's first row, so whatever the caller appends next
-    //    lands where the frame was (plan §5.3).
-    let caret = if h == 0 {
-        cuu(&mut s, old_cur);
-        (top, 0)
-    } else {
-        push_caret(&mut s, frame, top, th)
-    };
+    // The old frame's tail: rows it covered that nothing overwrote. These sit
+    // at or above the screen bottom by construction (they were on screen), so
+    // these `LF`s never scroll — a nonzero `orphan` and a paint-induced scroll
+    // are mutually exclusive (orphan > 0 implies content did not push the old
+    // frame's bottom past the screen).
+    for _ in 0..orphan {
+        s.push('\n');
+        s.push('\r');
+        s.push_str(EL);
+    }
+    // Scroll bookkeeping: an `LF` at the bottom row scrolls instead of moving
+    // down, so the block may have landed `scroll` rows higher than `top`. The
+    // terminal decided it; the tracked row follows it. The tracked row is the
+    // *cursor*, and the caret walk below is relative — so this number is the
+    // only place the scroll has to be known.
+    let scroll = (top + h - 1).saturating_sub(th);
+    let top_post = top.saturating_sub(scroll).max(1);
+    // Caret: from the last written row (block bottom or orphan tail) up to the
+    // frame's caret row, then across. `CR` first — the last written row is
+    // full width, hence wrap-pending, and `CUU` preserves the column.
+    let (r, c) = frame_caret(frame);
+    s.push('\r');
+    cuu(&mut s, (h + orphan).saturating_sub(1).saturating_sub(r));
+    cuf(&mut s, c);
     cache.live = Some(LiveFrame {
-        frame_top_row: top,
+        frame_top_row: top_post,
         term_w: tw,
         term_h: th,
         frame: frame.clone(),
     });
     cache.screen_bottom = th;
-    cache.caret = caret;
+    cache.caret = ((top_post + r).clamp(1, th), c);
     s
 }
 
@@ -858,158 +965,75 @@ fn plan_append(cache: &mut DrawCache, frame: &Frame, anchor: usize, th: usize) -
 }
 
 /// Consume (§4.5 P1): a content write is about to start where the frame is.
-/// Walk to the frame's first row, clear what it painted, and take the frame —
-/// which comes back below the content via [`plan_reposition`].
+/// Walk to the frame's first row and take the frame — which comes back below
+/// the content via [`plan_reposition`].
 ///
-/// "Consume" is about **ownership**, not pixels: the frame stops being *live*
+/// "Consume" is about **ownership**: the frame stops being *live*
 /// (`live = None`) but is handed back rather than dropped, so it can be
-/// re-emitted. What it replaces retires the frame outright, and that is the
-/// difference that matters (§4.5.3).
+/// re-emitted (§4.5.3). **No pixels are cleared here** (ui_draw_261001): the
+/// content write that follows emits a line clear with each line it enters —
+/// overwrite, one pass — and rows it never reaches are the reposition's
+/// `old_h` tail (`old_h - h_new - consumed_rows`, cleared in the same forward
+/// pass as the block).
 ///
-/// The pixels *are* cleared, and that is load-bearing rather than a residue of
-/// the old erase: the frame's rows are padded to full width, so a content line
-/// shorter than the terminal would leave whatever the frame painted to its
-/// right of it still showing — the other half of the §1.1 resume artefact.
-///
-/// What the retire-and-clear gets wrong is where the walk *ends*: at the
-/// block's caret, so content starts mid-frame and strands the rows above it.
-/// It ends at the block's first row, column 0, because content takes the
-/// block's **whole height** — the status and input rows are content's to use
-/// too, not a margin the write has to live below.
+/// The walk ends at the block's first row, column 0, because content takes
+/// the block's **whole height** — the status and input rows are content's to
+/// use too, not a margin the write has to live below.
 ///
 /// Returns the walk and the frame to re-emit, or `None` when no frame was live.
-/// `None` was the state of a whole turn under the old scheme; now it is the
-/// state before a turn's first frame and after one resolves.
 ///
 /// **`CR` is part of the contract, not a detail.** `CUU` preserves the column,
 /// and the frame's caret is out at the *input's* column, so without an explicit
-/// `CR` the content would start a prompt-width to the right. It used to arrive
-/// by accident — the transient bar's own clear ended in one — and that bar is
-/// deleted with the rest of the transient machinery, so the byte is what
-/// carries it.
+/// `CR` the content would start a prompt-width to the right.
 pub(crate) fn plan_consume(cache: &mut DrawCache) -> Option<(String, Frame)> {
     let live = cache.live.take()?;
     let (caret_row, _) = frame_caret(&live.frame);
-    let h = live.frame.height();
     let mut s = String::new();
-    // Down to the block's last row, then erase bottom-up to its first — a walk
-    // *down* out of a block is impossible: `CUD` clamps at the screen edge
-    // instead of scrolling. The block is on screen, so its last row is
-    // reachable from any row inside it.
-    //
-    // `CR` before every `EL`, and that is the whole trick: `EL` reaches only
-    // from the cursor to the end of the line, and the cursor is out at the
-    // input's caret — so without it the erase would clear what lies *past* the
-    // prompt and leave the prompt itself standing, which is exactly the tail a
-    // short content line would then inherit.
-    //
-    // Also see `ui_draw_v2` §5.2: this erases all `h` rows every write, but rows are
-    // padded to `term_w`, so a content write already overwrites them. It is only
-    // needed when the area *shrank*, and then just for `old_h - new_h` rows.
-    if h > 0 {
-        let cur = caret_row.min(h - 1);
-        cud(&mut s, h - 1 - cur);
-        for i in 0..h {
-            s.push('\r');
-            s.push_str(EL);
-            if i + 1 < h {
-                cuu(&mut s, 1);
-            }
-        }
-    }
-    // Postcondition: column 0 of the block's first row.
+    // Up to the block's first row. **No erase** (ui_draw_261001): the content
+    // write that follows clears each line as it enters it, and the rows it
+    // never reaches are the reposition's `old_h` tail to clear — overwrite
+    // only, one pass, no separate clearing walk.
+    cuu(&mut s, caret_row);
+    // Postcondition: column 0 of the block's first row. `CR` is part of the
+    // contract, not a detail: `CUU` preserves the column, and the frame's
+    // caret is out at the *input's* column, so without it content would start
+    // a prompt-width to the right.
     s.push('\r');
     cache.caret = (live.frame_top_row, 0);
     Some((s, live.frame))
 }
 
-/// Reposition apply (§4.5 P1): the frame's top row has moved **down**, because
-/// content was written over the rows it used to occupy, and those rows now hold
-/// content that must not be erased.
-///
-/// This is `plan_full` with the retire step removed, and that removal is the
-/// whole point. Neither existing path fits: `plan_partial` requires an unmoved
-/// frame, and `plan_full` erases the old region — which here would erase the
-/// content that has just landed there. So the frame is walked to where the
-/// content left off and painted there, and nothing above is touched.
-///
-/// The contract is deliberately narrow: **the same frame, at a new top**. A
-/// frame that *changed* (grew a row, lost one) still goes through `plan_apply`,
-/// because only that path can retire the rows a shrunken frame orphaned. The
-/// caller re-renders the *same recipe* the consume took, at the same dims, so
-/// the height is fixed by construction and the narrowness costs nothing — what
-/// changed is where it goes and what its status row says, not how tall it is.
-///
-/// No `CUP`: the anchor is the cache's own caret, which is where the content
-/// write left the cursor.
+/// Reposition: the frame comes back **below the content** — the cursor is at
+/// the seam content left it on (one row below its last line, column 0), and
+/// the block paints forward from there. The old frame's height (`old_h`, from
+/// the frame the consume took) plus the content rows since then decide how
+/// many of the old frame's rows nothing overwrote; `paint_forward` clears
+/// them in the same pass.
 pub(crate) fn plan_reposition(
     cache: &mut DrawCache,
     frame: &Frame,
+    old_h: usize,
     tw: usize,
     th: usize,
 ) -> String {
     let h = frame.height();
     debug_assert!(h > 0, "reposition needs rows to paint");
-    let anchor = cache.caret.0.clamp(1, th);
-    let delta = (anchor + h).saturating_sub(1).saturating_sub(th);
-    let top = anchor.saturating_sub(delta).max(1);
-    let mut s = String::new();
-    // **NOT the model — see `ui_draw_v2` §4/§4.5.7 and the §5.2 known gap.**
-    // The area is *not* placed by its bottom edge: it sits immediately below
-    // the content and the content pushes it down, so it should paint forward
-    // from a fresh row and never descend. What follows anchors the block to
-    // the screen's last row instead — the common CLI idiom, but not this one.
-    // Kept until the replacement lands; do not read it as the design.
-    // Make room and land on the block's last row. `h-1` bare LFs do both: an LF
-    // at the bottom row scrolls, anywhere else it moves down one. So exactly
-    // `delta` of them reach scrollback and the block fits even when the tracked
-    // row was wrong — the terminal decides, as in `plan_full`.
-    for _ in 0..h.saturating_sub(1) {
-        s.push('\n');
+    let top = cache.caret.0.clamp(1, th);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/held.log")
+    {
+        let _ = std::io::Write::write_all(
+            &mut f,
+            format!(
+                "REPOS old_h={old_h} consumed={} top={top} h={h} th={th}\n",
+                cache.consumed_rows
+            )
+            .as_bytes(),
+        );
     }
-    // **No clear of the rows below the block**, and the omission is load-bearing
-    // enough to spell out. It is safe because those rows are provably clean:
-    //
-    // - With no scroll (`delta == 0`) they are the rows below the *old* frame,
-    //   which P4 had already cleared, and the content write stopped at the old
-    //   frame's top so it never reached them.
-    // - With a scroll, the bottom `delta` rows the scroll reveals are blank by
-    //   definition, and everything above them was the clean region from before.
-    //
-    // So the invariant P4 protects still holds without spending `below` erase
-    // codes per chunk — which matters most exactly when the area is mid-screen
-    // with free space beneath it, the case where `below` is largest.
-    for i in (0..h).rev() {
-        if i + 1 < h {
-            cuu(&mut s, 1);
-        }
-        s.push('\r');
-        s.push_str(frame.row(i));
-    }
-    let caret = push_caret(&mut s, frame, top, th);
-    cache.live = Some(LiveFrame {
-        frame_top_row: top,
-        term_w: tw,
-        term_h: th,
-        frame: frame.clone(),
-    });
-    cache.screen_bottom = th;
-    cache.caret = caret;
-    s
-}
-
-/// Emit the caret move from the block's *first* row and return the absolute
-/// `(row, col)` to store. The row is bookkeeping only — it is what row
-/// accounting compares against a terminal, and it is never addressed.
-fn push_caret(s: &mut String, frame: &Frame, top: usize, th: usize) -> (usize, usize) {
-    let (r, c) = frame_caret(frame);
-    // `CR` first: the paint left the cursor at the end of the block's first
-    // row, and `CUF` is relative — so the column it walks from has to be known
-    // rather than assumed.
-    s.push('\r');
-    cud(s, r);
-    cuf(s, c);
-    ((top + r).clamp(1, th), c)
+    paint_forward(cache, frame, top, tw, th, old_h)
 }
 
 /// Where the cursor rests once a block is painted: the frame's own caret, or
@@ -1729,21 +1753,27 @@ mod apply_tests {
         assert_eq!(p.screen().cursor_position(), (5, 0));
     }
 
+    /// A full apply clears **nothing below itself**: the rows below hold
+    /// content this frame never painted (here, a foreign writer's), and erase
+    /// is only ever for prior *frame* rows (ui_draw_261001). The paths that
+    /// own foreign rows are the empty-frame clear and `reanchor`.
     #[test]
-    fn full_clears_stale_rows_below() {
+    fn full_clears_nothing_below() {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["one", "two"], 20);
         cursor_to(&mut cache, 5, 24);
         let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
-        // Seed stale content the frame must erase, then put the cursor back on
-        // row 5: the frame applies relative to wherever the cursor is.
+        // Seed rows the frame does not own, then put the cursor back on row 5:
+        // the frame applies relative to wherever the cursor is.
         let seed = "\x1b[8;1Hstale8\x1b[9;1Hstale9\x1b[5;1H";
         let mut p = at(24, 20, 4);
         feed(&mut p, seed);
         feed(&mut p, &s);
         let rows = screen(&p, 24, 20);
-        assert_eq!(rows[7], "");
-        assert_eq!(rows[8], "");
+        assert_eq!(rows[4], "one");
+        assert_eq!(rows[5], "two");
+        assert_eq!(rows[7], "stale8", "rows the frame does not own survive");
+        assert_eq!(rows[8], "stale9");
     }
 
     #[test]
@@ -1850,20 +1880,22 @@ mod apply_tests {
         let f = lines_frame(&["head"], 20);
         cursor_to(&mut cache, 5, 24);
         let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 40);
-        // 19 rows below the block (6..=24) plus the painted row's own `EL` —
-        // and not the 35 down to 40, which is what a clear to the new bottom
-        // would have been. The absolute path expressed the same floor as
-        // "does not touch row 25".
+        // There is no floor to clear *to* anymore: a first paint owns only its
+        // own rows — rows below are not this frame's (ui_draw_261001). The
+        // painted row shows two clears and no more: the entry `EL` (the
+        // overwrite rule) plus the row's own trailing `el_if_short` (kept for
+        // diff mode, where rows are written without an entry clear).
         assert_eq!(
             s.matches("\x1b[K").count(),
-            20,
-            "clear must stop at the old bottom (24): {s:?}"
+            2,
+            "only the painted row clears itself: {s:?}"
         );
         let seed = "\x1b[25;1Hkeep25\x1b[30;1Hkeep30\x1b[5;1H";
         let mut p = at(40, 20, 4);
         feed(&mut p, seed);
         feed(&mut p, &s);
         let rows = screen(&p, 40, 20);
+        assert_eq!(rows[4], "head");
         assert_eq!(rows[24], "keep25");
         assert_eq!(rows[29], "keep30");
     }
@@ -1967,7 +1999,7 @@ mod apply_tests {
         );
 
         // The frame comes back, at the new fold — with the content above it.
-        let s = plan_reposition(&mut cache, &f, 20, 24);
+        let s = plan_reposition(&mut cache, &f, f.height(), 20, 24);
         feed(&mut p, &s);
         let rows = screen(&p, 24, 20);
         assert_eq!(
@@ -1993,7 +2025,7 @@ mod apply_tests {
         feed(&mut p, &s);
         cache.caret = (cache.caret.0 + 3, 0);
         cache.live = None;
-        let s = plan_reposition(&mut cache, &f, 20, 24);
+        let s = plan_reposition(&mut cache, &f, f.height(), 20, 24);
         assert!(
             cups(&s).is_empty(),
             "a reposition must not address a row: {s:?}"
@@ -2018,7 +2050,7 @@ mod apply_tests {
         feed(&mut p, "x\r\n");
         cache.caret = (10, 0);
         cache.live = None;
-        let s = plan_reposition(&mut cache, &f, 20, 10);
+        let s = plan_reposition(&mut cache, &f, f.height(), 20, 10);
         feed(&mut p, &s);
         let rows = screen(&p, 10, 20);
         assert_eq!(rows[8], "bar", "the frame fits at the bottom: {rows:?}");
@@ -2041,15 +2073,16 @@ mod apply_tests {
         feed(&mut p, "one\r\ntwo\r\nthree\r\n");
         cache.caret = (cache.caret.0 + 3, 0);
         cache.live = None;
-        let s = plan_reposition(&mut cache, &f, 20, 24);
+        let s = plan_reposition(&mut cache, &f, f.height(), 20, 24);
         // Not `!s.contains(EL)`: a `Lines` row carries its own trailing `EL` to
-        // pad to the terminal width, so that check could never be about the
-        // clear. A clear-below is a *walk* — `CUD` down past the block and `CUU`
-        // back — so one `CUD`, the caret move, is the whole budget.
+        // pad to the terminal width, and each row entry clears anyway — the
+        // check that matters is walks. A clear-below is a walk down past the
+        // block and back; paint-forward never descends at all (its caret move
+        // is up, from the block's bottom), so zero `CUD`s is the whole budget.
         assert_eq!(
             s.matches("\x1b[1B").count(),
-            1,
-            "only the caret moves down; no clear-below walk: {s:?}"
+            0,
+            "no descent at all, so no clear-below walk: {s:?}"
         );
         feed(&mut p, &s);
         let rows = screen(&p, 24, 20);
@@ -2060,21 +2093,17 @@ mod apply_tests {
     }
 
     /// §4.5 P1: consume leaves the cursor at the frame's first row, **column
-    /// 0**, and clears the rows it is taking over.
+    /// 0** — and erases nothing: it takes ownership, not pixels
+    /// (ui_draw_261001). The content write that follows clears each line as
+    /// it enters it, and the rows it never reaches are the reposition's
+    /// `old_h` tail — overwrite, one pass, no erase walk here.
     ///
-    /// The column is the substance. `CUU`/`CUD` preserve it, the frame's caret
+    /// The column is the substance. `CUU` preserves it, the frame's caret
     /// is out at the input's column, and the content about to be written would
     /// start a prompt-width to the right. This makes it the plan's own
-    /// postcondition rather than something inherited from the transient bar's
-    /// trailing `CR`.
-    ///
-    /// The clear is what "consume" is *not*: it takes ownership, not pixels.
-    /// The frame's rows are padded to full width, so a content line shorter
-    /// than the terminal would otherwise strand whatever they painted to its
-    /// right of it — the other half of the §1.1 resume artefact. The frame is
-    /// still handed back, so it can be re-emitted below.
+    /// postcondition rather than something inherited from a trailing `CR`.
     #[test]
-    fn consume_walks_to_the_frame_top_at_column_zero_and_clears_its_rows() {
+    fn consume_walks_to_the_frame_top_at_column_zero_without_erasing() {
         let mut cache = DrawCache::new(24);
         let mut e = LineEditor::new();
         e.insert_str("hi there");
@@ -2101,8 +2130,8 @@ mod apply_tests {
         let (walk, taken) = plan_consume(&mut cache).expect("a live frame");
         assert_eq!(taken.height(), f.height(), "the same frame comes back");
         assert!(
-            walk.contains(EL),
-            "the rows it takes over are cleared: {walk:?}"
+            !walk.contains(EL),
+            "no erase — the content write clears the rows it enters: {walk:?}"
         );
         feed(&mut p, &walk);
         assert_eq!(
@@ -2112,12 +2141,8 @@ mod apply_tests {
         );
         let after = screen(&p, 24, 20);
         assert_eq!(
-            after[4], "",
-            "the row it took over is clear to the end of the line: {after:?}"
-        );
-        assert_ne!(
             after, before,
-            "and so the frame no longer stands as painted"
+            "the frame still stands as painted — ownership changed, pixels did not"
         );
         assert!(cache.live.is_none(), "it is no longer intact");
     }
@@ -2153,7 +2178,7 @@ mod apply_tests {
         let rows = screen(&p, 24, 20);
         assert_eq!(rows[4], "one", "the content landed on the frame: {rows:?}");
 
-        let s = plan_reposition(&mut cache, &taken, 20, 24);
+        let s = plan_reposition(&mut cache, &taken, taken.height(), 20, 24);
         feed(&mut p, &s);
         let rows = screen(&p, 24, 20);
         assert_eq!(rows[4], "one", "the content survives: {rows:?}");
@@ -2214,23 +2239,66 @@ mod apply_tests {
         assert_eq!(cache.anchor(), 3);
     }
 
-    /// Plan §9 latent issue 2: a DSR *timeout* is still a re-anchor — the
-    /// tracked row stands (nothing better is known), but the live frame must
-    /// be invalidated all the same ("any uncertainty → clear it"), so the
-    /// next apply takes the full path instead of a partial diff against a
-    /// screen that may have changed under us.
+    /// Plan §9 latent issue 2, revised for paint-forward (ui_draw_261001): a
+    /// DSR *timeout* is no new information — DSR runs for exceptional events
+    /// only, so between calls nothing external has run, and an intact frame
+    /// stands. The tracked row is kept, `live` survives (the next apply still
+    /// diffs against it), and the unverified cursor is parked at the frame's
+    /// caret, which is what makes `live`'s contract true. An answer that
+    /// *agrees* is the same decision, minus the park.
     #[test]
-    fn reanchor_fallback_keeps_row_but_invalidates() {
+    fn reanchor_fallback_keeps_an_intact_frame() {
         let mut cache = DrawCache::new(10);
         let f = lines_frame(&["x"], 20);
         cursor_to(&mut cache, 5, 10);
         let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
-        assert_eq!(cache.reanchor(None, 20, 10).0, 5, "tracked row stands");
-        assert!(cache.live.is_none(), "live frame must be invalidated");
-        // Identical frame, same anchor: the partial path would emit nothing
-        // but the caret; the full path clears the region below the frame.
+        let (row, park) = cache.reanchor(None, 20, 10);
+        assert_eq!(row, 5, "tracked row stands");
+        assert!(
+            park.contains("\x1b[5;1H"),
+            "the unverified cursor is parked at the frame's caret: {park:?}"
+        );
+        assert!(
+            cache.live.is_some(),
+            "silent DSR: no new information, the frame stands"
+        );
+        // Identical frame, same anchor: the partial path diffs — no region
+        // clear, nothing but the caret walk.
         let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
-        assert!(s.contains("\x1b[K"), "full path required: {s:?}");
+        assert!(!s.contains("\x1b[K"), "partial path required: {s:?}");
+        // The answered case that agrees: verified, so nothing to park.
+        assert!(
+            cache.reanchor(Some(5), 20, 10).1.is_empty(),
+            "verified cursor: the park would be a move, not a sync"
+        );
+        assert!(cache.live.is_some(), "and the frame still stands");
+    }
+
+    /// What *does* invalidate the frame: disagreement (an answer that is not
+    /// the frame's caret — a foreign writer) and a reflow with no answer
+    /// (`frame_top_row` is a pre-resize absolute). Both fall back to the
+    /// absolute path — region addressed, cursor parked, `live` dropped so the
+    /// next apply repaints from a full path instead of diffing against rows
+    /// that may have moved under us.
+    #[test]
+    fn reanchor_invalidates_on_disagreement_or_silent_reflow() {
+        let mut cache = DrawCache::new(10);
+        let f = lines_frame(&["x"], 20);
+        cursor_to(&mut cache, 5, 10);
+        let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
+        let (row, s) = cache.reanchor(Some(8), 20, 10);
+        assert_eq!(row, 8, "the answer replaces the tracked row");
+        assert!(cache.live.is_none(), "a foreign cursor invalidates");
+        assert!(s.contains("\x1b["), "the old region is addressed: {s:?}");
+
+        // Width changed, terminal silent: the frame's top addresses rows the
+        // area no longer occupies, so the believed row is all there is — and
+        // it is not trusted for position either.
+        let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
+        assert!(cache.live.is_some());
+        let (_row, s) = cache.reanchor(None, 12, 10);
+        assert!(cache.live.is_none(), "a silent reflow invalidates");
+        assert!(s.contains("\x1b["), "region addressed absolutely: {s:?}");
     }
 
     /// Ports the old `Repl::next_input_row` cases (folded into the apply
@@ -2260,25 +2328,26 @@ mod apply_tests {
         assert_eq!(rows[37], "", "shrunken rows cleared in place");
     }
 
-    /// Ports the old `Repl::clear_rows_to(40, 24) == ""` case: with the
-    /// frame anchored below the previous screen bottom (bottom-anchored
-    /// grow), the clear floor sits above the frame — nothing is cleared, so
-    /// the scrollback a grow revealed stays intact.
+    /// A grow with the cursor mid-screen: the frame follows the cursor, not
+    /// the screen's bottom (there is no bottom-edge placement to clear
+    /// around), and only its own row clears.
     #[test]
-    fn full_clears_nothing_when_frame_sits_below_the_old_bottom() {
+    fn full_paints_at_the_cursor_on_a_grow_and_clears_only_itself() {
         let mut cache = DrawCache::new(24); // screen_bottom = 24
         let f = lines_frame(&["here"], 20);
-        cursor_to(&mut cache, 40, 24);
+        cursor_to(&mut cache, 40, 24); // clamps: the cursor sits at the old bottom
         let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 40);
-        // floor = min(40, 24) = 24 < frame top: only the frame row's own
-        // trailing `EL` is emitted — no clear addresses any other row.
         assert_eq!(
             s.matches("\x1b[K").count(),
-            1,
-            "only the painted row erases itself: {s:?}"
+            2,
+            "the painted row's entry clear + its own trailing, and nothing else: {s:?}"
         );
-        let mut p = at(40, 20, 39);
+        let seed = "\x1b[30;1Hkeep30\x1b[24;1H";
+        let mut p = at(40, 20, 23);
+        feed(&mut p, seed);
         feed(&mut p, &s);
-        assert_eq!(screen(&p, 40, 20)[39], "here");
+        let rows = screen(&p, 40, 20);
+        assert_eq!(rows[23], "here", "the frame follows the cursor: {rows:?}");
+        assert_eq!(rows[29], "keep30", "and the grow's scrollback is intact");
     }
 }

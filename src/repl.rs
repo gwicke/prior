@@ -42,6 +42,19 @@ use std::time::Duration;
 /// flag cleared.
 pub(crate) static RESUMED: AtomicBool = AtomicBool::new(false);
 
+/// The entry DSR at [`read_input`] has run once this process.
+///
+/// The query's whole job is the *first* paint of a session (the cache starts
+/// at row 1 while the shell that launched us may have left the prompt rows
+/// down — see the comment at the call site); from the second prompt on, the
+/// tracked row is measured from the emitted bytes and the query is pure
+/// overhead — a 60 ms timeout against any terminal that does not answer, and a
+/// re-anchor that could disturb a perfectly live frame between turns. DSR
+/// belongs to exceptional events (startup, resume, resize, `$EDITOR` return,
+/// error/dialog entries); this flag is what keeps it out of regular drawing
+/// (ui_draw_261001).
+static ENTRY_DSR_DONE: AtomicBool = AtomicBool::new(false);
+
 /// `SIGCONT` handler: we just record that the process resumed.
 /// It must stay async-signal-safe (no I/O, no allocation), so the
 /// actual terminal re-entry is performed by the reader thread (a normal
@@ -1457,7 +1470,11 @@ impl Repl {
         // picocode may have left its prompt three rows down. Every byte of the
         // greeter would then be counted from the wrong place and the drift
         // would be baked in before the first prompt is drawn.
-        let _ = output.cursor_row();
+        // First prompt of the process only — every later prompt's tracked row
+        // is measured from the bytes it wrote (see `ENTRY_DSR_DONE`).
+        if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
+            let _ = output.cursor_row();
+        }
         // Refresh the menu-facing view from this cycle's context. The loop
         // is the sole writer of these display fields (one acquisition);
         // menu nodes read them live through the same handle — no snapshot

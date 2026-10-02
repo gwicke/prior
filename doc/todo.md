@@ -1,11 +1,3 @@
-- [x] `sed` preview tool (`bsed` binary): a preview-only GNU sed that emits
-  line-anchored `@@@OLD`/`@@@NEW`/`@@@END` blocks for the `edit` tool, so the
-  model never runs `sed -i` on uncommitted work. Design, decisions and the
-  corrections the build forced in ./doc/bsed.md. Block-edit core extracted to
-  `crates/blockedit`; the tool runs in `crates/bsed` + `src/bin/bsed.rs`.
-  - [x] c\ over range support: c\ - text - Replace (change) lines with text.
-- [x] bash tool error return: report error code
-- [x] restore model on `/session <id> resume` (now via pre-fill, not silent)
 - [x] Compaction unification (Phase 7)
   - [x] /compact command — same as `/tree <id> compact` but at current position.
         Resolves `target_id` to the last user message on the active branch and
@@ -52,22 +44,14 @@
   - fuzzy matching: `test data` very different result from `test_data` -
     surprising
 
-- [x] UI Draw v2 — unified frame composition (REPL + menus + dialogs)
-      See: ./doc/ui_draw_v2.md
-      - [x] P0: extract real emit path so vt100 tests pin production bytes
-      - [x] P1: frame model (compose → allocate → render), input windowing
-      - [x] P2: ConsoleOutput DrawCache + apply (scroll-then-paint, partial repaint)
-      - [x] P3: REPL redraw on the frame path; $EDITOR DSR wrapper
-      - [x] P4: dialogs on the frame path; commit frame for decision line
-      - [x] P5: retire overlay_lines, fold next_input_row/clear_rows_to into apply
-      - [ ] Cleanups / follow-ups
-- [ ] doc/editor_cleanup.md - generalize editor integration
-- [ ] tools: safe sed wrapper producing edit input - generic / separate crate?
-  - [ ] research: identify patterns to support, existing similar tooling
-- [ ] tree view: lowest indent for longest "master" branch
-- [ ] model parameter revisit / expansion
-  - [ ] temperature support: model level only? move thinking level to model too?
-  - [ ] per-turn /thinking overrides, esp. at end of turn message
 - [ ] tool errors: split the operator's view from the model's, then unredact — ./doc/path_leak_risks.md
-- [ ] edit tool: return best matched text with line numbers (read format) to
-  the *model*, so it can construct a follow-up edit; do not show the diff to the model.
+
+## Drawing / doc/ui_draw_v2.md
+- Input field content loss on key-down
+- U4.4 — the ordering question you answered.
+  content write vs. frame update synchronization
+- R5's staleness half — batching turns N stale menu re-emits into 1; still one
+  wrong redraw if the recipe outlived its menu.
+
+- Cancelling a turn when it is being retried does not seem to work reliably
+  any more
