@@ -34,8 +34,9 @@ pub const LEGACY_BLOCKS_FIELD: &str = "edits";
 /// *require*: a harness, a model, or a session written before the rename all
 /// still send the old one, and dead-ending those calls would break the very
 /// shape this tool exists to serve. An `edits` *array* is deliberately not
-/// read here — that is pi's canonical form, never a blob, and `from_wire`
-/// rejects it by name.
+/// read here — that is pi's canonical form, never a blob — and neither is a
+/// string that is really a stringified array: both belong to
+/// [`crate::wire::EditArgs::from_wire`], which is where the two are told apart.
 pub fn blob_text(args: &Value) -> Option<&str> {
     let obj = args.as_object()?;
     obj.get(BLOCKS_FIELD)
@@ -480,10 +481,13 @@ fn edits_to_value(edits: &[ParsedEdit]) -> Value {
 /// - top-level `oldText`/`newText` → single-entry array;
 /// - legacy `old`/`new` → single-entry array.
 ///
-/// The array branches are **storage-side only**. The array is not a wire shape
-/// any more — a model sends `blocks` (a string) or the single-edit scalars —
-/// so reaching those branches here means we are normalizing something we read
-/// back off disk, which is exactly what they are for.
+/// The array branches are **storage-side only**. The array is not advertised
+/// on the wire — a model is pointed at `blocks` (a string) or the single-edit
+/// scalars — so reaching those branches here means we are normalizing a value
+/// we read back off disk, or one a model sent by reflex. The wire *accepts*
+/// the array (see [`crate::wire`]) but never asks for it, which is why
+/// canonicalization still runs in the other direction: a stored array is
+/// rewritten into the advertised block form before the model sees it.
 ///
 /// On a blob that does not satisfy the block policy (unparseable, a block that
 /// names no file, or a multi-file blob) the value is returned unchanged so

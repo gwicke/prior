@@ -70,21 +70,37 @@ unambiguous:
 | Field | Type | Who writes it | Who reads it |
 | --- | --- | --- | --- |
 | `blocks` | string (blob) | the model; `array_to_blob_value` | `EditArgs::from_wire` (wire), `blob_text` |
-| `edits` | array | `canonicalize_edit_value` (canonical, on disk) | `canonicalize_edit_value`, `get_preview`, replay |
+| `edits` | array | `canonicalize_edit_value` (canonical, on disk); a model by reflex | `canonicalize_edit_value`, `get_preview`, replay, and `EditArgs::from_wire` — accepted, never advertised |
 
-**The `edits` array is no longer a wire shape.** It was accepted for pi parity
-and is gone, because it is the exact thing weak harnesses mangle — most often
-by *stringifying* it, which turns a batch into a JSON string and silently loses
-the edit. A model that still sends one gets a named correction — "`edits` is a
-list; it is not a form this tool accepts" — rather than a generic "no
-recognizable edit arguments", because pi-shaped training makes that a likely
-slip. Nothing re-executes a persisted call (replay is display-only, and
-`from_wire` is reached solely through rig's `parse_tool_args` on dispatch), so
-dropping the shape cannot strand a stored session.
+**The `edits` array was removed as a wire shape, and has since been put back.**
+It was accepted for pi parity and then withdrawn, because it is the exact thing
+weak harnesses mangle — most often by *stringifying* it, which turns a batch
+into a JSON string and silently loses the edit.
 
-This does **not** touch pi compatibility. The array is not going away — it is
-pi's canonical on-disk form, which is the whole reason it was ever canonical.
-It simply stops crossing the model boundary, where the encoding hazard lives.
+Two of the three reasons that decision rested on turned out not to hold, so the
+array is accepted again (`crates/blockedit/src/wire.rs`, and
+`doc/edits_readd_and_arg_errors.md` for the full argument):
+
+- **The stringify hazard is handled rather than avoided.** An `edits` *string*
+  whose first character is `[` is parsed back into an array and run through the
+  same validation, so the mangled call now works instead of dying in the block
+  parser. The hazard was never "the array is hard to read" — it was "the array
+  is hard to *arrive* with" — and the arrival problem is now detected by name.
+- **The refusal cost more than it bought.** A pi-trained model sends it by
+  reflex, so every such call was paying a round trip to be told what the schema
+  had already told it. A correction cannot beat the model not knowing the
+  answer; it can only be slower.
+
+What did *not* change is the advertising, and that is the part that was always
+load-bearing: `edits` remains absent from `parameters()`, `blocks` remains a
+string, and no advertised property is an array. Accepting a shape and
+encouraging it are separate decisions, and only the first one was reversed —
+which is exactly the distinction the original design drew when it picked
+`blocks` over `edits` as the *name*. `src/tools.rs` pins both halves.
+
+The multi-file pi form (`edits: [{path: "a"}, {path: "b"}]`) stays refused: pi
+itself cannot express it, and `blocks` is the shape that can. One rule covers
+it and the lenient cases — every path the call names must be the same one.
 
 `startLine` (1-indexed) is an **anchor**, not a search window — see *Per-block
 line anchors* below for the semantics, the per-block header form, shape (B), and

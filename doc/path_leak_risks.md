@@ -54,21 +54,38 @@ for code that has an operator-facing sink; it is not prose.
    redacted text the model sees*. There is currently no separate operator
    channel for tool errors.
 
+3. **`edit` stopped being one of the redaction casualties**
+   (`doc/edits_readd_and_arg_errors.md`). It is still registered directly rather
+   than through `Guard`, but it now overrides `map_error` and shares one
+   classifier with `Guard` (`tools.rs::map_tool_error`), so its own diagnostics
+   reach the model instead of the `Other` default. This is what forced the
+   change: re-accepting the `edits` array moved its failures from the argument
+   layer — where the `Expected:`/`Actual:` envelope applies — to the call layer,
+   where they would all have arrived as `the tool failed`. Its IO errors name
+   the file **as the model spelled it**, and
+   `no_edit_failure_shows_the_model_a_host_path` runs the tool under a remapping
+   policy and asserts no host path appears in any of them.
+
 ## Open
 
-- **Redaction/guard gap.** `sed` is registered directly rather than through
-  `Guard`, so rig's default `map_error` → `redact_model_feedback()` replaces the
-  model-visible text with `"the tool failed"` (the real message survives only in
-  `error.source`). Same for `read`, `write`, `edit`, `glob`, `grep`, `list`.
-  This is *why* nothing above leaks today — it is a safety net, not a design,
-  and it also makes every failure undebuggable by the model.
+- **Redaction/guard gap, six tools remaining.** `sed`, `read`, `write`,
+  `glob`, `grep` and `list` are still registered without `map_error`, so rig's
+  default → `redact_model_feedback()` replaces the model-visible text with
+  `"the tool failed"` (the real message survives only in `error.source`). `edit`
+  was closed first because it was the one whose errors the model must act on;
+  the rest are the same one-line change plus their own leak test, and none of
+  them can be closed before step 1 below.
 - **No operator channel.** Because `on_tool_result` renders `output()`, the
   operator sees exactly what the model sees. `PolicyDenied::operator_message()`
   exists but has nowhere to write: no `tracing` subscriber is installed, so
   `tracing::warn!` is a no-op.
-- **No guard test.** Nothing fails if someone next writes
-  `format!("cannot read {p}")` with a host `p`. The current cleanliness is a
-  coincidence of what picocode happens to format today.
+- **No guard test, except for `edit`.** `no_edit_failure_shows_the_model_a_host_path`
+  runs the tool under a remapping policy and asserts no host path reaches the
+  model, so the rule above is enforced rather than coincidental for that tool.
+  Nothing fails yet if someone writes `format!("cannot read {p}")` with a host
+  `p` in one of the other six — and for those six the messages are still
+  redacted, which is why their tests would pass vacuously. A leak test that
+  asserts on a *redacted* message is not a leak test.
 
 ## When the guard comes off
 

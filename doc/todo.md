@@ -58,7 +58,10 @@
       clusters of matches?
 
 - [ ] tool errors: split the operator's view from the model's, then unredact —
-  path_leak_risks.md
+  path_leak_risks.md (`edit` done; `read`/`write`/`glob`/`grep`/`list`/`sed` open)
+- [x] re-accept `edits: [{oldText,newText}]` — accepted, never advertised;
+  stringified arrays recovered; `edit` errors no longer redacted to
+  "the tool failed". doc/edits_readd_and_arg_errors.md
 
 ## Drawing / doc/ui_draw_v2.md
 - [x] Input field content loss on key-down

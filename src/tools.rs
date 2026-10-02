@@ -1,4 +1,4 @@
-use rig_core::tool::ToolContext;
+use rig_core::tool::{ToolContext, ToolErrorKind, ToolExecutionError};
 use rig_core::tool_macro as rig_tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -270,6 +270,52 @@ impl rig_core::tool::Tool for EditFile {
     ) -> Result<Self::Output, Self::Error> {
         edit_files(args.files).await
     }
+
+    /// Keep picocode's own diagnostics out of rig's redaction.
+    ///
+    /// Without this the default `map_error` runs `from_error`, which redacts the
+    /// model-visible text to the `Other` kind's default — so a missing file, a
+    /// read-only binding and a real failure all reach the model as the same
+    /// three words, `the tool failed`, and none of them is something it can act
+    /// on. This is the "redaction/guard gap" in `doc/path_leak_risks.md:59-64`,
+    /// closed for this tool only: the other six unwrapped tools stay redacted,
+    /// and the operator channel that document also wants stays open.
+    ///
+    /// Safe to pass through here because every message this tool builds names
+    /// only the path the *model* supplied (`path_leak_risks.md:22-29`), and
+    /// `io::Error`'s `Display` carries no path at all — the guard test in
+    /// `edit_error_tests` asserts both under a remapping policy.
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        map_tool_error(error)
+    }
+}
+
+/// Classify a picocode [`ToolError`] into rig's taxonomy, preserving its message
+/// as the model-visible one.
+///
+/// Shared by [`EditFile`] and the agent's `Guard<T>`, because a wrapped and an
+/// unwrapped tool must not classify the same error differently — the difference
+/// between "your file is missing" and "the tool failed" is a policy choice, and
+/// two copies of it is where the second one goes stale.
+///
+/// - `ToolError::Io` → `Other` (infrastructure failure, not auto-retryable)
+/// - `ToolError::Generic` containing "timed out" → `Timeout` (auto-retryable)
+/// - `ToolError::Generic` containing "cancelled" → `Cancelled` (not retryable)
+/// - everything else → `Other` with the specific message preserved
+pub(crate) fn map_tool_error(error: ToolError) -> ToolExecutionError {
+    match error {
+        ToolError::Io(msg) => ToolExecutionError::other(msg),
+        ToolError::Generic(msg) => {
+            let kind = if msg.contains("timed out") {
+                ToolErrorKind::Timeout
+            } else if msg.contains("cancelled") {
+                ToolErrorKind::Cancelled
+            } else {
+                ToolErrorKind::Other
+            };
+            ToolExecutionError::new(kind, msg)
+        }
+    }
 }
 
 /// Apply a call's edits, one file at a time.
@@ -331,7 +377,14 @@ pub async fn edit_files(files: Vec<FileEdit>) -> Result<String, ToolError> {
 /// path against the sandbox policy, read, apply, write, and report.
 pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolError> {
     let p = get_path_with(&path, true)?;
-    let text = fs::read_to_string(&p).await?;
+    // The IO errors name the file *as the model spelled it* — the one path the
+    // rule at `doc/path_leak_risks.md:22-29` allows into any string a model can
+    // read. `io::Error`'s `Display` carries no path of its own, so nothing
+    // host-shaped rides along, and `map_tool_error` keeps the message intact
+    // instead of letting the model see `the tool failed`.
+    let text = fs::read_to_string(&p)
+        .await
+        .map_err(|e| ToolError::Generic(format!("cannot read {path}: {e}")))?;
 
     // All-or-nothing: on any failure nothing is written. Surfacing the full
     // list lets the model fix all problems in one retry instead of ping-ponging.
@@ -345,7 +398,9 @@ pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolE
         ApplyOutcome::Failed { report, .. } => return Ok(report),
     };
 
-    fs::write(&p, result).await?;
+    fs::write(&p, result)
+        .await
+        .map_err(|e| ToolError::Generic(format!("cannot write {path}: {e}")))?;
     // Render the path the model will see as relative to cwd when possible,
     // so the success string stays portable across checkouts (the model
     // already has cwd in its system prompt) and tokens aren't wasted on
@@ -3046,24 +3101,45 @@ mod edit_args_wire_tests {
 
     #[tokio::test]
     #[serial]
-    async fn an_edits_array_is_rejected_and_writes_nothing() {
-        // `edits: [...]` is pi's storage form, not a wire one. The point of
-        // refusing it is that a harness which stringifies the array cannot get
-        // far enough to half-apply a batch, so the file must be untouched.
+    async fn an_edits_array_applies_every_entry_to_the_one_file() {
+        // pi's canonical form, end to end: it is accepted, it batches onto a
+        // single file, and it writes. The former version of this test asserted
+        // the opposite — it was the test that *specified* the refusal, and a
+        // refusal the model keeps paying for is worth reversing.
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("canon.txt", "hello\nworld\n")
             .await
             .unwrap();
         let result = execute_edit(serde_json::json!({
             "path": "canon.txt",
-            "edits": [{"oldText": "hello", "newText": "goodbye"}]
+            "edits": [
+                {"oldText": "hello", "newText": "goodbye"},
+                {"oldText": "world", "newText": "there"}
+            ]
         }))
         .await;
-        assert!(result.is_error(), "array must not dispatch: {result:?}");
-        let text = result.output().render();
-        assert!(text.contains("`blocks`"), "must name the field: {text}");
+        assert!(result.is_success(), "the pi array must apply: {result:?}");
         let after = tokio::fs::read_to_string("canon.txt").await.unwrap();
-        assert_eq!(after, "hello\nworld\n", "the file must be untouched");
+        assert_eq!(after, "goodbye\nthere\n");
+    }
+
+    /// The array's failures are *call*-time, so they are exactly the ones that
+    /// used to arrive as `the tool failed`: `edit` is registered without a
+    /// `Guard`, so without `map_error` this text would be three words the model
+    /// cannot act on. It must name the file the model asked for.
+    #[tokio::test]
+    #[serial]
+    async fn a_failing_edits_array_call_names_the_file_it_could_not_read() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        let result = execute_edit(serde_json::json!({
+            "path": "gone.txt",
+            "edits": [{"oldText": "a", "newText": "b"}]
+        }))
+        .await;
+        let text = result.output().render();
+        assert!(result.is_error(), "{text}");
+        assert!(text.contains("gone.txt"), "must name the file: {text}");
+        assert_ne!(text, "the tool failed", "redacted to nothing: {text}");
     }
 
     // ---- Single shape (accepted, undocumented) ----
@@ -3721,9 +3797,15 @@ mod edit_args_wire_tests {
     /// expected `blocks`, and the mismatch was invisible to every test in the
     /// tree, because they all read the live `parameters()`.
     ///
-    /// So: every advertised property must be a name `from_wire` actually reads,
-    /// and the blob property must be spelled by the parser's own const. A field
-    /// advertised here but ignored there is a silent dead end for the model.
+    /// So the two directions are separated, because they are not equally
+    /// binding. **Advertised ⇒ parsed** is the one that reaches a model as a
+    /// silent dead end, and it is enforced. The reverse — a field the parser
+    /// reads but does not advertise — is now a supported state rather than an
+    /// oversight: pi's canonical `edits` array is read for a pi-trained model's
+    /// reflexive call and deliberately kept out of the schema, because an
+    /// advertised array is an invitation to produce the one shape a weak harness
+    /// cannot encode. Reading it is compatibility; advertising it would undo
+    /// the block form.
     #[test]
     fn every_advertised_property_is_one_the_parser_reads() {
         let schema = EditFile.parameters();
@@ -3732,9 +3814,13 @@ mod edit_args_wire_tests {
             .and_then(|v| v.as_object())
             .expect("properties present");
 
-        // What `EditArgs::from_wire` reads. Explicit, so that adding a field to
-        // one side without the other fails here rather than in a session.
+        // What `EditArgs::from_wire` reads, and what it advertises about that.
+        // Explicit, so that adding a field to one side without the other fails
+        // here rather than in a session.
         let parsed = ["path", "oldText", "newText", "startLine", BLOCKS_FIELD];
+        // …and the read-but-unadvertised remainder, asserted to be absent from
+        // the schema. Listed here so that *adding* one is a deliberate edit.
+        let unadvertised = [LEGACY_BLOCKS_FIELD];
 
         for name in props.keys() {
             assert!(
@@ -3746,6 +3832,12 @@ mod edit_args_wire_tests {
             assert!(
                 props.contains_key(name),
                 "`{name}` is read by the parser but not advertised: {schema}"
+            );
+        }
+        for name in unadvertised {
+            assert!(
+                !props.contains_key(name),
+                "`{name}` is read but must not be advertised: {schema}"
             );
         }
 
@@ -3762,6 +3854,84 @@ mod edit_args_wire_tests {
                 "the description still names the retired `{retired}`: {desc}"
             );
         }
+    }
+
+    /// The host-path guard test `doc/path_leak_risks.md` asks for, for this tool.
+    ///
+    /// The gap that document leaves open is redaction: with `map_error`
+    /// overridden, a tool error's message is model-visible, and the moment it
+    /// stops being redacted the rule at `doc/path_leak_risks.md:22-29` becomes
+    /// the *only* thing standing between a remapping sandbox and a host path in
+    /// the transcript. The document calls that "a coincidence of what picocode
+    /// happens to format today"; this is the test that ends the coincidence.
+    ///
+    /// It runs under a remap (`/tmp` → a host directory) and asserts two things
+    /// for every failure `edit` can produce: the model sees the path *it*
+    /// supplied, and it sees no host path at all.
+    #[tokio::test]
+    #[serial]
+    async fn no_edit_failure_shows_the_model_a_host_path() {
+        use crate::config::{BindPath, SandboxConfig};
+
+        /// Restores the process-global sandbox on drop — it is shared state, and
+        /// a leaked config would re-point every later test's paths.
+        struct SandboxReset;
+        impl Drop for SandboxReset {
+            fn drop(&mut self) {
+                set_sandbox(None);
+            }
+        }
+
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        // The host side of the remap, named so its path segment is a token no
+        // model-facing message could contain by accident.
+        let host_dir = std::path::Path::new("HOSTONLYDIR");
+        std::fs::create_dir_all(host_dir).unwrap();
+        set_sandbox(Some(SandboxConfig {
+            rw: vec![BindPath::Remap {
+                from: host_dir.display().to_string(),
+                to: "/tmp".into(),
+            }],
+            ..SandboxConfig::default()
+        }));
+        let _reset = SandboxReset;
+
+        // (1) Missing file: the common one, and the reason `map_error` exists.
+        let text = execute_edit(serde_json::json!({
+            "path": "/tmp/missing.txt", "oldText": "a", "newText": "b"
+        }))
+        .await
+        .output()
+        .render();
+        assert_ne!(text, "the tool failed", "redacted to nothing: {text}");
+        assert!(
+            text.contains("/tmp/missing.txt"),
+            "must echo the model's path: {text}"
+        );
+        assert!(!text.contains("HOSTONLYDIR"), "host path leaked: {text}");
+
+        // (2) A policy denial — the most likely denial a model hits for a
+        // mistyped path, and the one `PolicyDenied::model_message` exists for.
+        let text = execute_edit(serde_json::json!({
+            "path": "/elsewhere/f.txt", "oldText": "a", "newText": "b"
+        }))
+        .await
+        .output()
+        .render();
+        assert!(text.contains("/elsewhere/f.txt"), "{text}");
+        assert!(!text.contains("HOSTONLYDIR"), "host path leaked: {text}");
+
+        // (3) The batch form, whose per-file failures are rendered into the
+        // result array rather than returned as `Err`.
+        let text = execute_edit(serde_json::json!({
+            "path": "/tmp/missing2.txt",
+            "edits": [{"oldText": "a", "newText": "b"}]
+        }))
+        .await
+        .output()
+        .render();
+        assert!(text.contains("/tmp/missing2.txt"), "{text}");
+        assert!(!text.contains("HOSTONLYDIR"), "host path leaked: {text}");
     }
 
     #[tokio::test]
@@ -4017,9 +4187,10 @@ mod rename_verification {
 
     #[tokio::test]
     #[serial]
-    async fn blocks_applies_and_the_array_is_refused_without_touching_the_file() {
+    async fn blocks_applies_and_the_array_applies_and_the_multi_file_array_is_refused() {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("v.txt", "hello\nworld\n").await.unwrap();
+        tokio::fs::write("w.txt", "hello\nworld\n").await.unwrap();
 
         // 1. the blob field works end to end
         let ok = call(serde_json::json!({
@@ -4033,13 +4204,31 @@ mod rename_verification {
             "goodbye\nworld\n"
         );
 
-        // 2. the array is refused, by name, and changes nothing
-        let bad = call(serde_json::json!({
+        // 2. pi's array works end to end too — accepted, never advertised.
+        let ok = call(serde_json::json!({
             "path": "v.txt",
             "edits": [{"oldText": "world", "newText": "there"}]
         }))
         .await;
-        assert!(bad.is_error(), "array must not dispatch: {bad:?}");
+        assert!(ok.is_success(), "{ok:?}");
+        assert_eq!(
+            tokio::fs::read_to_string("v.txt").await.unwrap(),
+            "goodbye\nthere\n"
+        );
+
+        // 3. but one call is still one file: the multi-file array is refused, by
+        // name, and changes nothing.
+        let bad = call(serde_json::json!({
+            "edits": [
+                {"path": "v.txt", "oldText": "goodbye", "newText": "a"},
+                {"path": "w.txt", "oldText": "goodbye", "newText": "b"}
+            ]
+        }))
+        .await;
+        assert!(
+            bad.is_error(),
+            "multi-file array must not dispatch: {bad:?}"
+        );
         let text = bad.output().render();
         assert!(text.contains("blocks"), "must name the field: {text}");
         assert!(
@@ -4047,8 +4236,8 @@ mod rename_verification {
             "an arg error is not a batch-failure envelope: {text}"
         );
         assert_eq!(
-            tokio::fs::read_to_string("v.txt").await.unwrap(),
-            "goodbye\nworld\n",
+            tokio::fs::read_to_string("w.txt").await.unwrap(),
+            "hello\nworld\n",
             "the refused array must not write"
         );
     }
