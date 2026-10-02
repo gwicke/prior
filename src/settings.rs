@@ -1155,7 +1155,7 @@ mod tests {
         let opts: Vec<String> = table.render(198);
         let plan = crate::slashdot_menu::render::RenderPlan {
             detail: vec![crate::slashdot_menu::render::LogicalLine::new("Settings")],
-            rows: std::rc::Rc::new(
+            rows: std::sync::Arc::new(
                 opts.iter()
                     .map(|o| crate::slashdot_menu::render::LogicalLine::new(o.clone()))
                     .collect(),
@@ -1259,7 +1259,7 @@ mod tests {
         // sel = 0 keeps option 0 fully in view.
         let plan = crate::slashdot_menu::render::RenderPlan {
             detail: vec![crate::slashdot_menu::render::LogicalLine::new("Settings")],
-            rows: std::rc::Rc::new(
+            rows: std::sync::Arc::new(
                 opts.iter()
                     .map(|o| crate::slashdot_menu::render::LogicalLine::new(o.clone()))
                     .collect(),

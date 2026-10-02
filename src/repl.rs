@@ -18,11 +18,11 @@ use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
 use crate::output::Output;
 use crate::session::SessionTreeNode;
-use crate::ui::frame::{el_if_short, window, ApplyPolicy, Element, RenderAt, Rendered};
-// Only `compose_frame` — the `#[cfg(test)]` pipeline convenience — needs the
-// rest; naming them unconditionally would trip `unused_imports` on a normal build.
+use crate::ui::frame::{
+    allocate, el_if_short, live_budget, window, ApplyPolicy, Element, Extent, RenderAt, Rendered,
+};
 #[cfg(test)]
-use crate::ui::frame::{allocate, live_budget, render, Extent, Frame};
+use crate::ui::frame::{render, Frame};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -648,19 +648,78 @@ pub(crate) fn input_element(
     }
 }
 
-/// The overlay's rows and the window focus among them, as the painter wants
-/// them: no overlay ⇒ no rows and focus 0.
-pub(crate) fn overlay_paint(overlay: &ActiveOverlay, w: usize, h: usize) -> (Vec<String>, usize) {
-    let painted = match overlay {
-        ActiveOverlay::None => None,
-        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
-            Some(crate::slashdot_menu::render::paint_overlay(plan, w, h))
-        }
+/// Overlay elements for a plain list of rows — for tests that care about the
+/// frame, not about a menu's sections. See [`test_overlay_parts`].
+#[cfg(test)]
+pub(crate) fn test_overlay(lines: &[&str], sel: usize, term_w: usize) -> Vec<Element> {
+    test_overlay_parts(None, &[], lines, Some(sel), term_w)
+}
+
+/// Overlay elements from a plan's three sections, for tests that want a header
+/// or detail as well as rows.
+///
+/// Goes through a real [`RenderPlan`] and the real [`overlay_elements`], so a
+/// test that pastes in arbitrary strings is still exercising production's
+/// composition rather than a shortcut that can drift from it.
+#[cfg(test)]
+pub(crate) fn test_overlay_parts(
+    header: Option<&str>,
+    detail: &[&str],
+    rows: &[&str],
+    sel: Option<usize>,
+    term_w: usize,
+) -> Vec<Element> {
+    use crate::slashdot_menu::render::{LogicalLine, RenderPlan};
+    let plan = RenderPlan {
+        table_header: header.map(LogicalLine::new),
+        detail: detail.iter().map(|l| LogicalLine::new(*l)).collect(),
+        rows: std::sync::Arc::new(rows.iter().map(|l| LogicalLine::new(*l)).collect()),
+        selected: sel,
+        active_rows: vec![],
     };
-    // A plan whose selection did not fit falls back to 0 — window from the
-    // top — which is what the frame's focus means there.
-    let focus = painted.as_ref().and_then(|p| p.focus).unwrap_or(0);
-    (painted.map_or_else(Vec::new, |p| p.rows), focus)
+    crate::ui::overlay_elements(&plan, term_w, sel)
+}
+
+/// The rows element's allocation in a prompt frame — the page size a PageUp or
+/// PageDown moves by.
+///
+/// The page path needs the answer *before* the frame is rendered, which is why
+/// it used to call the painter a second time and read `data_budget` off the
+/// result: the painter's own guess at the budget, which is a *different number*
+/// from the one `allocate` hands the rows element. That disagreement is what
+/// let a page move by more than one screen.
+///
+/// This runs the same composition and the same `allocate` the frame will, so
+/// the two cannot differ. The status row is left out — it is one row, and a
+/// menu is only open between turns, when there is nothing streaming to report.
+pub(crate) fn rows_grant(
+    editor: &LineEditor,
+    prompt: &str,
+    overlay: Vec<Element>,
+    term_w: usize,
+    term_h: usize,
+) -> usize {
+    let elements = Repl::compose_elements(editor, prompt, None, overlay, term_w);
+    let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
+    let heights = allocate(&extents, live_budget(term_h.max(1)));
+    // The rows element is the last of the overlay's sections by construction
+    // (`overlay_elements` appends detail, header, then rows).
+    heights.last().copied().unwrap_or(0)
+}
+
+/// The overlay's frame elements: no overlay ⇒ none.
+///
+/// The overlay is *not* painted here. Its sections become elements and the
+/// frame allocates them, so there is no painted row list to hand on and no
+/// focus index to translate — the cursor's logical row index goes straight to
+/// the rows element, which is the only thing that scrolls.
+pub(crate) fn overlay_elements(overlay: &ActiveOverlay, term_w: usize) -> Vec<Element> {
+    match overlay {
+        ActiveOverlay::None => Vec::new(),
+        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
+            crate::ui::overlay_elements(plan, term_w, plan.selected)
+        }
+    }
 }
 
 /// Compose and apply the prompt frame: `[Input]`, or
@@ -680,8 +739,7 @@ pub(crate) fn paint_prompt(
     output: &dyn Output,
     label: &str,
     editor: &LineEditor,
-    overlay_rows: &[String],
-    focus: usize,
+    overlay: Vec<Element>,
     dims: (usize, usize),
 ) {
     let dims = (dims.0.max(1), dims.1.max(1));
@@ -691,8 +749,6 @@ pub(crate) fn paint_prompt(
     // something this module may reason about — and so is the divider that
     // separates the menu from the input above it (ui_draw_v2 §5.1.1).
     let input = input_element(editor, label, output.is_streaming(), dims.0);
-    let overlay =
-        (!overlay_rows.is_empty()).then(|| Element::overlay(overlay_rows.to_vec(), focus));
     // Composition *and* division are the tail's now: pieces move in and nothing
     // comes back, so no `Vec<Element>` crosses a call site (ui_draw_v2 §5.1.1).
     let _ = output.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
@@ -1154,8 +1210,8 @@ impl PromptSession {
         // `emit_commit` wants a painter as a closure; the painter it wants is
         // the same one everything else uses, so this is an adapter over
         // `paint_prompt` and not a second composition.
-        let redraw = |editor: &LineEditor, rows: &[String], focus: usize, dims: (usize, usize)| {
-            paint_prompt(output, prompt, editor, rows, focus, dims);
+        let redraw = |editor: &LineEditor, overlay: Vec<Element>, dims: (usize, usize)| {
+            paint_prompt(output, prompt, editor, overlay, dims);
         };
         // Bound before the `match` on purpose: a future in a match scrutinee
         // lives to the end of the `match`, and it would still hold the borrow
@@ -1164,16 +1220,7 @@ impl PromptSession {
         match eval {
             EvalOutcome::Frame => {}
             EvalOutcome::Commit { line, message } => {
-                Repl::emit_commit(
-                    output,
-                    &mut self.editor,
-                    &redraw,
-                    self.sel,
-                    dims,
-                    &line,
-                    "",
-                    history,
-                );
+                Repl::emit_commit(output, &mut self.editor, &redraw, dims, &line, "", history);
                 if let Some(text) = message {
                     output.display_text(&text);
                 }
@@ -1196,14 +1243,14 @@ impl PromptSession {
                 // an error path — rare, and the cost of being wrong is a
                 // stranded input region — not because the accounting needs
                 // rescuing.
-                redraw(&LineEditor::new(), &[], self.sel, dims);
+                redraw(&LineEditor::new(), Vec::new(), dims);
                 output.display_text(&message);
                 let _ = output.cursor_row();
             }
         }
         self.sync_selection();
-        let (rows, focus) = overlay_paint(&self.overlay, dims.0, dims.1);
-        paint_prompt(output, prompt, &self.editor, &rows, focus, dims);
+        let overlay = overlay_elements(&self.overlay, dims.0);
+        paint_prompt(output, prompt, &self.editor, overlay, dims);
         None
     }
 
@@ -1306,16 +1353,18 @@ impl PromptSession {
                             return KeyOutcome::Continue; // V25 overlay without its handle
                         }
                         let cur_sel = plan.selected.unwrap_or(0);
-                        // Page in the units the painter works in: ask it what
-                        // it painted and move the cursor by the rows that fit
-                        // on one screen (ui_draw_v2 §9 #5, #7). A row the
-                        // painter split across terminal rows counts for all of
-                        // them, so a PageDown moves a page and not a page and
-                        // a half.
-                        let (cur_h, _) = crossterm::terminal::size().unwrap_or((80, 24));
-                        let painted = crate::slashdot_menu::render::paint_overlay(
-                            plan,
-                            crate::output::term_width().max(1),
+                        // Page by what actually fits on screen: the rows
+                        // element's own allocation, from the same
+                        // composition and the same `allocate` the frame will
+                        // run. Measured on the rows as the engine wrote them,
+                        // which is the unit the rows element windows in.
+                        let (_, cur_h) = crossterm::terminal::size().unwrap_or((80, 24));
+                        let term_w = crate::output::term_width().max(1);
+                        let page = rows_grant(
+                            &self.editor,
+                            prompt,
+                            overlay_elements(overlay, term_w),
+                            term_w,
                             cur_h.max(1) as usize,
                         );
                         let direction = if matches!(key.code, KeyCode::PageDown) {
@@ -1323,11 +1372,8 @@ impl PromptSession {
                         } else {
                             -1
                         };
-                        let delta = crate::slashdot_menu::render::page_delta_heights(
-                            &painted.data_heights,
-                            cur_sel,
-                            painted.data_budget,
-                            direction,
+                        let delta = crate::slashdot_menu::render::page_delta(
+                            &plan.rows, cur_sel, page, direction,
                         );
                         if delta != 0 {
                             *pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
@@ -1711,8 +1757,7 @@ impl Repl {
                                     output,
                                     prompt,
                                     &session.editor,
-                                    &[],
-                                    session.sel,
+                                    Vec::new(),
                                     (cur_w, cur_h),
                                 );
                             }
@@ -1729,29 +1774,26 @@ impl Repl {
         }
     }
 
-    /// Test-only twin of [`crate::output::Output::compose_area`]: the same
-    /// composition, with the status row arriving as a literal `&str` so a test
-    /// can assert against bytes it wrote rather than against a rendered bar.
+    /// The prompt area's composition: `[Status?, Input, Divider?, Overlay…]`.
     ///
-    /// The `#[cfg(test)]` is the point, not a formality. Production reaches the
-    /// area through `compose_area` and nothing else, so there is exactly one
-    /// composer for anything that ships (ui_draw_v2 §5.1.1). What the two share
-    /// is [`crate::output::area_body`] — the rule that a menu brings a separator
-    /// — which leaves the status row as the only difference, and it is the one
-    /// difference a test needs to be able to make.
-    #[cfg(test)]
+    /// The twin of [`crate::output::Output::compose_area`] — same body
+    /// ([`crate::output::area_body`]), with the status row arriving as a literal
+    /// `&str` rather than a rendered bar. Two callers, and both need it to be
+    /// *this* composition: the tests, which assert against bytes they wrote, and
+    /// [`rows_grant`], which has to know the rows element's allocation before the
+    /// frame exists. Sharing it is what makes a page one screen of rows by
+    /// construction — a second composer here is how the page size and the
+    /// painted height drifted apart in the first place.
     pub(crate) fn compose_elements(
         editor: &LineEditor,
         prompt: &str,
         status: Option<&str>,
-        overlay: &[String],
-        focus: usize,
+        overlay: Vec<Element>,
         term_w: usize,
     ) -> Vec<Element> {
         let term_w = term_w.max(1);
         let layout = editor.layout(term_w, prompt);
         let input = Element::input(layout, prompt.to_string());
-        let overlay = (!overlay.is_empty()).then(|| Element::overlay(overlay.to_vec(), focus));
         let mut items: Vec<Element> = Vec::new();
         if let Some(bar) = status {
             items.push(Element::lines(vec![bar.to_string()]));
@@ -1772,13 +1814,12 @@ impl Repl {
         editor: &LineEditor,
         prompt: &str,
         status: Option<&str>,
-        overlay: &[String],
-        focus: usize,
+        overlay: Vec<Element>,
         term_w: usize,
         term_h: usize,
     ) -> Frame {
         let term_w = term_w.max(1);
-        let elements = Self::compose_elements(editor, prompt, status, overlay, focus, term_w);
+        let elements = Self::compose_elements(editor, prompt, status, overlay, term_w);
         let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
         let heights = allocate(&extents, live_budget(term_h.max(1)));
         render(&elements, &heights, term_w)
@@ -2024,11 +2065,10 @@ impl Repl {
     /// The status bar follows underneath without being asked for: the commit is
     /// written at the caret, which pushes the tracked row down, so the next
     /// frame apply draws the area below what was just written.
-    fn emit_commit<F: Fn(&LineEditor, &[String], usize, (usize, usize))>(
+    fn emit_commit<F: Fn(&LineEditor, Vec<Element>, (usize, usize))>(
         output: &dyn Output,
         editor: &mut LineEditor,
         redraw: &F,
-        sel: usize,
         dims: (usize, usize),
         line: &str,
         next_input: &str,
@@ -2044,7 +2084,7 @@ impl Repl {
         // screen writer ($EDITOR through `run_editor`) re-anchors on exit
         // (plan §4.2). Clear the input region, then echo the line
         // at the caret the frame apply left.
-        redraw(&LineEditor::new(), &[], sel, dims);
+        redraw(&LineEditor::new(), Vec::new(), dims);
         // Bracketed by rules, the way a turn is — and, when a prompt follows
         // directly, sharing one with it rather than stacking two (ui_draw_v2
         // R4). A committed line is a real event in the transcript — `/thinking
@@ -2996,8 +3036,7 @@ mod tests {
         Repl::emit_commit(
             &out,
             &mut editor,
-            &|_, _, _, _| {},
-            0,
+            &|_, _, _| {},
             (80, 24),
             line,
             "",
@@ -3081,11 +3120,10 @@ mod tests {
 
     fn redraw_fn(
         out: &crate::output::ConsoleOutput,
-    ) -> impl Fn(&LineEditor, &[String], usize, (usize, usize)) + '_ {
-        move |editor: &LineEditor, overlay: &[String], sel: usize, dims: (usize, usize)| {
+    ) -> impl Fn(&LineEditor, Vec<Element>, (usize, usize)) + '_ {
+        move |editor: &LineEditor, overlay: Vec<Element>, dims: (usize, usize)| {
             let input = input_element(editor, "> ", out.is_streaming(), dims.0);
-            let ov = (!overlay.is_empty()).then(|| Element::overlay(overlay.to_vec(), sel));
-            out.draw_elements(Some(input), ov, ApplyPolicy::Frame, dims);
+            out.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
         }
     }
 
@@ -3112,16 +3150,7 @@ mod tests {
             "/model xiaomimimo:mimo-v2.6-flash activate",
             "/reasoning high",
         ] {
-            Repl::emit_commit(
-                &out,
-                &mut editor,
-                &redraw,
-                0,
-                (40, 24),
-                line,
-                "",
-                &mut history,
-            );
+            Repl::emit_commit(&out, &mut editor, &redraw, (40, 24), line, "", &mut history);
         }
         let rows = screen_rows(&out.end_capture());
 
@@ -3176,7 +3205,6 @@ mod tests {
             &out,
             &mut editor,
             &redraw,
-            0,
             (40, 24),
             "Great, nice work! Please commit your changes.",
             "",
@@ -3337,9 +3365,8 @@ mod tests {
         // selected/default backgrounds and no override feature (nothing
         // used it).
         use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
-        use std::rc::Rc;
         let plan = RenderPlan {
-            rows: Rc::new(vec![LogicalLine::new("one"), LogicalLine::new("two")]),
+            rows: Arc::new(vec![LogicalLine::new("one"), LogicalLine::new("two")]),
             selected: Some(0),
             active_rows: vec![1],
             ..Default::default()
@@ -3959,10 +3986,9 @@ mod tests {
         // Ported to paint_plan (ui_draw_v2 P5): the title lives in the
         // plan's detail block, rows keep their `> `/`  ` markers.
         use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
-        use std::rc::Rc;
         let plan = RenderPlan {
             detail: vec![LogicalLine::new("Select a model:")],
-            rows: Rc::new(vec![
+            rows: Arc::new(vec![
                 LogicalLine::new("a: alpha model ctx 128000 $0.10/0.20 per M"),
                 LogicalLine::new("b: beta model ctx 200000 $0.30/0.40 per M"),
             ]),
@@ -3982,12 +4008,11 @@ mod tests {
         // the v2.5 engine does); paint_plan must keep the first line
         // marked and every continuation indented under the option text.
         use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
-        use std::rc::Rc;
         let long = "deepseek:deepseek-v4-flash ctx 1048576 $0.000000435/0.00000087 per M (est) and some extra trailing text to force a wrap";
         let wrapped = crate::output::wrap(long, 60);
         assert!(wrapped.len() > 1, "long option must wrap at 60 cols");
         let plan = RenderPlan {
-            rows: Rc::new(vec![LogicalLine::new(wrapped.join("\n"))]),
+            rows: Arc::new(vec![LogicalLine::new(wrapped.join("\n"))]),
             selected: Some(0),
             ..Default::default()
         };
@@ -4460,9 +4485,8 @@ mod tests {
     #[test]
     fn paint_plan_active_marker_beats_cursor() {
         use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
-        use std::rc::Rc;
         let plan = RenderPlan {
-            rows: Rc::new(vec![LogicalLine::new("x")]),
+            rows: Arc::new(vec![LogicalLine::new("x")]),
             selected: Some(0),
             active_rows: vec![0],
             ..Default::default()
@@ -4509,10 +4533,11 @@ mod tests {
             term_rows: usize,
             term_cols: usize,
             anchor: usize,
-            overlay: &[String],
+            overlay: &[&str],
             focus: usize,
         ) -> (usize, usize, Vec<String>, usize) {
-            let frame = Repl::compose_frame(editor, prompt, None, overlay, focus, width, term_rows);
+            let overlay = crate::repl::test_overlay(overlay, focus, width);
+            let frame = Repl::compose_frame(editor, prompt, None, overlay, width, term_rows);
             let mut cache = DrawCache::new(term_rows);
             // The tracked row is the block's position (A3.2): the apply reads it
             // from the cache, so the test sets it the way content would.
@@ -4734,7 +4759,7 @@ mod tests {
             // return to the input, and the live frame's anchor must not move.
             let mut e = LineEditor::new();
             e.insert_str("hi");
-            let overlay = ["one", "two", "three"].map(String::from);
+            let overlay = ["one", "two", "three"];
             let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 10, &overlay, 0);
             assert!(rows[9].starts_with("> hi"), "input row: {:?}", rows[9]);
@@ -4743,9 +4768,11 @@ mod tests {
                 "divider: {:?}",
                 rows[10]
             );
-            assert_eq!(rows[11], "one", "ov0: {:?}", rows[11]);
-            assert_eq!(rows[12], "two");
-            assert_eq!(rows[13], "three");
+            // Rows now go through the painter, so the cursor's marker is on
+            // the selected row rather than added by the test's raw strings.
+            assert!(rows[11].trim_end() == "> one", "ov0: {:?}", rows[11]);
+            assert!(rows[12].trim_end() == "  two", "ov1: {:?}", rows[12]);
+            assert!(rows[13].trim_end() == "  three", "ov2: {:?}", rows[13]);
             // Caret back on the input line, at prompt(2) + "hi"(2) = col 4.
             assert_eq!((cr, cc), (9, 4), "caret should be on the input row");
             // No overflow: the frame stays anchored where it was drawn.
@@ -4764,7 +4791,7 @@ mod tests {
             // catch.
             let mut e = LineEditor::new();
             e.insert_str("hi");
-            let overlay = ["one", "two", "three", "four", "five", "six"].map(String::from);
+            let overlay = ["one", "two", "three", "four", "five", "six"];
             let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 20, &overlay, 0);
             // delta = (20 + 8) - 1 - 24 = 3 → frame lands at row 17 (1-indexed).
@@ -4777,8 +4804,17 @@ mod tests {
                 rows
             );
             assert!(rows[17].chars().all(|c| c == '─'), "divider below input");
-            assert_eq!(rows[18], "one");
-            assert_eq!(rows[23], "six", "last overlay row at screen bottom");
+            assert_eq!(
+                rows[18].trim_end(),
+                "> one",
+                "cursor marker: {:?}",
+                rows[18]
+            );
+            assert!(
+                rows[23].trim_end().ends_with("six"),
+                "last overlay row at screen bottom: {:?}",
+                rows[23]
+            );
             // Caret tracks the input: row 16 (0-indexed), col 4.
             assert_eq!(
                 (cr, cc),
@@ -4797,16 +4833,37 @@ mod tests {
             // stays scrollback.
             let e = LineEditor::new();
             let overlay: Vec<String> = (0..100).map(|i| format!("item {i}")).collect();
+            let overlay: Vec<&str> = overlay.iter().map(|s| s.as_str()).collect();
             let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 8, &overlay, 50);
-            // allocate: [input 1, divider 1, overlay 14] of budget 16.
-            // The overlay window (14 rows, prefer 7 of context) centers on
-            // focus=50: start = 50 - 7 = 43, so rows 43..=56 are shown.
+            // allocate: [input 1, divider 1, rows 14] of budget 16. The rows
+            // element windows with `window_heights`: walk back over at most
+            // half the budget (14/2 = 7), then fill forward. Cursor 50 →
+            // start 44, so rows 44..=57 are shown.
+            //
+            // The window start moved from 43 to 44 with the split: the flat
+            // overlay used the frame's `window` (prefer_context = h/2), the
+            // rows element uses `window_heights` — the same primitive the
+            // painter always used for rows. What it no longer does is window
+            // twice: this is one window, over one allocation.
             assert_eq!(anchor, 8, "frame fits: no scroll");
             assert_eq!(rows[7].trim_end(), ">", "empty input: {:?}", rows[7]);
             assert!(rows[8].chars().all(|c| c == '─'), "divider: {:?}", rows[8]);
-            assert_eq!(rows[9], "item 43", "window start: {:?}", rows[9]);
-            assert_eq!(rows[22], "item 56", "window end: {:?}", rows[22]);
+            assert!(
+                rows[9].trim_end().ends_with("item 44"),
+                "start: {:?}",
+                rows[9]
+            );
+            assert!(
+                rows[22].trim_end().ends_with("item 57"),
+                "end: {:?}",
+                rows[22]
+            );
+            assert!(
+                rows[15].contains("> item 50"),
+                "the cursor row is painted: {:?}",
+                rows[15]
+            );
             // The frame starts at row 8 (1-indexed): everything above is
             // untouched scrollback.
             assert!(

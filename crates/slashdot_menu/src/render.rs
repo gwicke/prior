@@ -4,7 +4,7 @@
 //! Row styling (markers, backgrounds) is applied by the host at render
 //! time — the plan contains only data, not ANSI escapes.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// A single logical row. May contain embedded `\n` from table wrapping.
 /// The overlay splits on `\n` at render time and applies markers only to
@@ -23,7 +23,7 @@ impl LogicalLine {
 /// v2.5 panel structure (design §6):
 /// 1. `detail` — `header()` output (truncatable from bottom on tight space)
 /// 2. `table_header` — single-line column headings (always shown, never truncated)
-/// 3. `rows` — scrollable data (Rc-shared; same pointer on cursor moves)
+/// 3. `rows` — scrollable data (Arc-shared; same pointer on cursor moves)
 #[derive(Debug, Clone)]
 pub struct RenderPlan {
     /// Table column header (e.g. "Model   Ctx   Coding   Price in").
@@ -32,14 +32,20 @@ pub struct RenderPlan {
     /// `header()` output: help text, stats, focused-row details.
     /// Changes on cursor move (detail updates). Truncatable vertically.
     pub detail: Vec<LogicalLine>,
-    /// Scrollable data rows. Rc-shared — same pointer on cursor moves.
+    /// Scrollable data rows. `Arc`-shared — same pointer on cursor moves.
     ///
     /// Row text is laid out for the *content* width: `term_w - 2`, the
     /// terminal width minus the marker column the painter adds (see
     /// [`paint_row`]). A producer that laid a row out at the full width would
     /// have its last columns split onto a second terminal row. The engine's
     /// own tables are laid out that way (`render_multiline(tw - 2)`).
-    pub rows: Rc<Vec<LogicalLine>>,
+    ///
+    /// `Arc`, not `Rc`: a host holds these rows in a frame element, and
+    /// elements are stashed in the draw cache behind a `Mutex` under an
+    /// `Output: Send + Sync`, so an `Rc` here would have to be smuggled across
+    /// a `Send` boundary. Sharing is still one pointer either way — only the
+    /// refcount is atomic, and it is touched once per painted frame.
+    pub rows: Arc<Vec<LogicalLine>>,
     /// Index of the cursor-selected logical row among `rows`.
     pub selected: Option<usize>,
     /// Indices of active (`*`-marked) rows (design §5.2).
@@ -51,7 +57,7 @@ impl Default for RenderPlan {
         RenderPlan {
             table_header: None,
             detail: Vec::new(),
-            rows: Rc::new(Vec::new()),
+            rows: Arc::new(Vec::new()),
             selected: None,
             active_rows: Vec::new(),
         }
@@ -108,7 +114,7 @@ mod tests {
         RenderPlan {
             table_header: None,
             detail: vec![],
-            rows: Rc::new((0..rows).map(row).collect()),
+            rows: Arc::new((0..rows).map(row).collect()),
             selected: Some(0),
             active_rows: vec![],
         }
@@ -145,7 +151,7 @@ mod tests {
         let plan = RenderPlan {
             table_header: None,
             detail: vec![LogicalLine::new(long)],
-            rows: Rc::new(vec![LogicalLine::new("r0")]),
+            rows: Arc::new(vec![LogicalLine::new("r0")]),
             selected: Some(0),
             active_rows: vec![],
         };
@@ -166,7 +172,7 @@ mod tests {
                 LogicalLine::new("a detail line that is quite a lot longer than the width"),
                 LogicalLine::new(""),
             ],
-            rows: Rc::new(vec![
+            rows: Arc::new(vec![
                 LogicalLine::new("laid out to the content width".to_string() + &" ".repeat(30)),
                 LogicalLine::new("日本".repeat(40)),
             ]),
@@ -197,7 +203,7 @@ mod tests {
                 LogicalLine::new("first detail line"),
                 LogicalLine::new("second detail line"),
             ],
-            rows: Rc::new(
+            rows: Arc::new(
                 (0..6)
                     .map(|i| LogicalLine::new(format!("row {i}")))
                     .collect(),
@@ -225,7 +231,7 @@ mod tests {
             detail: (0..40)
                 .map(|i| LogicalLine::new(format!("detail {i}")))
                 .collect(),
-            rows: Rc::new(vec![LogicalLine::new("row 0")]),
+            rows: Arc::new(vec![LogicalLine::new("row 0")]),
             selected: Some(0),
             active_rows: vec![],
         };
@@ -251,7 +257,7 @@ mod tests {
         let plan = RenderPlan {
             table_header: None,
             detail: vec![],
-            rows: Rc::new(
+            rows: Arc::new(
                 (0..5)
                     .map(|i| LogicalLine::new(format!("row {i}")))
                     .collect(),
@@ -275,7 +281,7 @@ mod tests {
         let plan = RenderPlan {
             table_header: None,
             detail: vec![],
-            rows: Rc::new(vec![
+            rows: Arc::new(vec![
                 LogicalLine::new("one"),
                 LogicalLine::new("two\nwrapped\nlines"),
                 LogicalLine::new("a row far too wide to fit the content width of this terminal"),
@@ -431,7 +437,7 @@ mod tests {
         let plan = RenderPlan {
             table_header: Some(LogicalLine::new("MODEL")),
             detail: vec![LogicalLine::new("pick one")],
-            rows: Rc::new(
+            rows: Arc::new(
                 (0..20)
                     .map(|i| LogicalLine::new(format!("model-{i}")))
                     .collect(),
