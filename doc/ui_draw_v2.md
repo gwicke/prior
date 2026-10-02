@@ -723,7 +723,7 @@ which this thread cannot make without a session, so it forwards now — and
 correctness property, not a detail. The 50 ms is only how long an *idle* `poll`
 takes to notice those flags; keystroke latency is ~0.)
 
-**Four units, separately green:**
+**Units, separately green:**
 
 - **U4.1 — extract `PromptSession`** out of `read_input`'s frame (`editor`,
   `nav`, `history`, `draft`, `prose`, `pending_key`, `v25_menu`, `v25_handle`,
@@ -739,6 +739,29 @@ takes to notice those flags; keystroke latency is ~0.)
   behind a policy flag. First point at which mid-turn typing works.
 - **U4.4 — re-emit ordering:** key branch → `draw_elements` (compose + remember);
   content branch → write + `reposition_area`.
+- **U4.5 — the back-off pump** (landed): the dispatcher is turn-scoped, not
+  attempt-scoped. `prompt()`'s key branch and `cancellable_sleep_pumped` run
+  one body (`dispatch_in_turn_event`) over one queue, so a retry back-off is
+  pumped like the streaming window: a root `Esc` fires the cancel signal and
+  ends the wait immediately, menus step their ladder, edits settle into the
+  input row, and prose ticks its timer (U4.3's arm extended to the wait).
+  Before it the queue was drained only inside `prompt()`, which has
+  *returned* between attempts — an `Esc` sat unread until the next attempt
+  and the full delay always ran ("the session only aborts once the timeout
+  has elapsed"). Piped input has no pump pieces and falls back to deadline +
+  cancel signal alone (`cancellable_sleep_pumped` with `None`).
+- **U4.6 — the compaction window pump** (landed): `/tree … compact`'s LLM
+  window (requests *and* back-offs) awaits *inside* `settle`, where neither
+  pump reaches — no `read_input`, no in-flight reader, and the session
+  mutably borrowed by the eval in progress, so dispatch is impossible.
+  `retry_summarization` polls a `WindowKeySource` beside the attempt and the
+  sleep instead: a root `Esc` fires the cancel signal (the engine is
+  mid-`prepare()`, where the node's own `Esc` means abort, so menu-first
+  resolves to cancel there), and everything else is *parked* on `AppState`
+  for `read_input` to drain on its next iteration through the ordinary
+  dispatch — after any `$EDITOR`, instead of the typed-ahead leak. The
+  source is gated on the published term guard: piped/batch stdin (and
+  tests) never see a poll.
 
 **Settled.** All four open questions answered:
 
@@ -1120,7 +1143,7 @@ Every claim below was checked against the code, not against the phase list.
 | ✅ | **U1** contraction | Landed. `with_content_writer` consumes the area instead of retiring it, and `plan_reposition` is the third apply case. **But** it places the area by its bottom edge, which §4.5.7 rules out — see §5.2's known gap. Implemented, and wrong in the one respect §4.5.7 settled. |
 | ✅ | **U2** area survives the turn | Landed. The bar is a composed row resolved from `status_text` + `streaming`; the transient-bar machinery is gone. |
 | ✅ | **U3** dialogs are menus | Landed. `ui::confirm` composes `[Divider?, Overlay]` through the same composer. |
-| 🔶 | **U4** in-turn input | **U4.1–U4.3 landed; U4.4 open.** The plan is recorded under U4 itself. Landed: `PromptSession` owns `editor`, `nav`, `draft`, `sel`, `last_disc`, `prose`, `pending_key`, the `SlashDotMenu` and the overlay, and `read_input` takes it by `&mut`, so the state outlives the call; `handle_key` is the draw-free dispatcher (`Continue` / `RunEditor` / `Action`), generalising the `edit_key` split; `slashdot_menu` gained `continuation_handle` so a `/`-session keeps its epoch across evals. The in-flight reader no longer drops edit keys — `route_event` routes each one `Inline` (Ctrl-C, Ctrl-Z, Resize) or `Forward` (every other key, **`Esc` among them**, plus paste) onto an unbounded mpsc, unbounded precisely so a full queue can never block the thread at the moment it must deliver Ctrl-C. **The receiver is drained:** `prompt()`'s `select!` grew a key branch that runs `handle_key` → `settle` — eval, outcome, sync, paint, the sequence `read_input` runs minus its wait — plus a prose timer for `prose.poll_timeout()`, without which prose would go inert mid-turn. Submit is blocked and silent, as settled. `Esc` is menu-first: the ladder runs while a v2.5 menu is open and the turn stops only at root, which is *why* it moved to `Forward` — the reader has no session to look at, so routing it inline was routing it to "abort" unconditionally. `eval` is out of `read_input` and into `settle`, so the session is self-driving. **Still open: U4.4**, the ordering between the key branch's compose and the content branch's write + `reposition_area`. |
+| 🔶 | **U4** in-turn input | **U4.1–U4.3 + U4.5–U4.6 landed; U4.4 open.** The plan is recorded under U4 itself. Landed: `PromptSession` owns `editor`, `nav`, `draft`, `sel`, `last_disc`, `prose`, `pending_key`, the `SlashDotMenu` and the overlay, and `read_input` takes it by `&mut`, so the state outlives the call; `handle_key` is the draw-free dispatcher (`Continue` / `RunEditor` / `Action`), generalising the `edit_key` split; `slashdot_menu` gained `continuation_handle` so a `/`-session keeps its epoch across evals. The in-flight reader no longer drops edit keys — `route_event` routes each one `Inline` (Ctrl-C, Ctrl-Z, Resize) or `Forward` (every other key, **`Esc` among them**, plus paste) onto an unbounded mpsc, unbounded precisely so a full queue can never block the thread at the moment it must deliver Ctrl-C. **The receiver is drained:** `prompt()`'s `select!` grew a key branch that runs `handle_key` → `settle` — eval, outcome, sync, paint, the sequence `read_input` runs minus its wait — plus a prose timer for `prose.poll_timeout()`, without which prose would go inert mid-turn. Submit is blocked and silent, as settled. `Esc` is menu-first: the ladder runs while a v2.5 menu is open and the turn stops only at root, which is *why* it moved to `Forward` — the reader has no session to look at, so routing it inline was routing it to "abort" unconditionally. `eval` is out of `read_input` and into `settle`, so the session is self-driving. **U4.5 makes the pump turn-scoped, not attempt-scoped:** `cancellable_sleep_pumped` runs the same dispatcher over the same queue during retry back-offs — a root `Esc` ends a back-off immediately instead of after the delay elapsed, keys/menus stay live between attempts (the receiver was otherwise unread while `prompt()` had returned), and the prose timer ticks through the wait. **U4.6 gives the compaction window its own pump:** `retry_summarization` polls a `WindowKeySource` beside the attempt and the sleep — an `Esc` cancels a summarization or its back-off instead of waiting the provider floor out, and keys typed during the window are parked on `AppState` and drained by `read_input`'s normal dispatch afterwards. **Still open: U4.4**, the ordering between the key branch's compose and the content branch's write + `reposition_area`. |
 | ❌ | **U5** retire the entry DSRs | **Not started.** `read_input`'s entry DSR is live at `repl.rs:683` and `ui::confirm`'s at `ui.rs:92`, both marked for removal. The three sanctioned sites are correctly still there (Ctrl-Z resume `repl.rs:806`, the width-change `ESC[0J` + replay `repl.rs:841`, and the confirm error path `repl.rs:942`). |
 | ⏸ | **U6** scroll region | Optional, gates nothing, not started. |
 
