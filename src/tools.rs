@@ -48,12 +48,44 @@ impl From<tokio::task::JoinError> for ToolError {
 /// `spawn_in_flight_reader` sends `()` on every registered sender, which wakes
 /// the corresponding watchdog thread to kill the child process.
 ///
-/// Registration is scoped: `capture_bounded` pushes a clone of its `cancel_tx`
-/// before spawning the watchdog and pops it (via a drop guard) when the
-/// function returns.  This ensures a stale sender never kills the *next* tool.
+/// Registration is scoped: `capture_bounded` pushes an `(id, sender)` pair
+/// before spawning the watchdog and removes *that pair* when the function
+/// returns.  The id is what makes removal unambiguous — `mpsc::Sender` is not
+/// `PartialEq`, and a positional `pop()` would remove whichever entry happens
+/// to be last, which with overlapping commands deregisters a command that is
+/// still running and leaves this one's sender behind to cancel a later,
+/// unrelated command. The pair is removed on unwind too.
 pub(crate) static TOOL_CANCEL_SENDERS: std::sync::LazyLock<
-    std::sync::Mutex<Vec<std::sync::mpsc::Sender<()>>>,
+    std::sync::Mutex<Vec<(u64, std::sync::mpsc::Sender<()>)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Monotonic ids handed to `TOOL_CANCEL_SENDERS` entries. Only ever compared
+/// for equality against an id this thread was given, so a relaxed ordering is
+/// enough; the registry mutex is what serializes the vector itself.
+static NEXT_CANCEL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Register `tx` for `<Esc>` broadcast and return the id to deregister it by.
+fn register_cancel_sender(tx: &std::sync::mpsc::Sender<()>) -> u64 {
+    let id = NEXT_CANCEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut senders) = TOOL_CANCEL_SENDERS.lock() {
+        senders.push((id, tx.clone()));
+    }
+    id
+}
+
+/// Remove the entry registered under `id`, if it is still present.
+///
+/// Panic-safe: call this from a drop guard so an unwinding `capture_bounded`
+/// cannot leave a sender behind to cancel a later command.
+struct CancelRegistration(u64);
+
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut senders) = TOOL_CANCEL_SENDERS.lock() {
+            senders.retain(|(id, _)| *id != self.0);
+        }
+    }
+}
 
 fn get_path(path: &str) -> Result<PathBuf, ToolError> {
     get_path_with(path, false)
@@ -1153,11 +1185,10 @@ fn capture_bounded(
 
     // Register a clone of cancel_tx in the process-wide sender registry,
     // so the in-flight reader thread can send `()` on it when `<Esc>` is
-    // pressed.  We deregister explicitly before `drop(cancel_tx)` below so
-    // the channel is fully disconnected and the watchdog exits promptly.
-    if let Ok(mut senders) = TOOL_CANCEL_SENDERS.lock() {
-        senders.push(cancel_tx.clone());
-    }
+    // pressed.  The guard deregisters on drop — including on unwind — and
+    // drops before `cancel_tx` itself below, so the channel is fully
+    // disconnected and the watchdog exits promptly.
+    let _cancel_reg = CancelRegistration(register_cancel_sender(&cancel_tx));
 
     let guard: Option<std::thread::JoinHandle<()>> = timeout.map(|secs| {
         let w = handle.clone();
@@ -1222,9 +1253,7 @@ fn capture_bounded(
     // Deregister from the process-wide cancel-sender registry BEFORE
     // dropping `cancel_tx`, so the channel is fully disconnected and the
     // watchdog's `recv_timeout` returns `Disconnected` immediately.
-    if let Ok(mut senders) = TOOL_CANCEL_SENDERS.lock() {
-        let _ = senders.pop();
-    }
+    drop(_cancel_reg);
 
     // Signal the watchdog to exit immediately: closing cancel_tx makes
     // recv_timeout return Disconnected, so the watchdog exits without killing

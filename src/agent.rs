@@ -1071,7 +1071,7 @@ async fn dispatch_in_turn_event(
                 // back-off, so this is a no-op there — fired anyway so both
                 // pumps raise the identical signal set. Unbounded mpsc, so
                 // this cannot block the main task.
-                for tx in crate::tools::TOOL_CANCEL_SENDERS.lock().unwrap().iter() {
+                for (_, tx) in crate::tools::TOOL_CANCEL_SENDERS.lock().unwrap().iter() {
                     let _ = tx.send(());
                 }
                 // Nothing to settle: the window ends on the flag.
@@ -1264,7 +1264,7 @@ fn pump_window_key(
             // Identical signal set to the turn dispatcher; no tool runs
             // during a compaction window, so the send is inert there.
             // Unbounded mpsc, so this cannot block the caller.
-            for tx in crate::tools::TOOL_CANCEL_SENDERS.lock().unwrap().iter() {
+            for (_, tx) in crate::tools::TOOL_CANCEL_SENDERS.lock().unwrap().iter() {
                 let _ = tx.send(());
             }
             return true;
