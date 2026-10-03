@@ -1044,7 +1044,6 @@ mod tests {
     use super::*;
 
     use crate::agent::AgentConfig;
-    use crate::output::Output;
     use serial_test::serial;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
