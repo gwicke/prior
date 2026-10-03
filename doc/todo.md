@@ -40,9 +40,9 @@ More detail -> create and link a doc/ and/or commit hash
 - [ ] Investigate source of initial turn blank line - suppress in retries
 - [ ] System prompt / tool documentation: Mention @@@END consistently
 
-- [ ] `src/agent.rs` refactor — 261002_agent_refactor.md
-  - [ ] Step 1: move `run_interactive` out to `src/interactive.rs` (§3)
-  - [ ] Read all of `mod tests`, produce a placement table to review (§6)
-  - [ ] Step 2: split `agent.rs` into `agent/` — 9 files, one commit each (§3)
-  - [ ] Step 3: `Interactive` struct, in the new `interactive.rs` (§3)
-  - [ ] Deferred: `CodeAgent::prompt` — deliberately, not cleanup (§4)
+- [x] `src/agent.rs` refactor — 261002_agent_refactor.md
+  - [x] Step 1: move `run_interactive` out to `src/interactive.rs` (§3)
+  - [x] Read all of `mod tests`, produce a placement table to review (§6)
+  - [x] Step 2: split `agent.rs` into `agent/` — 9 files, one commit each (§3)
+  - [x] Step 3: `Interactive` struct, in the new `interactive.rs` (§3)
+  - [x] Deferred: `CodeAgent::prompt` — deliberately, not cleanup (§4)

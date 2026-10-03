@@ -1,10 +1,12 @@
 # `src/agent.rs` — refactor
 
-Status: **in progress.** `agent.rs` 11,889 → 1,685. Done: step 1
+Status: **done.** `agent.rs` 11,889 → 1,685; `interactive.rs`'s
+`run_interactive` decomposed into an `Interactive` struct. Done: step 1
 (`run_interactive` → `src/interactive.rs`), 2a `errors`, 2b `pumps`, 2c
-`status`, 2d `msglog`, 2e `replay`, 2f `compaction`, 2g `transcript`, 2h
-`build`, 2i `turn`. Remaining: step 3 `Interactive` struct. `CodeAgent::prompt`
-landed in `agent/turn.rs` as a pure move (§4).
+`status`, 2d `msglog`, 2e `replay`, 2f `compaction`, 2g `transcript`, 2h `build`,
+2i `turn`, and step 3 (`Interactive` struct: `new` / `converge` / `handle_submit`
+/ `run_bang_command` / `run_prompt_turn` / `run`). `CodeAgent::prompt` landed in
+`agent/turn.rs` as a pure move (§4).
 
 ## 1. What the file is
 
