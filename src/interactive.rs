@@ -26,7 +26,6 @@ use crate::settings::SettingsStore;
 use crate::tools::set_sandbox;
 use crate::Result;
 
-use console::style;
 use rig_core::message::{AssistantContent, Message, Text};
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -229,23 +228,10 @@ impl Interactive {
         let mut repl = if use_repl { Some(Repl::new()) } else { None };
         if let Some(r) = repl.as_mut() {
             let _ = r.start();
-            // First screen: a one-line hint + the current status line, both
-            // emitted via the `Output` impl so cursor tracking stays correct.
-            let status = format!(
-                "{} | {} ({}) | {}",
-                style("picocode").bold(),
-                style(&config.provider).cyan(),
-                style(&config.model).blue(),
-                style(format!(
-                    "limit:{} yolo={}",
-                    config.tool_call_limit, config.yolo
-                ))
-                .yellow(),
-            );
+            // First screen: a one-line hint
             config
                 .output
-                .display_plain("picocode - type `/` for details.");
-            config.output.display_plain(&status);
+                .display_plain("Welcome to picocode - type `/` for details.");
         }
 
         // Persistent session storage.

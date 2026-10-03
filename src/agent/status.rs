@@ -190,8 +190,7 @@ pub fn status_text(
 /// when the bar is widest. What used to be a fixed 25 columns showed a third of
 /// a long message on a 120-column bar and left a hole before the pipe.
 fn message_preview(msg: &str) -> String {
-    let first = msg.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let flat = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = msg.split_whitespace().collect::<Vec<_>>().join(" ");
     crate::output::strip_ansi(&flat)
 }
 
@@ -643,7 +642,7 @@ mod status_bar_tests {
         // one row, and the bar is one row.
         assert_eq!(
             message_preview("\n\n    fn main() {\n        todo!()\n    }"),
-            "fn main() {",
+            "fn main() { todo!() }",
             "the first non-empty line, with its indentation collapsed away"
         );
         assert_eq!(
