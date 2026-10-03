@@ -38,7 +38,7 @@ More detail -> create and link a doc/ and/or commit hash
 - [ ] Shorten preamble, remove duplicate status line
 - [ ] Adjust tool call limit for summarization requests - currently 1
 - [ ] Investigate source of initial turn blank line - suppress in retries
-- [ ] System prompt / tool documentation: Mention @@@END consistently
+- [x] System prompt / tool documentation: Mention @@@END consistently
 
 - [x] `src/agent.rs` refactor — 261002_agent_refactor.md
   - [x] Step 1: move `run_interactive` out to `src/interactive.rs` (§3)
