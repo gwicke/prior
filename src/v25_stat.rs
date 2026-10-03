@@ -50,7 +50,7 @@ impl SlashDotNode for StatNode {
                 let all = repo.list_sessions_overlay(None).await;
                 all.into_iter().find(|m| m.id == session_id).map(|meta| {
                     let detail = meta.detail.as_ref();
-                    crate::agent::SessionStatsInfo {
+                    crate::agent::status::SessionStatsInfo {
                         id: meta.id,
                         name: meta.name.filter(|n| !n.is_empty()),
                         cwd: Some(meta.cwd).filter(|c| !c.is_empty()),
@@ -65,7 +65,7 @@ impl SlashDotNode for StatNode {
             }
         };
 
-        crate::agent::session_stats_lines(
+        crate::agent::status::session_stats_lines(
             &provider,
             &model,
             usage,

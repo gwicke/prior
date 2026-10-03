@@ -1638,10 +1638,10 @@ impl Repl {
         // prompt-side bar and the mid-turn one cannot name different sessions —
         // and pushed before the first paint, because the very first prompt runs
         // before any turn has set a status, and an unset one draws no bar at all.
-        output.set_status(&crate::agent::status_text(
+        output.set_status(&crate::agent::status::status_text(
             ctx.session_name.as_deref(),
             ctx.session_first_message.as_deref(),
-            crate::agent::BarModel {
+            crate::agent::status::BarModel {
                 provider: &ctx.provider,
                 model: &ctx.model,
                 thinking: ctx.reasoning_level.as_deref(),
@@ -3215,10 +3215,10 @@ mod tests {
         let reasoning = crate::settings::default_show_reasoning_handle();
         crate::repl::TERMINAL_WIDTH.store(40, Ordering::SeqCst);
         let out = crate::output::ConsoleOutput::new(reasoning);
-        out.set_status(&crate::agent::status_text(
+        out.set_status(&crate::agent::status::status_text(
             Some("sess"),
             None,
-            crate::agent::BarModel {
+            crate::agent::status::BarModel {
                 provider: "llamacpp",
                 model: "test",
                 thinking: None,

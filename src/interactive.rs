@@ -13,9 +13,10 @@
 
 use crate::agent::errors::{retry_budget, retry_delay_secs};
 use crate::agent::pumps::{cancellable_sleep_pumped, turn_backoff_pump};
+use crate::agent::status::resolved_context_limit;
 use crate::agent::{
     build_session_ctx, create_agent, effective_params, ensure_session, record_reasoning_change,
-    resolved_context_limit, AgentConfig, TurnPersistence,
+    AgentConfig, TurnPersistence,
 };
 use crate::app_state::AppState;
 use crate::model_catalog;
