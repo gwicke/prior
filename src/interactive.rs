@@ -12,10 +12,10 @@
 //! `main` awaits, and it returns when the user quits.
 
 use crate::agent::errors::{retry_budget, retry_delay_secs};
+use crate::agent::pumps::{cancellable_sleep_pumped, turn_backoff_pump};
 use crate::agent::{
-    build_session_ctx, cancellable_sleep_pumped, create_agent, effective_params, ensure_session,
-    record_reasoning_change, resolved_context_limit, turn_backoff_pump, AgentConfig,
-    TurnPersistence,
+    build_session_ctx, create_agent, effective_params, ensure_session, record_reasoning_change,
+    resolved_context_limit, AgentConfig, TurnPersistence,
 };
 use crate::app_state::AppState;
 use crate::model_catalog;
