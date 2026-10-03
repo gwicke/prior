@@ -2402,14 +2402,25 @@ impl ConsoleOutput {
         if !wrote_content {
             // A write with no content in it changes no boundary: its new kind
             // never happened, so the predecessor still stands and the next
-            // write still gets the row that boundary owed it. One declaration
-            // does not roll back — `closes_segment`, the last-chunk flag. That
-            // is a statement about the *segment*, not about bytes, and the next
-            // write must open a block even when the flush closing this one had
-            // nothing left in it.
+            // write still gets the row that boundary owed it.
+            //
+            // INVARIANT 1 (content write): wrote_content == true
+            //   - last_content_display_kind = kind (new kind stands)
+            //   - last_content_closes_segment = closes_segment (new closed stands)
+            //
+            // INVARIANT 2 (empty write): wrote_content == false
+            //   - last_content_display_kind = old (kind unchanged)
+            //   - last_content_closes_segment = closed || genuinely_closes
+            //     where genuinely_closes = closes_segment && old == kind && !closed
+            //     i.e. an empty write only propagates closed=true when it GENUINELY
+            //     closes an open segment of the SAME kind (old == kind && !closed).
+            //     This prevents an empty turn end (old=None, kind=ResponseText) from
+            //     spuriously setting closed=true, which would inject blank lines
+            //     before subsequent retry messages.
             let mut cache = self.draw.lock().unwrap();
             cache.last_content_display_kind = old;
-            cache.last_content_closes_segment = closed || closes_segment;
+            let genuinely_closes = closes_segment && old == kind && !closed;
+            cache.last_content_closes_segment = closed || genuinely_closes;
         }
         let rows = counter.rows();
         let _ = counter.flush();
@@ -4715,6 +4726,95 @@ mod tests {
                 chunk,
             );
         }
+    }
+
+    /// An **empty** segment declares no boundary: a turn that ends having
+    /// streamed nothing is not a segment, so the retry notices that follow it
+    /// are consecutive `SystemMessage` blocks and share the space `boundary_spacer`
+    /// gives two of the same kind — none.
+    ///
+    /// The empty `end_response` is the interesting part, and it is invisible in
+    /// the output: it writes no bytes at all. What it used to leave behind was
+    /// a `closed` flag set by a segment that never existed, so each retry
+    /// message met `(ResponseText, closed)` rather than `(SystemMessage, open)`
+    /// and was given a blank line it had not earned. `with_content_writer`
+    /// decides it now — see the rollback invariants there — and the two
+    /// assertions below are the two halves: the block *between* the retries,
+    /// and the block *before* the first one.
+    #[test]
+    #[serial]
+    fn an_empty_segment_puts_no_blank_between_retries() {
+        let (mut out, reasoning) = capturing_output(80);
+        *reasoning.lock().unwrap() = ShowReasoning::Content;
+        out.reasoning_on_stderr = false;
+        out.begin_capture();
+        // Three failed attempts, each an empty turn: `begin_response` then a
+        // stream that errors before a single delta reaches the parser.
+        out.begin_response();
+        out.end_response();
+        out.display_text("Error: rate limited. Retrying in 1s...");
+        out.begin_response();
+        out.end_response();
+        out.display_text("Error: rate limited. Retrying in 2s...");
+        out.begin_response();
+        out.end_response();
+        out.display_text("Error: rate limited. Retrying in 4s...");
+        let lines = painted_lines(&out.end_capture());
+
+        assert_eq!(
+            lines.len(),
+            3,
+            "three retry notices and nothing else — no blank row above the \
+             first one either, since no response preceded it\n{lines:#?}"
+        );
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line.contains("Retrying in"),
+                "row {i} is a retry notice: {lines:#?}"
+            );
+        }
+    }
+
+    /// The mirror of the case above, and the reason the empty write cannot be
+    /// made wholly inert: a segment that *did* stream text still closes
+    /// itself, and that closure is what earns the blank line under the notice
+    /// the REPL prints afterwards.
+    ///
+    /// The empty `end_response` here is genuine — the renderer already emitted
+    /// the answer as it streamed, so the flush has nothing left to hand back —
+    /// yet the segment closed, so the boundary stands. A rollback that dropped
+    /// `closes_segment` from every empty write would collapse this to no blank
+    /// line, losing the separation between a turn's answer and the status
+    /// message that follows it.
+    #[test]
+    #[serial]
+    fn a_segment_that_streamed_still_closes_for_the_notice_after_it() {
+        let (mut out, reasoning) = capturing_output(80);
+        *reasoning.lock().unwrap() = ShowReasoning::Content;
+        out.reasoning_on_stderr = false;
+        out.begin_capture();
+        // The answer streams and is emitted as it arrives; the paragraph is
+        // closed by its own trailing blank, so the flush below is genuinely
+        // empty and `end_response`'s write carries no content.
+        out.begin_response();
+        out.stream_text("The answer to the question.\n\n");
+        out.end_response();
+        out.display_text("Error: something happened afterwards");
+        let lines = painted_lines(&out.end_capture());
+
+        assert_eq!(
+            lines,
+            vec![
+                // Streamed answer text carries no marker — `⏺` is
+                // `display_text`'s, and this row went through the answer
+                // renderer instead.
+                "The answer to the question.".to_string(),
+                String::new(),
+                "⏺ Error: something happened afterwards".to_string(),
+            ],
+            "the answer closed a real segment, so the notice is separated by \
+             exactly one blank row"
+        );
     }
 
     /// Reasoning then answer: the boundary blank and the dim reset, in the
