@@ -18,6 +18,25 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
 
+/// The back-off base, in ms, that `run_one` hands the child process.
+///
+/// 30ms keeps each gap comfortably above the ~50ms polling granularity and the
+/// noise of a pty round-trip, while making a 1+2+4+8+16 ms schedule cost well
+/// under a second instead of 31 seconds. Growth assertions are written against
+/// multiples of this, so raising it does not mean rewriting them.
+const BASE_MS: u64 = 30;
+
+/// One expected back-off gap: the base scaled by its `2^(n-1)` step.
+///
+/// Wide on the low side (never *shorter* than the schedule says) and generous
+/// on the high side (a loaded runner may be slow), because these measure that a
+/// delay happened and roughly how big it was — not that the scheduler hit an
+/// exact millisecond.
+fn gap_window(step: u32) -> std::ops::RangeInclusive<u64> {
+    let nominal = BASE_MS * (1u64 << step);
+    (nominal / 2)..=(nominal * 4 + 500)
+}
+
 /// Tracks the (elapsed, request-index, had_tool_result) of every chat request.
 struct TrackedMockLlm {
     port: u16,
@@ -221,6 +240,13 @@ fn run_one(pattern: &str, label: &str) -> (Vec<u64>, Vec<(u64, usize, bool)>) {
     // Use a temp directory for XDG_CONFIG_HOME to avoid littering user's config with test sessions.
     let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
+    // Run the back-off schedule in milliseconds instead of seconds. These tests
+    // spawn the real binary, so `tokio::time::pause` is not available to them;
+    // without this they sleep out real 1+2+4+8+16 s of back-off per run, which
+    // made `retry_backoff` the slowest binary in the suite. The growth *shape*
+    // is what these tests are about and it is unchanged — only its time base is.
+    // See `PICOCODE_TEST_RETRY_BASE_MS` in src/agent.rs.
+    cmd.env("PICOCODE_TEST_RETRY_BASE_MS", BASE_MS.to_string());
     let mut child = pair.slave.spawn_command(cmd).expect("spawn");
     // Keep the tempdir alive for the duration of the run.
     let _config_tempdir = config_tempdir;
@@ -237,14 +263,37 @@ fn run_one(pattern: &str, label: &str) -> (Vec<u64>, Vec<(u64, usize, bool)>) {
     let _ = writer.write_all(b"run the command\r");
     let _ = writer.flush();
 
-    // Wait until we've served the pattern length + a beat, OR 25s cap.
-    let want = pattern.len() + 1;
-    let deadline = Instant::now() + Duration::from_secs(26);
+    // Wait until the mock has served the whole pattern.
+    //
+    // The old `want = pattern.len() + 1` assumed an extra request would always
+    // arrive. It does not: "TEET" makes 4 requests and "EEETEETT" makes 7, so
+    // both waited out the entire 26s deadline and then asserted on a complete
+    // set of gaps anyway. That is where two of these tests spent their time —
+    // the loop was timing out, not working. With the back-off now in
+    // milliseconds the whole turn is over in well under a second, so an
+    // unmet `want` is unambiguously a bug rather than slowness.
+    //
+    // `serve` stops one short of `pattern.len()`: the trailing T of a pattern is
+    // the request that completes the turn, and the client is killed once it is
+    // in flight rather than waiting for its (unused) response. The assertion
+    // below is what pins that, so a change to `serve` cannot silently shift it.
+    let want = pattern.len() - 1;
+    let deadline = Instant::now() + Duration::from_secs(10);
     while llm.count() < want && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(20));
     }
+    let served = llm.count();
+    eprintln!(
+        "[{label}] served={served} (want {want}){} gaps={:?}",
+        if served < want { "  UNDERSERVED" } else { "" },
+        llm.gaps_ms()
+    );
+    assert!(
+        served >= want,
+        "[{label}] mock served {served} of {want} requests for pattern {pattern:?} — \
+         the gaps below are then asserted on an incomplete set"
+    );
     thread::sleep(Duration::from_millis(400));
-    eprintln!("[{label}] served={} gaps={:?}", llm.count(), llm.gaps_ms());
     eprintln!("[{label}] log={:?}", llm.log());
 
     let _ = child.kill();
@@ -303,9 +352,11 @@ fn consecutive_429s_grow_exponentially() {
     let g2 = gaps[1];
     let g3 = gaps[2];
     eprintln!("gaps={gaps:?}");
-    assert!((900..1600).contains(&g1), "gap0 ~1s, got {g1}ms");
-    assert!((1900..3500).contains(&g2), "gap1 ~2s, got {g2}ms");
-    assert!((3900..7000).contains(&g3), "gap2 ~4s, got {g3}ms");
+    assert!(gap_window(0).contains(&g1), "gap0 ~1 base, got {g1}ms");
+    assert!(gap_window(1).contains(&g2), "gap1 ~2 base, got {g2}ms");
+    assert!(gap_window(2).contains(&g3), "gap2 ~4 base, got {g3}ms");
+    // The point of the test is that each gap is LONGER than the one before.
+    assert!((g2 > g1) && (g3 > g2), "gaps must grow: {gaps:?}");
 }
 
 /// Progress then mid-run error: within ONE prompt(), req0 streams text + a tool
@@ -326,8 +377,8 @@ fn progress_then_error_resets_to_base() {
     let g1 = gaps[1];
     eprintln!("req1->req2 gap = {g1}ms");
     assert!(
-        (900..1600).contains(&g1),
-        "expected base ~1s after progress+error, got {g1}ms"
+        gap_window(0).contains(&g1),
+        "expected base ~1 base after progress+error, got {g1}ms"
     );
 }
 
@@ -349,15 +400,40 @@ fn backoff_resets_after_progress_even_with_prior_growth() {
     //   [3] req3->req4 (tool exec ~0ms, same run)
     //   [4] req4->req5 (base 1s after reset)
     assert!(gaps.len() >= 5, "need >=5 gaps, got {gaps:?}");
-    assert!((900..1600).contains(&gaps[0]), "gap0 ~1s, got {}", gaps[0]);
-    assert!((1900..3500).contains(&gaps[1]), "gap1 ~2s, got {}", gaps[1]);
-    assert!((3900..7000).contains(&gaps[2]), "gap2 ~4s, got {}", gaps[2]);
+    assert!(
+        gap_window(0).contains(&gaps[0]),
+        "gap0 ~1 base, got {}",
+        gaps[0]
+    );
+    assert!(
+        gap_window(1).contains(&gaps[1]),
+        "gap1 ~2 base, got {}",
+        gaps[1]
+    );
+    assert!(
+        gap_window(2).contains(&gaps[2]),
+        "gap2 ~4 base, got {}",
+        gaps[2]
+    );
+    // Growth before the reset is the whole premise of this test.
+    assert!(
+        gaps[1] > gaps[0] && gaps[2] > gaps[1],
+        "the pre-reset gaps must grow: {gaps:?}"
+    );
     // After the progress+midrun-error the next no-progress error must be base.
     let g4 = gaps[4];
     eprintln!("post-reset no-progress gap = {g4}ms");
     assert!(
-        (900..1600).contains(&g4),
-        "expected base ~1s after reset, got {g4}ms"
+        gap_window(0).contains(&g4),
+        "expected base ~1 base after reset, got {g4}ms"
+    );
+    // The reset is the claim: this gap is BASE again, not grown like gaps 1-2.
+    // Without this, a run that never grew at all would also satisfy the windows
+    // above and the test would pass without testing a reset.
+    assert!(
+        g4 < gaps[2],
+        "post-reset gap {g4} should be shorter than the pre-reset peak {}: {gaps:?}",
+        gaps[2]
     );
 }
 
@@ -392,6 +468,8 @@ fn no_session_still_resets_backoff_after_progress() {
     // Remove all home/config vars so app_config_dir() -> None => no session.
     cmd.env_remove("HOME");
     cmd.env_remove("XDG_CONFIG_HOME");
+    // Same scaled back-off base as `run_one` — see `BASE_MS`.
+    cmd.env("PICOCODE_TEST_RETRY_BASE_MS", BASE_MS.to_string());
     cmd.env_remove("APPDATA");
     let mut child = pair.slave.spawn_command(cmd).expect("spawn");
     let reader = pair.master.try_clone_reader().expect("clone reader");
@@ -424,7 +502,15 @@ fn no_session_still_resets_backoff_after_progress() {
     let g4 = gaps[4];
     eprintln!("post-progress gap under no-session = {g4}ms gaps={gaps:?}");
     assert!(
-        (900..1600).contains(&g4),
-        "expected base ~1s after progress with no session, got {g4}ms (gaps {gaps:?})"
+        gap_window(0).contains(&g4),
+        "expected base ~1 base after progress with no session, got {g4}ms (gaps {gaps:?})"
+    );
+    // The regression: without a session the counter used to keep building, so
+    // this gap grew instead of resetting. It must be shorter than the grown
+    // gaps before it, i.e. back near base.
+    assert!(
+        g4 < gaps[2],
+        "post-progress gap {g4}ms should be shorter than the pre-reset peak {} (gaps {gaps:?})",
+        gaps[2]
     );
 }
