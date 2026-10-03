@@ -19,7 +19,7 @@ use super::transcript::{normalize_call_ids, reasoning_text, TurnTranscript};
 use crate::Result;
 use futures::StreamExt;
 use rig_agent::agent::{MultiTurnStreamItem, StreamingError};
-use rig_agent::completion::{Chat, PromptError};
+use rig_agent::completion::{Prompt, PromptError};
 use rig_agent::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
 use rig_core::message::{AssistantContent, Message, Reasoning, Text, UserContent};
 use std::sync::atomic::Ordering;
@@ -731,10 +731,9 @@ impl CodeAgent {
     /// Generate a concise summary of the given text using the agent's model.
     /// Used by `/tree --summarize` to summarise abandoned branches.
     pub async fn summarize(&self, prompt: &str) -> Result<String> {
-        let msg = Message::user(prompt);
-        let mut history: Vec<Message> = vec![];
         self.agent
-            .chat(msg, &mut history)
+            .prompt(Message::user(prompt))
+            .max_turns(SUMMARIZATION_MAX_TURNS)
             .await
             .map_err(|e| classify_prompt_error(&e, "summarize"))
     }
@@ -782,8 +781,27 @@ impl CodeAgent {
         .await?;
 
         self.agent
-            .chat(Message::user(instruction), &mut prior.clone())
+            .prompt(Message::user(instruction))
+            .history(prior)
+            .max_turns(SUMMARIZATION_MAX_TURNS)
             .await
             .map_err(|e| classify_prompt_error(&e, "summarize"))
     }
 }
+
+/// Model-call budget for a summarization / compaction request.
+///
+/// A summarizer is not a single-shot request in practice: the agent
+/// carries the full tool set, so a summary that has to check a file,
+/// re-read a span, or recover from a hallucinated call costs more than
+/// one model call — and one call is all rig allows implicitly (an
+/// unconfigured agent's budget), which fails the request outright on the
+/// first tool call. Ten leaves room for that lookup-and-answer shape (a
+/// tool call plus the model-authored summary) without letting a
+/// summarizer wander.
+///
+/// Deliberately *not* `self.tool_call_limit`: that is the interactive
+/// turn budget, and a summary is a background, user-initiated operation
+/// whose cost is bounded by what the user asked for, not by the budget
+/// they set for a coding turn.
+const SUMMARIZATION_MAX_TURNS: usize = 10;
