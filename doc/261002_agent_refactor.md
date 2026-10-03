@@ -1,6 +1,10 @@
 # `src/agent.rs` — refactor
 
-Status: **proposed.** Nothing implemented.
+Status: **in progress.** `agent.rs` 11,889 → 4,875. Done: step 1
+(`run_interactive` → `src/interactive.rs`), 2a `errors`, 2b `pumps`, 2c
+`status`, 2d `msglog`, 2e `replay`, 2f `compaction`. Remaining: 2g `transcript`,
+2h `build`, 2i `turn` + `mod.rs`, step 3 `Interactive` struct. Deferred by
+design: `CodeAgent::prompt` (§4).
 
 ## 1. What the file is
 
