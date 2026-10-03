@@ -346,18 +346,41 @@ fn run_turn_typing(
 
     // Wait until the mock has served the expected turns, then a beat for the
     // separator + next prompt redraw.
+    //
+    // `want` is how many HTTP requests this scenario will EVER make, and getting
+    // it wrong is expensive rather than merely wrong: the loop below waits out
+    // its whole deadline, so asking for a second request from a single-turn
+    // scenario costs the full 30s and then proceeds anyway. Scenario 4 (the
+    // fenced-code one) is text-only like scenario 2 and never issues a tool
+    // call, so it serves exactly one request — and asking for two here is what
+    // made `the_status_line_keeps_one_blank_row_above_it` the slowest test in the
+    // suite, at 31s of a ~38s run. Scenario 3's second request is a 429 that the
+    // retrier makes by itself, so it is served either way.
     let want = if typed.starts_with('/') {
         0
-    } else if scenario == 2 {
+    } else if matches!(scenario, 2 | 4) {
         1
     } else {
         2
     };
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while llm.count() < want && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(50));
     }
-    eprintln!("[{label}] requests served: {}", llm.count());
+    let served = llm.count();
+    // A short wait is the normal settle; the deadline is the failure path. Say so
+    // rather than letting a timeout pass for a normal run, since the cost of a
+    // wrong `want` is now 10s of silence rather than an obviously-slow test.
+    eprintln!(
+        "[{label}] requests served: {served} (want {want}){}",
+        if served < want { "  UNDERSERVED" } else { "" }
+    );
+    assert!(
+        served >= want,
+        "[{label}] mock served {served} of {want} expected requests — \
+         a scenario that never makes the requests this harness waits for will \
+         otherwise spend the whole deadline here and capture a mid-turn screen"
+    );
     thread::sleep(Duration::from_millis(1200));
 
     let data = bytes.lock().unwrap().clone();

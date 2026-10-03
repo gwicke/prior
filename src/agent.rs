@@ -1156,13 +1156,13 @@ fn turn_backoff_pump<'a>(
 async fn cancellable_sleep_pumped(
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
-    secs: u64,
+    ms: u64,
     mut pump: Option<TurnPump<'_>>,
 ) -> bool {
-    if secs == 0 {
+    if ms == 0 {
         return true;
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
     loop {
         // Prose's wake-up for this iteration, resolved *before* the select
         // rather than inside the timer's async block — the same contract
@@ -1282,13 +1282,13 @@ fn pump_window_key(
 async fn cancellable_sleep_windowed(
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
-    secs: u64,
+    ms: u64,
     keys: Option<&dyn WindowKeySource>,
 ) -> bool {
-    if secs == 0 {
+    if ms == 0 {
         return true;
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return true,
@@ -1340,18 +1340,49 @@ fn retry_budget(e: &crate::PicocodeError) -> u8 {
 /// `metadata.retry_after_seconds`) is the **floor** when present — respect
 /// the provider's hint, then add our exponential growth on top by treating
 /// the hint as the starting base.
-fn retry_delay_secs(e: &crate::PicocodeError, consecutive_failures: u8) -> u64 {
+///
+/// # `PICOCODE_TEST_RETRY_BASE_MS`
+///
+/// The *base* of the no-hint schedule is overridable, in milliseconds, so the
+/// back-off tests in `tests/retry_backoff.rs` can exercise the growth and reset
+/// behaviour in milliseconds instead of sleeping out real seconds. Those tests
+/// spawn this binary and assert on the gaps between HTTP requests, so they
+/// cannot use `tokio::time::pause` the way an in-process test would.
+///
+/// The name is deliberately long and test-specific: a typo would have to be
+/// quite deliberate to land here. It only ever shortens a delay in a process
+/// that was explicitly started with it set, and a production run sets nothing.
+/// Only the no-hint branch reads it — a provider's `Retry-After` is a floor we
+/// must respect, so it is never scaled down.
+///
+/// Unset (or unparseable) means the production default: 1s.
+const TEST_RETRY_BASE_MS_VAR: &str = "PICOCODE_TEST_RETRY_BASE_MS";
+
+/// The no-hint base delay, in milliseconds. See [`TEST_RETRY_BASE_MS_VAR`].
+fn retry_base_ms() -> u64 {
+    match std::env::var(TEST_RETRY_BASE_MS_VAR) {
+        Ok(v) => v.trim().parse::<u64>().ok().filter(|ms| *ms > 0),
+        Err(_) => None,
+    }
+    .unwrap_or(1000)
+}
+
+fn retry_delay_ms(e: &crate::PicocodeError, consecutive_failures: u8) -> u64 {
+    let n = consecutive_failures.saturating_sub(1).min(63) as u32;
     // Provider hint floors the delay. If present, we use it as the base of
     // the exponential schedule: attempt 1 = `hint`, attempt 2 = `hint*2`,
     // …, attempt N = `hint * 2^(N-1)`. This respects upstream's request
     // while still growing on a string of consecutive 429s.
     if let Some(hint) = e.retry_after_secs() {
-        let n = consecutive_failures.saturating_sub(1).min(63) as u32;
-        return hint.saturating_mul(1u64 << n);
+        return hint.saturating_mul(1000).saturating_mul(1u64 << n);
     }
-    // No provider hint: pure 2^(n-1) seconds, no cap.
-    let n = consecutive_failures.saturating_sub(1).min(63) as u32;
-    1u64 << n
+    // No provider hint: pure 2^(n-1) multiples of the base, no cap.
+    //
+    // Milliseconds, not seconds, so a sub-second base is representable: a test
+    // that set a 30ms base and this returned whole seconds would truncate every
+    // delay to 0 and silently delete the back-off it is trying to observe.
+    // Production's base is 1000ms, so the real schedule is unchanged.
+    retry_base_ms().saturating_mul(1u64 << n)
 }
 
 /// Classify a `StreamingError` into a structured `PicocodeError` variant.
@@ -4666,7 +4697,7 @@ pub(crate) async fn apply_branch_summary(
 ///
 /// `build` produces the summarization request and returns the model's reply
 /// (or a classified `PicocodeError`). On a retryable failure it is re-invoked
-/// (previous `build` again) after `retry_delay_secs` seconds of
+/// (previous `build` again) after `retry_delay_ms` seconds of
 /// [`cancellable_sleep_windowed`]; non-retryable errors and cancellation
 /// propagate out.
 ///
@@ -4722,10 +4753,9 @@ where
             }
             Some(Err(e)) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                let secs = retry_delay_secs(&e, consecutive_failures);
-                output.display_text(&format!("Error: {}. Retrying in {secs}s...", e));
-                let slept =
-                    cancellable_sleep_windowed(user_cancel, cancel_notify, secs, keys).await;
+                let ms = retry_delay_ms(&e, consecutive_failures);
+                output.display_text(&format!("Error: {}. Retrying in {}s...", e, ms / 1000));
+                let slept = cancellable_sleep_windowed(user_cancel, cancel_notify, ms, keys).await;
                 if !slept {
                     return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
                 }
@@ -5793,15 +5823,16 @@ pub async fn run_interactive(
                                 // original `input` is already in the session,
                                 // so re-sending it would duplicate the user's
                                 // request.
-                                let secs = retry_delay_secs(&cause, 1);
+                                let ms = retry_delay_ms(&cause, 1);
                                 config.output.display_text(&format!(
-                                    "Error: {}. Retrying in {secs}s...",
-                                    cause
+                                    "Error: {}. Retrying in {}s...",
+                                    cause,
+                                    ms / 1000
                                 ));
                                 let slept = cancellable_sleep_pumped(
                                     &config.user_cancel,
                                     &config.cancel_notify,
-                                    secs,
+                                    ms,
                                     turn_backoff_pump(
                                         &mut prompt_session,
                                         &mut in_turn_keys,
@@ -5872,14 +5903,16 @@ pub async fn run_interactive(
                                     && consecutive_failures < retry_budget(&e) =>
                             {
                                 consecutive_failures = consecutive_failures.saturating_add(1);
-                                let secs = retry_delay_secs(&e, consecutive_failures);
-                                config
-                                    .output
-                                    .display_text(&format!("Error: {}. Retrying in {secs}s...", e));
+                                let ms = retry_delay_ms(&e, consecutive_failures);
+                                config.output.display_text(&format!(
+                                    "Error: {}. Retrying in {}s...",
+                                    e,
+                                    ms / 1000
+                                ));
                                 let slept = cancellable_sleep_pumped(
                                     &config.user_cancel,
                                     &config.cancel_notify,
-                                    secs,
+                                    ms,
                                     turn_backoff_pump(
                                         &mut prompt_session,
                                         &mut in_turn_keys,
@@ -8011,7 +8044,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             output: output.as_ref(),
         };
         let started = std::time::Instant::now();
-        let completed = cancellable_sleep_pumped(&cancel, &notify, 60, Some(pump)).await;
+        let completed = cancellable_sleep_pumped(&cancel, &notify, 60_000, Some(pump)).await;
         assert!(
             !completed,
             "a queued Esc must end the back-off, not the deadline"
@@ -8050,7 +8083,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             output: output.as_ref(),
         };
         let started = std::time::Instant::now();
-        let completed = cancellable_sleep_pumped(&cancel, &notify, 1, Some(pump)).await;
+        let completed = cancellable_sleep_pumped(&cancel, &notify, 1_000, Some(pump)).await;
         assert!(
             completed,
             "a plain key must not be mistaken for the cancel signal"
@@ -8077,7 +8110,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             notify2.notify_one();
         });
         let started = std::time::Instant::now();
-        let completed = cancellable_sleep_pumped(&cancel, &notify, 60, None).await;
+        let completed = cancellable_sleep_pumped(&cancel, &notify, 60_000, None).await;
         let _ = handle.await;
         assert!(
             !completed,
@@ -10442,24 +10475,77 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         );
     }
 
+    // `#[serial]`: reads the no-hint base, which
+    // `retry_base_override_scales_the_no_hint_schedule_only` overrides via a
+    // process-global env var.
     #[test]
+    #[serial]
     fn retry_delay_grows_as_pow2_without_cap() {
         // No provider hint: pure 2^(n-1), no ceiling. The per-turn budget
         // (50) is the implicit cap on how many attempts we will ever make.
         // attempt=1 → 1s, 2 → 2s, 3 → 4s, … (delay is `1 << (n-1)` seconds).
+        // Milliseconds: production's 1000ms base, so these are the same
+        // schedule as the old whole-second numbers.
         let e = PicocodeError::LlmTransport("reset".into());
-        assert_eq!(super::retry_delay_secs(&e, 1), 1);
-        assert_eq!(super::retry_delay_secs(&e, 2), 2);
-        assert_eq!(super::retry_delay_secs(&e, 3), 4);
-        assert_eq!(super::retry_delay_secs(&e, 4), 8);
-        assert_eq!(super::retry_delay_secs(&e, 10), 512);
+        assert_eq!(super::retry_delay_ms(&e, 1), 1000);
+        assert_eq!(super::retry_delay_ms(&e, 2), 2000);
+        assert_eq!(super::retry_delay_ms(&e, 3), 4000);
+        assert_eq!(super::retry_delay_ms(&e, 4), 8000);
+        assert_eq!(super::retry_delay_ms(&e, 10), 512_000);
         // Saturating at u64: still finite, no panic. We never reach 50 in
         // practice (budget caps it), but saturating_pow keeps the math safe.
-        let big = super::retry_delay_secs(&e, 50);
+        let big = super::retry_delay_ms(&e, 50);
         assert!(big > 0);
     }
 
+    /// The no-hint base is overridable so the pty-level back-off tests can run
+    /// in milliseconds, and — the part worth pinning — a provider `Retry-After`
+    /// is never scaled down by it. A hint is a floor we owe the provider, so
+    /// shrinking it would be us ignoring an explicit rate-limit request.
+    // `#[serial]`: sets and removes a process-global env var. Any sibling that
+    // reads `retry_delay_ms` without a hint must not overlap it.
     #[test]
+    #[serial]
+    fn retry_base_override_scales_the_no_hint_schedule_only() {
+        let no_hint = crate::PicocodeError::LlmTransport("reset".into());
+        let hinted = crate::PicocodeError::LlmRateLimited {
+            retry_after_secs: Some(4),
+        };
+
+        // Default: the production schedule, exactly as before the override.
+        assert_eq!(super::retry_base_ms(), 1000);
+        assert_eq!(super::retry_delay_ms(&no_hint, 1), 1000);
+        assert_eq!(super::retry_delay_ms(&hinted, 1), 4000);
+
+        // Scoped to this test's own process: it sets and removes the variable
+        // around every call rather than leaving it set, so it cannot leak into a
+        // sibling test in the same binary.
+        // Safety: single-threaded within this test — no other thread reads it.
+        std::env::set_var(super::TEST_RETRY_BASE_MS_VAR, "20");
+        assert_eq!(super::retry_base_ms(), 20);
+        // Growth shape is preserved, just scaled: 20ms, 40ms, 80ms.
+        assert_eq!(super::retry_delay_ms(&no_hint, 1), 20);
+        assert_eq!(super::retry_delay_ms(&no_hint, 2), 40);
+        // A hint is untouched by the override.
+        assert_eq!(super::retry_delay_ms(&hinted, 1), 4000);
+        assert_eq!(super::retry_delay_ms(&hinted, 2), 8000);
+
+        // Nonsense and zero fall back to the default rather than disabling or
+        // zeroing the back-off — a typo must not silently remove the delay.
+        std::env::set_var(super::TEST_RETRY_BASE_MS_VAR, "not-a-number");
+        assert_eq!(super::retry_base_ms(), 1000);
+        std::env::set_var(super::TEST_RETRY_BASE_MS_VAR, "0");
+        assert_eq!(super::retry_base_ms(), 1000);
+        std::env::remove_var(super::TEST_RETRY_BASE_MS_VAR);
+        assert_eq!(super::retry_base_ms(), 1000);
+        assert_eq!(super::retry_delay_ms(&no_hint, 1), 1000);
+    }
+
+    // `#[serial]`: reads the no-hint base, which
+    // `retry_base_override_scales_the_no_hint_schedule_only` overrides via a
+    // process-global env var.
+    #[test]
+    #[serial]
     fn retry_delay_respects_retry_after_as_floor_then_doubles() {
         // When the provider reports Retry-After, it is the FLOOR of the
         // first attempt; subsequent attempts double from there. This
@@ -10468,13 +10554,18 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let e = PicocodeError::LlmRateLimited {
             retry_after_secs: Some(5),
         };
-        assert_eq!(super::retry_delay_secs(&e, 1), 5);
-        assert_eq!(super::retry_delay_secs(&e, 2), 10);
-        assert_eq!(super::retry_delay_secs(&e, 3), 20);
-        assert_eq!(super::retry_delay_secs(&e, 4), 40);
+        assert_eq!(super::retry_delay_ms(&e, 1), 5000);
+        assert_eq!(super::retry_delay_ms(&e, 2), 10_000);
+        assert_eq!(super::retry_delay_ms(&e, 3), 20_000);
+        assert_eq!(super::retry_delay_ms(&e, 4), 40_000);
     }
 
+    // `#[serial]`: reads the process-global `PICOCODE_TEST_RETRY_BASE_MS`, which
+    // `retry_base_override_scales_the_no_hint_schedule_only` sets and removes
+    // around each of its calls. Overlapping them makes that test see this one's
+    // 20ms base and fail on the expected 1s.
     #[test]
+    #[serial]
     fn retry_delay_for_malformed_tool_call_uses_provider_floor_or_one() {
         // Malformed tool calls carry no provider hint (the model is the
         // source of the error), so the first delay is 1s — fast feedback
@@ -10483,9 +10574,9 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             tool_name: "edit".into(),
             parse_error: "expected `,` or `}`".into(),
         };
-        assert_eq!(super::retry_delay_secs(&e, 1), 1);
-        assert_eq!(super::retry_delay_secs(&e, 2), 2);
-        assert_eq!(super::retry_delay_secs(&e, 3), 4);
+        assert_eq!(super::retry_delay_ms(&e, 1), 1000);
+        assert_eq!(super::retry_delay_ms(&e, 2), 2000);
+        assert_eq!(super::retry_delay_ms(&e, 3), 4000);
     }
 
     #[test]
