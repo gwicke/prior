@@ -583,7 +583,7 @@ const BSED_BIN: &str = "bsed";
 
 #[rig_tool(
     name = "sed",
-    description = "Safe `sed` batch preview. Returns clean, line-disambiguated @@@OLD / @@@NEW blocks \
+    description = "Safe `sed` batch preview. Returns clean, line-disambiguated @@@OLD / @@@NEW / @@@END blocks \
 for the edit tool, never modifies files. Review the blocks, tweak @@@NEW text if necessary, \
 then pass them to the `edit` tool as its `blocks` string argument to apply. \
 **Auto multi-line context**: Automatically widens context to multiple lines for unbalanced structures. \

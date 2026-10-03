@@ -389,7 +389,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
             return Err(malformed_marker_error(marker, line));
         }
         return Err(ParseError(
-            "no `@@@OLD` / `@@@NEW` blocks found".to_string(),
+            "no `@@@OLD` / `@@@NEW` / `@@@END` blocks found".to_string(),
         ));
     }
 

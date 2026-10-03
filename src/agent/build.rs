@@ -746,7 +746,7 @@ const SED_TOOL_PROMPT: &str = r#"### Bulk edits: preview with `sed`, apply with 
 For a change that spans many lines or the whole file (renames, deletions, range
 rewrites), do NOT run `sed -i` and do NOT hand-write one `edit` block per line.
 Instead call `sed` with one GNU sed expression per line. It never writes: it
-returns the change as `@@@OLD`/`@@@NEW` blocks, each anchored to a line. Read the
+returns the change as `@@@OLD`/`@@@NEW`/`@@@END` blocks, each anchored to a line. Read the
 blocks, then pass them to `edit` as its `blocks` argument to apply. `sed` refuses
 `w`, `e` and `q`; use `edit` or `bash` for those. Pass `context` if you need more
 than the ~2 lines of trailing context you get by default."#;
