@@ -2013,7 +2013,7 @@ model = "claude-3-5-sonnet-20241022"
             !cfg.models.is_empty(),
             "the example should document at least one model table"
         );
-        for (id, _record) in &cfg.models {
+        for id in cfg.models.keys() {
             assert!(id.contains(':'), "a model key must be provider:model: {id}");
         }
         // Spot-check that the two kinds of setting are both documented, since

@@ -118,7 +118,7 @@ fn pack_facts(facts: &[(String, String)], indent: &str, width: usize) -> Vec<Str
             + crate::slashdot_menu::table::display_width(&piece);
         if !current.trim_start_matches(' ').is_empty() && candidate_len > width {
             lines.push(std::mem::take(&mut current));
-            current = format!("{indent}");
+            current = indent.to_string();
         }
         if current.len() > indent.len() {
             current.push_str(&" ".repeat(GAP));
