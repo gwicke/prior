@@ -166,6 +166,14 @@ struct Interactive {
     prompt_session: Option<PromptSession>,
 }
 
+/// Whether the input loop keeps going after an arm runs.
+enum LoopCtl {
+    /// Run another cycle.
+    Continue,
+    /// Exit the loop.
+    Break,
+}
+
 pub async fn run_interactive(
     config: AgentConfig,
     settings: SettingsStore,
@@ -550,6 +558,447 @@ impl Interactive {
         true
     }
 
+    /// Run one submitted user line: record it in history, drop the shell
+    /// `!`/`!!` path, split per-turn overrides, and run the prompt turn.
+    /// Returns [`LoopCtl::Break`] only for `/q` / `exit`.
+    async fn handle_submit(&mut self, input: String) -> LoopCtl {
+        if input.is_empty() {
+            return LoopCtl::Continue;
+        }
+        self.line_history.add(&input);
+        if input == "/q" || input == "exit" {
+            return LoopCtl::Break;
+        }
+        // Per-turn overrides (doc/model_settings_v2.md A.10).
+        //
+        // `line_history` above took the RAW line, so recall shows the
+        // user what they typed including the overrides; from here on
+        // `input` is the text with the override lines removed, which is
+        // what is persisted, sent, and counted for context. Nothing is
+        // mutated: the overrides travel as a value into `prompt()` for
+        // this turn only, so there is no restore step and no way one
+        // reaches the live params or the next turn.
+        let split = crate::turn_overrides::split(&input);
+        for w in &split.warnings {
+            self.config.output.display_text(w);
+        }
+        // An overrides-only prompt has nothing to send. Checked *before*
+        // `ensure_session` below, or a turn that never runs would still
+        // create a session.
+        if split.text.trim().is_empty() {
+            self.config
+                .output
+                .display_text("nothing to send — the prompt was only overrides");
+            return LoopCtl::Continue;
+        }
+        let input = split.text;
+        let (effective_params, notes) = effective_params(&self.app_state, &split.overrides);
+        for n in &notes {
+            self.config.output.display_text(n);
+        }
+        // Safety net: any code path that drops the in-memory session
+        // (notably `/new` and `/clear`) must leave us with a fresh one
+        // before the first post-drop prompt — otherwise
+        // `prompt(input, None, ...)` would build an empty prior context
+        // and skip every `append_message` (gated on `session.is_some()`),
+        // losing turn-to-turn memory and never writing the new session
+        // to disk. Cheap when the session is already populated.
+        let guarded = ensure_session(
+            self.app_state.session(),
+            &self.repo,
+            Some(self.config.provider.clone()),
+            Some(self.config.model.clone()),
+            self.config.params.reasoning_str(),
+        )
+        .await;
+        let guarded_id = guarded
+            .as_ref()
+            .map(|s| s.get_session_id().to_string())
+            .unwrap_or_default();
+        self.app_state.activate_session(guarded, guarded_id);
+        // User-initiated shell command. `!cmd` runs `cmd` in the
+        // sandbox and captures its output into the session context (so
+        // the LLM sees it on the next turn); `!!cmd` runs and displays
+        // it but does NOT add it to context. Both reuse the same
+        // `run_sandboxed` helper (and therefore the same bwrap sandbox
+        // + timeout policy) as the LLM's `bash` tool, so user- and
+        // model-initiated shelling are identical. No confirmation is
+        // required: the user typed it explicitly, unlike the
+        // LLM-initiated tool call. This skips the LLM prompt entirely.
+        if input.starts_with("!!") || input.starts_with('!') {
+            self.run_bang_command(&input).await;
+            return LoopCtl::Continue;
+        }
+        // `/stat` is handled by the REPL overlay (typing it opens the
+        // stats panel); it is never submitted here, so there's nothing
+        // to do for that keyword.
+        // Reprint the submitted prompt via the `Output` impl so the
+        // session (and cursor tracking) stays correct; `read_input`
+        // cleared the input line on submit. Bracketed — a rule above
+        // *and* below, which the second call used to add by hand — and
+        // shared with a directly preceding commit instead of stacked
+        // (ui_draw_v2 R4).
+        self.run_prompt_turn(input, effective_params).await;
+        LoopCtl::Continue
+    }
+
+    /// Run a user `!cmd` (capture its output into the session context) or
+    /// `!!cmd` (display only) command. Reuses `run_sandboxed`, so it runs under
+    /// the same bwrap + timeout policy as the agent's `bash` tool; no LLM turn.
+    async fn run_bang_command(&mut self, input: &str) {
+        let (capture, cmd) = if let Some(rest) = input.strip_prefix("!!") {
+            (false, rest)
+        } else if let Some(rest) = input.strip_prefix('!') {
+            (true, rest)
+        } else {
+            unreachable!()
+        };
+        let cmd = cmd.trim();
+        // Reprint the submitted command (cleared by `read_input`),
+        // bracketed like every other line the user committed with
+        // Enter (ui_draw_v2 R4).
+        self.config.output.display_committed_prompt(input);
+        if cmd.is_empty() {
+            self.config.output.display_plain(
+                "Usage: !<command> (capture output into context), or !!<command> (display only)",
+            );
+        } else {
+            // Re-publish the resolved sandbox config immediately
+            // before running the command. The config is held in a
+            // process-wide global that other tests (and other
+            // sessions) may mutate concurrently; pinning it here —
+            // with no await between this and `run_sandboxed`'s read
+            // of the global — keeps the `!`/`!!` path immune to
+            // that race while preserving the "publish once" intent.
+            set_sandbox(self.config.sandbox.clone());
+            match crate::tools::run_sandboxed(cmd, None).await {
+                Ok(out) => {
+                    let out = out.trim();
+                    if out.is_empty() {
+                        self.config.output.display_plain("(no output)");
+                    } else {
+                        self.config.output.display_plain(out);
+                    }
+                    if capture {
+                        // Mirror a normal turn so the model sees
+                        // both the command and its result: a user
+                        // message naming the command, plus an
+                        // assistant message carrying the captured
+                        // output.
+                        let msg = Message::user(format!("Ran shell command: {cmd}"));
+                        if let Some(s) = self.app_state.session() {
+                            let _ = s.append_message(&msg).await;
+                            let reply = Message::Assistant {
+                                id: None,
+                                content: vec![AssistantContent::Text(Text::new(out.to_string()))],
+                            };
+                            let _ = s.append_message(&reply).await;
+                        }
+                    } else {
+                        self.config
+                            .output
+                            .display_plain("(output was displayed but not added to context)");
+                    }
+                }
+                Err(e) => {
+                    self.config
+                        .output
+                        .display_text(&format!("shell error: {}", e));
+                }
+            }
+        }
+    }
+
+    /// Create the agent lazily on first use, then run the prompt turn: spawn
+    /// the in-flight reader, drive the single-attempt + auto-retry back-off
+    /// loop (handing the reader's key queue into `prompt()`), and surface the
+    /// outcome. `effective_params` are this turn's live params + overrides.
+    async fn run_prompt_turn(
+        &mut self,
+        input: String,
+        effective_params: crate::params::ModelParams,
+    ) {
+        self.config.output.display_committed_prompt(&input);
+        // Normal prompt — create the agent lazily on first use
+        // (loop-side, applied config; published to the slot).
+        if self.app_state.agent().is_none() {
+            match create_agent(self.config.clone()).await {
+                Ok(a) => self.app_state.activate_agent(Arc::from(a)),
+                Err(e) => {
+                    self.config
+                        .output
+                        .display_text(&format!("Cannot start agent: {}", e));
+                    return;
+                }
+            }
+        }
+        // Clone-out for this turn (lock rule 3: no guard across await).
+        let agent = self.app_state.agent();
+        let session = self.app_state.session();
+        // Single attempt + auto-retry, with the in-flight reader
+        // (if any) spanning the whole window. `Esc` is dispatched by
+        // the turn's one key dispatcher wherever the turn is: inside
+        // `prompt()` while an attempt streams, by the back-off pump
+        // while a retry delay runs (`cancellable_sleep_pumped`) —
+        // either way it fires the cancel signal, and the wait (or the
+        // stream) ends immediately, returning `Cancelled`.
+        // U4.2/U4.3: edit keys typed while the turn runs. The reader
+        // owns the sender; the receiver is bound for the whole turn so
+        // the queue lives exactly as long as the reader can feed it,
+        // and it is handed into `prompt()` as `InTurnInput::keys` for
+        // the key branch to drain.
+        //
+        // Holding it is what keeps `send` working — a dropped receiver
+        // makes every send a no-op, which would silently turn the
+        // forwarding back into the drop U4.2 existed to remove. It
+        // dies with this scope, so the queue dies with it and a
+        // keystroke queued at the end of one turn cannot leak into the
+        // next prompt.
+        let (in_turn_keys_tx, mut in_turn_keys) = tokio::sync::mpsc::unbounded_channel();
+        let reader_handle = if let Some(g) = &self.guard {
+            let done = Arc::new(AtomicBool::new(false));
+            let confirm_gate = self
+                .config
+                .output
+                .confirm_gate()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+            let h = crate::repl::spawn_in_flight_reader(
+                g.clone(),
+                done.clone(),
+                confirm_gate,
+                in_turn_keys_tx,
+            );
+            Some((h, done))
+        } else {
+            None
+        };
+        let response: std::result::Result<String, crate::PicocodeError> = {
+            let mut consecutive_failures: u8 = 0;
+            let mut next_input: String = input.clone();
+            // The params this turn sends. They are the live ones with
+            // the typed overrides applied, and they are *carried*, not
+            // applied to the live config — so a retry of the same
+            // dispatch re-uses them automatically (the stripped text is
+            // already in `next_input`), while a synthetic re-prompt
+            // below resets them, since an override belongs to the
+            // user's dispatch and not to the model's own feedback.
+            let mut turn_params = effective_params;
+            // Per-turn persistence flag. Reset once per user prompt
+            // (NOT per retry): the retry loop below reuses it across
+            // `prompt()` attempts so a pre-persisted `user(input)` is
+            // not duplicated, while the NEXT turn starts fresh (so
+            // two identical inputs in a row, e.g. "continue" twice,
+            // never collide). See `TurnPersistence`.
+            let turn = TurnPersistence::new();
+            // The user's original prompt is this turn's first NEW
+            // dispatch.
+            turn.mark_new_dispatch();
+            // The full steering message (synthetic feedback / "continue")
+            // is delivered once per logical turn; `prompt()` persists it
+            // with the partial transcript when a retry makes progress and
+            // then fails again. Re-sending the same full steer on that
+            // later interruption would repeat it in the session once the
+            // retry succeeds, so later interruptions get a short
+            // continuation instead.
+            let mut steer_delivered = false;
+            let outcome: std::result::Result<String, crate::PicocodeError> = loop {
+                let prompt_result = agent
+                    .as_ref()
+                    .unwrap()
+                    .prompt(
+                        &next_input,
+                        session.as_deref(),
+                        &turn,
+                        &turn_params,
+                        // `zip`: the key branch exists only where there
+                        // is both a session to receive the key and a
+                        // guard to stop the reader for it. Piped input
+                        // has neither, and piped input with a guard
+                        // has no reader, so there is no key either.
+                        self.prompt_session
+                            .as_mut()
+                            .zip(self.guard.as_deref())
+                            .map(|(sess, g)| crate::repl::InTurnInput {
+                                session: sess,
+                                keys: &mut in_turn_keys,
+                                confirms: &mut self.confirm_bridge.requests,
+                                label: &self.prompt_str,
+                                history: &mut self.line_history,
+                                guard: g,
+                            }),
+                    )
+                    .await;
+                match prompt_result {
+                    Ok(text) => break Ok(text),
+                    Err(crate::PicocodeError::Cancelled(_)) => {
+                        break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                    }
+                    // Mid-turn failure that persisted progress: the
+                    // underlying run produced content/tool calls
+                    // before erroring. This is NOT a "consecutive
+                    // failure" for back-off purposes — there was
+                    // successful work in between — so reset the
+                    // counter and treat the upcoming retry as a
+                    // fresh first attempt (delay = 2^0 = 1 s, or
+                    // the provider's Retry-After floor). The budget
+                    // is still consumed (one retry used), but the
+                    // exponential delay does not compound.
+                    Err(crate::PicocodeError::LlmInterrupted { cause, .. })
+                        if consecutive_failures < retry_budget(&cause) =>
+                    {
+                        consecutive_failures = 0;
+                        // `prompt()` persisted the user prompt + the
+                        // finalized partial transcript to the session
+                        // and returned `LlmInterrupted`. Continue from
+                        // that transcript with a steering message — the
+                        // original `input` is already in the session,
+                        // so re-sending it would duplicate the user's
+                        // request.
+                        let secs = retry_delay_secs(&cause, 1);
+                        self.config
+                            .output
+                            .display_text(&format!("Error: {}. Retrying in {secs}s...", cause));
+                        let slept = cancellable_sleep_pumped(
+                            &self.config.user_cancel,
+                            &self.config.cancel_notify,
+                            secs,
+                            turn_backoff_pump(
+                                &mut self.prompt_session,
+                                &mut in_turn_keys,
+                                &mut self.line_history,
+                                &self.prompt_str,
+                                &self.guard,
+                                self.config.output.as_ref(),
+                            ),
+                        )
+                        .await;
+                        if !slept {
+                            break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                        }
+                        // Steering prompt: the synthetic feedback for
+                        // e.g. malformed tool calls (carries the parse
+                        // error the model needs to self-correct), else a
+                        // short "continue" pointing at the persisted
+                        // work. NOT appended to the session — it becomes
+                        // the retry's prompt (input + partial are already
+                        // persisted). Delivered in full (the synthetic
+                        // feedback) only once per logical turn; after the
+                        // model has already been steered once and made
+                        // further (persisted) progress, a plain "continue"
+                        // suffices and avoids repeating the steer text in
+                        // the session.
+                        //
+                        // When there is no session, nothing was actually
+                        // persisted, so a "continue where you left off"
+                        // steer would point at context that doesn't exist
+                        // and drop the user's original request. In that
+                        // case re-send the original `input` instead (same
+                        // as the no-progress path) — the back-off reset
+                        // above still applies, but the user's turn is not
+                        // lost.
+                        next_input = if session.is_none() {
+                            input.clone()
+                        } else if steer_delivered {
+                            "continue".to_string()
+                        } else {
+                            steer_delivered = true;
+                            match cause.synthetic_retry_feedback() {
+                                Some(fb) => fb,
+                                None => "continue".to_string(),
+                            }
+                        };
+                        // The steering message is a NEW user dispatch
+                        // for this turn (distinct from the original
+                        // prompt), so it counts toward `turns_sent` and
+                        // will be persisted/deduped as its own message.
+                        turn.mark_new_dispatch();
+                        if self.cancel.load(Ordering::SeqCst) {
+                            break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                        }
+                        continue;
+                    }
+                    // No-progress retryable failure: `prompt()` returned
+                    // the plain classified error. `prompt()`'s error
+                    // branch already de-duped and persisted `user(input)`
+                    // (or skipped it because the session already ended
+                    // on it), so we do NOT re-append here. The retry
+                    // re-runs from `input` (the turn never got past its
+                    // first model call). For malformed tool calls the
+                    // model needs the parse error to self-correct; in
+                    // that case the synthetic feedback becomes the
+                    // retry's prompt instead of `input`.
+                    Err(e) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        let secs = retry_delay_secs(&e, consecutive_failures);
+                        self.config
+                            .output
+                            .display_text(&format!("Error: {}. Retrying in {secs}s...", e));
+                        let slept = cancellable_sleep_pumped(
+                            &self.config.user_cancel,
+                            &self.config.cancel_notify,
+                            secs,
+                            turn_backoff_pump(
+                                &mut self.prompt_session,
+                                &mut in_turn_keys,
+                                &mut self.line_history,
+                                &self.prompt_str,
+                                &self.guard,
+                                self.config.output.as_ref(),
+                            ),
+                        )
+                        .await;
+                        if !slept {
+                            break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                        }
+                        if let Some(feedback) = e.synthetic_retry_feedback() {
+                            // `prompt()` already persisted `user(input)`
+                            // (de-duped). Re-prompt with the synthetic
+                            // feedback so the model can self-correct.
+                            next_input = feedback;
+                            // Drop the override: it was the user's
+                            // instruction for *their* dispatch, and
+                            // this is the model's own corrective
+                            // re-prompt. Carrying a `/temperature 0.2`
+                            // into it would silently keep applying a
+                            // sampling the user never asked for on this
+                            // exchange.
+                            turn_params = self.app_state.params();
+                            // The feedback replaces the original prompt
+                            // as a NEW user dispatch for this turn.
+                            turn.mark_new_dispatch();
+                        }
+                        // Race window: cancel could fire after
+                        // `cancellable_sleep_pumped` returned but
+                        // before `prompt()` clears its flag. Bail
+                        // out here so the retry respects `Esc`.
+                        if self.cancel.load(Ordering::SeqCst) {
+                            break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                        }
+                        continue;
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            outcome
+        };
+        if let Some((h, done)) = reader_handle {
+            done.store(true, Ordering::SeqCst);
+            let _ = h.join();
+        }
+        match response {
+            Ok(_) => {}
+            Err(crate::PicocodeError::Cancelled(msg)) => {
+                // Turn aborted via `<Esc>`; `prompt()` already persisted
+                // the in-flight history, so show a clear notice instead
+                // of a generic "Error:".
+                self.config.output.display_text(&msg);
+            }
+            Err(e) => {
+                self.config.output.display_text(&format!("Error: {}", e));
+            }
+        }
+    }
+
     async fn run(&mut self) -> Result<()> {
         loop {
             let action = match self.repl.as_mut() {
@@ -674,440 +1123,10 @@ impl Interactive {
                     // (target config / control fields); the convergence step
                     // above applied them. No-op arm.
                 }
-                InputAction::Submit(input) => {
-                    if input.is_empty() {
-                        continue;
-                    }
-                    self.line_history.add(&input);
-                    if input == "/q" || input == "exit" {
-                        break;
-                    }
-                    // Per-turn overrides (doc/model_settings_v2.md A.10).
-                    //
-                    // `line_history` above took the RAW line, so recall shows the
-                    // user what they typed including the overrides; from here on
-                    // `input` is the text with the override lines removed, which is
-                    // what is persisted, sent, and counted for context. Nothing is
-                    // mutated: the overrides travel as a value into `prompt()` for
-                    // this turn only, so there is no restore step and no way one
-                    // reaches the live params or the next turn.
-                    let split = crate::turn_overrides::split(&input);
-                    for w in &split.warnings {
-                        self.config.output.display_text(w);
-                    }
-                    // An overrides-only prompt has nothing to send. Checked *before*
-                    // `ensure_session` below, or a turn that never runs would still
-                    // create a session.
-                    if split.text.trim().is_empty() {
-                        self.config
-                            .output
-                            .display_text("nothing to send — the prompt was only overrides");
-                        continue;
-                    }
-                    let input = split.text;
-                    let (effective_params, notes) =
-                        effective_params(&self.app_state, &split.overrides);
-                    for n in &notes {
-                        self.config.output.display_text(n);
-                    }
-                    // Safety net: any code path that drops the in-memory session
-                    // (notably `/new` and `/clear`) must leave us with a fresh one
-                    // before the first post-drop prompt — otherwise
-                    // `prompt(input, None, ...)` would build an empty prior context
-                    // and skip every `append_message` (gated on `session.is_some()`),
-                    // losing turn-to-turn memory and never writing the new session
-                    // to disk. Cheap when the session is already populated.
-                    let guarded = ensure_session(
-                        self.app_state.session(),
-                        &self.repo,
-                        Some(self.config.provider.clone()),
-                        Some(self.config.model.clone()),
-                        self.config.params.reasoning_str(),
-                    )
-                    .await;
-                    let guarded_id = guarded
-                        .as_ref()
-                        .map(|s| s.get_session_id().to_string())
-                        .unwrap_or_default();
-                    self.app_state.activate_session(guarded, guarded_id);
-                    // User-initiated shell command. `!cmd` runs `cmd` in the
-                    // sandbox and captures its output into the session context (so
-                    // the LLM sees it on the next turn); `!!cmd` runs and displays
-                    // it but does NOT add it to context. Both reuse the same
-                    // `run_sandboxed` helper (and therefore the same bwrap sandbox
-                    // + timeout policy) as the LLM's `bash` tool, so user- and
-                    // model-initiated shelling are identical. No confirmation is
-                    // required: the user typed it explicitly, unlike the
-                    // LLM-initiated tool call. This skips the LLM prompt entirely.
-                    if input.starts_with("!!") || input.starts_with('!') {
-                        let (capture, cmd) = if let Some(rest) = input.strip_prefix("!!") {
-                            (false, rest)
-                        } else if let Some(rest) = input.strip_prefix('!') {
-                            (true, rest)
-                        } else {
-                            unreachable!()
-                        };
-                        let cmd = cmd.trim();
-                        // Reprint the submitted command (cleared by `read_input`),
-                        // bracketed like every other line the user committed with
-                        // Enter (ui_draw_v2 R4).
-                        self.config.output.display_committed_prompt(&input);
-                        if cmd.is_empty() {
-                            self.config
-                            .output
-                            .display_plain("Usage: !<command> (capture output into context), or !!<command> (display only)");
-                        } else {
-                            // Re-publish the resolved sandbox config immediately
-                            // before running the command. The config is held in a
-                            // process-wide global that other tests (and other
-                            // sessions) may mutate concurrently; pinning it here —
-                            // with no await between this and `run_sandboxed`'s read
-                            // of the global — keeps the `!`/`!!` path immune to
-                            // that race while preserving the "publish once" intent.
-                            set_sandbox(self.config.sandbox.clone());
-                            match crate::tools::run_sandboxed(cmd, None).await {
-                                Ok(out) => {
-                                    let out = out.trim();
-                                    if out.is_empty() {
-                                        self.config.output.display_plain("(no output)");
-                                    } else {
-                                        self.config.output.display_plain(out);
-                                    }
-                                    if capture {
-                                        // Mirror a normal turn so the model sees
-                                        // both the command and its result: a user
-                                        // message naming the command, plus an
-                                        // assistant message carrying the captured
-                                        // output.
-                                        let msg =
-                                            Message::user(format!("Ran shell command: {cmd}"));
-                                        if let Some(s) = self.app_state.session() {
-                                            let _ = s.append_message(&msg).await;
-                                            let reply = Message::Assistant {
-                                                id: None,
-                                                content: vec![AssistantContent::Text(Text::new(
-                                                    out.to_string(),
-                                                ))],
-                                            };
-                                            let _ = s.append_message(&reply).await;
-                                        }
-                                    } else {
-                                        self.config.output.display_plain(
-                                            "(output was displayed but not added to context)",
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    self.config
-                                        .output
-                                        .display_text(&format!("shell error: {}", e));
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    // `/stat` is handled by the REPL overlay (typing it opens the
-                    // stats panel); it is never submitted here, so there's nothing
-                    // to do for that keyword.
-                    // Reprint the submitted prompt via the `Output` impl so the
-                    // session (and cursor tracking) stays correct; `read_input`
-                    // cleared the input line on submit. Bracketed — a rule above
-                    // *and* below, which the second call used to add by hand — and
-                    // shared with a directly preceding commit instead of stacked
-                    // (ui_draw_v2 R4).
-                    self.config.output.display_committed_prompt(&input);
-                    // Normal prompt — create the agent lazily on first use
-                    // (loop-side, applied config; published to the slot).
-                    if self.app_state.agent().is_none() {
-                        match create_agent(self.config.clone()).await {
-                            Ok(a) => self.app_state.activate_agent(Arc::from(a)),
-                            Err(e) => {
-                                self.config
-                                    .output
-                                    .display_text(&format!("Cannot start agent: {}", e));
-                                continue;
-                            }
-                        }
-                    }
-                    // Clone-out for this turn (lock rule 3: no guard across await).
-                    let agent = self.app_state.agent();
-                    let session = self.app_state.session();
-                    // Single attempt + auto-retry, with the in-flight reader
-                    // (if any) spanning the whole window. `Esc` is dispatched by
-                    // the turn's one key dispatcher wherever the turn is: inside
-                    // `prompt()` while an attempt streams, by the back-off pump
-                    // while a retry delay runs (`cancellable_sleep_pumped`) —
-                    // either way it fires the cancel signal, and the wait (or the
-                    // stream) ends immediately, returning `Cancelled`.
-                    // U4.2/U4.3: edit keys typed while the turn runs. The reader
-                    // owns the sender; the receiver is bound for the whole turn so
-                    // the queue lives exactly as long as the reader can feed it,
-                    // and it is handed into `prompt()` as `InTurnInput::keys` for
-                    // the key branch to drain.
-                    //
-                    // Holding it is what keeps `send` working — a dropped receiver
-                    // makes every send a no-op, which would silently turn the
-                    // forwarding back into the drop U4.2 existed to remove. It
-                    // dies with this scope, so the queue dies with it and a
-                    // keystroke queued at the end of one turn cannot leak into the
-                    // next prompt.
-                    let (in_turn_keys_tx, mut in_turn_keys) =
-                        tokio::sync::mpsc::unbounded_channel();
-                    let reader_handle = if let Some(g) = &self.guard {
-                        let done = Arc::new(AtomicBool::new(false));
-                        let confirm_gate = self
-                            .config
-                            .output
-                            .confirm_gate()
-                            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-                        let h = crate::repl::spawn_in_flight_reader(
-                            g.clone(),
-                            done.clone(),
-                            confirm_gate,
-                            in_turn_keys_tx,
-                        );
-                        Some((h, done))
-                    } else {
-                        None
-                    };
-                    let response: std::result::Result<String, crate::PicocodeError> = {
-                        let mut consecutive_failures: u8 = 0;
-                        let mut next_input: String = input.clone();
-                        // The params this turn sends. They are the live ones with
-                        // the typed overrides applied, and they are *carried*, not
-                        // applied to the live config — so a retry of the same
-                        // dispatch re-uses them automatically (the stripped text is
-                        // already in `next_input`), while a synthetic re-prompt
-                        // below resets them, since an override belongs to the
-                        // user's dispatch and not to the model's own feedback.
-                        let mut turn_params = effective_params;
-                        // Per-turn persistence flag. Reset once per user prompt
-                        // (NOT per retry): the retry loop below reuses it across
-                        // `prompt()` attempts so a pre-persisted `user(input)` is
-                        // not duplicated, while the NEXT turn starts fresh (so
-                        // two identical inputs in a row, e.g. "continue" twice,
-                        // never collide). See `TurnPersistence`.
-                        let turn = TurnPersistence::new();
-                        // The user's original prompt is this turn's first NEW
-                        // dispatch.
-                        turn.mark_new_dispatch();
-                        // The full steering message (synthetic feedback / "continue")
-                        // is delivered once per logical turn; `prompt()` persists it
-                        // with the partial transcript when a retry makes progress and
-                        // then fails again. Re-sending the same full steer on that
-                        // later interruption would repeat it in the session once the
-                        // retry succeeds, so later interruptions get a short
-                        // continuation instead.
-                        let mut steer_delivered = false;
-                        let outcome: std::result::Result<String, crate::PicocodeError> = loop {
-                            let prompt_result = agent
-                                .as_ref()
-                                .unwrap()
-                                .prompt(
-                                    &next_input,
-                                    session.as_deref(),
-                                    &turn,
-                                    &turn_params,
-                                    // `zip`: the key branch exists only where there
-                                    // is both a session to receive the key and a
-                                    // guard to stop the reader for it. Piped input
-                                    // has neither, and piped input with a guard
-                                    // has no reader, so there is no key either.
-                                    self.prompt_session.as_mut().zip(self.guard.as_deref()).map(
-                                        |(sess, g)| crate::repl::InTurnInput {
-                                            session: sess,
-                                            keys: &mut in_turn_keys,
-                                            confirms: &mut self.confirm_bridge.requests,
-                                            label: &self.prompt_str,
-                                            history: &mut self.line_history,
-                                            guard: g,
-                                        },
-                                    ),
-                                )
-                                .await;
-                            match prompt_result {
-                                Ok(text) => break Ok(text),
-                                Err(crate::PicocodeError::Cancelled(_)) => {
-                                    break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
-                                }
-                                // Mid-turn failure that persisted progress: the
-                                // underlying run produced content/tool calls
-                                // before erroring. This is NOT a "consecutive
-                                // failure" for back-off purposes — there was
-                                // successful work in between — so reset the
-                                // counter and treat the upcoming retry as a
-                                // fresh first attempt (delay = 2^0 = 1 s, or
-                                // the provider's Retry-After floor). The budget
-                                // is still consumed (one retry used), but the
-                                // exponential delay does not compound.
-                                Err(crate::PicocodeError::LlmInterrupted { cause, .. })
-                                    if consecutive_failures < retry_budget(&cause) =>
-                                {
-                                    consecutive_failures = 0;
-                                    // `prompt()` persisted the user prompt + the
-                                    // finalized partial transcript to the session
-                                    // and returned `LlmInterrupted`. Continue from
-                                    // that transcript with a steering message — the
-                                    // original `input` is already in the session,
-                                    // so re-sending it would duplicate the user's
-                                    // request.
-                                    let secs = retry_delay_secs(&cause, 1);
-                                    self.config.output.display_text(&format!(
-                                        "Error: {}. Retrying in {secs}s...",
-                                        cause
-                                    ));
-                                    let slept = cancellable_sleep_pumped(
-                                        &self.config.user_cancel,
-                                        &self.config.cancel_notify,
-                                        secs,
-                                        turn_backoff_pump(
-                                            &mut self.prompt_session,
-                                            &mut in_turn_keys,
-                                            &mut self.line_history,
-                                            &self.prompt_str,
-                                            &self.guard,
-                                            self.config.output.as_ref(),
-                                        ),
-                                    )
-                                    .await;
-                                    if !slept {
-                                        break Err(crate::PicocodeError::Cancelled(
-                                            "Aborted.".into(),
-                                        ));
-                                    }
-                                    // Steering prompt: the synthetic feedback for
-                                    // e.g. malformed tool calls (carries the parse
-                                    // error the model needs to self-correct), else a
-                                    // short "continue" pointing at the persisted
-                                    // work. NOT appended to the session — it becomes
-                                    // the retry's prompt (input + partial are already
-                                    // persisted). Delivered in full (the synthetic
-                                    // feedback) only once per logical turn; after the
-                                    // model has already been steered once and made
-                                    // further (persisted) progress, a plain "continue"
-                                    // suffices and avoids repeating the steer text in
-                                    // the session.
-                                    //
-                                    // When there is no session, nothing was actually
-                                    // persisted, so a "continue where you left off"
-                                    // steer would point at context that doesn't exist
-                                    // and drop the user's original request. In that
-                                    // case re-send the original `input` instead (same
-                                    // as the no-progress path) — the back-off reset
-                                    // above still applies, but the user's turn is not
-                                    // lost.
-                                    next_input = if session.is_none() {
-                                        input.clone()
-                                    } else if steer_delivered {
-                                        "continue".to_string()
-                                    } else {
-                                        steer_delivered = true;
-                                        match cause.synthetic_retry_feedback() {
-                                            Some(fb) => fb,
-                                            None => "continue".to_string(),
-                                        }
-                                    };
-                                    // The steering message is a NEW user dispatch
-                                    // for this turn (distinct from the original
-                                    // prompt), so it counts toward `turns_sent` and
-                                    // will be persisted/deduped as its own message.
-                                    turn.mark_new_dispatch();
-                                    if self.cancel.load(Ordering::SeqCst) {
-                                        break Err(crate::PicocodeError::Cancelled(
-                                            "Aborted.".into(),
-                                        ));
-                                    }
-                                    continue;
-                                }
-                                // No-progress retryable failure: `prompt()` returned
-                                // the plain classified error. `prompt()`'s error
-                                // branch already de-duped and persisted `user(input)`
-                                // (or skipped it because the session already ended
-                                // on it), so we do NOT re-append here. The retry
-                                // re-runs from `input` (the turn never got past its
-                                // first model call). For malformed tool calls the
-                                // model needs the parse error to self-correct; in
-                                // that case the synthetic feedback becomes the
-                                // retry's prompt instead of `input`.
-                                Err(e)
-                                    if e.is_auto_retryable()
-                                        && consecutive_failures < retry_budget(&e) =>
-                                {
-                                    consecutive_failures = consecutive_failures.saturating_add(1);
-                                    let secs = retry_delay_secs(&e, consecutive_failures);
-                                    self.config.output.display_text(&format!(
-                                        "Error: {}. Retrying in {secs}s...",
-                                        e
-                                    ));
-                                    let slept = cancellable_sleep_pumped(
-                                        &self.config.user_cancel,
-                                        &self.config.cancel_notify,
-                                        secs,
-                                        turn_backoff_pump(
-                                            &mut self.prompt_session,
-                                            &mut in_turn_keys,
-                                            &mut self.line_history,
-                                            &self.prompt_str,
-                                            &self.guard,
-                                            self.config.output.as_ref(),
-                                        ),
-                                    )
-                                    .await;
-                                    if !slept {
-                                        break Err(crate::PicocodeError::Cancelled(
-                                            "Aborted.".into(),
-                                        ));
-                                    }
-                                    if let Some(feedback) = e.synthetic_retry_feedback() {
-                                        // `prompt()` already persisted `user(input)`
-                                        // (de-duped). Re-prompt with the synthetic
-                                        // feedback so the model can self-correct.
-                                        next_input = feedback;
-                                        // Drop the override: it was the user's
-                                        // instruction for *their* dispatch, and
-                                        // this is the model's own corrective
-                                        // re-prompt. Carrying a `/temperature 0.2`
-                                        // into it would silently keep applying a
-                                        // sampling the user never asked for on this
-                                        // exchange.
-                                        turn_params = self.app_state.params();
-                                        // The feedback replaces the original prompt
-                                        // as a NEW user dispatch for this turn.
-                                        turn.mark_new_dispatch();
-                                    }
-                                    // Race window: cancel could fire after
-                                    // `cancellable_sleep_pumped` returned but
-                                    // before `prompt()` clears its flag. Bail
-                                    // out here so the retry respects `Esc`.
-                                    if self.cancel.load(Ordering::SeqCst) {
-                                        break Err(crate::PicocodeError::Cancelled(
-                                            "Aborted.".into(),
-                                        ));
-                                    }
-                                    continue;
-                                }
-                                Err(e) => break Err(e),
-                            }
-                        };
-                        outcome
-                    };
-                    if let Some((h, done)) = reader_handle {
-                        done.store(true, Ordering::SeqCst);
-                        let _ = h.join();
-                    }
-                    match response {
-                        Ok(_) => {}
-                        Err(crate::PicocodeError::Cancelled(msg)) => {
-                            // Turn aborted via `<Esc>`; `prompt()` already persisted
-                            // the in-flight history, so show a clear notice instead
-                            // of a generic "Error:".
-                            self.config.output.display_text(&msg);
-                        }
-                        Err(e) => {
-                            self.config.output.display_text(&format!("Error: {}", e));
-                        }
-                    }
-                }
+                InputAction::Submit(input) => match self.handle_submit(input).await {
+                    LoopCtl::Continue => {}
+                    LoopCtl::Break => break,
+                },
             }
         }
         Ok(())
