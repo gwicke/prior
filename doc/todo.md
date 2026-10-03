@@ -35,11 +35,11 @@ More detail -> create and link a doc/ and/or commit hash
 
 - [ ] tool errors: split the operator's view from the model's, then unredact —
   path_leak_risks.md (`edit` done; `read`/`write`/`glob`/`grep`/`list`/`sed` open)
-- [ ] Shorten preamble, remove duplicate status line
+- [x] Shorten preamble, remove duplicate status line
 - [x] Adjust tool call limit for summarization requests - currently 1
       (rig's implicit budget) — now an explicit `SUMMARIZATION_MAX_TURNS = 10`
       on both summarizers in `agent/turn.rs`
-- [ ] Investigate source of initial turn blank line - suppress in retries
+- [x] Investigate source of initial turn blank line - suppress in retries
 - [x] System prompt / tool documentation: Mention @@@END consistently
 
 - [x] `src/agent.rs` refactor — 261002_agent_refactor.md
