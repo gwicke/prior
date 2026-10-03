@@ -36,3 +36,6 @@ More detail -> create and link a doc/ and/or commit hash
 - [ ] tool errors: split the operator's view from the model's, then unredact —
   path_leak_risks.md (`edit` done; `read`/`write`/`glob`/`grep`/`list`/`sed` open)
 - [ ] Shorten preamble, remove duplicate status line
+- [ ] Adjust tool call limit for summarization requests - currently 1
+- [ ] Investigate source of initial turn blank line - suppress in retries
+- [ ] System prompt / tool documentation: Mention @@@END consistently
