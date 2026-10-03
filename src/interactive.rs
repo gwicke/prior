@@ -388,6 +388,168 @@ impl Interactive {
 
     /// Drive the input loop: read one input, converge the applied config
     /// against the target, then dispatch. Runs until the user quits.
+    /// Convergence: fold the runtime-target config (AppState) into the
+    /// applied layer, then record session metadata and drain control
+    /// targets — this loop is the targets' sole consumer. Runs every
+    /// cycle: run-to-completion means at most one menu submit per cycle,
+    /// and a missed application point only delays convergence.
+    async fn converge(&mut self) -> bool {
+        let target = self.app_state.config_snapshot();
+        let control = self.app_state.take_control();
+        if control.quit {
+            return false;
+        }
+
+        // Rebuild gate: canonical whole-string compares against the
+        // RUNNING model (config), never a segment split — model ids may
+        // themselves contain colons (openrouter `…:free`), and a
+        // `nth(1)`-style truncation reads a different value than what is
+        // configured, making every menu commit look like a model change.
+        // Narrower flag for the journal: only a *level* change is worth a
+        // `ThinkingLevelChange` entry, and recording it for a temperature
+        // tweak would be noise.
+        let reasoning_changed = self.config.params.reasoning != target.params.reasoning;
+        let target_reasoning = target.params.reasoning_str();
+        // What the loop's rebuild gate should do this cycle. Extracted so the
+        // once-per-target invariant is testable without running the REPL.
+        let rebuild = plan_rebuild(&self.config, &target, self.last_attempted_target.as_ref());
+        let model_changed = self.config.qualified_model_id() != target.qualified_model_id();
+        let params_changed = self.config.params != target.params;
+        let persona_changed = self.config.persona_name != target.persona_name;
+
+        // One rebuild attempt per distinct target: re-running a failed
+        // attempt would reprint the same error every cycle while the user
+        // digs back to the menu to fix it. Changing the target — or an
+        // explicit `/model` re-commit of the same model — arms the next
+        // attempt. (`create_agent` is local: key/config errors are final
+        // for a given target, so recovery really is "change the target".)
+        if let Some(attempt) = rebuild {
+            self.last_attempted_target = Some(attempt);
+            let mut new_cfg = self.config.clone();
+            if model_changed {
+                new_cfg.provider = target.provider.clone();
+                new_cfg.model = target.model.clone();
+            }
+            if params_changed {
+                new_cfg.params = target.params;
+            }
+            // Re-read on every rebuild: the window moves when the model does,
+            // and also when the user Ctrl-E's a `context_length` override and
+            // then switches away and back.
+            new_cfg.context_limit = resolved_context_limit(&self.app_state);
+            if persona_changed {
+                new_cfg.persona_name = target.persona_name.clone();
+                new_cfg.persona_prompt = target
+                    .persona_name
+                    .as_ref()
+                    .and_then(|p| crate::persona::get_persona(p));
+            }
+            match create_agent(new_cfg.clone()).await {
+                Ok(new_agent) => {
+                    self.app_state.activate_agent(Arc::from(new_agent));
+                    if model_changed {
+                        let model_id = new_cfg.qualified_model_id();
+                        let updated = self.app_state.note_recent_model(&model_id);
+                        save_recent_models(&updated);
+                    }
+                    self.config = new_cfg;
+                }
+                Err(e) => {
+                    let kind = if model_changed {
+                        "switch model"
+                    } else if params_changed {
+                        "set model params"
+                    } else {
+                        "set persona"
+                    };
+                    self.config
+                        .output
+                        .display_text(&format!("Cannot {}: {}", kind, e));
+                }
+            }
+        }
+
+        // Thinking metadata recording (the model entry moved inline: the
+        // /model node journals its explicit commit at submit time — its
+        // record helper skips values the session already holds and folds
+        // metadata into the in-memory header while the session is still
+        // unpersisted). Runs AFTER the rebuild so `config` matches the
+        // target when we record.
+        let recording_session = self.app_state.session();
+        if reasoning_changed && self.config.params.reasoning_str() == target_reasoning {
+            if let Some(ref s) = recording_session {
+                record_reasoning_change(s, target_reasoning.as_deref().unwrap_or("off")).await;
+            }
+        }
+        // Control appliers — each field's sole consumer. `take_control()`
+        // above already GC'd the one-shots; run-to-completion means at
+        // most one menu submit set them this cycle.
+
+        if let Some(op) = control.sandbox {
+            // Relocated v2.0 /sandbox handler: mutate the state
+            // store, then re-publish the merged config — BOTH
+            // `tools::set_sandbox` (live) AND `config.sandbox`
+            // (so the merge survives a lazy agent rebuild, which
+            // does `set_sandbox(config.sandbox.clone())`).
+            use crate::app_state::SandboxOp;
+            let result = match &op {
+                SandboxOp::Add {
+                    host_path,
+                    sandbox_path,
+                    mode,
+                } => crate::sandbox_state::add(host_path, sandbox_path, *mode),
+                SandboxOp::Remove { sandbox_path } => crate::sandbox_state::remove(sandbox_path),
+                SandboxOp::Exclude { sandbox_path } => crate::sandbox_state::exclude(sandbox_path),
+                SandboxOp::Restore { sandbox_path } => crate::sandbox_state::restore(sandbox_path),
+            };
+            match result {
+                Ok(()) => {
+                    let mut merged = self.config.sandbox.clone().unwrap_or_default();
+                    crate::sandbox_state::merge_into(&mut merged);
+                    crate::tools::set_sandbox(Some(merged.clone()));
+                    self.config.sandbox = Some(merged.clone());
+                    // Keep the target snapshot in sync — this applier is the
+                    // one that *applies* sandbox state.
+                    self.app_state.update_config(|c| c.sandbox = Some(merged));
+                    let msg = match &op {
+                        SandboxOp::Add {
+                            host_path,
+                            sandbox_path,
+                            mode,
+                        } => {
+                            let m = if *mode == crate::config::BindMode::Rw {
+                                "add_rw"
+                            } else {
+                                "add_ro"
+                            };
+                            if sandbox_path.is_empty() {
+                                format!("sandbox: {} {} (ok)", m, host_path)
+                            } else {
+                                format!("sandbox: {} {} → {} (ok)", m, host_path, sandbox_path)
+                            }
+                        }
+                        SandboxOp::Remove { sandbox_path } => {
+                            format!("sandbox: removed {} (ok)", sandbox_path)
+                        }
+                        SandboxOp::Exclude { sandbox_path } => {
+                            format!("sandbox: excluded {} (ok)", sandbox_path)
+                        }
+                        SandboxOp::Restore { sandbox_path } => {
+                            format!("sandbox: restored {} (ok)", sandbox_path)
+                        }
+                    };
+                    self.config.output.display_text(&msg);
+                }
+                Err(e) => {
+                    self.config
+                        .output
+                        .display_text(&format!("sandbox error: {}", e));
+                }
+            }
+        }
+        true
+    }
+
     async fn run(&mut self) -> Result<()> {
         loop {
             let action = match self.repl.as_mut() {
@@ -503,174 +665,13 @@ impl Interactive {
                 Some(a) => a,
                 None => continue,
             };
-            // Convergence: fold the runtime-target self.config (AppState) into the
-            // applied layer, then record session metadata and drain control
-            // targets — this loop is the targets' sole consumer. Runs every
-            // cycle: run-to-completion means at most one menu submit per cycle,
-            // and a missed application point only delays convergence.
-            let target = self.app_state.config_snapshot();
-            let control = self.app_state.take_control();
-            if control.quit {
+            if !self.converge().await {
                 break;
-            }
-
-            // Rebuild gate: canonical whole-string compares against the
-            // RUNNING model (self.config), never a segment split — model ids may
-            // themselves contain colons (openrouter `…:free`), and a
-            // `nth(1)`-style truncation reads a different value than what is
-            // configured, making every menu commit look like a model change.
-            // Narrower flag for the journal: only a *level* change is worth a
-            // `ThinkingLevelChange` entry, and recording it for a temperature
-            // tweak would be noise.
-            let reasoning_changed = self.config.params.reasoning != target.params.reasoning;
-            let target_reasoning = target.params.reasoning_str();
-            // What the loop's rebuild gate should do this cycle. Extracted so the
-            // once-per-target invariant is testable without running the REPL.
-            let rebuild = plan_rebuild(&self.config, &target, self.last_attempted_target.as_ref());
-            let model_changed = self.config.qualified_model_id() != target.qualified_model_id();
-            let params_changed = self.config.params != target.params;
-            let persona_changed = self.config.persona_name != target.persona_name;
-
-            // One rebuild attempt per distinct target: re-running a failed
-            // attempt would reprint the same error every cycle while the user
-            // digs back to the menu to fix it. Changing the target — or an
-            // explicit `/model` re-commit of the same model — arms the next
-            // attempt. (`create_agent` is local: key/self.config errors are final
-            // for a given target, so recovery really is "change the target".)
-            if let Some(attempt) = rebuild {
-                self.last_attempted_target = Some(attempt);
-                let mut new_cfg = self.config.clone();
-                if model_changed {
-                    new_cfg.provider = target.provider.clone();
-                    new_cfg.model = target.model.clone();
-                }
-                if params_changed {
-                    new_cfg.params = target.params;
-                }
-                // Re-read on every rebuild: the window moves when the model does,
-                // and also when the user Ctrl-E's a `context_length` override and
-                // then switches away and back.
-                new_cfg.context_limit = resolved_context_limit(&self.app_state);
-                if persona_changed {
-                    new_cfg.persona_name = target.persona_name.clone();
-                    new_cfg.persona_prompt = target
-                        .persona_name
-                        .as_ref()
-                        .and_then(|p| crate::persona::get_persona(p));
-                }
-                match create_agent(new_cfg.clone()).await {
-                    Ok(new_agent) => {
-                        self.app_state.activate_agent(Arc::from(new_agent));
-                        if model_changed {
-                            let model_id = new_cfg.qualified_model_id();
-                            let updated = self.app_state.note_recent_model(&model_id);
-                            save_recent_models(&updated);
-                        }
-                        self.config = new_cfg;
-                    }
-                    Err(e) => {
-                        let kind = if model_changed {
-                            "switch model"
-                        } else if params_changed {
-                            "set model params"
-                        } else {
-                            "set persona"
-                        };
-                        self.config
-                            .output
-                            .display_text(&format!("Cannot {}: {}", kind, e));
-                    }
-                }
-            }
-
-            // Thinking metadata recording (the model entry moved inline: the
-            // /model node journals its explicit commit at submit time — its
-            // record helper skips values the session already holds and folds
-            // metadata into the in-memory header while the session is still
-            // unpersisted). Runs AFTER the rebuild so `self.config` matches the
-            // target when we record.
-            let recording_session = self.app_state.session();
-            if reasoning_changed && self.config.params.reasoning_str() == target_reasoning {
-                if let Some(ref s) = recording_session {
-                    record_reasoning_change(s, target_reasoning.as_deref().unwrap_or("off")).await;
-                }
-            }
-            // Control appliers — each field's sole consumer. `take_control()`
-            // above already GC'd the one-shots; run-to-completion means at
-            // most one menu submit set them this cycle.
-
-            if let Some(op) = control.sandbox {
-                // Relocated v2.0 /sandbox handler: mutate the state
-                // store, then re-publish the merged self.config — BOTH
-                // `tools::set_sandbox` (live) AND `self.config.sandbox`
-                // (so the merge survives a lazy agent rebuild, which
-                // does `set_sandbox(self.config.sandbox.clone())`).
-                use crate::app_state::SandboxOp;
-                let result = match &op {
-                    SandboxOp::Add {
-                        host_path,
-                        sandbox_path,
-                        mode,
-                    } => crate::sandbox_state::add(host_path, sandbox_path, *mode),
-                    SandboxOp::Remove { sandbox_path } => {
-                        crate::sandbox_state::remove(sandbox_path)
-                    }
-                    SandboxOp::Exclude { sandbox_path } => {
-                        crate::sandbox_state::exclude(sandbox_path)
-                    }
-                    SandboxOp::Restore { sandbox_path } => {
-                        crate::sandbox_state::restore(sandbox_path)
-                    }
-                };
-                match result {
-                    Ok(()) => {
-                        let mut merged = self.config.sandbox.clone().unwrap_or_default();
-                        crate::sandbox_state::merge_into(&mut merged);
-                        crate::tools::set_sandbox(Some(merged.clone()));
-                        self.config.sandbox = Some(merged.clone());
-                        // Keep the target snapshot in sync — this applier is the
-                        // one that *applies* sandbox state.
-                        self.app_state.update_config(|c| c.sandbox = Some(merged));
-                        let msg = match &op {
-                            SandboxOp::Add {
-                                host_path,
-                                sandbox_path,
-                                mode,
-                            } => {
-                                let m = if *mode == crate::config::BindMode::Rw {
-                                    "add_rw"
-                                } else {
-                                    "add_ro"
-                                };
-                                if sandbox_path.is_empty() {
-                                    format!("sandbox: {} {} (ok)", m, host_path)
-                                } else {
-                                    format!("sandbox: {} {} → {} (ok)", m, host_path, sandbox_path)
-                                }
-                            }
-                            SandboxOp::Remove { sandbox_path } => {
-                                format!("sandbox: removed {} (ok)", sandbox_path)
-                            }
-                            SandboxOp::Exclude { sandbox_path } => {
-                                format!("sandbox: excluded {} (ok)", sandbox_path)
-                            }
-                            SandboxOp::Restore { sandbox_path } => {
-                                format!("sandbox: restored {} (ok)", sandbox_path)
-                            }
-                        };
-                        self.config.output.display_text(&msg);
-                    }
-                    Err(e) => {
-                        self.config
-                            .output
-                            .display_text(&format!("sandbox error: {}", e));
-                    }
-                }
             }
             match action {
                 InputAction::MenuDone => {
                     // v2.5 menu committed: the node already wrote to `AppState`
-                    // (target self.config / control fields); the convergence step
+                    // (target config / control fields); the convergence step
                     // above applied them. No-op arm.
                 }
                 InputAction::Submit(input) => {
@@ -683,7 +684,7 @@ impl Interactive {
                     }
                     // Per-turn overrides (doc/model_settings_v2.md A.10).
                     //
-                    // `self.line_history` above took the RAW line, so recall shows the
+                    // `line_history` above took the RAW line, so recall shows the
                     // user what they typed including the overrides; from here on
                     // `input` is the text with the override lines removed, which is
                     // what is persisted, sent, and counted for context. Nothing is
@@ -756,8 +757,8 @@ impl Interactive {
                             .output
                             .display_plain("Usage: !<command> (capture output into context), or !!<command> (display only)");
                         } else {
-                            // Re-publish the resolved sandbox self.config immediately
-                            // before running the command. The self.config is held in a
+                            // Re-publish the resolved sandbox config immediately
+                            // before running the command. The config is held in a
                             // process-wide global that other tests (and other
                             // sessions) may mutate concurrently; pinning it here —
                             // with no await between this and `run_sandboxed`'s read
@@ -816,7 +817,7 @@ impl Interactive {
                     // (ui_draw_v2 R4).
                     self.config.output.display_committed_prompt(&input);
                     // Normal prompt — create the agent lazily on first use
-                    // (loop-side, applied self.config; published to the slot).
+                    // (loop-side, applied config; published to the slot).
                     if self.app_state.agent().is_none() {
                         match create_agent(self.config.clone()).await {
                             Ok(a) => self.app_state.activate_agent(Arc::from(a)),
@@ -828,7 +829,7 @@ impl Interactive {
                             }
                         }
                     }
-                    // Clone-out for this turn (lock rule 3: no self.guard across await).
+                    // Clone-out for this turn (lock rule 3: no guard across await).
                     let agent = self.app_state.agent();
                     let session = self.app_state.session();
                     // Single attempt + auto-retry, with the in-flight reader
@@ -836,7 +837,7 @@ impl Interactive {
                     // the turn's one key dispatcher wherever the turn is: inside
                     // `prompt()` while an attempt streams, by the back-off pump
                     // while a retry delay runs (`cancellable_sleep_pumped`) —
-                    // either way it fires the self.cancel signal, and the wait (or the
+                    // either way it fires the cancel signal, and the wait (or the
                     // stream) ends immediately, returning `Cancelled`.
                     // U4.2/U4.3: edit keys typed while the turn runs. The reader
                     // owns the sender; the receiver is bound for the whole turn so
@@ -874,7 +875,7 @@ impl Interactive {
                         let mut next_input: String = input.clone();
                         // The params this turn sends. They are the live ones with
                         // the typed overrides applied, and they are *carried*, not
-                        // applied to the live self.config — so a retry of the same
+                        // applied to the live config — so a retry of the same
                         // dispatch re-uses them automatically (the stripped text is
                         // already in `next_input`), while a synthetic re-prompt
                         // below resets them, since an override belongs to the
@@ -909,8 +910,8 @@ impl Interactive {
                                     &turn_params,
                                     // `zip`: the key branch exists only where there
                                     // is both a session to receive the key and a
-                                    // self.guard to stop the reader for it. Piped input
-                                    // has neither, and piped input with a self.guard
+                                    // guard to stop the reader for it. Piped input
+                                    // has neither, and piped input with a guard
                                     // has no reader, so there is no key either.
                                     self.prompt_session.as_mut().zip(self.guard.as_deref()).map(
                                         |(sess, g)| crate::repl::InTurnInput {
@@ -1074,7 +1075,7 @@ impl Interactive {
                                         // as a NEW user dispatch for this turn.
                                         turn.mark_new_dispatch();
                                     }
-                                    // Race window: self.cancel could fire after
+                                    // Race window: cancel could fire after
                                     // `cancellable_sleep_pumped` returned but
                                     // before `prompt()` clears its flag. Bail
                                     // out here so the retry respects `Esc`.
