@@ -1455,7 +1455,7 @@ impl SlashDotNode for TreeEditNode {
                 active_ids: Vec::new(),
             }));
         };
-        if !crate::agent::is_reaskable_entry(&session, &target_id).await {
+        if !crate::agent::compaction::is_reaskable_entry(&session, &target_id).await {
             return Ok(Rc::new(DataResponse {
                 rows: Vec::new(),
                 active_ids: Vec::new(),
@@ -1483,7 +1483,7 @@ impl SlashDotNode for TreeEditNode {
 
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
-        match crate::agent::reask_from_entry(&self.app_state, &target_id).await {
+        match crate::agent::compaction::reask_from_entry(&self.app_state, &target_id).await {
             Ok(()) => SubmitResult::Done(None),
             Err(msg) => SubmitResult::Done(Some(msg)),
         }
@@ -1681,7 +1681,7 @@ struct CompactStash {
     /// The session leaf when the draft was generated — `apply_branch_summary`
     /// refuses a moved leaf rather than summarizing the wrong span.
     source_leaf_id: Option<String>,
-    draft: crate::agent::CompactionDraft,
+    draft: crate::agent::compaction::CompactionDraft,
 }
 
 /// `prepare()` / `edit()` body shared by the compact and switch-summarize mode
@@ -1732,18 +1732,28 @@ async fn compact_prepare(
         }
     }
     let summary_mode = match plan.mode {
-        CompactMode::Manual => crate::agent::CompactSummaryMode::Manual,
-        CompactMode::TextOnly => crate::agent::CompactSummaryMode::TextOnly,
-        CompactMode::Prompt => crate::agent::CompactSummaryMode::Llm,
+        CompactMode::Manual => crate::agent::compaction::CompactSummaryMode::Manual,
+        CompactMode::TextOnly => crate::agent::compaction::CompactSummaryMode::TextOnly,
+        CompactMode::Prompt => crate::agent::compaction::CompactSummaryMode::Llm,
     };
     let generated = match plan.action {
         SummaryAction::Compact => {
-            crate::agent::generate_compaction(app_state, &target_id, summary_mode, plan.payload)
-                .await
+            crate::agent::compaction::generate_compaction(
+                app_state,
+                &target_id,
+                summary_mode,
+                plan.payload,
+            )
+            .await
         }
         SummaryAction::SwitchSummarize => {
-            crate::agent::generate_branch_summary(app_state, &target_id, summary_mode, plan.payload)
-                .await
+            crate::agent::compaction::generate_branch_summary(
+                app_state,
+                &target_id,
+                summary_mode,
+                plan.payload,
+            )
+            .await
         }
     };
     match generated {
@@ -1772,7 +1782,7 @@ fn edit_draft(
     action: SummaryAction,
     target_id: String,
     source_leaf_id: Option<String>,
-    mut draft: crate::agent::CompactionDraft,
+    mut draft: crate::agent::compaction::CompactionDraft,
 ) -> SubmitResult {
     match app_state.edit_text(&draft.summary, crate::editor::EditorMode::Edit) {
         Ok(text) => {
@@ -1830,11 +1840,12 @@ async fn compact_submit(
     };
     let applied = match action {
         SummaryAction::Compact => {
-            crate::agent::apply_compaction(app_state, &target_id, &draft).await
+            crate::agent::compaction::apply_compaction(app_state, &target_id, &draft).await
         }
         SummaryAction::SwitchSummarize => {
             let source = source_leaf_id.unwrap_or_default();
-            crate::agent::apply_branch_summary(app_state, &target_id, &source, &draft).await
+            crate::agent::compaction::apply_branch_summary(app_state, &target_id, &source, &draft)
+                .await
         }
     };
     match applied {
@@ -2700,11 +2711,11 @@ mod tests {
     fn switch_summarize_context_carries_the_digest() {
         // The point of the pi placement: the very next turn sees the digest.
         let (app_state, session) = spur_app_state();
-        let draft = crate::agent::CompactionDraft {
+        let draft = crate::agent::compaction::CompactionDraft {
             summary: "Tried the wrong approach".into(),
             tokens_before: 0,
         };
-        crate::agent::block_on_test(crate::agent::apply_branch_summary(
+        crate::agent::block_on_test(crate::agent::compaction::apply_branch_summary(
             &app_state, "u1", "a3", &draft,
         ))
         .expect("apply");
@@ -2731,14 +2742,14 @@ mod tests {
     #[test]
     fn switch_summarize_refuses_a_stale_leaf() {
         let (app_state, session) = spur_app_state();
-        let draft = crate::agent::CompactionDraft {
+        let draft = crate::agent::compaction::CompactionDraft {
             summary: "digest".into(),
             tokens_before: 0,
         };
         // The leaf moved since generation (here: we assert against a leaf that
         // is not the current one) — the apply refuses rather than summarizing
         // the wrong span.
-        let err = crate::agent::block_on_test(crate::agent::apply_branch_summary(
+        let err = crate::agent::block_on_test(crate::agent::compaction::apply_branch_summary(
             &app_state,
             "u1",
             "some-other-leaf",
@@ -2763,10 +2774,10 @@ mod tests {
         // Target ahead on the current branch: nothing was abandoned, so there
         // is nothing to summarize (pi skips the entry in the same case).
         let (app_state, _session) = spur_app_state();
-        let err = crate::agent::block_on_test(crate::agent::generate_branch_summary(
+        let err = crate::agent::block_on_test(crate::agent::compaction::generate_branch_summary(
             &app_state,
             "a3",
-            crate::agent::CompactSummaryMode::TextOnly,
+            crate::agent::compaction::CompactSummaryMode::TextOnly,
             "",
         ))
         .unwrap_err();
@@ -2780,10 +2791,10 @@ mod tests {
     #[test]
     fn switch_summarize_at_the_current_leaf_reports_an_error() {
         let (app_state, _session) = spur_app_state();
-        let err = crate::agent::block_on_test(crate::agent::generate_branch_summary(
+        let err = crate::agent::block_on_test(crate::agent::compaction::generate_branch_summary(
             &app_state,
             "a3",
-            crate::agent::CompactSummaryMode::TextOnly,
+            crate::agent::compaction::CompactSummaryMode::TextOnly,
             "",
         ))
         .unwrap_err();

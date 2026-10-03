@@ -384,9 +384,8 @@ mod tests {
     use super::*;
 
     // The window-pump tests need a long-running operation to pump during, and
-    // a retried summarization is the one that exists. `retry_summarization`
-    // moves to the compaction module in a later step; this import follows it.
-    use super::super::retry_summarization;
+    // a retried summarization is the one that exists.
+    use super::super::compaction::retry_summarization;
     use crate::settings::SettingsStore;
     use serial_test::serial;
 
