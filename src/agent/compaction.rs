@@ -27,8 +27,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use super::build::create_agent;
 use super::errors::{retry_budget, retry_delay_secs};
-use super::{create_agent, estimate_context_tokens, maybe_strip_reasoning, CodeAgent};
+use super::{estimate_context_tokens, maybe_strip_reasoning, CodeAgent};
 
 /// Summary mode for `/tree compact`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

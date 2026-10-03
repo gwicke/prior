@@ -11,13 +11,11 @@
 //! Nothing else depends on this module; [`run_interactive`] is the entry point
 //! `main` awaits, and it returns when the user quits.
 
+use crate::agent::build::{create_agent, effective_params, AgentConfig};
 use crate::agent::errors::{retry_budget, retry_delay_secs};
 use crate::agent::pumps::{cancellable_sleep_pumped, turn_backoff_pump};
 use crate::agent::status::resolved_context_limit;
-use crate::agent::{
-    build_session_ctx, create_agent, effective_params, ensure_session, record_reasoning_change,
-    AgentConfig, TurnPersistence,
-};
+use crate::agent::{build_session_ctx, ensure_session, record_reasoning_change, TurnPersistence};
 use crate::app_state::AppState;
 use crate::model_catalog;
 use crate::params;
@@ -1043,7 +1041,7 @@ pub async fn run_interactive(
 mod tests {
     use super::*;
 
-    use crate::agent::AgentConfig;
+    use crate::agent::build::AgentConfig;
     use serial_test::serial;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;

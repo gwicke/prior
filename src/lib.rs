@@ -56,7 +56,8 @@ pub use rig_core::client::{CompletionClient, ProviderClient};
 pub use rig_core::completion::CompletionModel;
 pub use rig_core::providers;
 
-pub use agent::{create_agent, load_agents_md, AgentConfig, CodeAgent};
+pub use agent::build::{create_agent, load_agents_md, AgentConfig};
+pub use agent::CodeAgent;
 pub use interactive::run_interactive;
 pub use output::{Confirmation, ConsoleOutput, LogOutput, NoOutput, Output, QuietOutput};
 

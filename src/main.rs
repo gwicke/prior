@@ -284,7 +284,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(ConsoleOutput::new(show_reasoning_handle.clone()))
     };
 
-    let system_message_extension = picocode::agent::load_agents_md();
+    let system_message_extension = picocode::load_agents_md();
     let persona_prompt = persona_name
         .as_ref()
         .and_then(|p| picocode::persona::get_persona(p));
