@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::build::create_agent;
-use super::errors::{retry_budget, retry_delay_secs};
+use super::errors::{retry_budget, retry_delay_ms};
 use super::{estimate_context_tokens, maybe_strip_reasoning, CodeAgent};
 
 /// Summary mode for `/tree compact`.
@@ -768,7 +768,7 @@ pub(crate) async fn apply_branch_summary(
 ///
 /// `build` produces the summarization request and returns the model's reply
 /// (or a classified `PicocodeError`). On a retryable failure it is re-invoked
-/// (previous `build` again) after `retry_delay_secs` seconds of
+/// (previous `build` again) after a `retry_delay_ms` back-off in
 /// [`cancellable_sleep_windowed`]; non-retryable errors and cancellation
 /// propagate out.
 ///
@@ -824,10 +824,9 @@ where
             }
             Some(Err(e)) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                let secs = retry_delay_secs(&e, consecutive_failures);
-                output.display_text(&format!("Error: {}. Retrying in {secs}s...", e));
-                let slept =
-                    cancellable_sleep_windowed(user_cancel, cancel_notify, secs, keys).await;
+                let ms = retry_delay_ms(&e, consecutive_failures);
+                output.display_text(&format!("Error: {}. Retrying in {}s...", e, ms / 1000));
+                let slept = cancellable_sleep_windowed(user_cancel, cancel_notify, ms, keys).await;
                 if !slept {
                     return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
                 }

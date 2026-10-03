@@ -7,7 +7,7 @@
 //! provider error arrives as a `CompletionError` wearing some transport's
 //! clothes, and this is the only place the shapes are unwrapped.
 //!
-//! [`retry_budget`] and [`retry_delay_secs`] are what the REPL applies to
+//! [`retry_budget`] and [`retry_delay_ms`] are what the REPL applies to
 //! whatever comes back. They live here rather than beside the loop because the
 //! policy is only meaningful against this taxonomy: which variants are
 //! retryable at all is decided by `PicocodeError::is_auto_retryable`, and the
@@ -64,7 +64,7 @@ pub(crate) fn retry_budget(e: &crate::PicocodeError) -> u8 {
     }
 }
 
-/// Back-off delay before the next retry attempt, in seconds.
+/// Back-off delay before the next retry attempt, in milliseconds.
 ///
 /// Policy: `2^(consecutive_failures - 1)`, no upper bound — the per-turn
 /// `retry_budget` (50) caps how many retries we will ever attempt, so the
@@ -84,18 +84,49 @@ pub(crate) fn retry_budget(e: &crate::PicocodeError) -> u8 {
 /// `metadata.retry_after_seconds`) is the **floor** when present — respect
 /// the provider's hint, then add our exponential growth on top by treating
 /// the hint as the starting base.
-pub(crate) fn retry_delay_secs(e: &crate::PicocodeError, consecutive_failures: u8) -> u64 {
+///
+/// # `PICOCODE_TEST_RETRY_BASE_MS`
+///
+/// The *base* of the no-hint schedule is overridable, in milliseconds, so the
+/// back-off tests in `tests/retry_backoff.rs` can exercise the growth and reset
+/// behaviour in milliseconds instead of sleeping out real seconds. Those tests
+/// spawn this binary and assert on the gaps between HTTP requests, so they
+/// cannot use `tokio::time::pause` the way an in-process test would.
+///
+/// The name is deliberately long and test-specific: a typo would have to be
+/// quite deliberate to land here. It only ever shortens a delay in a process
+/// that was explicitly started with it set, and a production run sets nothing.
+/// Only the no-hint branch reads it — a provider's `Retry-After` is a floor we
+/// must respect, so it is never scaled down.
+///
+/// Unset (or unparseable) means the production default: 1s.
+const TEST_RETRY_BASE_MS_VAR: &str = "PICOCODE_TEST_RETRY_BASE_MS";
+
+/// The no-hint base delay, in milliseconds. See [`TEST_RETRY_BASE_MS_VAR`].
+fn retry_base_ms() -> u64 {
+    match std::env::var(TEST_RETRY_BASE_MS_VAR) {
+        Ok(v) => v.trim().parse::<u64>().ok().filter(|ms| *ms > 0),
+        Err(_) => None,
+    }
+    .unwrap_or(1000)
+}
+
+pub(crate) fn retry_delay_ms(e: &crate::PicocodeError, consecutive_failures: u8) -> u64 {
+    let n = consecutive_failures.saturating_sub(1).min(63) as u32;
     // Provider hint floors the delay. If present, we use it as the base of
     // the exponential schedule: attempt 1 = `hint`, attempt 2 = `hint*2`,
     // …, attempt N = `hint * 2^(N-1)`. This respects upstream's request
     // while still growing on a string of consecutive 429s.
     if let Some(hint) = e.retry_after_secs() {
-        let n = consecutive_failures.saturating_sub(1).min(63) as u32;
-        return hint.saturating_mul(1u64 << n);
+        return hint.saturating_mul(1000).saturating_mul(1u64 << n);
     }
-    // No provider hint: pure 2^(n-1) seconds, no cap.
-    let n = consecutive_failures.saturating_sub(1).min(63) as u32;
-    1u64 << n
+    // No provider hint: pure 2^(n-1) multiples of the base, no cap.
+    //
+    // Milliseconds, not seconds, so a sub-second base is representable: a test
+    // that set a 30ms base and this returned whole seconds would truncate every
+    // delay to 0 and silently delete the back-off it is trying to observe.
+    // Production's base is 1000ms, so the real schedule is unchanged.
+    retry_base_ms().saturating_mul(1u64 << n)
 }
 
 /// Classify a `StreamingError` into a structured `PicocodeError` variant.
@@ -398,6 +429,7 @@ mod tests {
 
     use crate::PicocodeError;
     use rig_core::message::Message;
+    use serial_test::serial;
     // ---- Error classification tests ----
     //
     // The auto-retry / error-formatting pipeline in `run_interactive`
@@ -688,24 +720,77 @@ mod tests {
         );
     }
 
+    // `#[serial]`: reads the no-hint base, which
+    // `retry_base_override_scales_the_no_hint_schedule_only` overrides via a
+    // process-global env var.
     #[test]
+    #[serial]
     fn retry_delay_grows_as_pow2_without_cap() {
         // No provider hint: pure 2^(n-1), no ceiling. The per-turn budget
         // (50) is the implicit cap on how many attempts we will ever make.
         // attempt=1 → 1s, 2 → 2s, 3 → 4s, … (delay is `1 << (n-1)` seconds).
+        // Milliseconds: production's 1000ms base, so these are the same
+        // schedule as the old whole-second numbers.
         let e = PicocodeError::LlmTransport("reset".into());
-        assert_eq!(super::retry_delay_secs(&e, 1), 1);
-        assert_eq!(super::retry_delay_secs(&e, 2), 2);
-        assert_eq!(super::retry_delay_secs(&e, 3), 4);
-        assert_eq!(super::retry_delay_secs(&e, 4), 8);
-        assert_eq!(super::retry_delay_secs(&e, 10), 512);
+        assert_eq!(super::retry_delay_ms(&e, 1), 1000);
+        assert_eq!(super::retry_delay_ms(&e, 2), 2000);
+        assert_eq!(super::retry_delay_ms(&e, 3), 4000);
+        assert_eq!(super::retry_delay_ms(&e, 4), 8000);
+        assert_eq!(super::retry_delay_ms(&e, 10), 512_000);
         // Saturating at u64: still finite, no panic. We never reach 50 in
         // practice (budget caps it), but saturating_pow keeps the math safe.
-        let big = super::retry_delay_secs(&e, 50);
+        let big = super::retry_delay_ms(&e, 50);
         assert!(big > 0);
     }
 
+    /// The no-hint base is overridable so the pty-level back-off tests can run
+    /// in milliseconds, and — the part worth pinning — a provider `Retry-After`
+    /// is never scaled down by it. A hint is a floor we owe the provider, so
+    /// shrinking it would be us ignoring an explicit rate-limit request.
+    // `#[serial]`: sets and removes a process-global env var. Any sibling that
+    // reads `retry_delay_ms` without a hint must not overlap it.
     #[test]
+    #[serial]
+    fn retry_base_override_scales_the_no_hint_schedule_only() {
+        let no_hint = crate::PicocodeError::LlmTransport("reset".into());
+        let hinted = crate::PicocodeError::LlmRateLimited {
+            retry_after_secs: Some(4),
+        };
+
+        // Default: the production schedule, exactly as before the override.
+        assert_eq!(super::retry_base_ms(), 1000);
+        assert_eq!(super::retry_delay_ms(&no_hint, 1), 1000);
+        assert_eq!(super::retry_delay_ms(&hinted, 1), 4000);
+
+        // Scoped to this test's own process: it sets and removes the variable
+        // around every call rather than leaving it set, so it cannot leak into a
+        // sibling test in the same binary.
+        // Safety: single-threaded within this test — no other thread reads it.
+        std::env::set_var(super::TEST_RETRY_BASE_MS_VAR, "20");
+        assert_eq!(super::retry_base_ms(), 20);
+        // Growth shape is preserved, just scaled: 20ms, 40ms, 80ms.
+        assert_eq!(super::retry_delay_ms(&no_hint, 1), 20);
+        assert_eq!(super::retry_delay_ms(&no_hint, 2), 40);
+        // A hint is untouched by the override.
+        assert_eq!(super::retry_delay_ms(&hinted, 1), 4000);
+        assert_eq!(super::retry_delay_ms(&hinted, 2), 8000);
+
+        // Nonsense and zero fall back to the default rather than disabling or
+        // zeroing the back-off — a typo must not silently remove the delay.
+        std::env::set_var(super::TEST_RETRY_BASE_MS_VAR, "not-a-number");
+        assert_eq!(super::retry_base_ms(), 1000);
+        std::env::set_var(super::TEST_RETRY_BASE_MS_VAR, "0");
+        assert_eq!(super::retry_base_ms(), 1000);
+        std::env::remove_var(super::TEST_RETRY_BASE_MS_VAR);
+        assert_eq!(super::retry_base_ms(), 1000);
+        assert_eq!(super::retry_delay_ms(&no_hint, 1), 1000);
+    }
+
+    // `#[serial]`: reads the no-hint base, which
+    // `retry_base_override_scales_the_no_hint_schedule_only` overrides via a
+    // process-global env var.
+    #[test]
+    #[serial]
     fn retry_delay_respects_retry_after_as_floor_then_doubles() {
         // When the provider reports Retry-After, it is the FLOOR of the
         // first attempt; subsequent attempts double from there. This
@@ -714,13 +799,18 @@ mod tests {
         let e = PicocodeError::LlmRateLimited {
             retry_after_secs: Some(5),
         };
-        assert_eq!(super::retry_delay_secs(&e, 1), 5);
-        assert_eq!(super::retry_delay_secs(&e, 2), 10);
-        assert_eq!(super::retry_delay_secs(&e, 3), 20);
-        assert_eq!(super::retry_delay_secs(&e, 4), 40);
+        assert_eq!(super::retry_delay_ms(&e, 1), 5000);
+        assert_eq!(super::retry_delay_ms(&e, 2), 10_000);
+        assert_eq!(super::retry_delay_ms(&e, 3), 20_000);
+        assert_eq!(super::retry_delay_ms(&e, 4), 40_000);
     }
 
+    // `#[serial]`: reads the process-global `PICOCODE_TEST_RETRY_BASE_MS`, which
+    // `retry_base_override_scales_the_no_hint_schedule_only` sets and removes
+    // around each of its calls. Overlapping them makes that test see this one's
+    // 20ms base and fail on the expected 1s.
     #[test]
+    #[serial]
     fn retry_delay_for_malformed_tool_call_uses_provider_floor_or_one() {
         // Malformed tool calls carry no provider hint (the model is the
         // source of the error), so the first delay is 1s — fast feedback
@@ -729,9 +819,9 @@ mod tests {
             tool_name: "edit".into(),
             parse_error: "expected `,` or `}`".into(),
         };
-        assert_eq!(super::retry_delay_secs(&e, 1), 1);
-        assert_eq!(super::retry_delay_secs(&e, 2), 2);
-        assert_eq!(super::retry_delay_secs(&e, 3), 4);
+        assert_eq!(super::retry_delay_ms(&e, 1), 1000);
+        assert_eq!(super::retry_delay_ms(&e, 2), 2000);
+        assert_eq!(super::retry_delay_ms(&e, 3), 4000);
     }
 
     #[test]

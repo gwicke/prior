@@ -12,7 +12,7 @@
 //! `main` awaits, and it returns when the user quits.
 
 use crate::agent::build::{create_agent, effective_params, AgentConfig};
-use crate::agent::errors::{retry_budget, retry_delay_secs};
+use crate::agent::errors::{retry_budget, retry_delay_ms};
 use crate::agent::pumps::{cancellable_sleep_pumped, turn_backoff_pump};
 use crate::agent::status::resolved_context_limit;
 use crate::agent::{build_session_ctx, ensure_session, record_reasoning_change, TurnPersistence};
@@ -854,14 +854,16 @@ impl Interactive {
                         // original `input` is already in the session,
                         // so re-sending it would duplicate the user's
                         // request.
-                        let secs = retry_delay_secs(&cause, 1);
-                        self.config
-                            .output
-                            .display_text(&format!("Error: {}. Retrying in {secs}s...", cause));
+                        let ms = retry_delay_ms(&cause, 1);
+                        self.config.output.display_text(&format!(
+                            "Error: {}. Retrying in {}s...",
+                            cause,
+                            ms / 1000
+                        ));
                         let slept = cancellable_sleep_pumped(
                             &self.config.user_cancel,
                             &self.config.cancel_notify,
-                            secs,
+                            ms,
                             turn_backoff_pump(
                                 &mut self.prompt_session,
                                 &mut in_turn_keys,
@@ -929,14 +931,16 @@ impl Interactive {
                     // retry's prompt instead of `input`.
                     Err(e) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
-                        let secs = retry_delay_secs(&e, consecutive_failures);
-                        self.config
-                            .output
-                            .display_text(&format!("Error: {}. Retrying in {secs}s...", e));
+                        let ms = retry_delay_ms(&e, consecutive_failures);
+                        self.config.output.display_text(&format!(
+                            "Error: {}. Retrying in {}s...",
+                            e,
+                            ms / 1000
+                        ));
                         let slept = cancellable_sleep_pumped(
                             &self.config.user_cancel,
                             &self.config.cancel_notify,
-                            secs,
+                            ms,
                             turn_backoff_pump(
                                 &mut self.prompt_session,
                                 &mut in_turn_keys,

@@ -228,13 +228,13 @@ pub(crate) fn turn_backoff_pump<'a>(
 pub(crate) async fn cancellable_sleep_pumped(
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
-    secs: u64,
+    ms: u64,
     mut pump: Option<TurnPump<'_>>,
 ) -> bool {
-    if secs == 0 {
+    if ms == 0 {
         return true;
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
     loop {
         // Prose's wake-up for this iteration, resolved *before* the select
         // rather than inside the timer's async block — the same contract
@@ -356,13 +356,13 @@ pub(crate) fn pump_window_key(
 pub(crate) async fn cancellable_sleep_windowed(
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
-    secs: u64,
+    ms: u64,
     keys: Option<&dyn WindowKeySource>,
 ) -> bool {
-    if secs == 0 {
+    if ms == 0 {
         return true;
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return true,
@@ -462,7 +462,7 @@ mod tests {
             output.as_ref(),
         );
         let started = std::time::Instant::now();
-        let completed = cancellable_sleep_pumped(&cancel, &notify, 60, Some(pump)).await;
+        let completed = cancellable_sleep_pumped(&cancel, &notify, 60_000, Some(pump)).await;
         assert!(
             !completed,
             "a queued Esc must end the back-off, not the deadline"
@@ -501,7 +501,7 @@ mod tests {
             output.as_ref(),
         );
         let started = std::time::Instant::now();
-        let completed = cancellable_sleep_pumped(&cancel, &notify, 1, Some(pump)).await;
+        let completed = cancellable_sleep_pumped(&cancel, &notify, 1_000, Some(pump)).await;
         assert!(
             completed,
             "a plain key must not be mistaken for the cancel signal"
@@ -528,7 +528,7 @@ mod tests {
             notify2.notify_one();
         });
         let started = std::time::Instant::now();
-        let completed = cancellable_sleep_pumped(&cancel, &notify, 60, None).await;
+        let completed = cancellable_sleep_pumped(&cancel, &notify, 60_000, None).await;
         let _ = handle.await;
         assert!(
             !completed,
