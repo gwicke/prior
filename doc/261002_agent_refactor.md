@@ -1,10 +1,10 @@
 # `src/agent.rs` — refactor
 
-Status: **in progress.** `agent.rs` 11,889 → 2,448. Done: step 1
+Status: **in progress.** `agent.rs` 11,889 → 1,685. Done: step 1
 (`run_interactive` → `src/interactive.rs`), 2a `errors`, 2b `pumps`, 2c
-`status`, 2d `msglog`, 2e `replay`, 2f `compaction`, 2g `transcript`, 2h `build`.
-Remaining: 2i `turn` + `mod.rs`, step 3 `Interactive` struct. Deferred by design:
-`CodeAgent::prompt` (§4).
+`status`, 2d `msglog`, 2e `replay`, 2f `compaction`, 2g `transcript`, 2h
+`build`, 2i `turn`. Remaining: step 3 `Interactive` struct. `CodeAgent::prompt`
+landed in `agent/turn.rs` as a pure move (§4).
 
 ## 1. What the file is
 
