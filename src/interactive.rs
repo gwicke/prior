@@ -11,10 +11,11 @@
 //! Nothing else depends on this module; [`run_interactive`] is the entry point
 //! `main` awaits, and it returns when the user quits.
 
+use crate::agent::errors::{retry_budget, retry_delay_secs};
 use crate::agent::{
     build_session_ctx, cancellable_sleep_pumped, create_agent, effective_params, ensure_session,
-    record_reasoning_change, resolved_context_limit, retry_budget, retry_delay_secs,
-    turn_backoff_pump, AgentConfig, TurnPersistence,
+    record_reasoning_change, resolved_context_limit, turn_backoff_pump, AgentConfig,
+    TurnPersistence,
 };
 use crate::app_state::AppState;
 use crate::model_catalog;
