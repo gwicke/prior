@@ -354,7 +354,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
                 return Err(malformed_marker_error(mk, bad));
             }
             return Err(ParseError(
-                "an `@@@OLD` section is missing its `@@@END` marker".to_string(),
+                "a `@@@NEW` section is missing its `@@@END` marker".to_string(),
             ));
         }
 
