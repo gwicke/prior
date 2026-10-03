@@ -229,9 +229,9 @@ impl Interactive {
         if let Some(r) = repl.as_mut() {
             let _ = r.start();
             // First screen: a one-line hint
-            config
-                .output
-                .display_plain("Welcome to picocode - type `/` for details.");
+            let ref output = config.output;
+            output.display_text("Welcome to picocode - type `/` for details.");
+            output.display_separator();
         }
 
         // Persistent session storage.
