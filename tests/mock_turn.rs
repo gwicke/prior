@@ -382,7 +382,6 @@ fn run_turn_typing(
          otherwise spend the whole deadline here and capture a mid-turn screen"
     );
     thread::sleep(Duration::from_millis(1200));
-    thread::sleep(Duration::from_millis(1200));
 
     let data = bytes.lock().unwrap().clone();
     dumps.write(&format!("{label}.bin"), &data);
