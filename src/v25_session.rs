@@ -516,7 +516,7 @@ impl SlashDotNode for SessionResumeNode {
         let replay = if replay_arg.is_empty() {
             (default, false)
         } else {
-            crate::agent::parse_replay_len_arg(&replay_arg, default)
+            crate::agent::replay::parse_replay_len_arg(&replay_arg, default)
         };
         let out = self.app_state.with_config(|c| c.output.clone());
         let qualified = self.app_state.with_config(|c| c.qualified_model_id());

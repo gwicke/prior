@@ -1729,7 +1729,7 @@ impl Repl {
                     if let Some(s) = app_state.session() {
                         let _ = io::stdout().write_all(b"\x1b[0J");
                         let _ = io::stdout().flush();
-                        crate::agent::replay_last_turn_silent(&s, output).await;
+                        crate::agent::replay::replay_last_turn_silent(&s, output).await;
                     }
                 }
                 let _ = output.cursor_row();

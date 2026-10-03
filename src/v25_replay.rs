@@ -52,7 +52,7 @@ impl SlashDotNode for ReplayNode {
         // showed. Session and output are both reachable via the slot.
         let out = self.app_state.with_config(|c| c.output.clone());
         match self.app_state.session() {
-            Some(s) => crate::agent::handle_replay(&arg, &s, out.as_ref()).await,
+            Some(s) => crate::agent::replay::handle_replay(&arg, &s, out.as_ref()).await,
             None => out.display_text("No active session to replay"),
         }
         SubmitResult::Done(None)
