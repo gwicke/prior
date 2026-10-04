@@ -237,11 +237,12 @@ the replacement text
 
 /// The batch policy sentence that follows the syntax: atomicity, and the
 /// `path:LINE` anchor the model needs for repeated text.
-const BLOCK_POLICY: &str = "Each block MUST specify its file path, and SHOULD \
-provide the 1-based start line number hint, e.g. from `read` or `grep`. \
-Line numbers greatly reduce the chance of edit failures, \
-especially when there are similar content lines in other parts of the file. Blocks \
-editing the same file are executed all-or-nothing. Multi-file batches are supported.";
+const BLOCK_POLICY: &str = "Each block MUST specify its file path in its header line,
+and SHOULD provide the 1-based start line number hint, e.g. from `read` or `grep`. \
+Line numbers greatly reduce the chance of edit failures, especially when there are similar \
+content lines in other parts of the file. Line anchors also reduce context needs: \
+For single line edits, just one line of @@@OLD content (e.g. from grep) will normally succeed. \
+Blocks editing the same file are executed all-or-nothing. Multi-file batches are supported.";
 
 /// Static tool facade for `edit`. Hand-written (rather than `#[rig_tool]`) so
 /// the args deserializer can select a variant from the raw JSON and accept the
@@ -3795,10 +3796,9 @@ mod edit_args_wire_tests {
         }
         // The block syntax and the policy sentence live in one const each, so
         // the description and the parameter cannot drift apart.
-        assert_eq!(
-            desc.matches("@@@OLD").count(),
-            1,
-            "the syntax example must appear once in the description: {desc}"
+        assert!(
+            desc.matches("@@@OLD").count() >= 1,
+            "the syntax example must appear at least once in the description: {desc}"
         );
         assert!(
             desc.contains(&format!("\n{BLOCK_SYNTAX}\n")),
