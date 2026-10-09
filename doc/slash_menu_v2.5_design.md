@@ -72,14 +72,17 @@ command nodes.
 customizes data and submission.** A command is one `impl SlashDotNode`.
 
 `data(&mut self, epoch: u64, path_args: &PathArgs) -> DataResult | DataError`
+
 - The rows this node contributes to its parent's listing. Default: none.
 - Return `Rc<DataResponse>` so the parent can check `Rc::ptr_eq` for
   cheap "nothing changed" signals. Caching decisions are the handler's.
 
 `submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult`
+
 - The leaf accept behavior. Default: none (node is a listing; Enter drills).
 
 `prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult`
+
 - Optional confirm hook; default = `submit()`. An override runs the prep
   phase — may open an external editor (via a callback captured at
   construction), precompute, stage the payload — then returns
@@ -87,6 +90,7 @@ customizes data and submission.** A command is one `impl SlashDotNode`.
   (§2), accessible to `submit()` on yea.
 
 `header(&mut self, path_args: &PathArgs) -> Vec<String>`
+
 - Non-selectable header lines (replaces v2 DetailProvider). Default: none.
   The engine truncates based on terminal size (§6).
 
@@ -127,9 +131,12 @@ restore ladder, render-plan emission. Encapsulated by the
 `NodeEntry` newtype:
 
 - the host implements `SlashDotNode` (data, submit, prepare, header);
-- `NodeEntry` wraps a `dyn SlashDotNode` and adds children, cursor cache, data cache;
-- `NodeEntry::node_traverse()` and `NodeEntry::node_data()` are internal methods on the struct;
-- the host never sees `NodeEntry` — it interacts only through `SlashDotMenu` / `SlashDotHandle`.
+- `NodeEntry` wraps a `dyn SlashDotNode` and adds children, cursor cache, data
+  cache;
+- `NodeEntry::node_traverse()` and `NodeEntry::node_data()` are internal methods
+  on the struct;
+- the host never sees `NodeEntry` — it interacts only through `SlashDotMenu` /
+  `SlashDotHandle`.
 
 ### Per-node state and the epoch
 
@@ -147,10 +154,10 @@ All caches invalidate on **epoch** increment: a menu-invocation counter the
 host increments on menu open. Multi-stage flows (compaction) key on their own
 decision points, not epoch alone.
 
-The host gets a `SlashDotHandle` from `SlashDotMenu::get_handle()` (bumps epoch).
-The handle exposes `eval_prompt(prompt, key) -> MenuResult` — the only way for
-the host to interact with the menu. The epoch is passed to `SlashDotNode` methods
-so nodes can invalidate their own caches.
+The host gets a `SlashDotHandle` from `SlashDotMenu::get_handle()` (bumps
+epoch). The handle exposes `eval_prompt(prompt, key) -> MenuResult` — the only
+way for the host to interact with the menu. The epoch is passed to
+`SlashDotNode` methods so nodes can invalidate their own caches.
 
 ### Traversal algorithm
 
@@ -162,11 +169,12 @@ returns the child's result unmodified (pass-through, §2 "Parent→child
 API"); leaves own the newprompt.
 
 **Listing node (children, no submit):**
+
 - Refresh row cache via `node_data()` on each child; check `Rc::ptr_eq`.
 - No child ID match (or child ID with trailing space):
-  - `no key` / `MoveCursor`: render listing `MenuResult::Continue(RenderPlan, prompt)`.
-    Rendering a listing that is not *exactly* one valid ID clears
-    `should_restore_view_args` (§5.1).
+  - `no key` / `MoveCursor`: render listing
+    `MenuResult::Continue(RenderPlan, prompt)`. Rendering a listing that is not
+    *exactly* one valid ID clears `should_restore_view_args` (§5.1).
   - `Tab`: replace the level's view args with the cursor row's ID and a
     trailing space (drill), set this node's `should_restore_view_args`,
     append the ID to `PathArgs.ids`, recurse into that child with the ID
@@ -181,6 +189,7 @@ API"); leaves own the newprompt.
     the child level's listing is hidden. No recursion.
 
 **Leaf node (no children, submit handler):**
+
 - Display `header()` via RenderPlan.
 - `Enter`: run `prepare()` → default returns `submit()`. If `Prepared`,
   render confirm dialog; subsequent `Enter` calls `submit()` (yea) or Esc
@@ -195,6 +204,7 @@ movement shares unchanged content — only marker positions (`selected_row`,
 ### Parent→child API (implementation-internal, private)
 
 `NodeEntry::node_traverse(&mut self, epoch, HostKey, PathArgs) -> MenuResult`
+
 - `HostKey`: `Tab`, `Enter`, `Esc`, `MoveCursor(n)`. The node at the end
   of the traversal handles all logical key actions.
 - `PathArgs.ids`: traversal path — the IDs drilled so far, one entry per
@@ -207,6 +217,7 @@ movement shares unchanged content — only marker positions (`selected_row`,
   `NewPath` rewrites the buffer and traversal restarts at root.
 
 `NodeEntry::node_data(&mut self, epoch, PathArgs) -> DataResult | DataError`
+
 - Parses args from suffix, calls `SlashDotNode::data()`.
 
 ### Borrow discipline
@@ -242,18 +253,18 @@ its own row source and submit handler.
 
 ### Reference shapes
 
-| Command | Shape |
-| --- | --- |
-| `/set` | Mixed: static setting children + dynamic child reusing model rows with own submit. |
-| `/model` | Single dynamic child (catalog rows), field metadata on level, leaf = select model. |
-| `/sandbox` | Mixed: static `add` row + dynamic binding rows. |
-| `/tree` | Dynamic child (tree rows) + static action level after id. |
+|Command   |Shape                                                              |
+|----------|-------------------------------------------------------------------|
+|`/set`|Mixed: static setting children + dynamic child reusing model rows with own submit.|
+|`/model`|Single dynamic child (catalog rows), field metadata on level, leaf = select model.|
+|`/sandbox`|Mixed: static `add` row + dynamic binding rows.                    |
+|`/tree`   |Dynamic child (tree rows) + static action level after id.          |
 
 ---
 
 ## 3. Path grammar (per level, recursive)
 
-```
+```text
 [parent tokens] [fuzzy search terms] [dot modifiers] [selection token]
 ```
 
@@ -296,7 +307,7 @@ prompt); fs-style completion is a modifier behavior (§7), not a level signal.
   otherwise Tab-drill.
 - **Esc**: back navigation via §5.1 restore ladder.
 - **Drill**: Tab/Enter replaces the level's view args with the cursored ID
-  + trailing space and recurses into that child; the previous view args
+  - trailing space and recurses into that child; the previous view args
   are remembered in per-node state for the §5.1 restore.
 - **Edit invalidation**: scoped to the edited level; trailing-space removal
   is navigation, not edit.
@@ -319,7 +330,7 @@ boolean (set when this node drills into a child, consumed once).
      focused row, so the user can immediately add filter terms or
      re-drill).
    - Replace the ID in the prompt with this node's stored `view_args`
-     (e.g. `/model claude-4 ` → Esc → `/model sonnet`).
+     (e.g. `/model claude-4` → Esc → `/model sonnet`).
    - Clear `should_restore_view_args`.
    Without the boolean (the ID was typed by hand, e.g. `/model` letter
    by letter), nothing is rewritten — the level renders its own listing
@@ -361,22 +372,28 @@ The `*` row comes from a uniform mechanism — host never computes it:
 One mechanism, dot-prefixed, at every level (D3). Static children remain bare
 words. Multi-word modes → hyphenated tokens (R8-1).
 
-| Property | Notes |
-| --- | --- |
-| `key` | Dot token name (`.sort`, `.prompt`, `.ro`, …). |
-| value kind | `string` / `number` only. |
-| enum set | Orthogonal to kind; constrains completion only; backend validates at accept. |
-| completion source | `dataset-derived` (default, lazy extraction), `dynamic handler` (fs paths), `default value`. |
-| front-end / back-end | Front-end: engine-applied over cached rows (§7.1). Back-end: passed to live-filter handler. `data()` controls which. |
+- **Property**: `key`
+  - **Notes**: Dot token name (`.sort`, `.prompt`, `.ro`, …).
+- **Property**: value kind
+  - **Notes**: `string` / `number` only.
+- **Property**: enum set
+  - **Notes**: Orthogonal to kind; constrains completion only; backend validates
+    at accept.
+- **Property**: completion source
+  - **Notes**: `dataset-derived` (default, lazy extraction), `dynamic handler`
+    (fs paths), `default value`.
+- **Property**: front-end / back-end
+  - **Notes**: Front-end: engine-applied over cached rows (§7.1). Back-end:
+    passed to live-filter handler. `data()` controls which.
 
 ### 7.1 Field filtering & sorting
 
-| Token | Semantics |
-| --- | --- |
-| `.field:value` | Exact match (string field). |
-| `.field:>v` / `.field:<v` | Numeric comparison; `>=`/`<=` likewise. Drops missing. |
-| `.sort:field` | Direction defaults to field's `default_dir`. |
-| `.sort:>field` / `.sort:<field` | Explicit desc/asc prefix; `<>` stripped during fuzzy. |
+|Token                          |Semantics                                     |
+|-------------------------------|----------------------------------------------|
+|`.field:value`                 |Exact match (string field).                   |
+|`.field:>v` / `.field:<v`|Numeric comparison; `>=`/`<=` likewise. Drops missing.|
+|`.sort:field`                  |Direction defaults to field's `default_dir`.  |
+|`.sort:>field` / `.sort:<field`|Explicit desc/asc prefix; `<>` stripped during fuzzy.|
 
 Rules: filters AND, apply before sort; fuzzy narrows on top. Single sort
 (later `.sort:` overrides). Missing values: excluded by filters, sort last.
@@ -448,35 +465,55 @@ the host applies only control flow / terminal / transcript (§12).
 
 ## 10. Per-command target shape
 
-| Command | Shape |
-| --- | --- |
-| `/` | Static root list; children = command nodes. |
-| `/model` | Dynamic child (catalog); field modifiers (§7.1); leaf = select model. |
-| `/thinking` | Enum value child (`off\|low\|med\|high`); shared leaf = SetThinking. |
-| `/persona` | Dynamic child with dataset/enum string values. |
-| `/set` | Mixed: static setting children + dynamic `default_model` child (§2.1). |
-| `/sandbox` | Mixed: static `add` + dynamic bindings (§2.1). |
-| `/session` | Dynamic → static action children → confirm on delete (§9). |
-| `/tree` | Dynamic → static actions (`switch`/`compact`); `llm` = confirm (§9). |
-| `/compact` | Leaf: `NewPath` → `/tree <id> compact `. |
-| `/stat` | `header()` = stats; no submit. |
-| `/replay` | `header()` = help; `submit()` dispatches replay. |
+|Command    |Shape                                                             |
+|-----------|------------------------------------------------------------------|
+|`/`        |Static root list; children = command nodes.                       |
+|`/model`|Dynamic child (catalog); field modifiers (§7.1); leaf = select model.|
+|`/thinking`|Enum value child (`off\|low\|med\|high`); shared leaf = SetThinking.|
+|`/persona` |Dynamic child with dataset/enum string values.                    |
+|`/set` |Mixed: static setting children + dynamic `default_model` child (§2.1).|
+|`/sandbox` |Mixed: static `add` + dynamic bindings (§2.1).                    |
+|`/session` |Dynamic → static action children → confirm on delete (§9).        |
+|`/tree`  |Dynamic → static actions (`switch`/`compact`); `llm` = confirm (§9).|
+|`/compact` |Leaf: `NewPath` → `/tree <id> compact `.                          |
+|`/stat`    |`header()` = stats; no submit.                                    |
+|`/replay`  |`header()` = help; `submit()` dispatches replay.                  |
 
 ---
 
 ## 11. Traceability of resolved questions
 
-| Question | Resolution |
-| --- | --- |
-| Q1–Q8 | Decisions D1–D8: surface changes for uniformity; `<…>` dropped (D2); dot-modifiers (D3); stat/replay in scope (D4); tables generalized (D6); dataset completion default (D7); fs completion via modifier (D8). |
-| R8-1–R8-8 | Single-token labels; structural terminators; confirm two-phase submit (R8-3 → §9); headers from node (R8-4); accept clears filter + traversal memory (R8-5); one-shot vs live-filter + front/back-end modifiers (R8-6); selection space-free, values may contain spaces (R8-7); compact as leaf-returns-path (R8-8). |
-| Node model | `SlashDotNode` trait + internal `NodeEntry` wrapper; non-overridable traversal on `NodeEntry`; epoch-cached per-node state; providers on nodes, not side tables (§2, §8). |
-| Merged child sets | Ordered union of child rows; field metadata on parent; per-child submit dispatch (§2.1). |
-| Cursoring | Up/down moves cursor only; Tab/Enter drill (ID + space into prompt); per-node view_args memory + §5.1 restore on the way up. |
-| `*` marker | Always from application context, never typed selection (§5.2). |
-| Esc | Per-level restore ladder: restore (ID→cursor + view_args if drilled) → refinement → space → root clear (§5.1). |
-| Confirm | Handler-local state machine; engine dialog service (§9). |
-| Coordinator | Eliminated — host epoch wrapper (§2, §12). |
+- **Question**: Q1–Q8
+  - **Resolution**: Decisions D1–D8: surface changes for uniformity; `<…>`
+    dropped (D2); dot-modifiers (D3); stat/replay in scope (D4); tables
+    generalized (D6); dataset completion default (D7); fs completion via
+    modifier (D8).
+- **Question**: R8-1–R8-8
+  - **Resolution**: Single-token labels; structural terminators; confirm
+    two-phase submit (R8-3 → §9); headers from node (R8-4); accept clears
+    filter + traversal memory (R8-5); one-shot vs live-filter + front/back-end
+    modifiers (R8-6); selection space-free, values may contain spaces (R8-7);
+    compact as leaf-returns-path (R8-8).
+- **Question**: Node model
+  - **Resolution**: `SlashDotNode` trait + internal `NodeEntry` wrapper;
+    non-overridable traversal on `NodeEntry`; epoch-cached per-node state;
+    providers on nodes, not side tables (§2, §8).
+- **Question**: Merged child sets
+  - **Resolution**: Ordered union of child rows; field metadata on parent;
+    per-child submit dispatch (§2.1).
+- **Question**: Cursoring
+  - **Resolution**: Up/down moves cursor only; Tab/Enter drill (ID + space into
+    prompt); per-node view_args memory + §5.1 restore on the way up.
+- **Question**: `*` marker
+  - **Resolution**: Always from application context, never typed selection
+    (§5.2).
+- **Question**: Esc
+  - **Resolution**: Per-level restore ladder: restore (ID→cursor + view_args if
+    drilled) → refinement → space → root clear (§5.1).
+- **Question**: Confirm
+  - **Resolution**: Handler-local state machine; engine dialog service (§9).
+- **Question**: Coordinator
+  - **Resolution**: Eliminated — host epoch wrapper (§2, §12).
 
 ---
 
@@ -497,15 +534,19 @@ payload inside nodes; epoch bump invalidates on menu open. No `Arc`s needed.
 **Host**: terminal I/O, table rendering, plan painting, submit-result
 translation → `InputAction`. Non-slash affordances (`!shell`, path completion).
 
-| Layer | Owns |
-| --- | --- |
-| Engine (default impl) | Node tree + traversal (grammar, cursor caches, Esc restore ladder, view_args state, render plan); confirm dialog service; key decisions |
-| Node instances | Application data — `data()` / `submit()` / `prepare()`; mutations via shared handles |
-| Host | App state, terminal I/O, rendering plan, `SubmitResult` → `InputAction` |
+- **Layer**: Engine (default impl)
+  - **Owns**: Node tree + traversal (grammar, cursor caches, Esc restore ladder,
+    view_args state, render plan); confirm dialog service; key decisions
+- **Layer**: Node instances
+  - **Owns**: Application data — `data()` / `submit()` / `prepare()`; mutations
+    via shared handles
+- **Layer**: Host
+  - **Owns**: App state, terminal I/O, rendering plan, `SubmitResult` →
+    `InputAction`
 
-**Dispatch**: one `ActiveOverlay::Menu`. Host loop: `node_traverse(epoch, buffer)` →
-apply `MenuResult` (buffer / submit). Per-command code lives only in node
-impls, never as overlay arms.
+**Dispatch**: one `ActiveOverlay::Menu`. Host loop:
+`node_traverse(epoch, buffer)` → apply `MenuResult` (buffer / submit).
+Per-command code lives only in node impls, never as overlay arms.
 
 ---
 

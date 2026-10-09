@@ -1,11 +1,11 @@
 # B3 — one separator rule, one render path
 
-**Status:** plan for approval — nothing implemented yet
-**Part of:** `doc/row_accounting.md` §6, phase B (the row-counting phase). A1 (the
+**Status:** plan for approval — nothing implemented yet **Part of:**
+`doc/row_accounting.md` §6, phase B (the row-counting phase). A1 (the
 composition) waits on this: the blank line a block gets above it is a row, and
-the frame's placement is decided against the block boundary, so a separator
-rule that moves under the composition makes the composition wrong in a way
-that is hard to see.
+the frame's placement is decided against the block boundary, so a separator rule
+that moves under the composition makes the composition wrong in a way that is
+hard to see.
 
 Four sub-commits, each independently revertible, in this order. The first is a
 characterization suite: it changes no behavior and its job is to *tell us what
@@ -17,11 +17,16 @@ the current behavior is* before anything moves it.
 
 **The separator state** is three booleans in three places:
 
-| State | Set by | Read by |
-|---|---|---|
-| `last_blank` (`set_blank` / `ended_blank`) | ~12 call sites | every block's leading-blank decision |
-| `last_was_tool` (`note_tool` / `note_text`) | `paint_panel`, the streaming boundary | `stream_text` (blank after a tool), `display_tool_call` (blank between tool calls) |
-| `dim_on` (`ensure_dim`) | the thinking boundary | the thinking boundary |
+- **State**: `last_blank` (`set_blank` / `ended_blank`)
+  - **Set by**: ~12 call sites
+  - **Read by**: every block's leading-blank decision
+- **State**: `last_was_tool` (`note_tool` / `note_text`)
+  - **Set by**: `paint_panel`, the streaming boundary
+  - **Read by**: `stream_text` (blank after a tool), `display_tool_call` (blank
+    between tool calls)
+- **State**: `dim_on` (`ensure_dim`)
+  - **Set by**: the thinking boundary
+  - **Read by**: the thinking boundary
 
 So "does this block need a blank line above it?" is answered from partial
 state, differently at each of ~12 sites. The subtle part is the *ordering*:
@@ -124,11 +129,19 @@ impl ConsoleOutput {
 
 The rules, each one a line of today's behavior that the matrix pins:
 
-| After | Before a `Reasoning` | before a `Text`/`Message` | before `ToolCall`/`ToolResult` |
-|---|---|---|---|
-| anything | none | blank, unless the last write already ended blank | blank |
-| a tool block | — | blank | blank |
-| a block that ended blank | none | none | none |
+- **After**: anything
+  - **Before a `Reasoning`**: none
+  - **before a `Text`/`Message`**: blank, unless the last write already ended
+    blank
+  - **before `ToolCall`/`ToolResult`**: blank
+- **After**: a tool block
+  - **Before a `Reasoning`**: —
+  - **before a `Text`/`Message`**: blank
+  - **before `ToolCall`/`ToolResult`**: blank
+- **After**: a block that ended blank
+  - **Before a `Reasoning`**: none
+  - **before a `Text`/`Message`**: none
+  - **before `ToolCall`/`ToolResult`**: none
 
 `dim_on` keeps its own field — it is the *style* state, and the dim reset has
 to be written after the boundary blank. The ordering moves into `begin_block`,
@@ -262,13 +275,13 @@ necessary."*
 
 ## 3. What each commit is gated on
 
-| Commit | Gate |
-|---|---|
-| B3a | the matrix exists and its failures are reported (not fixed) |
-| B3b | full suite green; no behavior change to assert |
-| B3c | full suite green; the row-accounting tests no longer need `begin_response_inner(true)`; live-vs-replay equality is the new gate |
-| B3d | the matrix, unchanged, still green — the rule has to reproduce today's structure exactly, including the cases that were already odd |
-| B3e | full suite green; the two `emit_commit` sites unchanged in behavior |
+|Commit|Gate                                                                   |
+|------|-----------------------------------------------------------------------|
+|B3a   |the matrix exists and its failures are reported (not fixed)            |
+|B3b   |full suite green; no behavior change to assert                         |
+|B3c|full suite green; the row-accounting tests no longer need `begin_response_inner(true)`; live-vs-replay equality is the new gate|
+|B3d|the matrix, unchanged, still green — the rule has to reproduce today's structure exactly, including the cases that were already odd|
+|B3e   |full suite green; the two `emit_commit` sites unchanged in behavior    |
 
 ## 4. Decisions I need
 

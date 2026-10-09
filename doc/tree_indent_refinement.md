@@ -24,7 +24,7 @@ The change requested was:
 
 The layout as implemented, in full:
 
-```
+```text
 spine(v)        = the child c maximising (height(c), write_index(c))
 indent(v)       = number of spur edges on the path from the root
 row_column(v)   = indent(v) * SPUR_STEP + (2 if assistant else 0)
@@ -52,7 +52,7 @@ margin is exactly where the useful text is.
 Measured on a small session (main flow `u1 → a1 → u2 → a2 → u3 → a3`, one
 2-row experiment spur off `a1`, one 2-row side quest off `u2`):
 
-```
+```text
 indent=0 kick off
 indent=2 reply 1
 indent=4 experiment prompt      <- spur
@@ -84,16 +84,16 @@ the main line**, not distance from the root.
 
 Everything in this section is the code as it stands.
 
-| Piece | Location |
-|---|---|
-| Row building | `src/v25_tree.rs:340` `flatten_turns` |
-| Fork indent rule | `src/v25_tree.rs:361-366` |
-| Row indent rule (turn) | `src/v25_tree.rs:377-381` |
-| Invisible-entry descent | `src/v25_tree.rs:368-374` |
-| Indent → leading spaces | `src/v25_tree.rs:627` `format!("{:indent$}{}", "", r.desc, …)` |
-| Tree snapshot source | `src/agent.rs:2144` → `AppState::raw_tree` (`src/app_state.rs:361`) |
-| Sibling order | insertion order from `SessionIndex::children` (`src/session/types.rs:537` `build_subtree`); only the **root** vec is re-sorted, by active path (`build_tree`, `src/session/types.rs:512`) |
-| Caching | `TreeListNode::data()` caches on `Arc::ptr_eq` of the tree + leaf id |
+|Piece                  |Location                                              |
+|-----------------------|------------------------------------------------------|
+|Row building           |`src/v25_tree.rs:340` `flatten_turns`                 |
+|Fork indent rule       |`src/v25_tree.rs:361-366`                             |
+|Row indent rule (turn) |`src/v25_tree.rs:377-381`                             |
+|Invisible-entry descent|`src/v25_tree.rs:368-374`                             |
+|Indent → leading spaces|`src/v25_tree.rs:627` `format!("{:indent$}{}", "", r.desc, …)`|
+|Tree snapshot source|`src/agent.rs:2144` → `AppState::raw_tree` (`src/app_state.rs:361`)|
+|Sibling order|insertion order from `SessionIndex::children` (`src/session/types.rs:537` `build_subtree`); only the **root** vec is re-sorted, by active path (`build_tree`, `src/session/types.rs:512`)|
+|Caching  |`TreeListNode::data()` caches on `Arc::ptr_eq` of the tree + leaf id|
 
 The two rules, verbatim:
 
@@ -120,12 +120,13 @@ knowing before changing anything:
 
 Rendering side: the indent is baked into the row `description` as leading
 spaces, the column is `wrap(false)` (`tree_listing_columns`,
-`src/v25_tree.rs:479`), and `Table::fit` (`crates/slashdot_menu/src/table.rs:380`)
-truncates with an ellipsis from the left, keeping the leading spaces. Indent
-therefore eats directly out of the text budget, and fuzzy-match snippet
-extraction (`extract_snippet`, `table.rs:419`) runs over the *padded* cell,
-so a deep spur also gets a narrower snippet window. Lower indents are
-strictly better on this path — another argument for the change.
+`src/v25_tree.rs:479`), and `Table::fit`
+(`crates/slashdot_menu/src/table.rs:380`) truncates with an ellipsis from the
+left, keeping the leading spaces. Indent therefore eats directly out of the text
+budget, and fuzzy-match snippet extraction (`extract_snippet`, `table.rs:419`)
+runs over the *padded* cell, so a deep spur also gets a narrower snippet window.
+Lower indents are strictly better on this path — another argument for the
+change.
 
 ---
 
@@ -143,7 +144,7 @@ strictly better on this path — another argument for the change.
 
 The whole change is one line of policy:
 
-```
+```text
 old:  every child of a forking node        → parent column + STEP
 new:  the spine child of a forking node   → parent column + 0
       every other child                   → parent column + STEP
@@ -164,11 +165,18 @@ is not a heuristic trade-off — it is a choice of objective.
 *height vs size has nothing to do with visibility.* There are three
 independent axes and they are easy to conflate:
 
-| Axis | Question | Where it is handled |
-|---|---|---|
-| **visibility** | Which entries produce a row at all? | `entry_display_label` — tool results, tool-call-only assistant segments, `SessionInfo`/`Leaf` are **invisible**; user text, assistant text, `[MODEL]`, `[THINK]`, `[SUMMARY]`, `[COMPACT]` are visible. |
-| **height** | How *deep* is the subtree? (longest chain) | §4.1 |
-| **size** | How *many rows* does the subtree hold? (total mass) | §4.2 |
+- **Axis**: **visibility**
+  - **Question**: Which entries produce a row at all?
+  - **Where it is handled**: `entry_display_label` — tool results,
+    tool-call-only assistant segments, `SessionInfo`/`Leaf` are **invisible**;
+    user text, assistant text, `[MODEL]`, `[THINK]`, `[SUMMARY]`, `[COMPACT]`
+    are visible.
+- **Axis**: **height**
+  - **Question**: How *deep* is the subtree? (longest chain)
+  - **Where it is handled**: §4.1
+- **Axis**: **size**
+  - **Question**: How *many rows* does the subtree hold? (total mass)
+  - **Where it is handled**: §4.2
 
 Both height and size are measured **over the visible projection** — a spur
 made only of tool results has height 0 and size 0, and never out-ranks a
@@ -219,7 +227,7 @@ Both metrics are counted in **listing rows** — the `FlatRow`s
 Height and size differ because one is a **max** over downward paths and the
 other is a **sum** over all nodes:
 
-```
+```text
 h(v) = vis(v) + max over children c of h(c)        (0 if no children)
 s(v) = vis(v) + Σ      over children c of s(c)
 ```
@@ -239,7 +247,7 @@ different spines. Session: after `reply 1`, one branch continues as a
 5-row chain (`main 1 … main 3`), the other is a 7-row bush of three
 2-row experiments (`explore → try 1/2/3`).
 
-```
+```text
 === height-primary (longest path leftmost) ===   === size-primary (most rows leftmost) ===
 indent=0 kick off                               indent=0 kick off
 indent=2 reply 1                                indent=2 reply 1
@@ -357,11 +365,11 @@ entirely if the key order is `(height, recency)`.
 Pick, for every node, the child that continues the main line; the others
 become spurs.
 
-* **A1 — `(height, recency)`** ← **chosen** (see §4.4): longest path, else
+- **A1 — `(height, recency)`** ← **chosen** (see §4.4): longest path, else
   the newest branch. Total order, so nothing else is needed.
-* **A2 — `(height, active, recency)`** — the reader-oriented variant:
+- **A2 — `(height, active, recency)`** — the reader-oriented variant:
   longest path, else the branch you are on, else the newest.
-* **A3 — `(height, size, recency, active)`** — the earlier recommendation;
+- **A3 — `(height, size, recency, active)`** — the earlier recommendation;
   keeps the min-total-indent guarantee, demoted in favour of `recency`.
 
 Tie-break mechanics (in order, first difference wins):
@@ -393,7 +401,7 @@ Properties:
 Measured on the §1 session (spur step 4, the same scale as the old branch
 step):
 
-```
+```text
 indent=0 kick off
 indent=2 reply 1
 indent=4 experiment prompt      <- spur, right
@@ -479,7 +487,8 @@ comparison per child — the `active_path: &HashSet<String>` that
 `flatten_turns` already receives is threaded in and `best` becomes
 `(height, active, index, id)`. Variant A3 additionally carries a `size`
 map and inserts `size(child)` into the key. Nothing else differs.
-```
+
+```text
 
 and in `flatten_turns` (`src/v25_tree.rs:340`) replace the fork rule:
 
@@ -517,11 +526,15 @@ sketched, to match the file's stack-safety convention.
 
 Choice of `SPUR_STEP`:
 
-| Step | Effect |
-|---|---|
-| **4 (recommended)** | Same scale as today's fork step; keeps the spur column visually distinct from the assistant +2 cue (2). A level-1 spur starts at 4, a level-2 at 8. |
-| 2 | Denser; a level-1 spur's first column (2) coincides with the assistant reply column, which reads as "part of the turn above". |
-| 3 | Middle ground; breaks the even-column rhythm of the +2 cue. |
+- **Step**: **4 (recommended)**
+  - **Effect**: Same scale as today's fork step; keeps the spur column visually
+    distinct from the assistant +2 cue (2). A level-1 spur starts at 4, a
+    level-2 at 8.
+- **Step**: 2
+  - **Effect**: Denser; a level-1 spur's first column (2) coincides with the
+    assistant reply column, which reads as "part of the turn above".
+- **Step**: 3
+  - **Effect**: Middle ground; breaks the even-column rhythm of the +2 cue.
 
 `SPUR_STEP = 4` also means a two-level spur lands exactly where a two-level
 fork lands today, so muscle memory transfers.
@@ -537,7 +550,7 @@ otherwise.
 Trade-off, measured on the same session with the leaf moved into the
 2-row experiment spur:
 
-```
+```text
 === Variant A (longest path) ===
 indent=0 kick off            indent=0 kick off
 indent=2 reply 1             indent=2 reply 1
@@ -657,7 +670,7 @@ gave **736 passed, 1 failed** — `tree_with_model_changes_indent_render`,
 the only test that pinned the old fork rule by name. That is the whole
 behaviour change, and it is not a bug:
 
-```
+```text
 row 4: indent=0 "[MODEL] openai/gpt-4o"      (mc1, fork point)
 row 5: indent=4 "[MODEL] openai/gpt-4o"      (mc2 — now a spur)
 row 6: indent=4 "[MODEL] anthropic/claude-3" (mc3 — now a spur)
@@ -787,13 +800,27 @@ scope for this change.
 
 ## 8. Implementation — done
 
-| Step | File | Change |
-|---|---|---|
-| 1 ✅ | `src/v25_tree.rs` | Added `SPUR_STEP` + `spine_children()` (iterative post-order, `HashSet<&str>` out, key `(height, slice index)`) |
-| 2 ✅ | `src/v25_tree.rs` | `flatten_turns`: dropped `is_branch`/`child_indent`, added the `child_indent` closure, used it at both push sites (the invisible-entry descent and the normal one) |
-| 3 ✅ | `src/v25_tree.rs` | `tree_with_model_changes_indent_render` updated to the spine layout (see §6) |
-| 4 ✅ | `src/v25_tree.rs` | Nine tests added — the list below, plus `spine_indent_survives_render_plan` |
-| 5 ✅ | `doc/slashdot/tree_design.md` | §Indentation rewritten to the spine rule, with the properties and the pointer back to this document |
+- **Step**: 1 ✅
+  - **File**: `src/v25_tree.rs`
+  - **Change**: Added `SPUR_STEP` + `spine_children()` (iterative post-order,
+    `HashSet<&str>` out, key `(height, slice index)`)
+- **Step**: 2 ✅
+  - **File**: `src/v25_tree.rs`
+  - **Change**: `flatten_turns`: dropped `is_branch`/`child_indent`, added the
+    `child_indent` closure, used it at both push sites (the invisible-entry
+    descent and the normal one)
+- **Step**: 3 ✅
+  - **File**: `src/v25_tree.rs`
+  - **Change**: `tree_with_model_changes_indent_render` updated to the spine
+    layout (see §6)
+- **Step**: 4 ✅
+  - **File**: `src/v25_tree.rs`
+  - **Change**: Nine tests added — the list below, plus
+    `spine_indent_survives_render_plan`
+- **Step**: 5 ✅
+  - **File**: `doc/slashdot/tree_design.md`
+  - **Change**: §Indentation rewritten to the spine rule, with the properties
+    and the pointer back to this document
 
 Not touched: `src/session/types.rs` (`build_tree`, sibling order),
 `AppState::raw_tree`, the row/field plumbing, the engine.
@@ -867,19 +894,43 @@ fn row_indents(resp: &DataResponse) -> Vec<(String, usize)> {
 
 Recorded from review of this document:
 
-| # | Question | Decision |
-|---|---|---|
-| 1 | Primary key — `height` or `size`? | **`height`.** It is the only variant that guarantees the shortening property the change exists to create (§4.3). |
-| 2 | Secondary key — `size` or `recency`? | **`recency`** (newest branch wins exact height ties). Gives up the min-total-indent guarantee; the cost is bounded to exact height ties (§4.4). |
-| 3 | Active path — tie-break only, or full priority (Option B)? | **Tie-break only**, and *not* after `recency`: with recency keyed on slice index the key is already a total order, so a trailing `active` key can never fire. Either drop it (A1) or put it in front (A2). **Dropped** — see the open question below. |
-| 4 | Step — 4 or 2? | **4.** Same scale as the old fork step; keeps the spur column distinct from the assistant +2 cue. |
-| 5 | Row order — chronological or spine-first (Option C)? | **Chronological.** The tree structure determines the indent column only; early forks keep alternating vertically in blocks, with the indent saying which line is the long one. |
-| 6 | Markers (`▸`, `depth` field) in this change? | **No.** Deferred and merged with Option E (box drawing) into one coherent follow-up design. |
-| 7 | Recursion policy | **Apply the same key at every node** (already implied by the bottom-up pass): the first level in from the margin holds the longest top-level branches, and spurs shorten the further right you go. |
+- **#**: 1
+  - **Question**: Primary key — `height` or `size`?
+  - **Decision**: **`height`.** It is the only variant that guarantees the
+    shortening property the change exists to create (§4.3).
+- **#**: 2
+  - **Question**: Secondary key — `size` or `recency`?
+  - **Decision**: **`recency`** (newest branch wins exact height ties). Gives up
+    the min-total-indent guarantee; the cost is bounded to exact height ties
+    (§4.4).
+- **#**: 3
+  - **Question**: Active path — tie-break only, or full priority (Option B)?
+  - **Decision**: **Tie-break only**, and *not* after `recency`: with recency
+    keyed on slice index the key is already a total order, so a trailing
+    `active` key can never fire. Either drop it (A1) or put it in front (A2).
+    **Dropped** — see the open question below.
+- **#**: 4
+  - **Question**: Step — 4 or 2?
+  - **Decision**: **4.** Same scale as the old fork step; keeps the spur column
+    distinct from the assistant +2 cue.
+- **#**: 5
+  - **Question**: Row order — chronological or spine-first (Option C)?
+  - **Decision**: **Chronological.** The tree structure determines the indent
+    column only; early forks keep alternating vertically in blocks, with the
+    indent saying which line is the long one.
+- **#**: 6
+  - **Question**: Markers (`▸`, `depth` field) in this change?
+  - **Decision**: **No.** Deferred and merged with Option E (box drawing) into
+    one coherent follow-up design.
+- **#**: 7
+  - **Question**: Recursion policy
+  - **Decision**: **Apply the same key at every node** (already implied by the
+    bottom-up pass): the first level in from the margin holds the longest
+    top-level branches, and spurs shorten the further right you go.
 
 So the layout function is, in full:
 
-```
+```text
 spine(v) = the child c maximising (height(c), write_index(c))     // A1
 indent(v) = number of spur edges on the path from the root        // × SPUR_STEP
 row_column(v) = indent(v) + (2 if assistant else 0)

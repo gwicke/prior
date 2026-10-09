@@ -1,11 +1,12 @@
 # Rig 0.40+ migration assessment
 
-Status: **Implemented** against the unreleased git HEAD (`87f3f5b7`, 2026-07-18) via
-`[patch.crates-io]` → `https://github.com/gwicke/rig.git` (rev `87f3f5b7`), with
-`rig-core`/`rig-derive` bumped to `0.40`. Goal: upgrade `rig-core` from `0.38.2`
-to the unreleased HEAD to fix the "reasoning-only turns look like missing
-responses" issue more cleanly, and pick up the refined hooks/tools/caching API.
-Findings below are grounded in the actual `rig/` source.
+Status: **Implemented** against the unreleased git HEAD (`87f3f5b7`, 2026-07-18)
+via `[patch.crates-io]` → `https://github.com/gwicke/rig.git` (rev `87f3f5b7`),
+with `rig-core`/`rig-derive` bumped to `0.40`. Goal: upgrade `rig-core` from
+`0.38.2` to the unreleased HEAD to fix the "reasoning-only turns look like
+missing responses" issue more cleanly, and pick up the refined
+hooks/tools/caching API. Findings below are grounded in the actual `rig/`
+source.
 
 **Fork note (temporary):** We are currently tracking a vendored copy of `rig`
 via `[patch.crates-io]` in `Cargo.toml` (→ `https://github.com/gwicke/rig.git`)
@@ -56,6 +57,7 @@ released 0.40.0 the migration is a different shape than the HEAD plan.
 ## 2. How 0.40 fixes the reasoning/history issue
 
 ### Root cause (recap from `doc/streaming_mode.md` §Phase 5)
+
 picocode persists `resp.history()` (rig `Message`s that include `Reasoning`)
 and feeds it back next turn via `with_history(...)`. The model therefore sees
 its own prior reasoning and, after a reasoning-heavy turn, continues reasoning
@@ -63,14 +65,16 @@ instead of emitting a text reply → a reasoning-only turn that reads as "no
 response."
 
 ### What 0.40 changes
+
 The shared OpenAI-compatible history sanitizer **removes reasoning content and
 then drops assistant messages left without text**:
 
-- `sanitize_plain_text_history` (`rig/crates/rig-core/src/providers/openai/completion/mod.rs:1661`)
-  does `object.remove("reasoning_content")` and `object.remove("tool_calls")`
-  for assistant messages, then `retain`s only assistant messages whose
-  `content` is a non-empty string. A pure-reasoning turn (content empty,
-  reasoning in `reasoning_content` which was stripped) is therefore dropped.
+- `sanitize_plain_text_history`
+  (`rig/crates/rig-core/src/providers/openai/completion/mod.rs:1661`) does
+  `object.remove("reasoning_content")` and `object.remove("tool_calls")` for
+  assistant messages, then `retain`s only assistant messages whose `content` is
+  a non-empty string. A pure-reasoning turn (content empty, reasoning in
+  `reasoning_content` which was stripped) is therefore dropped.
 - CHANGELOG (`rig/CHANGELOG.md`) line 228: *"(moonshot) reasoning-only assistant
   history turns are no longer preserved: the shared conversion drops assistant
   messages with neither text nor tool calls. Reasoning attached to text or
@@ -83,6 +87,7 @@ openrouter), a reasoning-only turn is **not** sent back to the model. The loop
 stops without any picocode-side reasoning stripping.
 
 ### Scope / caveat
+
 - **Anthropic keeps `thinking` blocks** (reasoning round-trips as part of the
   API), so the loop may *persist* for Anthropic unless we also strip reasoning
   from history there. The earlier "strip reasoning from persisted history"
@@ -96,12 +101,28 @@ stops without any picocode-side reasoning stripping.
 
 ## 3. Context caching in 0.40
 
-| Capability | 0.38 | 0.40 | Notes |
-|---|---|---|---|
-| Anthropic automatic caching | `with_automatic_caching()` | `with_automatic_caching()` + `with_automatic_caching_1h()` (`anthropic/completion.rs:1649`, `:1665`) | Preserved; up to 4 `cache_control` markers. |
-| OpenAI chat / OpenRouter prompt caching | `with_prompt_caching()` | same (`openrouter/completion.rs:1514`, `anthropic/completion.rs:1610`) | Preserved. |
-| OpenAI **Responses API** cache params | not present | `AdditionalParameters.prompt_cache_key` / `prompt_cache_retention` (`openai/responses_api/mod.rs:1659`) | From #1830. No typed builder; set via `AgentBuilder::additional_params(serde_json::to_value(AdditionalParameters { prompt_cache_key: Some(...), prompt_cache_retention: Some(...), .. })?.into())`. The "draft a wrapper" idea is feasible through `additional_params`. |
-| Streaming usage shape | narrowed to OpenAI `Usage` | generic over provider payload (`StreamingCompletionResponse<U>`) | DeepSeek cache hit/miss + Mistral cached-token counters survive streaming (CHANGELOG line 222). |
+- **Capability**: Anthropic automatic caching
+  - **0.38**: `with_automatic_caching()`
+  - **0.40**: `with_automatic_caching()` + `with_automatic_caching_1h()`
+    (`anthropic/completion.rs:1649`, `:1665`)
+  - **Notes**: Preserved; up to 4 `cache_control` markers.
+- **Capability**: OpenAI chat / OpenRouter prompt caching
+  - **0.38**: `with_prompt_caching()`
+  - **0.40**: same (`openrouter/completion.rs:1514`,
+    `anthropic/completion.rs:1610`)
+  - **Notes**: Preserved.
+- **Capability**: OpenAI **Responses API** cache params
+  - **0.38**: not present
+  - **0.40**: `AdditionalParameters.prompt_cache_key` / `prompt_cache_retention`
+    (`openai/responses_api/mod.rs:1659`)
+  - **Notes**: From #1830. No typed builder; set via
+    `AgentBuilder::additional_params(serde_json::to_value(AdditionalParameters { prompt_cache_key: Some(...), prompt_cache_retention: Some(...), .. })?.into())`.
+    The "draft a wrapper" idea is feasible through `additional_params`.
+- **Capability**: Streaming usage shape
+  - **0.38**: narrowed to OpenAI `Usage`
+  - **0.40**: generic over provider payload (`StreamingCompletionResponse<U>`)
+  - **Notes**: DeepSeek cache hit/miss + Mistral cached-token counters survive
+    streaming (CHANGELOG line 222).
 
 Our thinking-level mapping already uses `AgentBuilder::additional_params`, so
 adding Responses-API cache params is purely additive.
@@ -110,11 +131,12 @@ adding Responses-API cache params is purely additive.
 
 > **Scope note.** The subsections below (§4.1–§4.5) describe the API at **HEAD**
 > (post-0.40). The **released `v0.40.0`** differs in three material ways — see
-> **§4.7** for the exact `v0.40.0` shape. If we target the released tag (which is
-> what the question is about), the migration is a *different* (and in some spots
-> smaller) change than the HEAD plan.
+> **§4.7** for the exact `v0.40.0` shape. If we target the released tag (which
+> is what the question is about), the migration is a *different* (and in some
+> spots smaller) change than the HEAD plan.
 
 ### 4.1 Agent execution call-site (rename, mechanical)
+
 `StreamingPromptRequest` keeps `history()`, `max_turns()`, `add_hook()` and
 `IntoFuture` (`streaming.rs:299`, `:319`, `:342`, `:1565`), but the old names
 are renamed:
@@ -142,18 +164,21 @@ let mut stream = self.agent.runner(input)
     .await?;
 ```
 
-`AgentRunner::stream` returns the same `Stream<Item = Result<MultiTurnStreamItem<R>, StreamingError>>`
+`AgentRunner::stream` returns the same
+`Stream<Item = Result<MultiTurnStreamItem<R>, StreamingError>>`
 (`runner.rs:1485`), and `StreamingChat::stream_chat` is also available
 (`completion.rs:~720`) but takes history by value (no caller mutation), so our
 manual history write-back stays.
 
-> **Released `v0.40.0` differs:** `StreamingPromptRequest` has **no** `history()`
-> / `with_history` method. Pass history via `agent.stream_chat(input, prior)`
-> (the `StreamingChat` trait), which internally calls `.history(chat_history)`.
-> So the 0.40.0 call-site is `stream_chat(input, prior).add_hook(h).max_turns(n).await`
-> — `stream_prompt(...).with_history(...)` does not compile on 0.40.0.
+> **Released `v0.40.0` differs:** `StreamingPromptRequest` has **no**
+> `history()` / `with_history` method. Pass history via
+> `agent.stream_chat(input, prior)` (the `StreamingChat` trait), which
+> internally calls `.history(chat_history)`. So the 0.40.0 call-site is
+> `stream_chat(input, prior).add_hook(h).max_turns(n).await` —
+> `stream_prompt(...).with_history(...)` does not compile on 0.40.0.
 
 ### 4.2 Final response type + history accessor
+
 - `MultiTurnStreamItem::FinalResponse(FinalResponse)` →
   `FinalResponse(PromptResponse)` (`streaming.rs:47`–`138`).
 - `resp.history()` → **`resp.messages()`** (`prompt_request/mod.rs:501`);
@@ -161,19 +186,42 @@ manual history write-back stays.
 - Our `prompt` write-back (`*h = fh`) is unchanged except the accessor rename.
 
 ### 4.3 Hooks: `PromptHook` → `AgentHook`
+
 `AgentHook` (`hook.rs:916`) replaces `PromptHook` with **event-specific**
 methods and renamed action enums. Our `LoggingHook` must implement it:
 
-| 0.38 `PromptHook` | 0.40 `AgentHook` | Action type |
-|---|---|---|
-| `on_completion_call(&self, &Message, &[Message]) -> HookAction` | `on_completion_call(&self, &HookContext, CompletionCall) -> CompletionCallAction` | `Continue` / `Stop(String)` |
-| `on_completion_response(...)` | `on_completion_response(&self, &HookContext, CompletionResponse) -> ObservationAction` | `Continue` / `Stop(String)` |
-| `on_tool_call(&self, name, id, internal_id, args) -> ToolCallHookAction` | `on_tool_call(&self, &HookContext, ToolCall) -> ToolCallAction` | `Run` / `Stop(String)` / `Rewrite` |
-| `on_tool_result(...)` | `on_tool_result(&self, &HookContext, ToolResultEvent) -> ToolResultAction` | `Keep` / `Stop(String)` |
-| — | `on_model_turn_finished(... ModelTurnFinished) -> ModelTurnAction` | `Continue` / `Stop(String)` / `Retry` |
-| — | `on_text_delta(... TextDelta) -> ObservationAction` | new |
-| — | `on_tool_call_delta(...)` | new |
-| — | `on_invalid_tool_call(... InvalidToolCallContext) -> Option<InvalidToolCallAction>` | new |
+- **0.38 `PromptHook`**:
+  `on_completion_call(&self, &Message, &[Message]) -> HookAction`
+  - **0.40 `AgentHook`**:
+    `on_completion_call(&self, &HookContext, CompletionCall) -> CompletionCallAction`
+  - **Action type**: `Continue` / `Stop(String)`
+- **0.38 `PromptHook`**: `on_completion_response(...)`
+  - **0.40 `AgentHook`**:
+    `on_completion_response(&self, &HookContext, CompletionResponse) -> ObservationAction`
+  - **Action type**: `Continue` / `Stop(String)`
+- **0.38 `PromptHook`**:
+  `on_tool_call(&self, name, id, internal_id, args) -> ToolCallHookAction`
+  - **0.40 `AgentHook`**:
+    `on_tool_call(&self, &HookContext, ToolCall) -> ToolCallAction`
+  - **Action type**: `Run` / `Stop(String)` / `Rewrite`
+- **0.38 `PromptHook`**: `on_tool_result(...)`
+  - **0.40 `AgentHook`**:
+    `on_tool_result(&self, &HookContext, ToolResultEvent) -> ToolResultAction`
+  - **Action type**: `Keep` / `Stop(String)`
+- **0.38 `PromptHook`**: —
+  - **0.40 `AgentHook`**:
+    `on_model_turn_finished(... ModelTurnFinished) -> ModelTurnAction`
+  - **Action type**: `Continue` / `Stop(String)` / `Retry`
+- **0.38 `PromptHook`**: —
+  - **0.40 `AgentHook`**: `on_text_delta(... TextDelta) -> ObservationAction`
+  - **Action type**: new
+- **0.38 `PromptHook`**: —
+  - **0.40 `AgentHook`**: `on_tool_call_delta(...)`
+  - **Action type**: new
+- **0.38 `PromptHook`**: —
+  - **0.40 `AgentHook`**:
+    `on_invalid_tool_call(... InvalidToolCallContext) -> Option<InvalidToolCallAction>`
+  - **Action type**: new
 
 Our user-cancel bridge (`HookAction::terminate("cancelled by user")`) maps to
 returning e.g. `CompletionCallAction::Stop("cancelled by user".into())` (and
@@ -185,29 +233,35 @@ the analogous `Stop` for `on_tool_call` / `on_completion_response` /
 > **Released `v0.40.0` differs:** `AgentHook` is **event-based**, not
 > method-per-event. It is `pub trait AgentHook<M>` (generic over `M`) with
 > `fn on_event(&self, &HookContext, StepEvent<'_, M>) -> impl Future<Output = Flow>`
-> + `fn observes(&self, StepEventKind) -> bool` (hook.rs:1151). `Flow` is the
+>
+> - `fn observes(&self, StepEventKind) -> bool` (hook.rs:1151). `Flow` is the
 > action enum (`Continue` / `Terminate` / `Skip` / `PatchRequest` / …,
 > hook.rs:905). So `LoggingHook` for 0.40.0 is:
-> ```rust
-> impl<M: CompletionModel> AgentHook<M> for LoggingHook {
->     fn observes(&self, k: StepEventKind) -> bool {
->         matches!(k, StepEventKind::ToolCall | StepEventKind::ToolResult
->                     | StepEventKind::CompletionResponse)
->     }
->     async fn on_event(&self, _ctx: &HookContext, ev: StepEvent<'_, M>) -> Flow {
->         match ev {
->             StepEvent::ToolCall { tool_name, args, .. } => { display_tool_call(tool_name, args); Flow::Continue }
->             StepEvent::ToolResult { tool_name, raw_result, .. } => { display_tool_result(tool_name, raw_result); Flow::Continue }
->             _ => Flow::Continue,
->         }
->     }
-> }
-> ```
+>
+```rust
+impl<M: CompletionModel> AgentHook<M> for LoggingHook {
+    fn observes(&self, k: StepEventKind) -> bool {
+        matches!(k, StepEventKind::ToolCall | StepEventKind::ToolResult
+                    | StepEventKind::CompletionResponse)
+    }
+    async fn on_event(&self, _ctx: &HookContext, ev: StepEvent<'_, M>) -> Flow {
+        match ev {
+            StepEvent::ToolCall { tool_name, args, .. } => {
+                display_tool_call(tool_name, args); Flow::Continue }
+            StepEvent::ToolResult { tool_name, raw_result, .. } => {
+                display_tool_result(tool_name, raw_result); Flow::Continue }
+            _ => Flow::Continue,
+        }
+    }
+}
+```
+>
 > Cancel = `Flow::Terminate` when `user_cancel` is set. This is conceptually
 > closer to the 0.38 `PromptHook` (single dispatch) than to HEAD's
 > method-per-event form.
 
 ### 4.4 Tools: `Tool::call` signature
+
 `Tool::call` gains a `ToolContext` (`tool/mod.rs:175`):
 
 ```rust
@@ -226,13 +280,14 @@ is the normalized error type. `Guard<T>` only needs the new
 (`ReadFile`, `WriteFile`, …) update with rig.
 
 > **Released `v0.40.0` differs:** `Tool::call` is **unchanged** — still
-> `fn call(&self, args: Self::Args) -> impl Future<...>` (tool/mod.rs:159). There
-> is no `ToolContext` param; per-call runtime values use
-> `call_with_extensions(&self, args, &ToolCallExtensions)` (tool/mod.rs:181).
-> So `Guard<T>` needs **no change** on 0.40.0 (unlike HEAD). Keep the existing
+> `fn call(&self, args: Self::Args) -> impl Future<...>` (tool/mod.rs:159).
+> There is no `ToolContext` param; per-call runtime values use
+> `call_with_extensions(&self, args, &ToolCallExtensions)` (tool/mod.rs:181). So
+> `Guard<T>` needs **no change** on 0.40.0 (unlike HEAD). Keep the existing
 > `call(&self, args)` impl; drop any plan to add a `ToolContext` parameter.
 
 ### 4.5 `MultiTurnStreamItem` variants
+
 - `StreamAssistantItem(StreamedAssistantContent<R>)` — unchanged; `Text`,
   `Reasoning`, `ReasoningDelta`, `ToolCall(RawStreamingToolCall)` variants
   still exist (`streaming.rs:~100`).
@@ -246,7 +301,6 @@ is the normalized error type. `Guard<T>` only needs the new
   **`ToolExecutionCommitted`** (the commit event) — tool call/result display is
   already handled by the `AgentHook` (`on_tool_call` / `on_tool_result`), and
   the streamed `ToolCall` delta is ignored via `_ => {}`.
-
 - Our `end_response_segment()` currently fires on `CompletionCall`. Move it to
   **`ToolExecutionCommitted`** (the commit event) — tool call/result display is
   already handled by the `AgentHook` (`on_tool_call` / `on_tool_result`), and
@@ -256,11 +310,12 @@ is the normalized error type. `Guard<T>` only needs the new
 > variant (the `MultiTurnStreamItem` enum only has `FinalResponse(R)` plus
 > assistant-content items — streaming.rs:129). Tool calls/results are observed
 > exclusively through `AgentHook::on_event(StepEvent::ToolCall / ToolResult)`
-> (§4.3). So commit the answer paragraph from `on_event` on `StepEvent::ToolCall`
-> (or keep `end_response_segment` keyed off the same event), not off a stream
-> item that does not exist on 0.40.0.
+> (§4.3). So commit the answer paragraph from `on_event` on
+> `StepEvent::ToolCall` (or keep `end_response_segment` keyed off the same
+> event), not off a stream item that does not exist on 0.40.0.
 
 ### 4.6 Removed / unaffected
+
 - Raw `Completion` / `StreamingCompletion` traits removed (CHANGELOG line 107) —
   picocode only uses `Agent::stream_prompt`, unaffected.
 - `AgentBuilder::dynamic_context` removed (line 32) — picocode uses static
@@ -277,29 +332,52 @@ If we target the released tag `v0.40.0` (`2f37dfcd`), the migration is **not**
 identical to the HEAD plan above. Summary of divergences (verified in
 `git show v0.40.0:...`):
 
-| Area | Released `v0.40.0` | HEAD (post-0.40) |
-|---|---|---|
-| Reasoning-only history drop | **present** (sanitize_plain_text_history:1644) | present |
-| Generic streaming usage (DeepSeek/Mistral cache) | **present** | present |
-| OpenAI Responses `prompt_cache_key`/`retention` | **present** (responses_api/mod.rs:1431/1434) | present |
-| `Tool::call` signature | **unchanged** (`(&self, args)`) | gains `ToolContext` param |
-| History passing | `agent.stream_chat(input, prior)` (no `with_history`/`history` on `StreamingPromptRequest`) | `stream_prompt(...).history(prior)` / `runner(...).history(...)` |
-| `AgentHook` shape | **event-based** `on_event(StepEvent) -> Flow` + `observes` (generic `<M>`) | method-per-event (`on_completion_call`, `on_tool_call`, …) |
-| `MultiTurnStreamItem` tool commit | **no** `ToolExecutionCommitted`; tool call/result via `on_event` | new `ToolExecutionCommitted` variant |
-| Final response type | `PromptResponse` with `messages()` (variant still `FinalResponse(R)`) | same |
-| `add_hook` / `max_turns` renames | present | present |
+- **Area**: Reasoning-only history drop
+  - **Released `v0.40.0`**: **present** (sanitize_plain_text_history:1644)
+  - **HEAD (post-0.40)**: present
+- **Area**: Generic streaming usage (DeepSeek/Mistral cache)
+  - **Released `v0.40.0`**: **present**
+  - **HEAD (post-0.40)**: present
+- **Area**: OpenAI Responses `prompt_cache_key`/`retention`
+  - **Released `v0.40.0`**: **present** (responses_api/mod.rs:1431/1434)
+  - **HEAD (post-0.40)**: present
+- **Area**: `Tool::call` signature
+  - **Released `v0.40.0`**: **unchanged** (`(&self, args)`)
+  - **HEAD (post-0.40)**: gains `ToolContext` param
+- **Area**: History passing
+  - **Released `v0.40.0`**: `agent.stream_chat(input, prior)` (no
+    `with_history`/`history` on `StreamingPromptRequest`)
+  - **HEAD (post-0.40)**: `stream_prompt(...).history(prior)` /
+    `runner(...).history(...)`
+- **Area**: `AgentHook` shape
+  - **Released `v0.40.0`**: **event-based** `on_event(StepEvent) -> Flow` +
+    `observes` (generic `<M>`)
+  - **HEAD (post-0.40)**: method-per-event (`on_completion_call`,
+    `on_tool_call`, …)
+- **Area**: `MultiTurnStreamItem` tool commit
+  - **Released `v0.40.0`**: **no** `ToolExecutionCommitted`; tool call/result
+    via `on_event`
+  - **HEAD (post-0.40)**: new `ToolExecutionCommitted` variant
+- **Area**: Final response type
+  - **Released `v0.40.0`**: `PromptResponse` with `messages()` (variant still
+    `FinalResponse(R)`)
+  - **HEAD (post-0.40)**: same
+- **Area**: `add_hook` / `max_turns` renames
+  - **Released `v0.40.0`**: present
+  - **HEAD (post-0.40)**: present
 
 **Net for released 0.40.0:** the upgrade still delivers all three benefits
 (reasoning-loop fix, generic streaming usage, Responses-API cache params). The
 code changes are: (1) `stream_prompt(input).with_history(prior)` →
-`stream_chat(input, prior)`; (2) `with_hook`→`add_hook`, `multi_turn`→`max_turns`;
-(3) `PromptHook` (message-based) → event-based `AgentHook<M>` (`on_event`/
-`observes`, returning `Flow`); (4) `FinalResponse::history()` →
-`PromptResponse::messages()`; (5) **`Guard<T>` / `Tool::call` need no change**.
-This is a smaller, more contained diff than the HEAD plan (no `ToolContext`
-plumbing, no `ToolExecutionCommitted` match arm). The trade-off: HEAD has more
-refinements (method-per-event hooks, `ToolContext`, typed Responses-API
-builder) that we'd forgo by pinning to the release.
+`stream_chat(input, prior)`; (2) `with_hook`→`add_hook`,
+`multi_turn`→`max_turns`; (3) `PromptHook` (message-based) → event-based
+`AgentHook<M>` (`on_event`/ `observes`, returning `Flow`); (4)
+`FinalResponse::history()` → `PromptResponse::messages()`; (5)
+**`Guard<T>` / `Tool::call` need no change**. This is a smaller, more contained
+diff than the HEAD plan (no `ToolContext` plumbing, no `ToolExecutionCommitted`
+match arm). The trade-off: HEAD has more refinements (method-per-event hooks,
+`ToolContext`, typed Responses-API builder) that we'd forgo by pinning to the
+release.
 
 ## 5. Migration effort
 
@@ -312,11 +390,12 @@ builder) that we'd forgo by pinning to the release.
   version bump (`0.38` → `0.40`) + re-pin the `[patch.crates-io]` / path to the
   new rig.
 - **Files (released `v0.40.0`):** `src/agent.rs` (`stream_prompt`+`with_history`
-  → `stream_chat(input, prior)`; `with_hook`→`add_hook`, `multi_turn`→`max_turns`;
-  `PromptHook` → event-based `AgentHook<M>` (`on_event`/`observes`);
-  `FinalResponse::history()` → `PromptResponse::messages()`; commit answer
-  paragraph from `on_event(StepEvent::ToolCall)`); `src/tools.rs` **needs no
-  change** (`Tool::call` unchanged on 0.40.0); `Cargo.toml` bump + re-pin.
+  → `stream_chat(input, prior)`; `with_hook`→`add_hook`,
+  `multi_turn`→`max_turns`; `PromptHook` → event-based `AgentHook<M>`
+  (`on_event`/`observes`); `FinalResponse::history()` →
+  `PromptResponse::messages()`; commit answer paragraph from
+  `on_event(StepEvent::ToolCall)`); `src/tools.rs` **needs no change**
+  (`Tool::call` unchanged on 0.40.0); `Cargo.toml` bump + re-pin.
 - **Tests:** `reasoning_text` test unaffected; output rendering tests
   (`output.rs`) unaffected (rendering layer unchanged); add a regression test
   that a reasoning-only turn is not persisted into the next prompt for
@@ -339,12 +418,14 @@ generic streaming usage, Responses-API cache params) — verified in the release
   `ToolContext`, `ToolExecutionCommitted`, typed Responses-API builder) but more
   refined hooks/tools API.
 
-**Decision: implement the HEAD migration** (per user instruction). Done — see §7.
+**Decision: implement the HEAD migration** (per user instruction). Done — see
+§7.
 
 Sequencing for the released 0.40.0 target (kept for reference):
 
-1. Bump `rig-core` to `0.40` and fix the compile errors (`stream_chat`, `add_hook`,
-   `max_turns`, event-based `AgentHook<M>`, `PromptResponse::messages()`).
+1. Bump `rig-core` to `0.40` and fix the compile errors (`stream_chat`,
+   `add_hook`, `max_turns`, event-based `AgentHook<M>`,
+   `PromptResponse::messages()`).
 2. Commit the answer paragraph from `on_event(StepEvent::ToolCall)` (no
    `ToolExecutionCommitted` on 0.40.0).
 3. Add a "strip reasoning from persisted history" toggle (cheap; covers
@@ -360,6 +441,7 @@ clean (no warnings); `cargo test` → **141 lib + 6 + 4 integration + 1 doc test
 pass, 1 ignored**.
 
 ### 7.1 `Cargo.toml`
+
 - `rig-core = "0.38"` → `"0.40"` (features `["derive"]` kept); `rig-derive =
   "0.38"` → `"0.40"`.
 - `[patch.crates-io]` now also pins both to the public repo:
@@ -368,6 +450,7 @@ pass, 1 ignored**.
   `gwicke/rig` repo, not a local path.)
 
 ### 7.2 `src/agent.rs`
+
 - **Call-site renames** (per §4.1 HEAD): `stream_prompt(input)`
   `.with_hook(LoggingHook{..})` → `.add_hook(..)`; `.multi_turn(n)` →
   `.max_turns(n)`; `.with_history(prior)` → `.history(prior)`.
@@ -380,9 +463,9 @@ pass, 1 ignored**.
   `on_tool_call`/`on_tool_result`, returning the new action enums
   (`CompletionCallAction`, `ObservationAction`, `ModelTurnAction`,
   `ToolCallAction`, `ToolResultAction`). User-cancel bridge now returns the
-  appropriate `Stop("cancelled by user")` per event (was `HookAction::terminate`).
-  `on_tool_call` parses `event.args` (a `&str` JSON string) into a `Value` for
-  `display_tool_call`; `on_tool_result` renders via
+  appropriate `Stop("cancelled by user")` per event (was
+  `HookAction::terminate`). `on_tool_call` parses `event.args` (a `&str` JSON
+  string) into a `Value` for `display_tool_call`; `on_tool_result` renders via
   `event.raw_result.output().render()` for `display_tool_result`.
 - **`Guard<T>` (generic `Tool` wrapper, §4.4):** `call(&self, args)` →
   `call(&self, context: &mut ToolContext, args)` (delegates
@@ -395,6 +478,7 @@ pass, 1 ignored**.
   `HookContext`, and `rig_core::tool::ToolContext`.
 
 ### 7.3 `src/tools.rs`
+
 - **`Bash` manual `Tool` impl (§4.4):** same `call` signature change
   (`context: &mut ToolContext`); dropped manual `definition(&self, _prompt)`
   (trait default builds it from `description()`/`parameters()`); added
@@ -407,10 +491,11 @@ pass, 1 ignored**.
 ### 7.4 Provider list changes (vs rig HEAD)
 
 - **Removed `galadriel`** — rig 0.40 dropped it entirely (commit `695490d9`
-  `refactor(providers)!: remove galadriel provider (#2041)`, not a rename). Removed
-  its `providers` import, the `"galadriel"` arm in `agent.rs`'s client builder,
-  its `model_catalog.rs` entry + env-var arm, and the `main.rs` default-model arm
-  + doc comment.
+  `refactor(providers)!: remove galadriel provider (#2041)`, not a rename).
+  Removed its `providers` import, the `"galadriel"` arm in `agent.rs`'s client
+  builder, its `model_catalog.rs` entry + env-var arm, and the `main.rs`
+  default-model arm
+  - doc comment.
 - **Added (non-OAuth, chat-capable) — rig 0.40 providers picocode now wires:**
   `doubleword`, `llamafile`, `minimax`, `xiaomimimo`, `zai`. Each got a client-
   builder arm (`check_env!` + `build!(provider::Client::from_env()?)`), a
@@ -431,6 +516,7 @@ pass, 1 ignored**.
   (Tier 2) remains deferred.
 
 ### 7.5 Pre-existing test fix (not caused by this migration)
+
 - `settings.rs::apply_to_config_maps_the_five_settings` built `AgentConfig`
   without the committed `sandbox` field → added `sandbox: None`. (The `sandbox`
   field predates this migration; the test simply wasn't updated when the field
@@ -438,8 +524,9 @@ pass, 1 ignored**.
 
 ### 7.6 Adding the OAuth providers (`chatgpt`, `copilot`)
 
-Both already implement `from_env()` + `ProviderClient` (so `AgentClient`/`.agent()`
-works — they wire in like the non-OAuth providers). Two tiers:
+Both already implement `from_env()` + `ProviderClient` (so
+`AgentClient`/`.agent()` works — they wire in like the non-OAuth providers). Two
+tiers:
 
 - **Tier 1 — token env var (DONE in this migration):** `chatgpt` reads
   `CHATGPT_ACCESS_TOKEN`; `copilot` reads `COPILOT_GITHUB_ACCESS_TOKEN`/
@@ -448,15 +535,17 @@ works — they wire in like the non-OAuth providers). Two tiers:
   supplies a browser-obtained token. `check_env!` was extended to OR multiple
   vars so copilot accepts either credential.
 - **Tier 2 — in-app interactive device-code OAuth (IMPLEMENTED):** the build
-  chain is `provider::Client::builder().oauth().token_dir(dir)
-  .allow_device_flow(true).build()` (note: rig only exposes the device-code
-  methods `oauth`/`token_dir`/`allow_device_flow`/`on_device_code` on the
-  **post-`oauth()`** builder type `ClientBuilder<ProviderBuilder, ProviderAuth,
-  H>`, so `.oauth()` must come first). `token_dir` is set to the settings `token/`
-  sub-directory (see below); `allow_device_flow(true)` is always on because the
-  flow only triggers on the explicit `oauth` sentinel (no silent fallback, so
-  CI-gating isn't needed). picocode does **not** implement the OAuth protocol —
-  rig's `auth` module handles token exchange, polling, refresh, and persistence.
+  chain is
+  `provider::Client::builder().oauth().token_dir(dir) .allow_device_flow(true).build()`
+  (note: rig only exposes the device-code methods
+  `oauth`/`token_dir`/`allow_device_flow`/`on_device_code` on the
+  **post-`oauth()`** builder type
+  `ClientBuilder<ProviderBuilder, ProviderAuth, H>`, so `.oauth()` must come
+  first). `token_dir` is set to the settings `token/` sub-directory (see below);
+  `allow_device_flow(true)` is always on because the flow only triggers on the
+  explicit `oauth` sentinel (no silent fallback, so CI-gating isn't needed).
+  picocode does **not** implement the OAuth protocol — rig's `auth` module
+  handles token exchange, polling, refresh, and persistence.
   - **Trigger (consistent with other providers):** keep `check_env!` requiring
     the token env var (a provider is still "triggered by an env var"), and treat
     the literal value `oauth` as the signal to run the device flow. So
@@ -468,34 +557,37 @@ works — they wire in like the non-OAuth providers). Two tiers:
     `chatgpt/mod.rs` and `copilot/mod.rs`), so a custom handler (e.g. to print
     the prompt to stderr instead of stdout) can't be passed without a small rig
     change (make `DeviceCodePrompt` + `mod auth` `pub`). Rig's built-in default
-    handler prints the verification URL + code via `println!` (stdout). The token
-    caching still works; only the prompt destination is stdout. Upstream rig fix
-    would route it to stderr cleanly. A `picocode login <provider>` subcommand
-    remains a nice-to-have.
+    handler prints the verification URL + code via `println!` (stdout). The
+    token caching still works; only the prompt destination is stdout. Upstream
+    rig fix would route it to stderr cleanly. A `picocode login <provider>`
+    subcommand remains a nice-to-have.
 
-  #### Token storage (`token_dir`)
-  - Token dir = `platform::app_config_dir().join("token").join(<provider>)`
-    (e.g. `~/.config/picocode/token/chatgpt/auth.json`), created with `0o700`
-    perms (see `create_private_dir` in `agent.rs`). This is separate from the
-    settings file, as recommended. rig persists the full OAuth cache
-    (`access_token`, `refresh_token`, `id_token`, `expires_at`, `account_id`)
-    and **auto-renews** the refresh token (`auth/native.rs`); the browser step
-    happens once.
-    (rig default without our `token_dir`: `<config_dir>/chatgpt/auth.json`
-    / `<config_dir>/github_copilot/`.)
-  - **Permission caveat:** rig writes the token file with default perms (no
-    `0o600` chmod in `auth/native.rs`); mitigated by making the `token/`
-    directory tree `0o700`.
+#### Token storage (`token_dir`)
 
-  #### "Login on startup" = explicit `oauth` sentinel (no extra logic)
-  - Because the `check_env!` requirement + `oauth` sentinel already make the
-    device flow explicit and lazy (first `create_agent`/request), there is no
-    separate login step or `from_env()` fallback needed. Setting the token env
-    var to `oauth` *triggers* the flow; any real token *avoids* it.
+- Token dir = `platform::app_config_dir().join("token").join(<provider>)`
+  (e.g. `~/.config/picocode/token/chatgpt/auth.json`), created with `0o700`
+  perms (see `create_private_dir` in `agent.rs`). This is separate from the
+  settings file, as recommended. rig persists the full OAuth cache
+  (`access_token`, `refresh_token`, `id_token`, `expires_at`, `account_id`)
+  and **auto-renews** the refresh token (`auth/native.rs`); the browser step
+  happens once.
+  (rig default without our `token_dir`: `<config_dir>/chatgpt/auth.json`
+  / `<config_dir>/github_copilot/`.)
+- **Permission caveat:** rig writes the token file with default perms (no
+  `0o600` chmod in `auth/native.rs`); mitigated by making the `token/`
+  directory tree `0o700`.
+
+#### "Login on startup" = explicit `oauth` sentinel (no extra logic)
+
+- Because the `check_env!` requirement + `oauth` sentinel already make the
+  device flow explicit and lazy (first `create_agent`/request), there is no
+  separate login step or `from_env()` fallback needed. Setting the token env
+  var to `oauth` *triggers* the flow; any real token *avoids* it.
 
 **Status:** Tier 1 and Tier 2 both implemented for `chatgpt`/`copilot`.
 
 ### 7.7 Open follow-ups (not required for the upgrade)
+
 - "Strip reasoning from persisted history" toggle (esp. for Anthropic, which
   keeps `thinking` blocks) — §5 risk.
 - Option (B): render reasoning-only turns as the visible answer for the residual

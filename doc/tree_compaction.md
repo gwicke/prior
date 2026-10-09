@@ -86,9 +86,9 @@ session's leaf pointer (via `InputAction::NavigateTree`). We want:
 6. Loading a session with existing compaction entries (e.g. written by pi, or
    resumed later) applies the same scoping on `build_context()`.
 7. **Output documentation follows the slash-menu pattern**: the nested menus are
-   reflected in the prompt itself (`/tree <entry-id> switch`, `/tree <entry-id> compact
-   truncate`), and the completed prompt is preserved in the output via
-   `Repl::emit_commit` — exactly like `/model <model>` or
+   reflected in the prompt itself (`/tree <entry-id> switch`,
+   `/tree <entry-id> compact truncate`), and the completed prompt is preserved
+   in the output via `Repl::emit_commit` — exactly like `/model <model>` or
    `/session <id> resume`. This **replaces** the current non-compliant
    `/tree navigated (<id>)` confirmation line (and the proposed
    `/tree compacted at …` line): the committed prompt is the record of the
@@ -157,14 +157,14 @@ Then `buildSessionContext` (`session-manager.ts:457`) converts each entry:
 `convertToLlm` (`core/messages.ts:176`) turns `compactionSummary` into a user
 message with pi's wrapper:
 
-```
+```text
 COMPACTION_SUMMARY_PREFIX = "Conversation before this point:\n\n<summary>\n"
 COMPACTION_SUMMARY_SUFFIX = "\n</summary>"
 ```
 
 So the LLM-visible context is:
 
-```
+```text
 [system]  [summary from cmp (if any)]  [firstKeptEntryId … compaction)  [post-compaction …]
 ```
 
@@ -190,16 +190,16 @@ pi (`prepareCompaction`, `compaction.ts:633`):
 
 **picocode's divergence (documented in `doc/nested_compactions.md`):**
 
-- **Runtime context steps over nested compactions.** `apply_compaction_transforms`
-  drops **every** `Compaction` entry inside the kept range silently — both the
-  latest (represented by the front summary message) and any older nested
-  compactions. Only the latest compaction's `summary` appears as a
-  `compactionSummary` user message at the front of the context. Older
-  summaries are not re-emitted mid-turn.
+- **Runtime context steps over nested compactions.**
+  `apply_compaction_transforms` drops **every** `Compaction` entry inside the
+  kept range silently — both the latest (represented by the front summary
+  message) and any older nested compactions. Only the latest compaction's
+  `summary` appears as a `compactionSummary` user message at the front of the
+  context. Older summaries are not re-emitted mid-turn.
 - **LLM compaction mode merges `previousSummary`.** When re-compacting, the
   summarizer receives the deepest prior compaction's `summary` whose
-  `first_kept_entry_id` is *strictly before* the new target (strict-before
-  rule — see `doc/nested_compactions.md` phase B), as a `--- PREVIOUS SUMMARY ---`
+  `first_kept_entry_id` is *strictly before* the new target (strict-before rule
+  — see `doc/nested_compactions.md` phase B), as a `--- PREVIOUS SUMMARY ---`
   section. This makes iterative re-compaction lossless.
 - **The leaf-is-compaction guard is removed.** Compacting a session whose
   leaf is already a `Compaction` entry is allowed; the LLM-mode
@@ -234,18 +234,20 @@ That is exactly the requested split: **replay full, context scoped.**
   lands, replay would **stop showing the beginning** unless switched to the raw
   branch. (This is the main replay change.)
 - `/tree` UI: `ActiveOverlay::Tree` Enter emits `NavigateTree(target_id)`
-  (`repl.rs:1341`); main loop `move_leaf` (`agent.rs:2089`) and `/tree <entry-id>
-  [--summarize]` Submit path (`agent.rs:2185`) both handle switching.
+  (`repl.rs:1341`); main loop `move_leaf` (`agent.rs:2089`) and
+  `/tree <entry-id> [--summarize]` Submit path (`agent.rs:2185`) both handle
+  switching.
 - **Branch summarization already exists** (`parse_tree_args`, `agent.rs:1674`
-  + the Submit handler `agent.rs:2199-2228`): pi's "Branch Summarization"
-  (pi `compaction.md`; `session_before_tree` `userWantsSummary`). It
-  summarizes the **abandoned branch** (old leaf → common ancestor), appends a
-  `BranchSummary` entry at the old leaf, then `move_leaf(target)` —
-  pi-identical. Its canonical command becomes `/tree <entry-id> switch --summarize`
-  (the bare `/tree <entry-id> --summarize` stays accepted as a backward-compatible
-  alias). It is **orthogonal to `compact`**: branch-summarization preserves
-  the branch you're leaving when switching; `compact` truncates the *prefix*
-  of the current context. pi has both mechanisms.
+  - the Submit handler `agent.rs:2199-2228`): pi's "Branch Summarization" (pi
+    `compaction.md`; `session_before_tree` `userWantsSummary`). It summarizes
+    the **abandoned branch** (old leaf → common ancestor), appends a
+    `BranchSummary` entry at the old leaf, then `move_leaf(target)` —
+    pi-identical. Its canonical command becomes
+    `/tree <entry-id> switch --summarize` (the bare
+    `/tree <entry-id> --summarize` stays accepted as a backward-compatible
+    alias). It is **orthogonal to `compact`**: branch-summarization preserves
+    the branch you're leaving when switching; `compact` truncates the *prefix*
+    of the current context. pi has both mechanisms.
 - No token estimator exists (no `estimate_tokens` anywhere) — Phase 3 adds one.
 
 ---
@@ -254,14 +256,14 @@ That is exactly the requested split: **replay full, context scoped.**
 
 ### Command grammar
 
-```
+```text
 /tree <entry-id> [switch [--summarize] | compact [truncate|text-only]]
 ```
 
 - Default action = `switch`; default switch mode = plain (`just switch`).
-- `switch --summarize` = switch **and** summarize the abandoned branch
-  (existing branch-summarization; committed as `/tree <entry-id> switch --summarize`).
-  The bare `/tree <entry-id> --summarize` form remains accepted as an alias.
+- `switch --summarize` = switch **and** summarize the abandoned branch (existing
+  branch-summarization; committed as `/tree <entry-id> switch --summarize`). The
+  bare `/tree <entry-id> --summarize` form remains accepted as an alias.
 - `compact` appends a compaction entry; its sub-menu selects the summary mode
   (`truncate` = `summary ""`; `text-only` = deterministic text summary).
   Default mode = `truncate`.
@@ -270,11 +272,12 @@ That is exactly the requested split: **replay full, context scoped.**
 
 ### Output documentation (slash-menu convention)
 
-Every action completed through the overlays is committed via
-`Repl::emit_commit` (same as the `/model`, `/thinking`, `/session` overlays,
-`repl.rs:1095/1280`), so the finished prompt — `/tree <entry-id> switch`,
-`/tree <entry-id> switch --summarize`, or `/tree <entry-id> compact truncate` — is echoed
-into the session output and stands as the record of the action. Consequently:
+Every action completed through the overlays is committed via `Repl::emit_commit`
+(same as the `/model`, `/thinking`, `/session` overlays, `repl.rs:1095/1280`),
+so the finished prompt — `/tree <entry-id> switch`,
+`/tree <entry-id> switch --summarize`, or `/tree <entry-id> compact truncate` —
+is echoed into the session output and stands as the record of the action.
+Consequently:
 
 - the main loop **no longer prints** `/tree navigated (<id>)`
   (`agent.rs:2096`, `agent.rs:2234`) or any `/tree compacted at …` equivalent;
@@ -288,7 +291,7 @@ into the session output and stands as the record of the action. Consequently:
 
 ### UI flow
 
-```
+```text
 /tree                       → tree list overlay
   ↓ Enter on a point
 /tree <entry-id>            → TreeAction overlay: [switch*] [compact]
@@ -399,7 +402,8 @@ Notes:
   `continue` for the latest compaction keeps ordering correct (its summary is
   at the front, not duplicated at its path position).
 - This exactly reproduces pi's `buildContextEntries` message order for the
-  single-compaction case: `[summary?] [firstKept…compaction) [post-compaction…]`.
+  single-compaction case:
+  `[summary?] [firstKept…compaction) [post-compaction…]`.
 - Because `CodeAgent::prompt` calls `build_context()` fresh each turn
   (`agent.rs:101`), **resume and subsequent turns get the scoped context for
   free** — this satisfies "compactions handled correctly when loading session
@@ -453,10 +457,11 @@ fn build_replay_units(branch: &[SessionEntry]) -> Vec<ReplayUnit>
 fn replay_units(output: &Arc<dyn Output>, units: &[ReplayUnit], start: usize)
 ```
 
-   Marker rendering: `output.display_thinking(&format!("[compaction: {}k tokens]", t/1000))`
-   (or `display_system`/`display_plain` — pick the dimmest available; see
-   `src/output.rs` trait). A marker is **not** a turn: `Nt`/`Nl` limits count
-   turns, and markers inside the kept window still render.
+Marker rendering:
+`output.display_thinking(&format!("[compaction: {}k tokens]", t/1000))` (or
+`display_system`/`display_plain` — pick the dimmest available; see
+`src/output.rs` trait). A marker is **not** a turn: `Nt`/`Nl` limits count
+turns, and markers inside the kept window still render.
 
 3. Update call sites to pass the raw branch:
 
@@ -765,15 +770,15 @@ split into the action token and the sub-menu's fuzzy filter.
 Every option list above is **fuzzy-filterable by the trailing buffer text**,
 rebuilt on each keystroke exactly like the `/persona` and `/model` overlays:
 
-- `TreeAction`: the text after `/tree <entry-id> ` filters `switch`/`compact`
+- `TreeAction`: the text after `/tree <entry-id>` filters `switch`/`compact`
   via `Repl::filter_tree_options` (fuzzy rank + exact pre-selection); e.g.
   `/tree <entry-id> co` narrows to `compact`. An unknown single token after
   the id (`/tree <entry-id> sw`) is treated as this filter — the id is
   selected, the action menu opens pre-narrowed.
-- `SwitchAction`: text after `/tree <entry-id> switch ` filters `just switch` /
+- `SwitchAction`: text after `/tree <entry-id> switch` filters `just switch` /
   `summarize`; e.g. `/tree <entry-id> switch su` → `summarize` active,
   `/tree <entry-id> switch j` → `just switch` active.
-- `CompactSummary`: text after `/tree <entry-id> compact ` filters
+- `CompactSummary`: text after `/tree <entry-id> compact` filters
   `truncate` / `text only` (e.g. `/tree <entry-id> compact te` → `text only`).
 - Exact known tokens (`--summarize`, `truncate`, `just-switch`, `switch`,
   `compact`) additionally **pre-select** their option regardless of fuzzy
@@ -791,14 +796,14 @@ rebuilt on each keystroke exactly like the `/persona` and `/model` overlays:
 
 Selection → committed line mapping (canonical, filter text dropped):
 
-| Overlay | Option | Committed line |
-| --- | --- | --- |
-| TreeAction | `switch` | `/tree <entry-id> switch` (then sub-menu) |
-| TreeAction | `compact` | `/tree <entry-id> compact` (then sub-menu) |
-| SwitchAction | `just switch` | `/tree <entry-id> switch` |
-| SwitchAction | `summarize` | `/tree <entry-id> switch --summarize` |
-| CompactSummary | `truncate` | `/tree <entry-id> compact truncate` |
-| CompactSummary | `text only` | `/tree <entry-id> compact text-only` |
+| Overlay        | Option        | Committed line                             |
+| -------------- | ------------- | ------------------------------------------ |
+| TreeAction     | `switch`      | `/tree <entry-id> switch` (then sub-menu)  |
+| TreeAction     | `compact`     | `/tree <entry-id> compact` (then sub-menu) |
+| SwitchAction   | `just switch` | `/tree <entry-id> switch`                  |
+| SwitchAction   | `summarize`   | `/tree <entry-id> switch --summarize`      |
+| CompactSummary | `truncate`    | `/tree <entry-id> compact truncate`        |
+| CompactSummary | `text only`   | `/tree <entry-id> compact text-only`       |
 
 #### Header rows for `CompactSummary` (the "per-session info" equivalent)
 
@@ -853,9 +858,10 @@ headers (selected entry row only).
   the `SessionAction` resume arm does at `repl.rs:1280`) with
   `line = "/tree <entry-id> switch"`, then
   `return OverlayAction::Action(InputAction::Submit(line))`.
-- `SwitchAction` `summarize`: commit + submit `/tree <entry-id> switch --summarize`
-  (same `emit_commit` + `Submit` pattern). The committed line is preserved in
-  the output — this is the action's documentation.
+- `SwitchAction` `summarize`: commit + submit
+  `/tree <entry-id> switch --summarize` (same `emit_commit` + `Submit` pattern).
+  The committed line is preserved in the output — this is the action's
+  documentation.
 - `CompactSummary` `truncate`: commit + submit
   `/tree <entry-id> compact truncate` (same `emit_commit` + `Submit` pattern).
 - `CompactSummary` `text only`: commit + submit
@@ -870,14 +876,16 @@ headers (selected entry row only).
   previously a no-op).
 - `TreeAction` Tab: fill `/tree <entry-id> <action>` (e.g.
   `/tree <entry-id> compact`) — **implemented**.
-- `SwitchAction` Tab: fill `/tree <entry-id> switch --summarize` when `summarize`
-  is selected, else leave `/tree <entry-id> switch` — **implemented**.
-- `CompactSummary` Tab: fill `/tree <entry-id> compact truncate` — **implemented**.
-- `TreeAction` Esc → `/tree ` (back to list); `SwitchAction` /
-  `CompactSummary` Esc → `/tree <entry-id>` (back to TreeAction) — **implemented**.
-- `display_rows`: "Tree actions  (up/down, Tab/Enter select, Esc back)",
-  "Switch actions  (up/down, Tab/Enter select, Esc back)", and
-  "Compact summary  (up/down, Tab/Enter select, Esc back)".
+- `SwitchAction` Tab: fill `/tree <entry-id> switch --summarize` when
+  `summarize` is selected, else leave `/tree <entry-id> switch` —
+  **implemented**.
+- `CompactSummary` Tab: fill `/tree <entry-id> compact truncate` —
+  **implemented**.
+- `TreeAction` Esc → `/tree` (back to list); `SwitchAction` / `CompactSummary`
+  Esc → `/tree <entry-id>` (back to TreeAction) — **implemented**.
+- `display_rows`: "Tree actions (up/down, Tab/Enter select, Esc back)",
+  "Switch actions (up/down, Tab/Enter select, Esc back)", and
+  "Compact summary (up/down, Tab/Enter select, Esc back)".
 - New discriminants (e.g. 16, 17, 18) so `sel` resets on promotion.
 - Add `TreeAction`/`SwitchAction`/`CompactSummary` to the `overlay_text` match
   that forwards `header` (`repl.rs:1681`), exactly like `SessionAction`/
@@ -904,7 +912,7 @@ response as a *summary* and continues from the **original** session position.
 
 ### 6.1 The user-facing flow
 
-```
+```text
 /tree                       → tree list overlay
   ↓ Enter on a point
 /tree <entry-id>            → TreeAction overlay: [switch*] [compact]
@@ -933,7 +941,7 @@ editable via `/set`):
 
 After picking `llm`, the buffer becomes:
 
-```
+```text
 /tree <entry-id> compact llm Summarize the conversation so far in less than 2000 words. Preserve…
 ```
 
@@ -942,7 +950,7 @@ edit surface). Pressing `<Enter>` on the final line submits it as a regular
 prompt. The committed line is preserved in the scrollback via `emit_commit`,
 e.g.:
 
-```
+```text
 /tree <entry-id> compact llm Summarize the conversation so far in less than 2000 words…
 ```
 
@@ -1327,9 +1335,10 @@ untouched (for `llm` mode the leaf was already restored by
 > live in `generate_compaction` / `apply_compaction` and the nodes'
 > `prepare()` / `submit()` (§6.7b, `doc/editor_cleanup.md` §6).
 
-The `TreeAction::Compact` arm of the main-loop `/tree` block gains an `Llm`
-mode branch, slotted into the same `match mode.unwrap_or(CompactSummaryMode::Truncate)`
-that already picks between `Truncate` and `TextOnly`:
+The `TreeAction::Compact` arm of the main-loop `/tree` block gains an `Llm` mode
+branch, slotted into the same
+`match mode.unwrap_or(CompactSummaryMode::Truncate)` that already picks between
+`Truncate` and `TextOnly`:
 
 ```rust
 TreeAction::Compact => {
@@ -1572,28 +1581,75 @@ to use (`/set <key> <free-text-value>` is the closest precedent).
 
 ## Edge cases & risks
 
-| Case | Behavior |
-| --- | --- |
-| `target_id` not on the current branch | Validate with `get_entry` before writing; error message, session unchanged (avoids a silently no-op compaction). |
-| `target_id` == current leaf | Appending a compaction with `firstKeptEntryId` = leaf scopes to the last entry only; allowed but pointless. Consider warning "nothing before this point" — decide in review. |
-| Leaf is already a compaction entry | Allowed (guard removed — see doc/nested_compactions.md phase C). `Truncate`/`TextOnly` write a fresh compaction; `Llm` on an empty dropped span is still refused by the "nothing before the current position" guard. |
-| Empty `summary` in context | No summary message emitted (documented divergence from pi's empty wrapper). |
-| Repeated compactions | Latest compaction scopes the context; older nested compactions inside the kept range are **stepped over** (not re-emitted — see doc/nested_compactions.md phase A). LLM compaction mode injects the prior summary as `--- PREVIOUS SUMMARY ---` (phase B). |
-| Session written by pi, read by picocode (and vice versa) | Schema identical; `build_index`/`get_path_to_root` treat compaction as a normal node; `build_context` scopes. Verify with round-trip test (below). |
-| `firstKeptEntryId` missing on branch | `apply_transforms` falls back to the full branch (defensive, matches pi's graceful handling). |
-| `tokensBefore` accuracy | Heuristic only; used for the sub-menu header display and future prompts — no correctness dependency. Header and written value come from the same `estimate_context_tokens(build_context())` call. |
-| Replay of a compacted session | Markers render, full history from root is replayed; `Nt`/`Nl` limits count turns (markers don't count). |
-| `NavigateTree` removal | Only emitter is `repl.rs:1344`; grep after editing. |
-| Phase 6 — LLM compaction: `<entry-id>` has no predecessor | **Done.** Refuse: `Cannot compact: nothing before this point`. |
-| Phase 6 — LLM compaction: `<entry-id>` == current leaf | **Done.** Refuse: `Cannot compact: nothing before the current position`. |
-| Phase 6 — LLM compaction: leaf is already a compaction | **Superseded.** The refusal was removed (doc/nested_compactions.md phase C); the empty-dropped-span guard still protects the no-op case. |
-| Phase 6 — LLM compaction: `agent.summarize` fails | **Done.** Restore `old_leaf_id` before surfacing the error; session unchanged (no compaction entry appended). |
-| Phase 6 — LLM compaction: empty/whitespace response | **Done.** Soft-fail: `Summary was empty; nothing written.`; restore leaf; do not append. |
-| Phase 6 — LLM compaction: panic/unwind during `summarize` | Documented failure path is the only safety net; no Drop guard implemented. |
-| Phase 7 — `/compact` with no user message on the active branch | `from_buffer` returns `ActiveOverlay::None` (silent). Mirrors the no-leaf behavior; user can `!cmd` or `/new` to bootstrap. |
-| Phase 7 — `/compact` mid-turn (leaf is a user prompt, no response yet) | `last_user_message_id_on_active_branch` returns the leaf id; dropped span = everything before the leaf; kept range starts with the prompt. |
-| Phase 7 — `/compact` at the root (single user message, no response) | `Truncate` / `TextOnly` are legal no-ops on an empty dropped span; `Llm` refuses (`Err("nothing before this point")`). |
-| Phase 7 — last user message is itself a compaction | **Superseded.** The compaction-refuse check was removed (doc/nested_compactions.md phase C); `/compact` now resolves normally and may write a new compaction over a compaction leaf. |
+- **Case**: `target_id` not on the current branch
+  - **Behavior**: Validate with `get_entry` before writing; error message,
+    session unchanged (avoids a silently no-op compaction).
+- **Case**: `target_id` == current leaf
+  - **Behavior**: Appending a compaction with `firstKeptEntryId` = leaf scopes
+    to the last entry only; allowed but pointless. Consider warning "nothing
+    before this point" — decide in review.
+- **Case**: Leaf is already a compaction entry
+  - **Behavior**: Allowed (guard removed — see doc/nested_compactions.md phase
+    C). `Truncate`/`TextOnly` write a fresh compaction; `Llm` on an empty
+    dropped span is still refused by the "nothing before the current position"
+    guard.
+- **Case**: Empty `summary` in context
+  - **Behavior**: No summary message emitted (documented divergence from pi's
+    empty wrapper).
+- **Case**: Repeated compactions
+  - **Behavior**: Latest compaction scopes the context; older nested compactions
+    inside the kept range are **stepped over** (not re-emitted — see
+    doc/nested_compactions.md phase A). LLM compaction mode injects the prior
+    summary as `--- PREVIOUS SUMMARY ---` (phase B).
+- **Case**: Session written by pi, read by picocode (and vice versa)
+  - **Behavior**: Schema identical; `build_index`/`get_path_to_root` treat
+    compaction as a normal node; `build_context` scopes. Verify with round-trip
+    test (below).
+- **Case**: `firstKeptEntryId` missing on branch
+  - **Behavior**: `apply_transforms` falls back to the full branch (defensive,
+    matches pi's graceful handling).
+- **Case**: `tokensBefore` accuracy
+  - **Behavior**: Heuristic only; used for the sub-menu header display and
+    future prompts — no correctness dependency. Header and written value come
+    from the same `estimate_context_tokens(build_context())` call.
+- **Case**: Replay of a compacted session
+  - **Behavior**: Markers render, full history from root is replayed; `Nt`/`Nl`
+    limits count turns (markers don't count).
+- **Case**: `NavigateTree` removal
+  - **Behavior**: Only emitter is `repl.rs:1344`; grep after editing.
+- **Case**: Phase 6 — LLM compaction: `<entry-id>` has no predecessor
+  - **Behavior**: **Done.** Refuse: `Cannot compact: nothing before this point`.
+- **Case**: Phase 6 — LLM compaction: `<entry-id>` == current leaf
+  - **Behavior**: **Done.** Refuse:
+    `Cannot compact: nothing before the current position`.
+- **Case**: Phase 6 — LLM compaction: leaf is already a compaction
+  - **Behavior**: **Superseded.** The refusal was removed
+    (doc/nested_compactions.md phase C); the empty-dropped-span guard still
+    protects the no-op case.
+- **Case**: Phase 6 — LLM compaction: `agent.summarize` fails
+  - **Behavior**: **Done.** Restore `old_leaf_id` before surfacing the error;
+    session unchanged (no compaction entry appended).
+- **Case**: Phase 6 — LLM compaction: empty/whitespace response
+  - **Behavior**: **Done.** Soft-fail: `Summary was empty; nothing written.`;
+    restore leaf; do not append.
+- **Case**: Phase 6 — LLM compaction: panic/unwind during `summarize`
+  - **Behavior**: Documented failure path is the only safety net; no Drop guard
+    implemented.
+- **Case**: Phase 7 — `/compact` with no user message on the active branch
+  - **Behavior**: `from_buffer` returns `ActiveOverlay::None` (silent). Mirrors
+    the no-leaf behavior; user can `!cmd` or `/new` to bootstrap.
+- **Case**: Phase 7 — `/compact` mid-turn (leaf is a user prompt, no response
+  yet)
+  - **Behavior**: `last_user_message_id_on_active_branch` returns the leaf id;
+    dropped span = everything before the leaf; kept range starts with the
+    prompt.
+- **Case**: Phase 7 — `/compact` at the root (single user message, no response)
+  - **Behavior**: `Truncate` / `TextOnly` are legal no-ops on an empty dropped
+    span; `Llm` refuses (`Err("nothing before this point")`).
+- **Case**: Phase 7 — last user message is itself a compaction
+  - **Behavior**: **Superseded.** The compaction-refuse check was removed
+    (doc/nested_compactions.md phase C); `/compact` now resolves normally and
+    may write a new compaction over a compaction leaf.
 
 ## Phase 7 — Compaction unification: shared `run_compaction` + `/compact`
 
@@ -1617,10 +1673,11 @@ ready for a future `/tree <id> switch --summarize` UI extension.
     for `/tree <id> compact` and `/compact`; `Abandoned { common_ancestor_id }`
     for future switch-summarize). Marked `#[allow(dead_code)]` until the
     abandoned-branch UI lands.
-  - New `pub(crate) async fn run_compaction(session, agent, settings, target, old_leaf_id, mode, llm_payload, output) -> Result<(), String>`
-    — shared backend that takes a `CompactionTarget` and one of the
-    three `CompactSummaryMode` variants and produces a `Compaction`
-    entry (or, eventually, a `BranchSummary`).
+  - New
+    `pub(crate) async fn run_compaction(session, agent, settings, target, old_leaf_id, mode, llm_payload, output) -> Result<(), String>`
+    — shared backend that takes a `CompactionTarget` and one of the three
+    `CompactSummaryMode` variants and produces a `Compaction` entry (or,
+    eventually, a `BranchSummary`).
   - The `TreeAction::Compact` arm in the main loop is now a thin
     validation block followed by a single `run_compaction(...)` call.
     The LLM-mode predecessor lookup, the move-to-predecessor /
@@ -1652,14 +1709,14 @@ ready for a future `/tree <id> switch --summarize` UI extension.
 current position. The two paths to a `Compaction` entry are now
 indistinguishable from the session file's perspective:
 
-| User action | Committed line | `target_id` | Dropped span |
-|---|---|---|---|
-| `/tree <id> compact truncate` | (echoed in scrollback) | `<id>` (as picked) | branch entries strictly before `<id>` |
-| `/tree <id> compact text-only` | (echoed) | `<id>` | same |
-| `/tree <id> compact llm [payload]` | (echoed; payload staged for editing) | `<id>` | same |
-| `/compact truncate` | `/tree <last_user_id> compact truncate` | last user message on active branch | same as the explicit form would produce with that id |
-| `/compact text-only` | same | same | same |
-| `/compact llm [payload]` | same | same | same |
+|User action                       |Committed line    |`target_id`|Dropped span|
+|----------------------------------|------------------|-----------|------------|
+|`/tree <id> compact truncate`|(echoed in scrollback)|`<id>` (as picked)|branch entries strictly before `<id>`|
+|`/tree <id> compact text-only`    |(echoed)          |`<id>`     |same        |
+|`/tree <id> compact llm [payload]`|(echoed; payload staged for editing)|`<id>`|same|
+|`/compact truncate`|`/tree <last_user_id> compact truncate`|last user message on active branch|same as the explicit form would produce with that id|
+|`/compact text-only`              |same              |same       |same        |
+|`/compact llm [payload]`          |same              |same       |same        |
 
 The committed line is what `emit_commit` echoes to scrollback. Because
 the line is the same canonical form for both paths, there's no
@@ -1698,12 +1755,12 @@ known target, leaf isn't a compaction, LLM-mode predecessor check).
 
 - `Truncate` → `append_compaction("", first_kept_entry_id, tokens_before)`.
 - `TextOnly` → build deterministic summary, `append_compaction`, render inline.
-- `Llm` → find predecessor (returns `Err("nothing before this point")` if missing),
-  build the dropped span, compose `<user-prompt>\n\n--- BEGIN DROPPED SPAN
-  ---\n...\n--- END DROPPED SPAN ---`, `agent.summarize`, move leaf back,
-  `append_compaction`, render inline. On any failure (no agent, summarize
-  Err, empty response) restore the leaf, surface the error, return
-  `Err(msg)`.
+- `Llm` → find predecessor (returns `Err("nothing before this point")` if
+  missing), build the dropped span, compose
+  `<user-prompt>\n\n--- BEGIN DROPPED SPAN ---\n...\n--- END DROPPED SPAN ---`,
+  `agent.summarize`, move leaf back, `append_compaction`, render inline. On any
+  failure (no agent, summarize Err, empty response) restore the leaf, surface
+  the error, return `Err(msg)`.
 
 ### 7.4 Why `/compact` rewrites to `/tree <last_user_id> compact` (not `/compact <mode>`)
 
@@ -1760,51 +1817,66 @@ follow-up.
 
 ### 7.6 Edge cases specific to `/compact`
 
-| Case | Behavior |
-|---|---|
-| Active branch has no user message (empty session) | `from_buffer` returns `ActiveOverlay::None` (silent; same as the no-leaf path). |
-| Current leaf is a user message (mid-turn, no response yet) | `last_user_message_id_on_active_branch` returns the leaf id. The dropped span = everything before the leaf (the prior turns). The kept range starts with the user's prompt. |
-| Current leaf is the assistant's last response | Resolves to the user prompt immediately before it. The dropped span = everything before that prompt; the kept range = [user prompt, assistant response, ..., leaf]. |
-| Last user message is itself a compaction entry | **Superseded.** The refusal was removed (doc/nested_compactions.md phase C); compaction over a compaction leaf resolves normally. |
-| `/compact llm` at the start of the conversation | Empty dropped span → `Err("nothing before this point")` (same as `/tree <root> compact llm`). The other two modes are no-ops on an empty dropped span but still legal. |
+- **Case**: Active branch has no user message (empty session)
+  - **Behavior**: `from_buffer` returns `ActiveOverlay::None` (silent; same as
+    the no-leaf path).
+- **Case**: Current leaf is a user message (mid-turn, no response yet)
+  - **Behavior**: `last_user_message_id_on_active_branch` returns the leaf id.
+    The dropped span = everything before the leaf (the prior turns). The kept
+    range starts with the user's prompt.
+- **Case**: Current leaf is the assistant's last response
+  - **Behavior**: Resolves to the user prompt immediately before it. The dropped
+    span = everything before that prompt; the kept range = [user prompt,
+    assistant response, ..., leaf].
+- **Case**: Last user message is itself a compaction entry
+  - **Behavior**: **Superseded.** The refusal was removed
+    (doc/nested_compactions.md phase C); compaction over a compaction leaf
+    resolves normally.
+- **Case**: `/compact llm` at the start of the conversation
+  - **Behavior**: Empty dropped span → `Err("nothing before this point")` (same
+    as `/tree <root> compact llm`). The other two modes are no-ops on an empty
+    dropped span but still legal.
 
 ---
 
 ## Test plan
 
-1. **`apply_transforms` unit tests** (`session.rs`) — **done**: empty-summary scoping;
-   non-empty pi-wrapper message; nested compaction stepped over; triple-nested
-   only-latest-summary; missing `firstKeptEntryId` fallback; compaction entry
-   never in output.
+1. **`apply_transforms` unit tests** (`session.rs`) — **done**: empty-summary
+   scoping; non-empty pi-wrapper message; nested compaction stepped over;
+   triple-nested only-latest-summary; missing `firstKeptEntryId` fallback;
+   compaction entry never in output.
 2. **Serialization cross-compat**: assert picocode writes
-   `{"type":"compaction",…,"firstKeptEntryId":…,"tokensBefore":…}` byte-compatible
-   with the pi sample in `session-format.md`; parse pi's sample line into
-   `SessionEntry` and back. (Extend `session_entry_roundtrip_all_variants`.)
+   `{"type":"compaction",…,"firstKeptEntryId":…,"tokensBefore":…}`
+   byte-compatible with the pi sample in `session-format.md`; parse pi's sample
+   line into `SessionEntry` and back. (Extend
+   `session_entry_roundtrip_all_variants`.)
 3. **Pi round-trip (manual/integration)**: write a compacted session with
    picocode, open it in pi (`pi --session <file>` or via the TUI) and confirm
    the TUI shows the compaction node and the LLM context starts at
    `firstKeptEntryId`; then write a compacted session with pi and resume it in
    picocode, confirming `build_context` scopes identically.
-4. **Replay tests** — **done** (`build_replay_units_marks_compaction_and_keeps_all_turns`, `build_replay_units_uncompacted_has_all_turns` + renderer tests): uncompacted branch → identical output to today; compacted
-   branch → markers rendered, full history present, `Nt`/`Nl` limits correct.
+4. **Replay tests** — **done**
+   (`build_replay_units_marks_compaction_and_keeps_all_turns`,
+   `build_replay_units_uncompacted_has_all_turns` + renderer tests): uncompacted
+   branch → identical output to today; compacted branch → markers rendered, full
+   history present, `Nt`/`Nl` limits correct.
 5. **`parse_tree_args` tests**: default `switch`; `switch --summarize` and the
    bare `--summarize` alias; `compact`/`compact truncate` (and `no-summary`
    alias); last action token wins.
 6. **REPL tests** — **partially done**: `parse_tree_id` (angle-bracket vs
    search-term) and `filter_tree_options` (empty/exact/fuzzy/no-match) are
-   unit-tested. Remaining: `from_buffer` promotion cases
-   (`/tree <entry-id>` → `TreeAction`, `+ switch` → `SwitchAction`,
-   `+ compact` → `CompactSummary`), trailing-mode pre-selection, `CompactSummary`
-   header contents, Enter commit lines, Esc unwinding (TUI-heavy; cover in
-   manual smoke).
+   unit-tested. Remaining: `from_buffer` promotion cases (`/tree <entry-id>` →
+   `TreeAction`, `+ switch` → `SwitchAction`, `+ compact` → `CompactSummary`),
+   trailing-mode pre-selection, `CompactSummary` header contents, Enter commit
+   lines, Esc unwinding (TUI-heavy; cover in manual smoke).
 7. **Manual smoke**: `/tree` → pick a point → `switch` sub-menu shows
-   `just switch`/`summarize`; `summarize` commits `/tree <entry-id> switch --summarize`
-   and appends a `BranchSummary` entry while moving the leaf; `compact`
-   sub-menu shows the info header (`drops N`, `~Xk tokens`, `written into
-   this session`) + `truncate`; after `truncate`, the next prompt only sees
-   context from that point; `/replay` still shows the whole conversation with
-   `[compaction: …]` markers; `/session` list unaffected; `!`/`!!` turns append
-   after the compaction entry.
+   `just switch`/`summarize`; `summarize` commits
+   `/tree <entry-id> switch --summarize` and appends a `BranchSummary` entry
+   while moving the leaf; `compact` sub-menu shows the info header (`drops N`,
+   `~Xk tokens`, `written into this session`) + `truncate`; after `truncate`,
+   the next prompt only sees context from that point; `/replay` still shows the
+   whole conversation with `[compaction: …]` markers; `/session` list
+   unaffected; `!`/`!!` turns append after the compaction entry.
 8. **Phase 6 tests (LLM compaction)** — **done**: `parse_tree_args_llm_mode`
    covers bare `llm`, the `summary` alias, multi-word payloads, and
    `text-only`-after-`llm`-is-payload; `find_predecessor_on_active_branch`
@@ -1829,13 +1901,66 @@ follow-up.
 
 ## File-by-file checklist
 
-| File | Change |
-| --- | --- |
-| `src/session/session.rs` | **Done.** `apply_transforms` rewritten (pi semantics, empty-summary skip, pi summary wrapper, repeated-compaction handling); `compaction_summary_message` helper + `COMPACTION_SUMMARY_PREFIX/SUFFIX` constants; unit tests. |
-| `src/agent.rs` | **Done.** `TreeAction`/`CompactSummaryMode` enums + `parse_tree_args` (canonical `switch [--summarize]`, bare `--summarize` alias; `compact llm <payload>` with trailing free-text payload); `/tree` dispatch (switch + optional branch-summarize, no `/tree navigated` line / compact, no inline token output); `estimate_context_tokens` (+ `build_session_ctx` computing `ReplCtx::context_tokens`); replay: `ReplayUnit`, `build_replay_units`, `replay_units` (+ `count_turns`/`last_turns_start`/`replay_last_turns`); `/replay` + resume replay on the raw branch; `NavigateTree` handling **removed**; LLM compaction arm (predecessor lookup + `agent.summarize` + move-back + `append_compaction`); `find_predecessor_on_active_branch` helper. **Phase 7:** `run_compaction` helper + `CompactionTarget` enum (`AtPoint` / `Abandoned`); `TreeAction::Compact` arm refactored to call the helper (the per-mode inline LLM / text-only / truncate code moved into the helper); 4 new tests (`run_compaction_truncate_writes_empty_summary`, `_text_only_writes_deterministic_summary`, `_llm_no_agent_returns_err_and_no_compaction`, `_text_only_nonzero_dropped_span`). |
-| `src/repl.rs` | **Done.** `ReplCtx::context_tokens` field; `TreeAction` + `SwitchAction` + `CompactSummary` (with `header`) overlay variants; `from_buffer` promotion with the angle-bracket id syntax (`Repl::parse_tree_id`) + fuzzy option filtering (`Repl::filter_tree_options`); `tree_entry_header` / `compact_summary_header` builders; `handle_enter` (commit+submit via `emit_commit` for leaves, buffer promotion otherwise); `handle_tab`/`handle_esc` (one level up); `display_rows` titles; `overlay_disc` (16/17/18); header-aware render arm; Tree Enter/Tab → `/tree <entry-id>` completion; `InputAction::NavigateTree` **removed**; `CompactSummary` opts gain `"llm"`; `handle_enter`/`handle_tab` branch on `llm` to stage the editable prompt (with `settings.llm_compact_prompt()` as the default). **Phase 7:** `last_user_message_id_on_active_branch` + `is_user_message` helpers; `compact` arm in `from_buffer` resolves `target_id` to the last user message on the active branch; `CompactPrefix` enum + the `prefix` field on `CompactSummary` **removed** (both paths now commit the same `/tree <id> compact <mode>` line); `llm_compact_buffer_is_canonical` simplified to take a `target_id` instead of an arbitrary `head`; `"compact"` added to the "open without trailing space" list in `from_buffer`; 8 new tests (5 for `last_user_message_id_on_active_branch`, 3 for `/compact` overlay resolution). |
-| `src/settings.rs` | **Done.** `SettingKey::LlmCompactPrompt` + `SettingsStore::llm_compact_prompt` field; `DEFAULT_LLM_COMPACT_PROMPT` constant; `llm_compact_prompt()` method with default fallback; `value`/`validate`/`apply`/`save` arms; `from_agent_config`/`from_config` constructors; `SettingsStore` test fixtures updated. |
-| `src/config.rs` | **Done.** `Config.llm_compact_prompt: Option<String>` field with `#[serde(default)]`. |
-| `settings.toml.example` | **Done.** `llm_compact_prompt` example line (commented-out). |
-| `src/slash.rs` | (optional) `/tree` help: "Navigate session history — switch, compact, or summarize branches". |
-| `doc/tree_compaction.md` | this doc (status updated: Phases 1–6 implemented). |
+- **File**: `src/session/session.rs`
+  - **Change**: **Done.** `apply_transforms` rewritten (pi semantics,
+    empty-summary skip, pi summary wrapper, repeated-compaction handling);
+    `compaction_summary_message` helper + `COMPACTION_SUMMARY_PREFIX/SUFFIX`
+    constants; unit tests.
+- **File**: `src/agent.rs`
+  - **Change**: **Done.** `TreeAction`/`CompactSummaryMode` enums +
+    `parse_tree_args` (canonical `switch [--summarize]`, bare `--summarize`
+    alias; `compact llm <payload>` with trailing free-text payload); `/tree`
+    dispatch (switch + optional branch-summarize, no `/tree navigated` line /
+    compact, no inline token output); `estimate_context_tokens` (+
+    `build_session_ctx` computing `ReplCtx::context_tokens`); replay:
+    `ReplayUnit`, `build_replay_units`, `replay_units` (+
+    `count_turns`/`last_turns_start`/`replay_last_turns`); `/replay` + resume
+    replay on the raw branch; `NavigateTree` handling **removed**; LLM
+    compaction arm (predecessor lookup + `agent.summarize` + move-back +
+    `append_compaction`); `find_predecessor_on_active_branch` helper.
+    **Phase 7:** `run_compaction` helper + `CompactionTarget` enum (`AtPoint` /
+    `Abandoned`); `TreeAction::Compact` arm refactored to call the helper (the
+    per-mode inline LLM / text-only / truncate code moved into the helper); 4
+    new tests (`run_compaction_truncate_writes_empty_summary`,
+    `_text_only_writes_deterministic_summary`,
+    `_llm_no_agent_returns_err_and_no_compaction`,
+    `_text_only_nonzero_dropped_span`).
+- **File**: `src/repl.rs`
+  - **Change**: **Done.** `ReplCtx::context_tokens` field; `TreeAction` +
+    `SwitchAction` + `CompactSummary` (with `header`) overlay variants;
+    `from_buffer` promotion with the angle-bracket id syntax
+    (`Repl::parse_tree_id`) + fuzzy option filtering
+    (`Repl::filter_tree_options`); `tree_entry_header` /
+    `compact_summary_header` builders; `handle_enter` (commit+submit via
+    `emit_commit` for leaves, buffer promotion otherwise);
+    `handle_tab`/`handle_esc` (one level up); `display_rows` titles;
+    `overlay_disc` (16/17/18); header-aware render arm; Tree Enter/Tab →
+    `/tree <entry-id>` completion; `InputAction::NavigateTree` **removed**;
+    `CompactSummary` opts gain `"llm"`; `handle_enter`/`handle_tab` branch on
+    `llm` to stage the editable prompt (with `settings.llm_compact_prompt()` as
+    the default). **Phase 7:** `last_user_message_id_on_active_branch` +
+    `is_user_message` helpers; `compact` arm in `from_buffer` resolves
+    `target_id` to the last user message on the active branch; `CompactPrefix`
+    enum + the `prefix` field on `CompactSummary` **removed** (both paths now
+    commit the same `/tree <id> compact <mode>` line);
+    `llm_compact_buffer_is_canonical` simplified to take a `target_id` instead
+    of an arbitrary `head`; `"compact"` added to the "open without trailing
+    space" list in `from_buffer`; 8 new tests (5 for
+    `last_user_message_id_on_active_branch`, 3 for `/compact` overlay
+    resolution).
+- **File**: `src/settings.rs`
+  - **Change**: **Done.** `SettingKey::LlmCompactPrompt` +
+    `SettingsStore::llm_compact_prompt` field; `DEFAULT_LLM_COMPACT_PROMPT`
+    constant; `llm_compact_prompt()` method with default fallback;
+    `value`/`validate`/`apply`/`save` arms; `from_agent_config`/`from_config`
+    constructors; `SettingsStore` test fixtures updated.
+- **File**: `src/config.rs`
+  - **Change**: **Done.** `Config.llm_compact_prompt: Option<String>` field with
+    `#[serde(default)]`.
+- **File**: `settings.toml.example`
+  - **Change**: **Done.** `llm_compact_prompt` example line (commented-out).
+- **File**: `src/slash.rs`
+  - **Change**: (optional) `/tree` help: "Navigate session history — switch,
+    compact, or summarize branches".
+- **File**: `doc/tree_compaction.md`
+  - **Change**: this doc (status updated: Phases 1–6 implemented).

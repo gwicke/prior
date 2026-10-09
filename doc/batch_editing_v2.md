@@ -1,6 +1,11 @@
 # Batch Editing v2 — Aider-style text edits
 
-*Status: Phase 1 implemented. W1–W4, W7 and W8 done — multi-file editing is accepted, split per file, applied and reported with per-file failure granularity, an unreadable file no longer aborts the call, the model sees N per-file calls and results, and a saved session stores N pi-canonical single-path calls with matching results. W5 wording remains, deliberately deferred.*
+*Status: Phase 1 implemented. W1–W4, W7 and W8 done — multi-file editing is
+accepted, split per file, applied and reported with per-file failure
+granularity, an unreadable file no longer aborts the call, the model sees N
+per-file calls and results, and a saved session stores N pi-canonical
+single-path calls with matching results. W5 wording remains, deliberately
+deferred.*
 
 ## Motivation
 
@@ -20,13 +25,23 @@ session layer are reused unchanged.
 
 ## Two-phase scope
 
-| Phase | Scope | Why |
-| --- | --- | --- |
-| **1 (the fix)** | Single file. `{path, blocks:"<block blob>"}` → normalize to canonical `{path, edits:[{oldText,newText}]}`. Flat schema, no `anyOf`, no array on the wire. | Directly kills the nested-array mangling with minimal surface. Reuses `edit_file` + `render_batch` + display + storage verbatim. |
-| **2 (gated)** | Multi-file blobs accepted and **split per file**. The canonical form does *not* move: it stays pi's single-`path` `{path, edits:[{oldText,newText}]}`, one stored call per file. | Only worth it if telemetry shows the model routinely wanting cross-file batches. pi cannot express a multi-file call at all, so "one call per file" *is* the pi-compatible shape, not a deviation from it. See Phase 2 below. |
+- **Phase**: **1 (the fix)**
+  - **Scope**: Single file. `{path, blocks:"<block blob>"}` → normalize to
+    canonical `{path, edits:[{oldText,newText}]}`. Flat schema, no `anyOf`, no
+    array on the wire.
+  - **Why**: Directly kills the nested-array mangling with minimal surface.
+    Reuses `edit_file` + `render_batch` + display + storage verbatim.
+- **Phase**: **2 (gated)**
+  - **Scope**: Multi-file blobs accepted and **split per file**. The canonical
+    form does *not* move: it stays pi's single-`path`
+    `{path, edits:[{oldText,newText}]}`, one stored call per file.
+  - **Why**: Only worth it if telemetry shows the model routinely wanting
+    cross-file batches. pi cannot express a multi-file call at all, so "one call
+    per file" *is* the pi-compatible shape, not a deviation from it. See Phase 2
+    below.
 
-Rationale for gating Phase 2: the backend is **all-or-nothing** (`src/tools.rs` —
-no edits applied if any block fails), so a call of `N` blocks succeeds with
+Rationale for gating Phase 2: the backend is **all-or-nothing** (`src/tools.rs`
+— no edits applied if any block fails), so a call of `N` blocks succeeds with
 roughly `(1-p)^N`; large batches are heavily penalized and one mismatch discards
 the whole call. Multi-file does **not** address the actual failure (JSON
 mangling) — single-file text edits do. The gate is measurable with no new
@@ -67,10 +82,16 @@ scalars. Accepted shapes — and **only** these two:
 canonical array. Splitting them removes the overloading, and each name is now
 unambiguous:
 
-| Field | Type | Who writes it | Who reads it |
-| --- | --- | --- | --- |
-| `blocks` | string (blob) | the model; `array_to_blob_value` | `EditArgs::from_wire` (wire), `blob_text` |
-| `edits` | array | `canonicalize_edit_value` (canonical, on disk); a model by reflex | `canonicalize_edit_value`, `get_preview`, replay, and `EditArgs::from_wire` — accepted, never advertised |
+- **Field**: `blocks`
+  - **Type**: string (blob)
+  - **Who writes it**: the model; `array_to_blob_value`
+  - **Who reads it**: `EditArgs::from_wire` (wire), `blob_text`
+- **Field**: `edits`
+  - **Type**: array
+  - **Who writes it**: `canonicalize_edit_value` (canonical, on disk); a model
+    by reflex
+  - **Who reads it**: `canonicalize_edit_value`, `get_preview`, replay, and
+    `EditArgs::from_wire` — accepted, never advertised
 
 **The `edits` array was removed as a wire shape, and has since been put back.**
 It was accepted for pi parity and then withdrawn, because it is the exact thing
@@ -110,7 +131,7 @@ served to the model**.
 
 Example:
 
-```
+```text
 src/foo.py
 @@@OLD
 def foo():
@@ -162,8 +183,8 @@ will inject per-block filename lines. The policy balances familiarity against
 data integrity:
 
 - The parser treats the line(s) between the previous block's `@@@END` (or start
-  of text) and `@@@OLD` as an **optional header**. A header line that resolves as
-  a path is captured; other non-marker text is ignored.
+  of text) and `@@@OLD` as an **optional header**. A header line that resolves
+  as a path is captured; other non-marker text is ignored.
 - **`path` present, header present, they match** → OK.
 - **`path` present, header present, they differ** → **hard error** naming both
   paths. This is the data-integrity guard: never silently write file A when the
@@ -228,7 +249,7 @@ rather than inventing a local one. If the normalized forms are not equal, error
 
 ### Grammar (`src/edit_blocks.rs`, new)
 
-```
+```text
 @@@OLD
 <original lines>
 @@@NEW
@@ -276,8 +297,9 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError>;
 validates that headers agree without keeping them, and keeping them is what
 turns a validated blob into a groupable one.
 
-Plus a small merge helper — `(json_path: Option<&str>, parsed) -> Result<(String, Vec<EditOp>), String>`
-— implementing the path policy above; called by `from_wire` (ingress) and the
+Plus a small merge helper —
+`(json_path: Option<&str>, parsed) -> Result<(String, Vec<EditOp>), String>` —
+implementing the path policy above; called by `from_wire` (ingress) and the
 canonical normalizers (persist, display) so they can never diverge.
 
 Malformed input (missing `@@@NEW`, unterminated block, empty original text)
@@ -290,21 +312,22 @@ The edit tool result does **not** echo the raw edit parameters, and should not.
 Two different "echoes" are worth separating:
 
 - **The tool-result body.** Today it returns `Replaced N block(s) in <path>` on
-  success, and a structured `{ui_view, model_view}` failure on error. That is the
-  right shape: the model already *has* its own parameters, so re-sending them
-  wastes tokens and adds no information. The result only needs to convey the
-  **outcome** — success, or the diagnostic needed to fix it.
+  success, and a structured `{ui_view, model_view}` failure on error. That is
+  the right shape: the model already *has* its own parameters, so re-sending
+  them wastes tokens and adds no information. The result only needs to convey
+  the **outcome** — success, or the diagnostic needed to fix it.
 
   The failure diagnostic **used to** be a targeted diff of the mismatching
   region, and the parenthetical below used to argue for it: *"Error diagnostics
-  legitimately quote the old text region; that is a diff, not a parameter dump."*
-  **That argument no longer holds.** The diff was over a window padded by a fixed
-  256 bytes on each side, capped at 30 rows from the front, so for a small
-  `oldText` in a short-line file the rows that actually differed were usually the
-  ones cut — the model received its own rejected line and nothing else. It now
-  quotes the **file**, in `read`'s exact `NNNN| ` format, at the region that
-  differs; it never quotes the model's own text except when the block cannot be
-  identified any other way. See `doc/edit_error_improvements_260930.md`.
+  legitimately quote the old text region; that is a diff, not a parameter
+  dump."* **That argument no longer holds.** The diff was over a window padded
+  by a fixed 256 bytes on each side, capped at 30 rows from the front, so for a
+  small `oldText` in a short-line file the rows that actually differed were
+  usually the ones cut — the model received its own rejected line and nothing
+  else. It now quotes the **file**, in `read`'s exact `NNNN|` format, at the
+  region that differs; it never quotes the model's own text except when the
+  block cannot be identified any other way. See
+  `doc/edit_error_improvements_260930.md`.
 - **The assistant's own tool-call arguments in the transcript.** These are
   re-sent to the model on every completion because the assistant message is part
   of history — this is not something the tool result controls. It means we are
@@ -336,7 +359,7 @@ echo is still bounded by `MAX_ECHOED_ARGS`.
 
 Example:
 
-```
+```text
 {"blocks":"@@@OLD\nold line 0\n… (38 lines elided) …\nold line 39\n@@@NEW\n…\n@@@END","path":"src/foo.rs"}
 ```
 
@@ -365,12 +388,12 @@ envelope, and session canonical shape are untouched.
 ### Canonical normalization (verified against rig rev `1c2f440`)
 
 The goal is to keep the custom parser **out of `output.rs`** and, more broadly,
-to establish a single **canonical internal form** (the pi array) that persist and
-render share. Normalize the args at each boundary where they enter picocode's
-internal representation, so every downstream consumer (`get_preview`,
+to establish a single **canonical internal form** (the pi array) that persist
+and render share. Normalize the args at each boundary where they enter
+picocode's internal representation, so every downstream consumer (`get_preview`,
 `render_turn`, the session file) sees the same shape. (The **model-facing** form
-is a separate, deliberate divergence — the blob — handled in *What the model
-sees* below.)
+is a separate, deliberate divergence — the blob — handled in
+*What the model sees* below.)
 
 First, a negative result that rules out the obvious hook:
 
@@ -382,19 +405,27 @@ First, a negative result that rules out the obvious hook:
   items.clone() }`. So a rewrite never reaches `resp.messages()` /
   `final_history` and never reaches the session. Do not use it here.
 
-The raw string reaches the internal surfaces at three points, so normalization to
-canonical happens at three call sites — **one shared `normalize_edit_args` fn**,
-called from each:
+The raw string reaches the internal surfaces at three points, so normalization
+to canonical happens at three call sites —
+**one shared `normalize_edit_args` fn**, called from each:
 
-| Path | Where | Notes |
-| --- | --- | --- |
-| Live display | `LoggingHook::on_tool_call` (`agent.rs:1741`) | Fires **mid-turn**, before the assistant message is appended. Normalize the parsed `Value` *before* `display_tool_call`. This is what keeps the parser out of `output.rs`. |
-| Disk JSONL + in-memory index | `Session::append_message` (`session.rs:897`) | Rewrite the assistant `edit` tool-call's args **before** `rig_message_to_pi_entries`, so both the file on disk and `index.entries` are canonical. |
-| Load / reload | `build_index` → `normalize_entry_in_place` (`storage.rs:275`) | Already exists; kept for pre-existing files. |
+- **Path**: Live display
+  - **Where**: `LoggingHook::on_tool_call` (`agent.rs:1741`)
+  - **Notes**: Fires **mid-turn**, before the assistant message is appended.
+    Normalize the parsed `Value` *before* `display_tool_call`. This is what
+    keeps the parser out of `output.rs`.
+- **Path**: Disk JSONL + in-memory index
+  - **Where**: `Session::append_message` (`session.rs:897`)
+  - **Notes**: Rewrite the assistant `edit` tool-call's args **before**
+    `rig_message_to_pi_entries`, so both the file on disk and `index.entries`
+    are canonical.
+- **Path**: Load / reload
+  - **Where**: `build_index` → `normalize_entry_in_place` (`storage.rs:275`)
+  - **Notes**: Already exists; kept for pre-existing files.
 
 Why normalize the **message** (before `rig_message_to_pi_entries`) rather than
-only the in-memory index: **pi reads picocode's files**, so the on-disk form must
-already be pi-canonical. This deliberately overrides the codebase's default
+only the in-memory index: **pi reads picocode's files**, so the on-disk form
+must already be pi-canonical. This deliberately overrides the codebase's default
 "normalize on read, keep JSONL raw" preference (`storage.rs:273`) — that
 preference assumed picocode was the only reader. It is not: pi is a second
 reader, so the write path must emit the canonical shape.
@@ -403,11 +434,15 @@ reader, so the write path must emit the canonical shape.
 
 There are three distinct representations, with clear owners:
 
-| Representation | Form | Owner |
-| --- | --- | --- |
-| **Emitted** | blob, pi array, or legacy `old`/`new` | the model; ingress only |
-| **Canonical internal** | pi array `{path, edits:[{oldText,newText}]}` | persist + render |
-| **Model-facing** | blob (`path` + SEARCH/REPLACE blocks) | history sent to the model |
+- **Representation**: **Emitted**
+  - **Form**: blob, pi array, or legacy `old`/`new`
+  - **Owner**: the model; ingress only
+- **Representation**: **Canonical internal**
+  - **Form**: pi array `{path, edits:[{oldText,newText}]}`
+  - **Owner**: persist + render
+- **Representation**: **Model-facing**
+  - **Form**: blob (`path` + SEARCH/REPLACE blocks)
+  - **Owner**: history sent to the model
 
 The **model-facing** form is the blob, **consistently** — every message in the
 history a completion call sends, not just cross-turn. Rationale: the model
@@ -421,8 +456,8 @@ carries `history: &[Message]`; a `RequestPatch::history` **replaces** the prior
 messages per `prepare.rs`), so a single transform there covers prior *and*
 within-turn messages — the current `on_tool_call`/`append_message` sites cannot,
 because they run before the within-turn assistant message exists. Today the hook
-returns `Continue` when `reasoning_in_context`; change it to **always** build the
-full history and return `Patch(history(transformed))`:
+returns `Continue` when `reasoning_in_context`; change it to **always** build
+the full history and return `Patch(history(transformed))`:
 
 ```rust
 // agent.rs on_completion_call
@@ -457,15 +492,15 @@ accepted cost of pi-compat.
 
 ### Pi compatibility and the egress points
 
-pi's canonical `edit` call is `{path, edits:[{oldText,newText}]}` — an *array* of
-`oldText`/`newText` entries (multi-entry), under a **single** `path`
-(`packages/coding-agent/src/core/tools/edit.ts`; there is no per-edit `path`, and
-`applyEditsToNormalizedContent` writes one file per call). picocode's canonical
-in-memory form already matches this (`normalize_args_in_place` folds legacy
-`old`/`new` into the array). So "pi compatibility" here means one concrete
-thing: **every model form (the new Aider text blob, the legacy array, or a
-legacy `old`/`new`) must be written to disk as that array**, or pi cannot read
-the file. The single-`path` part is load-bearing for multi-file: pi cannot
+pi's canonical `edit` call is `{path, edits:[{oldText,newText}]}` — an *array*
+of `oldText`/`newText` entries (multi-entry), under a **single** `path`
+(`packages/coding-agent/src/core/tools/edit.ts`; there is no per-edit `path`,
+and `applyEditsToNormalizedContent` writes one file per call). picocode's
+canonical in-memory form already matches this (`normalize_args_in_place` folds
+legacy `old`/`new` into the array). So "pi compatibility" here means one
+concrete thing: **every model form (the new Aider text blob, the legacy array,
+or a legacy `old`/`new`) must be written to disk as that array**, or pi cannot
+read the file. The single-`path` part is load-bearing for multi-file: pi cannot
 represent a cross-file batch at all, which is why Phase 2 splits into per-file
 calls instead of adopting a path-per-edit canonical form.
 
@@ -489,12 +524,19 @@ carry args — the `on_tool_call` event and the `ToolExecutionCommitted` effecti
 call — are **not** what gets persisted. So the representation must be normalized
 at each *egress*, all via one shared `normalize_edit_args()` helper:
 
-| Egress | Site | Transform |
-| --- | --- | --- |
-| Disk JSONL + in-memory index | `Session::append_message`, rewrite assistant tool-call args before `rig_message_to_pi_entries` | → canonical array (pi reads the file) |
-| Live display | `LoggingHook::on_tool_call`, before `display_tool_call` | → canonical array (so `get_preview` stays array-only) |
-| Model history | `LoggingHook::on_completion_call`, whole history, every call | → blob (see *What the model sees* above) |
-| Legacy files on disk | `build_index` → `normalize_entry_in_place` (exists) | → canonical array |
+- **Egress**: Disk JSONL + in-memory index
+  - **Site**: `Session::append_message`, rewrite assistant tool-call args before
+    `rig_message_to_pi_entries`
+  - **Transform**: → canonical array (pi reads the file)
+- **Egress**: Live display
+  - **Site**: `LoggingHook::on_tool_call`, before `display_tool_call`
+  - **Transform**: → canonical array (so `get_preview` stays array-only)
+- **Egress**: Model history
+  - **Site**: `LoggingHook::on_completion_call`, whole history, every call
+  - **Transform**: → blob (see *What the model sees* above)
+- **Egress**: Legacy files on disk
+  - **Site**: `build_index` → `normalize_entry_in_place` (exists)
+  - **Transform**: → canonical array
 
 The first two and the last all use the same `normalize_edit_args` (→ array);
 model history uses the inverse `edit_args_to_model_form` (→ blob). Persist and
@@ -564,7 +606,7 @@ Risks / trade-offs:
   header; conflicting header (error names both); missing `@@@NEW` /
   `@@@END`; empty original text.
 - Path policy: `path`+header agree; `path`+header differ → error; `path` absent
-  + one distinct header → inferred; `path` absent + differing headers → error.
+  - one distinct header → inferred; `path` absent + differing headers → error.
 - Wire: flat schema has **no** `anyOf` and advertises **no array** property;
   the `blocks` string applies via `ErasedTool::execute`; malformed text errors
   with guidance; the single-edit shape still parses; the `edits` array is
@@ -600,7 +642,7 @@ two different regions.
 
 A block's header line may carry a trailing line anchor:
 
-```
+```text
 some/path.rs:120
 @@@OLD
 The original text
@@ -642,12 +684,13 @@ field had two meanings — "first line of an exact byte window" when `endLine` w
 set, "nearest-match anchor" when it was not — a comprehension tax selected by a
 sibling field's presence. The window's only unique power was targeting a *far*
 occurrence that was nonetheless the sole match in a broad range; in practice you
-anchor *on* the target or add context instead. Crucially it did **not** remove the
-anchor's one real hazard — a silent wrong-pick, which is inherent to nearest-match
-and survives either way. Dropping it is a strict simplification (one anchor
-concept, no window code), and its cost is *loud*: a legacy call relying on a wide
-window now fails as out-of-tolerance and can simply be retried. Since anchors are
-transient, there is no session or pi-format migration.
+anchor *on* the target or add context instead. Crucially it did **not** remove
+the anchor's one real hazard — a silent wrong-pick, which is inherent to
+nearest-match and survives either way. Dropping it is a strict simplification
+(one anchor concept, no window code), and its cost is *loud*: a legacy call
+relying on a wide window now fails as out-of-tolerance and can simply be
+retried. Since anchors are transient, there is no session or pi-format
+migration.
 
 ---
 
@@ -677,19 +720,18 @@ The original plan does not survive contact with the code. Five findings:
    first-seen order, with a tested consumer (`bsed apply -i`). "Parser allows a
    header per block; blocks may repeat or omit a path" is implemented — and its
    answer to the open question below is already coded.
-3. **`group_by_file` is not a drop-in; the difference is a
-   wrong-file-write hazard.** (Written when the block path went through
-   `merge_path`, which is strict-on-conflict. `merge_path` has since been
-   removed from the block path entirely — `split_by_file` serves every blob —
-   so the hazard below stands on its own:) `merge_path` is strict-on-conflict;
-   `group_by_file` is header-authoritative — a header wins and `path` only fills
-   gaps. So a blob whose first block says `a.rs`, whose second block has no
-   header, sent with `path: "b.rs"` is **today a loud `path mismatch` error**, but
-   under a naive `group_by_file` split becomes **two batches, `a.rs` and
-   `b.rs`** (verified). That is precisely the silent wrong-file write
-   `merge_path` exists to prevent, so the split must run the conflict check
-   first — cheapest as a `merge_path` variant that keeps the policy and relaxes
-   only its `multi_file` arm.
+3. **`group_by_file` is not a drop-in; the difference is a wrong-file-write
+   hazard.** (Written when the block path went through `merge_path`, which is
+   strict-on-conflict. `merge_path` has since been removed from the block path
+   entirely — `split_by_file` serves every blob — so the hazard below stands on
+   its own:) `merge_path` is strict-on-conflict; `group_by_file` is
+   header-authoritative — a header wins and `path` only fills gaps. So a blob
+   whose first block says `a.rs`, whose second block has no header, sent with
+   `path: "b.rs"` is **today a loud `path mismatch` error**, but under a naive
+   `group_by_file` split becomes **two batches, `a.rs` and `b.rs`** (verified).
+   That is precisely the silent wrong-file write `merge_path` exists to prevent,
+   so the split must run the conflict check first — cheapest as a `merge_path`
+   variant that keeps the policy and relaxes only its `multi_file` arm.
 4. **`group_by_file` keys on the raw header string, not the normalized path.**
    `path: "./a.rs"` with a header `a.rs` yields *two* batches for one file,
    where `merge_path`'s `same_path` (`resolve_normalized`) collapses them
@@ -707,11 +749,18 @@ The original plan does not survive contact with the code. Five findings:
 
 Multi-file touches three separate paths, and only the first is the tool:
 
-| | assistant `edit` call | tool result | source |
-| --- | --- | --- | --- |
-| **execution** | 1 call | 1 aggregated envelope | `EditFile::call` |
-| **in-turn model context** | 1 × multi-file blob | 1 aggregated | rig's live history → `on_completion_call` |
-| **stored + post-reload** | N × single-path | N per-file | `append_message` → JSONL → `extract_messages` |
+- **execution**
+  - **assistant `edit` call**: 1 call
+  - **tool result**: 1 aggregated envelope
+  - **source**: `EditFile::call`
+- **in-turn model context**
+  - **assistant `edit` call**: 1 × multi-file blob
+  - **tool result**: 1 aggregated
+  - **source**: rig's live history → `on_completion_call`
+- **stored + post-reload**
+  - **assistant `edit` call**: N × single-path
+  - **tool result**: N per-file
+  - **source**: `append_message` → JSONL → `extract_messages`
 
 `append_message` writes the session file and the index; it does not touch rig's
 live `history`. `on_completion_call` (`agent.rs:1794`) reads that live history
@@ -722,9 +771,9 @@ model's **raw** assistant message and the tool results. `blob_edit_tool_calls`
 array. So **the model sees exactly the one multi-file blob it emitted, in-turn
 and forever within that turn** — verified.
 
-**This is the trap in the obvious plan.** Splitting only at persist is the single
-option where the two views of one session disagree: the panel, the model and
-`--log-messages` all say one call, while the file says three, and a reload
+**This is the trap in the obvious plan.** Splitting only at persist is the
+single option where the two views of one session disagree: the panel, the model
+and `--log-messages` all say one call, while the file says three, and a reload
 silently rewrites the model's own history underneath it. A model that trusts its
 context less after a reload is a worse outcome than either alternative. So the
 model-facing split is not optional garnish on the storage split — it is what
@@ -744,10 +793,13 @@ pi compatibility is a *storage* property, not an execution one, so "accept the
 blob" and "let pi read the session" are separate changes that can be gated on
 separate evidence:
 
-| | Today | Change |
-| --- | --- | --- |
-| **execution** | a multi-file blob is rejected; the model retries, or had already emitted parallel per-file calls (rig dispatches those; costs nothing) | accept the blob, split per file in `EditFile::call` |
-| **storage** | one raw multi-file call; pi cannot read the file | split at persist into N canonical single-path calls |
+- **execution**
+  - **Today**: a multi-file blob is rejected; the model retries, or had already
+    emitted parallel per-file calls (rig dispatches those; costs nothing)
+  - **Change**: accept the blob, split per file in `EditFile::call`
+- **storage**
+  - **Today**: one raw multi-file call; pi cannot read the file
+  - **Change**: split at persist into N canonical single-path calls
 
 Either can ship alone, and each is small. The storage axis presupposes the
 execution one — a call that is rejected never produces the per-file results the
@@ -799,12 +851,13 @@ over the status quo.
 - **No new API for the per-file canonical value**: `render_blob` +
   `canonicalize_edit_value` already produce it, and `array_to_blob_value`
   inverts it idempotently (verified). `render_blob` drops the `:LINE` anchors,
-  which is correct here — anchors are transient and the canonical array has never
-  carried them.
+  which is correct here — anchors are transient and the canonical array has
+  never carried them.
 - **This repairs compaction for free.** `collect_touched_files`
-  (`session.rs:194`) reads `arguments.path` per `edit` call, so a multi-file blob
-  stored raw contributes at most its top-level `path` and every header-only file
-  is missing from the compaction summary. N stored calls fix it with no code.
+  (`session.rs:194`) reads `arguments.path` per `edit` call, so a multi-file
+  blob stored raw contributes at most its top-level `path` and every header-only
+  file is missing from the compaction summary. N stored calls fix it with no
+  code.
 - **`on_completion_call` is the second call site, not a bystander.** An earlier
   draft of this note claimed it "needs nothing", on the grounds that
   `blob_edit_tool_calls` derives the model-facing form from the stored canonical
@@ -828,10 +881,10 @@ over the status quo.
 
 **Fixed in the rename.** Splitting inside the tool does not change the live
 panel, because `on_tool_call` canonicalizes before `display_tool_call` and a
-blob that cannot canonicalize reaches `get_preview` as-is. The `edit` branch used
-to read `edits` as an array (miss), then the legacy `old`/`new` fields (miss,
-both empty), and called `edit_preview` with one empty op — an empty diff plus a
-bogus `[1]` range, since `content.find("")` is `Some(0)`. The panel read
+blob that cannot canonicalize reaches `get_preview` as-is. The `edit` branch
+used to read `edits` as an array (miss), then the legacy `old`/`new` fields
+(miss, both empty), and called `edit_preview` with one empty op — an empty diff
+plus a bogus `[1]` range, since `content.find("")` is `Some(0)`. The panel read
 `edit b.rs [1]` with nothing under it, for a call that failed.
 
 `get_preview` now canonicalizes its own input first, so a resolvable blob
@@ -846,15 +899,24 @@ cannot justify is worse than no line number.
 
 ### Files
 
-`src/edit_blocks.rs` is a re-export shim — edit `crates/blockedit`, not the shim.
+`src/edit_blocks.rs` is a re-export shim — edit `crates/blockedit`, not the
+shim.
 
-| # | File | Change |
-| --- | --- | --- |
-| W1–W3 | `blockedit/src/{blob,wire,diagnose}.rs` | split policy + cap, `EditArgs.files`, the envelope |
-| W4–W5 | `src/tools.rs` | plan/commit split, multi-file driver, deduplicated description |
-| W6 | `src/output.rs` | `get_preview` label-only for an unsplittable blob |
-| W7 | `src/agent.rs` | the shared split transform + `on_completion_call` site |
-| W8 | `src/session/session.rs` | the persist site |
+- **#**: W1–W3
+  - **File**: `blockedit/src/{blob,wire,diagnose}.rs`
+  - **Change**: split policy + cap, `EditArgs.files`, the envelope
+- **#**: W4–W5
+  - **File**: `src/tools.rs`
+  - **Change**: plan/commit split, multi-file driver, deduplicated description
+- **#**: W6
+  - **File**: `src/output.rs`
+  - **Change**: `get_preview` label-only for an unsplittable blob
+- **#**: W7
+  - **File**: `src/agent.rs`
+  - **Change**: the shared split transform + `on_completion_call` site
+- **#**: W8
+  - **File**: `src/session/session.rs`
+  - **Change**: the persist site
 
 ### Types
 
@@ -920,8 +982,8 @@ fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message>;
 It rewrites two things, and must find them independently:
 
 - **the call** — an `edit` tool call whose arguments are a blob that splits into
-  more than one file becomes N calls, arguments `split_canonical_values(&args)[i]`,
-  ids `split_id(&orig, i, n)`;
+  more than one file becomes N calls, arguments
+  `split_canonical_values(&args)[i]`, ids `split_id(&orig, i, n)`;
 - **its result** — a `ToolResult` whose text parses as the per-file array
   becomes N results, ids taken by index, each carrying that entry's own `result`
   verbatim (its success note, or its `{ui_view, model_view}` envelope).
@@ -981,6 +1043,7 @@ precedence at all. **That comment is fixed** as the W1 drive-by, and now names
 `split_by_file`'s no-fallback rule so the two cannot be conflated again.
 
 *Invariants:*
+
 - a header-less block is rejected, and never becomes a second file — the exact
   blob `group_by_file` turns into two batches;
 - `./a.rs` and `a.rs` are **one** batch, not two;
@@ -994,6 +1057,7 @@ first-seen ordering; exactly 32 files ok / 33 rejected; the cap counting files
 not blocks; `merge_path`'s own behaviour untouched.
 
 *Two fixes found while implementing, both pre-existing:*
+
 - **`group_by_file` named the wrong block.** Its error used
   `order.len() + 1` — the *group* count, not the block index — so three blocks
   naming `a.rs` followed by a header-less block reported "block 2" for block 4,
@@ -1011,10 +1075,10 @@ not blocks; `merge_path`'s own behaviour untouched.
   malformation rather than report an absence.
 
 **W2 — the tool's Args (`blockedit/src/wire.rs`). — DONE.** `EditArgs` is now
-`{ files: Vec<FileEdit> }`, with `FileEdit { path, edits }`. `from_wire` routes a
-**multi-file** block blob through `split_by_file` and wraps the single-edit and
-single-file block shapes as a one-element `files`, so the tool has one loop and
-no shape special-case beyond construction.
+`{ files: Vec<FileEdit> }`, with `FileEdit { path, edits }`. `from_wire` routes
+a **multi-file** block blob through `split_by_file` and wraps the single-edit
+and single-file block shapes as a one-element `files`, so the tool has one loop
+and no shape special-case beyond construction.
 
 **Multi-file is now reachable by a model** — this is the commit that ships the
 feature. Routing is on `parsed.multi_file`, not on "did it look multi-file":
@@ -1035,19 +1099,21 @@ through the erased tool: one call edits three files, and a file that fails to
 match leaves the others written.
 
 *Two scope notes, both deliberate:*
+
 - `FileEdit` has no `PartialEq`. `EditOp` deliberately has none, and widening a
   core type for a convenience nothing uses would be the wrong trade.
-- **`EditFile::call` applies each file as it resolves.** That is the
-  per-file failure granularity the tool description already advertises, and the
+- **`EditFile::call` applies each file as it resolves.** That is the per-file
+  failure granularity the tool description already advertises, and the
   single-file path is `edit_file` verbatim. What is *not* here is W4's
   resolve-everything-then-write-what-resolved pass, which would report all of a
   call's problems in one round trip instead of one file per trip. Until W4, a
-  multi-file call is applied file-by-file and each file's own report is returned.
+  multi-file call is applied file-by-file and each file's own report is
+  returned.
 
-**W3 — the result shape (`blockedit/src/diagnose.rs` + `src/output.rs`) — DONE.**
-The multi-file result is a **bare JSON array of per-file results**, one entry per
-file, each `result` being that file's single-file result *verbatim* (a success
-note string, or a `{ui_view, model_view}` failure envelope):
+**W3 — the result shape (`blockedit/src/diagnose.rs` + `src/output.rs`) —
+DONE.** The multi-file result is a **bare JSON array of per-file results**, one
+entry per file, each `result` being that file's single-file result *verbatim* (a
+success note string, or a `{ui_view, model_view}` failure envelope):
 
 ```json
 [ {"path": "src/a.rs", "result": "Replaced 1 block(s) in ./a.rs"},
@@ -1096,9 +1162,9 @@ already is.
 
 What it was actually for — a per-file failure being **data, not control flow** —
 is now a fold in the existing loop: a file that cannot be resolved, read, or
-written becomes that file's `{path, result}` entry (naming the path) and the loop
-continues, so the model gets every file's outcome in one round trip. Before this,
-the `?` in the loop aborted the whole call and discarded the other files'
+written becomes that file's `{path, result}` entry (naming the path) and the
+loop continues, so the model gets every file's outcome in one round trip. Before
+this, the `?` in the loop aborted the whole call and discarded the other files'
 reports, reducing a 3-file call to a bare `the tool failed`.
 
 *Tests:* two files both apply; one fails to match and the other still applies,
@@ -1107,12 +1173,12 @@ folds into its own entry naming the path, the other files still apply, and the
 array always has exactly one entry per file**; success notes name each file's
 own matched lines.
 
-**W5 — the tool contract (`src/tools.rs`). — the de-dup is DONE; the copy is not.**
-The rename already lifted the syntax and the policy sentence into `BLOCK_SYNTAX`
-/ `BLOCK_POLICY` and interpolated both into the description and the
-`blocks` parameter, so only the *wording* of `BLOCK_POLICY` remains: state that
-a blob may span files, that each file is all-or-nothing, and that a file which
-fails is reported without blocking the others. Do **not** advertise the
+**W5 — the tool contract (`src/tools.rs`). — the de-dup is DONE; the copy is
+not.** The rename already lifted the syntax and the policy sentence into
+`BLOCK_SYNTAX` / `BLOCK_POLICY` and interpolated both into the description and
+the `blocks` parameter, so only the *wording* of `BLOCK_POLICY` remains: state
+that a blob may span files, that each file is all-or-nothing, and that a file
+which fails is reported without blocking the others. Do **not** advertise the
 split-to-N-calls behaviour — that is a storage detail, not a model contract.
 Also state that a multi-file blob needs a filename line above **every** block,
 so the stricter policy is something the model is told rather than discovered.
@@ -1156,14 +1222,23 @@ has to be kept whole, which means the call half must wait for the result half.
 
 *The mechanism* (`src/output.rs`):
 
-| where | what |
-| --- | --- |
-| `display_tool_call` | stashes `last_tool`, and for a multi-file `edit` **returns without rendering** — the pair is incomplete |
-| `multi_file_blobs` / `per_file_blocks` | per-file call arguments, in first-seen order, each a complete single-file argument value |
-| `display_tool_result` | reads the stashed args back, pairs them with the array's entries by index, and for each pair calls `render_call_panel` then `render_result_panel` |
-| `render_call_panel` | the call half: `boundary()`, label, trailing diff lines |
-| `render_result_panel` | the result half: envelope/`sed`/note, ending in `end_tool_block()` |
-| `multi_file_pairs` | the pairing; a length mismatch degrades to rendering the result alone rather than guessing |
+- **where**: `display_tool_call`
+  - **what**: stashes `last_tool`, and for a multi-file `edit`
+    **returns without rendering** — the pair is incomplete
+- **where**: `multi_file_blobs` / `per_file_blocks`
+  - **what**: per-file call arguments, in first-seen order, each a complete
+    single-file argument value
+- **where**: `display_tool_result`
+  - **what**: reads the stashed args back, pairs them with the array's entries
+    by index, and for each pair calls `render_call_panel` then
+    `render_result_panel`
+- **where**: `render_call_panel`
+  - **what**: the call half: `boundary()`, label, trailing diff lines
+- **where**: `render_result_panel`
+  - **what**: the result half: envelope/`sed`/note, ending in `end_tool_block()`
+- **where**: `multi_file_pairs`
+  - **what**: the pairing; a length mismatch degrades to rendering the result
+    alone rather than guessing
 
 `render_call_panel` and `render_result_panel` are the *same* functions a
 single-file call goes through — there is no second code path, which is what
@@ -1267,12 +1342,27 @@ message — `on_tool_result` → `ToolResultAction::Rewrite` — and it looks li
 transient "what the model sees this round." **It is not.** A rewrite replaces
 the result *permanently in history*:
 
-| what | where (rig rev `1c2f440`, `crates/rig-agent/src/agent/`) | what it does |
-| --- | --- | --- |
-| `ToolResultAction::Rewrite` | `hook.rs` — "Replace the effective presentation sent to the model" | the replacement becomes the `ToolCallOutcome.content` |
-| how it lands | `runner.rs:743` — `Rewrite(replacement) => … tool_result_output(id, …, replacement)` | the history entry is built from `replacement`, **not** `exec.output()` |
-| proof | `runner.rs` test `rewrite_result_is_delivered_verbatim_not_reparsed` — asserts the tool's own output `!tool_result_text_in_history(..)` and the replacement *is* in history | the original never reaches the model |
-| also | `runner.rs` test `rewrite_result_does_not_mask_the_structured_outcome` | a rewrite changes what the *model* sees, not classification — so the bytes in history are the rewrite |
+- **what**: `ToolResultAction::Rewrite`
+  - **where (rig rev `1c2f440`, `crates/rig-agent/src/agent/`)**: `hook.rs` —
+    "Replace the effective presentation sent to the model"
+  - **what it does**: the replacement becomes the `ToolCallOutcome.content`
+- **what**: how it lands
+  - **where (rig rev `1c2f440`, `crates/rig-agent/src/agent/`)**:
+    `runner.rs:743` —
+    `Rewrite(replacement) => … tool_result_output(id, …, replacement)`
+  - **what it does**: the history entry is built from `replacement`, **not**
+    `exec.output()`
+- **what**: proof
+  - **where (rig rev `1c2f440`, `crates/rig-agent/src/agent/`)**: `runner.rs`
+    test `rewrite_result_is_delivered_verbatim_not_reparsed` — asserts the
+    tool's own output `!tool_result_text_in_history(..)` and the replacement
+    *is* in history
+  - **what it does**: the original never reaches the model
+- **what**: also
+  - **where (rig rev `1c2f440`, `crates/rig-agent/src/agent/`)**: `runner.rs`
+    test `rewrite_result_does_not_mask_the_structured_outcome`
+  - **what it does**: a rewrite changes what the *model* sees, not
+    classification — so the bytes in history are the rewrite
 
 Consequence: rewriting the array to an aggregate at `on_tool_result` would erase
 it before W7/W8 read it. The model would be happy for exactly one round, and
@@ -1291,16 +1381,36 @@ strip applies — the array is left alone so it survives.)
 
 ### Test matrix
 
-| Area | Where | Cases |
-| --- | --- | --- |
-| split policy | `blockedit` unit | 4 rules; header-less block rejected even with `path` set; `./a.rs`+`a.rs` → 1 batch; `path` conflict → error; ordering; 32/33 cap |
-| wire | `blockedit` unit | 2 shapes; multi-file → N; single-file unchanged; `edits` array rejected; `blocks` as array unrecognised |
-| result shape | `blockedit` unit | array round-trips; per-file `result` verbatim; single-file unchanged |
-| tool e2e | `tools::edit_args_wire_tests` (reuse `CwdGuard`, `#[serial]`) | 2 files apply; partial; sandbox denial; missing file; notes per file |
-| display | `output` unit | no `[1]`, no diff; canonicalizable unchanged |
-| model hook | `agent` unit | N calls + N results, ids paired, identity fields cleared, idempotent, identity without |
-| persist | `session` unit | JSONL pi-canonical; N results; reload no-op; touched-files complete |
-| regression | whole suite | existing `edit_file` / wire / output-preview tests pass unchanged |
+- **Area**: split policy
+  - **Where**: `blockedit` unit
+  - **Cases**: 4 rules; header-less block rejected even with `path` set;
+    `./a.rs`+`a.rs` → 1 batch; `path` conflict → error; ordering; 32/33 cap
+- **Area**: wire
+  - **Where**: `blockedit` unit
+  - **Cases**: 2 shapes; multi-file → N; single-file unchanged; `edits` array
+    rejected; `blocks` as array unrecognised
+- **Area**: result shape
+  - **Where**: `blockedit` unit
+  - **Cases**: array round-trips; per-file `result` verbatim; single-file
+    unchanged
+- **Area**: tool e2e
+  - **Where**: `tools::edit_args_wire_tests` (reuse `CwdGuard`, `#[serial]`)
+  - **Cases**: 2 files apply; partial; sandbox denial; missing file; notes per
+    file
+- **Area**: display
+  - **Where**: `output` unit
+  - **Cases**: no `[1]`, no diff; canonicalizable unchanged
+- **Area**: model hook
+  - **Where**: `agent` unit
+  - **Cases**: N calls + N results, ids paired, identity fields cleared,
+    idempotent, identity without
+- **Area**: persist
+  - **Where**: `session` unit
+  - **Cases**: JSONL pi-canonical; N results; reload no-op; touched-files
+    complete
+- **Area**: regression
+  - **Where**: whole suite
+  - **Cases**: existing `edit_file` / wire / output-preview tests pass unchanged
 
 ### Rollout
 
@@ -1312,32 +1422,47 @@ deterministic rejoin is a small change *inside the same function* rather than an
 undo.
 
 **W1, W5 and W6 have already landed.** W5 and W6 came in with the `blocks`
-rename, which touched the same two call sites the split needs. W1 landed next, as
-a pure path policy with no caller: `split_by_file` is implemented and tested, but
-nothing routes to it yet — `from_wire` still goes through `merge_path` and still
-rejects a multi-file blob. So multi-file editing is **not** available to a model
-at this commit; W2 is what makes it so, and the remaining work is W2–W4 and
-W7–W8. The only item still open in W5 is the *wording* of `BLOCK_POLICY` once
-multi-file ships. The rename itself is already deployed and ungated, because it
-removes a wire shape rather than adding one.
+rename, which touched the same two call sites the split needs. W1 landed next,
+as a pure path policy with no caller: `split_by_file` is implemented and tested,
+but nothing routes to it yet — `from_wire` still goes through `merge_path` and
+still rejects a multi-file blob. So multi-file editing is **not** available to a
+model at this commit; W2 is what makes it so, and the remaining work is W2–W4
+and W7–W8. The only item still open in W5 is the *wording* of `BLOCK_POLICY`
+once multi-file ships. The rename itself is already deployed and ungated,
+because it removes a wire shape rather than adding one.
 
-W1 landing first is deliberate: it is pure, it touches no wire shape, and it puts
-the strict policy — plus the two error messages — under test before anything can
-call them. It is also revertible on its own, which matters more than usual here
-because it is the piece that could silently re-target a file if it were wrong.
+W1 landing first is deliberate: it is pure, it touches no wire shape, and it
+puts the strict policy — plus the two error messages — under test before
+anything can call them. It is also revertible on its own, which matters more
+than usual here because it is the piece that could silently re-target a file if
+it were wrong.
 
 ### Risks
 
-| Risk | Mitigation |
-| --- | --- |
-| `group_by_file` used for the agent by mistake, silently re-targeting a file | `split_by_file` is the only entry point `from_wire` may call; the conflict case is a named regression test |
-| N identical provider ids on the wire | clear `provider`/`signature`; asserted in the W7 tests |
-| Prompt-cache churn from a non-deterministic rewrite | ids derive from `(orig, i, n)` only; the idempotence test plus a fixed-golden transform test |
-| The model reads a call it did not emit as N calls | the rejoin is the escape hatch, and it is deterministic |
-| Partial write surprises a cross-file refactor | the model-facing envelope enumerates every file's outcome; global all-or-nothing is a one-line change to the write step |
-| Unbounded fan-out from one string argument | `MAX_FILES_PER_CALL`, checked before any file is touched |
-| `bsed` drift | both binaries share `blockedit`; W1–W3 add to it rather than fork it, and `blockedit`'s tests (plus `bsed`'s own) gate the change |
-| A stricter multi-file rule than the single-file one costs a round trip on a sloppy blob | accepted: the cost is one filename line per block in a format whose header line is already idiomatic, and the alternative is a silent wrong-file write |
+- **Risk**: `group_by_file` used for the agent by mistake, silently re-targeting
+  a file
+  - **Mitigation**: `split_by_file` is the only entry point `from_wire` may
+    call; the conflict case is a named regression test
+- **Risk**: N identical provider ids on the wire
+  - **Mitigation**: clear `provider`/`signature`; asserted in the W7 tests
+- **Risk**: Prompt-cache churn from a non-deterministic rewrite
+  - **Mitigation**: ids derive from `(orig, i, n)` only; the idempotence test
+    plus a fixed-golden transform test
+- **Risk**: The model reads a call it did not emit as N calls
+  - **Mitigation**: the rejoin is the escape hatch, and it is deterministic
+- **Risk**: Partial write surprises a cross-file refactor
+  - **Mitigation**: the model-facing envelope enumerates every file's outcome;
+    global all-or-nothing is a one-line change to the write step
+- **Risk**: Unbounded fan-out from one string argument
+  - **Mitigation**: `MAX_FILES_PER_CALL`, checked before any file is touched
+- **Risk**: `bsed` drift
+  - **Mitigation**: both binaries share `blockedit`; W1–W3 add to it rather than
+    fork it, and `blockedit`'s tests (plus `bsed`'s own) gate the change
+- **Risk**: A stricter multi-file rule than the single-file one costs a round
+  trip on a sloppy blob
+  - **Mitigation**: accepted: the cost is one filename line per block in a
+    format whose header line is already idiomatic, and the alternative is a
+    silent wrong-file write
 
 ### Open questions (reduced)
 
@@ -1481,10 +1606,10 @@ legacy-normalize (`session`), history blobification (`agent`). Full suite green.
 
 ## Implementation status (`blocks`, no array on the wire — done)
 
-- `blockedit::blob`: `BLOCKS_FIELD` + `blob_text`, the one accessor every
-  site uses to find the blob, so the field name is stated once. A blob string
-  under a pre-rename `edits` as a **string** is still read (`LEGACY_BLOCKS_FIELD`),
-  so the rename does not break callers that never saw it.
+- `blockedit::blob`: `BLOCKS_FIELD` + `blob_text`, the one accessor every site
+  uses to find the blob, so the field name is stated once. A blob string under a
+  pre-rename `edits` as a **string** is still read (`LEGACY_BLOCKS_FIELD`), so
+  the rename does not break callers that never saw it.
 - `array_to_blob_value` emits `blocks`; `canonicalize_edit_value` reads it.
   The canonical array keeps the name `edits` — that is pi's, and it stays.
 - `wire::EditArgs::from_wire` accepts **two** shapes: the `blocks` blob and the
@@ -1498,11 +1623,11 @@ legacy-normalize (`session`), history blobification (`agent`). Full suite green.
   `blocks`, in picocode and in `bsed`'s banner.
 - `output.rs`: `get_preview` canonicalizes, and takes `path` from the canonical
   value. This retires the bogus `edit b.rs [1]` label.
-- Tests: the array-on-wire test became `an_edits_array_is_rejected_and_writes_nothing`
-  (it now proves the file is untouched); `canonical_multi_edit_applies_all` was
-  deleted as a duplicate of `block_form_applies_all_edits`; new coverage for
-  field non-interchangeability, and for the legacy `edits` string winning only
-  when `blocks` is absent.
+- Tests: the array-on-wire test became
+  `an_edits_array_is_rejected_and_writes_nothing` (it now proves the file is
+  untouched); `canonical_multi_edit_applies_all` was deleted as a duplicate of
+  `block_form_applies_all_edits`; new coverage for field non-interchangeability,
+  and for the legacy `edits` string winning only when `blocks` is absent.
 - **Second rename**, `batches` → `blocks`, carried by the `sed` tool: the
   field, the constant, and the two description consts all moved together
   (`BLOCKS_FIELD`, `BLOCK_SYNTAX`, `BLOCK_POLICY`). See *Parameter name* for
@@ -1526,8 +1651,8 @@ batch that a harness may silently stringify into nothing.
 **Correction, after shipping.** The rename first shipped *requiring* the new
 name on ingress: `blob_text` read `blocks` only, and a pre-rename
 `{"edits": "<blob>"}` — the shape this tool had advertised for its whole life —
-fell through to the generic "no recognizable edit arguments". That was wrong, and
-it was the more likely caller of the two: a harness, a model, or a session
+fell through to the generic "no recognizable edit arguments". That was wrong,
+and it was the more likely caller of the two: a harness, a model, or a session
 recorded before the rename. `blocks` is the name we *ask* for, not one we
 *require*.
 
@@ -1538,11 +1663,11 @@ halves matter: `blocks` wins when both are present, and a malformed `blocks` is
 an error rather than a silent fall-through to a healthy `edits` — otherwise a
 typo in the new name would apply an edit the model did not ask for.
 
-The earlier justification ("a pre-rename blob was stored raw precisely because it
-did not canonicalize, so it is display-only either way") was a *storage*
+The earlier justification ("a pre-rename blob was stored raw precisely because
+it did not canonicalize, so it is display-only either way") was a *storage*
 argument applied to the *wire*, where it does not hold. Keeping the alias
-recovers a small thing too: a session recorded before the rename now
-normalizes on load.
+recovers a small thing too: a session recorded before the rename now normalizes
+on load.
 
 ## Implementation status (anchors — done)
 
@@ -1602,14 +1727,15 @@ evidence. The A/B/C table is retired; see *Two independent axes* and *Three
 pipelines* in Phase 2.
 
 **The hook-surface constraint stands.** No rig `1c2f440` hook can expand one
-assistant message into N before dispatch: `ToolCallAction` is `{Run, Rewrite,
-Skip, Stop}` (it rewrites *one* call's arguments, never the call list),
-`ToolResultAction` is `{Keep, Rewrite, Stop}` (presentation, not structure), and
-`on_completion_response` / `on_model_turn_finished` observe, retry or stop only.
-Verified. So a multi-file call is necessarily *one* call to the dispatcher and
-one result on the wire — the split is a boundary transform, applied either when
-the turn's messages are persisted (`append_message`) or when the request is built
-(`on_completion_call`), and the two are genuinely different moments.
+assistant message into N before dispatch: `ToolCallAction` is
+`{Run, Rewrite, Skip, Stop}` (it rewrites *one* call's arguments, never the call
+list), `ToolResultAction` is `{Keep, Rewrite, Stop}` (presentation, not
+structure), and `on_completion_response` / `on_model_turn_finished` observe,
+retry or stop only. Verified. So a multi-file call is necessarily *one* call to
+the dispatcher and one result on the wire — the split is a boundary transform,
+applied either when the turn's messages are persisted (`append_message`) or when
+the request is built (`on_completion_call`), and the two are genuinely different
+moments.
 
 **They have to be both.** An earlier draft of this note reasoned that
 `append_message` alone sufficed, because the model-facing history is derived
@@ -1626,25 +1752,25 @@ file index. `on_completion_call` holds both sides in one pass and pairs by
 inspection — but it runs on *every* completion call, so the transform is
 deterministic there too, which is what keeps the prompt-cache prefix stable.
 
-**The "surprising to agents" question answers itself against the wrong baseline.**
-pi cannot represent a cross-file batch at all and its own prompt guidance steers
-per-file, so a model following pi's habits emits per-file calls. Once the split
-reaches the model hook, the model would then *see* N per-file calls where it
-emitted one — which is either the nudge we want or an avoidable divergence, and
-the deterministic rejoin decides it (Phase 2, *Storage axis*). A tool call
-becoming several is not surprising where the alternative is a hard error, and it
-is not surprising at all if the same session then reloads as N calls, which is
-the consistency that actually costs something to get wrong.
+**The "surprising to agents" question answers itself against the wrong
+baseline.** pi cannot represent a cross-file batch at all and its own prompt
+guidance steers per-file, so a model following pi's habits emits per-file calls.
+Once the split reaches the model hook, the model would then *see* N per-file
+calls where it emitted one — which is either the nudge we want or an avoidable
+divergence, and the deterministic rejoin decides it (Phase 2, *Storage axis*). A
+tool call becoming several is not surprising where the alternative is a hard
+error, and it is not surprising at all if the same session then reloads as N
+calls, which is the consistency that actually costs something to get wrong.
 
 The stricter path policy interacts well with this: because a multi-file blob
 must name **every** file, the split has no ambiguity to resolve and no rule to
 get wrong. A model that under-specifies gets a named error instead of a block
 landing somewhere plausible.
 
-**One thing both A and B leave unfixed**, and worth not forgetting: live display.
-`on_tool_call` canonicalizes, and a multi-file blob cannot canonicalize, so the
-panel renders an empty diff and a bogus `[1]` range today. Splitting the
-execution does not fix it. See Phase 2, *Display*.
+**One thing both A and B leave unfixed**, and worth not forgetting: live
+display. `on_tool_call` canonicalizes, and a multi-file blob cannot
+canonicalize, so the panel renders an empty diff and a bogus `[1]` range today.
+Splitting the execution does not fix it. See Phase 2, *Display*.
 
 ### 2. Ratio-based anchor tolerance ✅ *implemented*
 
@@ -1663,7 +1789,7 @@ influenced the multi-candidate case, which is exactly where it's a proxy.)
 **Proposed rule** (additive to today's, so every currently-accepted call stays
 accepted):
 
-```
+```text
 accept nearest candidate iff
     d1 ≤ tol_ctx(old_text)                       # current rule, kept as fast path
     OR (d1 ≤ CAP AND d2 ≥ RATIO × d1)            # NEW: decisive-skew escape hatch
@@ -1720,7 +1846,7 @@ its candidate set shrinks to positions not overlapping previous matches.
 **Evaluation — correct, and the investigation surfaced a missing invariant.**
 A probe against the current `edit_file` (since removed; not committed):
 
-```
+```text
 file: "hello world\n"
 edits: [{old: "hello", new: "bye"}, {old: "hello", new: "hi"}]   # same unique old_text
 → result: "Replaced 2 block(s) … (matched lines 1, 1)"
@@ -1813,7 +1939,9 @@ corruption is now a loud `overlapping`/`all-claimed` failure).
 
 ### Suggested order — completed
 
-1. ✅ **3 + 2** (implemented in [`f05d078`](https://github.com/gwicke/picocode/commit/f05d078)) — the skew rule and claim-based resolver are live; 653 tests pass.
+1. ✅ **3 + 2** (implemented in
+   [`f05d078`](https://github.com/gwicke/picocode/commit/f05d078)) — the skew
+   rule and claim-based resolver are live; 653 tests pass.
 2. **1** — multi-file: the gate is still unmeasured (no session corpus was
    reachable to run the grep), with the design and the work breakdown done
    (W1–W8, *Phase 2*). **W1 has landed** — the strict `split_by_file` path
@@ -1853,18 +1981,32 @@ model") is an **ancestor of both sides** of the `7d7fd3b` merge, so nothing
 about it could have been dropped by the merge resolution. Verified by content,
 not by ancestry alone:
 
-| Added by `e35717d` | `e35717d` | `57e069d` | HEAD |
-| --- | --- | --- | --- |
-| `render_blob_structure` (the line-based `Actual:`) | present | present | present |
-| `actual_summary` | present | present | present |
-| `is_path_header` | present | present | present |
-| `strip_arg_error_prefixes` | present | present | present |
-| `arg_error_view` (the two-column table) | **absent** | present | present |
+- **Added by `e35717d`**: `render_blob_structure` (the line-based `Actual:`)
+  - **`e35717d`**: present
+  - **`57e069d`**: present
+  - **HEAD**: present
+- **Added by `e35717d`**: `actual_summary`
+  - **`e35717d`**: present
+  - **`57e069d`**: present
+  - **HEAD**: present
+- **Added by `e35717d`**: `is_path_header`
+  - **`e35717d`**: present
+  - **`57e069d`**: present
+  - **HEAD**: present
+- **Added by `e35717d`**: `strip_arg_error_prefixes`
+  - **`e35717d`**: present
+  - **`57e069d`**: present
+  - **HEAD**: present
+- **Added by `e35717d`**: `arg_error_view` (the two-column table)
+  - **`e35717d`**: **absent**
+  - **`57e069d`**: present
+  - **HEAD**: present
 
 The only deletions in the whole error path between `e35717d` and HEAD are two
 lines of mine, both deliberate: `op_from_value` and its test
 `legacy_array_shape_still_parses`, which went when the canonical array left the
-wire (`81f6fcf`), replaced by `the_edits_array_is_rejected_with_a_named_correction`.
+wire (`81f6fcf`), replaced by
+`the_edits_array_is_rejected_with_a_named_correction`.
 
 The error path at HEAD is byte-equivalent to `57e069d` and **strictly better
 than `e35717d`**, which predates `arg_error_view` entirely. Reverting does not
@@ -1875,7 +2017,7 @@ restore error reporting, because none of it was lost.
 **F1 — the client cannot express a block call, and the tool's error does not
 say so.** Every block-shaped call in the session arrived as
 
-```
+```text
 sent:    {"path": "probe.py", "edits": "<blob>"}
 arrived: {"edits": {"path": "<blob>"}, "path": "probe.py"}
 ```
@@ -1899,8 +2041,8 @@ live `parameters()` and the *served* copy is not observable from inside. That is
 the durable class behind F1's sibling failure: the tool was fine, the contract
 was stale, and no test could see it.
 
-**F3 — a pre-existing cwd race in the test suite, surfaced by the rebuild.**
-On `57e069d` three lib tests fail deterministically — `sed_preview_is_read_only…`,
+**F3 — a pre-existing cwd race in the test suite, surfaced by the rebuild.** On
+`57e069d` three lib tests fail deterministically — `sed_preview_is_read_only…`,
 `sed_preview_reports_a_rejected_expression…`, `grep_text_uses_ripgrep…` — all
 with `./x: No such file or directory`. Root cause, localized: `src/tools.rs`
 carries **two** cwd guards, `TempCwd` (line 1535) and `CwdGuard` (line 2222).
@@ -1944,14 +2086,15 @@ it was handed.
 
 ### Status
 
-**P1 and P2 are done.** `from_wire` now diagnoses a blob field that is neither
-a string nor an array, naming the fault (`` `blocks` is an object; it must be a
-string of `@@@OLD`/`@@@NEW`/`@@@END` blocks ``) instead of reporting an absence
-the caller cannot act on — refusal is unchanged, so acceptance widens by nothing.
-The advertised schema key is now `(BLOCKS_FIELD)`, and
-`every_advertised_property_is_one_the_parser_reads` closes the schema⇄parser gap
-in both directions. P1's test replays the payload this session actually produced,
-byte for byte, through `ErasedTool::execute`, and asserts the file is untouched.
+**P1 and P2 are done.** `from_wire` now diagnoses a blob field that is neither a
+string nor an array, naming the fault
+(`` `blocks` is an object; it must be a string of `@@@OLD`/`@@@NEW`/`@@@END` blocks ``)
+instead of reporting an absence the caller cannot act on — refusal is unchanged,
+so acceptance widens by nothing. The advertised schema key is now
+`(BLOCKS_FIELD)`, and `every_advertised_property_is_one_the_parser_reads` closes
+the schema⇄parser gap in both directions. P1's test replays the payload this
+session actually produced, byte for byte, through `ErasedTool::execute`, and
+asserts the file is untouched.
 
 P3, P4 and F5 are open, in that order.
 

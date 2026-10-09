@@ -28,6 +28,7 @@ interface Message {
 ```
 
 `messageContent(msg)` normalizes content to a string:
+
 - `string` → returned as-is.
 - array → text blocks concatenated (non-text blocks rendered as `[type]`).
 
@@ -41,8 +42,10 @@ This scalar text is the unit every downstream algorithm operates on.
 tokenizer. It is purely character-length based with four content-type ratios.
 
 For each message:
+
 1. `len = text.length`.
-2. `codeBlockCount = count of "```"` (fence) occurrences; `hasCodeBlocks = count > 1`.
+2. `codeBlockCount = count of "```"` (fence) occurrences;
+   `hasCodeBlocks = count > 1`.
 3. `nonSpace = count of non-whitespace chars`.
 4. `whitespaceRatio = (len - nonSpace) / len` (0 when none).
 5. Choose a chars-per-token ratio `r`:
@@ -69,7 +72,8 @@ does not change.
   1. If no name → fallback `128000`.
   2. Lowercase the name; first match against an **exact model table** (e.g.
      `claude-sonnet-4` → 200000, `gemini-3.5-flash` → 1e6, `deepseek-r1` →
-     65536, `codestral` → 256000, …). Matching is substring `name.includes(model)`.
+     65536, `codestral` → 256000, …). Matching is substring
+     `name.includes(model)`.
   3. Else **family fallback** (`claude`→200000, `gpt`→128000, `gemini`→1e6,
      `deepseek`→128000, `llama`/`mistral`/`codestral`→128000).
   4. Else `128000`.
@@ -78,6 +82,7 @@ does not change.
   recommendations, not for compaction behavior.
 
 Threshold derivation in the constructor:
+
 - `thresholdTokens = config.thresholdTokens ?? 100000`.
 - If the caller did **not** set `thresholdTokens` *and* a `contextWindow` is
   known (from Pi metadata or constructor), then
@@ -86,9 +91,10 @@ Threshold derivation in the constructor:
   the caller's override if one exists. This is what makes thresholds follow the
   active model at `session_start` / `model_select` time.
 
-> Note (discrepancy to be aware of): `hardWatermark` **default in code is `0.5`**
-> (see `types/index.ts` comment and `engine.ts` `?? 0.5`), even though `README`
-> documents `0.95`. Mirror whichever the Rust port intends and make it explicit.
+> Note (discrepancy to be aware of): `hardWatermark`
+> **default in code is `0.5`** (see `types/index.ts` comment and `engine.ts`
+> `?? 0.5`), even though `README` documents `0.95`. Mirror whichever the Rust
+> port intends and make it explicit.
 
 ---
 
@@ -98,6 +104,7 @@ There are **three** independent gate definitions in the code; a port should pick
 one consistent policy rather than carry all three.
 
 ### 4a. `shouldCompact(currentTokens)` — dual gate
+
 - Gate 1 (percentage): `percentThreshold = floor(contextWindow * 0.6)`.
   Fires if `currentTokens >= percentThreshold`.
 - Gate 2 (hard cap): `hardCap = floor(contextWindow * hardWatermark)`
@@ -108,20 +115,24 @@ With the default `hardWatermark = 0.5`, **Gate 2 dominates** (fires at 50%,
 earlier than the 60% of Gate 1).
 
 ### 4b. `determineTier(messages)` — generative tier
+
 - `ratio = estimateTokens(messages) / contextWindow`.
 - `ratio >= 0.9` → `CompactionTier.FULL`
 - `ratio >= 0.6` → `CompactionTier.MICRO`
 - else → `CompactionTier.NONE`
 
 ### 4c. `shouldCompactDefaultThreshold()` — preemptive cap
+
 - If a `contextWindow` was explicitly supplied (Pi metadata), returns the raw
   `thresholdTokens`.
 - Otherwise returns `min(thresholdTokens, floor(preemptiveWatermark *
   contextWindow))` where `preemptiveWatermark = 0.7`.
 
 ### 4d. Preemptive projection (in `index.ts`)
+
 At the auto-compaction hook, the *next* turn is projected:
 `projectedTokens = currentTokens + outputHeadroom` (default `4096`).
+
 - Manual `/ultracompact` uses `currentTokens` directly (always compacts).
 - Auto uses `projectedTokens` as the argument to `shouldCompact`, i.e. it fires
   **before** the next turn's response headroom would overflow the window.
@@ -135,6 +146,7 @@ This single score drives classification (Section 7) and level-4 eviction
 (Section 8.4). It combines four signals:
 
 ### 5a. Keyword-signal (max, not sum)
+
 `IMPORTANCE_SIGNALS.keywords` is an ordered list of `{ pattern, weight }`:
 GOAL(1.0), DECISION(0.95), ERROR(0.9), SOLUTION(0.85), DISCOVERY(0.8),
 CONSTRAINT(0.75), FILE(0.7), CHANGE(0.65), NEXT(0.6). Each pattern is a regex
@@ -142,7 +154,9 @@ like `/\b(?:GOAL|OBJECTIVE|TARGET|WANT TO|TRYING TO)\b:?\s*(.+)/i`. The score is
 the **maximum** weight among all matching patterns (not additive).
 
 ### 5b. Redundancy penalty (entropy / lost-in-the-middle mitigation)
+
 `extractPatternKey(text)` returns a key for *repeatable* content:
+
 - tool file-read → `"read:" + filePath`
 - command output → `"cmd:" + commandName` (or `cmd:generic`)
 - else `null`.
@@ -153,12 +167,14 @@ repeated reads and repeated commands are progressively de-valued, fighting
 context bloat in long histories.
 
 ### 5c. Content-type multipliers (multiply the running score)
+
 - contains ```` ``` ```` → `* 1.3` (codeBlock)
 - matches `[\w./\\-]+\.(ts|js|tsx|jsx|py|rs|go)` → `* 1.2` (filePath)
 - `role === "tool"` → `* 1.15` (toolCall)
 - contains `"Error:"` or `"error"` → `* 1.25` (errorLog)
 
 ### 5d. Length decay & floor
+
 - `text.length > 2000` → `* 0.9` (multiLine).
 - Floor boost: if `role === "tool"` or contains ```` ``` ````,
   `score = max(score, 0.5)` — tool output and code are never scored below 0.5.
@@ -175,6 +191,7 @@ the first occurrence of a read/command scores higher than later ones.
 Runs before classification / summarization. Three ordered steps:
 
 ### 6a. Deduplicate (`deduplicateMessages`)
+
 Key = `role + ":" + content.substring(0, 100)`. Keep the first occurrence;
 if a later duplicate appears, **remove the earlier one and keep the latest**
 (it splices out the earlier index, then pushes the new message). Worst case
@@ -182,6 +199,7 @@ O(n²) due to `findIndex` per duplicate — fine for agent histories, but a Rust
 port should consider a doubly-linked removal or two-pass approach.
 
 ### 6b. Tool-output pruning (`pruneToolOutputs`)
+
 - `protectRecentCount = max(5, floor(len * 0.2))`. A tail window is always kept
   verbatim.
 - For each message `i`:
@@ -199,6 +217,7 @@ port should consider a doubly-linked removal or two-pass approach.
   generic *output*.
 
 ### 6c. Empty removal
+
 Drop messages whose normalized content is blank.
 
 ---
@@ -214,11 +233,13 @@ bucket exists but is currently unused / always empty).
   - `calculateMessageImportance(...) > 0.7`;
   - `shouldProtectContent(content)`:
     - two or more code fences (`split("```").length > 2`),
-    - a path matching `\b(?:src|lib|extensions|tests?)\/[\w./\\-]+\.(ts|js|tsx|jsx)`,
+    - a path matching
+      `\b(?:src|lib|extensions|tests?)\/[\w./\\-]+\.(ts|js|tsx|jsx)`,
     - `"Error:"` **and** `"at "` (a stack trace).
 - Otherwise → `compressible`.
 
 ### 7a. Recency budget protection (`protectRecentByTokenBudget`)
+
 From the `compressible` set, walk **backwards from the most recent** message,
 accumulating `estimateTokens` until a `tokenBudget` (hard-coded `20000`) is hit.
 Those recent messages are pulled back into `protected`. Final:
@@ -242,11 +263,13 @@ conversation.
 Levels (`EvictionLevel` enum 1–4):
 
 ### Level 1 — `STRIP_REASONING`
+
 `stripReasoningBlocks`: for `assistant` messages with array content, drop blocks
 where `type === "thinking"`. If that leaves no content, replace with
 `"[reasoning stripped]"`. (Harmless: reasoning is not needed after the turn.)
 
 ### Level 2 — `STRIP_BULK_OUTPUT`
+
 `stripBulkToolOutputs`: for `tool` messages **only**, and **only if**
 `content.length >= 5000` **and** `lines > 100`, replace with a marker keeping
 the first 3000 chars:
@@ -254,18 +277,22 @@ the first 3000 chars:
 The dual condition avoids truncating compact single-line tool results.
 
 ### Level 3 — `STRIP_ARTIFACTS`
+
 `stripArtifactToolOutputs`: for `tool` messages, if `containsErrorIndicators`
 (`Error:`/`error:`/`failed`/`Failed`/`exit code`/`exit status`/`SyntaxError`/
 `TypeError`) → **keep** (errors are critical). Otherwise collapse to
 `[tool result stripped: N lines | <first 120 chars>]`.
 
 ### Level 4 — `FULL_REMOVAL`
+
 `removeOldCompressibleMessages(messages, tokenBudget)`:
+
 1. Partition into `protected` (role `user`/`system`, or `importance > 0.7`) and
    `candidates` (everything else).
 2. Start from protected; then re-add candidates **newest-first** while the
    running `estimateTokens` total stays ≤ `tokenBudget`.
 3. Restore original ordering via a `keptIds` set filter.
+
 - **Inviolable roles:** `user` and `system` are never candidates, so they can
   never be evicted here.
 
@@ -296,6 +323,7 @@ floor(contextWindow * 0.5)`. It runs with **no LLM** and is the MICRO tier.
 6. Record the run in `compressionHistory` (capped at the last 5 entries).
 
 `generateSummaryFromRemaining`:
+
 - If `useLLM` and an `llmSummarize(text) => Promise<string>` callback is set,
   build the prompt from `compressible` (`[role] <first 500 chars>`, joined by
   `\n---\n`), call it, and prepend `previousSummary` under a `## Previous
@@ -322,12 +350,14 @@ shorthand** (very high token density). Sections:
 - `#C` conversation digest (`compressConversation`).
 
 Each literal is run through `compressText`:
+
 - strip stopwords (`the a an and is are was were be been being`) and fillers
   (`basically actually really just simply essentially literally`);
 - replace `\s+and\s+` → `" + "`;
 - collapse whitespace.
 
 ### Information extraction (regex)
+
 - `extractGoals` / `extractDecisions` / `extractNextSteps`: scan all messages
   for their category keyword pattern, capture group 1, dedupe via `Set`, slice.
 - `extractErrors`: match `errorPattern` + optionally `solutionPattern` on the
@@ -351,10 +381,12 @@ these patterns.
 
 `index.ts` implements **cache-aware compaction** to keep the prompt-cache prefix
 stable (saves prefill cost on the API):
+
 - If `cacheAware` and a `previousSummary` exists, that summary becomes an
-  immutable `cacheAwarePrefix` and `snapshotPreviousSummary` is set to `undefined`
-  so the engine does **not** re-summarize old content.
-- For MICRO tier: output is `cacheAwarePrefix + "\n\n## Chat\n" + conversationText`.
+  immutable `cacheAwarePrefix` and `snapshotPreviousSummary` is set to
+  `undefined` so the engine does **not** re-summarize old content.
+- For MICRO tier: output is
+  `cacheAwarePrefix + "\n\n## Chat\n" + conversationText`.
 - For FULL tier: `result.summary = cacheAwarePrefix + "\n\n" + result.summary`.
 - Net effect: only the *new* delta is paid for; the historical prefix is reused
   verbatim by the provider's prompt cache.
@@ -364,13 +396,16 @@ stable (saves prefill cost on the API):
 ## 12. Safety systems
 
 ### 12a. Snapshot / rollback
+
 At the compact hook, `messagesToCompact` is deep-cloned via
 `JSON.parse(JSON.stringify(...))`. The engine operates on the snapshot; the
 original array is never mutated, so any thrown error leaves the session intact.
 
 ### 12b. Circuit breaker (module-level, per session)
+
 State: `compactionFailures`, `breakerTrippedAtTurn`, `currentTurn` (incremented
 every hook entry).
+
 - On entry, if `breakerTrippedAtTurn` is set **and** `currentTurn - tripped <
   circuitBreakerCooldown` (default 5) → return `undefined` (use Pi's default
   compaction) without attempting ultra-compact.
@@ -388,6 +423,7 @@ The design guarantees the session **never dies** from a bad compaction: worst
 case is a crude truncation that preserves the system prompt and recent tail.
 
 ### 12c. Inviolable content
+
 `user` and `system` roles are excluded from eviction/removal at every level
 (Section 8.4, classification). Empty-summary results throw (caught by the
 breaker).
@@ -396,7 +432,7 @@ breaker).
 
 ## 13. End-to-end flow (auto hook in `index.ts`)
 
-```
+```text
 session_before_compact(event, ctx)
   ├─ increment currentTurn; check circuit-breaker cooldown → maybe bail
   ├─ capture model from ctx; reconfigure engine (follow active model)
@@ -444,11 +480,13 @@ session_before_compact(event, ctx)
   `circuitBreakerMaxFailures`, `circuitBreakerCooldown`, `useLLM` +
   `llm_summarize` callback.
 - **Single policy decision:** reconcile the three trigger definitions
-  (`shouldCompact` 60%/50%, `determineTier` 60%/90%, `shouldCompactDefaultThreshold`
-  70%). They are not fully consistent in the source; pick one coherent rule
-  (recommend: percentage gate + hard-cap, plus projected-headroom for
-  preemption).
+  (`shouldCompact` 60%/50%, `determineTier` 60%/90%,
+  `shouldCompactDefaultThreshold` 70%). They are not fully consistent in the
+  source; pick one coherent rule (recommend: percentage gate + hard-cap, plus
+  projected-headroom for preemption).
 - **Safety you must keep:** deep-clone before mutating, never evict `user`/
   `system`, and always have a lossy-truncation fallback so compaction can never
   crash the session.
+
+```text
 ```

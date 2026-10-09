@@ -13,13 +13,21 @@ The `SessionIndex::build_subtree` method was already fixed to be iterative
 typical (non-branching) session the tree is a degenerate linked-list: every
 entry has exactly one child, so **tree depth ≈ number of entries**.
 
-| Function | File:Line | Recursion depth |
-|---|---|---|
-| `collect_labels` | `src/repl.rs:4381` | tree depth |
-| `flatten_turns` | `src/repl.rs:4482` | tree depth |
-| `collect_active_path` | `src/repl.rs:5755` | tree depth |
-| `walk` (inside `last_user_message_id_on_active_branch`) | `src/repl.rs:4429` | tree depth |
-| `walk` (inside `find_parent_id_in_tree`) | `src/repl.rs:4021` | tree depth |
+- **Function**: `collect_labels`
+  - **File:Line**: `src/repl.rs:4381`
+  - **Recursion depth**: tree depth
+- **Function**: `flatten_turns`
+  - **File:Line**: `src/repl.rs:4482`
+  - **Recursion depth**: tree depth
+- **Function**: `collect_active_path`
+  - **File:Line**: `src/repl.rs:5755`
+  - **Recursion depth**: tree depth
+- **Function**: `walk` (inside `last_user_message_id_on_active_branch`)
+  - **File:Line**: `src/repl.rs:4429`
+  - **Recursion depth**: tree depth
+- **Function**: `walk` (inside `find_parent_id_in_tree`)
+  - **File:Line**: `src/repl.rs:4021`
+  - **Recursion depth**: tree depth
 
 **Why this triggers on `/session <id> resume` specifically:** the resume
 handler (`handle_session_command` in `src/agent.rs:2600`) sets
@@ -73,6 +81,7 @@ a parameter or caching it in a `RefCell`/`OnceCell` on `Session`), or have
 `build_context` accept a pre-fetched branch.
 
 ## 3. `read_all()` loads the entire JSONL file into a single `String`
+
 (medium severity, memory)
 
 `JsonlSessionStorage::build_index` (`src/session/storage.rs:232`) calls
@@ -91,6 +100,7 @@ that deserialises each line and discards the raw text immediately, avoiding
 the peak of (raw file + line vec + entry map) in memory at once.
 
 ## 4. `get_branch()` clones every entry even when only the tail is needed
+
 (low–medium severity, performance)
 
 `build_replay_units` (`src/agent.rs:2680`) receives the **full** branch and
@@ -125,12 +135,12 @@ The following core paths are **correctly iterative**:
 
 ## Summary
 
-| # | Issue | Severity | Category |
-|---|---|---|---|
-| 1 | Recursive tree traversal in REPL overlay | **High** | Stack overflow |
-| 2 | Double `get_branch()` per loop iteration | Medium | Performance / memory |
-| 3 | Full-file `read_all()` in `build_index` | Medium | Memory |
-| 4 | Full-branch clone for short replay window | Low–medium | Performance / memory |
+|#  |Issue                                    |Severity  |Category            |
+|---|-----------------------------------------|----------|--------------------|
+|1  |Recursive tree traversal in REPL overlay |**High**  |Stack overflow      |
+|2  |Double `get_branch()` per loop iteration |Medium    |Performance / memory|
+|3  |Full-file `read_all()` in `build_index`  |Medium    |Memory              |
+|4  |Full-branch clone for short replay window|Low–medium|Performance / memory|
 
 The **stack overflow on resume of larger sessions** is caused by recursive
 tree traversal in the REPL overlay rendering layer (`src/repl.rs`), not in

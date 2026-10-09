@@ -25,16 +25,34 @@ cut off before it is rendered.
 So the cap is spent first on padding inserts the model never sent. Measured on
 four shapes (row counts by tag):
 
-| case | `oldText` lines | ` ` (unchanged) | `+` (padding) | `-` | truncated |
-|---|---|---|---|---|---|
-| 4-line oldText, normal file | 4 | 3 | 21 | 1 | no |
-| 121-line oldText, typo on last line | 121 | 30 | 0 | 0 | **yes** |
-| 2-line oldText, 4-byte file lines | 2 | **0** | 29 | 1 | **yes** |
-| 2-line oldText, normal file lines | 2 | 1 | 18 | 1 | no |
+- **case**: 4-line oldText, normal file
+  - **`oldText` lines**: 4
+  - **` ` (unchanged)**: 3
+  - **`+` (padding)**: 21
+  - **`-`**: 1
+  - **truncated**: no
+- **case**: 121-line oldText, typo on last line
+  - **`oldText` lines**: 121
+  - **` ` (unchanged)**: 30
+  - **`+` (padding)**: 0
+  - **`-`**: 0
+  - **truncated**: **yes**
+- **case**: 2-line oldText, 4-byte file lines
+  - **`oldText` lines**: 2
+  - **` ` (unchanged)**: **0**
+  - **`+` (padding)**: 29
+  - **`-`**: 1
+  - **truncated**: **yes**
+- **case**: 2-line oldText, normal file lines
+  - **`oldText` lines**: 2
+  - **` ` (unchanged)**: 1
+  - **`+` (padding)**: 18
+  - **`-`**: 1
+  - **truncated**: no
 
 Row 3 is the sharpest case. Real output:
 
-```
+```text
 oldText not found. Closest match: similarity 0.50, file lines 147-202 ...
 -target HERE
 +7
@@ -79,21 +97,37 @@ carried only as an **identifier** (§ *Origin*), and never as a possible cause.
 
 ## Decisions
 
-| # | Question | Decision |
-|---|---|---|
-| Q1 | Render format | `{:4}| ` — byte-identical to `read` (`src/tools.rs:159`) |
-| Q2 | Locating the region | Myers internally, to *locate*; its output is never shown |
-| Q3 | `oldText` in the message | Identifier by origin string; `oldText` only as a fallback |
-| Q4 | `similarity` | Dropped from both views; gate re-based on the anchor alone |
-| Q5 | Elision cap | 40 file-context lines, split first/last around the divergence |
-| Q6 | Path in the body | Not threaded — the origin string already carries it |
-| Q7 | Fallback elision | At most 20 lines, elided at the end |
-| Q8 | Candidate context for `non_unique` | **Deferred** — see *Follow-ups* |
-| Q9 | Vocabulary in the model-facing prose | `@@@OLD lines`, not `oldText`; the `ui_view` keeps `oldText` |
+- Q1
+  - **Question**: Render format
+  - **Decision**: `{:4}|` — byte-identical to `read` (`src/tools.rs:159`)
+- Q2
+  - **Question**: Locating the region
+  - **Decision**: Myers internally, to *locate*; its output is never shown
+- Q3
+  - **Question**: `oldText` in the message
+  - **Decision**: Identifier by origin string; `oldText` only as a fallback
+- Q4
+  - **Question**: `similarity`
+  - **Decision**: Dropped from both views; gate re-based on the anchor alone
+- Q5
+  - **Question**: Elision cap
+  - **Decision**: 40 file-context lines, split first/last around the divergence
+- Q6
+  - **Question**: Path in the body
+  - **Decision**: Not threaded — the origin string already carries it
+- Q7
+  - **Question**: Fallback elision
+  - **Decision**: At most 20 lines, elided at the end
+- Q8
+  - **Question**: Candidate context for `non_unique`
+  - **Decision**: **Deferred** — see *Follow-ups*
+- Q9
+  - **Question**: Vocabulary in the model-facing prose
+  - **Decision**: `@@@OLD lines`, not `oldText`; the `ui_view` keeps `oldText`
 
 ### Q1 — format
 
-`read` emits `format!("{:4}| {}\n", i + 1, l)`, i.e. `   1| fn main() {`. The
+`read` emits `format!("{:4}| {}\n", i + 1, l)`, i.e. `1| fn main() {`. The
 failure body uses the same format, so the model can lift lines straight into a
 `@@@OLD` block and reuse the numbers as a `path:LINE` anchor without re-parsing
 anything.
@@ -166,8 +200,8 @@ and the span.
 index, so `first + i` double-counted and every rendered line number was one too
 high — the header said `lines 2-6` while the body printed `3` through `7`.
 Caught by the test that checks rendered numbers against the file, which is the
-reason that test exists. `i + 1` is now literally `read`'s expression, so the two
-renders cannot drift.
+reason that test exists. `i + 1` is now literally `read`'s expression, so the
+two renders cannot drift.
 
 ### 3. The rewrite reintroduced a panic the diff had already fixed
 
@@ -204,10 +238,14 @@ diagnostic that taught the model `oldText` would be teaching the exception.
 
 The split is **asymmetric**, and deliberately so:
 
-| | speaks | why |
-|---|---|---|
-| `model_view` | `@@@OLD lines` only — never `oldText` | blocks are the default; naming the exception teaches the wrong thing |
-| `ui_view` | may name `oldText`; must never contain `@@@OLD` | a person recognises the field, not the block syntax, and the panel must not teach the model-facing wording |
+- `model_view`
+  - **speaks**: `@@@OLD lines` only — never `oldText`
+  - **why**: blocks are the default; naming the exception teaches the wrong
+    thing
+- `ui_view`
+  - **speaks**: may name `oldText`; must never contain `@@@OLD`
+  - **why**: a person recognises the field, not the block syntax, and the panel
+    must not teach the model-facing wording
 
 Both directions are pinned in `diagnose::vocabulary_tests`. Note that a
 `ui_view` is not required to mention `oldText` at all: `overlap_conflict` names
@@ -216,7 +254,7 @@ the failure is about two edits colliding rather than about the text.
 
 ### The rendered region
 
-```
+```text
 oldText not found. The closest region is file lines 138-145; the file reads:
   138| fn main() {
   139|     let x = 1;
@@ -240,7 +278,7 @@ Copy the lines above into @@@OLD verbatim, or anchor the block with path:140.
 
 `ui_view` becomes:
 
-```
+```text
 Closest match at file lines 138-145.
 ```
 
@@ -255,7 +293,7 @@ header, so that string is a literal the model can search its own message for.
 
 The message leads with the origin **verbatim, exactly as the model wrote it**:
 
-```
+```text
 --- edit #2 ---
 Your block `src/foo.rs:140` failed: oldText not found. …
 ```
@@ -277,11 +315,11 @@ failure.
 
 ### `oldText` — the fallback
 
-| block supplied `:LINE`? | file's batch | identifier | `oldText` echoed? |
-|---|---|---|---|
-| yes | any | origin string (contains the line) | no |
-| no | `total == 1` | `edit #1`, unambiguous | no |
-| no | `total > 1` | origin string only | **yes** |
+|block supplied `:LINE`?|file's batch|identifier             |`oldText` echoed?|
+|-----------------------|------------|-----------------------|-----------------|
+|yes                    |any         |origin string (contains the line)|no     |
+|no                     |`total == 1`|`edit #1`, unambiguous |no               |
+|no                     |`total > 1` |origin string only     |**yes**          |
 
 The condition is `total > 1` — hunks **in the file** — not `failed > 1`. A
 ten-block file with one failure still needs the fallback, because `edit #4`
@@ -289,21 +327,23 @@ forces the model to count to identify it among its ten.
 
 The decision belongs in `BatchEditFailure::build`, which already holds `total`
 and the complete `failures` list; the per-failure constructors cannot make it.
-`BatchItem` therefore gains `origin: Option<String>` and `old_text: String` (both
-already in memory — no IO), and the constructors stop embedding either.
+`BatchItem` therefore gains `origin: Option<String>` and `old_text: String`
+(both already in memory — no IO), and the constructors stop embedding either.
 
 Echoed `oldText` is capped at **20 lines, elided at the end** (Q7):
 
-```
+```text
 The text you sent for this block was:
 ```
+
 fn helper() {
 …
 … (140 lines elided) …
-```
+
+```text
 ```
 
-It is fenced so it cannot be confused with the `NNNN| ` numbered file lines
+It is fenced so it cannot be confused with the `NNNN|` numbered file lines
 above. This is a dedicated cap, not `wire::elide_string`: that helper is
 marker-aware (`@@@OLD`/`@@@NEW`/`@@@END`), which is right for a blob being
 echoed back and wrong for raw `oldText`, which never contains markers. Only the
@@ -394,15 +434,25 @@ the new wording.
 
 ### Files
 
-| File | Change |
-|---|---|
-| `crates/blockedit/src/diagnose.rs` | `diagnose` rewrite; the two constants; six constructors drop the `oldText` clause; `BatchItem` fields; `BatchEditFailure::build` gains the origin header and the `total > 1` fallback; module doc |
-| `crates/blockedit/src/resolve.rs` | `not_found_failure` — drop `anchor_info`, realign fallback text |
-| `crates/blockedit/src/blob.rs` | `ParsedEdit.raw_header` |
-| `crates/blockedit/src/wire.rs` | `to_ops` passes `raw_header` → `EditOp.origin`; the single-edit form reconstructs origin from the `path` argument; `elision_notice` made `pub(crate)` for shared phrasing |
-| `crates/blockedit/src/types.rs` | `EditOp.origin` |
-| `src/tools.rs` | two tests asserting `"Closest match"` in both views (`:2777`, `:2980`) |
-| `doc/batch_editing_v2.md` | *Tool result: outcome, not echo* — the diff premise is inverted |
+- **File**: `crates/blockedit/src/diagnose.rs`
+  - **Change**: `diagnose` rewrite; the two constants; six constructors drop the
+    `oldText` clause; `BatchItem` fields; `BatchEditFailure::build` gains the
+    origin header and the `total > 1` fallback; module doc
+- **File**: `crates/blockedit/src/resolve.rs`
+  - **Change**: `not_found_failure` — drop `anchor_info`, realign fallback text
+- **File**: `crates/blockedit/src/blob.rs`
+  - **Change**: `ParsedEdit.raw_header`
+- **File**: `crates/blockedit/src/wire.rs`
+  - **Change**: `to_ops` passes `raw_header` → `EditOp.origin`; the single-edit
+    form reconstructs origin from the `path` argument; `elision_notice` made
+    `pub(crate)` for shared phrasing
+- **File**: `crates/blockedit/src/types.rs`
+  - **Change**: `EditOp.origin`
+- **File**: `src/tools.rs`
+  - **Change**: two tests asserting `"Closest match"` in both views (`:2777`,
+    `:2980`)
+- **File**: `doc/batch_editing_v2.md`
+  - **Change**: *Tool result: outcome, not echo* — the diff premise is inverted
 
 **No signature change** to `apply_to_text`, and `similar` stays a dependency
 (`udiff.rs`, `bsed`, and Q2's internal diff all still use it).

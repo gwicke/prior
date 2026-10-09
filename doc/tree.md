@@ -2,38 +2,41 @@
 
 ## Overview
 
-The `/tree` overlay shows the current session's entry tree (a branchable conversation
-history), lets the user select a point to continue from, and optionally summarizes
-the abandoned branch via the LLM.
+The `/tree` overlay shows the current session's entry tree (a branchable
+conversation history), lets the user select a point to continue from, and
+optionally summarizes the abandoned branch via the LLM.
 
-This mirrors pi's tree navigator (`packages/coding-agent/src/modes/interactive/components/tree-selector.ts`)
-but adapted to picocode's architectural constraints: no TypeScript async, no extension
-hooks, no separate agent-session layer.
+This mirrors pi's tree navigator
+(`packages/coding-agent/src/modes/interactive/components/tree-selector.ts`) but
+adapted to picocode's architectural constraints: no TypeScript async, no
+extension hooks, no separate agent-session layer.
 
 ## Critique of this plan (read before implementing)
 
-The plan below is directionally correct but contains several concrete errors that
-would not compile or would corrupt the session tree. Fix these while implementing:
+The plan below is directionally correct but contains several concrete errors
+that would not compile or would corrupt the session tree. Fix these while
+implementing:
 
 1. **Missing enum variant.** `SessionEntryContent` also has an
    `ActiveToolsChange { active_tool_names }` variant (see `types.rs:161`). The
-   overview list and the `entry_display_label` `match` both omit it, so the match
-   is non-exhaustive and will not compile. Every `match &entry.content` in this
-   doc must handle `ActiveToolsChange` (render as meta / skip).
+   overview list and the `entry_display_label` `match` both omit it, so the
+   match is non-exhaustive and will not compile. Every `match &entry.content` in
+   this doc must handle `ActiveToolsChange` (render as meta / skip).
 2. **`Leaf` entries must not become tree nodes.** The existing append helpers
    (`append_message`, `append_model_change`, …) write the leaf pointer with
-   `SessionEntry::new_leaf(Some(id), None)` — parent `None` — and **never** insert
-   it into `index.entries` or `index.children`; they only set `index.leaf_id`.
-   The `move_leaf`/`append_*` code below instead gives the Leaf a parent and
-   inserts it into the tree, which pollutes `build_tree()` with phantom nodes.
-   Follow the existing pattern exactly (corrected code inline below).
+   `SessionEntry::new_leaf(Some(id), None)` — parent `None` — and **never**
+   insert it into `index.entries` or `index.children`; they only set
+   `index.leaf_id`. The `move_leaf`/`append_*` code below instead gives the Leaf
+   a parent and inserts it into the tree, which pollutes `build_tree()` with
+   phantom nodes. Follow the existing pattern exactly (corrected code inline
+   below).
 3. **Navigation drops thinking level and model.** `build_context()` already
    returns `thinking_level` and `model` for the branch. Phase 3.2 only copies
-   `ctx.messages` into the agent, so after navigating to a branch with a different
-   model/thinking level the agent keeps the old ones. Apply all three.
+   `ctx.messages` into the agent, so after navigating to a branch with a
+   different model/thinking level the agent keeps the old ones. Apply all three.
 4. **`build_tree()` is O(n²).** Both `subtree_contains` (called per node during
-   sort) and the per-node `entries.values().find_map(...)` label scan re-walk the
-   whole map. Precompute a `target_id -> label` map once and a single
+   sort) and the per-node `entries.values().find_map(...)` label scan re-walk
+   the whole map. Precompute a `target_id -> label` map once and a single
    `active_path: HashSet<&str>` from `get_path_to_root(leaf)` before recursing.
 5. **Naming/signature drift.** The REPL meta type is `SessionMeta` (not
    `ReplSessionMeta`), and `build_session_ctx` currently returns a 2-tuple
@@ -42,28 +45,31 @@ would not compile or would corrupt the session tree. Fix these while implementin
    defined; `target_id` is moved into `move_leaf` then used again in the final
    `format!`; and `old_leaf_id.unwrap_or_default()` moves a value read earlier.
    Corrected sketch inline below.
-7. **Emoji width.** 🏷️/📝/📦 include variation selectors and render at
-   ambiguous widths; since rows are pre-rendered and later width-measured, prefer
-   ASCII markers (or verify against the existing width helper) to avoid cursor
-   drift in the overlay.
+7. **Emoji width.** 🏷️/📝/📦 include variation selectors and render at ambiguous
+   widths; since rows are pre-rendered and later width-measured, prefer ASCII
+   markers (or verify against the existing width helper) to avoid cursor drift
+   in the overlay.
 
 ## Current state
 
 The session storage layer already supports a tree structure:
 
-- `SessionEntry` has `id`, `parent_id`, `timestamp`, and a `SessionEntryContent` enum
-  with `Message`, `ThinkingLevelChange`, `ModelChange`, `ActiveToolsChange`,
-  `Compaction`, `BranchSummary`, `Label`, `SessionInfo`, `Custom`, `CustomMessage`,
-  and `Leaf` variants (verify against `types.rs:139` — the set must be handled
-  exhaustively everywhere)
+- `SessionEntry` has `id`, `parent_id`, `timestamp`, and a `SessionEntryContent`
+  enum with `Message`, `ThinkingLevelChange`, `ModelChange`,
+  `ActiveToolsChange`, `Compaction`, `BranchSummary`, `Label`, `SessionInfo`,
+  `Custom`, `CustomMessage`, and `Leaf` variants (verify against `types.rs:139`
+  — the set must be handled exhaustively everywhere)
 - `SessionIndex` has an `entries: HashMap<String, SessionEntry>`, a
   `children: HashMap<String, Vec<String>>`, and a `leaf_id: Option<String>`
-- `SessionIndex::get_path_to_root()` walks from leaf to root (used by context building)
-- `Session::get_branch()` and `Session::build_context()` already traverse the tree
+- `SessionIndex::get_path_to_root()` walks from leaf to root (used by context
+  building)
+- `Session::get_branch()` and `Session::build_context()` already traverse the
+  tree
 
 What's missing:
 
-- A `build_tree()` method to produce a recursive tree structure from the flat index
+- A `build_tree()` method to produce a recursive tree structure from the flat
+  index
 - Navigation methods (`move_leaf`, `get_entry`, `get_tree`)
 - Entry constructors for `BranchSummary`, `Compaction`, `Label`
 - The REPL overlay (display, selection, keyboard navigation)
@@ -377,8 +383,9 @@ Also register `/tree` in the `from_buffer` parsing. Currently the parser in
 - **Option B:** Keep it as `/session <name> tree`. More discoverable via the
   `/session` action menu.
 
-**Recommendation:** Option A (standalone `/tree` operating on the current session).
-The `/session` action menu can gain a `tree` action that sets the editor to `/tree`.
+**Recommendation:** Option A (standalone `/tree` operating on the current
+session). The `/session` action menu can gain a `tree` action that sets the
+editor to `/tree`.
 
 Update the test `registry_has_nine_commands` → `registry_has_ten_commands`.
 
@@ -387,9 +394,9 @@ Update the test `registry_has_nine_commands` → `registry_has_ten_commands`.
 **File:** `src/repl.rs`
 
 The `ReplCtx` struct needs access to the session tree so the overlay can render
-it without holding a lock or doing async work in the hot loop. Follow the pattern
-established by `sessions` and `branch_messages`: pre-build the tree snapshot
-in `run_interactive` and pass it in.
+it without holding a lock or doing async work in the hot loop. Follow the
+pattern established by `sessions` and `branch_messages`: pre-build the tree
+snapshot in `run_interactive` and pass it in.
 
 ```rust
 pub struct ReplCtx {
@@ -409,8 +416,8 @@ pub struct ReplCtx {
 Build it in `run_interactive` (`src/agent.rs`, alongside `build_session_ctx`):
 
 Do NOT use `blocking_lock`/`now_or_never` here. `build_session_ctx` is already
-`async` and runs before `read_input`, so build the tree and leaf id cleanly there
-and thread them through `ReplCtx`:
+`async` and runs before `read_input`, so build the tree and leaf id cleanly
+there and thread them through `ReplCtx`:
 
 ```rust
 let (tree, leaf_id) = match session {
@@ -419,8 +426,9 @@ let (tree, leaf_id) = match session {
 };
 ```
 
-(`get_tree()` already sorts the current leaf's branch first, so `leaf_id` is only
-needed for highlighting.) Extend `build_session_ctx` to also return tree data:
+(`get_tree()` already sorts the current leaf's branch first, so `leaf_id` is
+only needed for highlighting.) Extend `build_session_ctx` to also return tree
+data:
 
 ```rust
 // Current signature (agent.rs:1103) returns a 2-tuple:
@@ -453,9 +461,9 @@ pub(crate) enum ActiveOverlay {
 }
 ```
 
-The `rows` vector stores fully rendered lines (with indentation, tree connectors,
-and entry labels). Each visual line maps 1:1 to a `targets` entry ID; the Enter
-handler uses `targets[sel]` to determine where to navigate.
+The `rows` vector stores fully rendered lines (with indentation, tree
+connectors, and entry labels). Each visual line maps 1:1 to a `targets` entry
+ID; the Enter handler uses `targets[sel]` to determine where to navigate.
 
 ### 2.4 from_buffer for `/tree`
 
@@ -644,9 +652,9 @@ fn entry_display_label(entry: &SessionEntry, label: Option<&str>) -> String {
 }
 ```
 
-**Important:** The function must skip `SessionInfo` and `Leaf` entries completely
-(they are meta entries, not part of the conversation timeline). The `flatten_tree_rows`
-helper should skip nodes whose entry display returns empty.
+**Important:** The function must skip `SessionInfo` and `Leaf` entries
+completely (they are meta entries, not part of the conversation timeline). The
+`flatten_tree_rows` helper should skip nodes whose entry display returns empty.
 
 ### 2.6 Handle Enter on Tree overlay
 
@@ -670,7 +678,8 @@ The `/tree <target_id>` command is then parsed in the main loop (Phase 3).
 
 ### 2.7 Handle Tab on Tree overlay
 
-Tab copies the selected entry's text (following pi's `app.message.copy` pattern):
+Tab copies the selected entry's text (following pi's `app.message.copy`
+pattern):
 
 ```rust
 ActiveOverlay::Tree { targets, .. } => {
@@ -683,7 +692,8 @@ ActiveOverlay::Tree { targets, .. } => {
 
 ### 2.8 Handle Esc on Tree overlay
 
-Esc dismisses the tree overlay and returns to bare prompt (like Esc on `/session`):
+Esc dismisses the tree overlay and returns to bare prompt (like Esc on
+`/session`):
 
 ```rust
 // In handle_esc:
@@ -846,7 +856,8 @@ fn collect_entries_for_branch_summary(
 
 ## Phase 4 — Summarization (deferred)
 
-This phase depends on having the `agent` reference available in the tree handler.
+This phase depends on having the `agent` reference available in the tree
+handler.
 
 ### 4.1 Summary prompt
 
@@ -939,7 +950,7 @@ session would just switch to that session first).
 
 ## Implementation order
 
-```
+```text
 Phase 1.1  SessionTreeNode type + build_tree()       │ types.rs
 Phase 1.2  Entry constructors                         │ types.rs
 Phase 1.3  Navigation methods on Session              │ session.rs
@@ -960,23 +971,45 @@ Phase 4    Summarization (deferred)                   │ agent.rs
 
 ## Key design decisions
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| Standalone vs sub-command | Standalone `/tree` | Clearer UX, simpler routing |
-| Tree data flow | Pre-built snapshot in `ReplCtx` | Avoids async locking in hot overlay loop |
-| Enter action | Emits `/tree <id>` command string | Follows existing `/session` pattern |
-| Active branch sorting | Current leaf's branch first | Same as pi, makes active path easy to find |
-| Meta entries | Skipped (`SessionInfo`, `Leaf`) | Not part of conversation timeline |
-| Filter | Text match on display labels | Same as other overlays |
-| Summarization | LLM call with collected branch entries | Reuses agent's model, no extra config |
-| Compaction | `Compaction` entry + `apply_transforms` | Already partially supported |
+- **Decision**: Standalone vs sub-command
+  - **Choice**: Standalone `/tree`
+  - **Rationale**: Clearer UX, simpler routing
+- **Decision**: Tree data flow
+  - **Choice**: Pre-built snapshot in `ReplCtx`
+  - **Rationale**: Avoids async locking in hot overlay loop
+- **Decision**: Enter action
+  - **Choice**: Emits `/tree <id>` command string
+  - **Rationale**: Follows existing `/session` pattern
+- **Decision**: Active branch sorting
+  - **Choice**: Current leaf's branch first
+  - **Rationale**: Same as pi, makes active path easy to find
+- **Decision**: Meta entries
+  - **Choice**: Skipped (`SessionInfo`, `Leaf`)
+  - **Rationale**: Not part of conversation timeline
+- **Decision**: Filter
+  - **Choice**: Text match on display labels
+  - **Rationale**: Same as other overlays
+- **Decision**: Summarization
+  - **Choice**: LLM call with collected branch entries
+  - **Rationale**: Reuses agent's model, no extra config
+- **Decision**: Compaction
+  - **Choice**: `Compaction` entry + `apply_transforms`
+  - **Rationale**: Already partially supported
 
 ## Files modified
 
-| File | Change |
-|---|---|
-| `src/session/types.rs` | `SessionTreeNode`, `build_tree()`, `subtree_contains()`, entry constructors |
-| `src/session/session.rs` | `get_entry()`, `get_leaf_id()`, `get_tree()`, `move_leaf()`, `append_branch_summary()`, `append_compaction()`, `append_label()` |
-| `src/slash.rs` | `SlashKind::Tree`, `/tree` command, test updates |
-| `src/repl.rs` | `ReplCtx` tree fields, `ActiveOverlay::Tree`, `from_buffer`, `tree_overlay_entries()`, `flatten_tree_rows()`, `entry_display_label()`, Enter/Tab/Esc handlers |
-| `src/agent.rs` | `ReplCtx` construction with tree, `/tree` command handler, `parse_tree_args()`, `collect_entries_for_branch_summary()`, summarization |
+- **File**: `src/session/types.rs`
+  - **Change**: `SessionTreeNode`, `build_tree()`, `subtree_contains()`, entry
+    constructors
+- **File**: `src/session/session.rs`
+  - **Change**: `get_entry()`, `get_leaf_id()`, `get_tree()`, `move_leaf()`,
+    `append_branch_summary()`, `append_compaction()`, `append_label()`
+- **File**: `src/slash.rs`
+  - **Change**: `SlashKind::Tree`, `/tree` command, test updates
+- **File**: `src/repl.rs`
+  - **Change**: `ReplCtx` tree fields, `ActiveOverlay::Tree`, `from_buffer`,
+    `tree_overlay_entries()`, `flatten_tree_rows()`, `entry_display_label()`,
+    Enter/Tab/Esc handlers
+- **File**: `src/agent.rs`
+  - **Change**: `ReplCtx` construction with tree, `/tree` command handler,
+    `parse_tree_args()`, `collect_entries_for_branch_summary()`, summarization

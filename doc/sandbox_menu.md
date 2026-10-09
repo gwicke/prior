@@ -67,7 +67,7 @@ immediately for the next `!`/`!!` command or LLM tool call.
 
 The overlay flow:
 
-```
+```text
 /          → command list (kind 1) includes "/sandbox"
 /sandbox   → sub-menu overlay (kind 8) with three items:
                add_ro   — Make path available read-only
@@ -102,20 +102,21 @@ and Tab/Enter to complete (same pattern as `/model` / `/set` value overlays).
 
 ### Files changed
 
-| File | Change |
-|------|--------|
-| `src/sandbox_bindings.rs` | **New** — session bindings registry + merge |
-| `src/slash.rs` | Add `Sandbox` variant to `SlashKind`, add `/sandbox` to registry |
-| `src/repl.rs` | Add `Sandbox` variant to `InputAction`, handle kind 8/9, file-path completion |
-| `src/agent.rs` | Handle `InputAction::Sandbox` in `run_interactive` |
-| `src/tools.rs` | Minor: expose `set_sandbox` and `sandbox_config` (already `pub(crate)`) |
-| `src/lib.rs` | Add `pub mod sandbox_bindings` |
+|File                     |Change                                              |
+|-------------------------|----------------------------------------------------|
+|`src/sandbox_bindings.rs`|**New** — session bindings registry + merge         |
+|`src/slash.rs`|Add `Sandbox` variant to `SlashKind`, add `/sandbox` to registry|
+|`src/repl.rs`|Add `Sandbox` variant to `InputAction`, handle kind 8/9, file-path completion|
+|`src/agent.rs`           |Handle `InputAction::Sandbox` in `run_interactive`  |
+|`src/tools.rs`|Minor: expose `set_sandbox` and `sandbox_config` (already `pub(crate)`)|
+|`src/lib.rs`             |Add `pub mod sandbox_bindings`                      |
 
 ### Stages
 
 1. **New module `sandbox_bindings.rs`** — session-scoped bindings, `merge_into`.
 2. **`slash.rs`** — register `/sandbox` command.
-3. **`repl.rs`** — overlay for sub-commands, file-path completion, Tab/Enter handling.
+3. **`repl.rs`** — overlay for sub-commands, file-path completion, Tab/Enter
+   handling.
 4. **`agent.rs`** — handle `InputAction::Sandbox`, re-publish sandbox config.
 5. **`lib.rs`** — register the new module.
 

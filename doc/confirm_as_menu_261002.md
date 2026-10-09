@@ -41,7 +41,7 @@ Neither is a drawing problem. Both are consequences of the dialog being a
 `Pending`, the loop is free, and the confirm becomes ordinary session state that
 the existing pump already knows how to drive.
 
-```
+```text
 Guard::call                       prompt()'s select!              PromptSession
 ────────────                       ───────────────────             ────────────
 !yolo && !approved(tool):
@@ -109,7 +109,7 @@ last, so "always visible" means "whenever the terminal has ≥3 spare rows", not
 request carries `{header, subject}` and nothing else; the repl owns the option
 list, the quick keys and the default selection:
 
-```
+```text
 ? Confirm tool BASH call?
   yes              Yes
   ❯ no             No                  ← default (deny)
@@ -143,9 +143,9 @@ store the guard can read. That store *is* the port:
   `Accept | Deny`, not `Confirmation`, so "accept" is genuinely all the agent
   learns.
 - **Amendment — the field survives on the no-port path.** With no REPL there is
-  no pump to record an approval, so `Guard::always` is what makes `QuietOutput`'s
-  `Always` ("s" = session) still mean *for the session* rather than *just this
-  once*. It is now reachable only when `confirm` is `None`
+  no pump to record an approval, so `Guard::always` is what makes
+  `QuietOutput`'s `Always` ("s" = session) still mean *for the session* rather
+  than *just this once*. It is now reachable only when `confirm` is `None`
   (`Guard::already_approved`), and an interactive session never reads it.
 
 **Open question — lifetime.** Today's `always` is an in-memory
@@ -166,7 +166,7 @@ scope here: it is threaded through 7 `guard(...)` sites *and* every test
 
 ## 5. Key ladder (#4)
 
-```
+```text
 Esc → 1. resolve the confirm      (Deny)
      → 2. step the v2.5 menu ladder     (already the case)
      → 3. cancel the turn           (root only, already the case)
@@ -209,15 +209,28 @@ carrying into the doc rather than rediscovering later:
 
 ## 8. Deletes / retires
 
-| Gone | Where |
-|---|---|
-| `ui::confirm`'s blocking body: gate raise/release, entry DSR, `event::read()` loop, `Frame::empty()` resolve | ui.rs:64-166, 414-445 |
-| `confirm_gate` **for confirms** (the `$EDITOR` hold in editor.rs:35 stays — a foreign writer really does own the tty) | output.rs:836, 1031 |
-| `ConfirmSpec`, `ConfirmResult`, `quick_key_index`, `build_confirm_plan`, `draw_dialog`, `resolve` — the option list is the repl's now | ui.rs (all) |
-| `Guard::always` + the `Confirmation::Always` arm, **on the interactive path** (kept for no-port; §4.1) | agent.rs |
-| `Frame::empty()` — the erase was always "apply a frame with no rows", and the area now simply stops containing the dialog | ui/frame.rs |
-| `dispatch_in_turn_event`'s unconditional root-`Esc` cancel (becomes the third rung) | agent.rs:1010 |
-| **U5's dialog half** — the `ui.rs:92` entry DSR — and with it the last open item in `doc/ui_draw_261001.md` | ui.rs:99 |
+- **Gone**: `ui::confirm`'s blocking body: gate raise/release, entry DSR,
+  `event::read()` loop, `Frame::empty()` resolve
+  - **Where**: ui.rs:64-166, 414-445
+- **Gone**: `confirm_gate` **for confirms** (the `$EDITOR` hold in editor.rs:35
+  stays — a foreign writer really does own the tty)
+  - **Where**: output.rs:836, 1031
+- **Gone**: `ConfirmSpec`, `ConfirmResult`, `quick_key_index`,
+  `build_confirm_plan`, `draw_dialog`, `resolve` — the option list is the repl's
+  now
+  - **Where**: ui.rs (all)
+- **Gone**: `Guard::always` + the `Confirmation::Always` arm,
+  **on the interactive path** (kept for no-port; §4.1)
+  - **Where**: agent.rs
+- **Gone**: `Frame::empty()` — the erase was always "apply a frame with no
+  rows", and the area now simply stops containing the dialog
+  - **Where**: ui/frame.rs
+- **Gone**: `dispatch_in_turn_event`'s unconditional root-`Esc` cancel (becomes
+  the third rung)
+  - **Where**: agent.rs:1010
+- **Gone**: **U5's dialog half** — the `ui.rs:92` entry DSR — and with it the
+  last open item in `doc/ui_draw_261001.md`
+  - **Where**: ui.rs:99
 
 Also: the "`Confirm tool … call?` gate left raised freezes every later in-flight
 reader" hazard (plan §9 latent issue 1) stops existing, because there is no

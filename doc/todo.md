@@ -1,4 +1,5 @@
 # TODO
+
 NOTE: Keep things tight - normally no more than 1-2 lines per bullet point.
 More detail -> create and link a doc/ and/or commit hash
 
@@ -16,7 +17,8 @@ More detail -> create and link a doc/ and/or commit hash
       when activating that model would not reproduce it (`AppState::
       peek_model_reasoning`), else the short `/model <id>` stands.
       Deferred: a level auto-completion dialog on the activate leaf.
-- [x] Address resume stack overflow in debug builds: resume_stack_overflow_audit.md
+- [x] Address resume stack overflow in debug builds:
+      resume_stack_overflow_audit.md
 - [ ] table rendering and filtering: dynamic columns
   - Include filter / sort columns in layout (.columns)
   - [ ] Less misleading / confusing modifier value auto-complete - headers
@@ -32,9 +34,9 @@ More detail -> create and link a doc/ and/or commit hash
     - `test data` very different result from `test_data` - surprising
     - highlighting often char-wise - not helpful. require runs or tight
       clusters of matches?
-
 - [ ] tool errors: split the operator's view from the model's, then unredact —
-  path_leak_risks.md (`edit` done; `read`/`write`/`glob`/`grep`/`list`/`sed` open)
+      path_leak_risks.md (`edit` done; `read`/`write`/`glob`/`grep`/`list`/`sed`
+      open)
 - [x] Shorten preamble, remove duplicate status line
 - [x] Adjust tool call limit for summarization requests - currently 1
       (rig's implicit budget) — now an explicit `SUMMARIZATION_MAX_TURNS = 10`
@@ -42,9 +44,12 @@ More detail -> create and link a doc/ and/or commit hash
 - [x] Investigate source of initial turn blank line - suppress in retries
 - [x] System prompt / tool documentation: Mention @@@END consistently
 
+## Cleanup
+
 - [x] `src/agent.rs` refactor — 261002_agent_refactor.md
   - [x] Step 1: move `run_interactive` out to `src/interactive.rs` (§3)
   - [x] Read all of `mod tests`, produce a placement table to review (§6)
   - [x] Step 2: split `agent.rs` into `agent/` — 9 files, one commit each (§3)
   - [x] Step 3: `Interactive` struct, in the new `interactive.rs` (§3)
   - [x] Deferred: `CodeAgent::prompt` — deliberately, not cleanup (§4)
+- [ ] audit output, repl

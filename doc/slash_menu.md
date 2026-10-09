@@ -20,7 +20,7 @@ called at the top of every `read_input` loop pass, `repl.rs:1658`).
 
 Consequences:
 
-- **Promotion is structural.** Typing `/model ` (or Tab-selecting a command)
+- **Promotion is structural.** Typing `/model` (or Tab-selecting a command)
   opens the model list; typing `/session <name>` *promotes* to that session's
   action menu; `/session <name> delete` promotes to the confirm dialog; a bare
   `/tree <id>` becomes the tree-action menu; `/tree <id> compact` becomes the
@@ -46,20 +46,62 @@ backward compatibility but the menus never emit them.
 
 ## 2. Architecture
 
-| Piece | Location | Role |
-| --- | --- | --- |
-| `InputAction` enum | `src/repl.rs` (~`236`) | What `read_input` returns: `Submit(String)`, `SetModel`, `SetThinking`, `Quit`, `NavigateTree` (deprecated, see `doc/tree_compaction.md`), … |
-| `ReplCtx` | `src/repl.rs` `ReplCtx` | Everything `from_buffer` needs to render overlays without touching the agent directly: provider/model, `recent`, `persona`, `session_usage`, `repo`, `current_session_id`, `branch_messages`, `tree`, `leaf_id`, `context_tokens`. Rebuilt each loop by `build_session_ctx` (`src/agent.rs`). |
-| `ActiveOverlay` enum | `src/repl.rs` `ActiveOverlay` | One variant per menu (`Model`, `Session`, `SessionAction`, `Confirm`, `Thinking`, `Settings`, `SettingsVal`, `Persona`, `Sandbox`, `Tree`, …). Carries **pre-computed** data (option rows, targets, header) so Tab/Enter/Esc never re-query the buffer. |
-| `from_buffer` | `ActiveOverlay::from_buffer` | Pure-ish: buffer + `ReplCtx` → overlay. Classifies the leading command word, then builds the appropriate variant (with filtering, `active` index, headers). |
-| `display_rows` / `title` | `ActiveOverlay` | `(title, options, active_index, wrap_opts)` → the caller runs them through `Repl::overlay_lines` for uniform panel rendering. |
-| `handle_tab` | `ActiveOverlay` | Fill a completion into the buffer (stays in input). |
-| `handle_enter` | `ActiveOverlay` | Leaf options: `Repl::emit_commit` + `InputAction::Submit(canonical_line)`; non-leaf options: `editor.set(...)` to promote to the next level. Returns `OverlayAction::{Continue, Action}`. |
-| `handle_esc` | `ActiveOverlay` | Rewrite the buffer to the parent menu (`editor.set`). |
-| `overlay_disc` | `ActiveOverlay` | Discriminant number per variant; the loop resets `sel` to 0 when it changes (so moving between menus doesn't carry the cursor over). |
-| `Repl::overlay_lines` | `src/repl.rs` `overlay_lines` | Renders one panel: title row (`BG`), optional non-selectable **header** rows (`BG_HEADER`), then selectable option rows with `> ` marker (selected) / `* ` marker (active-default), `BG_SEL` highlight + cyan on the selected row. |
-| `Repl::emit_commit` | `src/repl.rs` `emit_commit` | Redraws an empty editor, `output.display_plain(committed_line)`, optional separator, re-anchors `input_row`, sets the next editor text. **This is how the prompt gets into the session scrollback.** |
-| fuzzy module | `src/fuzzy.rs` | `fuzzy_filter` / `fuzzy_filter_bonus` over a candidate list with a scorer/ranker. |
+- **Piece**: `InputAction` enum
+  - **Location**: `src/repl.rs` (~`236`)
+  - **Role**: What `read_input` returns: `Submit(String)`, `SetModel`,
+    `SetThinking`, `Quit`, `NavigateTree` (deprecated, see
+    `doc/tree_compaction.md`), …
+- **Piece**: `ReplCtx`
+  - **Location**: `src/repl.rs` `ReplCtx`
+  - **Role**: Everything `from_buffer` needs to render overlays without touching
+    the agent directly: provider/model, `recent`, `persona`, `session_usage`,
+    `repo`, `current_session_id`, `branch_messages`, `tree`, `leaf_id`,
+    `context_tokens`. Rebuilt each loop by `build_session_ctx` (`src/agent.rs`).
+- **Piece**: `ActiveOverlay` enum
+  - **Location**: `src/repl.rs` `ActiveOverlay`
+  - **Role**: One variant per menu (`Model`, `Session`, `SessionAction`,
+    `Confirm`, `Thinking`, `Settings`, `SettingsVal`, `Persona`, `Sandbox`,
+    `Tree`, …). Carries **pre-computed** data (option rows, targets, header) so
+    Tab/Enter/Esc never re-query the buffer.
+- **Piece**: `from_buffer`
+  - **Location**: `ActiveOverlay::from_buffer`
+  - **Role**: Pure-ish: buffer + `ReplCtx` → overlay. Classifies the leading
+    command word, then builds the appropriate variant (with filtering, `active`
+    index, headers).
+- **Piece**: `display_rows` / `title`
+  - **Location**: `ActiveOverlay`
+  - **Role**: `(title, options, active_index, wrap_opts)` → the caller runs them
+    through `Repl::overlay_lines` for uniform panel rendering.
+- **Piece**: `handle_tab`
+  - **Location**: `ActiveOverlay`
+  - **Role**: Fill a completion into the buffer (stays in input).
+- **Piece**: `handle_enter`
+  - **Location**: `ActiveOverlay`
+  - **Role**: Leaf options: `Repl::emit_commit` +
+    `InputAction::Submit(canonical_line)`; non-leaf options: `editor.set(...)`
+    to promote to the next level. Returns `OverlayAction::{Continue, Action}`.
+- **Piece**: `handle_esc`
+  - **Location**: `ActiveOverlay`
+  - **Role**: Rewrite the buffer to the parent menu (`editor.set`).
+- **Piece**: `overlay_disc`
+  - **Location**: `ActiveOverlay`
+  - **Role**: Discriminant number per variant; the loop resets `sel` to 0 when
+    it changes (so moving between menus doesn't carry the cursor over).
+- **Piece**: `Repl::overlay_lines`
+  - **Location**: `src/repl.rs` `overlay_lines`
+  - **Role**: Renders one panel: title row (`BG`), optional non-selectable
+    **header** rows (`BG_HEADER`), then selectable option rows with `>` marker
+    (selected) / `*` marker (active-default), `BG_SEL` highlight + cyan on the
+    selected row.
+- **Piece**: `Repl::emit_commit`
+  - **Location**: `src/repl.rs` `emit_commit`
+  - **Role**: Redraws an empty editor, `output.display_plain(committed_line)`,
+    optional separator, re-anchors `input_row`, sets the next editor text.
+    **This is how the prompt gets into the session scrollback.**
+- **Piece**: fuzzy module
+  - **Location**: `src/fuzzy.rs`
+  - **Role**: `fuzzy_filter` / `fuzzy_filter_bonus` over a candidate list with a
+    scorer/ranker.
 
 The dispatch loop (`read_input`, `repl.rs:1657-1710`) is uniform for every
 menu: compute overlay → reset `sel` if kind changed → `display_rows` →
@@ -107,7 +149,7 @@ structure matters (`/session <name>` resolves the *session id/name*; `/tree
 
 Title strings follow one shape:
 
-```
+```text
 <Menu name>  (up/down, Tab/Enter select, Esc back)
 ```
 
@@ -153,12 +195,12 @@ place:
   description, so the option set is always discoverable.
 - **Typing `.s` narrows by fuzzy match** to `.sort:`; **Tab/Enter** fills the
   token `.sort:` (staying in the menu for the value step).
-- For **enumerated** modifiers (`.sort:`), the overlay then lists the **fixed
-  value set** (fuzzy-filtered as you type) — `.sort:most-popular`, `.sort:coding`,
-  etc. Choosing one rewrites the token and returns to the list.
-- For **free-form numeric** modifiers (`.coding:`, `.price:`, …), a bare `.coding`
-  shows the single name as a hint; once `.coding:` is typed the overlay hands
-  back to the list so you can type the number.
+- For **enumerated** modifiers (`.sort:`), the overlay then lists the
+  **fixed value set** (fuzzy-filtered as you type) — `.sort:most-popular`,
+  `.sort:coding`, etc. Choosing one rewrites the token and returns to the list.
+- For **free-form numeric** modifiers (`.coding:`, `.price:`, …), a bare
+  `.coding` shows the single name as a hint; once `.coding:` is typed the
+  overlay hands back to the list so you can type the number.
 - A fully-formed `.name:value` returns to the list (nothing left to complete).
 
 The parser (`parse_model_filter`) and the overlay both read the same
@@ -264,8 +306,8 @@ action should instead be in this header *before* the action.
    rewrites the buffer to the parent level.
 6. Put contextual info in the header; print nothing informational after the
    committed line.
-7. Wire `display_rows`, `overlay_disc`, the header rendering arm (`overlay_lines`
-   forward with `Some(header)`), and the `title`.
+7. Wire `display_rows`, `overlay_disc`, the header rendering arm
+   (`overlay_lines` forward with `Some(header)`), and the `title`.
 8. Tests: `from_buffer` promotion, filtering/active, pre-selection,
    Tab/Enter/Esc transitions, canonical committed line, no extra inline
    output. If the command has a review step, verify that cancel sets
@@ -276,15 +318,39 @@ action should instead be in this header *before* the action.
 
 ## 9. Quick reference (concrete examples, current code)
 
-| Command | Levels | Commit example | Key helpers |
-| --- | --- | --- | --- |
-| `/model` | list → filter modifiers → Enter | `/model anthropic:claude-…` → `InputAction::SetModel` | `model_overlay_entries`, `active_entry_id`, `modifier_overlay_entries` (`.` prefix) |
-| `/thinking` off/low/med/high | list → Enter | `/thinking high` → `SetThinking` | `thinking_overlay_entries` |
-| `/set <key>` | list → value eval | `editor.set("/set <key> ")` promotion; `SettingsVal` value-errors rendered red above title | `parse_settings`, `filtered_value_candidates` |
-| `/persona` | list → Enter | `/persona none` → `SetPersona` | `setting_value_candidates` |
-| `/session <name>` | list → detail → Enter/Tab | `/session <id> resume [N[t|l]]` → `Submit` | `parse_session_name_after`, `session_action_overlay_entries` |
-| `/tree <id>` | list → action → sub-menus → Enter | `/tree <id> switch [--summarize]`, `/tree <id> compact truncate` → `Submit` | `tree_overlay_entries`, trailing-token pre-selection (`doc/tree_compaction.md`) |
-| `/sandbox` | subcommand → path completion | `/sandbox add_ro <path>` → `InputAction::Sandbox` | `sandbox_overlay_entries`, `complete_path_prefix_sandbox` |
+- **Command**: `/model`
+  - **Levels**: list → filter modifiers → Enter
+  - **Commit example**: `/model anthropic:claude-…` → `InputAction::SetModel`
+  - **Key helpers**: `model_overlay_entries`, `active_entry_id`,
+    `modifier_overlay_entries` (`.` prefix)
+- **Command**: `/thinking` off/low/med/high
+  - **Levels**: list → Enter
+  - **Commit example**: `/thinking high` → `SetThinking`
+  - **Key helpers**: `thinking_overlay_entries`
+- **Command**: `/set <key>`
+  - **Levels**: list → value eval
+  - **Commit example**: `editor.set("/set <key> ")` promotion; `SettingsVal`
+    value-errors rendered red above title
+  - **Key helpers**: `parse_settings`, `filtered_value_candidates`
+- **Command**: `/persona`
+  - **Levels**: list → Enter
+  - **Commit example**: `/persona none` → `SetPersona`
+  - **Key helpers**: `setting_value_candidates`
+- **Command**: `/session <name>`
+  - **Levels**: list → detail → Enter/Tab
+  - **Commit example**: `/session <id> resume [N[t|l]]` → `Submit`
+  - **Key helpers**: `parse_session_name_after`,
+    `session_action_overlay_entries`
+- **Command**: `/tree <id>`
+  - **Levels**: list → action → sub-menus → Enter
+  - **Commit example**: `/tree <id> switch [--summarize]`,
+    `/tree <id> compact truncate` → `Submit`
+  - **Key helpers**: `tree_overlay_entries`, trailing-token pre-selection
+    (`doc/tree_compaction.md`)
+- **Command**: `/sandbox`
+  - **Levels**: subcommand → path completion
+  - **Commit example**: `/sandbox add_ro <path>` → `InputAction::Sandbox`
+  - **Key helpers**: `sandbox_overlay_entries`, `complete_path_prefix_sandbox`
 
 ---
 

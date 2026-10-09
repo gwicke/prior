@@ -2,14 +2,20 @@
 
 ## Motivation
 
-picocode currently has **zero persistent session storage**. The conversation history lives only in a `Vec<Message>` (`history` in `run_interactive`, `src/agent.rs:1108`) that is in-memory and lost on restart. There is no way to:
+picocode currently has **zero persistent session storage**. The conversation
+history lives only in a `Vec<Message>` (`history` in `run_interactive`,
+`src/agent.rs:1108`) that is in-memory and lost on restart. There is no way to:
 
 - Resume a previous session
 - Name or label a session
 - Fork/branch from an earlier point in the conversation
 - Inspect past sessions
 
-This document specifies a session storage layer that follows the [pi agent](https://github.com/badlogic/pi-mono) model closely, aiming for **JSONL on-disk format compatibility**. Every design decision is evaluated against the goal that a pi session file and a picocode session file should be interchangeable (modulo trivial serde renaming).
+This document specifies a session storage layer that follows the
+[pi agent](https://github.com/badlogic/pi-mono) model closely, aiming for
+**JSONL on-disk format compatibility**. Every design decision is evaluated
+against the goal that a pi session file and a picocode session file should be
+interchangeable (modulo trivial serde renaming).
 
 ---
 
@@ -17,11 +23,13 @@ This document specifies a session storage layer that follows the [pi agent](http
 
 ### Overview
 
-pi stores sessions as **JSONL (JSON Lines) files**, one per session, in `~/.pi/agent/sessions/`. Each session file is an append-only log of structured entries representing every state change in the session.
+pi stores sessions as **JSONL (JSON Lines) files**, one per session, in
+`~/.pi/agent/sessions/`. Each session file is an append-only log of structured
+entries representing every state change in the session.
 
 ### File Layout (pi-compatible)
 
-```
+```text
 ~/.picocode/sessions/
   └── <cwd-encoded>/
        └── <timestamp>_<uuid>.jsonl
@@ -29,7 +37,8 @@ pi stores sessions as **JSONL (JSON Lines) files**, one per session, in `~/.pi/a
 
 ### CWD Encoding (exact pi format)
 
-The working directory is encoded into a single directory name. **Pi's actual `encodeCwd`** (`jsonl-repo.ts:34`):
+The working directory is encoded into a single directory name.
+**Pi's actual `encodeCwd`** (`jsonl-repo.ts:34`):
 
 ```typescript
 function encodeCwd(cwd: string): string {
@@ -38,6 +47,7 @@ function encodeCwd(cwd: string): string {
 ```
 
 The algorithm:
+
 1. Strip a leading `/` or `\`
 2. Replace every `/`, `\`, and `:` with a single hyphen `-`
 3. Wrap with `--` prefix and `--` suffix
@@ -45,9 +55,9 @@ The algorithm:
 > **Ambiguity is a real, accepted limitation.** Path components containing
 > hyphens produce collisions:
 >
-> | Path | Encoded |
-> |---|---|
-> | `/home/gabriel/my-project` | `--home-gabriel-my-project--` |
+> | Path                       | Encoded                               |
+> | -------------------------- | ------------------------------------- |
+> | `/home/gabriel/my-project` | `--home-gabriel-my-project--`         |
 > | `/home/gabriel/my/project` | `--home-gabriel-my-project--` (same!) |
 >
 > Pi **does not provide a `decodeCwd` function** — the directory name is
@@ -64,13 +74,13 @@ The algorithm:
 
 Examples:
 
-| Original path | Encoded directory name |
-|---|---|
-| `/home/gabriel/src/picocode` | `--home-gabriel-src-picocode--` |
-| `/Users/badlogic/workspaces/pi-mono` | `--Users-badlogic-workspaces-pi-mono--` |
-| `/home/my-project/src` | `--home-my-project-src--` |
-| `C:\Users\me\project` | `--C-Users-me-project--` (`\` → `-`, `:` → `-`) |
-| `/` | `----` (strip → `""` → wrap → `----`; edge case, valid) |
+|Original path                       |Encoded directory name                   |
+|------------------------------------|-----------------------------------------|
+|`/home/gabriel/src/picocode`        |`--home-gabriel-src-picocode--`          |
+|`/Users/badlogic/workspaces/pi-mono`|`--Users-badlogic-workspaces-pi-mono--`  |
+|`/home/my-project/src`              |`--home-my-project-src--`                |
+|`C:\Users\me\project`         |`--C-Users-me-project--` (`\` → `-`, `:` → `-`)|
+|`/`                   |`----` (strip → `""` → wrap → `----`; edge case, valid)|
 
 **Rust implementation (exact pi match):**
 
@@ -108,14 +118,16 @@ fn decode_cwd(encoded: &str) -> Option<String> {
 
 `<iso_timestamp>_<uuid>.jsonl`
 
-The ISO 8601 timestamp has `:` characters replaced with `-` (since `:` is invalid on Windows filenames):
+The ISO 8601 timestamp has `:` characters replaced with `-` (since `:` is
+invalid on Windows filenames):
 
-```
+```text
 Input:  2026-07-20T22:22:21.906Z
 Output: 2026-07-20T22-22-21-906Z
 ```
 
-Full filename: `2026-07-20T22-22-21-906Z_019f819f-80d2-7948-8ee8-c96d4785c6ec.jsonl`
+Full filename:
+`2026-07-20T22-22-21-906Z_019f819f-80d2-7948-8ee8-c96d4785c6ec.jsonl`
 
 **Rust implementation:**
 
@@ -137,7 +149,7 @@ fn parse_session_filename(name: &str) -> Option<(String, String)> {
 
 ### Full Path Example
 
-```
+```text
 ~/.picocode/sessions/--home-gabriel-src-picocode--/2026-07-20T22-22-21-906Z_019f819f-80d2-7948-8ee8-c96d4785c6ec.jsonl
 ```
 
@@ -145,7 +157,9 @@ fn parse_session_filename(name: &str) -> Option<(String, String)> {
 
 ## File Format (pi JSONL)
 
-Each file contains one JSON object per line, **exactly matching pi's wire format** (camelCase field names, same `type` tags, same field layout).
+Each file contains one JSON object per line,
+**exactly matching pi's wire format** (camelCase field names, same `type` tags,
+same field layout).
 
 ### Line 1 — Session Header
 
@@ -177,23 +191,50 @@ Each entry has the base fields:
 
 #### Entry Type Catalog
 
-| `type` value | Required fields | pi compatibility notes |
-|---|---|---|
-| `"message"` | `message: AgentMessage` | See AgentMessage mapping below |
-| `"thinking_level_change"` | `thinkingLevel: string` | Same field name |
-| `"model_change"` | `provider: string, modelId: string` | Same field names |
-| `"active_tools_change"` | `activeToolNames: string[]` | Same field name |
-| `"compaction"` | `summary: string, firstKeptEntryId: string, tokensBefore: number` | Same names |
-| `"branch_summary"` | `fromId: string, summary: string` | Same names. `fromId` is the **branch-from position** (pi's `branchWithSummary`), not the common ancestor; `parentId` is the same id. Written parented at the `/tree` switch target, so it is inline on the branch the conversation continues on and projects into context. pi also writes optional `details` / `fromHook`, which we omit. See `doc/branch_summary.md`. |
-| `"label"` | `targetId: string, label?: string` | Same names |
-| `"session_info"` | `name?: string` | Same field name |
-| `"custom"` | `customType: string, data: object` | Same names |
-| `"custom_message"` | `customType: string, content: object` | Same names |
-| `"leaf"` | `targetId: string \| null` | Same field name |
+- **`type` value**: `"message"`
+  - **Required fields**: `message: AgentMessage`
+  - **pi compatibility notes**: See AgentMessage mapping below
+- **`type` value**: `"thinking_level_change"`
+  - **Required fields**: `thinkingLevel: string`
+  - **pi compatibility notes**: Same field name
+- **`type` value**: `"model_change"`
+  - **Required fields**: `provider: string, modelId: string`
+  - **pi compatibility notes**: Same field names
+- **`type` value**: `"active_tools_change"`
+  - **Required fields**: `activeToolNames: string[]`
+  - **pi compatibility notes**: Same field name
+- **`type` value**: `"compaction"`
+  - **Required fields**:
+    `summary: string, firstKeptEntryId: string, tokensBefore: number`
+  - **pi compatibility notes**: Same names
+- **`type` value**: `"branch_summary"`
+  - **Required fields**: `fromId: string, summary: string`
+  - **pi compatibility notes**: Same names. `fromId` is the
+    **branch-from position** (pi's `branchWithSummary`), not the common
+    ancestor; `parentId` is the same id. Written parented at the `/tree` switch
+    target, so it is inline on the branch the conversation continues on and
+    projects into context. pi also writes optional `details` / `fromHook`, which
+    we omit. See `doc/branch_summary.md`.
+- **`type` value**: `"label"`
+  - **Required fields**: `targetId: string, label?: string`
+  - **pi compatibility notes**: Same names
+- **`type` value**: `"session_info"`
+  - **Required fields**: `name?: string`
+  - **pi compatibility notes**: Same field name
+- **`type` value**: `"custom"`
+  - **Required fields**: `customType: string, data: object`
+  - **pi compatibility notes**: Same names
+- **`type` value**: `"custom_message"`
+  - **Required fields**: `customType: string, content: object`
+  - **pi compatibility notes**: Same names
+- **`type` value**: `"leaf"`
+  - **Required fields**: `targetId: string \| null`
+  - **pi compatibility notes**: Same field name
 
 ### AgentMessage Mapping (pi ↔ rig)
 
-pi uses its own abstracted `AgentMessage` format with three roles and typed content items. Mapping to rig's `Message` type:
+pi uses its own abstracted `AgentMessage` format with three roles and typed
+content items. Mapping to rig's `Message` type:
 
 **pi `AgentMessage` wire format:**
 
@@ -219,21 +260,36 @@ pi uses its own abstracted `AgentMessage` format with three roles and typed cont
 
 **Mapping to rig:**
 
-| pi role + content type | rig equivalent |
-|---|---|
-| `role:"user"`, `type:"text"` | `Message::User { content: [UserContent::Text(text)] }` |
-| `role:"assistant"`, `type:"text"` | `Message::Assistant { content: [AssistantContent::Text(text)] }` |
-| `type:"thinking"`, fields `thinking`/`thinkingSignature` | `AssistantContent::Reasoning(Reasoning { content: [ReasoningContent::Text { text: thinking, signature: thinkingSignature }] })` |
-| `type:"toolCall"`, fields `id`/`name`/`arguments` | `AssistantContent::ToolCall(ToolCall { id, function: ToolFunction { name, arguments } })` |
-| `role:"toolResult"` messages | `UserContent::ToolResult(ToolResult { id: toolCallId, call_id: toolCallId, is_error, content: ... })` |
+- **pi role + content type**: `role:"user"`, `type:"text"`
+  - **rig equivalent**: `Message::User { content: [UserContent::Text(text)] }`
+- **pi role + content type**: `role:"assistant"`, `type:"text"`
+  - **rig equivalent**:
+    `Message::Assistant { content: [AssistantContent::Text(text)] }`
+- **pi role + content type**: `type:"thinking"`, fields
+  `thinking`/`thinkingSignature`
+  - **rig equivalent**:
+    `AssistantContent::Reasoning(Reasoning { content: [ReasoningContent::Text { text: thinking, signature: thinkingSignature }] })`
+- **pi role + content type**: `type:"toolCall"`, fields `id`/`name`/`arguments`
+  - **rig equivalent**:
+    `AssistantContent::ToolCall(ToolCall { id, function: ToolFunction { name, arguments } })`
+- **pi role + content type**: `role:"toolResult"` messages
+  - **rig equivalent**:
+    `UserContent::ToolResult(ToolResult { id: toolCallId, call_id: toolCallId, is_error, content: ... })`
 
-> **pi toolResult batching:** pi stores one `"toolResult"` entry per tool call. In rig's message history (the `Vec<Message>` passed to the next LLM call), all results for a turn are committed together as a single `Message::User` with multiple `UserContent::ToolResult` items. The importer must scan ahead to group consecutive pi `"toolResult"` entries into one `User` message.
+> **pi toolResult batching:** pi stores one `"toolResult"` entry per tool call.
+> In rig's message history (the `Vec<Message>` passed to the next LLM call), all
+> results for a turn are committed together as a single `Message::User` with
+> multiple `UserContent::ToolResult` items. The importer must scan ahead to
+> group consecutive pi `"toolResult"` entries into one `User` message.
 
-> **pi entry IDs:** pi uses 8-character hex strings for entry IDs (e.g. `"84c3124c"`); the session header uses a standard UUID. picocode uses UUIDv7 throughout. The importer accepts any string, not validating as UUID.
+> **pi entry IDs:** pi uses 8-character hex strings for entry IDs (e.g.
+> `"84c3124c"`); the session header uses a standard UUID. picocode uses UUIDv7
+> throughout. The importer accepts any string, not validating as UUID.
 
 ### Wire Compatibility Strategy
 
-picocode's *own* storage uses **pi's camelCase field names directly** — not snake_case. This means:
+picocode's *own* storage uses **pi's camelCase field names directly** — not
+snake_case. This means:
 
 - `parentId` not `parent_id`
 - `modelId` not `model_id`
@@ -245,9 +301,12 @@ picocode's *own* storage uses **pi's camelCase field names directly** — not sn
 - `tokensBefore` not `tokens_before`
 - `parentSession` not `parent_session`
 
-The serde attributes on our Rust types use `#[serde(rename_all = "camelCase")]` at the container level, and explicit `#[serde(rename = "...")]` where pi uses a different key name.
+The serde attributes on our Rust types use `#[serde(rename_all = "camelCase")]`
+at the container level, and explicit `#[serde(rename = "...")]` where pi uses a
+different key name.
 
-This means **picocode JSONL files are directly readable by pi** and vice versa, modulo the session header `version` field (both use `3`).
+This means **picocode JSONL files are directly readable by pi** and vice versa,
+modulo the session header `version` field (both use `3`).
 
 ---
 
@@ -388,7 +447,13 @@ pub(crate) enum SessionEntryContent {
 }
 ```
 
-> **Design note on `Message` as `serde_json::Value`:** We store the pi `AgentMessage` as a raw `serde_json::Value` rather than trying to map it to rig's `Message` type at storage time. This preserves pi wire compatibility exactly — we take whatever JSON pi produces and write it verbatim. The mapping to rig's type happens only in `build_context()` (session → LLM context) and in the import path. This means the storage layer is agnostic to rig's message schema versioning.
+> **Design note on `Message` as `serde_json::Value`:** We store the pi
+> `AgentMessage` as a raw `serde_json::Value` rather than trying to map it to
+> rig's `Message` type at storage time. This preserves pi wire compatibility
+> exactly — we take whatever JSON pi produces and write it verbatim. The mapping
+> to rig's type happens only in `build_context()` (session → LLM context) and in
+> the import path. This means the storage layer is agnostic to rig's message
+> schema versioning.
 
 ### In-Memory Index
 
@@ -1034,63 +1099,97 @@ fn rig_message_to_pi(msg: &Message) -> serde_json::Value {
 
 **Goal:** Types + JSONL I/O + repo + unit tests. No changes to `agent.rs`.
 
-**Status: Complete.** All types, storage, and repo implemented. 30 unit tests pass.
-78 real pi agent session files (46,825 entries) read with zero errors.
+**Status: Complete.** All types, storage, and repo implemented. 30 unit tests
+pass. 78 real pi agent session files (46,825 entries) read with zero errors.
 
 ### Checklist
 
 - [x] **1.1 Add dependencies to `Cargo.toml`**
 - [x] **1.2 Create `src/session/mod.rs`**
-- [x] **1.3 Implement `src/session/types.rs`** — all types, encoding, convenience constructors, 13 tests
-- [x] **1.4 Implement `src/session/storage.rs`** — JSONL I/O, index building, implicit leaf fallback, 8+2 tests
-- [x] **1.5 Implement `src/session/repo.rs`** — create/open/list/delete/fork, 6 tests
-- [x] **1.6 Integration test: pi wire format compatibility** — manual pi-format JSONL, snake_case leak check
+- [x] **1.3 Implement `src/session/types.rs`** — all types, encoding,
+      convenience constructors, 13 tests
+- [x] **1.4 Implement `src/session/storage.rs`** — JSONL I/O, index building,
+      implicit leaf fallback, 8+2 tests
+- [x] **1.5 Implement `src/session/repo.rs`** — create/open/list/delete/fork, 6
+      tests
+- [x] **1.6 Integration test: pi wire format compatibility** — manual pi-format
+      JSONL, snake_case leak check
 - [x] **1.7 Cross-compatibility test: read actual pi session store**
   - `src/session/pi_compat_test.rs`, gated with `#[ignore]`
   - Verified: **78 files, 46,825 entries, 78 trees, 0 errors**
 
 ### Lessons Learned from Phase 1
 
-1.  **Implicit leaf pointer.** pi never writes `type:"leaf"` entries. The leaf is implicitly the last entry's ID (pi's `leafIdAfterEntry()` returns `entry.id` for every non-leaf type). `build_index()` must track `last_entry_id` and fall back when no explicit leaf entry exists. A `saw_leaf_entry` flag ensures explicit leaf entries (including `None` clears) are still authoritative for picocode's own sessions.
+1. **Implicit leaf pointer.** pi never writes `type:"leaf"` entries. The leaf is
+   implicitly the last entry's ID (pi's `leafIdAfterEntry()` returns `entry.id`
+   for every non-leaf type). `build_index()` must track `last_entry_id` and fall
+   back when no explicit leaf entry exists. A `saw_leaf_entry` flag ensures
+   explicit leaf entries (including `None` clears) are still authoritative for
+   picocode's own sessions.
 
-2.  **Read-only mount needed.** pi's session directory (`~/.pi/agent/sessions/`) is often on a read-only filesystem. `JsonlSessionStorage` needs `open_readonly()` to inspect external stores without requesting write access.
+2. **Read-only mount needed.** pi's session directory (`~/.pi/agent/sessions/`)
+   is often on a read-only filesystem. `JsonlSessionStorage` needs
+   `open_readonly()` to inspect external stores without requesting write access.
 
-3.  **8-char entry IDs.** pi uses 8-character hex strings for entry IDs (e.g. `"84c3124c"`), not UUIDv7. Our `SessionEntry.id` is `String`, so this works without changes.
+3. **8-char entry IDs.** pi uses 8-character hex strings for entry IDs (e.g.
+   `"84c3124c"`), not UUIDv7. Our `SessionEntry.id` is `String`, so this works
+   without changes.
 
-4.  **Separate header write.** The session header must be written as a raw JSON line (not via `append_entry`), because it has a different structure from `SessionEntry`. pi does the same.
+4. **Separate header write.** The session header must be written as a raw JSON
+   line (not via `append_entry`), because it has a different structure from
+   `SessionEntry`. pi does the same.
 
-5.  **No `decodeCwd` in pi.** pi has no `decode_cwd` function. The directory name is write-only; the real CWD is always read from the session header's `cwd` field.
+5. **No `decodeCwd` in pi.** pi has no `decode_cwd` function. The directory name
+   is write-only; the real CWD is always read from the session header's `cwd`
+   field.
 
 **Estimated size:** ~1020 lines of Rust + ~450 lines of tests (actual)
 
 ---
 
-
 ## Implementation Plan — Phase 2: Session Object ✅
 
-**Goal:** `Session` wrapper with context building (pi AgentMessage → rig Message), append helpers, and forking.
+**Goal:** `Session` wrapper with context building (pi AgentMessage → rig
+Message), append helpers, and forking.
 
-**Status: Complete.** 13 unit tests pass. pi↔rig round-trip verified. Tool-result batching verified.
+**Status: Complete.** 13 unit tests pass. pi↔rig round-trip verified.
+Tool-result batching verified.
 
 ### Lessons Learned from Phase 2
 
-1. **`Session` must be `Send + Sync`.** Both `storage` and `index` are wrapped in `Arc<AsyncMutex<>>` so append helpers take `&self` not `&mut self`. Essential for Phase 3 where `Session` is shared by reference.
+1. **`Session` must be `Send + Sync`.** Both `storage` and `index` are wrapped
+   in `Arc<AsyncMutex<>>` so append helpers take `&self` not `&mut self`.
+   Essential for Phase 3 where `Session` is shared by reference.
 
-2. **`build_context()` is async.** Index access goes through an async mutex, so `get_branch()` and `build_context()` are async methods. This affects `CodeAgent::prompt()` and all callers.
+2. **`build_context()` is async.** Index access goes through an async mutex, so
+   `get_branch()` and `build_context()` are async methods. This affects
+   `CodeAgent::prompt()` and all callers.
 
-3. **Leaf pointer updated automatically.** Every append helper writes a `type:"leaf"` entry to storage AND updates the in-memory index. No separate `set_leaf()` call needed.
+3. **Leaf pointer updated automatically.** Every append helper writes a
+   `type:"leaf"` entry to storage AND updates the in-memory index. No separate
+   `set_leaf()` call needed.
 
-4. **Tool-result batching works.** Forward scan in `extract_messages()` correctly groups consecutive pi `toolResult` entries into a single `Message::User` with multiple `UserContent::ToolResult` items.
+4. **Tool-result batching works.** Forward scan in `extract_messages()`
+   correctly groups consecutive pi `toolResult` entries into a single
+   `Message::User` with multiple `UserContent::ToolResult` items.
 
-5. **`rig_message_to_pi_entries()` returns `Vec<SessionEntry>`.** A single rig `Message::User` with `ToolResult` items produces multiple pi entries. The append helper iterates and writes each.
+5. **`rig_message_to_pi_entries()` returns `Vec<SessionEntry>`.** A single rig
+   `Message::User` with `ToolResult` items produces multiple pi entries. The
+   append helper iterates and writes each.
 
-6. **`Message::assistant()` convenience doesn't capture `id`.** When the agent returns a `responseId`, construct `Message::Assistant` manually with `id: Some(...)`.
+6. **`Message::assistant()` convenience doesn't capture `id`.** When the agent
+   returns a `responseId`, construct `Message::Assistant` manually with
+   `id: Some(...)`.
 
 ### Checklist
 
-- [x] **2.1 Implement `src/session/session.rs`** — `Session::new()`, `get_branch()`, `build_context()`, `apply_transforms()`, all append helpers, in-memory leaf updates
-- [x] **2.2 pi↔rig conversion** — `pi_message_to_rig()`, `rig_message_to_pi_entries()`, toolResult batching, 9 round-trip tests
-- [x] **2.3 Integration tests** — branch→context, metadata derivation, append→re-read, session name
+- [x] **2.1 Implement `src/session/session.rs`** — `Session::new()`,
+      `get_branch()`, `build_context()`, `apply_transforms()`, all append
+      helpers, in-memory leaf updates
+- [x] **2.2 pi↔rig conversion** — `pi_message_to_rig()`,
+      `rig_message_to_pi_entries()`, toolResult batching, 9 round-trip tests
+- [x] **2.3 Integration tests** — branch→context, metadata derivation,
+      append→re-read, session name
 
 **Estimated size:** ~625 lines of Rust + ~550 lines of tests (actual)
 
@@ -1100,43 +1199,58 @@ fn rig_message_to_pi(msg: &Message) -> serde_json::Value {
 
 **Goal:** Replace `history: Vec<Message>` with `Session`.
 
-**Status: Complete.** 267 tests pass (1 pre-existing repl failure). 43 session tests + 9 agent tests all pass. Session created at startup via `JsonlSessionRepo`, all paths (success, cancel, error, `!`/`!!`) persist to session.
+**Status: Complete.** 267 tests pass (1 pre-existing repl failure). 43 session
+tests + 9 agent tests all pass. Session created at startup via
+`JsonlSessionRepo`, all paths (success, cancel, error, `!`/`!!`) persist to
+session.
 
 ### Checklist
 
-- [x] **3.1 Session initialization** — `~/.picocode/sessions/` at startup, `Session` via `repo.create(cwd)`, stored as `Option<Session>`
-- [x] **3.2 `prompt()` signature** — `session: Option<&Session>`, prior context from `build_context().await`, stripping before LLM
-- [x] **3.3 Persistence** — `session.append_message()` for all paths, `normalize_call_ids()` applied, pre-strip storage
-- [x] **3.4 Slash commands** — `/model` → `append_model_change()`, `/thinking` → `append_thinking_level_change()`
-- [x] **3.5 Fallback** — `run_once()` passes `None`; no session = empty context + no persistence
+- [x] **3.1 Session initialization** — `~/.picocode/sessions/` at startup,
+      `Session` via `repo.create(cwd)`, stored as `Option<Session>`
+- [x] **3.2 `prompt()` signature** — `session: Option<&Session>`, prior context
+      from `build_context().await`, stripping before LLM
+- [x] **3.3 Persistence** — `session.append_message()` for all paths,
+      `normalize_call_ids()` applied, pre-strip storage
+- [x] **3.4 Slash commands** — `/model` → `append_model_change()`, `/thinking` →
+      `append_thinking_level_change()`
+- [x] **3.5 Fallback** — `run_once()` passes `None`; no session = empty
+      context + no persistence
 - [x] **3.6 Regression tests** — All 9 existing agent tests pass unchanged
 
 ### Lessons Learned
 
-1. **`prompt()` signature change was clean.** `&mut Vec<Message>` → `&Session` works because Session uses interior mutability (Arc<AsyncMutex<>>).
-2. **Stripping moved to context time.** Previously `persist_turn()` stripped before storing. With sessions, `build_context()` returns pre-strip messages; stripping is applied before sending to LLM.
-3. **All error paths persist.** Non-cancellation streaming errors and `Esc` cancellation both call `session.append_message()` for partial turns.
-4. **`persist_turn()` kept for test compat** with `#[allow(dead_code)]`. Tests use it directly; will be removed in Phase 4.
+1. **`prompt()` signature change was clean.** `&mut Vec<Message>` → `&Session`
+   works because Session uses interior mutability (Arc<AsyncMutex<>>).
+2. **Stripping moved to context time.** Previously `persist_turn()` stripped
+   before storing. With sessions, `build_context()` returns pre-strip messages;
+   stripping is applied before sending to LLM.
+3. **All error paths persist.** Non-cancellation streaming errors and `Esc`
+   cancellation both call `session.append_message()` for partial turns.
+4. **`persist_turn()` kept for test compat** with `#[allow(dead_code)]`. Tests
+   use it directly; will be removed in Phase 4.
 
 **Estimated size:** ~127 lines changed in `agent.rs`
 
-------
+---
 
 ## Implementation Plan — Phase 4: `/session` Command ✅
 
-**Goal:** A single `/session` entry point for listing, naming, resuming, forking, and
-deleting sessions — TUI overlay only, no separate slash commands for each action.
+**Goal:** A single `/session` entry point for listing, naming, resuming,
+forking, and deleting sessions — TUI overlay only, no separate slash commands
+for each action.
 
 No extra confirmation messages. The input line tells the story.
 
-**Status: Complete** via the v2.5 slash menu engine (not the original v2.0 overlay
-plan). The original Phase 4 checklist items (4.1–4.7) were implemented through the
-v2.5 `SlashDotNode` tree: `SessionListNode` + action leaf nodes, `AsyncOp` dispatch,
-v2.0 session overlay removal. Design: `slashdot/session_design.md`. 19 unit tests.
+**Status: Complete** via the v2.5 slash menu engine (not the original v2.0
+overlay plan). The original Phase 4 checklist items (4.1–4.7) were implemented
+through the v2.5 `SlashDotNode` tree: `SessionListNode` + action leaf nodes,
+`AsyncOp` dispatch, v2.0 session overlay removal. Design:
+`slashdot/session_design.md`. 19 unit tests.
 
 ### UI Flow
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────┐
 │ /session                              (commands filter)      │
 ├──────────────────────────────────────────────────────────────┤
@@ -1149,10 +1263,10 @@ v2.0 session overlay removal. Design: `slashdot/session_design.md`. 19 unit test
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Typing a name after `/session` filters the list. Hitting Enter or Tab on a session
-opens the per-session action menu:
+Typing a name after `/session` filters the list. Hitting Enter or Tab on a
+session opens the per-session action menu:
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────┐
 │ /session "picocode session storage"                          │
 ├──────────────────────────────────────────────────────────────┤
@@ -1170,20 +1284,27 @@ opens the per-session action menu:
 Selecting an action sets the input line to a full-sentence form and commits it
 (no additional confirmation):
 
-| Action | Input after Enter | Behaviour |
-|---|---|---|
-| resume | `/session "picocode session storage" resume` | Switch to selected session |
-| fork | `/session "picocode session storage" fork` | Fork from the leaf, create new session, switch |
-| rename | `/session "picocode session storage" rename ` | Pre-fills input for typing new name |
-| delete | `/session "picocode session storage" delete` | Remove the file, remove from list |
+- **Action**: resume
+  - **Input after Enter**: `/session "picocode session storage" resume`
+  - **Behaviour**: Switch to selected session
+- **Action**: fork
+  - **Input after Enter**: `/session "picocode session storage" fork`
+  - **Behaviour**: Fork from the leaf, create new session, switch
+- **Action**: rename
+  - **Input after Enter**: `/session "picocode session storage" rename`
+  - **Behaviour**: Pre-fills input for typing new name
+- **Action**: delete
+  - **Input after Enter**: `/session "picocode session storage" delete`
+  - **Behaviour**: Remove the file, remove from list
 
-Typing these directly (without the overlay) also works: `/session <name> resume`,
-`/session <name> fork`, `/session <name> rename <newname>`,
-`/session <name> delete`.
+Typing these directly (without the overlay) also works:
+`/session <name> resume`, `/session <name> fork`,
+`/session <name> rename <newname>`, `/session <name> delete`.
 
 ### Implementation Details
 
 **New overlay kind codes:**
+
 - `10` — session list (top-level `/session`)
 - `11` — per-session action menu
 
@@ -1204,6 +1325,7 @@ existing `Submit` path:
 ```
 
 **`ReplCtx` new fields:**
+
 ```rust
 pub sessions_list: Vec<SessionMetadata>,
 pub current_session_id: String,
@@ -1217,7 +1339,8 @@ All functional goals achieved through `SlashDotNode` tree rather than the
 original v2.0 overlay plan below.
 
 - [x] **4.1 Store repo in `run_interactive()`**
-  - [x] Keep `repo: Option<JsonlSessionRepo>` alongside `session: Option<Session>`
+  - [x] Keep `repo: Option<JsonlSessionRepo>` alongside
+        `session: Option<Session>`
   - [x] Populate session data from `repo` via `SessionListNode::data()`
   - [x] Session operations dispatch via `AsyncOp` enum on `MenuShared`
 
@@ -1243,7 +1366,8 @@ original v2.0 overlay plan below.
 
 - [x] **4.6 Direct text input** — handled by v2.5 engine section parsing
 
-- [x] **4.7 Tests** — 19 unit tests (listing, traversal, submit, guards, helpers)
+- [x] **4.7 Tests** — 19 unit tests (listing, traversal, submit, guards,
+      helpers)
 
 - [ ] **4.5 Dispatch in `run_interactive()` (`agent.rs`)**
   - [ ] Before the `Submit` handler, check if input matches `/session` pattern
@@ -1255,13 +1379,15 @@ original v2.0 overlay plan below.
     - [ ] Replace current `session` with `Session::new(storage, index)`
     - [ ] Update `ReplCtx.current_session_id`
   - [ ] `fork`:
-    - [ ] Get current `SessionMetadata` from repo's list for the selected session
+    - [ ] Get current `SessionMetadata` from repo's list for the selected
+          session
     - [ ] Call `repo.fork(&source_meta, leaf_id, cwd)` → new storage
     - [ ] Build index, create `Session::new(...)`, replace current session
   - [ ] `rename <newname>`:
     - [ ] Find the session in repo's list by name
     - [ ] If it's the current session: `session.set_session_name(newname)`
-    - [ ] If it's a different session: open it, rename, close (or defer — Phase 5)
+    - [ ] If it's a different session: open it, rename, close (or defer — Phase
+          5)
   - [ ] `delete`:
     - [ ] Find session by name, call `repo.delete(&meta)`
     - [ ] Refresh `ReplCtx.sessions_list`
@@ -1279,11 +1405,12 @@ original v2.0 overlay plan below.
 
 ### Notes
 
-- Session switching (resume) replaces the `Session` object in `run_interactive()`.
-  The in-memory `index` is rebuilt via `repo.open()`. No in-flight state is lost
-  because resume only happens between turns (not mid-prompt).
-- `fork` creates a new session file and sets `parentSession` in the header to the
-  source file path. The new session becomes the current session.
+- Session switching (resume) replaces the `Session` object in
+  `run_interactive()`. The in-memory `index` is rebuilt via `repo.open()`. No
+  in-flight state is lost because resume only happens between turns (not
+  mid-prompt).
+- `fork` creates a new session file and sets `parentSession` in the header to
+  the source file path. The new session becomes the current session.
 - `delete` removes the `.jsonl` file. If it's the current session, greyed out in
   the menu; the user must resume a different session first.
 - Session name lookup is O(n) over the list (n < 100 in practice). For large
@@ -1310,26 +1437,33 @@ No separate Phase 5 is needed.
 
 ### 1. pi Wire Compatibility
 
-**Decision:** picocode's JSONL files are **identical** to pi's (camelCase, same tags, same field layout). This means:
+**Decision:** picocode's JSONL files are **identical** to pi's (camelCase, same
+tags, same field layout). This means:
 
 - A pi session file can be opened in picocode with zero transformation
 - A picocode session file can be opened in pi with zero transformation
 - The serde attributes use `#[serde(rename_all = "camelCase")]` at all levels
-- `Message` content is stored as raw `serde_json::Value` in the pi `AgentMessage` format, not rig's format
+- `Message` content is stored as raw `serde_json::Value` in the pi
+  `AgentMessage` format, not rig's format
 
-The only difference is entry ID length: pi uses 8-char hex strings, picocode uses full UUIDv7 strings. The importer accepts any string.
+The only difference is entry ID length: pi uses 8-char hex strings, picocode
+uses full UUIDv7 strings. The importer accepts any string.
 
 ### 2. JSONL File Format (Reaffirmed)
 
-Storage format remains JSONL (same as pi). See original document for the comparison table.
+Storage format remains JSONL (same as pi). See original document for the
+comparison table.
 
 ### 3. Entry Tree Model (Reaffirmed)
 
-Tree model with `parentId` chains, matching pi's design. Enables forking, branching, labels, and compaction without ad-hoc hacks.
+Tree model with `parentId` chains, matching pi's design. Enables forking,
+branching, labels, and compaction without ad-hoc hacks.
 
 ### 4. Pre-Strip Storage
 
-Messages are stored **before** reasoning stripping. The stripping (`maybe_strip_reasoning`) is applied only in `build_context()` before sending to the LLM. This ensures:
+Messages are stored **before** reasoning stripping. The stripping
+(`maybe_strip_reasoning`) is applied only in `build_context()` before sending to
+the LLM. This ensures:
 
 - Full reasoning is available for re-display of past sessions
 - `/fork` from a reasoning-rich point preserves the full content
@@ -1337,11 +1471,16 @@ Messages are stored **before** reasoning stripping. The stripping (`maybe_strip_
 
 ### 5. Leaf Pointer Updates
 
-Every append operation that changes the current position updates the leaf pointer. This is done by appending a new `leaf` entry after the content entry, keeping the leaf history as part of the entry tree.
+Every append operation that changes the current position updates the leaf
+pointer. This is done by appending a new `leaf` entry after the content entry,
+keeping the leaf history as part of the entry tree.
 
 ### 6. UUIDv7 for Entry IDs
 
-Full UUIDv7 strings (not pi's abbreviated 8-char format). The `uuid` crate with `v7` feature provides `Uuid::now_v7()`. A `uuid::timestamp::context::Context` (monotonic counter) should be created at agent startup and shared across the session to guard against clock rewinds.
+Full UUIDv7 strings (not pi's abbreviated 8-char format). The `uuid` crate with
+`v7` feature provides `Uuid::now_v7()`. A `uuid::timestamp::context::Context`
+(monotonic counter) should be created at agent startup and shared across the
+session to guard against clock rewinds.
 
 ### 7. Resume Semantics
 
@@ -1382,26 +1521,36 @@ is the terminal's responsibility.
 
 ### Q1: Compaction Integration
 
-Deferred to the compaction design (`doc/compaction.md`). The session storage provides `apply_transforms()` as the integration point. When compaction runs:
+Deferred to the compaction design (`doc/compaction.md`). The session storage
+provides `apply_transforms()` as the integration point. When compaction runs:
 
 1. It identifies a range of entries to compact
-2. Generates a `Compaction` entry with `firstKeptEntryId` pointing past the compacted range
+2. Generates a `Compaction` entry with `firstKeptEntryId` pointing past the
+   compacted range
 3. Appends the compaction entry to the session file
 4. `build_context()` skips entries before `firstKeptEntryId`
 
-The existing entries remain in the file (no deletion) — compaction is purely a context-building transform.
+The existing entries remain in the file (no deletion) — compaction is purely a
+context-building transform.
 
 ### Q2: Concurrent Sessions
 
-No locking required. Each session writes to a uniquely-named JSONL file (UUID in filename). The only shared resource is the session directory; `list()` is atomic at the OS level.
+No locking required. Each session writes to a uniquely-named JSONL file (UUID in
+filename). The only shared resource is the session directory; `list()` is atomic
+at the OS level.
 
 ### Q3: pi Import Path
 
-Planned as a future `/import-pi-session <path>` command. Since the formats are wire-compatible, this is almost trivial: copy the file into the picocode sessions directory, generate a new header line. The only non-trivial step is mapping pi's 8-char entry IDs to full UUIDv7 — but since picocode's `SessionEntry.id` is `String` (not UUID), even that is straightforward.
+Planned as a future `/import-pi-session <path>` command. Since the formats are
+wire-compatible, this is almost trivial: copy the file into the picocode
+sessions directory, generate a new header line. The only non-trivial step is
+mapping pi's 8-char entry IDs to full UUIDv7 — but since picocode's
+`SessionEntry.id` is `String` (not UUID), even that is straightforward.
 
 ### Q4: Error Recovery
 
-On open, if the last line is not valid JSON (truncated write), skip it and log a warning. All preceding lines are valid. This is handled in `build_index()`.
+On open, if the last line is not valid JSON (truncated write), skip it and log a
+warning. All preceding lines are valid. This is handled in `build_index()`.
 
 ---
 
@@ -1419,7 +1568,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 ## File Structure (Final)
 
-```
+```text
 src/
   session/
     mod.rs          # Re-exports + module declarations
@@ -1439,11 +1588,10 @@ src/
 
 ## Migration Path (Summary)
 
-| Phase | What | Tests | Risk |
-|---|---|---|---|
-| ✅ 1 | Types + Storage | 30 unit, 78 pi files | Low |
-| ✅ 2 | Session Object  | 13 unit, full round-trip | Low |
-| ✅ 3 | Wire into agent loop | 267 pass, 9 agent | Medium |
-| ✅ 4 | `/session` command | 19 session, manual | Medium |
-| ✅ 5 | (merged into Phase 4) | — | — |
-
+| Phase | What                  | Tests                    | Risk   |
+| ----- | --------------------- | ------------------------ | ------ |
+| ✅ 1  | Types + Storage       | 30 unit, 78 pi files     | Low    |
+| ✅ 2  | Session Object        | 13 unit, full round-trip | Low    |
+| ✅ 3  | Wire into agent loop  | 267 pass, 9 agent        | Medium |
+| ✅ 4  | `/session` command    | 19 session, manual       | Medium |
+| ✅ 5  | (merged into Phase 4) | —                        | —      |

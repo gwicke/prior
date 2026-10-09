@@ -123,21 +123,28 @@ pub enum BindMode { Ro, Rw }
 > **Note on the two-list design:** Instead of a single `paths` array where each
 > entry carries its own mode, bindings are split into two lists — `ro` and `rw`
 > — and the mode is implied by which list the entry lives in. Each entry is a
-> plain path string or a `{ from, to }` remap table. This is simpler to parse
-> (a plain `untagged` enum) and removes the per-entry `mode`/`ro`/`rw` ambiguity.
+> plain path string or a `{ from, to }` remap table. This is simpler to parse (a
+> plain `untagged` enum) and removes the per-entry `mode`/`ro`/`rw` ambiguity.
 
 ---
 
 ## The `paths` model
 
-Each entry in the `ro`/`rw` lists declares one filesystem binding. Semantics mirror `bwrap` (the list name selects the flag):
+Each entry in the `ro`/`rw` lists declares one filesystem binding. Semantics
+mirror `bwrap` (the list name selects the flag):
 
-| Config              | bwrap flag             | Meaning                                                        |
-| ------------------- | ---------------------- | -------------------------------------------------------------- |
-| `P`  (in `ro`)      | `--ro-bind P P`        | Host `P` mounted read-only at the **same** path in-sandbox.    |
-| `P`  (in `rw`)      | `--bind P P`           | Host `P` mounted read-write at the **same** path.              |
-| `{from,to}` (in `ro`) | `--ro-bind from to`  | Host `from` mounted read-only at in-sandbox `to`.              |
-| `{from,to}` (in `rw`) | `--bind from to`     | Host `from` mounted read-write at in-sandbox `to`.             |
+- **Config**: `P` (in `ro`)
+  - **bwrap flag**: `--ro-bind P P`
+  - **Meaning**: Host `P` mounted read-only at the **same** path in-sandbox.
+- **Config**: `P` (in `rw`)
+  - **bwrap flag**: `--bind P P`
+  - **Meaning**: Host `P` mounted read-write at the **same** path.
+- **Config**: `{from,to}` (in `ro`)
+  - **bwrap flag**: `--ro-bind from to`
+  - **Meaning**: Host `from` mounted read-only at in-sandbox `to`.
+- **Config**: `{from,to}` (in `rw`)
+  - **bwrap flag**: `--bind from to`
+  - **Meaning**: Host `from` mounted read-write at in-sandbox `to`.
 
 ### Resolution rules
 
@@ -230,7 +237,7 @@ fn run_sandboxed(cmd: &str, cfg: &SandboxConfig) -> Result<String, ToolError> {
 
 ### bwrap command construction
 
-```
+```text
 bwrap
   --ro-bind <cwd> <cwd>            # baseline: CWD visible read-only (if no path overrides)
   [for each path in cfg.ro]   --ro-bind <from> <to>
@@ -245,8 +252,8 @@ bwrap
 
 - **Memory limit.** bwrap has no direct RLIMIT flag. We set `RLIMIT_AS` with
   `prlimit` (util-linux), which execs the target via a **direct argv list** — no
-  shell, so the limit step is never interpreted by a shell. `prlimit --as`
-  takes bytes, so `memory_mb` is converted to `memory_mb * 1024 * 1024`. Both the
+  shell, so the limit step is never interpreted by a shell. `prlimit --as` takes
+  bytes, so `memory_mb` is converted to `memory_mb * 1024 * 1024`. Both the
   shell path (`sh -c <cmd>`) and the argv path (`<program> <argv…>`) are wrapped
   the same way, so the cap is enforced on both. (`RLIMIT_AS` + `--unshare-pid`
   scopes the limit to the command's process tree.)
@@ -426,7 +433,8 @@ same `ResolvedBind` + `RemapTable`, so the two worlds cannot disagree.
 ### Decision: non-shell tools stay host-direct (NOT run in-namespace)
 
 We deliberately do **not** execute the non-shell tools as child processes inside
-a bwrap namespace to make them "see" the same filesystem as the shell. Rationale:
+a bwrap namespace to make them "see" the same filesystem as the shell.
+Rationale:
 
 - **Per-call process + serialization cost.** Each read/write would become
   `bwrap … -- helper <op> <path>` with bytes round-tripped over stdout. The
@@ -542,7 +550,8 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
       `--unshare-net` (unless `network`); `--unshare-pid --pid`
       (if `pid_isolation`); `--cap-drop ALL` (if `drop_caps`);
       `--die-with-parent`.
-- [x] Memory wrapper: `prlimit --as=<MB*1024*1024> -- <argv>` (direct argv, no shell); `ulimit -v` shell-builtin fallback when `prlimit` absent.
+- [x] Memory wrapper: `prlimit --as=<MB*1024*1024> -- <argv>` (direct argv, no
+      shell); `ulimit -v` shell-builtin fallback when `prlimit` absent.
 - [ ] Integration tests (tempfile): ro/rw remap round-trip; `network:false`
       blocks connect, `network:true` allows; OOM under `memory_mb`.
 - [ ] Wire `tool_config.bash.sandbox` through `build_rig_agent` →
@@ -559,8 +568,8 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
       prefix wins.
 - [ ] Implement binding coverage + `ro`/`rw` mode checks (read vs write) on the
       *rewritten host* path.
-- [ ] Reject paths outside all bindings when `paths` non-empty (deny-by-default);
-      keep CWD-visible read-only fallback when empty.
+- [ ] Reject paths outside all bindings when `paths` non-empty
+      (deny-by-default); keep CWD-visible read-only fallback when empty.
 - [ ] Thread the resolved policy + `RemapTable` from `Config` into every file
       tool (read, write, edit, glob, grep, list, make_dir, remove, move, copy);
       for move/copy check both src and dst (each rewritten + checked).

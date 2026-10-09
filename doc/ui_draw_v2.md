@@ -1,16 +1,16 @@
 # UI Draw v2 — unified frame composition for REPL, menus & dialogs
 
-**Status:** Design settled — implemented (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 ✅, P5 ✅;
-§4.5 U1/U2 ✅ in the API fold, U4.1–U4.3/U4.5–U4.6 ✅, U5–U6 not started; **U3's
-composition half is ✅ but its delivery half is not** — moved to
+**Status:** Design settled — implemented (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 ✅, P5
+✅; §4.5 U1/U2 ✅ in the API fold, U4.1–U4.3/U4.5–U4.6 ✅, U5–U6 not started;
+**U3's composition half is ✅ but its delivery half is not** — moved to
 [`confirm_as_menu_261002.md`](./confirm_as_menu_261002.md), which supersedes
-§4.5.6's U3 entry). One end-to-end layout
-assertion is off by one row — see §5.2; the design to close it (paint-forward)
-moved to [`ui_draw_261001.md`](./ui_draw_261001.md), which supersedes §5.2's
-"Proposed change" and its open questions.
-Post-implementation follow-ups (§9): 7 done, 3 open, 1 accepted limitation —
-audited 2026-09-28, recommended order at the end of §9.
-**Supersedes:** the ad-hoc dialog renderer in `src/ui.rs`, the `redraw` closure in `src/repl.rs`
+§4.5.6's U3 entry). One end-to-end layout assertion is off by one row — see
+§5.2; the design to close it (paint-forward) moved to
+[`ui_draw_261001.md`](./ui_draw_261001.md), which supersedes §5.2's "Proposed
+change" and its open questions. Post-implementation follow-ups (§9): 7 done, 3
+open, 1 accepted limitation — audited 2026-09-28, recommended order at the end
+of §9. **Supersedes:** the ad-hoc dialog renderer in `src/ui.rs`, the `redraw`
+closure in `src/repl.rs`
 
 ---
 
@@ -18,42 +18,86 @@ audited 2026-09-28, recommended order at the end of §9.
 
 Drawing is done in two unrelated code paths:
 
-- **REPL** (`repl.rs` `redraw` closure, line 618): anchored at a tracked `input_row`,
-  clears then rewrites input + divider + overlay, lets the terminal scroll on overflow,
-  and adjusts a row counter (`next_input_row`). Carefully tuned (see the `\n` vs `CSI B`
-  comments and the vt100 tests).
-- **Dialogs** (`ui.rs` `confirm`): computes its own anchor, clears with `\x1b[0J`, writes
-  lines, no scroll tracking, no shared budget handling.
+- **REPL** (`repl.rs` `redraw` closure, line 618): anchored at a tracked
+  `input_row`, clears then rewrites input + divider + overlay, lets the terminal
+  scroll on overflow, and adjusts a row counter (`next_input_row`). Carefully
+  tuned (see the `\n` vs `CSI B` comments and the vt100 tests).
+- **Dialogs** (`ui.rs` `confirm`): computes its own anchor, clears with
+  `\x1b[0J`, writes lines, no scroll tracking, no shared budget handling.
 
-Consequences: duplicated anchoring/scrolling logic, a second-class dialog path that can
-corrupt scrollback (clearing above the cursor), no shared budget enforcement, and a test
-suite (`vt100_*`) that re-implements emission instead of exercising it.
+Consequences: duplicated anchoring/scrolling logic, a second-class dialog path
+that can corrupt scrollback (clearing above the cursor), no shared budget
+enforcement, and a test suite (`vt100_*`) that re-implements emission instead of
+exercising it.
 
-Goal: **one pipeline** that composes elements (input line, divider, overlay, dialog,
-status line, …) into a frame, allocates vertical space, renders it, and applies it to the
-terminal with bounded clearing and consistent scroll tracking. Dialogs become "frames
-without an input segment".
+Goal: **one pipeline** that composes elements (input line, divider, overlay,
+dialog, status line, …) into a frame, allocates vertical space, renders it, and
+applies it to the terminal with bounded clearing and consistent scroll tracking.
+Dialogs become "frames without an input segment".
 
 ---
 
 ## 2. Settled decisions (from design discussion)
 
-| Topic | Decision |
-|---|---|
-| Draw pipeline | 4 phases: **compose → allocate → render → apply** |
-| Composition | Elements declare `(must, might)` heights; allocator distributes |
-| Budget | Live region ≤ **2/3 of terminal height**; top 1/3 guaranteed scrollback |
-| Full apply | **Scroll-then-paint**: LF scroll by `delta` from the bottom row (never `CSI S` — it deletes rows instead of pushing scrollback), then absolute writes |
-| Partial apply | Row-diff repaint when `delta == 0 ∧ top == live.frame_top_row ∧ term size (w, h) unchanged` |
-| Clear policy | Full apply: clear the union of the old frame region (scroll-shifted) and the rows below the new frame, floored at `min(term_h, screen_bottom)`. Partial apply: row-diff + shrink remainder only. Append: no region clear (reserved for §4.5's chunked writes). **General invariant (P4):** a Frame apply clears the rows below the frame, so any later append-only render (and any row-diff) lands in already-clean space and never re-clears it. **To be restated by §4.5 U1:** with the area live across a turn, content *consumes* the area's rows instead of landing below them, so the invariant becomes "content writes stop at the fold; the area's rows are re-emitted, not erased". That is a change to a settled decision and wants its own commit and test |
-| Buffer | Flat `String` + per-screen-row extents `Vec<Range<usize>>` |
-| Caret | Absolute `(row, col)` in the cache (row authoritative, col best-effort); frame-relative `(row_idx, display_col)` inside `Frame`; applied with `CUP` + `CHA` (`\x1b[{col}G`) |
-| Draw state | `DrawCache { caret, screen_bottom, live: Option<LiveFrame> }` in `ConsoleOutput`; all writers maintain it before returning |
-| Screen position | Stored rows are absolute (everything emitted/consumed is); bottom-relative quantities (`delta`, 2/3 budget, clear floor) are computed per apply. No reflow-model invariance is assumed |
-| UI surface | `Output::draw_frame(frame, anchor, policy, dims)` + `frame_anchor()`; default drops UI drawing; `ConsoleOutput` overrides and applies exactly `dims` (the size the frame was composed for — §9 #3), returning what it applied. Content-out (`display_*`) and UI-out stay separate |
-| DSR | Only via the explicit `cursor_row()` re-anchor primitive (foreign-process / size-change / dialog-entry sites); steady state uses the cache |
-| Dialogs | Same pipeline, no input segment; entry DSR re-anchor, then `frame_anchor()`; the composer's divider rule separates mid-turn dialogs from streamed output. Resolve = `Frame::empty()` union-clear; the optional decision line is written at the cleared first row |
-| Commit lines | Clear the region with a Frame apply, then write the line where the caret lands (`emit_commit`, dialog decision line). `Append` stays reserved for §4.5's chunked/fixed-bottom writes |
+- **Topic**: Draw pipeline
+  - **Decision**: 4 phases: **compose → allocate → render → apply**
+- **Topic**: Composition
+  - **Decision**: Elements declare `(must, might)` heights; allocator
+    distributes
+- **Topic**: Budget
+  - **Decision**: Live region ≤ **2/3 of terminal height**; top 1/3 guaranteed
+    scrollback
+- **Topic**: Full apply
+  - **Decision**: **Scroll-then-paint**: LF scroll by `delta` from the bottom
+    row (never `CSI S` — it deletes rows instead of pushing scrollback), then
+    absolute writes
+- **Topic**: Partial apply
+  - **Decision**: Row-diff repaint when
+    `delta == 0 ∧ top == live.frame_top_row ∧ term size (w, h) unchanged`
+- **Topic**: Clear policy
+  - **Decision**: Full apply: clear the union of the old frame region
+    (scroll-shifted) and the rows below the new frame, floored at
+    `min(term_h, screen_bottom)`. Partial apply: row-diff + shrink remainder
+    only. Append: no region clear (reserved for §4.5's chunked writes).
+    **General invariant (P4):** a Frame apply clears the rows below the frame,
+    so any later append-only render (and any row-diff) lands in already-clean
+    space and never re-clears it. **To be restated by §4.5 U1:** with the area
+    live across a turn, content *consumes* the area's rows instead of landing
+    below them, so the invariant becomes "content writes stop at the fold; the
+    area's rows are re-emitted, not erased". That is a change to a settled
+    decision and wants its own commit and test
+- **Topic**: Buffer
+  - **Decision**: Flat `String` + per-screen-row extents `Vec<Range<usize>>`
+- **Topic**: Caret
+  - **Decision**: Absolute `(row, col)` in the cache (row authoritative, col
+    best-effort); frame-relative `(row_idx, display_col)` inside `Frame`;
+    applied with `CUP` + `CHA` (`\x1b[{col}G`)
+- **Topic**: Draw state
+  - **Decision**: `DrawCache { caret, screen_bottom, live: Option<LiveFrame> }`
+    in `ConsoleOutput`; all writers maintain it before returning
+- **Topic**: Screen position
+  - **Decision**: Stored rows are absolute (everything emitted/consumed is);
+    bottom-relative quantities (`delta`, 2/3 budget, clear floor) are computed
+    per apply. No reflow-model invariance is assumed
+- **Topic**: UI surface
+  - **Decision**: `Output::draw_frame(frame, anchor, policy, dims)` +
+    `frame_anchor()`; default drops UI drawing; `ConsoleOutput` overrides and
+    applies exactly `dims` (the size the frame was composed for — §9 #3),
+    returning what it applied. Content-out (`display_*`) and UI-out stay
+    separate
+- **Topic**: DSR
+  - **Decision**: Only via the explicit `cursor_row()` re-anchor primitive
+    (foreign-process / size-change / dialog-entry sites); steady state uses the
+    cache
+- **Topic**: Dialogs
+  - **Decision**: Same pipeline, no input segment; entry DSR re-anchor, then
+    `frame_anchor()`; the composer's divider rule separates mid-turn dialogs
+    from streamed output. Resolve = `Frame::empty()` union-clear; the optional
+    decision line is written at the cleared first row
+- **Topic**: Commit lines
+  - **Decision**: Clear the region with a Frame apply, then write the line where
+    the caret lands (`emit_commit`, dialog decision line). `Append` stays
+    reserved for §4.5's chunked/fixed-bottom writes
 
 ---
 
@@ -61,15 +105,15 @@ without an input segment".
 
 ### 3.1 Phases
 
-```
+```text
 compose(self, ctx)  →  Element list with (must, might)     [pure]
 allocate(w, h, budget) →  Row ranges per element, extents  [pure]
 render(alloc)       →  buffer + caret + element spans      [pure]
 apply(f, anchor, pol) → escapes → stdout, update cache    [impure]
 ```
 
-`compose`/`allocate`/`render` take no terminal dependency (w/h passed in) → unit-testable.
-`apply` is the only phase that touches the terminal or the cache.
+`compose`/`allocate`/`render` take no terminal dependency (w/h passed in) →
+unit-testable. `apply` is the only phase that touches the terminal or the cache.
 
 ### 3.2 Element model
 
@@ -91,74 +135,80 @@ enum Element {
 }
 ```
 
-`must` is the height the element cannot go below (visible floor); `might` is the height
-it would take with unlimited space. Allocation gives each element `must`, then distributes
-surplus up to `might` (same shape as the existing `compute_space_budget`, generalized from
-2 to N elements).
+`must` is the height the element cannot go below (visible floor); `might` is the
+height it would take with unlimited space. Allocation gives each element `must`,
+then distributes surplus up to `might` (same shape as the existing
+`compute_space_budget`, generalized from 2 to N elements).
 
 #### 3.2.1 How the two passes decide
 
 `allocate` is one early return and two rounds:
 
-```
+```text
 if sum(might) <= budget { return might }          // no pressure: everyone is served
 fill(heights, musts, budget)                      // pass 1: floors
 fill(heights, mights, budget − granted)           // pass 2: surplus toward wants
 ```
 
-`fill` distributes the pool in **even shares per round**, with unused shares falling back
-into the pool for the next round, and hands out one row each in element order when the
-pool is smaller than the number of claimants.
+`fill` distributes the pool in **even shares per round**, with unused shares
+falling back into the pool for the next round, and hands out one row each in
+element order when the pool is smaller than the number of claimants.
 
 Two consequences worth writing down rather than re-deriving:
 
-- **There is no priority.** Nothing declares "the menu yields to the input": under
-  pressure they compete on even shares, and the only ordering anywhere is that
-  `share == 0` tie-break. It works out today because the overlay's `might` (~2/3·term_h)
-  dwarfs the input's (1–3). If deliberate yielding is ever wanted — the input owns the
-  caret — it is not expressible; it would mean lowering another element's `might` first,
-  i.e. a second pass, which is the complexity `window` exists to avoid.
-- **`Lines` never competes.** Its `must == might == rows.len()`, so it is fully served by
-  pass 1 regardless of what else is asking. That is what `must` is *for*, and it is why the
-  status row can be added without the composition having to protect it.
+- **There is no priority.** Nothing declares "the menu yields to the input":
+  under pressure they compete on even shares, and the only ordering anywhere is
+  that `share == 0` tie-break. It works out today because the overlay's `might`
+  (~2/3·term_h) dwarfs the input's (1–3). If deliberate yielding is ever wanted
+  — the input owns the caret — it is not expressible; it would mean lowering
+  another element's `might` first, i.e. a second pass, which is the complexity
+  `window` exists to avoid.
+- **`Lines` never competes.** Its `must == might == rows.len()`, so it is fully
+  served by pass 1 regardless of what else is asking. That is what `must` is
+  *for*, and it is why the status row can be added without the composition
+  having to protect it.
 
-In `src/ui/frame.rs`, production code matches on the variants in exactly **two** places —
-`extent()` and `render()`. Everything else (`Frame`, `spans`, `allocate`, all of `plan_*`)
-works in rows and byte ranges and is variant-agnostic. (Other modules *construct* variants;
-none pattern-matches one.)
+In `src/ui/frame.rs`, production code matches on the variants in exactly **two**
+places — `extent()` and `render()`. Everything else (`Frame`, `spans`,
+`allocate`, all of `plan_*`) works in rows and byte ranges and is
+variant-agnostic. (Other modules *construct* variants; none pattern-matches
+one.)
 
 #### 3.2.2 The squeeze policy is in the wrong layer
 
 `render` hardcodes *how an element fits when it is squeezed*:
 
-| element | policy when squeezed | whose knowledge |
-|---|---|---|
-| `Input` | `window(n, cursor_row, h, INPUT_CONTEXT_ROWS = 3)` | the editor's |
-| `Overlay` | `window(n, focus, h, h / 2)` | the menu's |
-| `Divider` | 0 or 1 | neither |
-| `Lines` | `rows.iter().take(h)` | — |
+|element  |policy when squeezed                              |whose knowledge|
+|---------|--------------------------------------------------|---------------|
+|`Input`  |`window(n, cursor_row, h, INPUT_CONTEXT_ROWS = 3)`|the editor's   |
+|`Overlay`|`window(n, focus, h, h / 2)`                      |the menu's     |
+|`Divider`|0 or 1                                            |neither        |
+|`Lines`  |`rows.iter().take(h)`                             |—              |
 
 Two findings:
 
-- **`Lines` has no notion of focus.** `take(h)` keeps the *front* and drops the rest, so
-  the row the reader was looking at can be the one cut. It does not bite today — `Lines`'
-  planned users are the status row (one row) and commit lines (append-only), both
-  focus-free — but the variant's doc claims the opposite ("truncated from the top"), so
-  code and doc disagree about *which* end is cut, and about which should be.
-- **`INPUT_CONTEXT_ROWS` and `h / 2` are opinions living in `frame.rs`.** The editor knows
-  it wants three rows of context; the menu knows it wants half its budget above its focus.
+- **`Lines` has no notion of focus.** `take(h)` keeps the *front* and drops the
+  rest, so the row the reader was looking at can be the one cut. It does not
+  bite today — `Lines`' planned users are the status row (one row) and commit
+  lines (append-only), both focus-free — but the variant's doc claims the
+  opposite ("truncated from the top"), so code and doc disagree about *which*
+  end is cut, and about which should be.
+- **`INPUT_CONTEXT_ROWS` and `h / 2` are opinions living in `frame.rs`.** The
+  editor knows it wants three rows of context; the menu knows it wants half its
+  budget above its focus.
 
-The general form: **the enum invites the frame layer to accumulate squeeze knowledge that
-its callers already hold**, and every new element kind adds another arm to a `match` in a
-module that should only know about rows and byte ranges.
+The general form: **the enum invites the frame layer to accumulate squeeze
+knowledge that its callers already hold**, and every new element kind adds
+another arm to a `match` in a module that should only know about rows and byte
+ranges.
 
 #### 3.2.3 The item splits into (data, polymorphic render)
 
 The requirement that constrains any replacement:
 
-> `allocate` needs `must`/`might` for **every** item before it renders **any** of them
-> (§3.1's two passes). So the sizing declaration must be *data* on the item, and only the
-> rendering may be polymorphic.
+> `allocate` needs `must`/`might` for **every** item before it renders **any**
+> of them (§3.1's two passes). So the sizing declaration must be *data* on the
+> item, and only the rendering may be polymorphic.
 
 ```rust
 struct Item {
@@ -181,46 +231,62 @@ struct Rendered {
 }
 ```
 
-The caret is why the return type grows: today `render`'s `Input` arm sets `Frame.caret`
-directly. Under polymorphism there is no arm, so each item answers for itself and items
-with no caret return `None`.
+The caret is why the return type grows: today `render`'s `Input` arm sets
+`Frame.caret` directly. Under polymorphism there is no arm, so each item answers
+for itself and items with no caret return `None`.
 
 Three ways to carry the render half:
 
-| | enum (today) | `Arc<dyn Fn(usize) -> Rendered>` | trait object |
-|---|---|---|---|
-| squeeze policy | in `frame.rs` ✗ | with the owner ✓ | with the owner ✓ |
-| new kind | edit both `match`es | drop in ✓ | drop in ✓ |
-| exhaustiveness | compile error ✓ | none — silent | none — silent |
-| sizing + render kept in step | one `match` | **two independent fields that can disagree** | one `impl` ✓ |
-| storage | `Send` ✓ | needs `'static` + `Send + Sync` | needs `'static` + `Send + Sync` |
+- squeeze policy
+  - **enum (today)**: in `frame.rs` ✗
+  - **`Arc<dyn Fn(usize) -> Rendered>`**: with the owner ✓
+  - **trait object**: with the owner ✓
+- new kind
+  - **enum (today)**: edit both `match`es
+  - **`Arc<dyn Fn(usize) -> Rendered>`**: drop in ✓
+  - **trait object**: drop in ✓
+- exhaustiveness
+  - **enum (today)**: compile error ✓
+  - **`Arc<dyn Fn(usize) -> Rendered>`**: none — silent
+  - **trait object**: none — silent
+- sizing + render kept in step
+  - **enum (today)**: one `match`
+  - **`Arc<dyn Fn(usize) -> Rendered>`**:
+    **two independent fields that can disagree**
+  - **trait object**: one `impl` ✓
+- storage
+  - **enum (today)**: `Send` ✓
+  - **`Arc<dyn Fn(usize) -> Rendered>`**: needs `'static` + `Send + Sync`
+  - **trait object**: needs `'static` + `Send + Sync`
 
-On storage: the last two rows are **equal**, and `Box` suffices for either — an item is
-owned by exactly one composition at a time and is only ever moved (§5.1.1). `Arc` would
-be needed only if a composition were shared across owners, which nothing does.
+On storage: the last two rows are **equal**, and `Box` suffices for either — an
+item is owned by exactly one composition at a time and is only ever moved
+(§5.1.1). `Arc` would be needed only if a composition were shared across owners,
+which nothing does.
 
-**Chosen: a trait.** It buys everything the closure buys — policy back with its owner, no
-`match` in `frame.rs` — while keeping the sizing and the rendering in one `impl`, so
-`must`/`might` cannot drift from what `render_at` will actually produce. Both require the
-item to own what it captures: `Output: Send + Sync` and `draw: Mutex<DrawCache>` rule out
-any borrow of a caller's editor, which is the same rule the element list already follows
-(the REPL builds a fresh one per keystroke and moves it).
+**Chosen: a trait.** It buys everything the closure buys — policy back with its
+owner, no `match` in `frame.rs` — while keeping the sizing and the rendering in
+one `impl`, so `must`/`might` cannot drift from what `render_at` will actually
+produce. Both require the item to own what it captures: `Output: Send + Sync`
+and `draw: Mutex<DrawCache>` rule out any borrow of a caller's editor, which is
+the same rule the element list already follows (the REPL builds a fresh one per
+keystroke and moves it).
 
-Not urgent. Four kinds cover the whole frame stack (§4.5: status, input, menu, divider)
-and nothing in §4.5 needs a fifth. Do it *with* the status row rather than before it,
-because the status row is the first item whose squeeze policy belongs to someone other
-than `frame.rs`.
+Not urgent. Four kinds cover the whole frame stack (§4.5: status, input, menu,
+divider) and nothing in §4.5 needs a fifth. Do it *with* the status row rather
+than before it, because the status row is the first item whose squeeze policy
+belongs to someone other than `frame.rs`.
 
 #### 3.2.4 What does not change
 
-- **`allocate`** — both passes, even shares, the `musts`-first floor. It never looked at
-  a variant.
+- **`allocate`** — both passes, even shares, the `musts`-first floor. It never
+  looked at a variant.
 - **`window(n, focus, budget, prefer_context)`** — unchanged; only *whose*
   `prefer_context` it is changes.
 - **`Frame`, `spans`, and all of `plan_*`** — rows and byte ranges only.
-- **Purity.** `render` is still `(items, heights, term_w) -> Frame` with no terminal
-  dependency; `h` and `term_w` arrive as parameters, exactly as §3.1's `render(alloc)`
-  says.
+- **Purity.** `render` is still `(items, heights, term_w) -> Frame` with no
+  terminal dependency; `h` and `term_w` arrive as parameters, exactly as §3.1's
+  `render(alloc)` says.
 
 ### 3.3 Frame
 
@@ -234,20 +300,23 @@ struct Frame {
 }
 ```
 
-Renderers return `Vec<String>` (one string per **screen** row; multi-line `LogicalLine`s
-already expand to screen rows inside `paint_overlay`). The frame builder concatenates and
-records ranges. Overlay rows are padded to `term_w`; input rows get a trailing `EL`.
+Renderers return `Vec<String>` (one string per **screen** row; multi-line
+`LogicalLine`s already expand to screen rows inside `paint_overlay`). The frame
+builder concatenates and records ranges. Overlay rows are padded to `term_w`;
+input rows get a trailing `EL`.
 
 ### 3.4 Windowing
 
 Both the input and the overlay may be taller than their allocation:
 
-- **Overlay** — existing `visual_row_window` (centered on `focus`) — reuse as-is.
-- **Input** — new: keep the caret row visible, preferring a few context rows above;
-  clip to the allocation. This replaces the current "input grows unbounded and pushes
-  scrollback off the top" behavior.
+- **Overlay** — existing `visual_row_window` (centered on `focus`) — reuse
+  as-is.
+- **Input** — new: keep the caret row visible, preferring a few context rows
+  above; clip to the allocation. This replaces the current "input grows
+  unbounded and pushes scrollback off the top" behavior.
 
-Extract the shared primitive: `window(heights, focus_row, budget, prefer_context)`.
+Extract the shared primitive:
+`window(heights, focus_row, budget, prefer_context)`.
 
 ---
 
@@ -286,35 +355,51 @@ computes the bytes + the next cache state. `draw_frame` locks `writer` then
 `draw` so the write and the cache advance are atomic (never the reverse — the
 `display_*`/`note_lines` path is writer-then-cache too).
 
-**Rows are stored absolute.** Everything emitted and consumed is an absolute row —
-`CUP`, DSR replies, anchors — so the stored top/bottom are absolute too; the
-bottom-relative quantities (`delta`, the `⌈2/3·term_h⌉` budget, the clear floor) are
-computed per apply from `term_h`. Neither representation is invariant across a
-vertical resize: terminals disagree on reflow anchoring (the `clear_rows_to_*` tests
-pin both the top- and bottom-anchored models), so any size change invalidates `live`
-and re-anchors via DSR rather than trusting either invariance.
+**Rows are stored absolute.** Everything emitted and consumed is an absolute row
+— `CUP`, DSR replies, anchors — so the stored top/bottom are absolute too; the
+bottom-relative quantities (`delta`, the `⌈2/3·term_h⌉` budget, the clear floor)
+are computed per apply from `term_h`. Neither representation is invariant across
+a vertical resize: terminals disagree on reflow anchoring (the `clear_rows_to_*`
+tests pin both the top- and bottom-anchored models), so any size change
+invalidates `live` and re-anchors via DSR rather than trusting either
+invariance.
 
-**Caret is absolute** (not frame-relative): it must stay meaningful when no frame is
-live — content writes advance it between frames — and every consumer of
-`cursor_row()` wants an absolute row. When a frame is applied, the absolute caret is
-derived as `frame_top_row + frame.caret.row`; never stored twice. `frame_anchor()`
-(§5.1) returns `live.frame_top_row` while a frame is intact, else `caret.0`.
+**Caret is absolute** (not frame-relative): it must stay meaningful when no
+frame is live — content writes advance it between frames — and every consumer of
+`cursor_row()` wants an absolute row. When a frame is applied, the absolute
+caret is derived as `frame_top_row + frame.caret.row`; never stored twice.
+`frame_anchor()` (§5.1) returns `live.frame_top_row` while a frame is intact,
+else `caret.0`.
 
 ### 4.2 Invalidation contract
 
-**Rule: every writer that can move the cursor maintains the cache before returning.**
+**Rule: every writer that can move the cursor maintains the cache before
+returning.**
 
-| Writer | Action |
-|---|---|
-| Our own frame apply | updates `caret`, `live`, `screen_bottom` itself |
-| `display_text`/`display_plain`/tool panels (`note_lines`) | advance `caret`; `live = None` |
-| `emit_commit`-style frames (`Append`) | advance `caret` past the written rows; `live = None` |
-| `$EDITOR` wrapper (`run_editor`: Ctrl-E prompt edit, compaction draft edit) | `cursor_row()` (DSR) after exit → `caret`; `live = None` |
-| Resize | `cursor_row()` (DSR) re-anchor; `live = None` |
-| Ctrl-Z resume | `cursor_row()` (DSR) re-anchor; `live = None` |
-| Dialog entry (`ui::confirm`) | `cursor_row()` (DSR) re-anchor; `live = None`. Afterwards the dialog itself maintains the cache through `draw_frame`. (The reason used to be "the tracked caret does not follow streamed content" — false since the streaming writers started counting, see #10. Kept as a cheap confirmation on a path where a wrong anchor strands the dialog; §4.5 U5 revisits it, and [`confirm_as_menu_261002.md`](./confirm_as_menu_261002.md) removes it outright as a consequence of U3.) |
+- **Writer**: Our own frame apply
+  - **Action**: updates `caret`, `live`, `screen_bottom` itself
+- **Writer**: `display_text`/`display_plain`/tool panels (`note_lines`)
+  - **Action**: advance `caret`; `live = None`
+- **Writer**: `emit_commit`-style frames (`Append`)
+  - **Action**: advance `caret` past the written rows; `live = None`
+- **Writer**: `$EDITOR` wrapper (`run_editor`: Ctrl-E prompt edit, compaction
+  draft edit)
+  - **Action**: `cursor_row()` (DSR) after exit → `caret`; `live = None`
+- **Writer**: Resize
+  - **Action**: `cursor_row()` (DSR) re-anchor; `live = None`
+- **Writer**: Ctrl-Z resume
+  - **Action**: `cursor_row()` (DSR) re-anchor; `live = None`
+- **Writer**: Dialog entry (`ui::confirm`)
+  - **Action**: `cursor_row()` (DSR) re-anchor; `live = None`. Afterwards the
+    dialog itself maintains the cache through `draw_frame`. (The reason used to
+    be "the tracked caret does not follow streamed content" — false since the
+    streaming writers started counting, see #10. Kept as a cheap confirmation on
+    a path where a wrong anchor strands the dialog; §4.5 U5 revisits it, and
+    [`confirm_as_menu_261002.md`](./confirm_as_menu_261002.md) removes it
+    outright as a consequence of U3.)
 
-`live = None` forces the full path on the next apply. Any uncertainty → clear it.
+`live = None` forces the full path on the next apply. Any uncertainty → clear
+it.
 
 **`cursor_row()` is the explicit re-anchor primitive.** It keeps the historical
 behavior — DSR with a tracked fallback — and additionally stores the answer into
@@ -327,7 +412,7 @@ Since P3 the REPL's steady-state reads go through `frame_anchor()`;
 
 ### 4.3 Full apply (scroll-then-paint)
 
-```
+```text
 delta = max(0, (anchor + frame.height - 1) - term_h)
 top   = anchor - delta
 ```
@@ -335,13 +420,14 @@ top   = anchor - delta
 All coordinates are computed **before** any emission; the whole sequence is one
 `write_all`. There is no post-hoc caret-delta math — `top` is final.
 
-1. If `delta > 0`: `CUP(term_h, 1)` then emit `delta` bare newlines. Precondition:
-   newlines must start from the bottom row, otherwise leading LFs just walk the
-   cursor down without scrolling. Same mechanism as the current `redraw` (bare `\n`
-   → `\r\n` via ONLCR; scrolls at the bottom row); it pushes the scrolled-out top
-   lines into scrollback — **never `CSI {delta} S`**, which deletes those lines
-   instead of preserving them in some terminals (xterm.js#6010, codex#45091).
-   `delta == 0` (steady state) skips the scroll entirely.
+1. If `delta > 0`: `CUP(term_h, 1)` then emit `delta` bare newlines.
+   Precondition: newlines must start from the bottom row, otherwise leading LFs
+   just walk the cursor down without scrolling. Same mechanism as the current
+   `redraw` (bare `\n` → `\r\n` via ONLCR; scrolls at the bottom row); it pushes
+   the scrolled-out top lines into scrollback — **never `CSI {delta} S`**, which
+   deletes those lines instead of preserving them in some terminals
+   (xterm.js#6010, codex#45091). `delta == 0` (steady state) skips the scroll
+   entirely.
 2. Paint and clear in one top-to-bottom pass over rows `from ..= to`:
    - `to = min(term_h, screen_bottom)` — the clear floor: a maximize's revealed
      rows below the old bottom stay intact (today's `prev_term_h` bound).
@@ -353,19 +439,19 @@ All coordinates are computed **before** any emission; the whole sequence is one
    - rows `top ..= top + height − 1`: `CUP r;1` + frame row bytes.
    - all other rows: `CUP r;1` + `EL` (absolute addressing; never scrolls).
 3. `CUP` + `CHA` to the caret target.
-4. Update cache: `caret` (absolute), `live = Some(LiveFrame { frame_top_row: top,
-   term_w, term_h, frame })` (bottom derived as `top + height − 1`),
-   `screen_bottom = term_h`.
+4. Update cache: `caret` (absolute),
+   `live = Some(LiveFrame { frame_top_row: top, term_w, term_h, frame })`
+   (bottom derived as `top + height − 1`), `screen_bottom = term_h`.
 
-Because `height ≤ ⌈2/3·term_h⌉` (allocator-guaranteed) and `delta` lands the frame
-at `top ≥ term_h − height + 1`, the top 1/3 of the screen is never occupied by the
-frame; the frame can always scroll itself fully into view.
+Because `height ≤ ⌈2/3·term_h⌉` (allocator-guaranteed) and `delta` lands the
+frame at `top ≥ term_h − height + 1`, the top 1/3 of the screen is never
+occupied by the frame; the frame can always scroll itself fully into view.
 
 ### 4.4 Partial apply (default in steady state)
 
 Predicate:
 
-```
+```text
 live.is_some()
   && delta == 0                       // this frame does not scroll
   && top == live.frame_top_row        // position stable
@@ -373,19 +459,21 @@ live.is_some()
   && term_h == live.term_h            // size stable (reflow models differ)
 ```
 
-Then diff `live.frame.extents[i]` vs the new extents: emit `CUP r` + row bytes for
-changed rows only (one batched `write_all`, **no newlines** → can never scroll), clear
-the shrink remainder if the frame shrank (`top+height ..= live.frame_top_row +
-live.frame.height() − 1` — trusted here: the anchor is stable by the predicate),
-reposition the caret. Identical frames emit nothing but the caret.
+Then diff `live.frame.extents[i]` vs the new extents: emit `CUP r` + row bytes
+for changed rows only (one batched `write_all`, **no newlines** → can never
+scroll), clear the shrink remainder if the frame shrank
+(`top+height ..= live.frame_top_row + live.frame.height() − 1` — trusted here:
+the anchor is stable by the predicate), reposition the caret. Identical frames
+emit nothing but the caret.
 
 The `term_h` check matters: a size change we did not observe (no resize event
-processed) must still force the full path, because the terminal may have reflowed the
-frame region under us.
+processed) must still force the full path, because the terminal may have
+reflowed the frame region under us.
 
-Row diff (not dirty flags) is the starting point — it catches input-growth shifts and
-cross-element reflows that per-element flags miss; cost is negligible against I/O.
-Dirty spans from `spans` are a later refinement if profiling demands it.
+Row diff (not dirty flags) is the starting point — it catches input-growth
+shifts and cross-element reflows that per-element flags miss; cost is negligible
+against I/O. Dirty spans from `spans` are a later refinement if profiling
+demands it.
 
 ### 4.5 The fold: one composed, relatively-drawn area below the content
 
@@ -439,17 +527,17 @@ growth adds no apply case of its own.
 
 An earlier draft of this section called the area "pinned", which is wrong, and
 the distinction is worth stating precisely because the two designs converge:
-**nothing is reserved.** The content region is not held at `th - h` rows from the
-start, so at the first prompt of a session the area is right under the greeter,
-mid-screen, with empty rows beneath it. As content accumulates the area walks
-down; once the screen is full it stays at the bottom, because further content
-scrolls rather than grows. Same steady state, different mechanism — and the
-mechanism is what keeps the first prompt cheap.
+**nothing is reserved.** The content region is not held at `th - h` rows from
+the start, so at the first prompt of a session the area is right under the
+greeter, mid-screen, with empty rows beneath it. As content accumulates the area
+walks down; once the screen is full it stays at the bottom, because further
+content scrolls rather than grows. Same steady state, different mechanism — and
+the mechanism is what keeps the first prompt cheap.
 
 The area is also **one frame, not several**: status, input, divider and overlay
 are a single element list, allocated, rendered and applied once. "Several
-disjointed writes" is what this whole section removes, and the mid-turn status bar
-is already one — which is why it has to go rather than be extended.
+disjointed writes" is what this whole section removes, and the mid-turn status
+bar is already one — which is why it has to go rather than be extended.
 
 #### 4.5.2 What "fully-relative" means here, precisely
 
@@ -462,23 +550,24 @@ Two readings, and the difference decides how much is achievable:
 - (b) No `CUP` ever, including after a foreign writer. **Not achievable** while
   `$EDITOR` (Ctrl-E, compaction drafts) and Ctrl-Z resume exist: a cache cannot
   know where a foreign writer left the cursor, and the only alternative is a
-  full-screen repaint that itself needs to know the scroll offset — i.e. the same
-  query by another name. OQ1 asks which reading is wanted.
+  full-screen repaint that itself needs to know the scroll offset — i.e. the
+  same query by another name. OQ1 asks which reading is wanted.
 
 So the honest end state is (a), and it is the settled target (4.5.5): absolute
-addressing survives only at **startup** and in **foreign-writer** recovery, where
-it is *information the cache does not have* rather than an architectural gap. The
-three sites that stay are `read_input`'s very first anchor, `$EDITOR` exit, and
-Ctrl-Z / width-change.
+addressing survives only at **startup** and in **foreign-writer** recovery,
+where it is *information the cache does not have* rather than an architectural
+gap. The three sites that stay are `read_input`'s very first anchor, `$EDITOR`
+exit, and Ctrl-Z / width-change.
 
 #### 4.5.3 What blocks it today
 
 Three facts, all of which are consequences of one decision:
 
-1. **The area is retired by the first content write of a turn.** The REPL applies
-   an empty-input frame before returning (`redraw(&LineEditor::new(), …)` on the
-   submit path), and `with_content_writer`'s `plan_clear_live_frame` then erases
-   it and sets `live = None`. For the rest of the turn there is no area at all.
+1. **The area is retired by the first content write of a turn.** The REPL
+   applies an empty-input frame before returning
+   (`redraw(&LineEditor::new(), …)` on the submit path), and
+   `with_content_writer`'s `plan_clear_live_frame` then erases it and sets
+   `live = None`. For the rest of the turn there is no area at all.
 2. **Content and a live area therefore never coexist.** The only production
    `draw_frame` callers are the REPL's `redraw` and `ui::confirm`, and the
    latter blocks. So §4.5's no-clear content policy has had nothing to operate
@@ -498,14 +587,14 @@ Each is checkable, and each is what a phase below establishes.
 
 - **I1 — One owner.** At every instant exactly one component composes the area.
 - **I2 — Content and the area never claim the same row *at rest*.** At the end
-  of every screen update the screen partitions into content above and the area at
-  or below **the fold as of that moment** — and the fold is a *value that moves*,
-  down as content is written and up as the area grows, so this is a statement
-  about a moment, not about a fixed line. Within a content write the area's top
-  rows are transiently overwritten and then re-emitted; that transient is the
-  mechanism, and the partition is restored before the update ends. The thing most
-  likely to regress is the restore: an area that is cleared underneath its own
-  content rather than painted over it.
+  of every screen update the screen partitions into content above and the area
+  at or below **the fold as of that moment** — and the fold is a
+  *value that moves*, down as content is written and up as the area grows, so
+  this is a statement about a moment, not about a fixed line. Within a content
+  write the area's top rows are transiently overwritten and then re-emitted;
+  that transient is the mechanism, and the partition is restored before the
+  update ends. The thing most likely to regress is the restore: an area that is
+  cleared underneath its own content rather than painted over it.
 - **I3 — The fold is derived, not remembered.** It is a function of the tracked
   caret, the area's height and `term_h` — never a separate counter.
 - **I4 — Steady state is relative.** Between a turn starting and ending, no
@@ -565,10 +654,10 @@ separately verifiable.
 
 **Why `U` and not `P`.** The phase table above numbers the *capability* work
 `P0`–`P5`, and this list numbered the *delivery* work `P1`–`P6` — so one label
-meant two different things. `P1` was `Element`/`Frame`/`allocate` in the table and
-contraction here; `P4` was dialog wiring in the table and in-turn input here.
-Anyone planning against the table would have read in-turn input as done, which it
-is not. `P` is capability, `U` is delivery.
+meant two different things. `P1` was `Element`/`Frame`/`allocate` in the table
+and contraction here; `P4` was dialog wiring in the table and in-turn input
+here. Anyone planning against the table would have read in-turn input as done,
+which it is not. `P` is capability, `U` is delivery.
 
 **U1 — Contraction: the area establishes the content's lower bound.**
 `with_content_writer` stops retiring the area. Content is written from the fold
@@ -578,12 +667,12 @@ re-draws the element stack it already holds — the concrete form of "compose
 those fixed parts into the same screen update", and why the cache keeps the
 stack rather than the rendered `Frame`.
 
-The apply this needs is a *reposition*: the frame's top row has moved down by the
-content's row count, and the rows it used to occupy now hold content, so nothing
-may erase them. That is neither of the existing two paths — `plan_partial`
-requires an unmoved frame, and `plan_full` erases the old region, which would
-erase the content that just landed there. It is a third case: walk to the new
-top, paint, do not clear above.
+The apply this needs is a *reposition*: the frame's top row has moved down by
+the content's row count, and the rows it used to occupy now hold content, so
+nothing may erase them. That is neither of the existing two paths —
+`plan_partial` requires an unmoved frame, and `plan_full` erases the old region,
+which would erase the content that just landed there. It is a third case: walk
+to the new top, paint, do not clear above.
 
 **There are two write mechanisms, and which one is in play is the fold's job.**
 This is the part that is easy to get wrong, because the obvious case is the
@@ -592,14 +681,14 @@ This is the part that is easy to get wrong, because the obvious case is the
 - **Fold moves (screen not full).** Content is written *at* the fold, so it
   consumes the area's top rows, the fold moves down by the content's row count,
   and the area is re-emitted at its new position. This is OQ3's "moves gradually
-  toward the bottom", and a reposition is unavoidable — there is nowhere else for
-  the content to go.
-- **Fold stationary (screen full).** The area is already at rows
-  `[th-h+1, th]` and the content region is `[1, th-h]`. Here the re-emit *is*
-  avoidable in principle, but **not by scrolling**: a terminal scroll moves every
-  row up, so it displaces the area just as surely as the content did — the area
-  ends at `[th-h, th-1]` with a blank row beneath, and has to be painted back
-  down. Scrolling cannot preserve the area, because a scroll is not selective.
+  toward the bottom", and a reposition is unavoidable — there is nowhere else
+  for the content to go.
+- **Fold stationary (screen full).** The area is already at rows `[th-h+1, th]`
+  and the content region is `[1, th-h]`. Here the re-emit *is* avoidable in
+  principle, but **not by scrolling**: a terminal scroll moves every row up, so
+  it displaces the area just as surely as the content did — the area ends at
+  `[th-h, th-1]` with a blank row beneath, and has to be painted back down.
+  Scrolling cannot preserve the area, because a scroll is not selective.
 
   What *can* preserve it is a **scroll region** (`DECSTBM`,
   `CSI top ; bottom r`): set it to the content region `[1, th-h]` and the
@@ -608,30 +697,30 @@ This is the part that is easy to get wrong, because the obvious case is the
   Note what that costs in shape as well as state: the content has to be written
   *inside* the region, so the write point is the region's **bottom** row
   (`th-h`), not the fold. The content flows upward because the terminal scrolls,
-  rather than downward because we push it. So the stationary case has a different
-  write point from the moving one, and choosing between them is a real decision
-  rather than an optimisation of a single mechanism. In exchange the fold becomes
-  self-maintaining — the terminal moves the content, not us — and a content chunk
-  costs nothing but its own bytes.
+  rather than downward because we push it. So the stationary case has a
+  different write point from the moving one, and choosing between them is a real
+  decision rather than an optimisation of a single mechanism. In exchange the
+  fold becomes self-maintaining — the terminal moves the content, not us — and a
+  content chunk costs nothing but its own bytes.
 
   U1 as scoped does **not** do this: it writes at the fold in both cases, so it
   has one mechanism and one write point. The scroll region is a separate, later
   optimisation (U6) rather than a refinement of U1.
 
   **Deferred, not dismissed** (U6). The saving is real but bounded (one area
-  re-emit per chunk: ~2 rows, a few hundred bytes), and the cost is a *global
-  terminal mode* that every write path must honour: a resize, a full repaint, the
-  dialog path and (later) in-turn input all have to re-issue or reset it, and a
-  path that forgets scrolls the wrong part of the screen — a bug class that is
-  miserable to diagnose from a transcript. Recommend measuring the re-emit cost
-  first; the region does not change I1–I6, so it can land whenever the
-  measurement justifies it. It is written down because U1 will *look* like it is
-  re-emitting something avoidable, and the next reader deserves to know it was
-  considered.
+  re-emit per chunk: ~2 rows, a few hundred bytes), and the cost is a
+  *global terminal mode* that every write path must honour: a resize, a full
+  repaint, the dialog path and (later) in-turn input all have to re-issue or
+  reset it, and a path that forgets scrolls the wrong part of the screen — a bug
+  class that is miserable to diagnose from a transcript. Recommend measuring the
+  re-emit cost first; the region does not change I1–I6, so it can land whenever
+  the measurement justifies it. It is written down because U1 will *look* like
+  it is re-emitting something avoidable, and the next reader deserves to know it
+  was considered.
 - Establishes I2, I3, I6, and the "one frame" half of I1.
-- Verify: the post-turn screen is unchanged from today's (the transcript does not
-  move), plus a new vt100 case where a multi-chunk stream never leaves the area
-  blank (I5) and one where the area is re-emitted with no `CUP`.
+- Verify: the post-turn screen is unchanged from today's (the transcript does
+  not move), plus a new vt100 case where a multi-chunk stream never leaves the
+  area blank (I5) and one where the area is re-emitted with no `CUP`.
 - Risk: **P4** (the clear-policy invariant) has to be restated — content now
   *consumes* the area's rows rather than landing below them. The invariant
   becomes "content writes stop at the fold; the area's rows are re-emitted, not
@@ -647,16 +736,17 @@ This is the part that is easy to get wrong, because the obvious case is the
   `plan_consume`'s explicit `CR` must carry column 0 on its own before P1's
   wiring goes in.
 
-**U2 — The area survives the turn; the bar becomes a permanent row.**
-The REPL stops applying an empty-input frame to retire, and the content path
-stops clearing. The status bar moves out of the content stream and into the area
-composition as `Element::Lines`, and its dot is driven by real turn state (grey at
-the prompt, green in flight) — which is what makes the two states mean something
-and removes the jump at submit. `StatusSpot`, `clear_status`, `paint_status`'s
-cursor-hide/dim dance and the `row_accounting` §3.5 gap logic all become dead and
-are deleted; §3.5's gap tests go with them, restated as "the area's first row is
-preceded by a blank" if that is still wanted (it is: the gap is why the bar is
-readable below a tool panel).
+**U2 — The area survives the turn; the bar becomes a permanent row.** The REPL
+stops applying an empty-input frame to retire, and the content path stops
+clearing. The status bar moves out of the content stream and into the area
+composition as `Element::Lines`, and its dot is driven by real turn state (grey
+at the prompt, green in flight) — which is what makes the two states mean
+something and removes the jump at submit. `StatusSpot`, `clear_status`,
+`paint_status`'s cursor-hide/dim dance and the `row_accounting` §3.5 gap logic
+all become dead and are deleted; §3.5's gap tests go with them, restated as "the
+area's first row is preceded by a blank" if that is still wanted (it is: the gap
+is why the bar is readable below a tool panel).
+
 - Establishes I1, I4, I5.
 - Verify: the dot flips on the *same row* with no second bar anywhere; a resize
   mid-turn re-flows the area; `plan_clear_live_frame` has no production callers
@@ -674,9 +764,9 @@ pipeline on resolve and the area comes back as `[Status, Input]`; **a positional
 assertion is required** — the confirm suite asserts behaviour (which option was
 chosen) and not the dialog's row, so "green" is not evidence for anything here.
 
-**U4 — In-turn input. (Unblocked by OQ2; depends on U1–U3.)**
-The read loop stays alive while the turn runs: the input row is part of the area,
-the menu opens over it, `Esc` is menu-first (stopping the turn only at root), and
+**U4 — In-turn input. (Unblocked by OQ2; depends on U1–U3.)** The read loop
+stays alive while the turn runs: the input row is part of the area, the menu
+opens over it, `Esc` is menu-first (stopping the turn only at root), and
 **submit is blocked in v0** (4.5.5). Two pieces of work, and the drawing is not
 the hard one:
 
@@ -701,20 +791,20 @@ they interleave by construction: no mutex, and the remembered `element_stack`
 cannot be stale relative to a compose because there is no parallel compose.
 
 **Reader: keep `spawn_in_flight_reader` as a thread, add a channel.** It already
-drops edit keys ("cannot be typed into the prompt mid-request") — U4.2 makes that
-arm send instead. Not `crossterm::EventStream`, though `event-stream` is already
-enabled and it would delete the thread, the 50 ms tick, the channel and the
-`done`/`join()` handoff:
+drops edit keys ("cannot be typed into the prompt mid-request") — U4.2 makes
+that arm send instead. Not `crossterm::EventStream`, though `event-stream` is
+already enabled and it would delete the thread, the 50 ms tick, the channel and
+the `done`/`join()` handoff:
 
 > **U4 requires a pauseable reader, and `EventStream` cannot be paused.**
 > `run_editor` (editor.rs) owns a stdin window covering *both* the `$EDITOR`
 > child and the post-editor DSR re-anchor — "its reply arrives on stdin, so an
 > unguarded reader would swallow it" — and it is reachable **mid-turn** through
 > the v2.5 menu (`v25_listing_node`, `v25_tree`), which U4 exists to open.
-> `ReaderHold` gates the thread with one `load()` before every `poll`; crossterm's
-> only disarm is `Drop`. EventStream would be safe only while nobody polls it
-> during the window — safe by timing, not by policy, and broken silently by
-> making the arm `.await`ed or catching a key mid-window.
+> `ReaderHold` gates the thread with one `load()` before every `poll`;
+> crossterm's only disarm is `Drop`. EventStream would be safe only while nobody
+> polls it during the window — safe by timing, not by policy, and broken
+> silently by making the arm `.await`ed or catching a key mid-window.
 
 OQ4 makes `confirm` a menu, so it stops needing the gate — but the editor never
 can: it hands the tty to a child and reads a DSR back. Unifying confirm retires
@@ -740,8 +830,8 @@ takes to notice those flags; keystroke latency is ~0.)
 - **U4.3 — the key branch** in `prompt()`'s `select!`, plus a timer arm for
   `prose.poll_timeout()` (repl.rs:1031) or prose goes inert mid-turn. Submit
   behind a policy flag. First point at which mid-turn typing works.
-- **U4.4 — re-emit ordering:** key branch → `draw_elements` (compose + remember);
-  content branch → write + `reposition_area`.
+- **U4.4 — re-emit ordering:** key branch → `draw_elements` (compose +
+  remember); content branch → write + `reposition_area`.
 - **U4.5 — the back-off pump** (landed): the dispatcher is turn-scoped, not
   attempt-scoped. `prompt()`'s key branch and `cancellable_sleep_pumped` run
   one body (`dispatch_in_turn_event`) over one queue, so a retry back-off is
@@ -793,25 +883,25 @@ mechanisms:
   evals after every key rather than parking a `pending_key` for a later
   iteration — which also makes the cross-boundary `pending_key` leak
   unrepresentable instead of merely theoretical.
-
 - Verify: keys typed during a turn reach the editor; the area's row diff is
   correct under interleaving of chunks and keys — this wants a test that drives
   both from one thread on a deterministic schedule, not a pty race.
 - gwicke: Agreed, only abort turn when at prompt (empty or not), not when
   overlay / menu is active.
 
-**U5 — Retire the DSRs that are no longer load-bearing.**
-With the fold maintained across turns and every content write counted (done: #10),
+**U5 — Retire the DSRs that are no longer load-bearing.** With the fold
+maintained across turns and every content write counted (done: #10),
 `read_input`'s entry DSR and `ui::confirm`'s (P3) stop being load-bearing.
 Startup and the three foreign-writer sites stay, by OQ1.
+
 - Verify: each removal is a separate commit with the suite green and a note on
   what now covers it.
 
-**U6 — Scroll region, if the re-emit measures expensive. (Optional.)**
-Set the terminal's scrolling region to the content area so the fold is maintained
-by the terminal in the stationary case, and a content chunk costs only its own
-bytes. Changes the content write point in that case (region bottom, not the fold).
-Only after measuring; see the P1 note above.
+**U6 — Scroll region, if the re-emit measures expensive. (Optional.)** Set the
+terminal's scrolling region to the content area so the fold is maintained by the
+terminal in the stationary case, and a content chunk costs only its own bytes.
+Changes the content write point in that case (region bottom, not the fold). Only
+after measuring; see the P1 note above.
 
 #### 4.5.7 Not in scope
 
@@ -832,8 +922,8 @@ Only after measuring; see the P1 note above.
 
 ### 5.1 UI surface
 
-`Output` gains a small UI surface, separate from content-out (`display_*`; a later
-step may unify content output under the same pipeline):
+`Output` gains a small UI surface, separate from content-out (`display_*`; a
+later step may unify content output under the same pipeline):
 
 ```rust
 /// Draw a composed UI frame with its top row at `anchor` (1-based).
@@ -859,9 +949,9 @@ fn frame_anchor(&self) -> usize {
 }
 ```
 
-`ConsoleOutput` overrides both (`live.frame_top_row`, else `caret.0`; cache-aware
-apply). The REPL and dialogs call `output.draw_frame(...)` through `&dyn Output`;
-they never write frame bytes to stdout themselves.
+`ConsoleOutput` overrides both (`live.frame_top_row`, else `caret.0`;
+cache-aware apply). The REPL and dialogs call `output.draw_frame(...)` through
+`&dyn Output`; they never write frame bytes to stdout themselves.
 
 The signature names `Frame`/`ApplyPolicy`, so those types are `pub` and the
 `ui`/`ui::frame` modules are public (opaque: fields and the pure helpers stay
@@ -874,9 +964,9 @@ then it is the only way to keep `Output` (which `AgentConfig` exposes) clean.
 `draw_frame` shares the *apply* half, but the `allocate`+`render` half *was*
 duplicated: `Repl::compose_frame` ran it, and `ui.rs::confirm`'s frame builder
 hand-assembled `[Divider?, Overlay]` and called `allocate`+`render` itself
-(ui.rs:184). A third is arriving with §4.5 — the content path, re-rendering the area
-per chunk. Two pieces, then: one **tail** that every frame goes through, and one
-**composer** that decides what the area is made of.
+(ui.rs:184). A third is arriving with §4.5 — the content path, re-rendering the
+area per chunk. Two pieces, then: one **tail** that every frame goes through,
+and one **composer** that decides what the area is made of.
 
 **Status: the composer is folded into the tail.** Callers pass *pieces* and get
 nothing back — no `Vec<Element>` crosses a call site, because no caller ever
@@ -908,59 +998,72 @@ fn draw_stack(&self, policy: ApplyPolicy, dims: (usize, usize)) -> (usize, usize
 
 Three call sites, and what each is:
 
-| caller | pieces | then |
-|---|---|---|
-| `read_input`, per keystroke | `draw_elements(Some(input), overlay, …)` — both **moved** in; the REPL rebuilds them next keystroke, so nothing is preserved by copying. Compose stores the stack. | tail |
-| `with_content_writer`, per chunk | none — the stored stack, re-drawn | `plan_consume` → content → `draw_stack` → `plan_reposition` |
-| `ui::confirm` | `(None, Some(dialog))` — the composer's own rule supplies the divider, and it gains the status row a dialog is due (4.5.5, OQ4; the **P3** input row is still to come) | tail |
+- **caller**: `read_input`, per keystroke
+  - **pieces**: `draw_elements(Some(input), overlay, …)` — both **moved** in;
+    the REPL rebuilds them next keystroke, so nothing is preserved by copying.
+    Compose stores the stack.
+  - **then**: tail
+- **caller**: `with_content_writer`, per chunk
+  - **pieces**: none — the stored stack, re-drawn
+  - **then**: `plan_consume` → content → `draw_stack` → `plan_reposition`
+- **caller**: `ui::confirm`
+  - **pieces**: `(None, Some(dialog))` — the composer's own rule supplies the
+    divider, and it gains the status row a dialog is due (4.5.5, OQ4; the **P3**
+    input row is still to come)
+  - **then**: tail
 
-The dialog keeps its own composition because §5.3 treats it as a separate surface. What it
-gains is that it stops hand-rolling the pipeline; that is a duplicate *decision* (§4.5's
-"one place composes") versus a second *site* running `allocate`+`render`, which is
-duplicated code.
+The dialog keeps its own composition because §5.3 treats it as a separate
+surface. What it gains is that it stops hand-rolling the pipeline; that is a
+duplicate *decision* (§4.5's "one place composes") versus a second *site*
+running `allocate`+`render`, which is duplicated code.
 
-**The status row is `must = might = 1`, and it resolves at render time.** §3.1's purity
-rule is "no terminal dependency — `w`/`h` passed in → unit-testable", and a status element
-that *owns* its data source (`Arc<Mutex<StatusText>>`, `Arc<AtomicBool>`) satisfies it:
-you construct one with your own state and render it anywhere. What was rejected was an
-element reaching back into `Output` from `render`, not an element holding its own bytes'
-source. Resolving at render time is what makes §4.5's re-draw of the stored stack show the
-*current* dot and context figure instead of the ones present at the last compose — compose
-runs once per keystroke, the turn's `set_status` runs after.
+**The status row is `must = might = 1`, and it resolves at render time.** §3.1's
+purity rule is "no terminal dependency — `w`/`h` passed in → unit-testable", and
+a status element that *owns* its data source (`Arc<Mutex<StatusText>>`,
+`Arc<AtomicBool>`) satisfies it: you construct one with your own state and
+render it anywhere. What was rejected was an element reaching back into `Output`
+from `render`, not an element holding its own bytes' source. Resolving at render
+time is what makes §4.5's re-draw of the stored stack show the *current* dot and
+context figure instead of the ones present at the last compose — compose runs
+once per keystroke, the turn's `set_status` runs after.
 
-**The terminal size is one fact, owned by the drawing layer.** Items flow up; the budget
-flows down from `dims`. The REPL keeps reading it for two things that are *not*
-composition — windowing the menu (`paint_overlay`, done before anything crosses, which is
-what keeps bulk data out) and resize detection (`painted_size`). For that second one,
-`draw_elements` still takes `dims` as the REPL's *belief* and returns the size it actually
-painted; today those are the same value passed through, so nothing changes, but a
-mismatch becomes a stale cache rather than something to clamp away.
+**The terminal size is one fact, owned by the drawing layer.** Items flow up;
+the budget flows down from `dims`. The REPL keeps reading it for two things that
+are *not* composition — windowing the menu (`paint_overlay`, done before
+anything crosses, which is what keeps bulk data out) and resize detection
+(`painted_size`). For that second one, `draw_elements` still takes `dims` as the
+REPL's *belief* and returns the size it actually painted; today those are the
+same value passed through, so nothing changes, but a mismatch becomes a stale
+cache rather than something to clamp away.
 
 ### 5.2 REPL (`read_input`)
 
-`redraw` becomes one call: `out.draw_elements(Some(input), overlay, policy, dims)` — the
-compose/allocate/render tail is no longer this module's (§5.1.1), and the element list
-never comes back to the caller. The `input_row`
-local and `prev_term_h` `Cell` are retired; `frame_anchor()` replaces `next_input_row`'s
-scroll tracking (the cache holds the post-scroll top). The REPL always applies an
-empty-input frame before returning (as today's submit paths do), so no frame is live
-when content streams under the next turn.
+`redraw` becomes one call:
+`out.draw_elements(Some(input), overlay, policy, dims)` — the
+compose/allocate/render tail is no longer this module's (§5.1.1), and the
+element list never comes back to the caller. The `input_row` local and
+`prev_term_h` `Cell` are retired; `frame_anchor()` replaces `next_input_row`'s
+scroll tracking (the cache holds the post-scroll top). The REPL always applies
+an empty-input frame before returning (as today's submit paths do), so no frame
+is live when content streams under the next turn.
 
-The compose list gains the **status row**, which the REPL no longer builds: the composer
-prepends it, because it reads `status_text` and `streaming`, which only this layer may
-know (§5.1.1). So `redraw` supplies `input` and `overlay` and gets *nothing back* — the
-composition, and the stack it produced, belong to the output — and the divider is the
-composer's too, since "a menu brings a separator" is a rule rather than a caller's choice.
-`dims` carries the width: the status row has to be fitted for the same width the frame
-renders at, and width is composition, not budget.
+The compose list gains the **status row**, which the REPL no longer builds: the
+composer prepends it, because it reads `status_text` and `streaming`, which only
+this layer may know (§5.1.1). So `redraw` supplies `input` and `overlay` and
+gets *nothing back* — the composition, and the stack it produced, belong to the
+output — and the divider is the composer's too, since "a menu brings a
+separator" is a rule rather than a caller's choice. `dims` carries the width:
+the status row has to be fitted for the same width the frame renders at, and
+width is composition, not budget.
 
-> **The data is still the REPL's; the row is not.** `read_input` pushes a `StatusText`
-> built from `ctx` via `set_status`, once per cycle, before the first paint. Without
-> that push the frame bar would read whatever the last turn's `set_status` left — and
-> the very first prompt, which runs before any turn has started, would read an unset
-> status and draw no bar at all (an unset status is *off*, and `status_row` returns
-> `None` for off rather than an empty full-width row). What moved out is the rendering:
-> width, the streaming dot, and the off-rule are `status_row`'s.
+> **The data is still the REPL's; the row is not.** `read_input` pushes a
+> `StatusText` built from `ctx` via `set_status`, once per cycle, before the
+> first paint. Without that push the frame bar would read whatever the last
+> turn's `set_status` left — and the very first prompt, which runs before any
+> turn has started, would read an unset status and draw no bar at all (an unset
+> status is *off*, and `status_row` returns `None` for off rather than an empty
+> full-width row). What moved out is the rendering: width, the streaming dot,
+> and the off-rule are `status_row`'s.
 
 > **Superseded by §4.5, now landed.** The empty-input frame and the
 > `plan_clear_live_frame` that retired it are gone: the area stays live across
@@ -990,19 +1093,20 @@ renders at, and width is composition, not budget.
 > That is the shape of the bug, and it explains why fixing it has resisted a
 > formula. Measuring the byte stream of the real binary, three things hold:
 >
-> 1. **`plan_consume` and `plan_reposition` use different vertical primitives for
->    the same move.** `plan_consume` descends with `CUD` (`CSI n B`, relative);
->    `plan_reposition` descends with bare `LF`. They agree everywhere except the
->    screen's last row, where `CUD` does nothing and `LF` **scrolls**. So a
->    single number — the LF count — means "advance the cursor" in one regime and
->    "scroll the transcript" in the other. That is the whole sensitivity.
+> 1. **`plan_consume` and `plan_reposition` use different vertical primitives
+>    for the same move.** `plan_consume` descends with `CUD` (`CSI n B`,
+>    relative); `plan_reposition` descends with bare `LF`. They agree everywhere
+>    except the screen's last row, where `CUD` does nothing and `LF`
+>    **scrolls**. So a single number — the LF count — means "advance the cursor"
+>    in one regime and "scroll the transcript" in the other. That is the whole
+>    sensitivity.
 > 2. **Cutting the LFs does not work**, which is why the arithmetic kept
 >    failing. The content write is *into the area's own rows* (consume moves the
 >    cursor there first), so the area's LFs are the scroll that lifts the
 >    transcript back out. Reducing them makes the area paint over its own
 >    transcript: the 429-retry scenario's two `Error:` lines are emitted and
->    never reach the screen, and no assertion catches it, because that content is
->    simply absent.
+>    never reach the screen, and no assertion catches it, because that content
+>    is simply absent.
 > 3. **`note_lines` clamps the tracked row at `term_h`,** discarding exactly the
 >    quantity the placement needs. Once the transcript reaches the last row the
 >    *logical* row keeps growing while the tracked one sticks, so no value
@@ -1035,52 +1139,57 @@ renders at, and width is composition, not budget.
 >
 > This is also why the test could not arbitrate the arithmetic: scenario 0 is a
 > short turn that fills the screen, which is the **steady state**, and §4 notes
-> that the reserved and unreserved designs converge there and differ only *before*
-> the screen fills. A regression test for this change has to keep the area
-> mid-screen — a long, low-output turn, or an area that changed height — since
-> that is the only regime where the two differ. Until then the gap is expected
-> to close from this change, and is not to be re-investigated as arithmetic.
+> that the reserved and unreserved designs converge there and differ only
+> *before* the screen fills. A regression test for this change has to keep the
+> area mid-screen — a long, low-output turn, or an area that changed height —
+> since that is the only regime where the two differ. Until then the gap is
+> expected to close from this change, and is not to be re-investigated as
+> arithmetic.
 
-`next_input_row` / `clear_rows_to` folded into the apply implementation (P3); their
-meaningful unit tests moved to `ui::frame::apply_tests`, the byte-mechanics ones
-dropped with the helpers.
+`next_input_row` / `clear_rows_to` folded into the apply implementation (P3);
+their meaningful unit tests moved to `ui::frame::apply_tests`, the
+byte-mechanics ones dropped with the helpers.
 
 ### 5.3 Dialogs (`ui.rs::confirm`)
 
-Compose through the same call as the REPL — `draw_elements(None, Some(dialog), …)` — so
-the divider is the composer's rule ("a menu brings a separator", §5.2) rather than
-`ConfirmSpec.divider`, and the dialog gains the status row a dialog is due (§4.5.5, OQ4).
-The input row is **P3**'s remaining piece. Allocate, render, apply. The entry `cursor_row()` DSR is kept:
-it used to be kept because mid-turn the tracked caret did not follow streamed content,
-so `frame_anchor()` alone would point into the stream — that reason is **false** now
-(#10: the streaming writers count from the bytes they emit, checked against a vt100
-replay). It is kept as a cheap confirmation on a path where a wrong anchor strands the
-dialog over the output, and because the confirm suite asserts *behaviour* rather than
-the dialog's row, so "green" is not evidence either way. §4.5 U5 revisits it.
-After the DSR the dialog anchors via `frame_anchor()`, and if
-it does not fit below, `delta` scrolls it into the live region. Key loop stays; each
-key re-composes (cheap) and re-applies (partial). A resize re-composes at the new size
-(full repaint; the dialog keeps its top).
+Compose through the same call as the REPL —
+`draw_elements(None, Some(dialog), …)` — so the divider is the composer's rule
+("a menu brings a separator", §5.2) rather than `ConfirmSpec.divider`, and the
+dialog gains the status row a dialog is due (§4.5.5, OQ4). The input row is
+**P3**'s remaining piece. Allocate, render, apply. The entry `cursor_row()` DSR
+is kept: it used to be kept because mid-turn the tracked caret did not follow
+streamed content, so `frame_anchor()` alone would point into the stream — that
+reason is **false** now (#10: the streaming writers count from the bytes they
+emit, checked against a vt100 replay). It is kept as a cheap confirmation on a
+path where a wrong anchor strands the dialog over the output, and because the
+confirm suite asserts *behaviour* rather than the dialog's row, so "green" is
+not evidence either way. §4.5 U5 revisits it. After the DSR the dialog anchors
+via `frame_anchor()`, and if it does not fit below, `delta` scrolls it into the
+live region. Key loop stays; each key re-composes (cheap) and re-applies
+(partial). A resize re-composes at the new size (full repaint; the dialog keeps
+its top).
 
-On resolve the dialog is erased **through the pipeline**: applying `Frame::empty()`
-under the Frame policy takes the union clear over the old (taller) dialog region and
-parks the cursor on the region's first row — the general invariant (§2 clear policy):
-the space below is already clean, so nothing needs a second clear and the next
-append-only render can start right there. What is written at that row:
+On resolve the dialog is erased **through the pipeline**: applying
+`Frame::empty()` under the Frame policy takes the union clear over the old
+(taller) dialog region and parks the cursor on the region's first row — the
+general invariant (§2 clear policy): the space below is already clean, so
+nothing needs a second clear and the next append-only render can start right
+there. What is written at that row:
 
-- **Tool approval** — one synthetic decision line, `accepted tool X` / `denied tool X`
-  (subject derived from the `Confirm tool {NAME} call?` message convention; Esc
-  records `denied`). No divider on the commit — scrollback already carries one above
-  the input region.
-- **Compaction review** — nothing: the committed `/tree <id> compact …` prompt is
-  self-documenting; the dialog simply clears away.
+- **Tool approval** — one synthetic decision line, `accepted tool X` /
+  `denied tool X` (subject derived from the `Confirm tool {NAME} call?` message
+  convention; Esc records `denied`). No divider on the commit — scrollback
+  already carries one above the input region.
+- **Compaction review** — nothing: the committed `/tree <id> compact …` prompt
+  is self-documenting; the dialog simply clears away.
 
-Resolved P4 review item: the old `render_at` anchored the dialog *above* the cursor
-and cleared with `\x1b[0J`; the frame pipeline anchors at the cursor and scrolls on
-demand — `render_at` is deleted.
+Resolved P4 review item: the old `render_at` anchored the dialog *above* the
+cursor and cleared with `\x1b[0J`; the frame pipeline anchors at the cursor and
+scrolls on demand — `render_at` is deleted.
 
-The zero-room case (cursor on the last row) is handled by the normal `delta` scroll —
-the frame scrolls itself into the budget; it never overwrites above the cursor.
+The zero-room case (cursor on the last row) is handled by the normal `delta`
+scroll — the frame scrolls itself into the budget; it never overwrites above the
+cursor.
 
 ### 5.4 Stale doc reference
 
@@ -1094,19 +1203,81 @@ picker; the fn no longer exists. Fix the header while touching this file.
 
 Each phase: green build + `cargo test` + `cargo fmt`.
 
-| Phase | Work | Gate |
-|---|---|---|
-| **P0** ✅ | Test-safety net: make the vt100 tests consume the real emit path. Extracted `Repl::build_redraw(layout, prompt, overlay, sel, row, clear_to, w, h) -> (String, next_row)` from today's `redraw` (takes today's inputs, not a `Frame` — Frame arrives in P1). vt100 harness now feeds production bytes through an ONLCR shim (production emits bare `\n`; the tty maps to `\r\n`). Added 3 overlay tests pinning the scroll-delta caret math. | ✅ 674 tests green |
-| **P1** ✅ | Frame model: `Element`, `Extent`, `Frame`, `allocate`, `render`, `window` (input windowing). Pure; lives in `src/ui/frame.rs` + `live_budget`. Unit tests: allocation distribution, windowing, extents/caret. | ✅ 21 unit tests; 695 total green |
-| **P2** ✅ | Cache + apply in `ui::frame` (`plan_apply`, `DrawCache { caret, screen_bottom, live }`, `LiveFrame`, `ApplyPolicy`), stored as `ConsoleOutput.draw`. Trait surface `draw_frame(frame, anchor, policy)` + `frame_anchor()` (defaults drop UI; `Frame`/`ApplyPolicy` published — `ui` is a `pub mod`, the module is expected to become a companion UI crate). Full apply (scroll-then-paint, union clear, floor `min(term_h, screen_bottom)`), partial row-diff with the extended predicate, `Append` policy for commits. `note_lines` advances `caret` + invalidates `live`; `cursor_row()` = re-anchor primitive (DSR → `caret`, invalidates). Replaces the old `row: Mutex<usize>`. | ✅ 13 apply tests over `apply` output through vt100; 708 lib tests green |
-| **P3** ✅ | REPL wiring: `redraw` → `Repl::compose_frame` (compose/allocate/render) → `Output::draw_frame(frame, frame_anchor(), Frame)`. Retired the `input_row`/`prev_term_*` locals (one `painted_size` cell remains for resize *detection* → DSR re-anchor + width wipe/replay; the clear bound lives in `plan_apply`'s `screen_bottom`) and the `initial_row` parameter (entry re-anchor via DSR inside `read_input`); Ctrl-Z resume re-anchors. `emit_commit` on the frame path without its own DSR — `$EDITOR` (`review_compaction_summary`) re-anchors on exit instead. Deleted `build_redraw`, `next_input_row`, `clear_rows_to`, `overlay_window`, `render_content`, `cursor_positioning` and their byte-copy tests; the vt100 suite now drives `compose_frame` + `plan_apply`. Behavior change: the 2/3 budget bounds the *whole* frame, so the pop-up gets `budget − input − divider` rows (the clamped-budget test was re-pinned: frame fits at its anchor, no scroll). | ✅ full suite green (702 lib + pty tests) |
-| **P4** ✅ | Dialog wiring: `ui::confirm` composes `[Divider?, Overlay]` → `Output::draw_frame` (entry DSR re-anchor, then per-key/per-resize re-compose = partial applies); resolve = `Frame::empty()` union-clear, then a synthetic decision line for tool approval (`accepted\|denied tool X` via `ConfirmSpec.subject`) and nothing for compaction; `ConfirmSpec` gains `divider`/`subject`; `render_at` deleted. Also fixed the pre-existing `confirm_n_returns_no` miss (no `('n', 1)` quick key — the suite is `test-utils`-gated, so plain `cargo test` skips it). | ✅ `cargo test --features test-utils --test confirm_raw_mode` 7 green (incl. new paint → clear → decision screen test); full suite green |
-| **P5** ✅ | Cleanup: deleted `overlay_lines`/`overlay_lines_with_bgs` (zero production callers) and ported their tests to `paint_plan` — marker tests (the `active == selected` case was already pinned by `paint_plan_active_marker_beats_cursor`), title/markers, wrap-continuation, and both `settings.rs` table-alignment tests; the per-row `row_bgs` test went with the removed feature (paint_plan has fixed backgrounds). Dropped `ui::frame`'s module `allow(dead_code)`: `Element::Lines` (§3.2's fixed rows, first user = §4.5) and `Frame::spans` (§4.4's dirty-span refinement) carry targeted allows instead. Stale `Repl::overlay_lines` reference in `slashdot_menu::table` docs fixed. (`next_input_row`/`clear_rows_to` folded into apply and `repl.rs` module docs updated in P3.) | ✅ full suite green (702 lib + pty tests; `--features test-utils` confirm suite 7/7); `overlay_lines` zero code hits |
+- **Phase**: **P0** ✅
+  - **Work**: Test-safety net: make the vt100 tests consume the real emit path.
+    Extracted
+    `Repl::build_redraw(layout, prompt, overlay, sel, row, clear_to, w, h) -> (String, next_row)`
+    from today's `redraw` (takes today's inputs, not a `Frame` — Frame arrives
+    in P1). vt100 harness now feeds production bytes through an ONLCR shim
+    (production emits bare `\n`; the tty maps to `\r\n`). Added 3 overlay tests
+    pinning the scroll-delta caret math.
+  - **Gate**: ✅ 674 tests green
+- **Phase**: **P1** ✅
+  - **Work**: Frame model: `Element`, `Extent`, `Frame`, `allocate`, `render`,
+    `window` (input windowing). Pure; lives in `src/ui/frame.rs` +
+    `live_budget`. Unit tests: allocation distribution, windowing,
+    extents/caret.
+  - **Gate**: ✅ 21 unit tests; 695 total green
+- **Phase**: **P2** ✅
+  - **Work**: Cache + apply in `ui::frame` (`plan_apply`,
+    `DrawCache { caret, screen_bottom, live }`, `LiveFrame`, `ApplyPolicy`),
+    stored as `ConsoleOutput.draw`. Trait surface
+    `draw_frame(frame, anchor, policy)` + `frame_anchor()` (defaults drop UI;
+    `Frame`/`ApplyPolicy` published — `ui` is a `pub mod`, the module is
+    expected to become a companion UI crate). Full apply (scroll-then-paint,
+    union clear, floor `min(term_h, screen_bottom)`), partial row-diff with the
+    extended predicate, `Append` policy for commits. `note_lines` advances
+    `caret` + invalidates `live`; `cursor_row()` = re-anchor primitive (DSR →
+    `caret`, invalidates). Replaces the old `row: Mutex<usize>`.
+  - **Gate**: ✅ 13 apply tests over `apply` output through vt100; 708 lib tests
+    green
+- **Phase**: **P3** ✅
+  - **Work**: REPL wiring: `redraw` → `Repl::compose_frame`
+    (compose/allocate/render) →
+    `Output::draw_frame(frame, frame_anchor(), Frame)`. Retired the
+    `input_row`/`prev_term_*` locals (one `painted_size` cell remains for resize
+    *detection* → DSR re-anchor + width wipe/replay; the clear bound lives in
+    `plan_apply`'s `screen_bottom`) and the `initial_row` parameter (entry
+    re-anchor via DSR inside `read_input`); Ctrl-Z resume re-anchors.
+    `emit_commit` on the frame path without its own DSR — `$EDITOR`
+    (`review_compaction_summary`) re-anchors on exit instead. Deleted
+    `build_redraw`, `next_input_row`, `clear_rows_to`, `overlay_window`,
+    `render_content`, `cursor_positioning` and their byte-copy tests; the vt100
+    suite now drives `compose_frame` + `plan_apply`. Behavior change: the 2/3
+    budget bounds the *whole* frame, so the pop-up gets
+    `budget − input − divider` rows (the clamped-budget test was re-pinned:
+    frame fits at its anchor, no scroll).
+  - **Gate**: ✅ full suite green (702 lib + pty tests)
+- **Phase**: **P4** ✅
+  - **Work**: Dialog wiring: `ui::confirm` composes `[Divider?, Overlay]` →
+    `Output::draw_frame` (entry DSR re-anchor, then per-key/per-resize
+    re-compose = partial applies); resolve = `Frame::empty()` union-clear, then
+    a synthetic decision line for tool approval (`accepted\|denied tool X` via
+    `ConfirmSpec.subject`) and nothing for compaction; `ConfirmSpec` gains
+    `divider`/`subject`; `render_at` deleted. Also fixed the pre-existing
+    `confirm_n_returns_no` miss (no `('n', 1)` quick key — the suite is
+    `test-utils`-gated, so plain `cargo test` skips it).
+  - **Gate**: ✅ `cargo test --features test-utils --test confirm_raw_mode` 7
+    green (incl. new paint → clear → decision screen test); full suite green
+- **Phase**: **P5** ✅
+  - **Work**: Cleanup: deleted `overlay_lines`/`overlay_lines_with_bgs` (zero
+    production callers) and ported their tests to `paint_plan` — marker tests
+    (the `active == selected` case was already pinned by
+    `paint_plan_active_marker_beats_cursor`), title/markers, wrap-continuation,
+    and both `settings.rs` table-alignment tests; the per-row `row_bgs` test
+    went with the removed feature (paint_plan has fixed backgrounds). Dropped
+    `ui::frame`'s module `allow(dead_code)`: `Element::Lines` (§3.2's fixed
+    rows, first user = §4.5) and `Frame::spans` (§4.4's dirty-span refinement)
+    carry targeted allows instead. Stale `Repl::overlay_lines` reference in
+    `slashdot_menu::table` docs fixed. (`next_input_row`/`clear_rows_to` folded
+    into apply and `repl.rs` module docs updated in P3.)
+  - **Gate**: ✅ full suite green (702 lib + pty tests; `--features test-utils`
+    confirm suite 7/7); `overlay_lines` zero code hits
 
-P0 is not optional: it converts the existing carefully-tuned tests from "a copy of the
-emit logic" into a real safety net for P2–P3.
+P0 is not optional: it converts the existing carefully-tuned tests from "a copy
+of the emit logic" into a real safety net for P2–P3.
 
-#### Open before the §5.2 change — all three resolved
+### Open before the §5.2 change — all three resolved
 
 The change itself moved to [`ui_draw_261001.md`](./ui_draw_261001.md); status
 of the three, for the record:
@@ -1135,47 +1306,122 @@ Two more notes that are easy to lose:
   `Error:` lines from the 429-retry scenario — the content was emitted and never
   reached the screen, and nothing asserted against it. Until there is an
   assertion covering that content, check it by eye.
+
 ---
 
 #### Audit of U1–U6 against the tree
 
 Every claim below was checked against the code, not against the phase list.
 
-| | unit | state |
-|---|---|---|
-| ✅ | **U1** contraction | Landed. `with_content_writer` consumes the area instead of retiring it, and `plan_reposition` is the third apply case. **But** it places the area by its bottom edge, which §4.5.7 rules out — see §5.2's known gap. Implemented, and wrong in the one respect §4.5.7 settled. |
-| ✅ | **U2** area survives the turn | Landed. The bar is a composed row resolved from `status_text` + `streaming`; the transient-bar machinery is gone. |
-| ✅ | **U3** dialogs are menus | Landed, in two halves that this row used to conflate (which is why it read ✅ while the delivery half was untouched). The *composition* half was P3/P5: `ui::confirm` composing `[Divider?, Overlay]` through the same composer. The *delivery* half landed in [`confirm_as_menu_261002.md`](confirm_as_menu_261002.md): the confirm is session state in the REPL's pump, composed into the **live** area mid-turn as an ordinary overlay element, with its own anchor, its entry DSR, its reader gate and its `Frame::empty()` erase all gone. A gated tool call now *awaits* an answer instead of blocking the `select!`. |
-| 🔶 | **U4** in-turn input | **U4.1–U4.3 + U4.5–U4.6 landed; U4.4 open.** The plan is recorded under U4 itself. Landed: `PromptSession` owns `editor`, `nav`, `draft`, `sel`, `last_disc`, `prose`, `pending_key`, the `SlashDotMenu` and the overlay, and `read_input` takes it by `&mut`, so the state outlives the call; `handle_key` is the draw-free dispatcher (`Continue` / `RunEditor` / `Action`), generalising the `edit_key` split; `slashdot_menu` gained `continuation_handle` so a `/`-session keeps its epoch across evals. The in-flight reader no longer drops edit keys — `route_event` routes each one `Inline` (Ctrl-C, Ctrl-Z, Resize) or `Forward` (every other key, **`Esc` among them**, plus paste) onto an unbounded mpsc, unbounded precisely so a full queue can never block the thread at the moment it must deliver Ctrl-C. **The receiver is drained:** `prompt()`'s `select!` grew a key branch that runs `handle_key` → `settle` — eval, outcome, sync, paint, the sequence `read_input` runs minus its wait — plus a prose timer for `prose.poll_timeout()`, without which prose would go inert mid-turn. Submit is blocked and silent, as settled. `Esc` is menu-first: the ladder runs while a v2.5 menu is open and the turn stops only at root, which is *why* it moved to `Forward` — the reader has no session to look at, so routing it inline was routing it to "abort" unconditionally. `eval` is out of `read_input` and into `settle`, so the session is self-driving. **U4.5 makes the pump turn-scoped, not attempt-scoped:** `cancellable_sleep_pumped` runs the same dispatcher over the same queue during retry back-offs — a root `Esc` ends a back-off immediately instead of after the delay elapsed, keys/menus stay live between attempts (the receiver was otherwise unread while `prompt()` had returned), and the prose timer ticks through the wait. **U4.6 gives the compaction window its own pump:** `retry_summarization` polls a `WindowKeySource` beside the attempt and the sleep — an `Esc` cancels a summarization or its back-off instead of waiting the provider floor out, and keys typed during the window are parked on `AppState` and drained by `read_input`'s normal dispatch afterwards. **Still open: U4.4**, the ordering between the key branch's compose and the content branch's write + `reposition_area`. |
-| ❌ | **U5** retire the entry DSRs | **Not started.** `read_input`'s entry DSR is live at `repl.rs:683` and `ui::confirm`'s at `ui.rs:92`, both marked for removal. The three sanctioned sites are correctly still there (Ctrl-Z resume `repl.rs:806`, the width-change `ESC[0J` + replay `repl.rs:841`, and the confirm error path `repl.rs:942`). **Done** by [`confirm_as_menu_261002.md`](confirm_as_menu_261002.md) (U3): `ui::confirm`'s entry DSR went when the confirm became session state rather than a blocking loop with its own anchor. `read_input`'s half was already retired by `ENTRY_DSR_DONE`. |
-| ⏸ | **U6** scroll region | Optional, gates nothing, not started. |
+- ✅
+  - **unit**: **U1** contraction
+  - **state**: Landed. `with_content_writer` consumes the area instead of
+    retiring it, and `plan_reposition` is the third apply case. **But** it
+    places the area by its bottom edge, which §4.5.7 rules out — see §5.2's
+    known gap. Implemented, and wrong in the one respect §4.5.7 settled.
+- ✅
+  - **unit**: **U2** area survives the turn
+  - **state**: Landed. The bar is a composed row resolved from `status_text` +
+    `streaming`; the transient-bar machinery is gone.
+- ✅
+  - **unit**: **U3** dialogs are menus
+  - **state**: Landed, in two halves that this row used to conflate (which is
+    why it read ✅ while the delivery half was untouched). The *composition*
+    half was P3/P5: `ui::confirm` composing `[Divider?, Overlay]` through the
+    same composer. The *delivery* half landed in
+    [`confirm_as_menu_261002.md`](confirm_as_menu_261002.md): the confirm is
+    session state in the REPL's pump, composed into the **live** area mid-turn
+    as an ordinary overlay element, with its own anchor, its entry DSR, its
+    reader gate and its `Frame::empty()` erase all gone. A gated tool call now
+    *awaits* an answer instead of blocking the `select!`.
+- 🔶
+  - **unit**: **U4** in-turn input
+  - **state**: **U4.1–U4.3 + U4.5–U4.6 landed; U4.4 open.** The plan is recorded
+    under U4 itself. Landed: `PromptSession` owns `editor`, `nav`, `draft`,
+    `sel`, `last_disc`, `prose`, `pending_key`, the `SlashDotMenu` and the
+    overlay, and `read_input` takes it by `&mut`, so the state outlives the
+    call; `handle_key` is the draw-free dispatcher (`Continue` / `RunEditor` /
+    `Action`), generalising the `edit_key` split; `slashdot_menu` gained
+    `continuation_handle` so a `/`-session keeps its epoch across evals. The
+    in-flight reader no longer drops edit keys — `route_event` routes each one
+    `Inline` (Ctrl-C, Ctrl-Z, Resize) or `Forward` (every other key,
+    **`Esc` among them**, plus paste) onto an unbounded mpsc, unbounded
+    precisely so a full queue can never block the thread at the moment it must
+    deliver Ctrl-C. **The receiver is drained:** `prompt()`'s `select!` grew a
+    key branch that runs `handle_key` → `settle` — eval, outcome, sync, paint,
+    the sequence `read_input` runs minus its wait — plus a prose timer for
+    `prose.poll_timeout()`, without which prose would go inert mid-turn. Submit
+    is blocked and silent, as settled. `Esc` is menu-first: the ladder runs
+    while a v2.5 menu is open and the turn stops only at root, which is *why* it
+    moved to `Forward` — the reader has no session to look at, so routing it
+    inline was routing it to "abort" unconditionally. `eval` is out of
+    `read_input` and into `settle`, so the session is self-driving.
+    **U4.5 makes the pump turn-scoped, not attempt-scoped:**
+    `cancellable_sleep_pumped` runs the same dispatcher over the same queue
+    during retry back-offs — a root `Esc` ends a back-off immediately instead of
+    after the delay elapsed, keys/menus stay live between attempts (the receiver
+    was otherwise unread while `prompt()` had returned), and the prose timer
+    ticks through the wait. **U4.6 gives the compaction window its own pump:**
+    `retry_summarization` polls a `WindowKeySource` beside the attempt and the
+    sleep — an `Esc` cancels a summarization or its back-off instead of waiting
+    the provider floor out, and keys typed during the window are parked on
+    `AppState` and drained by `read_input`'s normal dispatch afterwards.
+    **Still open: U4.4**, the ordering between the key branch's compose and the
+    content branch's write + `reposition_area`.
+- ❌
+  - **unit**: **U5** retire the entry DSRs
+  - **state**: **Not started.** `read_input`'s entry DSR is live at
+    `repl.rs:683` and `ui::confirm`'s at `ui.rs:92`, both marked for removal.
+    The three sanctioned sites are correctly still there (Ctrl-Z resume
+    `repl.rs:806`, the width-change `ESC[0J` + replay `repl.rs:841`, and the
+    confirm error path `repl.rs:942`). **Done** by
+    [`confirm_as_menu_261002.md`](confirm_as_menu_261002.md) (U3):
+    `ui::confirm`'s entry DSR went when the confirm became session state rather
+    than a blocking loop with its own anchor. `read_input`'s half was already
+    retired by `ENTRY_DSR_DONE`.
+- ⏸
+  - **unit**: **U6** scroll region
+  - **state**: Optional, gates nothing, not started.
 
 **Two things this audit changes about the plan.**
 
-*U4 is the gate for everything the status-row and input proposals want.* R1 (an empty input is no row mid-turn) is written, tested and **was dormant**: it asks `is_streaming()` at compose time, and until U4.3 the only compose that happened during a turn was none — `read_input` returned on submit and the agent loop never composed an area. Its unit test passed without production ever reaching it, a test that could not have caught the real defect, which is why R1 was reported as done when it was not. **U4.3's key branch is the path that opens:** pressing a key mid-turn runs `settle` → `paint_prompt`, so a compose now happens with the stream live and R1 is reachable in production rather than only in its unit test.
+*U4 is the gate for everything the status-row and input proposals want.* R1 (an
+empty input is no row mid-turn) is written, tested and **was dormant**: it asks
+`is_streaming()` at compose time, and until U4.3 the only compose that happened
+during a turn was none — `read_input` returned on submit and the agent loop
+never composed an area. Its unit test passed without production ever reaching
+it, a test that could not have caught the real defect, which is why R1 was
+reported as done when it was not. **U4.3's key branch is the path that opens:**
+pressing a key mid-turn runs `settle` → `paint_prompt`, so a compose now happens
+with the stream live and R1 is reachable in production rather than only in its
+unit test.
 
-*U5 cannot start before U4.* It retires `read_input`'s entry DSR on the grounds that the fold now survives the turn — but the fold surviving the turn is exactly what U4's in-turn composer has to keep true once the area starts changing shape mid-turn. Doing U5 first optimises away the safety net that U4 would be leaning on.
+*U5 cannot start before U4.* It retires `read_input`'s entry DSR on the grounds
+that the fold now survives the turn — but the fold surviving the turn is exactly
+what U4's in-turn composer has to keep true once the area starts changing shape
+mid-turn. Doing U5 first optimises away the safety net that U4 would be leaning
+on.
 
 #### Reported rendering issues
 
 Five issues found by hand, distinct from §5.2's placement — which they do not
 affect, and which they should not be folded into. Triaged in this order.
 
-**R1 — the input row is painted even when there is nothing to show. - DONE** Mid-turn
-the area renders `[status, input]`, so an empty input still occupies a row and
-the cursor rests visibly on it. It should occupy **zero** rows when empty and
-appear on the first keystroke. `compose_elements` (`repl.rs:1269`) already takes
-`Option<&str>` for the status; the input needs the same treatment.
+**R1 — the input row is painted even when there is nothing to show. - DONE**
+Mid-turn the area renders `[status, input]`, so an empty input still occupies a
+row and the cursor rests visibly on it. It should occupy **zero** rows when
+empty and appear on the first keystroke. `compose_elements` (`repl.rs:1269`)
+already takes `Option<&str>` for the status; the input needs the same treatment.
 
-OQ2 is not contradicted by this. It settled that *the REPL stays live mid-turn* —
-it is a statement about activity, not about rows. The frame is composed and
+OQ2 is not contradicted by this. It settled that *the REPL stays live mid-turn*
+— it is a statement about activity, not about rows. The frame is composed and
 applied either way; it just has no input row to draw until there is input. This
 is also the "frame content changes in size" case at its most routine, so it is
 worth settling before the placement work rather than after.
 
 **R2 — consecutive committed prompts get a blank they should not have.**
 
-```
+```text
 ────────              ────────              ────────
 /session … resume     /reasoning med
 ────────              ────────              ────────
@@ -1198,9 +1444,10 @@ sits with a rule *below* it — the input's own underline — and nothing above,
 it reads as content rather than as something the user committed. A slash commit
 is bracketed on both sides; a prompt is bracketed on one.
 
-The row to use already exists: it is the row that holds the status line, directly
-above the input (`compose_elements` pushes it at `repl.rs:1282`). On a regular
-commit that row becomes a divider instead, and the prompt commits beneath it.
+The row to use already exists: it is the row that holds the status line,
+directly above the input (`compose_elements` pushes it at `repl.rs:1282`). On a
+regular commit that row becomes a divider instead, and the prompt commits
+beneath it.
 
 **Fixed:** a committed prompt goes through `Output::display_committed_prompt`,
 which brackets it and, when the previous content was also a committed prompt,
@@ -1224,7 +1471,7 @@ output they were invoked to produce.
 Both come from one shape. `with_content_writer` (`output.rs:1652`) does, **per
 write**:
 
-```
+```text
 lock writer → plan_consume (walk to the fold, take the frame) → write the
              content → reposition_area → write the frame back below → flush
 ```
@@ -1291,19 +1538,16 @@ a byte-level guess at a structural fact stops being necessary.
 > the frame-owned bar; `StreamTail`, `ends_blank` and `at_line_start` had no
 > production reader left and were deleted — row_accounting_b3 §2d.
 
-Worth doing while in there, though minor: `batch_commit` (`repl.rs:1482`) renders
-a commit as a bare `display_plain` line with no rules and no boundary, while
-`emit_commit` brackets it — so a startup replay looks different from the same
-action taken live. Only implicit submits reach it, which is why it went unnoticed.
----
+## Worth doing while in there, though minor: `batch_commit` (`repl.rs:1482`) renders a commit as a bare `display_plain` line with no rules and no boundary, while `emit_commit` brackets it — so a startup replay looks different from the same action taken live. Only implicit submits reach it, which is why it went unnoticed
 
 ---
 
 ## 8. Open questions (resolved)
 
-1. **Scroll-on-demand cap.** `delta` lands the frame with its bottom at `term_h`; the top
-   1/3 guarantee follows from `height ≤ 2/3`. Confirm no case needs a smaller `delta`
-   (e.g. preferring to scroll less when the frame would fit higher).
+1. **Scroll-on-demand cap.** `delta` lands the frame with its bottom at
+   `term_h`; the top 1/3 guarantee follows from `height ≤ 2/3`. Confirm no case
+   needs a smaller `delta` (e.g. preferring to scroll less when the frame would
+   fit higher).
    - Answer: If the sum of max-heights of individual elements is less than the
      budget, and the cursor position is at the bottom, then render to that
      sum, and only scroll to what is used. If the ask is for more than budget,
@@ -1325,7 +1569,9 @@ them; §4.2, §5.3 and §9 now each say so where they state it.
 **Audit 2026-09-28** (after the editor cleanups, with the v2.5 engine now
 driving every `/` command in the REPL): #1–#3 re-verified done, pins still
 green; #5, #7, #9 and #11 audited and then **fixed** the same day (see below).
-#4 is still open; #6 and #10 were on this list and are **done** (see their entries
+
+## 4 is still open; #6 and #10 were on this list and are **done** (see their entries
+
 below and in §4.2). Each carries a re-check with file/line
 evidence, what a fix involves, and a verdict. #8 stays an accepted limitation.
 A recommended order for what remains is at the end of the section.
@@ -1356,7 +1602,7 @@ A recommended order for what remains is at the end of the section.
    tracked one — and clears `live` in both cases. Pinned by
    `reanchor_fallback_keeps_row_but_invalidates`.
 
-### Small robustness cleanups
+#### Small robustness cleanups
 
 3. **Unify the size source.** *(resolved)* `Output::draw_frame` now **takes**
    the composed `dims` and applies exactly them, returning them so callers
@@ -1374,26 +1620,25 @@ A recommended order for what remains is at the end of the section.
    into the apply removes the class.
 
 4. **`confirm_subject` parses a message convention.** The decision line's
-   subject comes from stripping `Confirm … call?` off the tool-confirm
-   header. If the `agent.rs` message wording ever changes, the line silently
-   degrades to the full header (correct, just noisy). An explicit subject
-   parameter threaded through `Output::confirm` would drop the coupling.
-   **Still open** (audited 2026-09-28). There is exactly *one* production
-   caller — `agent.rs:2075` builds `Confirm tool {NAME} call?` — and
-   `ConsoleOutput::confirm` (`output.rs:2046`) strips the convention back off
-   it. So the coupling is a two-site round trip, not a spread convention.
-   Fix, cheapest first: add
+   subject comes from stripping `Confirm … call?` off the tool-confirm header.
+   If the `agent.rs` message wording ever changes, the line silently degrades to
+   the full header (correct, just noisy). An explicit subject parameter threaded
+   through `Output::confirm` would drop the coupling. **Still open** (audited
+   2026-09-28). There is exactly *one* production caller — `agent.rs:2075`
+   builds `Confirm tool {NAME} call?` — and `ConsoleOutput::confirm`
+   (`output.rs:2046`) strips the convention back off it. So the coupling is a
+   two-site round trip, not a spread convention. Fix, cheapest first: add
    `fn confirm_with_subject(&self, message: &str, subject: Option<&str>) -> Confirmation`
    defaulting to `self.confirm(message)`, override it in `ConsoleOutput` to
    build the spec with the given subject, and have `agent.rs:2075` pass
-   `Some(&format!("tool {}", Self::NAME.to_uppercase()))`;
-   `confirm_subject` survives as the documented fallback. The thorough form
-   changes `Output::confirm` itself: 4 impls + 1 delegating wrapper + 3 test
-   impls + `src/bin/confirm_probe.rs`, all mechanical.
-   **Verdict: bundle it.** The failure mode is cosmetic (a noisy line, never a
-   wrong decision), so it does not earn a change on its own.
+   `Some(&format!("tool {}", Self::NAME.to_uppercase()))`; `confirm_subject`
+   survives as the documented fallback. The thorough form changes
+   `Output::confirm` itself: 4 impls + 1 delegating wrapper + 3 test impls +
+   `src/bin/confirm_probe.rs`, all mechanical. **Verdict: bundle it.** The
+   failure mode is cosmetic (a noisy line, never a wrong decision), so it does
+   not earn a change on its own.
 
-5. **`draw_dialog` sniffs the `> ` marker** to find the overlay's windowing
+5. **`draw_dialog` sniffs the `>` marker** to find the overlay's windowing
    focus. Fine for today's specs (no detail line starts with `> `), but a
    spec whose detail ever does would window around the wrong row. Robust
    form: `focus = plan.detail visual height + selected row's height offset`,
@@ -1419,8 +1664,8 @@ A recommended order for what remains is at the end of the section.
 
 6. **`display_text` line counts can drift.** *Substantially fixed; the
    compensating DSR remains.* The count used to come from
-   `wrap(text)` while the bytes include the `⏺ ` prefix and `termimad::inline`
-   output — three drift sources: the 2-column `⏺ ` prefix never counted, `wrap`
+   `wrap(text)` while the bytes include the `⏺` prefix and `termimad::inline`
+   output — three drift sources: the 2-column `⏺` prefix never counted, `wrap`
    counting *chars* where the terminal wraps on *display columns* (CJK/emoji
    undercount), and `inline` rewriting the text before it reaches the terminal.
    `display_text` now measures the bytes it emits, through the same
@@ -1475,7 +1720,7 @@ A recommended order for what remains is at the end of the section.
    right trade. **No action** — recorded so a future reader doesn't mistake it
    for a bug when testing in a 2-row window.
 
-### Added by the audit
+#### Added by the audit
 
 9. **The feature-gated suite is still not in CI** (promoted from the process
    take-aways below, audited 2026-09-28). `.github/workflows/ci.yml` ran
@@ -1488,23 +1733,25 @@ A recommended order for what remains is at the end of the section.
    else, and keeping both halves in one step is what stops them drifting apart
    again.
 
-10. ~~**Streaming still doesn't track rows**~~ **DONE — the premise is stale,
-    and it has been for some time.** `stream_text` / `stream_thinking` no longer
-    hand completed blocks to `Renderer::feed` uncounted: every content write goes
-    through `with_content_writer`, which wraps the writer in a `RowCounter` and
-    calls `note_lines` with what the *bytes* moved the cursor by (row_accounting
-    §6 phase B). `streamed_answer_is_counted` and `streamed_thinking_is_counted`
+10. ~~**Streaming still doesn't track rows**~~
+    **DONE — the premise is stale, and it has been for some time.**
+    `stream_text` / `stream_thinking` no longer hand completed blocks to
+    `Renderer::feed` uncounted: every content write goes through
+    `with_content_writer`, which wraps the writer in a `RowCounter` and calls
+    `note_lines` with what the *bytes* moved the cursor by (row_accounting §6
+    phase B). `streamed_answer_is_counted` and `streamed_thinking_is_counted`
     compare the tracked row against a vt100 replay of the same bytes, so this is
     checked against a terminal emulator and not merely against itself.
     **The two entry DSRs are still here, for reasons that are not this one.**
     `read_input`'s establishes the *starting* row — the cache begins at row 1
-    while the shell that launched picocode may have left its prompt further down,
-    and every byte of the greeter would be counted from the wrong place. The one
-    in `ui::confirm` is a cheap confirmation on a path where a wrong anchor
-    strands the dialog, and whose tests assert behaviour rather than position.
-    The other two re-anchors (Ctrl-Z resume, and the width-change `ESC[0J` +
-    replay) are about *foreign* writers and were never about row accounting.
-    All three comments that still blamed streaming drift have been corrected.
+    while the shell that launched picocode may have left its prompt further
+    down, and every byte of the greeter would be counted from the wrong place.
+    The one in `ui::confirm` is a cheap confirmation on a path where a wrong
+    anchor strands the dialog, and whose tests assert behaviour rather than
+    position. The other two re-anchors (Ctrl-Z resume, and the width-change
+    `ESC[0J` + replay) are about *foreign* writers and were never about row
+    accounting. All three comments that still blamed streaming drift have been
+    corrected.
 
     **What this did not buy, and it is worth being explicit:** the status bar's
     hand-off at submit is *not* drift. The prompt-side bar is a row of the input
@@ -1545,28 +1792,29 @@ A recommended order for what remains is at the end of the section.
     width) — i.e. they pinned the over-wide row #11 is about — and were
     re-pinned to the real contract (lay out at `tw - 2`, paint at `tw`).
 
-### Deferred design pieces (allowed for in code)
+#### Deferred design pieces (allowed for in code)
 
 All four re-checked 2026-09-28: still deferred, still test-only users, allows
 still targeted (no blanket `allow(dead_code)` came back).
 
 - **`Element::Lines`** — no longer deferred: the prompt-side status bar is its
   first production user (`compose_frame` puts it in the divider's row, above the
-  input, so the frame's own union clear takes it at submit). The `#[allow(dead_code)]`
-  on the variant can go once the mid-turn bar moves here too — §4.5 U2.
+  input, so the frame's own union clear takes it at submit). The
+  `#[allow(dead_code)]` on the variant can go once the mid-turn bar moves here
+  too — §4.5 U2.
 - **`Frame::spans`** — §4.4's dirty-span refinement; the row diff is
   deliberately the sole reader until profiling asks for more.
 - **`ApplyPolicy::Append`** — built and vt100-tested in P2, no production user
-  yet. It is the *commit-line* append today (`plan_append` writes the rows at the
-  anchor and retires the frame), which is not what §4.5 needs: P1 wants the area
-  re-emitted at a new fold after a content chunk. Whether that is the same
+  yet. It is the *commit-line* append today (`plan_append` writes the rows at
+  the anchor and retires the frame), which is not what §4.5 needs: P1 wants the
+  area re-emitted at a new fold after a content chunk. Whether that is the same
   function with a different clear policy, or a second one, is an open detail of
   P1.
 - **Per-row backgrounds (`row_bgs`)** — dropped with `overlay_lines` in P5;
   if per-row tinting is ever wanted it belongs in `RenderPlan` (engine
   side), not in the painter.
 
-### Process take-aways
+#### Process take-aways
 
 - **A feature-gated suite is not a gate.** `confirm_raw_mode` requires
   `--features test-utils`, so plain `cargo test` skipped it through P0–P3 —
@@ -1587,11 +1835,13 @@ still targeted (no blanket `allow(dead_code)` came back).
   `streamed_thinking_is_counted`. The DSRs stayed, for the reasons §4.2 now
   records. §4.5 is the remaining work, and it was never gated on this.)*
 
-## Segment boundary normalization, v2
+### Segment boundary normalization, v2
+
 Replace the boundary() stuff that emits newlines after turn content with the
 opposite principle:
 
-- Strip all leading / trailing blank lines from all content output at kind boundaries 
+- Strip all leading / trailing blank lines from all content output at kind
+  boundaries
   - begin_response and end_response strip leading / trailing newlines
   - synthetic content never emits spacer lines at its boundaries
 - Single point emitting separator lines: Turn boundary() into
@@ -1599,16 +1849,16 @@ opposite principle:
   `with_content_writer`. How it encodes its logic is internal (matrix,
   conditions, whatever) - important is that it is the *only* point emitting
   seprator lines at content bondaries. It owns the policy.
-- UI controls spacing at fold: Display a spacer line between last turn output and status
-  / input in the UI (frame content)- can change whether to display spacer(s),
-  separator lines etc - UI issue
+- UI controls spacing at fold: Display a spacer line between last turn output
+  and status / input in the UI (frame content)- can change whether to display
+  spacer(s), separator lines etc - UI issue
   - Provides the formatting, but does not force newlines into the content -
     enables the "collapse newlines between prompts" behavior.
 - Segment boundaries between begin_response and end_response should follow the
   same conventions: One trailing newline, NO trailing separator lines.
   Following content is responsible for any separators.
 
-### Initial ContentDisplayKind set
+#### Initial ContentDisplayKind set
 
 ```rust
 enum ContentDisplayKind {
@@ -1626,12 +1876,16 @@ enum ContentDisplayKind {
 }
 ```
 
-### Future refinements
+#### Future refinements
+
 Pull streaming content boundary handling into the same layer:
-- Refine ContentDisplayKind to cover model content segments (text / reasoning / tool calls)
+
+- Refine ContentDisplayKind to cover model content segments (text / reasoning /
+  tool calls)
 - Maybe separately track streaming "first chunk" / "last chunk" status, since
   each segment can be emitted in many delta chunks, without an actual
   boundary.
 
-## Drawing efficiency
+### Drawing efficiency
+
 See ./ui_draw_261001.md

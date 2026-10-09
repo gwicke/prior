@@ -38,7 +38,8 @@ When `compat.cacheControlFormat === "anthropic"` and retention is not `"none"`,
 
 - the system/developer message (`addCacheControlToSystemPrompt`),
 - the last tool definition (`addCacheControlToLastTool`),
-- the last user/assistant text content block (`addCacheControlToLastConversationMessage`).
+- the last user/assistant text content block
+  (`addCacheControlToLastConversationMessage`).
 
 `ttl: "1h"` is added for long retention.
 
@@ -53,7 +54,8 @@ For OpenAI Responses/Completions, when retention is not `"none"`, a
 
 - OpenAI: `session_id`, `x-client-request-id`, `x-session-affinity`
   (or the `openai-nosession` variant without `session_id`),
-- OpenRouter: `x-session-id` (plus `ni-id` / `ni-affinity` on the completions path),
+- OpenRouter: `x-session-id` (plus `ni-id` / `ni-affinity` on the completions
+  path),
 
 along with body params:
 

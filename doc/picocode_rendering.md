@@ -41,13 +41,13 @@ raw / non-canonical terminal handling anywhere in the codebase.
 - `Ctrl-C` is delivered in cooked mode as the default `SIGINT`, terminating
   the process rather than being caught for a soft cancel.
 
-| Concern | Status |
-|---|---|
-| Raw mode setup | None |
-| Cooked mode | Default; used everywhere via `read_line` |
-| Input dependency | `std::io::stdin()` only (`console` for styling) |
-| Async/non-blocking input | No |
-| Keystroke-level handling | No |
+| Concern                  | Status                                          |
+| ------------------------ | ----------------------------------------------- |
+| Raw mode setup           | None                                            |
+| Cooked mode              | Default; used everywhere via `read_line`        |
+| Input dependency         | `std::io::stdin()` only (`console` for styling) |
+| Async/non-blocking input | No                                              |
+| Keystroke-level handling | No                                              |
 
 ---
 
@@ -73,12 +73,20 @@ The consumer (`CodeAgent`) holds it as `Arc<dyn Output>` (`agent.rs:82`), so
 **formatting is decoupled from logic**. Four implementations, selected at
 startup (`main.rs:126-130`) based on the `--quiet` flag / recipe:
 
-| Impl | Use case | Behavior |
-|---|---|---|
-| `ConsoleOutput` | Default interactive TTY | Full pretty ANSI rendering |
-| `QuietOutput` | `--quiet` / recipe `quiet` | Minimal: only errors to stderr; spinner for "thinking"; input via `read_line` |
-| `LogOutput` | Logging mode | No stdout rendering — everything via `tracing` (`info!`/`error!`/`debug!`) |
-| `NoOutput` | Fully silent / non-interactive | All display methods are no-ops; `confirm` returns `No` |
+- **Impl**: `ConsoleOutput`
+  - **Use case**: Default interactive TTY
+  - **Behavior**: Full pretty ANSI rendering
+- **Impl**: `QuietOutput`
+  - **Use case**: `--quiet` / recipe `quiet`
+  - **Behavior**: Minimal: only errors to stderr; spinner for "thinking"; input
+    via `read_line`
+- **Impl**: `LogOutput`
+  - **Use case**: Logging mode
+  - **Behavior**: No stdout rendering — everything via `tracing`
+    (`info!`/`error!`/`debug!`)
+- **Impl**: `NoOutput`
+  - **Use case**: Fully silent / non-interactive
+  - **Behavior**: All display methods are no-ops; `confirm` returns `No`
 
 ### `ConsoleOutput` — the real formatting layer
 
@@ -98,14 +106,15 @@ startup (`main.rs:126-130`) based on the `--quiet` flag / recipe:
    (`output.rs:195-208`, collapses newlines, takes first JSON value), dim.
 5. **Tool-result formatting** (`output.rs:268-325`):
    - Tries `serde_json` parse to unwrap a JSON string or join an array.
-   - Strips `Toolset error: ` / `ToolCallError: ` prefixes; detects error
+   - Strips `Toolset error:` / `ToolCallError:` prefixes; detects error
      status.
    - Renders lines with a tree prefix; **errors shown in full red**, normal
      results **truncated to 4 lines / 100 chars per line** with a
      `... +N lines` footer.
-6. **Spinner / "thinking" state** (`output.rs:230-240`): `indicatif::ProgressBar`
-   (120ms steady tick, blue spinner) in a `Mutex<Option<…>>`. Every display
-   method calls `stop_thinking()` first to clear it before output.
+6. **Spinner / "thinking" state** (`output.rs:230-240`):
+   `indicatif::ProgressBar` (120ms steady tick, blue spinner) in a
+   `Mutex<Option<…>>`. Every display method calls `stop_thinking()` first to
+   clear it before output.
 7. **Header** (`output.rs:382-438`): centered ASCII avatar + status line built
    by a local `status()` closure that dims inactive flags and colors `yolo`
    red. Width-aware centering via `Term::stdout().size()`.
@@ -126,7 +135,7 @@ startup (`main.rs:126-130`) based on the `--quiet` flag / recipe:
 
 ### Flow summary
 
-```
+```text
 main.rs selects Output impl (quiet flag)
    └─ agent loop calls output.display_* / get_user_input / confirm
         ├─ ConsoleOutput → ANSI + glyphs + termimad + indicatif spinner

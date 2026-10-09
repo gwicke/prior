@@ -1,12 +1,13 @@
 # `/tree <id> switch summarize` — branch summaries
 
-Status: **implemented** (`agent::generate_branch_summary` / `apply_branch_summary`,
-the `switch` → `summarize` → mode nodes in `v25_tree.rs`, and the
-`BranchSummary` → user-message projection in `extract_messages`).
+Status: **implemented** (`agent::generate_branch_summary` /
+`apply_branch_summary`, the `switch` → `summarize` → mode nodes in
+`v25_tree.rs`, and the `BranchSummary` → user-message projection in
+`extract_messages`).
 
 `/tree <id> switch` is a sub-menu:
 
-```
+```text
 /tree <id> switch                     → listing [cursor] [summarize]
 /tree <id> switch cursor              → move the leaf, no summary (pi's plain `branch()`)
 /tree <id> switch summarize           → listing [manual] [text-only] [prompt]
@@ -20,12 +21,22 @@ The three modes are the *same* two-phase flow as `/tree <id> compact`
 native confirm → `submit()` writes. Only the effect differs, and only in
 `submit()`:
 
-| | `/tree <id> compact <mode>` | `/tree <id> switch summarize <mode>` |
-|---|---|---|
-| span summarized | entries **before** the target on its branch | the **spur** left behind by the switch |
-| entry written | `Compaction { summary, first_kept_entry_id, tokens_before }` | `BranchSummary { from_id, summary }` |
-| leaf | unchanged | moves to the target |
-| context after | `[summary] + [first_kept …]` | `[digest] + [full branch from the target]` |
+- span summarized
+  - **`/tree <id> compact <mode>`**: entries **before** the target on its branch
+  - **`/tree <id> switch summarize <mode>`**: the **spur** left behind by the
+    switch
+- entry written
+  - **`/tree <id> compact <mode>`**:
+    `Compaction { summary, first_kept_entry_id, tokens_before }`
+  - **`/tree <id> switch summarize <mode>`**:
+    `BranchSummary { from_id, summary }`
+- leaf
+  - **`/tree <id> compact <mode>`**: unchanged
+  - **`/tree <id> switch summarize <mode>`**: moves to the target
+- context after
+  - **`/tree <id> compact <mode>`**: `[summary] + [first_kept …]`
+  - **`/tree <id> switch summarize <mode>`**:
+    `[digest] + [full branch from the target]`
 
 `SummaryAction` (`v25_tree.rs`) is that one difference; `compact_prepare` /
 `edit_draft` / `compact_submit` are shared verbatim.
@@ -82,7 +93,8 @@ From `core/compaction/branch-summarization.ts`:
   **appended** as `Additional focus: …` (pi's default), so a user instruction
   cannot break the required sections.
 - `<conversation>…</conversation>` + `serializeConversation` role tags
-  (`[User]:`, `[Assistant]:`, `[Assistant tool calls]:`) → `agent::serialize_spur`.
+  (`[User]:`, `[Assistant]:`, `[Assistant tool calls]:`) →
+  `agent::serialize_spur`.
 - Touched files are appended to the summary (`spur_files_section`), reusing the
   collector and renderer the text-only summary uses.
 
@@ -126,7 +138,7 @@ than attaching a digest that describes a different span.
 pi's user-message re-edit (`core/agent-session.ts:2950`) is implemented as its
 own leaf node rather than as a mode of `switch`:
 
-```
+```text
 /tree <id> edit    → move the leaf to the prompt's parent, pre-fill its text
 ```
 
@@ -145,11 +157,11 @@ own leaf node rather than as a mode of `switch`:
 
 ## Replay
 
-`ReplayUnit::BranchSummary { from_id, summary }` — the digest renders in `/replay`
-and in the resume prefill (both go through `replay_units`) as a dim system line
-followed by the markdown body, exactly like a compaction marker:
+`ReplayUnit::BranchSummary { from_id, summary }` — the digest renders in
+`/replay` and in the resume prefill (both go through `replay_units`) as a dim
+system line followed by the markdown body, exactly like a compaction marker:
 
-```
+```text
 [branch summary from u1]
 ## Goal
 …

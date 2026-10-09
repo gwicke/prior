@@ -6,17 +6,18 @@ chat history survives quit/suspend. All paths are relative to the repo root.
 
 ## 1. Raw vs. cooked terminal mode
 
-**The TUI only runs in raw mode while active; "cooked" is the restored/exit state.**
+**The TUI only runs in raw mode while active; "cooked" is the restored/exit
+state.**
 
-- `ProcessTerminal.start()` (`packages/tui/src/terminal.ts:155`) enters raw mode:
-  `process.stdin.setRawMode(true)`, `setEncoding("utf8")`, `resume()`.
-  It saves `wasRaw` so it can be restored later (`terminal.ts:160`, `:341`).
+- `ProcessTerminal.start()` (`packages/tui/src/terminal.ts:155`) enters raw
+  mode: `process.stdin.setRawMode(true)`, `setEncoding("utf8")`, `resume()`. It
+  saves `wasRaw` so it can be restored later (`terminal.ts:160`, `:341`).
 - Enables bracketed paste (`\x1b[?2004h`) and, on Windows,
   `ENABLE_VIRTUAL_TERMINAL_INPUT` so modified keys arrive as VT sequences.
 - Queries the Kitty keyboard protocol (flags 1+2+4) and falls back to
-  `modifyOtherKeys` otherwise (`terminal.ts:204`, `queryAndEnableKittyProtocol`).
-  Raw mode is required for per-key events, press/release event types, and
-  alternate keys.
+  `modifyOtherKeys` otherwise (`terminal.ts:204`,
+  `queryAndEnableKittyProtocol`). Raw mode is required for per-key events,
+  press/release event types, and alternate keys.
 - All stdin passes through `StdinBuffer` (`terminal.ts:setupStdinBuffer`), which
   splits batched bytes into individual sequences so key-release events and
   escape sequences are dispatched one at a time.
@@ -29,9 +30,10 @@ stdin, and `setRawMode(this.wasRaw)`.
 
 Deliberate hand-offs to cooked mode (so a child program gets the real terminal):
 
-- **External editor launch** (`packages/coding-agent/src/modes/interactive/interactive-mode.ts:3791`):
-  `ui.stop()` -> `spawn(editor, …, { stdio: "inherit" })` ->
-  `ui.start()` in a `finally`.
+- **External editor launch**
+  (`packages/coding-agent/src/modes/interactive/interactive-mode.ts:3791`):
+  `ui.stop()` -> `spawn(editor, …, { stdio: "inherit" })` -> `ui.start()` in a
+  `finally`.
 - **Ctrl+Z suspend** (`interactive-mode.ts:3639`): `ui.stop()` then
   `process.kill(0, "SIGTSTP")`; on `SIGCONT`, `ui.start()`.
 
@@ -57,8 +59,8 @@ rows (viewport = `prevViewportTop..prevViewportTop+height`).
 
 - **Session output** = message components (assistant-message, user-message,
   tool-execution, etc.) added to `chatContainer` via `addChild`, with streaming
-  text fed in via `appendOutput` (e.g. `interactive-mode.ts:3175`, `:5946`). They
-  are just lines in the concatenated buffer; the renderer handles viewport
+  text fed in via `appendOutput` (e.g. `interactive-mode.ts:3175`, `:5946`).
+  They are just lines in the concatenated buffer; the renderer handles viewport
   scrolling. Rich/terminal-sensitive content (Kitty images, OSC) is reconciled
   specially (`expandChangedRangeForKittyImages`, `deleteChangedKittyImages` in
   tui.ts).
@@ -112,6 +114,7 @@ positioning keeps working.
   clear the screen or scrollback.
 
 Consequences:
+
 - **After quit**: `shutdown()` -> `drainInput()` -> `ui.stop()` leaves all
   rendered chat in the primary scrollback, above the restored shell prompt.
 - **After suspend** (`Ctrl+Z`): `ui.stop()` drops raw mode and backgrounds the
@@ -120,7 +123,7 @@ Consequences:
 
 **Caveat:** a width or height change forces `fullRender(true)`, which emits
 `\x1b[2J\x1b[H\x1b[3J` (`tui.ts:1276`) — clearing both screen *and* scrollback.
-So persistence is best-effort during a stable-size session; any resize mid-session
-wipes the scrollback history (Termux is exempted from the height-triggered wipe,
-`tui.ts:1358`). The deliberate non-use of the alternate screen is what makes
-"quit and your conversation is still there" possible.
+So persistence is best-effort during a stable-size session; any resize
+mid-session wipes the scrollback history (Termux is exempted from the
+height-triggered wipe, `tui.ts:1358`). The deliberate non-use of the alternate
+screen is what makes "quit and your conversation is still there" possible.

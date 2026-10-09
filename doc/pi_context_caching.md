@@ -15,8 +15,8 @@ DeepSeek detail called out in the request.
   - Defaults to `"short"`.
   - Set to `"long"` via the `PI_CACHE_RETENTION=long` env var, or per-request
     via `options.cacheRetention`.
-  - `"none"` disables all cache hints (no `prompt_cache_key`, no `cache_control`,
-    no session-affinity headers).
+  - `"none"` disables all cache hints (no `prompt_cache_key`, no
+    `cache_control`, no session-affinity headers).
 - **`options.sessionId`** — the per-conversation session id. It drives both the
   `prompt_cache_key` request body param and the session-affinity headers.
 - **Usage read-back** — `cacheRead`, `cacheWrite`, `cacheWrite1h` in
@@ -42,19 +42,20 @@ Responses-API backends and behave the same way for caching.)
 File: `api/openai-responses.ts`
 
 - **`prompt_cache_key`** — sent whenever retention ≠ `"none"` (i.e. on the
-  default `"short"` *and* `"long"`). Value is `clampOpenAIPromptCacheKey(sessionId)`,
-  the session id clamped to **64 chars** (`api/openai-prompt-cache.ts:1`).
-  `buildParams` line 245.
+  default `"short"` *and* `"long"`). Value is
+  `clampOpenAIPromptCacheKey(sessionId)`, the session id clamped to **64 chars**
+  (`api/openai-prompt-cache.ts:1`). `buildParams` line 245.
 - **`prompt_cache_retention: "24h"`** — sent only when retention is `"long"`
   *and* `supportsLongCacheRetention` (default `true` for OpenAI; line 69/78).
 - **Session-affinity headers** — when a `sessionId` is present, the Responses
-  path sends them **unconditionally** (not gated by `sendSessionAffinityHeaders`):
+  path sends them **unconditionally** (not gated by
+  `sendSessionAffinityHeaders`):
   - `openai` format (auto-detected for non-OpenRouter base URLs):
     `session_id`, `x-client-request-id` (line 213-216).
   - `openrouter` format: `x-session-id`.
 - **No Anthropic-style `cache_control` markers** — the Responses API performs
-  automatic prefix caching keyed off `prompt_cache_key` + `prompt_cache_retention`;
-  pi does not attach `cache_control` blocks here.
+  automatic prefix caching keyed off `prompt_cache_key` +
+  `prompt_cache_retention`; pi does not attach `cache_control` blocks here.
 
 Net effect: the default OpenAI backend gets cache hints on *every* non-`none`
 turn via `prompt_cache_key`, with 24h retention when `PI_CACHE_RETENTION=long`.
@@ -72,10 +73,11 @@ turn via `prompt_cache_key`, with 24h retention when `PI_CACHE_RETENTION=long`.
 ## 2. DeepSeek — `openai-completions` API
 
 Provider: `deepseek` → `providers/deepseek.ts` uses `openAICompletionsApi()`,
-base URL `https://api.deepseek.com`. Model catalog `providers/deepseek.models.ts`
-(add `deepseek-v4-flash`, `deepseek-v4-pro`) sets only reasoning-related compat
-(`requiresReasoningContentOnAssistantMessages`, `thinkingFormat:"deepseek"`) —
-**no caching override**, so the generic completions defaults apply.
+base URL `https://api.deepseek.com`. Model catalog
+`providers/deepseek.models.ts` (add `deepseek-v4-flash`, `deepseek-v4-pro`) sets
+only reasoning-related compat (`requiresReasoningContentOnAssistantMessages`,
+`thinkingFormat:"deepseek"`) — **no caching override**, so the generic
+completions defaults apply.
 
 File: `api/openai-completions.ts`
 
@@ -101,9 +103,9 @@ caching behavior is materially different from generic OpenAI:
 **Caveat:** `prompt_cache_key` / `prompt_cache_retention` are OpenAI *Responses*
 semantics; the chat-completions surface caches prefixes automatically on the
 DeepSeek side (server-side, ~5-minute TTL). So pi's `long`-retention params are
-passed to the completions endpoint but are effectively advisory — DeepSeek's real
-prefix caching happens regardless and is reported back via cached-token usage
-(the DeepSeek model entries do carry `cost.cacheRead` pricing).
+passed to the completions endpoint but are effectively advisory — DeepSeek's
+real prefix caching happens regardless and is reported back via cached-token
+usage (the DeepSeek model entries do carry `cost.cacheRead` pricing).
 
 Takeaway: to get any cache hint through to DeepSeek you must run with
 `PI_CACHE_RETENTION=long`; with the default `short` retention DeepSeek gets no
@@ -113,8 +115,8 @@ explicit hints from pi at all.
 
 ## 3. OpenRouter — `openai-completions` API
 
-Provider: `openrouter` → `providers/openrouter.ts` uses `openAICompletionsApi()`,
-base URL `https://openrouter.ai/api/v1`.
+Provider: `openrouter` → `providers/openrouter.ts` uses
+`openAICompletionsApi()`, base URL `https://openrouter.ai/api/v1`.
 
 File: `api/openai-completions.ts`
 
@@ -124,9 +126,10 @@ File: `api/openai-completions.ts`
   (line 751). It attaches `{ type: "ephemeral", ttl?: "1h" }` to:
   - the system/developer message (`addCacheControlToSystemPrompt`),
   - the last tool definition (`addCacheControlToLastTool`),
-  - the last user/assistant text block (`addCacheControlToLastConversationMessage`).
-  `ttl: "1h"` is added for `"long"` retention.
-  Non-Anthropic OpenRouter models get no `cache_control` markers.
+  - the last user/assistant text block
+    (`addCacheControlToLastConversationMessage`). `ttl: "1h"` is added for
+    `"long"` retention. Non-Anthropic OpenRouter models get no `cache_control`
+    markers.
 - **`prompt_cache_key` / `prompt_cache_retention: "24h"`** — same as DeepSeek:
   emitted only on `"long"` retention (`supportsLongCacheRetention` defaults
   `true` for OpenRouter).
@@ -155,7 +158,8 @@ File: `api/anthropic-messages.ts`
 - Usage read back from `ni_read_input_tokens`, `ni_creation_input_tokens`,
   and `ni_creation.ephemeral_1h_input_tokens`.
 - `sendSessionAffinityHeaders` defaults to `false` for Anthropic, so the
-  `x-session-affinity` header is not sent unless a model overrides it (line 898).
+  `x-session-affinity` header is not sent unless a model overrides it (line
+  898).
 
 ---
 
@@ -167,9 +171,10 @@ File: `api/bedrock-converse-stream.ts`
   3.7 Sonnet, 4.x, and 5.x; otherwise false *unless* `AWS_BEDROCK_FORCE_CACHE=1`
   is set (line 669). Amazon Nova models auto-cache and need no explicit points
   (note at line 660).
-- When enabled and retention ≠ `"none"`, `cachePoint: { type: DEFAULT, ttl?: ONE_HOUR }`
-  is inserted after the system prompt (`buildSystemPrompt` line 706) and on the
-  last message (line 893). `ttl: ONE_HOUR` is added for `"long"` retention.
+- When enabled and retention ≠ `"none"`,
+  `cachePoint: { type: DEFAULT, ttl?: ONE_HOUR }` is inserted after the system
+  prompt (`buildSystemPrompt` line 706) and on the last message (line 893).
+  `ttl: ONE_HOUR` is added for `"long"` retention.
 
 ---
 
@@ -223,22 +228,46 @@ if the provider returns cached-token usage that pi's usage mapping picks up.
 
 ## Quick reference table
 
-| Backend (API) | Cache hint(s) emitted | Triggered by |
-|---|---|---|
-| OpenAI (`openai-responses`) | `prompt_cache_key` + `prompt_cache_retention:24h` + session-affinity headers | key/headers on any non-`none`; 24h on `long` |
-| Azure / Codex Responses | `prompt_cache_key` (always) + `prompt_cache_retention:24h` + session-affinity headers | key present every request (undefined if no session); 24h on `long` |
-| DeepSeek (`openai-completions`) | `prompt_cache_key` + `prompt_cache_retention:24h` | **only `long` retention** |
-| OpenRouter (`openai-completions`) | `cache_control` (anthropic/* only) + `prompt_cache_key` + 24h | markers always for anthropic/*; key/24h on `long` |
-| Anthropic (`anthropic-messages`) | `ni_control` markers | retention ≠ `none` (ttl 1h on `long`) |
-| Bedrock (`bedrock-converse-stream`) | `cachePoint` blocks | Claude 3.5+/3.7/4/5 or `AWS_BEDROCK_FORCE_CACHE=1`; ttl 1h on `long` |
-| Mistral (`mistral-conversations`) | `x-affinity` header + `promptCacheKey` | retention ≠ `none` |
-| Cloudflare GW / Workers / Fireworks | session-affinity headers (+ `prompt_cache_key` on `long`) | retention ≠ `none` (GW/Workers/Fireworks set `sendSessionAffinityHeaders`) |
-| Others (Gemini, Grok, Together, …) | none from pi | relies on provider auto-caching |
+- **Backend (API)**: OpenAI (`openai-responses`)
+  - **Cache hint(s) emitted**: `prompt_cache_key` +
+    `prompt_cache_retention:24h` + session-affinity headers
+  - **Triggered by**: key/headers on any non-`none`; 24h on `long`
+- **Backend (API)**: Azure / Codex Responses
+  - **Cache hint(s) emitted**: `prompt_cache_key` (always) +
+    `prompt_cache_retention:24h` + session-affinity headers
+  - **Triggered by**: key present every request (undefined if no session); 24h
+    on `long`
+- **Backend (API)**: DeepSeek (`openai-completions`)
+  - **Cache hint(s) emitted**: `prompt_cache_key` + `prompt_cache_retention:24h`
+  - **Triggered by**: **only `long` retention**
+- **Backend (API)**: OpenRouter (`openai-completions`)
+  - **Cache hint(s) emitted**: `cache_control` (anthropic/* only) +
+    `prompt_cache_key` + 24h
+  - **Triggered by**: markers always for anthropic/*; key/24h on `long`
+- **Backend (API)**: Anthropic (`anthropic-messages`)
+  - **Cache hint(s) emitted**: `ni_control` markers
+  - **Triggered by**: retention ≠ `none` (ttl 1h on `long`)
+- **Backend (API)**: Bedrock (`bedrock-converse-stream`)
+  - **Cache hint(s) emitted**: `cachePoint` blocks
+  - **Triggered by**: Claude 3.5+/3.7/4/5 or `AWS_BEDROCK_FORCE_CACHE=1`; ttl 1h
+    on `long`
+- **Backend (API)**: Mistral (`mistral-conversations`)
+  - **Cache hint(s) emitted**: `x-affinity` header + `promptCacheKey`
+  - **Triggered by**: retention ≠ `none`
+- **Backend (API)**: Cloudflare GW / Workers / Fireworks
+  - **Cache hint(s) emitted**: session-affinity headers (+ `prompt_cache_key` on
+    `long`)
+  - **Triggered by**: retention ≠ `none` (GW/Workers/Fireworks set
+    `sendSessionAffinityHeaders`)
+- **Backend (API)**: Others (Gemini, Grok, Together, …)
+  - **Cache hint(s) emitted**: none from pi
+  - **Triggered by**: relies on provider auto-caching
 
 ### Bottom line for the two backends you asked about
 
 - **Generic OpenAI (Responses API):** gets `prompt_cache_key` (and thus cache
-  reuse) on *every* turn by default, with 24h retention once `PI_CACHE_RETENTION=long`.
+  reuse) on *every* turn by default, with 24h retention once
+  `PI_CACHE_RETENTION=long`.
 - **DeepSeek (Completions API):** gets *no* cache hint on the default `short`
   retention; only `prompt_cache_key` + `prompt_cache_retention:24h` when run
   with `PI_CACHE_RETENTION=long`, and those params are advisory on the

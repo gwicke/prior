@@ -9,10 +9,12 @@ and displayed.*
 A path in picocode exists in two forms, and which one is correct depends on
 **who performs the I/O** — the process boundary, not the tool:
 
-| | path space | used by |
-|---|---|---|
-| **host** | after remapping, what this process opens | `read`/`write`/`edit`, `glob`, `list` (in-process IO) |
-| **in-sandbox** | what the bwrap namespace sees | everything handed to a child: `sed`→`bsed`, `grep`→`rg`, `bash` |
+- **host**
+  - **path space**: after remapping, what this process opens
+  - **used by**: `read`/`write`/`edit`, `glob`, `list` (in-process IO)
+- **in-sandbox**
+  - **path space**: what the bwrap namespace sees
+  - **used by**: everything handed to a child: `sed`→`bsed`, `grep`→`rg`, `bash`
 
 With no remapping binding the two coincide, which is why these bugs survive
 every test that clears the sandbox. They diverge only under a remap, e.g.
@@ -79,13 +81,14 @@ for code that has an operator-facing sink; it is not prose.
   operator sees exactly what the model sees. `PolicyDenied::operator_message()`
   exists but has nowhere to write: no `tracing` subscriber is installed, so
   `tracing::warn!` is a no-op.
-- **No guard test, except for `edit`.** `no_edit_failure_shows_the_model_a_host_path`
-  runs the tool under a remapping policy and asserts no host path reaches the
-  model, so the rule above is enforced rather than coincidental for that tool.
-  Nothing fails yet if someone writes `format!("cannot read {p}")` with a host
-  `p` in one of the other six — and for those six the messages are still
-  redacted, which is why their tests would pass vacuously. A leak test that
-  asserts on a *redacted* message is not a leak test.
+- **No guard test, except for `edit`.**
+  `no_edit_failure_shows_the_model_a_host_path` runs the tool under a remapping
+  policy and asserts no host path reaches the model, so the rule above is
+  enforced rather than coincidental for that tool. Nothing fails yet if someone
+  writes `format!("cannot read {p}")` with a host `p` in one of the other six —
+  and for those six the messages are still redacted, which is why their tests
+  would pass vacuously. A leak test that asserts on a *redacted* message is not
+  a leak test.
 
 ## When the guard comes off
 

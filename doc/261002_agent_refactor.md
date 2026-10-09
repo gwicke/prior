@@ -3,15 +3,15 @@
 Status: **done.** `agent.rs` 11,889 → 1,685; `interactive.rs`'s
 `run_interactive` decomposed into an `Interactive` struct. Done: step 1
 (`run_interactive` → `src/interactive.rs`), 2a `errors`, 2b `pumps`, 2c
-`status`, 2d `msglog`, 2e `replay`, 2f `compaction`, 2g `transcript`, 2h `build`,
-2i `turn`, and step 3 (`Interactive` struct: `new` / `converge` / `handle_submit`
-/ `run_bang_command` / `run_prompt_turn` / `run`). `CodeAgent::prompt` landed in
-`agent/turn.rs` as a pure move (§4).
+`status`, 2d `msglog`, 2e `replay`, 2f `compaction`, 2g `transcript`, 2h
+`build`, 2i `turn`, and step 3 (`Interactive` struct: `new` / `converge` /
+`handle_submit` / `run_bang_command` / `run_prompt_turn` / `run`).
+`CodeAgent::prompt` landed in `agent/turn.rs` as a pure move (§4).
 
 ## 1. What the file is
 
-11,889 lines. 93 top-level `fn`s, 330 total, 43 `pub`/`pub(crate)` items. Not one
-module — **seven or eight distinct concerns concatenated**, with only two
+11,889 lines. 93 top-level `fn`s, 330 total, 43 `pub`/`pub(crate)` items. Not
+one module — **seven or eight distinct concerns concatenated**, with only two
 section-divider comments in the whole file (lines 3335, 4225).
 
 45% is tests: `mod tests` (4,814) + `mod status_bar_tests` (510) = 5,324.
@@ -19,21 +19,21 @@ Production code ≈ 6,565.
 
 ### Measured clusters (current line numbers)
 
-| Lines | Count | Concern |
-|---|---|---|
-| 57–186 | 130 | `SessionUsage`, `TurnPersistence` |
-| 186–947 | 761 | `CodeAgent::prompt` (**643-line fn**) + `run_once`/`summarize` |
-| 941–1653 | 713 | error classification + retry policy |
-| 974–1307 | 334 | cancellation pumps — **interleaved with the above** |
-| 1674–2154 | 481 | transcript accumulation + message shaping |
-| 2154–3080 | 927 | `AgentConfig`, `create_agent`, `LoggingHook`, `build_rig_agent`, `Guard` |
-| 3263–3335 | 73 | token estimation |
-| 3335–3821 | 487 | session replay |
-| 3821–4678 | 858 | resume prefill + compaction + branch summary |
-| 4678–5056 | 378 | session lifecycle + rebuild gate |
-| 5056–5947 | 892 | `run_interactive` (**892-line fn**, the REPL's main loop) |
-| 5956–6827 | 872 | status bar + `/stat` rendering (pure functions) |
-| 11784–11889 | 106 | `MessageLogger` (after the tests, at EOF) |
+|Lines      |Count|Concern                                                     |
+|-----------|-----|------------------------------------------------------------|
+|57–186     |130  |`SessionUsage`, `TurnPersistence`                           |
+|186–947    |761|`CodeAgent::prompt` (**643-line fn**) + `run_once`/`summarize`|
+|941–1653   |713  |error classification + retry policy                         |
+|974–1307   |334  |cancellation pumps — **interleaved with the above**         |
+|1674–2154  |481  |transcript accumulation + message shaping                   |
+|2154–3080|927|`AgentConfig`, `create_agent`, `LoggingHook`, `build_rig_agent`, `Guard`|
+|3263–3335  |73   |token estimation                                            |
+|3335–3821  |487  |session replay                                              |
+|3821–4678  |858  |resume prefill + compaction + branch summary                |
+|4678–5056  |378  |session lifecycle + rebuild gate                            |
+|5056–5947  |892  |`run_interactive` (**892-line fn**, the REPL's main loop)   |
+|5956–6827  |872  |status bar + `/stat` rendering (pure functions)             |
+|11784–11889|106  |`MessageLogger` (after the tests, at EOF)                   |
 
 Two findings shape everything else:
 
@@ -95,17 +95,17 @@ tests (11223–11331).
 
 Cheapest and least-coupled first; every commit independently green.
 
-| | File | Lines | Note |
-|---|---|---|---|
-| 2a | `agent/errors.rs` | 386 | verified in §2 |
-| 2b | `agent/pumps.rs` | 349 | verified in §2; see coupling warning |
-| 2c | `agent/status.rs` | 880 | carries its 510 `status_bar_tests` |
-| 2d | `agent/msglog.rs` | 106 | self-contained, at EOF today |
-| 2e | `agent/replay.rs` | 487 | |
-| 2f | `agent/compaction.rs` | 858 | largest remaining |
-| 2g | `agent/transcript.rs` | 481 | |
-| 2h | `agent/build.rs` | 927 | |
-| 2i | `agent/turn.rs` + `agent/mod.rs` | ~1,000 | most entangled — last |
+|   |File                            |Lines |Note                              |
+|---|--------------------------------|------|----------------------------------|
+|2a |`agent/errors.rs`               |386   |verified in §2                    |
+|2b |`agent/pumps.rs`                |349 |verified in §2; see coupling warning|
+|2c |`agent/status.rs`               |880   |carries its 510 `status_bar_tests`|
+|2d |`agent/msglog.rs`               |106   |self-contained, at EOF today      |
+|2e |`agent/replay.rs`               |487   |                                  |
+|2f |`agent/compaction.rs`           |858   |largest remaining                 |
+|2g |`agent/transcript.rs`           |481   |                                  |
+|2h |`agent/build.rs`                |927   |                                  |
+|2i |`agent/turn.rs` + `agent/mod.rs`|~1,000|most entangled — last             |
 
 Ends at `agent/` ≈ 4,000 lines, largest file under 1,100.
 
@@ -165,9 +165,10 @@ one of them. Treat this as a **reading pass, not a mechanical move**:
 
 - Some tests don't obviously belong to the cluster their code sits in — the
   `ensure_session` / `new_and_clear` tests (10807, 10916) exercise interactive
-  state, `message_logger_writes_jsonl_file` (9240) sits far from `MessageLogger`.
+  state, `message_logger_writes_jsonl_file` (9240) sits far from
+  `MessageLogger`.
 - Several clusters are already internally sectioned (`// ---- compaction: retry
-  + generate/apply ----` and seven more), which gives a placement order but not
+  - generate/apply ----` and seven more), which gives a placement order but not
   a placement guarantee.
 - Moving a test can surface a test that only passed because of shared module
   state. That is a finding, not an obstacle — but it needs someone who has

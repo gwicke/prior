@@ -7,46 +7,71 @@ comparable to the pi agent (see `doc/pi_provider_caching.md`).
 
 ## Summary
 
-| pi capability | rig-core fork (gwicke/rig @ f31c38c) | picocode app |
-| --- | --- | --- |
-| Anthropic `cache_control` markers (system + last msg) | **Yes** (`apply_cache_control` / `apply_prompt_cache_control`) | **Enabled** — `with_automatic_caching()` (top-level `cache_control`, API auto-advances) |
-| Anthropic `ttl: "1h"` (long retention) | **Yes** — `CacheTtl::OneHour` variant plus `with_automatic_caching_1h()` builder | **Not used** — picocode calls `with_automatic_caching()` (5 min default) |
-| Anthropic cache on last tool definition | **Yes** — `apply_tool_cache_control()` marks the final non-deferred tool | **Covered** — automatic mode sets the breakpoint server-side on the last cacheable block |
-| OpenAI/OpenRouter `cache_control` / `prompt_cache_key` / session-affinity | **Partial** — OpenRouter `with_prompt_caching()` adds `cache_control: {"type": "ephemeral"}` to system prompt; OpenAI responses_api reads `cached_tokens` back but has no send-side hints | **Enabled** for OpenRouter (`with_prompt_caching()`) |
-| Amazon Bedrock cache points | **Yes** — `rig-bedrock` crate has `CachePoint` support in Converse API requests | **Not used** — picocode does not build a Bedrock agent |
-| Read-back of cache usage (input/output tokens) | **Yes** for Anthropic, OpenAI, DeepSeek, Gemini, OpenRouter, Bedrock | **Captured and surfaced** — `SessionUsage` tracks cached/creation tokens; `/stat` displays cache hit rate |
+- **pi capability**: Anthropic `cache_control` markers (system + last msg)
+  - **rig-core fork (gwicke/rig @ f31c38c)**: **Yes** (`apply_cache_control` /
+    `apply_prompt_cache_control`)
+  - **picocode app**: **Enabled** — `with_automatic_caching()` (top-level
+    `cache_control`, API auto-advances)
+- **pi capability**: Anthropic `ttl: "1h"` (long retention)
+  - **rig-core fork (gwicke/rig @ f31c38c)**: **Yes** — `CacheTtl::OneHour`
+    variant plus `with_automatic_caching_1h()` builder
+  - **picocode app**: **Not used** — picocode calls `with_automatic_caching()`
+    (5 min default)
+- **pi capability**: Anthropic cache on last tool definition
+  - **rig-core fork (gwicke/rig @ f31c38c)**: **Yes** —
+    `apply_tool_cache_control()` marks the final non-deferred tool
+  - **picocode app**: **Covered** — automatic mode sets the breakpoint
+    server-side on the last cacheable block
+- **pi capability**: OpenAI/OpenRouter `cache_control` / `prompt_cache_key` /
+  session-affinity
+  - **rig-core fork (gwicke/rig @ f31c38c)**: **Partial** — OpenRouter
+    `with_prompt_caching()` adds `cache_control: {"type": "ephemeral"}` to
+    system prompt; OpenAI responses_api reads `cached_tokens` back but has no
+    send-side hints
+  - **picocode app**: **Enabled** for OpenRouter (`with_prompt_caching()`)
+- **pi capability**: Amazon Bedrock cache points
+  - **rig-core fork (gwicke/rig @ f31c38c)**: **Yes** — `rig-bedrock` crate has
+    `CachePoint` support in Converse API requests
+  - **picocode app**: **Not used** — picocode does not build a Bedrock agent
+- **pi capability**: Read-back of cache usage (input/output tokens)
+  - **rig-core fork (gwicke/rig @ f31c38c)**: **Yes** for Anthropic, OpenAI,
+    DeepSeek, Gemini, OpenRouter, Bedrock
+  - **picocode app**: **Captured and surfaced** — `SessionUsage` tracks
+    cached/creation tokens; `/stat` displays cache hit rate
 
 Verdict: picocode now **actively enables** caching for the two most important
 providers (Anthropic via `with_automatic_caching()`, OpenRouter via
 `with_prompt_caching()`), and **reads back and displays** cache metrics for all
 providers that report them. The only missing send-side piece is OpenAI's native
-chat-completions API (no `prompt_cache_key` / `session_id` / `x-session-affinity`).
+chat-completions API (no `prompt_cache_key` / `session_id` /
+`x-session-affinity`).
 
 ## 1. rig-core fork — Anthropic `cache_control`
 
-File: `crates/rig-core/src/providers/anthropic/completion.rs`
-(inside the gwicke/rig checkout at `~/.cargo/git/checkouts/rig-794bcfddf11aa804/f31c38c/`)
+File: `crates/rig-core/src/providers/anthropic/completion.rs` (inside the
+gwicke/rig checkout at `~/.cargo/git/checkouts/rig-794bcfddf11aa804/f31c38c/`)
 
-- `CacheControl` enum has a single variant `Ephemeral { ttl: Option<CacheTtl> }`.
-  `CacheTtl` has two variants: `FiveMinutes` and `OneHour`. This means rig-core
-  **can** emit `ttl: "1h"` for long retention (unlike pi's `Long` retention, but
-  functionally equivalent).
+- `CacheControl` enum has a single variant
+  `Ephemeral { ttl: Option<CacheTtl> }`. `CacheTtl` has two variants:
+  `FiveMinutes` and `OneHour`. This means rig-core **can** emit `ttl: "1h"` for
+  long retention (unlike pi's `Long` retention, but functionally equivalent).
 - Two caching modes exist:
   1. **Manual prompt caching** (`with_prompt_caching()`, sets
      `self.prompt_caching = true`): `apply_prompt_cache_control()` marks three
      breakpoints — the final non-deferred tool, the system prompt's last content
-     block, and the last content block of the last message. Budgets up to 4 total
-     `cache_control` markers, accounting for any pre-existing tool markers.
+     block, and the last content block of the last message. Budgets up to 4
+     total `cache_control` markers, accounting for any pre-existing tool
+     markers.
   2. **Automatic caching** (`with_automatic_caching()`, sets
      `self.automatic_caching = true`): Adds a top-level `cache_control` field to
      the request. The Anthropic API automatically places the breakpoint on the
      last cacheable block and advances it as history grows. This is the
      recommended approach for multi-turn conversations.
 - `with_automatic_caching_1h()` enables automatic caching with a 1-hour TTL.
-- `apply_tool_cache_control()` (line ~2042) marks the **final non-deferred tool**
-  with `cache_control`. Tools carry an optional `cache_control` field in
-  `ToolDefinition`; existing markers are preserved and counted toward the 4-marker
-  budget.
+- `apply_tool_cache_control()` (line ~2042) marks the
+  **final non-deferred tool** with `cache_control`. Tools carry an optional
+  `cache_control` field in `ToolDefinition`; existing markers are preserved and
+  counted toward the 4-marker budget.
 - `validate_cache_control_ttl_order()` ensures `1h` markers appear before `5m`
   markers (Anthropic API constraint).
 - Read-back: `CompletionResponse` exposes `cache_read_input_tokens` /
@@ -63,16 +88,17 @@ beta header; the API manages the breakpoint automatically.
 
 ### OpenAI chat completions
 
-- `src/providers/openai/completion/mod.rs` — reads `prompt_tokens_details.cached_tokens`
-  back from responses and maps into `Usage.cached_input_tokens`. No send-side
-  cache hints (`cache_control`, `prompt_cache_key`, etc.).
+- `src/providers/openai/completion/mod.rs` — reads
+  `prompt_tokens_details.cached_tokens` back from responses and maps into
+  `Usage.cached_input_tokens`. No send-side cache hints (`cache_control`,
+  `prompt_cache_key`, etc.).
 
 ### OpenAI responses API
 
 - `src/providers/openai/responses_api/mod.rs` — exposes `cached_tokens` in the
-  usage struct (read-back only) and a `prompt_cache_key` / `prompt_cache_retention`
-  field on the request struct (lines ~1657–1662). picocode currently does not
-  set these fields.
+  usage struct (read-back only) and a `prompt_cache_key` /
+  `prompt_cache_retention` field on the request struct (lines ~1657–1662).
+  picocode currently does not set these fields.
 
 ### OpenRouter
 
@@ -136,24 +162,27 @@ Files: `src/agent.rs`
   `cache_creation_input_tokens` per-request into `SessionUsage`. The `/stat`
   command (via `session_stats_lines()`, lines ~1285–1351) displays a cache hit
   rate line:
-  ```
+
+  ```text
   cache hit rate       : 45.2% (read 4520 / written 350 / fresh 5500 tokens)
   ```
+
   When no cache metrics are reported, it shows:
-  ```
+
+  ```text
   cache hit rate       : n/a (provider reported no cache metrics)
   ```
 
 ## 7. Providers with no caching support at all
 
 These providers have no send-side cache hints and no cache read-back in their
-rig provider implementations: Azure, Cohere, ChatGPT, Copilot, Groq, HuggingFace,
-Hyperbolic, Llamafile, Mira, Minimax, Mistral, Moonshot, Ollama, Perplexity,
-Together, xAI, XiaomiMimo, Doubleword.
+rig provider implementations: Azure, Cohere, ChatGPT, Copilot, Groq,
+HuggingFace, Hyperbolic, Llamafile, Mira, Minimax, Mistral, Moonshot, Ollama,
+Perplexity, Together, xAI, XiaomiMimo, Doubleword.
 
-**ZAI** is an exception: the OpenAI-compatible path now benefits from the generic
-`with_prompt_caching()` added to the shared `GenericCompletionModel` (see §8.5),
-and the Anthropic-compatible endpoint (`zai-anthropic`) uses
+**ZAI** is an exception: the OpenAI-compatible path now benefits from the
+generic `with_prompt_caching()` added to the shared `GenericCompletionModel`
+(see §8.5), and the Anthropic-compatible endpoint (`zai-anthropic`) uses
 `with_automatic_caching()`.
 
 ## Notes
@@ -176,8 +205,8 @@ and the Anthropic-compatible endpoint (`zai-anthropic`) uses
 `ProviderPreferences` with `.order(["anthropic"]).allow_fallbacks(true)` and
 merges it into `additional_params` on every request. This pins OpenRouter to the
 `anthropic` upstream first, so cache state accumulates across turns instead of
-being invalidated by load-balancing. Falls back to other upstreams if `anthropic`
-is unavailable.
+being invalidated by load-balancing. Falls back to other upstreams if
+`anthropic` is unavailable.
 
 ### 8.2 ✅ OpenRouter — `cache_control` on conversation history
 
@@ -211,8 +240,8 @@ in `/stat`.
 **Status: Implemented.** Added to the rig fork in
 `crates/rig-core/src/providers/openai/completion/mod.rs`:
 
-- **`GenericCompletionModel::with_prompt_caching()`**: sets `self.prompt_caching`
-  on any OpenAI-compatible model handle.
+- **`GenericCompletionModel::with_prompt_caching()`**: sets
+  `self.prompt_caching` on any OpenAI-compatible model handle.
 - **Default `finalize_request_body_with_options()`**: now calls
   `apply_prompt_caching(body)` when `options.prompt_caching` is true.
 - **Shared `apply_prompt_caching()`**: a `pub(crate)` function that marks both
@@ -221,9 +250,9 @@ in `/stat`.
   and the OpenRouter override.
 
 This means any OpenAI-compatible provider (Groq, DeepSeek, Together, Perplexity,
-xAI, ZAI, etc.) can now enable prompt caching by calling `.with_prompt_caching()`
-on the model builder. Providers that do not support the `cache_control` field
-silently ignore it.
+xAI, ZAI, etc.) can now enable prompt caching by calling
+`.with_prompt_caching()` on the model builder. Providers that do not support the
+`cache_control` field silently ignore it.
 
 ### 8.6 ✅ `additional_params` plumbing through the agent layer
 
@@ -234,6 +263,7 @@ silently ignore it.
 provide fine-grained control. No rig fork changes were needed for this.
 
 picocode uses this plumbing to inject:
+
 - `think_json` (thinking/reasoning configuration) for all providers
 - OpenRouter `ProviderPreferences` (provider pinning) merged with `think_json`
 
@@ -248,12 +278,31 @@ in interactive sessions.
 
 All items from the original plan have been implemented:
 
-| Priority | What | Where | Status |
-| --- | --- | --- | --- |
-| P0 | ZAI Anthropic-compatible `with_automatic_caching()` | `src/agent.rs` | ✅ Done |
-| P1 | Generic `with_prompt_caching()` on OpenAI-compatible path | rig fork | ✅ Done |
-| P1 | Plumb `additional_params` through `AgentBuilder` | rig fork (already existed) | ✅ Already done |
-| P2 | OpenRouter provider pinning via `ProviderPreferences` | `src/agent.rs` + rig fork | ✅ Done |
-| P2 | Switch Anthropic to 1-hour TTL | `src/agent.rs` | ✅ Done |
-| P3 | OpenRouter conversation-history `cache_control` | rig fork | ✅ Done |
-| P3 | OpenAI responses API `prompt_cache_key` | rig fork + `src/agent.rs` | ❌ Not implemented (picocode doesn't use responses API) |
+- P0
+  - ZAI Anthropic-compatible `with_automatic_caching()`
+  - `src/agent.rs`
+  - ✅ Done
+- P1
+  - Generic `with_prompt_caching()` on OpenAI-compatible path
+  - rig fork
+  - ✅ Done
+- P1
+  - Plumb `additional_params` through `AgentBuilder`
+  - rig fork (already existed)
+  - ✅ Already done
+- P2
+  - OpenRouter provider pinning via `ProviderPreferences`
+  - `src/agent.rs` + rig fork
+  - ✅ Done
+- P2
+  - Switch Anthropic to 1-hour TTL
+  - `src/agent.rs`
+  - ✅ Done
+- P3
+  - OpenRouter conversation-history `cache_control`
+  - rig fork
+  - ✅ Done
+- P3
+  - OpenAI responses API `prompt_cache_key`
+  - rig fork + `src/agent.rs`
+  - ❌ Not implemented (picocode doesn't use responses API)

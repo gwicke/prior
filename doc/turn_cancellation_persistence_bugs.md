@@ -66,8 +66,8 @@ On a normal `Done`, the `FinalResponse` is built from `new_messages` only:
   `final_item` surfaces `Some(response.messages.clone() …)` (the current turn
   only; `chat_history` is **not** included).
 
-So `resp.messages()` returns just `[user, assistant]` for *this* prompt — it does
-**not** contain the prior conversation.
+So `resp.messages()` returns just `[user, assistant]` for *this* prompt — it
+does **not** contain the prior conversation.
 
 ### The mismatch
 
@@ -103,14 +103,14 @@ source of the context loss.
 (completion call, completion response, model-turn finished, tool call, tool
 result) whenever `user_cancel` is set.
 
-> **Update (U4.3 + U4.5 + U4.6).** The reader no longer sets the flag: `Esc` rides
-> the forwarded queue (menu-first needs a session to look at) and the turn's
-> key dispatcher sets it — `prompt()`'s key branch while an attempt streams,
-> the back-off pump (`cancellable_sleep_pumped`) while a retry delay runs
-> between attempts, and the compaction window's `WindowKeySource` poll
-> (`retry_summarization`) during a summarization, which has no reader at
-> all. The mechanism below (flag → `LoggingHook` → rig `Stop`) is unchanged;
-> only who *raises* the flag moved.
+> **Update (U4.3 + U4.5 + U4.6).** The reader no longer sets the flag: `Esc`
+> rides the forwarded queue (menu-first needs a session to look at) and the
+> turn's key dispatcher sets it — `prompt()`'s key branch while an attempt
+> streams, the back-off pump (`cancellable_sleep_pumped`) while a retry delay
+> runs between attempts, and the compaction window's `WindowKeySource` poll
+> (`retry_summarization`) during a summarization, which has no reader at all.
+> The mechanism below (flag → `LoggingHook` → rig `Stop`) is unchanged; only who
+> *raises* the flag moved.
 
 In the rig streaming driver, **every** `Stop`/`Terminate` path terminates the
 run as a terminal **error** and never emits a `FinalResponse`:
@@ -134,7 +134,8 @@ The `?` propagates the error out of `prompt()`, so the write-back block
 
 Consequences of an abort:
 
-- The aborted user prompt **and** any partial assistant text are never committed.
+- The aborted user prompt **and** any partial assistant text are never
+  committed.
 - Because the write-back is skipped, `history` keeps its previous value. Abort
   therefore does **not** wipe the *prior* turns; it only discards the in-flight
   one.
@@ -185,9 +186,9 @@ history it could have persisted.
    instead of a generic `Error:`.
 
 3. **Hygiene.** **Implemented.** `user_cancel` is reset at the start of each
-   `prompt()` (with a comment documenting that the in-flight reader's `done` flag
-   and `cancel` are mutually consistent across abort → next prompt), so a stale
-   cancel cannot leak into the next turn.
+   `prompt()` (with a comment documenting that the in-flight reader's `done`
+   flag and `cancel` are mutually consistent across abort → next prompt), so a
+   stale cancel cannot leak into the next turn.
 
 4. **Tests.** **Implemented.** `src/agent.rs` now has regression tests covering
    the persistence contract:
@@ -201,24 +202,29 @@ history it could have persisted.
 ## 5. Key references
 
 picocode (`src/agent.rs`):
+
 - `prompt()` body: `:44-119`
 - cancel-flag reset: `:52`
 - `prior` clone: `:56`
 - `history(prior)`: `:68`
 - `final_history` recorded: `:101`
 - write-back (replace): `:110-116`
-- `run_interactive` `history` owner: `:657`; `prompt(&input, Some(&mut history))`: `:807`, `:816`
+- `run_interactive` `history` owner: `:657`;
+  `prompt(&input, Some(&mut history))`: `:807`, `:816`
 - `LoggingHook` `Stop` outcomes: `:397-459`
 
 picocode (`src/repl.rs`):
+
 - in-flight reader sets `cancel` on `<Esc>`: `:107`
 
 rig fork (`~/.cargo/git/.../rig-core`):
+
 - blocking `chat()` extends history: `src/agent/completion.rs:683-691`
 - `AgentRun::new` / `with_history`: `src/agent/run/mod.rs:300-346`
 - `Done` builds `response.messages = new_messages` (current turn only):
   `:731`, `:802`
 - `prompt_cancelled` carries `full_history()`: `:573`
-- streaming driver yields `Err` on every `Stop`/`Terminate` (no `FinalResponse`):
-  `src/agent/prompt_request/streaming.rs:521-524`, `:1372-1392`
+- streaming driver yields `Err` on every `Stop`/`Terminate` (no
+  `FinalResponse`): `src/agent/prompt_request/streaming.rs:521-524`,
+  `:1372-1392`
 - `final_item` surfaces current-turn `response.messages`: `:1455-1480`

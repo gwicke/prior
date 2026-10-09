@@ -34,8 +34,8 @@ A temporary env-gated trace (since removed — see §9) logged every consumed
 
 - **Every model turn** emits, in order: `ReasoningDelta`… then `Text`… then
   `ToolCallDelta`… then `CompletionCall` (→ `end_response_segment`), then the
-  `CallTools` step where `HOOK on_tool_call`/`on_tool_result` print. So the model
-  streams reasoning **before** text **before** the tool call, every turn.
+  `CallTools` step where `HOOK on_tool_call`/`on_tool_result` print. So the
+  model streams reasoning **before** text **before** the tool call, every turn.
 - **The final turn** = `532 × ReasoningDelta`, then `665 × Text`, then
   `CompletionCall`, `FinalResponse`. Reasoning is streamed **first**, the answer
   **second**.
@@ -50,8 +50,9 @@ reasoning live, §6).
 ## 3. Faithful replay reproduces it, minimal replay does not [VERIFIED]
 
 Replaying the **real** final-turn reasoning then text (extracted from the trace)
-through the real `ConsoleOutput` under a PTY: the reasoning's tail ("Let me write
-it.") renders at the very end, after the whole answer — in **both** hold states.
+through the real `ConsoleOutput` under a PTY: the reasoning's tail ("Let me
+write it.") renders at the very end, after the whole answer — in **both** hold
+states.
 
 A **minimal** single-turn replay (reasoning = two plain paragraphs, then answer)
 renders **correctly** (reasoning above answer). So the trigger is the *content
@@ -68,7 +69,7 @@ is a strong correlation, not a hard rule.
 
 Feeding the real reasoning to `markdown_stream::StreamParser` in chunks:
 
-```
+```text
 events from write():        22      # rendered live while streaming
 events from "\n\n" commit:   0      # what end_response_segment / stream_text emit
 events ONLY from flush():   101      # the stranded bulk
@@ -76,15 +77,16 @@ events ONLY from flush():   101      # the stranded bulk
 
 Construct isolation (same parser):
 
-```
+```text
 plain paragraph              write=0  after \n\n=4   flush-only=1
 trailing bullet list         write=4  after \n\n=0   flush-only=12   ← culprit
 list then paragraph          write=4  after \n\n=11  flush-only=1
 ```
 
 A **trailing bullet/numbered list** emits nothing on `write("\n\n")` and is only
-released by `flush()` — because GFM must see a non-list line (or EOF) to know the
-list ended and whether it's loose/tight (`codewandler-markdown/crates/markdown-stream`).
+released by `flush()` — because GFM must see a non-list line (or EOF) to know
+the list ended and whether it's loose/tight
+(`codewandler-markdown/crates/markdown-stream`).
 
 picocode commits the *thinking* parser with `write(b"\n\n")` in three places and
 **never** `flush()` mid-response:
@@ -117,29 +119,31 @@ tables, fences) is ever stranded across the answer.
 
 ## 5. SECONDARY BUG: `flush_held_answer` drops the answer's last paragraph [VERIFIED]
 
-`src/output.rs:623-626` renders the held answer with `local_parser.write(buffer)`
-and **never** `local_parser.flush()`. By the same parser semantics, an answer
-whose final paragraph lacks a trailing blank line is never emitted (PTY-confirmed
-in HOLD mode: the answer's last paragraph vanishes). Independent of §4. Fix: add
-`local_parser.flush()` and feed those events too.
+`src/output.rs:623-626` renders the held answer with
+`local_parser.write(buffer)` and **never** `local_parser.flush()`. By the same
+parser semantics, an answer whose final paragraph lacks a trailing blank line is
+never emitted (PTY-confirmed in HOLD mode: the answer's last paragraph
+vanishes). Independent of §4. Fix: add `local_parser.flush()` and feed those
+events too.
 
 Because of this, and because `flush_held_answer` always commits thinking *above*
-the answer, the answer-hold path (`thinking_level != Off`) both mis-drops content
-and cannot produce the reported "reasoning below a complete answer" — consistent
-with the run behaving as hold-off. (Whether the hold engaged is now moot: §4 is
-the real cause and occurs regardless of hold state, as shown in §3.)
+the answer, the answer-hold path (`thinking_level != Off`) both mis-drops
+content and cannot produce the reported "reasoning below a complete answer" —
+consistent with the run behaving as hold-off. (Whether the hold engaged is now
+moot: §4 is the real cause and occurs regardless of hold state, as shown in §3.)
 
 ---
 
 ## 6. rig does not reorder the consumer stream [VERIFIED]
 
 - OpenRouter reuses the shared OpenAI chat streamer
-  (`openai_chat_completions_compatible.rs`), which yields only `ReasoningDelta` +
-  `Message`, never a complete `RawStreamingChoice::Reasoning`; the fork's dedup
-  commit `f31c38c2` is unreachable here.
+  (`openai_chat_completions_compatible.rs`), which yields only
+  `ReasoningDelta` + `Message`, never a complete
+  `RawStreamingChoice::Reasoning`; the fork's dedup commit `f31c38c2` is
+  unreachable here.
 - The assembler (`agent/run/streamed.rs::ingest`) forwards `Reasoning` /
-  `ReasoningDelta` as `EmitIngested` (live); tool calls are buffered and surfaced
-  in the next `CallTools` step. Its reasoning-before-text reordering
+  `ReasoningDelta` as `EmitIngested` (live); tool calls are buffered and
+  surfaced in the next `CallTools` step. Its reasoning-before-text reordering
   (`ordered_streaming_assistant_content`) applies **only to persisted history**.
 
 Confirmed by §2: reasoning items arrive live, before text, per turn. The
@@ -155,19 +159,20 @@ draft; corrected here:
 1. **False claim retracted:** the earlier draft said `thinking_order.md` "cites
    unit tests that do not exist." They **do exist** —
    `late_reasoning_answer_is_withheld_until_turn_end` (`src/output.rs:1569`) and
-   `answer_not_withheld_when_reasoning_disabled` (`src/output.rs:1597`), added in
-   `d554663`. (`thinking_order.md`'s *"guarantees ordering"* claim is still
+   `answer_not_withheld_when_reasoning_disabled` (`src/output.rs:1597`), added
+   in `d554663`. (`thinking_order.md`'s *"guarantees ordering"* claim is still
    wrong — §5 shows the hold path is broken — but the tests exist. Note also
    neither test covers §5's dropped-paragraph case or §4 at all.)
 2. **Overstatement fixed:** the hold does not commit thinking "unconditionally";
    `flush_held_answer` gates the thinking commit on `was_thinking` (dim state,
-   `output.rs:614`) — true in a reasoning run, so substantively but not literally
-   unconditional.
+   `output.rs:614`) — true in a reasoning run, so substantively but not
+   literally unconditional.
 3. **Imprecision fixed:** `LoggingHook` calls `display_tool_call` /
    `display_tool_result` (which print and call `stop_thinking`), not
    `stop_thinking` directly.
-4. **Retracted guess:** "hy3 emits reasoning even when thinking is off" was never
-   verified and is moot (thinking was high; the `reasoning` param was sent).
+4. **Retracted guess:** "hy3 emits reasoning even when thinking is off" was
+   never verified and is moot (thinking was high; the `reasoning` param was
+   sent).
 
 ---
 
@@ -222,6 +227,7 @@ stdout/stderr redirected to separate files.
   immediately after the reasoning with no empty line.
 
 **Verification:**
+
 - Replaying the real captured final turn through the fixed `ConsoleOutput`
   (PTY): the reasoning (incl. its trailing list "…Let me write it.") now renders
   **before** the answer; nothing leaks below it; the held answer's last

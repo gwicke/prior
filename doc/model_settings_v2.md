@@ -14,15 +14,15 @@ TOML editor, and ephemeral per-turn overrides at the tail of a prompt.
 
 ---
 
-# Part A — Technical design
+## Part A — Technical design
 
-## A.1 Current state (what already exists)
+### A.1 Current state (what already exists)
 
 **The params funnel is narrow — one place to extend.** There is exactly one
 `additional_params` producer:
 
-- `src/thinking.rs:53` `mapping(provider, level) -> Option<Value>` — per-provider
-  JSON for the five internal levels.
+- `src/thinking.rs:53` `mapping(provider, level) -> Option<Value>` —
+  per-provider JSON for the five internal levels.
 - `src/agent.rs:1466` computes it once in `create_agent`;
   `src/agent.rs:1499` folds OpenRouter's `ProviderPreferences` into it
   (`merge_openrouter_params`, `agent.rs:1434`);
@@ -33,12 +33,12 @@ TOML editor, and ephemeral per-turn overrides at the tail of a prompt.
   `model_changed || thinking_changed || persona_changed` against the *running*
   config and calls `create_agent` once per distinct target.
 
-**Settings persistence** (`src/settings.rs`): `SettingsStore` is the one in-memory
-copy; `save()` (`settings.rs:544`) round-trips `settings.toml` through
+**Settings persistence** (`src/settings.rs`): `SettingsStore` is the one
+in-memory copy; `save()` (`settings.rs:544`) round-trips `settings.toml` through
 `toml_edit::DocumentMut`, preserving comments and `[recipes.*]`. `Config`
 (`config.rs:878`) has no `deny_unknown_fields`, so new top-level tables are
-backward compatible. `SettingsStore` is built from the resolved `AgentConfig`
-at startup (`main.rs:323`), *not* from the file — new file-backed data must be
+backward compatible. `SettingsStore` is built from the resolved `AgentConfig` at
+startup (`main.rs:323`), *not* from the file — new file-backed data must be
 threaded explicitly. `SettingsStore { … }` is constructed literally in 33
 places; adding a field is wide but purely mechanical.
 
@@ -57,16 +57,17 @@ back, `View` is read-only. The two-phase prepare → editor → confirm → subm
 pattern is established by compaction (`v25_tree.rs:1385-1482`).
 
 **The catalog** (`src/model_catalog.rs:49` `ModelEntry`) is built from
-OpenRouter's public `/api/v1/models` (`parse_openrouter`, `model_catalog.rs:253`)
-plus curated `DIRECT_PRICING`. It currently keeps only
+OpenRouter's public `/api/v1/models` (`parse_openrouter`,
+`model_catalog.rs:253`) plus curated `DIRECT_PRICING`. It currently keeps only
 `supported_parameters.contains("reasoning")` and **drops** `description`,
 `temperature`/`top_p` support, and the `reasoning.supported_efforts` list.
 
 **rig capabilities** (checked against the pinned rev `1c2f440`):
-- `AgentBuilder::temperature(f64)` sets the typed `CompletionRequest.temperature`
-  field, which each provider maps to its own spelling (OpenAI/Anthropic flat,
-  Gemini → `generationConfig.temperature`, `gemini/completion.rs:362`).
-  **Provider-correct for free.**
+
+- `AgentBuilder::temperature(f64)` sets the typed
+  `CompletionRequest.temperature` field, which each provider maps to its own
+  spelling (OpenAI/Anthropic flat, Gemini → `generationConfig.temperature`,
+  `gemini/completion.rs:362`). **Provider-correct for free.**
 - `top_p` has no typed field anywhere. It must go through `additional_params`,
   which is `#[serde(flatten)]`-ed into the request body for OpenAI/Anthropic/
   OpenRouter — **but Gemini parses it into a typed
@@ -77,7 +78,7 @@ plus curated `DIRECT_PRICING`. It currently keeps only
   `.temperature()`, `.merge_additional_params(map)` and
   `.without_additional_params()` — **per-turn overrides need no agent rebuild**.
 
-## A.2 Data model
+### A.2 Data model
 
 One struct for "the params of a model", used by every layer (live, stored,
 per-turn):
@@ -94,9 +95,9 @@ pub struct ModelParams {
 }
 ```
 
-`ReasoningLevel` is the hard rename of `ThinkingLevel` (`Off | Low | Med | High |
-Max`); the internal ladder and its `FromStr`/`as_str` are unchanged, so
-`/reasoning med` keeps working verbatim.
+`ReasoningLevel` is the hard rename of `ThinkingLevel`
+(`Off | Low | Med | High | Max`); the internal ladder and its `FromStr`/`as_str`
+are unchanged, so `/reasoning med` keeps working verbatim.
 
 `AgentConfig.thinking_level: Option<String>` is replaced by
 `AgentConfig.params: ModelParams`. `AgentConfig` derives `Clone`, and
@@ -163,7 +164,7 @@ impl ModelSettings {
 }
 ```
 
-## A.3 Catalog enrichment
+### A.3 Catalog enrichment
 
 `ModelEntry` (`model_catalog.rs:49`) gains four fields, all parsed from the
 OpenRouter payload:
@@ -181,11 +182,11 @@ pub default_top_p: Option<f64>,         // data[].default_parameters.top_p
 
 `supported_parameters` is **not** retained: it is a ~20-element array and the
 catalog is 300–460 entries held in a process-wide cache. Two booleans capture
-all we need, derived once at parse time. `reasoning_levels` is kept verbatim
-(at most ~6 short strings) because §A.4 needs it. `default_parameters` also
-carries `top_k` / `frequency_penalty` / `presence_penalty` / `repetition_penalty`
-and explicit `null`s; we read only the two keys we model and treat `null` as
-"no default published".
+all we need, derived once at parse time. `reasoning_levels` is kept verbatim (at
+most ~6 short strings) because §A.4 needs it. `default_parameters` also carries
+`top_k` / `frequency_penalty` / `presence_penalty` / `repetition_penalty` and
+explicit `null`s; we read only the two keys we model and treat `null` as "no
+default published".
 
 *Measured against the live API* (60 most-popular models, 2026-09-29): only
 **19 of 60** publish a `temperature`/`top_p` default, and the values are **not**
@@ -202,6 +203,7 @@ nulls for everything). So the header must **not** hardcode a "typical" 1.0 /
 `tencent/hy4-preview` is `["high","low","none"]`.
 
 Consequences:
+
 - `/temperature` and `/top_p` can say "this model does not expose temperature"
   in the header, and can warn on set instead of letting the provider 400.
 - `/reasoning med` on `deepseek/v4.1-flash` no longer sends an effort the model
@@ -212,7 +214,7 @@ fills every field it leaves `None`. The resolved view is built in one place
 (`model_catalog::resolved_entry(id) -> Option<ModelEntry>`), used by the header,
 `/stat`, and the editor prefill.
 
-## A.4 Provider mapping
+### A.4 Provider mapping
 
 `src/thinking.rs` becomes `src/params.rs` (the module's doc comment already
 describes itself as the `additional_params` bridge). One entry point:
@@ -245,7 +247,7 @@ the *internal* levels, and an alias set per rank so a backend spelling is
 recognized however the provider spells it. A **third** source sits in front of
 the ladder: a provider's own documented request table (§A.4.1).
 
-```
+```text
 internal:      off=0  low=1  med=2  high=3  max=4
 aliases:       {off,none,disabled} {low,minimal} {med,medium} {high} {max,xhigh,x-high}
 ```
@@ -269,13 +271,13 @@ So `/reasoning med` on `["max","high","low"]` sends `low`, and on
 menu keeps the static five-level list, and the *model header* is the only
 place the backend's view surfaces (`supported efforts: low, high, max`).
 
-### A.4.1 The provider's own request table
+#### A.4.1 The provider's own request table
 
 The step-down ladder is wrong for a provider that *accepts* an effort it does
 not advertise. DeepSeek documents exactly that
 (`api-docs.deepseek.com/guides/thinking_mode/`):
 
-```
+```text
 requested   served
 minimal  →  low
 low      →  low
@@ -314,7 +316,7 @@ The header reads its answer through `params::resolve_effort_for`, which derives
 the on-the-wire spelling from `mapping()` itself rather than re-deriving it, so
 the disclosed mapping cannot drift from the request that is sent.
 
-## A.5 Settings storage
+### A.5 Settings storage
 
 New top-level table in `settings.toml`, one entry per `provider:model`:
 
@@ -382,7 +384,7 @@ temperature = 0.8
     `save` means, but it is worth knowing a no-op-looking `save` is not a
     byte-level no-op.
 
-## A.6 Runtime state
+### A.6 Runtime state
 
 `State` (`app_state.rs:138`) gains two fields, alongside the existing runtime
 target `config: AgentConfig`:
@@ -410,18 +412,18 @@ record, and pre-seeding would make it find its own entry and never get there.
 with the app-state lock rules honored (one acquisition per public method, no
 file IO under the guard — clone, drop, write):
 
-| method | role |
-|---|---|
-| `params() -> ModelParams` | read the live params |
-| `set_param(k, v)` / `set_reasoning(l)` | one live field (menu writes) |
-| `activate_model_params(id)` | load-or-seed on activation (§A.7) |
-| `model_settings(id) -> Option<ModelSettings>` | stored record (editor, header) |
-| `apply_model_settings(id, &ModelSettings)` | record in memory, no write |
-| `update_settings(f)` | mutate the store and persist, write outside the lock |
+|method                                       |role                            |
+|---------------------------------------------|--------------------------------|
+|`params() -> ModelParams`                    |read the live params            |
+|`set_param(k, v)` / `set_reasoning(l)`       |one live field (menu writes)    |
+|`activate_model_params(id)`                 |load-or-seed on activation (§A.7)|
+|`model_settings(id) -> Option<ModelSettings>`|stored record (editor, header)  |
+|`apply_model_settings(id, &ModelSettings)`   |record in memory, no write      |
+|`update_settings(f)`     |mutate the store and persist, write outside the lock|
 
 **Seeding rule** (`activate_model_params`) — **per field**, never per record:
 
-```
+```text
 model_param_map[id] exists?          → use it, done (a → b → a)
 else for each field f in {reasoning, temperature, top_p}:
     stored[id].f                → use it
@@ -443,7 +445,7 @@ entry does not exist yet, so the next activation seeds from the freshly stored
 values. If it *has* been activated, the live values win until the user changes
 them (or runs `save`, which copies live → stored).
 
-## A.7 Convergence
+### A.7 Convergence
 
 In `run_interactive`'s convergence step (`agent.rs:3635`):
 
@@ -464,14 +466,14 @@ In `run_interactive`'s convergence step (`agent.rs:3635`):
 4. `record_thinking_change` → `record_reasoning_change` (same journal entry; see
    A.11 renames).
 
-## A.8 Menu
+### A.8 Menu
 
-### `/model <id>` → an action listing
+#### `/model <id>` → an action listing
 
 `ModelNode` keeps `data()` (the catalog rows, which feed the `/model` listing)
 and **gains children**, making the drilled level a listing:
 
-```
+```text
 /model                       (listing: the static "model" row)
 └── ModelNode                (data() = catalog rows; now a listing)
     ├── activate             (set this model active — journal ModelChange)
@@ -523,14 +525,14 @@ against the session's recorded level, so it is the *runtime* level being
 restored, not a default one, and a level that does not parse is dropped rather
 than pre-filled. Outcomes:
 
-| model vs live | level vs what activation installs | prefill |
-|---|---|---|
-| differs | reproduces it (or none recorded) | `/model <id>` |
-| differs | differs | `/model <id> activate <level>` |
-| same | differs | `/model <id> activate <level>` |
-| same | reproduces it | *(none)* |
+|model vs live|level vs what activation installs|prefill                       |
+|-------------|---------------------------------|------------------------------|
+|differs      |reproduces it (or none recorded) |`/model <id>`                 |
+|differs      |differs                          |`/model <id> activate <level>`|
+|same         |differs                          |`/model <id> activate <level>`|
+|same         |reproduces it                    |*(none)*                      |
 
-### `/reasoning`, `/temperature`, `/top_p`
+#### `/reasoning`, `/temperature`, `/top_p`
 
 - `/reasoning` — the renamed `ThinkingEnumNode` (`v25_thinking.rs:20`), same
   static five-level list, now writing `set_param(Reasoning)`.
@@ -569,7 +571,7 @@ key, the value and the range. A value inside our range but outside a known
 provider's (Anthropic caps temperature at 1.0) is accepted with a warning in the
 header rather than rejected — see Risks.
 
-## A.9 The TOML editor routine (reusable)
+### A.9 The TOML editor routine (reusable)
 
 New module `src/settings_editor.rs` — deliberately **not** a method on the model
 node, since "edit settings via toml" is meant to be reused (a future `/set`
@@ -617,11 +619,11 @@ pub fn edit_fragment(
   a pipe) is `Unavailable`, which the node reports as an error rather than
   silently treating it as "nothing changed".
 
-## A.10 Per-turn overrides
+### A.10 Per-turn overrides
 
 At the tail of a submitted (non-menu) prompt:
 
-```
+```text
 explain this function
 /temperature 0.2
 /top_p 0.9
@@ -667,7 +669,7 @@ pub fn split(input: &str) -> Split;
 
 **Wiring** in the `Submit` arm (`agent.rs:3790`):
 
-```
+```text
 line_history.add(&input);              // RAW — the user recalls what they typed
 let split = turn_overrides::split(&input);
 for w in &split.warnings { output.display_text(w) }
@@ -702,22 +704,38 @@ History/session, per the decision: **prompt history keeps the raw text**
 persists the stripped text** (the model never sees the directive lines). The
 same split runs in the quiet/pipe path — both funnel through this arm.
 
-## A.11 Renames (all hard breaks)
+### A.11 Renames (all hard breaks)
 
-| Old | New | Notes |
-|---|---|---|
-| `/thinking` | `/reasoning` | menu row, root listing test (`v25_menu.rs:190`) |
-| `ThinkingLevel` | `ReasoningLevel` | `thinking.rs`, `settings.rs`, `agent.rs` |
-| `AgentConfig.thinking_level` | `AgentConfig.params: ModelParams` | + `AppState::thinking()` → `model_params()` |
-| `settings.toml` `default_thinking_level` | `default_reasoning_level` | `/set` writes the new key |
-| `SettingsStore.default_thinking_level` | `.default_reasoning_level` | 33 test constructors |
-| `record_thinking_change` | `record_reasoning_change` | fn name only |
-| **journal `thinking_level_change` / `thinkingLevel`** | **unchanged** | on-disk session format is a compatibility surface — old sessions must still replay; the value vocabulary is identical, so no data migration is needed |
-| `thinking.rs` | `params.rs` | the `additional_params` bridge |
+- **Old**: `/thinking`
+  - **New**: `/reasoning`
+  - **Notes**: menu row, root listing test (`v25_menu.rs:190`)
+- **Old**: `ThinkingLevel`
+  - **New**: `ReasoningLevel`
+  - **Notes**: `thinking.rs`, `settings.rs`, `agent.rs`
+- **Old**: `AgentConfig.thinking_level`
+  - **New**: `AgentConfig.params: ModelParams`
+  - **Notes**: + `AppState::thinking()` → `model_params()`
+- **Old**: `settings.toml` `default_thinking_level`
+  - **New**: `default_reasoning_level`
+  - **Notes**: `/set` writes the new key
+- **Old**: `SettingsStore.default_thinking_level`
+  - **New**: `.default_reasoning_level`
+  - **Notes**: 33 test constructors
+- **Old**: `record_thinking_change`
+  - **New**: `record_reasoning_change`
+  - **Notes**: fn name only
+- **Old**: **journal `thinking_level_change` / `thinkingLevel`**
+  - **New**: **unchanged**
+  - **Notes**: on-disk session format is a compatibility surface — old sessions
+    must still replay; the value vocabulary is identical, so no data migration
+    is needed
+- **Old**: `thinking.rs`
+  - **New**: `params.rs`
+  - **Notes**: the `additional_params` bridge
 
 ---
 
-# Part B — Implementation plan
+## Part B — Implementation plan
 
 Each phase is independently green; P0–P1 are the prerequisite for the rest.
 
@@ -758,6 +776,7 @@ from the real payloads; rebuild-gate tests that a param change rebuilds once
 and re-arms correctly.
 
 **P1 addendum — three shapes the implementation settled.**
+
 - **The rebuild gate is now a pure function.** `plan_rebuild(applied, target,
   last_attempt) -> Option<RebuildFingerprint>` was extracted from the
   convergence step, because both of its invariants ("only a real change
@@ -766,10 +785,10 @@ and re-arms correctly.
   locals — the rebuild body and the error message still branch on them.
 - **`mapping_opt` is gone.** `additional_params` takes the typed `ModelParams`;
   a string-typed entry point would be a way to bypass the composed producer and
-  silently lose the `top_p` and remap handling. Two `ReasoningSupport` tie-breaks
-  are pinned by tests: an exact rank match keeps the model's own spelling, and
-  when a model publishes two spellings for one rank (`["max","xhigh"]`) the
-  first published wins.
+  silently lose the `top_p` and remap handling. Two `ReasoningSupport`
+  tie-breaks are pinned by tests: an exact rank match keeps the model's own
+  spelling, and when a model publishes two spellings for one rank
+  (`["max","xhigh"]`) the first published wins.
 - **Temperature never appears in `additional_params`** — there is a test for it.
   It rides `AgentBuilder::temperature`, so rig spells it per provider and only
   one spelling of a given knob is ever in flight.
@@ -788,8 +807,8 @@ header contract, and two engine-level walks through the real `build_menu`.
 seam for the two catalog-derived facts (whether the model exposes this knob, and
 the provider's published default) and deliberately renders neither until P3
 supplies them. A guessed number is worse than silence, and guessing was already
-shown to be wrong: the published defaults are {0.3, 0.7, 0.9, 1.0} / {0.95, 1.0},
-not the 1.0/0.95 anyone would type from memory.
+shown to be wrong: the published defaults are {0.3, 0.7, 0.9, 1.0} / {0.95,
+1.0}, not the 1.0/0.95 anyone would type from memory.
 
 **P3 — catalog enrichment.** **Done (2026-09-29).** `ModelEntry` gains
 `description`, `supports_temperature`, `supports_top_p`, `reasoning_levels`,
@@ -801,6 +820,7 @@ the direct-entry path carrying the facts over, the composition from parsed
 entry to remapper input, and `unknown` for a model the catalog cannot see.
 
 **P3 addendum — three implementation decisions.**
+
 - **`ModelEntry` derives `Default`** and the literals that genuinely have
   nothing to say (`static_fallback`, `liveness_prune`, test fixtures) end in
   `..Default::default()`. Six new fields on thirteen literals would have been
@@ -833,6 +853,7 @@ message, the `/set` row set, both header states, the no-tty Ctrl-E path, and
 both halves of the two-phase commit.
 
 **P5 addendum — three things the implementation settled.**
+
 - **Ctrl-E and `save` both confirm, per the review decision.** §A.9's "the
   editor round-trip *is* the confirmation" was written when the confirm was a
   bare `bool`; the engine's own shipped precedent (compaction: editor, stash,
@@ -863,12 +884,12 @@ seeding that consumes it was specified in A.6/A.7 but never assigned a phase;
 P1 delivered the `ModelParams` type and the rebuild gate without it.
 
 `State.model_param_map: HashMap<String, ModelParams>`, load-or-seed on
-activation, per field: `model_param_map[id]` → `stored[id].f` → global (reasoning
-only) → built-in. *Tests:* 9 — the reported case, the global fallback, per-field
-seeding, a→b→a restoring runtime values, temperature not leaking across a
-switch, a record edited after a visit not displacing live values, the
-map/live invariant, an empty id, and a save-then-restart round trip through the
-menu.
+activation, per field: `model_param_map[id]` → `stored[id].f` → global
+(reasoning only) → built-in. *Tests:* 9 — the reported case, the global
+fallback, per-field seeding, a→b→a restoring runtime values, temperature not
+leaking across a switch, a record edited after a visit not displacing live
+values, the map/live invariant, an empty id, and a save-then-restart round trip
+through the menu.
 
 **P5.5 addendum — the a→b→a hole, and a second defect it uncovered.** The
 seeding rule has two clauses and the obvious implementation only has one: seed
@@ -922,6 +943,7 @@ hid. One test covers the whole chain from a written `settings.toml` through
 remap note.
 
 **P6 addendum — four things the implementation settled.**
+
 - **The override is a value in a parameter, not a mutation.** `prompt` takes
   `&ModelParams` — the live params with this turn's overrides applied — so
   nothing is mutated and there is nothing to restore. That is what makes it
@@ -943,21 +965,22 @@ remap note.
   `med`, their `medium`) is not announced as a downgrade. `reasoning_remap_note`
   is split out for testing against a support table with no catalog cache
   involved, the same reason `model_catalog::support_for_entry` is.
-- **A.10's API sketch was wrong in one respect and I nearly "fixed" it wrongly.**
-  It says to chain `.merge_additional_params` onto the `stream_prompt` request.
-  That method does not exist on `CompletionRequest` — it lives on
-  `PromptRequestBuilder`, and reaches `StreamingPromptRequest` through a
-  macro-generated forwarder, which a `grep "pub fn"` cannot see. I first
-  concluded the API was missing and reached for the wrong request type; the
-  setters (`temperature`, `without_temperature`, `replace_additional_params`,
-  `without_additional_params`) were there all along on the type already in use.
-  The merge-vs-replace concern was still right, and `replace_` is what ships.
+- **A.10's API sketch was wrong in one respect and I nearly "fixed" it
+  wrongly.** It says to chain `.merge_additional_params` onto the
+  `stream_prompt` request. That method does not exist on `CompletionRequest` —
+  it lives on `PromptRequestBuilder`, and reaches `StreamingPromptRequest`
+  through a macro-generated forwarder, which a `grep "pub fn"` cannot see. I
+  first concluded the API was missing and reached for the wrong request type;
+  the setters (`temperature`, `without_temperature`,
+  `replace_additional_params`, `without_additional_params`) were there all along
+  on the type already in use. The merge-vs-replace concern was still right, and
+  `replace_` is what ships.
 
 **P6 addendum — where the doc was right and I nearly argued otherwise.** The
 empty-prompt guard is where §A.10 puts it, and it does have to precede
-`ensure_session`: `input.is_empty()` runs on the raw line *before* extraction, so
-an overrides-only prompt needs its own check, and placing it after would create
-a session for a turn that never runs.
+`ensure_session`: `input.is_empty()` runs on the raw line *before* extraction,
+so an overrides-only prompt needs its own check, and placing it after would
+create a session for a turn that never runs.
 
 **P6 addendum — one shared validator.** `v25_number_param::parse_value` is now a
 free function used by both the menu nodes and the override parser, so a value
@@ -1006,7 +1029,7 @@ is a UX call rather than a correctness one, and it is not yet decided.
 
 ---
 
-## Decisions log
+### Decisions log
 
 Settled in design review (2026-09-29), in the order they were taken:
 

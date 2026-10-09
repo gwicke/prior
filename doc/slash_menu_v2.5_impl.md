@@ -7,9 +7,16 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 628 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate separator on commit fixed. Tree action children show id column. Overlay vertical space: balanced 50:50 detail/rows split with min 3 rows. Visual-line-aware row windowing. `drill_rewrite` for prompt pre-fill/redirect on drill (all 5 use cases).
+**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 628 lib tests
+pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn
+state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate
+separator on commit fixed. Tree action children show id column. Overlay vertical
+space: balanced 50:50 detail/rows split with min 3 rows. Visual-line-aware row
+windowing. `drill_rewrite` for prompt pre-fill/redirect on drill (all 5 use
+cases).
 
 **PathArgs / RenderContext refactor (c831d2f):**
+
 - `RenderContext { term_width }` threaded by reference through
   `node_traverse`; `header(path_args, render_ctx)`; `term_width` out of
   `PathArgs` (the old TODO) and `EpochState`.
@@ -39,6 +46,7 @@ SettingLeafNode. Root `/` list done — all `/` prefixes route through
 v2.5 engine.
 
 **Key additions:**
+
 - **`SlashDotMenuNode`** (menu.rs): thin public wrapper around `NodeEntry`.
   `root()` for the implicit root, `new(impl SlashDotNode)` for leaf nodes,
   `add_child(SlashDotMenuNode)` to build the tree. `From<T: SlashDotNode>`
@@ -108,6 +116,7 @@ v2.5 engine.
 - **Banner**: `picocode - type / for details` (removed `/help` mention).
 
 **Design deviations from step4 doc (per user clarification):**
+
 - Modifiers are single-word (no multi-word values).
 - Sort applied after fuzzy rank (filter → fuzzy rank → sort).
 - `Args` and `PathArgs` own their data (borrow deferred).
@@ -121,6 +130,7 @@ v2.5 engine.
 ### Deferred (not blocking, pick up as needed)
 
 **RenderPlan / rendering - DONE**
+
 - Confirm dialog: **rendered by the engine** (`NodeEntry::confirm_plan` —
   `header()` as detail, the two arms as rows on the shared `dialog_view`).
   `Prepared` arms it; Enter resolves the cursor row (`accept` → `submit()`,
@@ -130,23 +140,28 @@ v2.5 engine.
   (`Some((accept, cancel))`, or `None` for the defaults).
 
 **Row uniformity: - DONE**
+
 - Only enforces non-empty `id`. Description optional. Rendering tolerant of
   missing fields.
 
 **Field space inference fallback, field spec cleanup**
+
 - When `SlashDotNode::fields()` returns empty, `infer_field_space()`
   builds from row data. Commands with known fields should override
   `fields()`.
 - Audit field_spec / colums code; support enum overrides
 
 **Cursor / view state:**
+
 - `cursor_idx` updated in-place and kept in sync. No debug_assert
   enforcing the ID-authoritative invariant.
 
 **Prompt rewrite support - DONE**
+
 - Finalized design doc: slashdot/prompt_rewrite_design.md
 
 **Avoid drill-submit where args are expected / `SubmitResult::Error` - DONE**
+
 - Some nodes like `/session <id> rename` expect a parameter. Enter-drilling
   from a parent action listing auto-submitted with no name. Plan in
   ./slashdot/arg_and_modifier_autocomplete.md.
@@ -173,6 +188,7 @@ v2.5 engine.
 Final design + implementation plan: slashdot/arg_and_modifier_autocomplete.md
 (steps 1–6 implemented — v2.0's `field_options()` popup is reachable
 again, at every listing level, not just `/model`).
+
 - Landed: flat `PathArgs.args` + view-side `split_modifiers` (invalid-key
   dot words → fuzzy terms); `cursor_pos` threading with the EOL-only guard
   (`eval_prompt_with_cursor`); view extraction (`view.rs` — `RowView` /
@@ -190,12 +206,14 @@ again, at every listing level, not just `/model`).
   `path_complete` extraction, `sandbox_state` rename).
 
 **PathArgs / Args cleanup - DONE**
+
 - Clean up unrelated data (e.g. term_width)
 - Try to make it cheaper / less copying with refs. Deferred to avoid lifetime
   complexity in the trait API.
 
 **Render loop order / direct rendering**
-Current loop is 
+Current loop is
+
 1) eval_menu(Key::None)
 2) read event
 3) dispatch key
@@ -215,6 +233,7 @@ plan, and structurally the render plan is generally identical between no-keys
 and with-keys - so this change should not cause regressions.
 
 **State and async review**
+
 - Consider better designs for app state access and async execution
 - slashdot/state_and_async.md
 
@@ -237,10 +256,11 @@ and with-keys - so this change should not cause regressions.
       and in `refresh_data()`.
 
    1. **Value forwarding in `node_data()`. DONE** Add `value_forwarding: bool`
-      flag on `NodeEntry`, exposed via `SlashDotMenuNode::with_value_forwarding()`.
-      When true, `node_data()` calls own `inner.data()` for rows, then
-      queries children's `node_data()` for `active_ids`, injects them as
-      `"value"` field. Generic — no closures needed.
+      flag on `NodeEntry`, exposed via
+      `SlashDotMenuNode::with_value_forwarding()`. When true, `node_data()`
+      calls own `inner.data()` for rows, then queries children's `node_data()`
+      for `active_ids`, injects them as `"value"` field. Generic — no closures
+      needed.
 
    2. **`LiveState` bundle. - DONE** Replace three separate `Rc<RefCell<...>>`
       fields in `MenuShared` with `Rc<RefCell<LiveState>>` holding model,
@@ -266,7 +286,8 @@ and with-keys - so this change should not cause regressions.
         `header()` shows current value on drill.
 
    5. **Move root menu. - DONE** `build_menu()` from `v25_thinking.rs` → new
-      `src/v25_menu.rs`. Exports `build_root_menu(live_state, settings, shared)`.
+      `src/v25_menu.rs`. Exports
+      `build_root_menu(live_state, settings, shared)`.
 
    6. **REPL sync. - DONE** After DoneSuccess: LiveState → agent rebuild if
       changed; dirty flag for `/set` (existing mechanism). Engine stays
@@ -276,13 +297,13 @@ and with-keys - so this change should not cause regressions.
 6f. **Quit** — Leaf node via `AsyncOp::Quit`. **Done.** 3 tests.
 6g. **New** — Leaf node via `AsyncOp::New { name }`. **Done.** 3 tests.
 6h. **Clear** — Leaf node via `AsyncOp::Clear { name }`. **Done.** 3 tests.
-8. **Session - DONE** — Dynamic listing with action children:
+7. **Session - DONE** — Dynamic listing with action children:
    slashdot/session_design.md. **Done** (steps 0–5). Full session
    lifecycle: listing, resume, fork, rename, delete with confirm.
    v2.0 session overlay code removed. 19 unit tests. Rendering
    refinements: header() no background, compact timestamps,
    Table wrap option for single-line listings.
-7. **Sandbox - DONE** — Mixed static+dynamic children. Design + plan:
+8. **Sandbox - DONE** — Mixed static+dynamic children. Design + plan:
    slashdot/sandbox_design.md (incl. the settled `complete_parameter`
    contract). `v25_sandbox` nodes + `AsyncOp::Sandbox` wiring landed
    (11 tests); v2.0 `Sandbox` overlay / `InputAction::Sandbox` /
@@ -307,25 +328,62 @@ and with-keys - so this change should not cause regressions.
 
 ### Overlay variants (retirement state)
 
-| Variant | Used by | v2.5 replacement |
-|---|---|---|
-| ~~`Menu`~~ | Root list, model, tree list, replay | **Done.** All `/` routes to `V25Menu`; overlay removed (cleanup P1). |
-| ~~`Settings`~~ | `/set` settings list | **Done.** Ported to `v25_set`; overlay removed (cleanup P1). |
-| ~~`SettingsVal`~~ | `/set <key>` value picker | **Done.** Ported to `v25_set`; overlay removed (cleanup P1). |
-| ~~`Stat`~~ | `/stat` interstitial | **Done.** `stat_phase` relocated to `v25_stat::StatNode::header`; overlay removed (cleanup P1). |
-| ~~`Sandbox`~~ | removed | **Done.** Ported to v2.5 `v25_sandbox`; overlay + `InputAction::Sandbox` removed. |
-| ~~`Session`~~ | removed | **Done.** Removed (`48b17df`). |
-| ~~`SessionAction`~~ | removed | **Done.** Removed (`48b17df`). |
-| ~~`Confirm`~~ | removed | **Done.** Removed (`48b17df`). |
-| ~~`TreeAction`~~ | `/tree <id>` action menu | **Done.** Ported to v2.5 `TreeListNode` + action children (`switch` / `edit` / `compact`). |
-| ~~`SwitchAction`~~ | `/tree <id> switch` | **Done.** Now a sub-menu: `cursor` (`TreeSwitchCursorNode`) and `summarize` → the three mode nodes (`doc/branch_summary.md`). |
-| ~~`CompactSummary`~~ | `/tree <id> compact` summary | **Done.** Three compact nodes → `AsyncOp::TreeCompact`. |
-| ~~`Mod`~~ | Dotted modifier completion | **Done.** Relocated to `node_entry::default_complete`; overlay removed (cleanup P1/P2). |
-| `PathComplete` | Tab path completion | **Scoped out of cleanup** — lives until the prompt-completion step (`arg_and_modifier_autocomplete.md` §Prompt-line completion). |
+- **Variant**: ~~`Menu`~~
+  - **Used by**: Root list, model, tree list, replay
+  - **v2.5 replacement**: **Done.** All `/` routes to `V25Menu`; overlay removed
+    (cleanup P1).
+- **Variant**: ~~`Settings`~~
+  - **Used by**: `/set` settings list
+  - **v2.5 replacement**: **Done.** Ported to `v25_set`; overlay removed
+    (cleanup P1).
+- **Variant**: ~~`SettingsVal`~~
+  - **Used by**: `/set <key>` value picker
+  - **v2.5 replacement**: **Done.** Ported to `v25_set`; overlay removed
+    (cleanup P1).
+- **Variant**: ~~`Stat`~~
+  - **Used by**: `/stat` interstitial
+  - **v2.5 replacement**: **Done.** `stat_phase` relocated to
+    `v25_stat::StatNode::header`; overlay removed (cleanup P1).
+- **Variant**: ~~`Sandbox`~~
+  - **Used by**: removed
+  - **v2.5 replacement**: **Done.** Ported to v2.5 `v25_sandbox`; overlay +
+    `InputAction::Sandbox` removed.
+- **Variant**: ~~`Session`~~
+  - **Used by**: removed
+  - **v2.5 replacement**: **Done.** Removed (`48b17df`).
+- **Variant**: ~~`SessionAction`~~
+  - **Used by**: removed
+  - **v2.5 replacement**: **Done.** Removed (`48b17df`).
+- **Variant**: ~~`Confirm`~~
+  - **Used by**: removed
+  - **v2.5 replacement**: **Done.** Removed (`48b17df`).
+- **Variant**: ~~`TreeAction`~~
+  - **Used by**: `/tree <id>` action menu
+  - **v2.5 replacement**: **Done.** Ported to v2.5 `TreeListNode` + action
+    children (`switch` / `edit` / `compact`).
+- **Variant**: ~~`SwitchAction`~~
+  - **Used by**: `/tree <id> switch`
+  - **v2.5 replacement**: **Done.** Now a sub-menu: `cursor`
+    (`TreeSwitchCursorNode`) and `summarize` → the three mode nodes
+    (`doc/branch_summary.md`).
+- **Variant**: ~~`CompactSummary`~~
+  - **Used by**: `/tree <id> compact` summary
+  - **v2.5 replacement**: **Done.** Three compact nodes →
+    `AsyncOp::TreeCompact`.
+- **Variant**: ~~`Mod`~~
+  - **Used by**: Dotted modifier completion
+  - **v2.5 replacement**: **Done.** Relocated to `node_entry::default_complete`;
+    overlay removed (cleanup P1/P2).
+- **Variant**: `PathComplete`
+  - **Used by**: Tab path completion
+  - **v2.5 replacement**: **Scoped out of cleanup** — lives until the
+    prompt-completion step (`arg_and_modifier_autocomplete.md` §Prompt-line
+    completion).
 
 ### Retirement path
 
 The v2.0 code lives primarily in:
+
 - `slash_menu_bridge.rs` — `MenuEngine`, `MenuShared`, `PlanBuilder`,
   provider implementations (`ModelProvider`, `SessionProvider`, `TreeProvider`)
 - `repl.rs` — `ActiveOverlay::from_buffer_cursors()` (the v2.0 dispatcher),
@@ -369,7 +427,7 @@ the `V25Menu` vs `Menu` overlay variants until all commands are ported.
 
 ## 1. Crate layout (current, post-reshape)
 
-```
+```text
 crates/slashdot_menu/
   src/
     lib.rs
@@ -396,14 +454,19 @@ crates/slashdot_menu/
 
 ## 2. What changes in the reshape
 
-| v2 (current) | v2.5 (target) |
-| --- | --- |
-| `MenuNode` data struct + `Interpreter` central | `SlashDotNode` trait + `NodeEntry` wrapper + `SlashDotMenu`/`SlashDotHandle` |
-| Providers/handlers registered by path string | Providers/handlers on the node (`data()`, `submit()`) |
-| One child source per level | Merged child set (§2.1) |
-| `ConfirmPrep` two-handler state machine | `prepare()` → `Prepared` → engine dialog (§9) |
-| `Activation` bundle + rebuild per open | Persistent tree; epoch invalidation (§12) |
-| `DataProvider::fetch()` on side table | `data()` on the child node |
+- **v2 (current)**: `MenuNode` data struct + `Interpreter` central
+  - **v2.5 (target)**: `SlashDotNode` trait + `NodeEntry` wrapper +
+    `SlashDotMenu`/`SlashDotHandle`
+- **v2 (current)**: Providers/handlers registered by path string
+  - **v2.5 (target)**: Providers/handlers on the node (`data()`, `submit()`)
+- **v2 (current)**: One child source per level
+  - **v2.5 (target)**: Merged child set (§2.1)
+- **v2 (current)**: `ConfirmPrep` two-handler state machine
+  - **v2.5 (target)**: `prepare()` → `Prepared` → engine dialog (§9)
+- **v2 (current)**: `Activation` bundle + rebuild per open
+  - **v2.5 (target)**: Persistent tree; epoch invalidation (§12)
+- **v2 (current)**: `DataProvider::fetch()` on side table
+  - **v2.5 (target)**: `data()` on the child node
 
 **Not changed:** grammar, cursor/accept semantics, rendering contract, host
 role split, modifier system, field filtering/sorting.
@@ -469,7 +532,8 @@ state via `Rc<MenuShared>`. Active model marker from settings. 7 tests.
    from `v25_thinking.rs`). `prepare()` doc comment clarified: two-phase
    commit only, not for display.
 
-**Tests:** 12 thinking + 8 persona + 7 model + 4 stat + 3 replay + 3 quit + 3 new + 3 clear = 43 command tests.
+**Tests:** 12 thinking + 8 persona + 7 model + 4 stat + 3 replay + 3 quit + 3
+new + 3 clear = 43 command tests.
 
 ### Step 7: Two-phase submit confirm
 
@@ -556,6 +620,7 @@ Plan: `doc/slashdot/final_cleanup.md` (5 phases, P1–P5).
   test was ported to `v25_model` first (relocate-then-delete). Bridge
   1452 → 191 lines, keep-list verified byte-identical. Workspace green:
   570 lib + 169 integration, 0 failed.
+
 - **P1 — repl.rs pruning — DONE**: `ActiveOverlay` reduced to
   `{None, V25Menu, PathComplete}` (10 legacy variants + all their
   display/key/derivation arms gone), `from_buffer`/`from_buffer_cursors`
@@ -603,11 +668,13 @@ Plan: `doc/slashdot/final_cleanup.md` (5 phases, P1–P5).
 Merged `origin/main` (31 upstream commits since `c23abec`); backup
 branch `backup/pre-upstream-merge` at 215394e. Upstream delta: flat
 edit-batch rework (`src/edit_blocks.rs` new + `tools.rs` flat EditArgs
-+ session edit canonicalization), session fixes (ForkMode, subtree
+
+- session edit canonicalization), session fixes (ForkMode, subtree
 stack overflow), live formatting, `Guard::map_error`, compaction file
 order, xiaomimimo/mimo data, markdown renderer updates.
 
 **Conflicts — 2 files, both resolved keeping ours:**
+
 - `src/lib.rs`: v2.5 module set kept (deleted `pub mod slash;` stays
   deleted); upstream's `pub mod edit_blocks;` added.
 - `src/repl.rs`: upstream's entire 3-line delta fell inside legacy
@@ -617,6 +684,7 @@ order, xiaomimimo/mimo data, markdown renderer updates.
   auto-merged upstream content lived outside the conflict hunks.
 
 **Upstream repl.rs changes — ports:**
+
 - **f199117 `/stat` estimated context tokens — PORTED**: `MenuShared`
   gained `context_tokens: Rc<RefCell<u64>>` (synced from
   `ReplCtx.context_tokens` per `read_input`, alongside
@@ -634,6 +702,7 @@ Gate: workspace green post-merge — 623 lib + 133 crate + all
 integration, 0 failed.
 
 **Post-merge warning cleanup — DONE (zero warnings workspace-wide):**
+
 - `v25_tree::FlatRow`: dropped never-read `branch_depth` / `full_text`
   / `timestamp` — `header()` reads those straight from the raw entry
   (`find_entry`), so `flatten_turns` was cloning full multi-line text
@@ -661,14 +730,14 @@ in the port — scaffolding for these):
 - **Full text in rows**: `entry_row_desc()` — messages keep newlines
   (`sanitise_multiline`: control chars stripped, `\n`/`\t` kept);
   compactions carry `[COMPACT] from <kept context ≤300 chars>` + `\n`
-  + summary; model/thinking/summary/label keep their marker labels.
+  - summary; model/thinking/summary/label keep their marker labels.
   The tree column is wrap-disabled, so `Table::render` already
   flattens `\n` + ellipsizes for display — listing output unchanged,
   fuzzy rank (`id` + `description`) sees the full multi-line text.
 - **`header()` from the cached row**: no raw-tree `find_entry` walk and
   no cache-warm-and-discard; role/timestamp from row fields, body from
   the description (indent stripped; `[COMPACT]`/`[SUMMARY]` marker
-  re-stamped with the timestamp; model/thinking append ` (ts)`).
+  re-stamped with the timestamp; model/thinking append `(ts)`).
 - **`tags` field (optional)**: `visible_terminals()` — iterative
   post-order, visibility-aware (invisible tool results don't hide the
   visible endpoint above them) — tags branch endpoints
@@ -809,46 +878,64 @@ addressed after all commands are ported:
 
 `MenuShared` is a grab-bag of `Rc<RefCell<…>>` cells that the REPL
 populates on every `read_input` call (session_usage, current_session_id,
-tree, leaf_id, pending_op).  Each new command adds another field and
-another sync line.  Longer term, there should be a single app-global
+tree, leaf_id, pending_op). Each new command adds another field and
+another sync line. Longer term, there should be a single app-global
 state object — `AppState` or similar — that both the REPL and the menu
 nodes reference directly, eliminating the per-field syncing.
 
 ### Async operations from sync `submit()`
 
-`submit()` is `&mut self` (sync, single-threaded).  Commands that need
+`submit()` is `&mut self` (sync, single-threaded). Commands that need
 async context (e.g. `/replay` which calls `session.get_branch().await`)
-cannot call async code from `submit()`.  Current workaround:
+cannot call async code from `submit()`. Current workaround:
 `AsyncOp` enum on `MenuShared` that the agent loop dispatches after
-`DoneSuccess`.  This works but adds indirection.
+`DoneSuccess`. This works but adds indirection.
 
 Options for a cleaner design:
+
 - **`AppState` holds the session directly** (Session's internals are
   already `Arc`-wrapped, so it can be shared via `Rc<RefCell>`).
   `submit()` borrows the session reference; the engine can expose a
   `block_on` helper for sync-to-async bridging.
 - **`submit()` returns a richer type** (e.g. `SubmitResult::Run(AsyncOp)`)
-  that the engine propagates to the host.  The host decides how to
+  that the engine propagates to the host. The host decides how to
   execute — currently impossible because `MenuResult` carries
   `DonePayload` which is not generic (trait object constraint).
 - **Move async logic into the host entirely** — nodes return plain
   `Done(None)` and the host detects which command ran (by prompt
-  prefix) and dispatches the async work itself.  Simple but loses
+  prefix) and dispatches the async work itself. Simple but loses
   the "node owns its behavior" property.
 
 ---
 
 ## 5. Test strategy
 
-| Category | Count | Status |
-| --- | --- | --- |
-| Grammar / filter / fuzzy / table / render / wrap / value / prompt | 75 | Unchanged (v2.0 free functions) |
-| Accept (confirm, interstitial, editor, new-path) | 0 | **Deleted** with `accept.rs` (cleanup P2) |
-| Interpreter (state/tab/enter/esc, dynamic, field_options) | 0 | **Deleted** with `interpreter.rs` (cleanup P2) |
-| **v2.5 node_entry (parse, listing, drill, cursor, esc, header, mixed)** | **23** | **New (steps 4–5)** |
-| **v2.5 `/thinking` command (drill, submit, cursor, active, filter, esc)** | **12** | **New (step 6a)** |
-| **v2.5 `/persona` command (drill, submit, cursor, active, filter, esc, none-clear)** | **8** | **New (step 6b)** |
-| **v2.5 `/model` command (rows, cache, columns, fields, submit, traversal, filter)** | **7** | **New (step 6c)** |
+- **Category**: Grammar / filter / fuzzy / table / render / wrap / value /
+  prompt
+  - **Count**: 75
+  - **Status**: Unchanged (v2.0 free functions)
+- **Category**: Accept (confirm, interstitial, editor, new-path)
+  - **Count**: 0
+  - **Status**: **Deleted** with `accept.rs` (cleanup P2)
+- **Category**: Interpreter (state/tab/enter/esc, dynamic, field_options)
+  - **Count**: 0
+  - **Status**: **Deleted** with `interpreter.rs` (cleanup P2)
+- **Category**:
+  **v2.5 node_entry (parse, listing, drill, cursor, esc, header, mixed)**
+  - **Count**: **23**
+  - **Status**: **New (steps 4–5)**
+- **Category**:
+  **v2.5 `/thinking` command (drill, submit, cursor, active, filter, esc)**
+  - **Count**: **12**
+  - **Status**: **New (step 6a)**
+- **Category**: **v2.5 `/persona` command (drill, submit, cursor, active,
+  filter, esc, none-clear)**
+  - **Count**: **8**
+  - **Status**: **New (step 6b)**
+- **Category**: **v2.5 `/model` command (rows, cache, columns, fields, submit,
+  traversal, filter)**
+  - **Count**: **7**
+  - **Status**: **New (step 6c)**
 
 Total (after cleanup step 10): 568 lib tests + integration suites +
 133 crate tests, 0 failed. The interpreter/accept/PlanBuilder test
@@ -859,30 +946,49 @@ added 7 targeted v2.5 tests.
 
 ## 6. File changes summary
 
-| File | Reshape changes |
-| --- | --- |
-| `node_impl.rs` | `SlashDotNode` trait + public types + `StaticListingNode` (with `with_columns()`) |
-| `node_entry.rs` | `NodeEntry` (traversal, table rendering with aligned headers) |
-| `menu.rs` | `SlashDotMenuNode`, `SlashDotMenu`, `SlashDotHandle` (public API) |
-| `lib.rs` | Re-exports: `SlashDotNode`, `ColumnDef`, `StaticListingNode`, etc. |
-| `interpreter.rs` | Logic moves into `NodeEntry::node_traverse()`; file shrinks or is deleted |
-| `accept.rs` | Confirm state machine moves to node-local state; engine dialog service stays |
-| `provider.rs` | `DataProvider` trait absorbed; `ColumnDef` remains |
-| `render.rs` | `LogicalLine`, `RenderPlan` (table_header/detail/rows), `paint()` for v2.0 compat |
-| `table.rs` | `display_width()` made `pub(crate)`; `render_header()` added for aligned headers |
-| `cursor.rs` | `RankRefResult` / `rank_row_refs` made `pub(crate)` |
-| `grammar.rs` | Unchanged (free functions) |
-| `filter.rs` | Unchanged (free functions) |
-| `fuzzy.rs` | Unchanged |
+- **File**: `node_impl.rs`
+  - **Reshape changes**: `SlashDotNode` trait + public types +
+    `StaticListingNode` (with `with_columns()`)
+- **File**: `node_entry.rs`
+  - **Reshape changes**: `NodeEntry` (traversal, table rendering with aligned
+    headers)
+- **File**: `menu.rs`
+  - **Reshape changes**: `SlashDotMenuNode`, `SlashDotMenu`, `SlashDotHandle`
+    (public API)
+- **File**: `lib.rs`
+  - **Reshape changes**: Re-exports: `SlashDotNode`, `ColumnDef`,
+    `StaticListingNode`, etc.
+- **File**: `interpreter.rs`
+  - **Reshape changes**: Logic moves into `NodeEntry::node_traverse()`; file
+    shrinks or is deleted
+- **File**: `accept.rs`
+  - **Reshape changes**: Confirm state machine moves to node-local state; engine
+    dialog service stays
+- **File**: `provider.rs`
+  - **Reshape changes**: `DataProvider` trait absorbed; `ColumnDef` remains
+- **File**: `render.rs`
+  - **Reshape changes**: `LogicalLine`, `RenderPlan` (table_header/detail/rows),
+    `paint()` for v2.0 compat
+- **File**: `table.rs`
+  - **Reshape changes**: `display_width()` made `pub(crate)`; `render_header()`
+    added for aligned headers
+- **File**: `cursor.rs`
+  - **Reshape changes**: `RankRefResult` / `rank_row_refs` made `pub(crate)`
+- **File**: `grammar.rs`
+  - **Reshape changes**: Unchanged (free functions)
+- **File**: `filter.rs`
+  - **Reshape changes**: Unchanged (free functions)
+- **File**: `fuzzy.rs`
+  - **Reshape changes**: Unchanged
 
-| Host file | Changes |
-| --- | --- |
-| `src/v25_thinking.rs` | `ThinkingEnumNode` + `build_menu()` — constructs root `SlashDotMenuNode` tree with thinking, persona, model |
-| `src/v25_persona.rs` | `PersonaEnumNode` node impl + `add_persona_child()` |
-| `src/v25_model.rs` | `ModelNode` node impl + `build_model_node()` — dynamic catalog rows, Rc caching, columns, fields |
-| `src/v25_commands.rs` | Test-only node impls for engine harness testing |
-| `src/repl.rs` | All `/` routes through v2.5 (`ActiveOverlay::V25Menu { plan }`). `SlashDotMenu` + handle in input loop. `eval_prompt` key dispatch. V25Menu overlay rendering (LogicalLine direct path, PageUp/PageDown). `DoneSuccess` dispatch by prefix. Cursor clamping. |
-| `src/agent.rs` | Banner: `picocode - type / for details` |
+|Host file            |Changes                                                 |
+|---------------------|--------------------------------------------------------|
+|`src/v25_thinking.rs`|`ThinkingEnumNode` + `build_menu()` — constructs root `SlashDotMenuNode` tree with thinking, persona, model|
+|`src/v25_persona.rs` |`PersonaEnumNode` node impl + `add_persona_child()`     |
+|`src/v25_model.rs`|`ModelNode` node impl + `build_model_node()` — dynamic catalog rows, Rc caching, columns, fields|
+|`src/v25_commands.rs`|Test-only node impls for engine harness testing         |
+|`src/repl.rs`|All `/` routes through v2.5 (`ActiveOverlay::V25Menu { plan }`). `SlashDotMenu` + handle in input loop. `eval_prompt` key dispatch. V25Menu overlay rendering (LogicalLine direct path, PageUp/PageDown). `DoneSuccess` dispatch by prefix. Cursor clamping.|
+|`src/agent.rs`       |Banner: `picocode - type / for details`                 |
 
 ---
 
@@ -1074,13 +1180,12 @@ widths change, so every line's text changes.
 
 ### 7.10 Test strategy
 
-| Test | What it validates |
-|---|---|
-| Logical line wrapping | Multi-line row renders as single `LogicalLine` with `\n` |
-| Window centers on selected | `selected=50, budget=20` → window around rows 40–59 |
-| Marker on first sub-line only | Wrapped row: `>` only on first sub-line, continuation gets `"  "` |
-| Active + selected same row | `*` wins over `>` per §5.2 precedence |
-| Detail updates on cursor move | `rows` Rc unchanged, `detail` changed |
-| PageUp/PageDown | `selected ± page_size`, clamp, re-render |
-| Resize triggers rebuild | `term_width` change → new `Rc` for `rows` |
-
+|Test                         |What it validates                               |
+|-----------------------------|------------------------------------------------|
+|Logical line wrapping|Multi-line row renders as single `LogicalLine` with `\n`|
+|Window centers on selected|`selected=50, budget=20` → window around rows 40–59|
+|Marker on first sub-line only|Wrapped row: `>` only on first sub-line, continuation gets `"  "`|
+|Active + selected same row   |`*` wins over `>` per §5.2 precedence           |
+|Detail updates on cursor move|`rows` Rc unchanged, `detail` changed           |
+|PageUp/PageDown              |`selected ± page_size`, clamp, re-render        |
+|Resize triggers rebuild      |`term_width` change → new `Rc` for `rows`       |

@@ -16,7 +16,7 @@ record; post-7.2 work moves to the v2.5 plan.
 
 ## 1. Crate layout & independence
 
-```
+```text
 crates/slashdot_menu/
   Cargo.toml            # no picocode dependency
   src/
@@ -297,7 +297,7 @@ exceptions.
    ctx-driven `active` computations (Model, Thinking, Persona, Session,
    Tree) into providers; `MenuState` has `active_row_marker: Option<usize>`
    distinct from the cursor `active`; open-time cursor seeds on the marker
-   row when no sticky cursor exists. Fixes "`/model ` doesn't focus the
+   row when no sticky cursor exists. Fixes "`/model` doesn't focus the
    active model on entry" (the cursor currently seeds at the pinned/recent
    top, not the selector).
 3. **Esc ladder (engine)**: replace the host's per-variant `handle_esc`
@@ -604,7 +604,7 @@ handlers would migrate separately, which proved throwaway in practice.
       (`/think` → `thinking `) now drills with a trailing space exactly like
       a static/dynamic listing, instead of pinning and requiring a second
       Tab. (A completion *inside* an already-drilled value level, e.g.
-      `thinking ` → `med`, still pins the value token.)
+      `thinking` → `med`, still pins the value token.)
     - **`.sort` injected into the `.` auto-complete**: `sort` is really meta
       (it names a field) but from the user's perspective it is a dot-modifier
       like any other, so it appears in the bare-`.` field list. The `.sort:`
@@ -631,44 +631,47 @@ handlers would migrate separately, which proved throwaway in practice.
    is the *direct* remaining path to the end state
    `ActiveOverlay = None | Help | PathComplete | Menu`, ordered to avoid
    rework. Status of 7.1 at this point:
-   - **Engine-backed end-to-end, now collapsed to Menu** (plan verbatim,
-     keys through the engine): Model, Thinking, Persona, root
-     CommandList, plus the generic `Menu` fallthrough (any drilled engine
-     level: `/replay`, unknown prefixes; level-stay fix from `node_path`).
-     All five variants merged into a single `Menu` variant (7.2.1–3
-     implemented).
-   - **Partial** (engine candidates but host-rendered/host-cursed):
-     Session list, Tree list, Sandbox subcommand list.
-   - **Still fully v1**: Settings/SettingsVal, SessionAction/Confirm,
-     TreeAction/SwitchAction/CompactSummary, Stat, Mod, Sandbox value phase.
-   - Overlay count today: 14 variants; target: 4.
 
-   Remaining steps, in order:
+- **Engine-backed end-to-end, now collapsed to Menu** (plan verbatim,
+  keys through the engine): Model, Thinking, Persona, root
+  CommandList, plus the generic `Menu` fallthrough (any drilled engine
+  level: `/replay`, unknown prefixes; level-stay fix from `node_path`).
+  All five variants merged into a single `Menu` variant (7.2.1–3
+  implemented).
+- **Partial** (engine candidates but host-rendered/host-cursed):
+  Session list, Tree list, Sandbox subcommand list.
+- **Still fully v1**: Settings/SettingsVal, SessionAction/Confirm,
+  TreeAction/SwitchAction/CompactSummary, Stat, Mod, Sandbox value phase.
+- Overlay count today: 14 variants; target: 4.
 
-   1. **(done)** Uniform key loop for engine-backed overlays: collapsed
-      five identical `engine.step_at` Tab/Enter arms into one
-      `is_engine_backed()` path. Enter canonical-line → `InputAction`
-      translation uses `r.state.node_path` (root = SlashKind dispatch;
-      drilled = node_path[0]-keyed: model→SetModel, thinking→SetThinking,
-      persona→SetPersona, replay/other→Submit). `engine_seed`/`engine_arrow`
-      folded into `step_at` via `HostKey::Seed(idx)`.
-   2. **(done)** CommandList → Menu: root list renders from engine
-      `RenderPlan` verbatim. Deleted `CommandList` variant (legacy `cmds`
-      field, host-side formatting). `root_list_overlay` returns
-      `Menu { cursor, plan }`.
-   3. **(done)** Model / Thinking / Persona → Menu: deleted all three
-      variants. Their `from_buffer_cursors` arms, `display_rows`, `title`,
-      `handle_tab`, `handle_enter`, `handle_esc`, `cursor_row`,
-      `is_engine_backed`, `overlay_disc`, and paint arms all gone — the
-      generic `Menu` arm handles them identically. Net: −314 lines.
-    4. **Mod → engine plan** (deferred — needs engine plumbing) and subsequent command migrations (Session, Tree, Stat, Settings, Sandbox) move to the v2.5 plan.
+Remaining steps, in order:
 
-   **⟶ Post-7.2 steps continue in `slash_menu_v2.5_impl.md`** — the v2.5 reshape (trait nodes, merged child sets, two-phase confirm) happens between steps 3 and 4, and all remaining command migrations land on the reshaped engine.
+1. **(done)** Uniform key loop for engine-backed overlays: collapsed
+   five identical `engine.step_at` Tab/Enter arms into one
+   `is_engine_backed()` path. Enter canonical-line → `InputAction`
+   translation uses `r.state.node_path` (root = SlashKind dispatch;
+   drilled = node_path[0]-keyed: model→SetModel, thinking→SetThinking,
+   persona→SetPersona, replay/other→Submit). `engine_seed`/`engine_arrow`
+   folded into `step_at` via `HostKey::Seed(idx)`.
+2. **(done)** CommandList → Menu: root list renders from engine
+   `RenderPlan` verbatim. Deleted `CommandList` variant (legacy `cmds`
+   field, host-side formatting). `root_list_overlay` returns
+   `Menu { cursor, plan }`.
+3. **(done)** Model / Thinking / Persona → Menu: deleted all three variants.
+   Their `from_buffer_cursors` arms, `display_rows`, `title`, `handle_tab`,
+   `handle_enter`, `handle_esc`, `cursor_row`, `is_engine_backed`,
+   `overlay_disc`, and paint arms all gone — the generic `Menu` arm handles
+   them identically. Net: −314 lines. 4. **Mod → engine plan** (deferred —
+   needs engine plumbing) and subsequent command migrations (Session, Tree,
+   Stat, Settings, Sandbox) move to the v2.5 plan.
+
+**⟶ Post-7.2 steps continue in `slash_menu_v2.5_impl.md`** — the v2.5 reshape
+(trait nodes, merged child sets, two-phase confirm) happens between steps 3 and
+4, and all remaining command migrations land on the reshaped engine.
 
 ---
 
 ## 4. Integration approach inside picocode
-
 
 - `repl.rs` keeps the *dispatch* (key events → overlay) but its per-menu
   logic is replaced by: parse buffer → interpreter call → apply result

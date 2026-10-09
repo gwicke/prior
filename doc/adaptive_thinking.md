@@ -82,6 +82,7 @@ The extension registers four lifecycle handlers and one tool.
 
 Runtime State
 
+```rust
   interface RuntimeState {
     config: Config;
     currentLevel?: string;                         // active thinking level
@@ -90,16 +91,16 @@ Runtime State
     lastToolCallWasReasoningTool: boolean;         // back-to-back guard
     reasoningToolCallBackToBackById: Map<string, boolean>; // per-call-id tracking
   }
+```
 
-Lifecycle Hooks
+## Lifecycle Hooks
 
-│ Hook                  │ Purpose                                                        │ Rig Equivalent                                                      │
-├───────────────────────┼────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
-│ thinking_level_select │ User manually changed thinking level in UI — sync currentLevel │ No direct equivalent; would be an external event channel            │
-│ tool_call             │ Track whether consecutive calls are both set_thinking_level    │ PromptHook::on_tool_call                                            │
-│ before_agent_start    │ Injects adaptive-thinking guidance into system prompt          │ PromptHook::on_completion_call — modify the prompt's system message │
-│ agent_end             │ Reset temporary level and clear back-to-back tracking          │ PromptHook::on_completion_response or PromptHook::on_tool_result    │
-│ session_start         │ Load config, initialize state, register tool                   │ Agent builder setup                                                 │
+| Hook                  | Purpose                                                        | Rig Equivalent|
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------│ thinking_level_select │ User manually changed thinking level in UI — sync currentLevel │ No direct equivalent; would be an external event channel            │
+| tool_call             │ Track whether consecutive calls are both set_thinking_level    │ PromptHook::on_tool_call                                            │
+| before_agent_start    │ Injects adaptive-thinking guidance into system prompt          │ PromptHook::on_completion_call — modify the prompt's system message │
+| agent_end             │ Reset temporary level and clear back-to-back tracking          │ PromptHook::on_completion_response or PromptHook::on_tool_result    │
+| session_start         │ Load config, initialize state, register tool                   │ Agent builder setup                                                 │
 
 The Tool Itself
 

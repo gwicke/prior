@@ -48,19 +48,40 @@ A menu is a recursive node. One descriptor per command word; the root list
 
 Each node has:
 
-| Field | Meaning |
-| --- | --- |
-| `key` | The token that selects this node at its parent level. Space-free (R8-1). |
-| `description` | Optional single-line description; fuzzy-searched together with `key` in the parent menu. |
-| `child_header` | Optional single-line header shown when this node's child menu is active. |
-| `children` | Nested nodes (static subtree). A node is a *list level* if it has either static children, or a data handler (below). |
-| `modifiers` | Optional typed value/argument slots (§7): `key` + value kind + default + completion source + front-end/back-end flag. |
-| `data_handler` | Optional data-fetch handler (marks the level dynamic; §8). Absent ⇒ static level. |
-| `leaf_handler` | Optional accept handler (§10, first step). Absent ⇒ Enter behaves like Tab: add trailing space, drill into the child level. |
-| `confirm_handler` | Optional second-step handler on a confirm leaf (§9): invoked on the final accept, after the `leaf_handler` prep and the confirm dialog. Presence ⇒ the leaf is a confirm flow (replaces the boolean `confirm` property). |
-| `interstitial_handler` | Optional handler returning a static string, shown on Enter *before* any leaf call or drilling (§10). |
-| `confirm` | Optional stateful confirm property on a leaf (§10). |
-| `table` | Optional declarative column definition for list rendering (D6): headers, order, alignment, min-widths (priority), ellipsis vs wrap. |
+- **Field**: `key`
+  - **Meaning**: The token that selects this node at its parent level.
+    Space-free (R8-1).
+- **Field**: `description`
+  - **Meaning**: Optional single-line description; fuzzy-searched together with
+    `key` in the parent menu.
+- **Field**: `child_header`
+  - **Meaning**: Optional single-line header shown when this node's child menu
+    is active.
+- **Field**: `children`
+  - **Meaning**: Nested nodes (static subtree). A node is a *list level* if it
+    has either static children, or a data handler (below).
+- **Field**: `modifiers`
+  - **Meaning**: Optional typed value/argument slots (§7): `key` + value kind +
+    default + completion source + front-end/back-end flag.
+- **Field**: `data_handler`
+  - **Meaning**: Optional data-fetch handler (marks the level dynamic; §8).
+    Absent ⇒ static level.
+- **Field**: `leaf_handler`
+  - **Meaning**: Optional accept handler (§10, first step). Absent ⇒ Enter
+    behaves like Tab: add trailing space, drill into the child level.
+- **Field**: `confirm_handler`
+  - **Meaning**: Optional second-step handler on a confirm leaf (§9): invoked on
+    the final accept, after the `leaf_handler` prep and the confirm dialog.
+    Presence ⇒ the leaf is a confirm flow (replaces the boolean `confirm`
+    property).
+- **Field**: `interstitial_handler`
+  - **Meaning**: Optional handler returning a static string, shown on Enter
+    *before* any leaf call or drilling (§10).
+- **Field**: `confirm`
+  - **Meaning**: Optional stateful confirm property on a leaf (§10).
+- **Field**: `table`
+  - **Meaning**: Optional declarative column definition for list rendering (D6):
+    headers, order, alignment, min-widths (priority), ellipsis vs wrap.
 
 Handlers attached to nodes receive as arguments: positional ids collected from
 the path, and modifier key-values (typed).
@@ -131,7 +152,7 @@ exactly like ids on dynamic levels.
 
 At every level the buffer has the shape:
 
-```
+```text
 <parent tokens> [fuzzy search terms] [dot modifiers] [selection token]
 ```
 
@@ -155,7 +176,7 @@ At every level the buffer has the shape:
   not shown yet. This is a uniform, engine-owned rule for every **listing
   level** (a node with children, a value child, or a data handler):
   `/model` (no trailing space) stays in the *root* command list with the
-  `model` entry pinned/highlighted; only `/model ` shows the model list.
+  `model` entry pinned/highlighted; only `/model` shows the model list.
   The same applies to `/thinking`, `/set`, `/session`, `/tree`, `/sandbox`.
   The host must not keep a per-command "open without trailing space" list —
   the grammar decides. Leaf nodes (no children/handler) accept directly.
@@ -258,7 +279,6 @@ overlay:
 - Open-time cursor seeding falls out of this: when a level is first
   displayed and no sticky cursor exists for it, the cursor seeds on the
   active row if the selector resolves; otherwise row 0.
-
 - **Esc** = a strict per-level ladder (each step applies only when the next
   does not):
   1. Strip a trailing space (drill-out one level, cursor memory preserved
@@ -276,7 +296,7 @@ overlay:
 ## 6. Rendering
 
 - **Panel structure** (unchanged from v1): title row, optional non-selectable
-  header rows, selectable rows with `> ` (selected) / `* ` (active-default)
+  header rows, selectable rows with `>` (selected) / `*` (active-default)
   markers.
 - **Headers** (R8-4):
   - *(i)* static single-line `child_header` from the descriptor;
@@ -304,13 +324,28 @@ remain bare words. Multi-word modes become single hyphenated tokens
 
 A modifier is:
 
-| Property | Notes |
-| --- | --- |
-| `key` | Dot token name (`.sort`, `.prompt`, `.ro`, …). |
-| value kind | `string` / `number` (float or int, permissively parsed) — only these two types. |
-| enum set | **Orthogonal** to the value kind: an optional candidate list constraining *completion* only. The interpreter never rejects an out-of-enum token — the backend validates at accept time (any prompt is valid; the action may error). |
-| completion source | `dataset-derived` (**default**): unless an enum is set, the distinct string values of the field are extracted in a preprocessing pass over the cached rows (§8.1). · `dynamic handler` (query → candidates, cached until the level changes — trailing slash for fs descent, §8) · `default value` (auto-filled on Tab alongside the selector, e.g. `.prompt` next to the `llm` selection in the compaction menu). |
-| front-end / back-end | **Front-end**: applied by the interpreter over cached rows (§7.1). **Back-end**: passed through to the data-fetch handler for live filtering (e.g. fs paths). `MODEL_MODIFIERS` metadata is the seed for this split (R8-6). |
+- **Property**: `key`
+  - **Notes**: Dot token name (`.sort`, `.prompt`, `.ro`, …).
+- **Property**: value kind
+  - **Notes**: `string` / `number` (float or int, permissively parsed) — only
+    these two types.
+- **Property**: enum set
+  - **Notes**: **Orthogonal** to the value kind: an optional candidate list
+    constraining *completion* only. The interpreter never rejects an out-of-enum
+    token — the backend validates at accept time (any prompt is valid; the
+    action may error).
+- **Property**: completion source
+  - **Notes**: `dataset-derived` (**default**): unless an enum is set, the
+    distinct string values of the field are extracted in a preprocessing pass
+    over the cached rows (§8.1). · `dynamic handler` (query → candidates, cached
+    until the level changes — trailing slash for fs descent, §8) ·
+    `default value` (auto-filled on Tab alongside the selector, e.g. `.prompt`
+    next to the `llm` selection in the compaction menu).
+- **Property**: front-end / back-end
+  - **Notes**: **Front-end**: applied by the interpreter over cached rows
+    (§7.1). **Back-end**: passed through to the data-fetch handler for live
+    filtering (e.g. fs paths). `MODEL_MODIFIERS` metadata is the seed for this
+    split (R8-6).
 
 Value tokens may be multi-word (consume until next dot-modifier / valid id /
 end of prompt); selection tokens may not (R8-7).
@@ -322,12 +357,19 @@ after the field. The generic interpreter applies filters and sorting over the
 cached rows — this generalizes the hand-written `ModelFilter` /
 `apply_modifier` logic into one mechanism:
 
-| Token | Semantics |
-| --- | --- |
-| `.field:value` | Exact match on a string field (id, description, or string key-value field). |
-| `.field:>v` / `.field:<v` | Numeric comparison (retain rows with value > / < v); `>=` / `<=` likewise. Comparison filters drop rows *missing* the field. |
-| `.sort:field` | Direction defaults to the field's declared `default_dir` (§8.1), so legacy names like `.sort:coding` keep working. |
-| `.sort:field>` / `.sort:field<` | Explicit descending / ascending as a **suffix** (more ergonomic with type-ahead than a prefix: pick the field, then append the direction). |
+- **Token**: `.field:value`
+  - **Semantics**: Exact match on a string field (id, description, or string
+    key-value field).
+- **Token**: `.field:>v` / `.field:<v`
+  - **Semantics**: Numeric comparison (retain rows with value > / < v); `>=` /
+    `<=` likewise. Comparison filters drop rows *missing* the field.
+- **Token**: `.sort:field`
+  - **Semantics**: Direction defaults to the field's declared `default_dir`
+    (§8.1), so legacy names like `.sort:coding` keep working.
+- **Token**: `.sort:field>` / `.sort:field<`
+  - **Semantics**: Explicit descending / ascending as a **suffix** (more
+    ergonomic with type-ahead than a prefix: pick the field, then append the
+    direction).
 
 Rules:
 
@@ -433,7 +475,7 @@ is generic over the host's action type. It carries:
 
 - **Menu-semantic outcomes** the engine drives itself: close the menu,
   **return a new path** (buffer rewrite, e.g. `/compact` →
-  `/tree <last-user-id> compact ` — pure sugar, no parallel hierarchy),
+  `/tree <last-user-id> compact` — pure sugar, no parallel hierarchy),
   pause for confirm (§9), launch the editor, interstitial text;
 - a **narrow host-outcome payload** `T` the engine treats as uninterpreted
   data — *only* the effects belonging to the REPL outer loop, not app-data
@@ -456,56 +498,131 @@ terminal, transcript).
 
 ## 10. Per-command target shape (summary)
 
-| Command | Shape in v2 |
-| --- | --- |
-| `/` | static root list; children = command descriptors |
-| `/model` | dynamic level (catalog, one-shot) + front-end field modifiers (§7.1; `MODEL_MODIFIERS` metadata seeds field/computed-field definitions), leaf = select model |
-| `/thinking` | static level with one `enum` positional value child (`off|low|med|high`), shared leaf = SetThinking (§2) |
-| `/persona` | dynamic leaf with dataset/enum string value source |
-| `/set` | static level of setting children, each with typed modifier-like value machinery; `default_model` nests a dynamic model level |
-| `/sandbox` | static subcommand children (`add`/`remove`); `add` carries back-end fs modifiers (`.ro:` (default tab complete), `.rw:`); `remove` is a dynamic value menu with ids = paths |
-| `/session` | dynamic level (sessions) → static action children → confirm leaf on delete |
-| `/tree` | dynamic level (tree nodes) → static action children (`switch`, `compact`); `compact` modes are single-token enum children; `llm` leaf carries `.prompt` modifier (default value) + confirm property |
-| `/compact` | leaf that returns the rewritten path `/tree <id> compact ` |
-| `/stat` | interstitial, no leaf |
-| `/replay` | interstitial + leaf |
+- **Command**: `/`
+  - **Shape in v2**: static root list; children = command descriptors
+- **Command**: `/model`
+  - **Shape in v2**: dynamic level (catalog, one-shot) + front-end field
+    modifiers (§7.1; `MODEL_MODIFIERS` metadata seeds field/computed-field
+    definitions), leaf = select model
+- **Command**: `/thinking`
+  - **Shape in v2**: static level with one `enum` positional value child
+    (`off|low|med|high`), shared leaf = SetThinking (§2)
+- **Command**: `/persona`
+  - **Shape in v2**: dynamic leaf with dataset/enum string value source
+- **Command**: `/set`
+  - **Shape in v2**: static level of setting children, each with typed
+    modifier-like value machinery; `default_model` nests a dynamic model level
+- **Command**: `/sandbox`
+  - **Shape in v2**: static subcommand children (`add`/`remove`); `add` carries
+    back-end fs modifiers (`.ro:` (default tab complete), `.rw:`); `remove` is a
+    dynamic value menu with ids = paths
+- **Command**: `/session`
+  - **Shape in v2**: dynamic level (sessions) → static action children → confirm
+    leaf on delete
+- **Command**: `/tree`
+  - **Shape in v2**: dynamic level (tree nodes) → static action children
+    (`switch`, `compact`); `compact` modes are single-token enum children; `llm`
+    leaf carries `.prompt` modifier (default value) + confirm property
+- **Command**: `/compact`
+  - **Shape in v2**: leaf that returns the rewritten path `/tree <id> compact`
+- **Command**: `/stat`
+  - **Shape in v2**: interstitial, no leaf
+- **Command**: `/replay`
+  - **Shape in v2**: interstitial + leaf
 
 ---
 
 ## 11. Traceability of resolved questions
 
-| Question | Resolution |
-| --- | --- |
-| Q1 surface changes | Allowed where they buy uniformity (D1). |
-| Q2 `<…>` disambiguator | Dropped; positional ids (D2). Revised: accepts clear the filter, traversal memory restores it (§4, §5). |
-| Q3 modifier grammar | Dot-modifiers uniformly for values; children stay bare words (D3). |
-| Q4 `/stat` `/replay` | In scope via interstitial (D4). |
-| Q5 confirm | Revised: two independent handlers (prep leaf + confirm accept); prep payload passed to the confirm step, dropped on cancel (§2, §9). |
-| Q6 tables | Generalize now, low cost (D6). |
-| Q7 dataset values | Default per modifier (D7). |
-| Q8 fs completion | Dynamic completion handler within modifier value completion (D8). |
-| R8-1 spaced labels | Single-token; drop spaced display. |
-| R8-2 space vs slash | Different contexts; structural terminators; parsing unaffected. |
-| R8-3 paused accepts | Three distinct mechanisms (interstitial / confirm / editor handoff), §9. |
-| R8-4 headers | Static `child_header` + per-row derived header (§6). |
-| R8-5 pinned id | Revised: accepts commit the id and clear refinement; prompt state is path+id, filters ephemeral with traversal-memory restore (§4, §5). |
-| R8-6 handler kinds | One-shot vs live-filter (§8); front-end vs back-end modifiers (§7). |
-| R8-7 spaces in tokens | Selection tokens space-free; values and fuzzy terms may contain spaces (§3, §7). |
-| R8-8 `/compact` | Leaf "return new path" rewrite (§9); no parallel hierarchy. |
-| Value types | Cut to `string` / `number` (permissive); enum is an orthogonal completion constraint, backend validates at accept (§7). |
-| Dataset-derived completion | Default for cached values; built in the preprocessing pass unless an enum is pre-defined (§7, §8.1). |
-| Static children on dynamic nodes | One static action level for *all* rows of the dynamic level; no per-row child nodes (§2, §3). |
-| Positional enum / number values | `enum` / `number` value-typed child kinds; shared handler; permissive parse, backend validates (§2). |
-| Field filtering / sorting | `.field:value`, `.field:>v`/`<v`, `.sort:>f`/`<f` (+ per-field default direction); computed fields replace named sorts (§7.1). |
-| Compound filter specs | Dropped; express as separate per-field tokens (§7.1). |
-| Cursoring & accept model | *Post-v1 design review:* up/down moves the view cursor only; Tab/Enter act on the cursor row, commit path+id, clear refinement; traversal memory + scoped edit invalidation give seamless back-navigation (§4, §5). |
-| `*` marker | Always the currently-active state from application context, never the typed selection (§5). |
-| Active-state sourcing | Single engine mechanism (provider `DataResult::active_row`, §5.1) resolved to the `*` row per frame; open-time cursor seeds on it (§5.1). |
-| Listing-open rule | Uniform: pinned selection shows the *parent* list with the pinned row highlighted; only the trailing space drills (§3). |
-| Esc behavior | Per-level ladder: trailing space → frame replay → clear refinement → clear selection → clear buffer at root (§5.1). |
-| Engine lifetime | Persistent per activation; per-activation state (cursor/frames/cache/accept-phase) lives **inside the engine**; host keeps the engine instance across keypresses; no rebuild, no take/restore, no Arcs (§2, §12). |
-| Handler statefulness | Plain closures everywhere; confirm = two independent handlers (prep leaf + confirm accept) with a payload, not a shared mutable instance (§2, §9). |
-| Leaf result vocabulary | Generic `LeafResult<T>`: menu-semantic outcomes engine-typed; `T` = narrow host outcome (commit/quit/message/redraw) only. App-data mutations live in handlers; no canonical-line re-parsing (§9). |
+- **Question**: Q1 surface changes
+  - **Resolution**: Allowed where they buy uniformity (D1).
+- **Question**: Q2 `<…>` disambiguator
+  - **Resolution**: Dropped; positional ids (D2). Revised: accepts clear the
+    filter, traversal memory restores it (§4, §5).
+- **Question**: Q3 modifier grammar
+  - **Resolution**: Dot-modifiers uniformly for values; children stay bare words
+    (D3).
+- **Question**: Q4 `/stat` `/replay`
+  - **Resolution**: In scope via interstitial (D4).
+- **Question**: Q5 confirm
+  - **Resolution**: Revised: two independent handlers (prep leaf + confirm
+    accept); prep payload passed to the confirm step, dropped on cancel (§2,
+    §9).
+- **Question**: Q6 tables
+  - **Resolution**: Generalize now, low cost (D6).
+- **Question**: Q7 dataset values
+  - **Resolution**: Default per modifier (D7).
+- **Question**: Q8 fs completion
+  - **Resolution**: Dynamic completion handler within modifier value completion
+    (D8).
+- **Question**: R8-1 spaced labels
+  - **Resolution**: Single-token; drop spaced display.
+- **Question**: R8-2 space vs slash
+  - **Resolution**: Different contexts; structural terminators; parsing
+    unaffected.
+- **Question**: R8-3 paused accepts
+  - **Resolution**: Three distinct mechanisms (interstitial / confirm / editor
+    handoff), §9.
+- **Question**: R8-4 headers
+  - **Resolution**: Static `child_header` + per-row derived header (§6).
+- **Question**: R8-5 pinned id
+  - **Resolution**: Revised: accepts commit the id and clear refinement; prompt
+    state is path+id, filters ephemeral with traversal-memory restore (§4, §5).
+- **Question**: R8-6 handler kinds
+  - **Resolution**: One-shot vs live-filter (§8); front-end vs back-end
+    modifiers (§7).
+- **Question**: R8-7 spaces in tokens
+  - **Resolution**: Selection tokens space-free; values and fuzzy terms may
+    contain spaces (§3, §7).
+- **Question**: R8-8 `/compact`
+  - **Resolution**: Leaf "return new path" rewrite (§9); no parallel hierarchy.
+- **Question**: Value types
+  - **Resolution**: Cut to `string` / `number` (permissive); enum is an
+    orthogonal completion constraint, backend validates at accept (§7).
+- **Question**: Dataset-derived completion
+  - **Resolution**: Default for cached values; built in the preprocessing pass
+    unless an enum is pre-defined (§7, §8.1).
+- **Question**: Static children on dynamic nodes
+  - **Resolution**: One static action level for *all* rows of the dynamic level;
+    no per-row child nodes (§2, §3).
+- **Question**: Positional enum / number values
+  - **Resolution**: `enum` / `number` value-typed child kinds; shared handler;
+    permissive parse, backend validates (§2).
+- **Question**: Field filtering / sorting
+  - **Resolution**: `.field:value`, `.field:>v`/`<v`, `.sort:>f`/`<f` (+
+    per-field default direction); computed fields replace named sorts (§7.1).
+- **Question**: Compound filter specs
+  - **Resolution**: Dropped; express as separate per-field tokens (§7.1).
+- **Question**: Cursoring & accept model
+  - **Resolution**: *Post-v1 design review:* up/down moves the view cursor only;
+    Tab/Enter act on the cursor row, commit path+id, clear refinement; traversal
+    memory + scoped edit invalidation give seamless back-navigation (§4, §5).
+- **Question**: `*` marker
+  - **Resolution**: Always the currently-active state from application context,
+    never the typed selection (§5).
+- **Question**: Active-state sourcing
+  - **Resolution**: Single engine mechanism (provider `DataResult::active_row`,
+    §5.1) resolved to the `*` row per frame; open-time cursor seeds on it
+    (§5.1).
+- **Question**: Listing-open rule
+  - **Resolution**: Uniform: pinned selection shows the *parent* list with the
+    pinned row highlighted; only the trailing space drills (§3).
+- **Question**: Esc behavior
+  - **Resolution**: Per-level ladder: trailing space → frame replay → clear
+    refinement → clear selection → clear buffer at root (§5.1).
+- **Question**: Engine lifetime
+  - **Resolution**: Persistent per activation; per-activation state
+    (cursor/frames/cache/accept-phase) lives **inside the engine**; host keeps
+    the engine instance across keypresses; no rebuild, no take/restore, no Arcs
+    (§2, §12).
+- **Question**: Handler statefulness
+  - **Resolution**: Plain closures everywhere; confirm = two independent
+    handlers (prep leaf + confirm accept) with a payload, not a shared mutable
+    instance (§2, §9).
+- **Question**: Leaf result vocabulary
+  - **Resolution**: Generic `LeafResult<T>`: menu-semantic outcomes
+    engine-typed; `T` = narrow host outcome (commit/quit/message/redraw) only.
+    App-data mutations live in handlers; no canonical-line re-parsing (§9).
 
 ---
 
@@ -564,12 +681,16 @@ they are deleted once the host holds the engine directly.)
   intermediate result vocabulary;
 - non-slash affordances: bare-prompt path completion, `!shell`, general Esc
   with an empty menu, editor handoff (`$EDITOR`).
-
-| Layer | Owns |
-| --- | --- |
-| Engine (pure) | descriptor, prompt-derived state, per-activation state (cursor/frames/cache), key decisions |
-| Handlers (app adapters) | all application data — read ctx at call time; supply rows *and* active state (`DataResult::active_row`, §5.1); perform app-data mutations directly via shared handles |
-| Host | app state itself, terminal I/O, rendering the plan, translating `LeafResult` → `InputAction` |
+- **Layer**: Engine (pure)
+  - **Owns**: descriptor, prompt-derived state, per-activation state
+    (cursor/frames/cache), key decisions
+- **Layer**: Handlers (app adapters)
+  - **Owns**: all application data — read ctx at call time; supply rows *and*
+    active state (`DataResult::active_row`, §5.1); perform app-data mutations
+    directly via shared handles
+- **Layer**: Host
+  - **Owns**: app state itself, terminal I/O, rendering the plan, translating
+    `LeafResult` → `InputAction`
 
 **Dispatch rule**: there is exactly one `ActiveOverlay::Menu` shape in the
 final state (impl Phase 7). The host's key loop is uniform: `state(line)` →

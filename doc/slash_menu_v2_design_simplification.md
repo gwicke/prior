@@ -1,41 +1,47 @@
 # node
-Structure
-  - EITHER: childNodes
-    - need to return rows that are uniform in fields - single handler or uniform handlers
-      minimal common fields: id, description
-  - OR: leaf handler
-  - optional
-    - description
-    - field metadata etc
 
+Structure
+
+- EITHER: childNodes
+  - need to return rows that are uniform in fields - single handler or uniform
+    handlers minimal common fields: id, description
+- OR: leaf handler
+- optional
+  - description
+  - field metadata etc
 - own and validate their ids
 
 ## Parent / child interface
-- traverse(keys, parsed_args, path_prefix, id, path_remainder): 
- [Continue(Option<RenderPlan>, Option<newprompt>) | DoneSuccess | DoneError]
-    - called by parent
-    - validates own ids, extracts / consume their own parameters based on
-      generic code + spec - positional, dot modifiers - generic traid default
-      code
-    - path fully consumed?
-      - yes:
-        - if children: show listing; return newpath (normally unchanged full
-          path)
-          - if keys
-            - arrow up/down; page up / down: navigate listing, return new render plan
-            - tab / enter: call child with best matching ID
-        - no children:
-          - no special keys (tab / enter, arrows): maybe show help, return full path
-          - on submit: call handler (leaf)
-      - no: 
-        - if children: call their own children with path remainder
-        - no children: error? extra params that were not consumed
+
+- traverse(keys, parsed_args, path_prefix, id, path_remainder):
+ `[Continue(Option<RenderPlan>, Option<newprompt>) | DoneSuccess | DoneError]`
+  - called by parent
+  - validates own ids, extracts / consume their own parameters based on
+    generic code + spec - positional, dot modifiers - generic traid default
+    code
+  - path fully consumed?
+    - yes:
+      - if children: show listing; return newpath (normally unchanged full
+        path)
+        - if keys
+          - arrow up/down; page up / down: navigate listing, return new render
+            plan
+          - tab / enter: call child with best matching ID
+      - no children:
+        - no special keys (tab / enter, arrows): maybe show help, return full
+          path
+        - on submit: call handler (leaf)
+    - no:
+      - if children: call their own children with path remainder
+      - no children: error? extra params that were not consumed
 
 ## Tree assembly
+
 - addChild() - order determines merge / default sort order of rows / ids
-               returned - unless re-sorted in parent
+  returned - unless re-sorted in parent
 
 ## Internal actions / customization points
+
 - metadata
   - UI config: fields to display (table), title / description / help
 - headerText(): default to static description (also shown in parent);
@@ -43,31 +49,33 @@ Structure
 - getData
 - onSubmit
 
-
 ## Tree example
+
 / -> children
   /model -> single dynamic child returning uniform data
     /model <id> -> leaf handler
 
 ## Dynamic parameter complete
+
 FS complete for sandbox, with space-in-path support
   `/sandbox add_ro /some/long/path`
-  - add_ro: node
-    - child fs complete: no children, commit handler
-      `traverse(keys, args, prefix, remainder): [rows|newpath|submit|error]`
-          if directory, return new set of children - parent displays / caches
-          else: submit handler
+
+- add_ro: node
+  - child fs complete: no children, commit handler
+    `traverse(keys, args, prefix, remainder): [rows|newpath|submit|error]`
+    if directory, return new set of children - parent displays / caches
+    else: submit handler
 
 ---
 
-# Review (picocode, Phase 7 in flight)
+## Review (picocode, Phase 7 in flight)
 
 Read against the current engine: `MenuNode` (data descriptor, 117 lines) +
 centralized `Interpreter` (~1500 lines: state derivation, Tab/Enter/Esc,
 sticky cursors, modifier query, active-row resolution) + side-table
 provider/handler registration + `AcceptController`.
 
-## What the proposal actually changes
+### What the proposal actually changes
 
 Two separable ideas are bundled in the sketch:
 
@@ -86,7 +94,7 @@ These have very different costs. **A is a data-model change that slots into
 the existing interpreter. B moves the interpreter's logic into trait default
 bodies and distributes control flow across the tree.**
 
-## Why A is the real win (and directly serves the remaining plan)
+### Why A is the real win (and directly serves the remaining plan)
 
 The merged model solves exactly the friction the remaining 7.2 steps hit:
 
@@ -118,7 +126,7 @@ touch the grammar, the fuzzy rank/pin, the sticky cursor map, the §5.1
 active-row mechanism, or the Esc ladder. It changes where rows come from,
 not how keys behave.
 
-## Questions on B (distributed traversal)
+### Questions on B (distributed traversal)
 
 1. **Who owns cross-level state?** The interpreter's subtlest invariants are
    all cross-level: the Esc ladder + frame replay walks strictly *up* the
@@ -150,7 +158,7 @@ not how keys behave.
      buffer). Fine with recursion, but worth writing down: Esc always
      re-enters at the root, it never recurses up from the current node.
      - Yes, Esc traversing the node bundary back to the parent would involve
-       several steps. Lets say we start at `/parent child ` (child listing),
+       several steps. Lets say we start at `/parent child` (child listing),
        with earlier filter modifiers at `/parent <filters>`:
        1) first Esc: child strips trailing slash, returns newpath
        2) (assuming no fancy optimizations) traversal restarts at the root,
@@ -158,7 +166,7 @@ not how keys behave.
        node is no longer traversed.
        3) second Esc: parent pops its own frame cache, returns newpath
        `/parent <filters`; new root traversal, old filter state resumed
-       4) third Esc: parent clears filters, returns just `/parent `
+       4) third Esc: parent clears filters, returns just `/parent`
        5) continue at 1)
        So pretty much all path shortening, with the occasional internal frame
        pop.
@@ -274,9 +282,10 @@ not how keys behave.
    - How much of the test suite is prompt / key level (reusable?), and how
      much is low level unit tests?
 
-## Pros / Cons summary
+### Pros / Cons summary
 
 **Pros**
+
 - Merged child set + per-child handlers makes `/set`, `/sandbox`, and
   `/set default_model` modelable without per-command interpreter logic —
   the strongest argument, and it directly unblocks 7.2 steps 8–9.
@@ -293,6 +302,7 @@ not how keys behave.
   explicit (`getData`, `onSubmit`) instead of enum-arm dispatch.
 
 **Cons**
+
 - Distributed `traverse` recursion relocates ~1500 lines of centralized
   logic into default trait bodies without reducing it; the cross-cutting
   invariants (Esc up-walk + frame replay, scoped edit invalidation,
@@ -317,7 +327,7 @@ not how keys behave.
   mid-Phase-7; A alone preserves it (row-source plumbing changes, behavior
   contract does not).
 
-## Synthesis (recommended)
+### Synthesis (recommended)
 
 Adopt **A** as node-model v2; skip **B** as stated, or fold it into A:
 
@@ -338,13 +348,11 @@ Adopt **A** as node-model v2; skip **B** as stated, or fold it into A:
   step's work is throwaway under A, and B is deferred until there is a
   concrete command that needs it.
 
-
-
 ---
 
-# Round 2 responses (picocode)
+## Round 2 responses (picocode)
 
-## On the `&mut` traversal question (§4) — the direct answer
+### On the `&mut` traversal question (§4) — the direct answer
 
 You asked where "the parent holds siblings" comes from. **You are right:
 only one traversal is active at a time.** My original phrasing was wrong
@@ -409,7 +417,7 @@ into the nodes (`Vec<Box<dyn Node>>` per parent) instead of today's flat
 reconstruction) rather than a cheap clone — both fine, both policies to
 write down.
 
-## On epoch-cached per-node state (§1)
+### On epoch-cached per-node state (§1)
 
 Agreed this is tractable — it mirrors the persistent engine's reopen
 semantics (new engine per menu open ⇒ fresh caches), pushed down per node.
@@ -441,7 +449,7 @@ not by convention.
 
 - Yup, blanket impl is what I had in mind.
 
-## On the coordinator question (Cons §1)
+### On the coordinator question (Cons §1)
 
 Partial retraction. With `traverse()` private and epoch-cached per-node
 state, the coordinator shrinks to three small pieces: (a) the root entry
@@ -451,9 +459,10 @@ per-leaf, but the pause/cancel/accept control flow is menu-level). I
 agree the "several mirrored tree structures" concern was illusory — the
 side tables are flat maps keyed by path, not trees. My lean: keep (c)
 engine-owned (control flow, not per-node data); (a) and (b) are trivial.
+
 - I think the "accept / cancel" dialog could be rendered by the same node that
   also owns the final submit handler. Actually, she custom submit handler itself
-  could keep track of the state machine: 
+  could keep track of the state machine:
   1) if no cache match: run the prep, show editor (picocode shared code)
   2) call a pre-defined (not overridable) menu method that renders the accept /
      cancel dialog and handles keystrokes / cursoring, and returns yay or nay on
@@ -476,7 +485,7 @@ engine-owned (control flow, not per-node data); (a) and (b) are trivial.
   coordinator is now just entry + epoch, and the accept-controller's
   ConfirmPrep state machine folds into handler-local state.
 
-## On test-suite reuse (§7)
+### On test-suite reuse (§7)
 
 Counted: the engine crate has ~99 tests. The prompt/key-level scenario
 tests (state/tab/enter/esc/cursor semantics) are ~32 in `interpreter.rs`,
@@ -502,7 +511,7 @@ redesign of the semantics.
   cursor tests, while grammar/filter/table/render (~45 tests) are
   untouched.
 
-## Net position after round 3
+### Net position after round 3
 
 The stateful-node design is viable and the two open coordination questions
 resolved in your favor: the confirm flow is a two-phase submit protocol
@@ -536,31 +545,34 @@ specing the trait — it determines whether per-node cursor state can be
 shared or must be keyed by *full path* inside the node (shared node ⇒
 path-keyed cursor, template ⇒ plain local cursor).
 
-----
-
+---
 
 > Esc must be specified as a root re-entry with the shorter buffer
 
-Yup, I sketched this in a bit more detail in a response slightly higher up, see "Yes, Esc traversing the
-node bundary back to the parent would involve". Unless I am missing something, I think no special return
-protocol is needed beyong newpath and node-local key handling.
+Yup, I sketched this in a bit more detail in a response slightly higher up, see
+"Yes, Esc traversing the node bundary back to the parent would involve". Unless
+I am missing something, I think no special return protocol is needed beyong
+newpath and node-local key handling.
 
 > Borrow/traversal question
 
-For the normal traversal pattern, the need to structure this in phases seems fine to me. I would think
-that most local mutation happens when the local node is at the leaf, and is listing children - so the
-pattern you modeled. And in that case, having the well-defined fetch phase seems fine. For pure
-traversals, the pattern is pretty linear.
+For the normal traversal pattern, the need to structure this in phases seems
+fine to me. I would think that most local mutation happens when the local node
+is at the leaf, and is listing children - so the pattern you modeled. And in
+that case, having the well-defined fetch phase seems fine. For pure traversals,
+the pattern is pretty linear.
 
-> The submit() contract grows one return value (Prepared = pause with dialog) and one callback
-(submit_resolved(yea));
+> The submit() contract grows one return value (Prepared = pause with dialog)
+and one callback (submit_resolved(yea));
 
-Another way could be to offer an overridable (default-noop) "prepare" method in the trait. Default impl
-would be just `return submit()`, but an override can add its prep phase. Would need a return protocol,
-too, as you said. That is slightly less flexible than a directly callable "confirm" method, but maybe
-easier to understand - more of the scaffolding can be generic / hidden.
+Another way could be to offer an overridable (default-noop) "prepare" method in
+the trait. Default impl would be just `return submit()`, but an override can add
+its prep phase. Would need a return protocol, too, as you said. That is slightly
+less flexible than a directly callable "confirm" method, but maybe easier to
+understand - more of the scaffolding can be generic / hidden.
 
-> One design item flagged for the reshape spec: node sharing. /set default_model reusing the model
+> One design item flagged for the reshape spec: node sharing. /set default_model
+> reusing the model
 
 I think it would be fine to use two instances. The default model is rarely
 touched, and the model repo can cache independently, so any wins from having

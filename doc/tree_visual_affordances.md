@@ -34,7 +34,7 @@ answer: **row order is chronological** (a decision, `tree_indent_refinement.md`
 §10 #5), so two long lines of work that branched early alternate
 vertically:
 
-```
+```text
 kick off                      ← main line
   reply 1
     experiment prompt         ← excursion A starts
@@ -68,10 +68,14 @@ says "the rows above and below this one, in this column, are the same
 thread". That assertion is true only if the rows of a branch are adjacent,
 which chronological order deliberately breaks.
 
-| | adjacent rows (spine-first order) | interleaved rows (chronological) |
-|---|---|---|
-| vertical rail | correct and legible | **lies** — the eye looks for a line that isn't there |
-| per-row colour | works | **works** — colour is an attribute of the row, not a position |
+- vertical rail
+  - **adjacent rows (spine-first order)**: correct and legible
+  - **interleaved rows (chronological)**: **lies** — the eye looks for a line
+    that isn't there
+- per-row colour
+  - **adjacent rows (spine-first order)**: works
+  - **interleaved rows (chronological)**: **works** — colour is an attribute of
+    the row, not a position
 
 This is why the box-drawing idea and the "chronological order" decision are
 in tension, and why the classic tree drawing (and `git log --graph`) buys
@@ -134,11 +138,13 @@ where cells are built (after snippet extraction, before `add_row`).
 
 ### 3.4 Truncation is now ANSI-safe; the snippet path is not
 
-| path | escape-aware? |
-|---|---|
-| `wrap::atoms` (wrapped columns) | yes, already |
-| `Table::fit` (ellipsised columns) | **fixed** in `8657429` — was cutting mid-sequence and losing the reset |
-| `extract_snippet` (fuzzy, `table.rs:476`) | **no** — per-char width table, `char_width('\x1b')` → 1 |
+- **path**: `wrap::atoms` (wrapped columns)
+  - **escape-aware?**: yes, already
+- **path**: `Table::fit` (ellipsised columns)
+  - **escape-aware?**: **fixed** in `8657429` — was cutting mid-sequence and
+    losing the reset
+- **path**: `extract_snippet` (fuzzy, `table.rs:476`)
+  - **escape-aware?**: **no** — per-char width table, `char_width('\x1b')` → 1
 
 `extract_snippet` is the reason §3.1 matters: if styling is applied
 *before* it, the snippet window is computed over a string with escape
@@ -181,7 +187,6 @@ continuity:
 - optionally a dim `┣` on the fork row itself (a row with ≥2 visible
   children) — "this row is where the split is";
 - the existing `*` keeps meaning the active path, `>` selection.
-
 - **Pro:** interleaving-safe (a marker is a fact about one row, not a line
   across rows); cheap (one column); answers question 2 of §1 exactly;
   additive to colour, and it is the non-colour cue that makes colour
@@ -234,13 +239,41 @@ extra width, and dotted so it does not claim contiguity.
 
 ### Comparison
 
-| | identity | split location | interleaving-safe | extra columns | a11y | verdict |
-|---|---|---|---|---|---|---|
-| A rails | yes | yes | **no** | 2 | good | reject (now) |
-| B markers | no | **yes** | yes | 1 | good | **yes** |
-| C colour band | **yes** | no | yes | 1–2 | needs B | **yes** |
-| D row tint | yes | no | yes | 0 | needs B | reject |
-| E dotted rail | weak | no | yes | 0 | good | reject |
+- A rails
+  - **identity**: yes
+  - **split location**: yes
+  - **interleaving-safe**: **no**
+  - **extra columns**: 2
+  - **a11y**: good
+  - **verdict**: reject (now)
+- B markers
+  - **identity**: no
+  - **split location**: **yes**
+  - **interleaving-safe**: yes
+  - **extra columns**: 1
+  - **a11y**: good
+  - **verdict**: **yes**
+- C colour band
+  - **identity**: **yes**
+  - **split location**: no
+  - **interleaving-safe**: yes
+  - **extra columns**: 1–2
+  - **a11y**: needs B
+  - **verdict**: **yes**
+- D row tint
+  - **identity**: yes
+  - **split location**: no
+  - **interleaving-safe**: yes
+  - **extra columns**: 0
+  - **a11y**: needs B
+  - **verdict**: reject
+- E dotted rail
+  - **identity**: weak
+  - **split location**: no
+  - **interleaving-safe**: yes
+  - **extra columns**: 0
+  - **a11y**: good
+  - **verdict**: reject
 
 B + C is the pair: colour for identity, glyphs for events, indent for
 depth. Three mechanisms, three questions, no overlap.
@@ -257,18 +290,28 @@ heavy — over a saturated wash the thin strokes (U+2502 and friends) read
 as too faint, so the bar is carried by the stroke rather than by the
 colour behind it.
 
-| role | glyph | ink |
-|---|---|---|
-| the line continues | `┃` U+2503 | branch |
-| a reply, the line continues | `┣` U+2523 | branch |
-| a reply on the branch's last row | `┗` U+2517 | branch |
-| a non-reply on the branch's last row (the pipe ends) | `┻` U+253B | branch |
-| a spur's first visible row | `┓` U+2513 | branch |
-| connector: elbow at the parent's bar + run right | `┗` U+2517 + `━` U+2501 ×n | **neutral** |
+- **role**: the line continues
+  - **glyph**: `┃` U+2503
+  - **ink**: branch
+- **role**: a reply, the line continues
+  - **glyph**: `┣` U+2523
+  - **ink**: branch
+- **role**: a reply on the branch's last row
+  - **glyph**: `┗` U+2517
+  - **ink**: branch
+- **role**: a non-reply on the branch's last row (the pipe ends)
+  - **glyph**: `┻` U+253B
+  - **ink**: branch
+- **role**: a spur's first visible row
+  - **glyph**: `┓` U+2513
+  - **ink**: branch
+- **role**: connector: elbow at the parent's bar + run right
+  - **glyph**: `┗` U+2517 + `━` U+2501 ×n
+  - **ink**: **neutral**
 
 A row is:
 
-```
+```text
 [indent: depth × SPUR_STEP spaces]
 [spur-start connector, only on a spur's first visible row: ┗ at the parent's bar column, ━ filling up to this bar]
 [bar cell: 1 column, glyph from the table above, background = branch hue faded by depth]
@@ -278,7 +321,7 @@ A row is:
 
 and it renders as:
 
-```
+```text
 ┃kick off               main,  user               bar@0
 ┗╸ reply 1              main,  assistant           bar@0, branch ends
 ┗━━┓experiment prompt   spur1, user              ┗@0, ━@1..2, bar@3
@@ -355,18 +398,18 @@ The bar **replaces the last column of its branch's indent block**, so the
 text column is exactly where the shipped layout puts it — the prefix costs
 no width at all:
 
-```
+```text
 text_col(d) = d × SPUR_STEP          bar_col(d) = d × SPUR_STEP − 1  (d ≥ 1)
 text_col(0) = 1                      bar_col(0) = 0
 ```
 
-| row | bar column | text column |
-|---|---|---|
-| main, user | 0 | 1 |
-| main, assistant | 0 | 2 |
-| depth-1, user | 3 | 4 |
-| depth-1, assistant | 3 | 5 |
-| depth-2, user | 7 | 8 |
+| row                | bar column | text column |
+| ------------------ | ---------- | ----------- |
+| main, user         | 0          | 1           |
+| main, assistant    | 0          | 2           |
+| depth-1, user      | 3          | 4           |
+| depth-1, assistant | 3          | 5           |
+| depth-2, user      | 7          | 8           |
 
 With `SPUR_STEP = 4` that is **4 columns per spur level, unchanged from the
 layout already shipped** — the bar is drawn *in* the indent rather than
@@ -411,13 +454,24 @@ split matters because the description is not only display text:
 
 So the row carries the *text* in one place and the *prefix* in another:
 
-| field | type | meaning |
-|---|---|---|
-| `text` | str | the bare entry text — the haystack, the header, the filter index. |
-| `depth` | int | spur level; `0` = main line. Replaces `FlatRow.indent`. |
-| `branch` | int | colour ordinal: `0` = main line, else a **global** per-spur counter handed out in descending-height order (§8.1). |
-| `spur_start` | flag | first **visible** row of a spur — the row that draws the connector and the `┓`. |
-| `role` | str | already emitted; retained for filters and `header()`. |
+- **field**: `text`
+  - **type**: str
+  - **meaning**: the bare entry text — the haystack, the header, the filter
+    index.
+- **field**: `depth`
+  - **type**: int
+  - **meaning**: spur level; `0` = main line. Replaces `FlatRow.indent`.
+- **field**: `branch`
+  - **type**: int
+  - **meaning**: colour ordinal: `0` = main line, else a **global** per-spur
+    counter handed out in descending-height order (§8.1).
+- **field**: `spur_start`
+  - **type**: flag
+  - **meaning**: first **visible** row of a spur — the row that draws the
+    connector and the `┓`.
+- **field**: `role`
+  - **type**: str
+  - **meaning**: already emitted; retained for filters and `header()`.
 
 The listing cell is `prefix + text`; `header()` reads `text`. `depth`,
 `branch` and `spur_start` are also declared in `tree_fields()`, so they are
@@ -444,7 +498,7 @@ windows correctly around a match in a cell that carries a wash.
   warm, clearly-distinct hues, and the warm end of the wheel is reached
   last. 24-bit, full-colour terminals assumed, no 16-colour budget:
 
-```
+```text
 anchor #f97316 orange
    1 #f472b6 rose      2 #a78bfa violet   3 #60a5fa azure   4 #22d3ee cyan
    5 #2dd4bf teal      6 #6ee7a8 green    7 #a3e635 lime    8 #fbbf24 amber → wrap
@@ -477,7 +531,7 @@ Saturation is the second, independent reading of the same cell: hue says
 *which* branch, fade says *how far out*. Blend toward the row background
 (`48;5;235` = `#262626` for unselected rows):
 
-```
+```text
 depth  0     1      2      3      4      5+
 f      1.00  0.75   0.58   0.45   0.36   0.30
 ```
@@ -501,20 +555,60 @@ across the session) was considered and dropped.
 
 ## 7. Decisions
 
-| # | Question | Decision |
-|---|---|---|
-| 1 | Rails, markers, or colour? | **Markers + colour, no rails** (§2: rails assert contiguity that interleaving breaks). |
-| 2 | Gutter | Owned by the generic render layer; the tree emits fields and does not know the gutter exists (§5.4). |
-| 3 | Bar geometry | Aligned to the branch's own indent, text immediately after (§5). |
-| 4 | Glyphs | Box-drawing only, no arrows, no block elements, and **all heavy** — thin strokes are too faint over a saturated wash. `┃` on the line, `┓` on a spur's first row. |
-| 5 | Assistant replies | `┣` per reply, `┗` on the last of a turn; the vertical is per **branch**, so the ladder turns off (or the pipe ends with `┻`) on the branch's last row, not at every turn boundary (§5.1). |
-| 6 | Spur marker | A line from the bar above: `┗` under the parent's bar, `━` touching the new bar cell, in neutral ink with no wash; the bar cell's own glyph stays in branch ink (§5.1, §5.3). |
-| 7 | Hue | **Warm orange** anchor for the main line; rainbow rotated per level starting after the anchor, ordered by descending height; fade = depth; layout-relative (§6). |
-| 8 | Opt-out | A `tree_color` setting (`auto | on | off`) + `NO_COLOR`; neither exists today (§3.5). |
-| 9 | Defensive fix | Make `extract_snippet` escape-aware even though the recommended path does not reach it (§3.4). |
-| 10 | Assistant step | **1 column** — the junction's arm and the reply mark `╸` share it, in the same neutral ink as the connector (§5.2). |
-| 11 | Spur-level width | **4 columns per level, unchanged from the shipped layout**: the bar replaces the last indent column rather than being added after it (§5.2). |
-| 12 | Tunables | The fade curve (§6.2), the palette constants and the connector's dim ink are single constants; the exact anchor orange wants a look on a real terminal (§6.1). |
+- 1
+  - **Question**: Rails, markers, or colour?
+  - **Decision**: **Markers + colour, no rails** (§2: rails assert contiguity
+    that interleaving breaks).
+- 2
+  - **Question**: Gutter
+  - **Decision**: Owned by the generic render layer; the tree emits fields and
+    does not know the gutter exists (§5.4).
+- 3
+  - **Question**: Bar geometry
+  - **Decision**: Aligned to the branch's own indent, text immediately after
+    (§5).
+- 4
+  - **Question**: Glyphs
+  - **Decision**: Box-drawing only, no arrows, no block elements, and
+    **all heavy** — thin strokes are too faint over a saturated wash. `┃` on the
+    line, `┓` on a spur's first row.
+- 5
+  - **Question**: Assistant replies
+  - **Decision**: `┣` per reply, `┗` on the last of a turn; the vertical is per
+    **branch**, so the ladder turns off (or the pipe ends with `┻`) on the
+    branch's last row, not at every turn boundary (§5.1).
+- 6
+  - **Question**: Spur marker
+  - **Decision**: A line from the bar above: `┗` under the parent's bar, `━`
+    touching the new bar cell, in neutral ink with no wash; the bar cell's own
+    glyph stays in branch ink (§5.1, §5.3).
+- 7
+  - **Question**: Hue
+  - **Decision**: **Warm orange** anchor for the main line; rainbow rotated per
+    level starting after the anchor, ordered by descending height; fade = depth;
+    layout-relative (§6).
+- 8
+  - **Question**: Opt-out
+  - **Decision**: A `tree_color` setting (`auto | on | off`) + `NO_COLOR`;
+    neither exists today (§3.5).
+- 9
+  - **Question**: Defensive fix
+  - **Decision**: Make `extract_snippet` escape-aware even though the
+    recommended path does not reach it (§3.4).
+- 10
+  - **Question**: Assistant step
+  - **Decision**: **1 column** — the junction's arm and the reply mark `╸` share
+    it, in the same neutral ink as the connector (§5.2).
+- 11
+  - **Question**: Spur-level width
+  - **Decision**: **4 columns per level, unchanged from the shipped layout**:
+    the bar replaces the last indent column rather than being added after it
+    (§5.2).
+- 12
+  - **Question**: Tunables
+  - **Decision**: The fade curve (§6.2), the palette constants and the
+    connector's dim ink are single constants; the exact anchor orange wants a
+    look on a real terminal (§6.1).
 
 ---
 
@@ -527,20 +621,37 @@ one function — `row_prefix` is the seam the generic gutter work absorbs.
 
 **`src/v25_tree.rs`**
 
-| Step | Change |
-|---|---|
-| 1 | `ranked_children()` replaces `spine_children()`: per node, children ranked by `(height, write order)`. Rank 0 *is* the spine, so there is no separate spine set. Same iterative post-order, same visible projection. |
-| 2 | `flatten_turns` carries `(node, depth, branch, spur_start)` on the DFS stack and hands out hues from a **global** spur counter (see §8.1). Spine children inherit the parent's branch, so a spur's replies share its hue. |
-| 3 | `row_prefix(depth, branch, bar, assistant)` builds connector + bar cell + reply step; `Bar` is the glyph enum of §5.1; the palette, `FADE` and `blend` are constants. |
-| 4 | `FlatRow`: `indent` → `depth`, plus `branch` and `spur_start`. `data()` emits them as row fields (`text` carries the bare text), and `header()` reads `text` instead of `trim_start`-ing the description. |
-| 5 | `tree_fields()` exposes `depth`, `branch` and `spur_start` as filterable fields. |
-| 6 | Tests: every indent assertion moved from counting spaces to `depth` plus the visible prefix; new tests for branch identity, `spur_start` placement (including through invisible entries), the fade/ink split, and the connector's weight and ink. |
-
-**`crates/slashdot_menu/src/table.rs`**
-
-| Step | Change |
-|---|---|
-| 7 | `extract_snippet` is escape-aware (§3.4): escape characters occupy characters but no visible columns, so the snippet window is measured in columns and the escapes ride through the slice. Needed now that cells carry SGR. |
+- 1
+  - **Change**: `ranked_children()` replaces `spine_children()`: per node,
+    children ranked by `(height, write order)`. Rank 0 *is* the spine, so there
+    is no separate spine set. Same iterative post-order, same visible
+    projection.
+- 2
+  - **Change**: `flatten_turns` carries `(node, depth, branch, spur_start)` on
+    the DFS stack and hands out hues from a **global** spur counter (see §8.1).
+    Spine children inherit the parent's branch, so a spur's replies share its
+    hue.
+- 3
+  - **Change**: `row_prefix(depth, branch, bar, assistant)` builds connector +
+    bar cell + reply step; `Bar` is the glyph enum of §5.1; the palette, `FADE`
+    and `blend` are constants.
+- 4
+  - **Change**: `FlatRow`: `indent` → `depth`, plus `branch` and `spur_start`.
+    `data()` emits them as row fields (`text` carries the bare text), and
+    `header()` reads `text` instead of `trim_start`-ing the description.
+- 5
+  - **Change**: `tree_fields()` exposes `depth`, `branch` and `spur_start` as
+    filterable fields.
+- 6
+  - **Change**: Tests: every indent assertion moved from counting spaces to
+    `depth` plus the visible prefix; new tests for branch identity, `spur_start`
+    placement (including through invisible entries), the fade/ink split, and the
+    connector's weight and ink. **`crates/slashdot_menu/src/table.rs`**
+- 7
+  - **Change**: `extract_snippet` is escape-aware (§3.4): escape characters
+    occupy characters but no visible columns, so the snippet window is measured
+    in columns and the escapes ride through the slice. Needed now that cells
+    carry SGR.
 
 Not done, deliberately: the `tree_color` setting and `NO_COLOR` (§7 #8).
 Every colour in the codebase is currently static, so a single opt-out in

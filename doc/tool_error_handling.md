@@ -18,16 +18,17 @@ implementation in `src/agent.rs` / `src/lib.rs`.
 1. **Tool execution errors** — a registered tool runs and fails. Rig models
    these richly (`ToolResult` / `ToolErrorKind` / `ToolExecutionError`) and
    already feeds the failure text back to the model in the same run; the model
-   sees the error and can correct. Picocode's only job here is *display*
-   (render the failure distinctly) and *name recovery* (`on_invalid_tool_call`).
-   This class is **done** — see [Tool execution errors](#tool-execution-errors).
+   sees the error and can correct. Picocode's only job here is *display* (render
+   the failure distinctly) and *name recovery* (`on_invalid_tool_call`). This
+   class is **done** — see
+   [Tool execution errors](#tool-execution-errors-settled).
 2. **Turn-level provider / transport errors** — the provider's HTTP response
    or SSE stream fails mid-turn: 429, 401, 5xx, network drop, malformed
    streamed tool-call JSON. These kill the whole rig run. Picocode classifies
    them (`classify_stream_error`) and the REPL auto-retries — but the current
    retry **re-runs the whole turn from the session**, losing any tool work the
    turn had already completed. This class is the **open design** — see
-   [Mid-turn failure & resume](#mid-turn-failure--resume).
+   [Mid-turn failure & resume](#mid-turn-failure--resume-implemented).
 
 ---
 
@@ -218,6 +219,7 @@ struct TurnTranscript {
 ```
 
 Sources:
+
 - `input` → seed `committed[0] = Message::user(input)` only when the run
   actually starts (first model call begins); do not pre-seed.
 - `on_model_turn_finished` → append `Message::Assistant { content }`;
@@ -320,6 +322,7 @@ adapter in the pinned rev is a 1:1 message conversion with no visible
 merge-consecutive-users pass, so this is a **real, unverified risk**.
 
 Mitigation options to validate during implementation:
+
 - If `user,user` is rejected: when the partial transcript ends on a `user`
   tool-result message, *merge* the steering text into that same
   `Message::User` (append a text item alongside the tool results) instead of
@@ -535,15 +538,36 @@ taxonomy and the `Retry-After` extraction.
 
 ## Risk assessment
 
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| `user,user` rejected by a provider adapter (esp. Anthropic) | High if present | Merge steering into trailing `Message::User` when transcript ends on a user message (the common mid-turn shape); verify empirically (Q1) |
-| Accumulator diverges from rig's `new_messages` shape | Medium | Cross-check against `resp.messages()` on the happy path (Phase 1.4); validate with `rig_run`'s `validate_canonical` in tests |
-| Unanswered trailing tool-call turn persisted → invalid history | Medium | Finalization synthesizes a text tool result per unanswered call (G1), so the transcript stays canonical (`validate_canonical` passes); no truncation |
-| Duplicate `user(input)` on retry | Medium | Persist-once rule: no progress → no persist + re-send; progress → persist finalized + steering prompt (never re-send `input`) |
-| 429 budget burns `max_turns` | Medium | Per-turn counter only; each retry is a fresh `prompt()` consuming 1 turn — document that a 20-retry burst may exhaust a small `tool_call_limit`; keep budget configurable |
-| Long back-off with no user feedback | Low | REPL already prints `Retrying in Ns…`; add cumulative total on give-up |
-| Regression: replay of old sessions | Low | Compat shim kept in `display_tool_result`; no session-format change (messages persist via existing `append_message`) |
+- **Risk**: `user,user` rejected by a provider adapter (esp. Anthropic)
+  - **Impact**: High if present
+  - **Mitigation**: Merge steering into trailing `Message::User` when transcript
+    ends on a user message (the common mid-turn shape); verify empirically (Q1)
+- **Risk**: Accumulator diverges from rig's `new_messages` shape
+  - **Impact**: Medium
+  - **Mitigation**: Cross-check against `resp.messages()` on the happy path
+    (Phase 1.4); validate with `rig_run`'s `validate_canonical` in tests
+- **Risk**: Unanswered trailing tool-call turn persisted → invalid history
+  - **Impact**: Medium
+  - **Mitigation**: Finalization synthesizes a text tool result per unanswered
+    call (G1), so the transcript stays canonical (`validate_canonical` passes);
+    no truncation
+- **Risk**: Duplicate `user(input)` on retry
+  - **Impact**: Medium
+  - **Mitigation**: Persist-once rule: no progress → no persist + re-send;
+    progress → persist finalized + steering prompt (never re-send `input`)
+- **Risk**: 429 budget burns `max_turns`
+  - **Impact**: Medium
+  - **Mitigation**: Per-turn counter only; each retry is a fresh `prompt()`
+    consuming 1 turn — document that a 20-retry burst may exhaust a small
+    `tool_call_limit`; keep budget configurable
+- **Risk**: Long back-off with no user feedback
+  - **Impact**: Low
+  - **Mitigation**: REPL already prints `Retrying in Ns…`; add cumulative total
+    on give-up
+- **Risk**: Regression: replay of old sessions
+  - **Impact**: Low
+  - **Mitigation**: Compat shim kept in `display_tool_result`; no session-format
+    change (messages persist via existing `append_message`)
 
 ## Acceptance criteria
 

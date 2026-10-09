@@ -1,15 +1,14 @@
 # The screen is a composition: content, status, input
 
-**Status:** design discussion — nothing implemented yet
-**Context:** follows `doc/ui_draw_v2.md` §9 #6 (content row counts drift) and #10
-(streaming doesn't track rows). Those two are not two bugs: they are one missing
-capability, and it is the gate on a live status line.
-**Revises:** `doc/ui_draw_v2.md` §2 (apply policies) and §4.5 (fixed bottom
-elements) — see §3.4. My own first draft of this doc proposed a narrower
-"reserved band at the bottom" and deferred `ApplyPolicy::Append` as having no
-producer. Both were wrong in the same way: `Append` is not a chunked-write
-policy, it is the *content* policy, and the content is a first-class part of the
-screen's composition.
+**Status:** design discussion — nothing implemented yet **Context:** follows
+`doc/ui_draw_v2.md` §9 #6 (content row counts drift) and #10 (streaming doesn't
+track rows). Those two are not two bugs: they are one missing capability, and it
+is the gate on a live status line. **Revises:** `doc/ui_draw_v2.md` §2 (apply
+policies) and §4.5 (fixed bottom elements) — see §3.4. My own first draft of
+this doc proposed a narrower "reserved band at the bottom" and deferred
+`ApplyPolicy::Append` as having no producer. Both were wrong in the same way:
+`Append` is not a chunked-write policy, it is the *content* policy, and the
+content is a first-class part of the screen's composition.
 
 ---
 
@@ -20,14 +19,25 @@ applied frame. Everything drawn *underneath* them — streamed reasoning, stream
 answer text, rendered markdown, tool panels — moves the real cursor, and the
 cache is supposed to follow. It follows for some writers and not others:
 
-| Writer | Accounting | Verdict |
-|---|---|---|
-| `display_error` / `display_system` / `display_separator` | `note_lines(1)` | exact (single row) |
-| `display_plain` | `wrap(strip_ansi(text), w).len()` | exact (it wraps first) |
-| `paint_panel` / `tool_panel` (tool panels) | `note_lines(1)` per *pre-wrapped* line | exact for ASCII, undercounts wide chars |
-| `display_markdown` | `rendered.lines().count()` | exact if nothing wraps, undercounts otherwise |
-| `display_text` | `wrap(text, w).len()` — the bytes are `⏺ ` + `termimad::inline(text)` | **drifts** (§9 #6) |
-| `stream_text` / `stream_thinking` / `commit_thinking` | *nothing* — 7 `Renderer::feed` sites | **untracked** (§9 #10) |
+- **Writer**: `display_error` / `display_system` / `display_separator`
+  - **Accounting**: `note_lines(1)`
+  - **Verdict**: exact (single row)
+- **Writer**: `display_plain`
+  - **Accounting**: `wrap(strip_ansi(text), w).len()`
+  - **Verdict**: exact (it wraps first)
+- **Writer**: `paint_panel` / `tool_panel` (tool panels)
+  - **Accounting**: `note_lines(1)` per *pre-wrapped* line
+  - **Verdict**: exact for ASCII, undercounts wide chars
+- **Writer**: `display_markdown`
+  - **Accounting**: `rendered.lines().count()`
+  - **Verdict**: exact if nothing wraps, undercounts otherwise
+- **Writer**: `display_text`
+  - **Accounting**: `wrap(text, w).len()` — the bytes are `⏺` +
+    `termimad::inline(text)`
+  - **Verdict**: **drifts** (§9 #6)
+- **Writer**: `stream_text` / `stream_thinking` / `commit_thinking`
+  - **Accounting**: *nothing* — 7 `Renderer::feed` sites
+  - **Verdict**: **untracked** (§9 #10)
 
 And the fallback that papers over the drift has a second defect: `note_lines`
 **clamps** the tracked row to the terminal height (it models "the terminal
@@ -50,9 +60,9 @@ turn, then a DSR re-anchor. The chain, as reported:
 2. The turn had streamed, so the tracked row was the clamped bottom row — the
    real cursor was elsewhere, and `live` tracked a frame region that was no
    longer where it had been painted.
-3. The menu resolved with `Frame::empty()`, whose union clear is anchored to that
-   region. Wrong region → wrong clear → the replay paints over what it did not
-   clear.
+3. The menu resolved with `Frame::empty()`, whose union clear is anchored to
+   that region. Wrong region → wrong clear → the replay paints over what it did
+   not clear.
 
 Row accounting removes the cause; a scoped re-anchor removes the failure mode.
 Phase B pins the artifact against the report before fixing it.
@@ -64,7 +74,7 @@ Phase B pins the artifact against the report before fixing it.
 Not "a frame painted at an anchor over some content that happens to be there",
 but:
 
-```
+```text
 ┌──────────────────────────────┐  row 1
 │ scrollback content            │  … the LLM turn, in order, written once
 ├──────────────────────────────┤  content_bottom + 1
@@ -79,7 +89,7 @@ but:
 One solve answers where the frame goes and whether the content moves. With
 `H` = the frame's height after allocation and `cb` = the content's last row:
 
-```
+```text
 frame_top = min(cb + 1, term_h - H + 1)        // following (default)
 frame_top = term_h - H + 1                      // pinned
 content_bottom ≤ frame_top - 1                  // always
@@ -105,9 +115,10 @@ machinery either way.
 `write_content` of `n` rows, with the current `H`:
 
 1. `cb' = cb + n`.
-2. If `cb' > frame_top - 1`, the content must move up by `delta = cb' - (frame_top - 1)`.
-   Scroll first (bare LFs from the bottom row — never `CSI S`, ui_draw_v2 §4.3),
-   so the reclaimed rows come from the top of the content into scrollback.
+2. If `cb' > frame_top - 1`, the content must move up by
+   `delta = cb' - (frame_top - 1)`. Scroll first (bare LFs from the bottom row —
+   never `CSI S`, ui_draw_v2 §4.3), so the reclaimed rows come from the top of
+   the content into scrollback.
 3. **Clear the frame's old region first**, if the scroll moved the frame (see
    §2.2) — otherwise the first `delta` rows of the old frame survive *above* the
    new content, which is exactly the class of artifact in §1.1.
@@ -190,7 +201,7 @@ pub struct ContentBlock<'a> {
 }
 ```
 
-`display_text` builds `⏺ ` + `termimad::inline(text)` and calls it.
+`display_text` builds `⏺` + `termimad::inline(text)` and calls it.
 `stream_text` renders into a local buffer, calls it, and the count comes from
 the bytes. `paint_panel` calls it per line. Footers and menus are injected at
 the same point, which is what makes "one place to inject them" true rather than
@@ -231,12 +242,12 @@ A separate, small surface; its own paragraph when we get to phase A2.
 **As built (A2.1, tuned after):** `status_line` composes the text and also
 *renders* it, so `paint_status` stays a dumb writer. The bar is a full row —
 `48;5;237m`, the table header's own background, carried **before** the padding
-so the row is one solid block and not a highlighted fragment — with a `38;5;245m`
-foreground, the text against the right margin, and a reset. A named session shows
-its name; an unnamed one shows the first 25 columns of its opening user message
-(`prior`'s first user message, or this turn's prompt on turn one), whitespace
-collapsed, escapes stripped: it is untrusted text out of a session file, and a
-pasted escape must not colour or reposition the bar.
+so the row is one solid block and not a highlighted fragment — with a
+`38;5;245m` foreground, the text against the right margin, and a reset. A named
+session shows its name; an unnamed one shows the first 25 columns of its opening
+user message (`prior`'s first user message, or this turn's prompt on turn one),
+whitespace collapsed, escapes stripped: it is untrusted text out of a session
+file, and a pasted escape must not colour or reposition the bar.
 
 Two consequences of a bar that is exactly the terminal's width:
 
@@ -266,8 +277,8 @@ Three things the bar had to learn, each a bug first:
 - **It must not inherit the ambient SGR.** `ensure_dim` emits `\x1b[2m` /
   `\x1b[0m` only when the tracked `dim_on` *changes*, and the bar went straight
   to the writer without touching that state. So it broke the toggle in both
-  directions: it inherited the terminal's dim (a colour is not an *attribute*, so
-  `38;5;245m` did not clear dim) and its own trailing reset then silenced the
+  directions: it inherited the terminal's dim (a colour is not an *attribute*,
+  so `38;5;245m` did not clear dim) and its own trailing reset then silenced the
   *next* reasoning write, which saw no change to re-assert. The bar now opens
   with a full reset, and `paint_status` restores the tracked dim after it.
   Restores, not toggles.
@@ -380,23 +391,62 @@ choke point and `BlockKind` as the input, it becomes one function
 
 ## 5. Settled decisions (2026-09-28, after review)
 
-| # | Question | Decision |
-|---|---|---|
-| D1 | Following or pinned? | **Following** — the frame is painted top-down from the scrollback and sits directly below the content; menus appear below the status line. `frame_top = min(cb + 1, term_h − H + 1)`. |
-| D2 | Keep the frame's 2/3 budget? | **Keep** (`allocate(elements, ⌈2/3·term_h⌉)`). The solve places the frame; the budget still bounds its height, and the top 1/3 stays scrollback. |
-| D3 | API shape | **Additive.** `write_content` is added to `Output`; `draw_frame` and `ApplyPolicy` stay, with the policy mapping onto the internal solve. A full migration to `set_frame`/`write_content` is a recorded follow-up, not this work. |
-| D4 | `ContentOut`/`UiOut` trait split | **Deferred** — the composition carries the two anchors internally; the split's payoff is explicitness, not capability. Revisit with the queued-prompt work. |
-| D5 | Order | **The row counter first.** `content_bottom` has to be *true* before a composition can be built on it, and the counter is also §9 #6 and §9 #10 plus the resume artifact. |
-| D6 | Frame element order | `[Status, Input?, Divider?, Menu?]`. The status line is the frame's top element. The input is present only when not streaming. The divider only when something is visible below it (a menu). The menu's own `detail` + `rows` are vertically balanced inside the painter and the menu as a whole is a flexible element of the frame's stack (`allocate`'s even surplus division) — both already true, now written down. |
-| D7 | Status line tone | The table-header background (`\x1b[48;5;237m`), not the data-row grey. |
-| D8 | Padding | The painter pads frame rows that arrive unpadded; content writers keep padding their own rows for consistent backgrounds, and the painter never touches content rows. |
-| D9 | Entry DSRs | **Keep** `read_input`'s and `ui::confirm`'s after the counter lands. They become unnecessary, but they are the documented guard for *foreign* writers (a tool's subprocess on the tty), and they cost one round trip per prompt. Removing them is a follow-up with its own justification. |
+- D1
+  - **Question**: Following or pinned?
+  - **Decision**: **Following** — the frame is painted top-down from the
+    scrollback and sits directly below the content; menus appear below the
+    status line. `frame_top = min(cb + 1, term_h − H + 1)`.
+- D2
+  - **Question**: Keep the frame's 2/3 budget?
+  - **Decision**: **Keep** (`allocate(elements, ⌈2/3·term_h⌉)`). The solve
+    places the frame; the budget still bounds its height, and the top 1/3 stays
+    scrollback.
+- D3
+  - **Question**: API shape
+  - **Decision**: **Additive.** `write_content` is added to `Output`;
+    `draw_frame` and `ApplyPolicy` stay, with the policy mapping onto the
+    internal solve. A full migration to `set_frame`/`write_content` is a
+    recorded follow-up, not this work.
+- D4
+  - **Question**: `ContentOut`/`UiOut` trait split
+  - **Decision**: **Deferred** — the composition carries the two anchors
+    internally; the split's payoff is explicitness, not capability. Revisit with
+    the queued-prompt work.
+- D5
+  - **Question**: Order
+  - **Decision**: **The row counter first.** `content_bottom` has to be *true*
+    before a composition can be built on it, and the counter is also §9 #6 and
+    §9 #10 plus the resume artifact.
+- D6
+  - **Question**: Frame element order
+  - **Decision**: `[Status, Input?, Divider?, Menu?]`. The status line is the
+    frame's top element. The input is present only when not streaming. The
+    divider only when something is visible below it (a menu). The menu's own
+    `detail` + `rows` are vertically balanced inside the painter and the menu as
+    a whole is a flexible element of the frame's stack (`allocate`'s even
+    surplus division) — both already true, now written down.
+- D7
+  - **Question**: Status line tone
+  - **Decision**: The table-header background (`\x1b[48;5;237m`), not the
+    data-row grey.
+- D8
+  - **Question**: Padding
+  - **Decision**: The painter pads frame rows that arrive unpadded; content
+    writers keep padding their own rows for consistent backgrounds, and the
+    painter never touches content rows.
+- D9
+  - **Question**: Entry DSRs
+  - **Decision**: **Keep** `read_input`'s and `ui::confirm`'s after the counter
+    lands. They become unnecessary, but they are the documented guard for
+    *foreign* writers (a tool's subprocess on the tty), and they cost one round
+    trip per prompt. Removing them is a follow-up with its own justification.
 
 ### 5.1 What following buys
 
 `content_bottom` is a *derivation*, not a field:
 
-- `live.is_some()` (only right after a frame apply) → `cb = live.frame_top_row - 1`
+- `live.is_some()` (only right after a frame apply) →
+  `cb = live.frame_top_row - 1`
 - `live.is_none()` (after any content write or re-anchor) → `cb = caret.0`
 
 so `DrawCache` keeps `caret`, `live`, `screen_bottom` and the §4.2 invalidation
@@ -422,23 +472,68 @@ fact. D1 is therefore load-bearing for the state model, not just the look.
 
 ### Phase B — the row counter (§9 #6, §9 #10, the resume artifact)
 
-| Commit | Work | Gate |
-|---|---|---|
-| **B1** | `RowCounter`: a `Write` adapter that accumulates the terminal rows its bytes occupy at a width — `1 + (display_width(segment) − 1) / width` per `\n`-separated segment, ANSI-transparent, display-column aware. Lives next to the existing text measurement in `output.rs`. Pure; unit tests for wrapping, wide chars, escapes, and a trailing newline. | crate unit tests |
-| **B2** | Every content writer renders into a local buffer and counts the bytes it is about to write: `display_text` (#6), `display_markdown`, `paint_panel`/`tool_panel` (per painted row), the 7 `Renderer::feed` sites (`stream_text`, `stream_thinking`, `commit_thinking`, the replay paths). One private `ConsoleOutput::write_content(bytes, kind)` becomes the single choke point. The compensating DSR at `repl.rs:770` goes. | full suite; **a screen-truth test**: drive one of each writer through a real `ConsoleOutput` and assert the tracked row equals the vt100 screen's cursor after each (this is the real safety net — the count is either right or the next frame lands wrong) |
-| **B3** | Separators: `BlockKind` + one `needs_separator(prev, next)` replacing `set_blank`/`ended_blank`/`last_was_tool` and the `ensure_dim` boundary. *Last in the phase*, so a diff in blank lines cannot obscure B2's fix. | full suite; before/after transcript check for a few shapes (text → tool → text, reasoning → answer, error after content) |
-| **B4** | The resume artifact, as a regression test. Most likely shape: a pty test that puts a dialog up, tears it down, replays a short turn and asserts no residue — which may need a test seam (an injectable writer on `ConsoleOutput`); the pty suites in `tests/` show the pattern. | the new test fails before B2 and passes after |
+- **B1**
+  - **Work**: `RowCounter`: a `Write` adapter that accumulates the terminal rows
+    its bytes occupy at a width — `1 + (display_width(segment) − 1) / width` per
+    `\n`-separated segment, ANSI-transparent, display-column aware. Lives next
+    to the existing text measurement in `output.rs`. Pure; unit tests for
+    wrapping, wide chars, escapes, and a trailing newline.
+  - **Gate**: crate unit tests
+- **B2**
+  - **Work**: Every content writer renders into a local buffer and counts the
+    bytes it is about to write: `display_text` (#6), `display_markdown`,
+    `paint_panel`/`tool_panel` (per painted row), the 7 `Renderer::feed` sites
+    (`stream_text`, `stream_thinking`, `commit_thinking`, the replay paths). One
+    private `ConsoleOutput::write_content(bytes, kind)` becomes the single choke
+    point. The compensating DSR at `repl.rs:770` goes.
+  - **Gate**: full suite; **a screen-truth test**: drive one of each writer
+    through a real `ConsoleOutput` and assert the tracked row equals the vt100
+    screen's cursor after each (this is the real safety net — the count is
+    either right or the next frame lands wrong)
+- **B3**
+  - **Work**: Separators: `BlockKind` + one `needs_separator(prev, next)`
+    replacing `set_blank`/`ended_blank`/`last_was_tool` and the `ensure_dim`
+    boundary. *Last in the phase*, so a diff in blank lines cannot obscure B2's
+    fix.
+  - **Gate**: full suite; before/after transcript check for a few shapes (text →
+    tool → text, reasoning → answer, error after content)
+- **B4**
+  - **Work**: The resume artifact, as a regression test. Most likely shape: a
+    pty test that puts a dialog up, tears it down, replays a short turn and
+    asserts no residue — which may need a test seam (an injectable writer on
+    `ConsoleOutput`); the pty suites in `tests/` show the pattern.
+  - **Gate**: the new test fails before B2 and passes after
 
 ### Phase A1 — the composition (additive)
 
 Design below (§6a); the staging is:
 
-| Commit | Work | Gate |
-|---|---|---|
-| **A1.1** | `plan_solve(cache, screen, w, h) -> String` in `ui/frame.rs`, with `plan_apply` kept as the frame-only adapter so the byte stream is *identical*. The shape lands; nothing consults it yet. | **no visible change, byte for byte**: the vt100 frame tests and the REPL resize suite pass unchanged |
-| **A1.2** | `write_content` promoted to the `Output` trait (`ContentBlock { bytes, kind }`, default = write the bytes, so the other impls do not change) and routed through the solve. Content now places itself *below a live frame* instead of over it. | full suite; the resume-artifact case (§1.1) as a regression test — this is the commit that closes it |
-| **A1.3** | The two-region clear (§2.2) and the partial-predicate condition: a frame may only take the row-diff path if the content did not move since the last apply, or `live`'s row indices are stale by the scroll delta. The resize-replay path goes through the solve. | full suite; vt100 case: a live frame + a height change, asserting the old region is cleared and the frame lands below the replayed content |
-| **A1.4** | The cursor column (§4.1): `RenderContext { content_width }` + `RowCursor`, `paint_row` padding. Independent of the rest; its own commit, byte-identical output. | existing paint tests byte-identical; the `RenderContext` constructions updated |
+- **A1.1**
+  - **Work**: `plan_solve(cache, screen, w, h) -> String` in `ui/frame.rs`, with
+    `plan_apply` kept as the frame-only adapter so the byte stream is
+    *identical*. The shape lands; nothing consults it yet.
+  - **Gate**: **no visible change, byte for byte**: the vt100 frame tests and
+    the REPL resize suite pass unchanged
+- **A1.2**
+  - **Work**: `write_content` promoted to the `Output` trait
+    (`ContentBlock { bytes, kind }`, default = write the bytes, so the other
+    impls do not change) and routed through the solve. Content now places itself
+    *below a live frame* instead of over it.
+  - **Gate**: full suite; the resume-artifact case (§1.1) as a regression test —
+    this is the commit that closes it
+- **A1.3**
+  - **Work**: The two-region clear (§2.2) and the partial-predicate condition: a
+    frame may only take the row-diff path if the content did not move since the
+    last apply, or `live`'s row indices are stale by the scroll delta. The
+    resize-replay path goes through the solve.
+  - **Gate**: full suite; vt100 case: a live frame + a height change, asserting
+    the old region is cleared and the frame lands below the replayed content
+- **A1.4**
+  - **Work**: The cursor column (§4.1): `RenderContext { content_width }` +
+    `RowCursor`, `paint_row` padding. Independent of the rest; its own commit,
+    byte-identical output.
+  - **Gate**: existing paint tests byte-identical; the `RenderContext`
+    constructions updated
 
 ### Phase A3 — the frame without `CUP` (approved 2026-09-28)
 
@@ -449,7 +544,7 @@ planned designs into one.
 **Why it works.** A block does not need a row, only a starting point. Relative
 primitives (`CR`/`LF`, `CUU`, `CUD`, `CUF`, `CUB`, `EL`, `ED`) are enough:
 
-```
+```text
 paint row 1;  CUD 1;  paint row 2;  …  CUU (h-1-caret_row); CR; CUF col   ← the caret
 ```
 
@@ -471,8 +566,8 @@ change without addressing anything.
 
 **What it retires.**
 
-- `frame_anchor()` and `live.frame_top_row`. The frame is wherever the cursor is,
-  so its row is never computed, stored, or re-derived.
+- `frame_anchor()` and `live.frame_top_row`. The frame is wherever the cursor
+  is, so its row is never computed, stored, or re-derived.
 - The **tracker-vs-real-cursor drift class** — the resume artifact, the
   DSR/tracked disagreement, and the `llamacpp:testLet me run a command.` class
   from A2.1 all come from the same root: addressing a row derived from tracking.
@@ -487,8 +582,9 @@ change without addressing anything.
 **What it costs.**
 
 - **Arbitrary placement is gone.** The frame lives at the cursor. That is the
-  point, and it is what lets the input follow a stream — but `ApplyPolicy::Frame`
-  ("draw here") has nowhere to point, so the policy retires with the anchor.
+  point, and it is what lets the input follow a stream — but
+  `ApplyPolicy::Frame` ("draw here") has nowhere to point, so the policy retires
+  with the anchor.
 - **The block's height must be known** to walk and to erase. It is.
 - **A foreign writer's cursor is invisible to us** without the DSR. Concretely:
   **indicatif's spinner is a foreign writer** — it writes `\r` + text at the
@@ -591,16 +687,15 @@ disabled` really does suppress the reasoning text, in
 accurate — the gate that mattered is still there, and the one the spinner
 shared was only ever about the spinner.
 
-
 **Performance.** In bytes and in latency this is close to a wash, and the
 difference is not where intuition suggests:
 
-| | bytes | syscalls | cells painted |
-|---|---|---|---|
-| absolute, dense update | `k × (8 + row)` | 1 | same |
-| relative, dense update | `k × (6 + row)` + `O(h)` walk | 1 | same |
-| absolute, sparse in a tall block | `k × (8 + row)` | 1 | same |
-| relative, sparse in a tall block | `k × (6 + row)` + `O(h) × 4` | 1 | same |
+|                                |bytes                 |syscalls|cells painted|
+|--------------------------------|----------------------|--------|-------------|
+|absolute, dense update          |`k × (8 + row)`       |1       |same         |
+|relative, dense update          |`k × (6 + row)` + `O(h)` walk|1       |same  |
+|absolute, sparse in a tall block|`k × (8 + row)`       |1       |same         |
+|relative, sparse in a tall block|`k × (6 + row)` + `O(h) × 4`|1       |same   |
 
 Addressing is 4–8 bytes against a row of 80–200, so it is 3–8% of a repaint, and
 every repaint is already a single buffered write (one syscall, flushed once).
@@ -617,8 +712,8 @@ repaint today. Its preconditions are what make it an optimisation rather than
 the default: no wrap (we know the column and the width, so we can predict it),
 no styling in the row (a partial write would inherit the previous `SGR` state —
 or emit a reset), no selection, and no layout change (`Shift+Enter`, re-wrap).
-When any of those fails, fall back to repainting the changed rows and walking the
-caret back: `CUU`/`CUD` to the row, repaint, `CUU`/`CUD` back to the layout
+When any of those fails, fall back to repainting the changed rows and walking
+the caret back: `CUU`/`CUD` to the row, repaint, `CUU`/`CUD` back to the layout
 caret. That fallback is always correct and costs ~12 bytes of walking on top of
 what a repaint costs today.
 
@@ -654,7 +749,7 @@ not travel separately.
 
 ### One solve
 
-```
+```text
 cb        = content_bottom(cache)            // derivation, §5.1
 H         = frame.map_or(0, Frame::height)
 frame_top = min(cb + 1, term_h - H + 1)      // D1: following
@@ -684,7 +779,7 @@ once `Reserve` exists (A2.3) — one term.
 
 ### `content_bottom` is a derivation, not a field
 
-```
+```text
 fn content_bottom(cache: &DrawCache) -> usize {
     match cache.live {
         // A frame is always a contiguous block directly below the content
@@ -742,11 +837,16 @@ visible only where the old behaviour was wrong.
 Settled by review (2026-09-28), and it replaces the reserved-band design of §2
 for the status line. The three zones:
 
-| Zone | What | How it writes |
-|---|---|---|
-| **1. Scrollback** | assistant text, reasoning, tool panels | append-only, LF-driven — unchanged, and unchanged by A1 |
-| **2. The status line** | one transient readout line at the cursor | **cursor-relative only** |
-| **3. Below it** | the input line, its divider, a menu | absolute (`CUP`) — and only re-rendered on a keystroke, a resize, or a dialog |
+- **1. Scrollback**
+  - **What**: assistant text, reasoning, tool panels
+  - **How it writes**: append-only, LF-driven — unchanged, and unchanged by A1
+- **2. The status line**
+  - **What**: one transient readout line at the cursor
+  - **How it writes**: **cursor-relative only**
+- **3. Below it**
+  - **What**: the input line, its divider, a menu
+  - **How it writes**: absolute (`CUP`) — and only re-rendered on a keystroke, a
+    resize, or a dialog
 
 **Why zone 2 cannot be absolute.** `CUP row;colH` addresses the *viewport*. A
 user scrolled back is looking at older rows, so an absolute status repaint
@@ -765,7 +865,7 @@ not worth redesigning.
 **The status line is transient, not a region.** It occupies the content's last
 row and is overwritten by the next content write:
 
-```
+```text
 content block … LF        cursor at column 0 of a fresh line
 write_status(text)        relative: the text, no trailing LF   → cursor at its end
   … the turn ends, the user reads, the frame is drawn …
@@ -832,7 +932,7 @@ What survived is the part that was never about placement, and it is **done**
 first (`ui::frame::plan_clear_live_frame`). Reproduced before the fix — a menu
 frame plus one `display_text` left
 
-```
+```text
 ⏺ Cannot start agent: Missing API key fo
 r provider.      CTX    PRICE
   gpt-5          400k   1.00
@@ -875,11 +975,21 @@ yank-on-type that already exists and adds nothing.
 
 ### Phase A2 — the status line
 
-| Commit | Work | Gate |
-|---|---|---|
-| **A2.1** | `StatusHandle`: atomics the agent publishes as it runs (session, provider:model, thinking level, ctx used/total), read once per solve. | unit tests on the handle |
-| **A2.2** | `Element::Lines` gains a style (`RowStyle` from the painter, header tone) so the status line is a real frame element; `compose_frame` builds `[Status, Input?, Divider?, Menu?]` with the D6 rules. | full suite; `Element::Lines`'s `#[allow(dead_code)]` retired |
-| **A2.3** | The status line during streaming: the frame is `[Status]` alone, repainted by `write_content` after each block — the case §2.2's two-region clear exists for. | **vt100 case**: a long streamed turn stops above the line, the line survives, and no residue remains above the content |
+- **A2.1**
+  - **Work**: `StatusHandle`: atomics the agent publishes as it runs (session,
+    provider:model, thinking level, ctx used/total), read once per solve.
+  - **Gate**: unit tests on the handle
+- **A2.2**
+  - **Work**: `Element::Lines` gains a style (`RowStyle` from the painter,
+    header tone) so the status line is a real frame element; `compose_frame`
+    builds `[Status, Input?, Divider?, Menu?]` with the D6 rules.
+  - **Gate**: full suite; `Element::Lines`'s `#[allow(dead_code)]` retired
+- **A2.3**
+  - **Work**: The status line during streaming: the frame is `[Status]` alone,
+    repainted by `write_content` after each block — the case §2.2's two-region
+    clear exists for.
+  - **Gate**: **vt100 case**: a long streamed turn stops above the line, the
+    line survives, and no residue remains above the content
 
 ### Follow-ups (recorded, not in this work)
 

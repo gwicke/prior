@@ -5,7 +5,7 @@
 Typing `Ctrl-E` in the REPL prompt drops raw mode, opens the current prompt
 buffer in `$EDITOR` (a foreground child process that takes over the whole
 terminal), waits for the editor to exit, re-enters raw mode, and replaces the
-prompt buffer with the saved file content.  This gives users access to the full
+prompt buffer with the saved file content. This gives users access to the full
 editing power of vim/emacs/nano for composing complex multi-line prompts,
 shell snippets, or structured text.
 
@@ -14,48 +14,68 @@ shell snippets, or structured text.
 ### What works
 
 - **Foreground child + terminal takeover** is the standard Unix pattern (`sudo`,
-  `git commit`, `visudo`).  The kernel handles job control: the child inherits
-  the pty, reads keystrokes, and paints the screen while picocode is `waitpid`-ing.
-  Re-entering raw mode after the child exits is the Ctrl-Z pattern, already
-  proven in the codebase.
+  `git commit`, `visudo`). The kernel handles job control: the child inherits
+  the pty, reads keystrokes, and paints the screen while picocode is
+  `waitpid`-ing. Re-entering raw mode after the child exits is the Ctrl-Z
+  pattern, already proven in the codebase.
 
 - **Tempfile round-trip** (`editor <tmpfile>` → `inotify`/`waitpid` → read back)
-  is the defacto standard for `$EDITOR` integration (git, crontab, visudo).  No
+  is the defacto standard for `$EDITOR` integration (git, crontab, visudo). No
   IPC complexity, no pty-sharing race, no signal forwarding.
 
-- **No new sandbox hole.**  The editor runs **outside** the sandbox (plain
-  `std::process::Command`, same as Ctrl-Z would resume into a shell).  The
+- **No new sandbox hole.** The editor runs **outside** the sandbox (plain
+  `std::process::Command`, same as Ctrl-Z would resume into a shell). The
   user already has direct access to a shell via Ctrl-Z; adding `$EDITOR` access
   adds no new privilege-escalation surface.
 
 ### What needs careful design
 
-| Concern | Mitigation |
-|---------|------------|
-| **Editor never starts / crashes** | Detect non-zero exit, retry or abort.  Also handle `$EDITOR` unset → fallback chain. |
-| **Tempfile race (editor saves + picocode reads while editor still writing)** | `waitpid` guarantees the file is fully written before picocode reads it.  No `inotify` needed. |
-| **Tempfile contains stale content from a previous invocation** | Unlink before `waitpid` return read?  No — we read, then unlink.  The OS retains the inode until the last fd (ours) is closed (`open/unlink` trick). |
-| **Prompt is multi-line (includes `\n`)** | The tempfile stores the raw prompt text as-is (newlines preserved).  The editor shows them as line breaks naturally.  No escaping needed. |
-| **User deletes all content (empty buffer)** | Trivial: read back an empty string, set the prompt to `""`.  The user can then type fresh content or press Esc to cancel. |
-| **Editor writes a trailing newline** | Most editors add a trailing `\n`.  Trim exactly one trailing `\n` when reading back (but not more — preserve the user's intentional blank lines). |
-| **`$EDITOR` contains flags (e.g. `vim -p`)** | `Command::new` splits on first word only.  Use `sh -c "$EDITOR $tmpfile"` or parse `EDITOR` with `shlex`.  Shell-parse is more compatible. |
-| **Tempfile path predictability / security** | Write to a random path under `/tmp` (or `$TMPDIR`).  Use `std::os::unix::fs::PermissionsExt` to set mode `0600` so other users cannot read the prompt mid-edit.  Clean up with `unlink` after read-back. |
+- **Concern**: **Editor never starts / crashes**
+  - **Mitigation**: Detect non-zero exit, retry or abort. Also handle `$EDITOR`
+    unset → fallback chain.
+- **Concern**:
+  **Tempfile race (editor saves + picocode reads while editor still writing)**
+  - **Mitigation**: `waitpid` guarantees the file is fully written before
+    picocode reads it. No `inotify` needed.
+- **Concern**: **Tempfile contains stale content from a previous invocation**
+  - **Mitigation**: Unlink before `waitpid` return read? No — we read, then
+    unlink. The OS retains the inode until the last fd (ours) is closed
+    (`open/unlink` trick).
+- **Concern**: **Prompt is multi-line (includes `\n`)**
+  - **Mitigation**: The tempfile stores the raw prompt text as-is (newlines
+    preserved). The editor shows them as line breaks naturally. No escaping
+    needed.
+- **Concern**: **User deletes all content (empty buffer)**
+  - **Mitigation**: Trivial: read back an empty string, set the prompt to `""`.
+    The user can then type fresh content or press Esc to cancel.
+- **Concern**: **Editor writes a trailing newline**
+  - **Mitigation**: Most editors add a trailing `\n`. Trim exactly one trailing
+    `\n` when reading back (but not more — preserve the user's intentional blank
+    lines).
+- **Concern**: **`$EDITOR` contains flags (e.g. `vim -p`)**
+  - **Mitigation**: `Command::new` splits on first word only. Use
+    `sh -c "$EDITOR $tmpfile"` or parse `EDITOR` with `shlex`. Shell-parse is
+    more compatible.
+- **Concern**: **Tempfile path predictability / security**
+  - **Mitigation**: Write to a random path under `/tmp` (or `$TMPDIR`). Use
+    `std::os::unix::fs::PermissionsExt` to set mode `0600` so other users cannot
+    read the prompt mid-edit. Clean up with `unlink` after read-back.
 
 ### Not in scope (v1)
 
 - **Cursor / scrollback position after editor close:** The user sees the editor
   screen, then exits, and the REPL redraws the prompt from scratch (the
-  `redraw` closure handles this — it clears from `input_row` down).  No attempt
+  `redraw` closure handles this — it clears from `input_row` down). No attempt
   to restore the previous scrollback state; the session transcript above the
   prompt is preserved because `redraw` only clears from `input_row` downward.
   The greeter/status/divider/session content above the input is untouched.
 
 - **Pty-sharing live editor:** Running picocode in raw mode while hosting an
   editor *inside* the same pty (like Emacs `M-x term`) is a different feature
-  and would require full terminal multiplexer logic.  Out of scope.
+  and would require full terminal multiplexer logic. Out of scope.
 
 - **Windows:** `$EDITOR` integration works on Unix-likes only (the Ctrl-Z
-  suspend pattern is also Unix-only).  A future `start`-based fallback for
+  suspend pattern is also Unix-only). A future `start`-based fallback for
   Windows is possible but not planned here.
 
 ## 3. Implementation plan
@@ -85,7 +105,7 @@ shell snippets, or structured text.
 **B. Hook Ctrl-E in the main key-dispatch loop** (`read_input`, around
 line 759 in the current file, alongside the Ctrl-C/Ctrl-Z handlers):
 
-```
+```rust
 if let KeyCode::Char('e') = key.code {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         // Must not be inside an overlay (kind != 0).
@@ -106,9 +126,9 @@ if let KeyCode::Char('e') = key.code {
 **C. Shell-expansion helper for `$EDITOR`**
 
 `$EDITOR` commonly contains flags: `"vim -p"`, `"emacs -nw"`, `"code -w"`.
-A simple `split_whitespace().next()` would lose the flags.  Instead:
+A simple `split_whitespace().next()` would lose the flags. Instead:
 
-```
+```rust
 use std::process::Command;
 
 fn resolve_editor() -> (String, Vec<String>) {
@@ -175,24 +195,24 @@ fn edit_in_editor(current: &str) -> io::Result<String> {
 
 After the editor exits and `self.guard.start()` re-enters raw mode, the
 next iteration of the `read_input` loop will redraw the prompt via the
-existing `redraw` closure.  The `input_row` tracking still works because:
+existing `redraw` closure. The `input_row` tracking still works because:
 
 - The `RESUMED` atomic is not involved (we didn't suspend via SIGTSTP).
-- But the terminal may have scrolled during the editor session.  To be
+- But the terminal may have scrolled during the editor session. To be
   safe, re-anchor `input_row` by calling `output.cursor_row()` after
   re-entering raw mode (the same way the Ctrl-Z handler does it
   implicitly at the top of the loop via the `cur_h != prev_term_h` check
-  on line 458).  We can just set a flag or jump to the top of the loop
+  on line 458). We can just set a flag or jump to the top of the loop
   via `continue`.
 
-Simplest approach: after `self.guard.start()`, set `input_row = output.cursor_row();`
-before falling through to the next redraw.  This ensures the next
-`redraw` writes at the correct screen position.
+Simplest approach: after `self.guard.start()`, set
+`input_row = output.cursor_row();` before falling through to the next redraw.
+This ensures the next `redraw` writes at the correct screen position.
 
 #### 3.1.2 `src/settings.rs` — optional `editor_cmd` setting (deferred)
 
 A `SettingKey::EditorCmd` would let users override `$EDITOR` from within
-picocode's `/set` menu.  This is **not required for v1** since `$VISUAL`
+picocode's `/set` menu. This is **not required for v1** since `$VISUAL`
 / `$EDITOR` environment variables are the standard configuration channel.
 Add it as a follow-up if users request it.
 
@@ -200,27 +220,56 @@ Add it as a follow-up if users request it.
 
 ### 3.2 Testing strategy
 
-| Layer | Approach |
-|-------|----------|
-| **`edit_in_editor` unit** | Test with `$EDITOR=cat` (writes stdin to stdout, ignores the file arg — actually `cat` doesn't modify the file.  Use `$EDITOR=cp`?  Better: `$EDITOR=tee` overwrites; or a test helper shell script).  Write current text, run editor, read back. |
-| **Ctrl-E dispatch** | Unit-test the key-matching logic in isolation by calling `edit_key` (or the new handler) with a mock editor that writes a known string. |
-| **Tempfile edge cases** | Empty buffer, trailing newlines, Unicode content, editor crash (non-zero exit), editor unset, pipe stall. |
-| **vt100 integration** | Extend the existing vt100 tests in `repl.rs` to simulate the full cycle: `\x1b[5E` (Ctrl-E → ... well, we can't actually run a subprocess inside a pty test.  The existing `tests/render_scroll.rs` style (real pty + capturing bytes) could drive a real editor if `$EDITOR` is set to a trivial script, but that's expensive.  Prefer pure-logic unit tests for the editor round-trip and save the pty test for integration CI.) |
+- **`edit_in_editor` unit**
+  - Test with `$EDITOR=cat` (writes stdin to stdout, ignores the file arg
+    — actually `cat` doesn't modify the file. Use `$EDITOR=cp`? Better:
+    `$EDITOR=tee` overwrites; or a test helper shell script). Write current
+    text, run editor, read back.
+- **Ctrl-E dispatch**
+  - Unit-test the key-matching logic in isolation by calling `edit_key` (or the
+    new handler) with a mock editor that writes a known string.
+- **Tempfile edge cases**
+  - Empty buffer, trailing newlines, Unicode content, editor crash (non-zero
+    exit), editor unset, pipe stall.
+- **vt100 integration**
+  - Extend the existing vt100 tests in `repl.rs` to simulate the full cycle:
+    `\x1b[5E` (Ctrl-E → ... well, we can't actually run a subprocess inside a
+    pty test. The existing `tests/render_scroll.rs` style (real pty + capturing
+    bytes) could drive a real editor if `$EDITOR` is set to a trivial script,
+    but that's expensive. Prefer pure-logic unit tests for the editor round-trip
+    and save the pty test for integration CI.)
 
 ### 3.3 Risks and mitigations
 
-| Risk | Mitigation |
-|------|------------|
-| **Editor child inherits raw-mode TTY state** | `self.guard.stop()` calls `disable_raw_mode()` which restores the original termios.  The editor then sees a cooked terminal (its preferred mode).  After the editor exits, `self.guard.start()` re-applies raw mode. |
-| **Editor is a GUI app (e.g. `code`, `gvim`)** | The fork+`waitpid` pattern works fine: the GUI window opens, the terminal is NOT taken over (the child detaches from the pty in practice), and `waitpid` returns when the user closes the editor window.  The prompt reappears.  No special handling needed. |
-| **Editor re-parents / daemonizes** | `Command::status` calls `waitpid` on the direct child.  If the editor spawns a background daemon and exits immediately (common with GUI launchers), picocode resumes too early — the tempfile may not yet be written.  **Mitigation:** detect editors known to daemonize (`code`, `gvim`) and sleep-wait for the file to reach a stable size, or document that users should set `$EDITOR` to a blocking CLI editor like `code -w` (the `-w` flag makes `code` block until the window closes). |
-| **Large prompt (megabytes)** | Read the whole file into memory.  The prompt is bounded by user patience, not by memory.  This is fine. |
-| **Tempfile left behind on crash** | `remove_file` before return.  On panic/crash, the OS cleans up `/tmp` on the next reboot or via `tmpreaper`.  Not a concern for a v1. |
+- **Risk**: **Editor child inherits raw-mode TTY state**
+  - **Mitigation**: `self.guard.stop()` calls `disable_raw_mode()` which
+    restores the original termios. The editor then sees a cooked terminal (its
+    preferred mode). After the editor exits, `self.guard.start()` re-applies raw
+    mode.
+- **Risk**: **Editor is a GUI app (e.g. `code`, `gvim`)**
+  - **Mitigation**: The fork+`waitpid` pattern works fine: the GUI window opens,
+    the terminal is NOT taken over (the child detaches from the pty in
+    practice), and `waitpid` returns when the user closes the editor window. The
+    prompt reappears. No special handling needed.
+- **Risk**: **Editor re-parents / daemonizes**
+  - **Mitigation**: `Command::status` calls `waitpid` on the direct child. If
+    the editor spawns a background daemon and exits immediately (common with GUI
+    launchers), picocode resumes too early — the tempfile may not yet be
+    written. **Mitigation:** detect editors known to daemonize (`code`, `gvim`)
+    and sleep-wait for the file to reach a stable size, or document that users
+    should set `$EDITOR` to a blocking CLI editor like `code -w` (the `-w` flag
+    makes `code` block until the window closes).
+- **Risk**: **Large prompt (megabytes)**
+  - **Mitigation**: Read the whole file into memory. The prompt is bounded by
+    user patience, not by memory. This is fine.
+- **Risk**: **Tempfile left behind on crash**
+  - **Mitigation**: `remove_file` before return. On panic/crash, the OS cleans
+    up `/tmp` on the next reboot or via `tmpreaper`. Not a concern for a v1.
 
 ### 3.4 Order of implementation
 
 1. **Add `resolve_editor` + `edit_in_editor` free functions** in `src/repl.rs`
-   (before or after the `Repl` impl block).  Write unit tests for:
+   (before or after the `Repl` impl block). Write unit tests for:
    - `resolve_editor` with `$VISUAL`, `$EDITOR`, neither set.
    - `edit_in_editor` with a mock editor (shell one-liner that appends text).
    - Empty-buffer round trip.
@@ -231,10 +280,10 @@ Add it as a follow-up if users request it.
    Write unit tests that call the handler through `edit_key` (or directly).
 
 3. **Wire `input_row` re-anchor** after editor exit (the `output.cursor_row()`
-   call mentioned in §3.1.1.E).  The simplest approach: after `input_row =
+   call mentioned in §3.1.1.E). The simplest approach: after `input_row =
    output.cursor_row()`, `continue` to the loop top so the next redraw uses
-   the corrected row.  This is the same pattern used on line 459 for resize.
+   the corrected row. This is the same pattern used on line 459 for resize.
 
 4. **Add one integration test** in `tests/` (optional for v1) that sets
    `$EDITOR` to a known script, types Ctrl-E via a pty, and checks the
-   resulting buffer.  Model it on `tests/render_scroll.rs`.
+   resulting buffer. Model it on `tests/render_scroll.rs`.

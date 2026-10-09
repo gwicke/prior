@@ -21,7 +21,7 @@ Dispatching `{"path": "x.rs", "edits": [{"oldText": "a", "newText": "b"}]}`
 through the erased-tool boundary (`src/tools.rs:3039`) produces, as
 `ToolErrorKind::InvalidArgs`:
 
-```
+```text
 failed to parse tool arguments: `edits` is a list; it is not a form this tool
 accepts. Use `blocks` (a block string) or the single-edit fields `oldText` + `newText`
 
@@ -44,10 +44,12 @@ it is already the answer for the whole arg layer.
 
 ### 2. `the tool failed` is real, and it is the *call* layer
 
-| input | kind | model sees |
-|---|---|---|
-| `{"path":"missing.rs","oldText":"a","newText":"b"}` | `Other` | **`the tool failed`** |
-| `{"blocks":"missing.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"}` | `Other` | **`the tool failed`** |
+- **input**: `{"path":"missing.rs","oldText":"a","newText":"b"}`
+  - **kind**: `Other`
+  - **model sees**: **`the tool failed`**
+- **input**: `{"blocks":"missing.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"}`
+  - **kind**: `Other`
+  - **model sees**: **`the tool failed`**
 
 `edit` is registered raw (`.tool(EditFile)`, `src/agent.rs:2906`), so a
 call-time `ToolError` reaches rig's **default** `map_error` →
@@ -87,7 +89,7 @@ a good error for a bad one.
 The final `Err` in `from_wire` becomes a dedicated builder, so the terse paths
 stay terse. Two extra lines, and only when there is something to say:
 
-```
+```text
 no recognizable edit arguments (expected `oldText`+`newText`, or `blocks`)
 unrecognized: `file_path`, `old_string`, `new_string`
 this tool spells them `path`, `oldText`, `newText`
@@ -132,18 +134,35 @@ message verbatim. Cheap to add, with nothing to test against today.
 Accepted, in `from_wire`, after the blob branches and before the single-edit
 fields:
 
-| | rule |
-|---|---|
-| shape | `{edits: [{oldText, newText, startLine?, path?}], path?}` — pi's canonical form, single-file batching |
-| file | **every** path the call names — the top-level `path` (after `:LINE` peeling) and each entry's `path` — must be **one** path |
-| none named | `missing required field 'path'` |
-| more than one | refused, naming `blocks` (this is the multi-file pi form; pi itself cannot express it — `doc/batch_editing_v2.md:649` gives one `path` per call and entries without one) |
-| anchor, per entry | entry `path:LINE` → entry `startLine` → call `path:LINE` → call `startLine` → none |
-| entry with both its own `path:LINE` and `startLine` | must agree, else the single-edit form's existing disagreement error, verbatim |
-| `[]` | error — never a vacuous success |
-| entry not an object / missing either text field | named error naming `edits[i]` |
-| precedence | the array wins over top-level `oldText`/`newText`, and a **malformed** array must not fall through to a healthy single edit — the same rule as `blocks` over a legacy `edits` string (`wire.rs:582-601`) |
-| `origin` | the entry's `path:LINE` as spelled, else the call path (+ `:LINE`), so one failed entry of ten is identifiable |
+- shape
+  - **rule**: `{edits: [{oldText, newText, startLine?, path?}], path?}` — pi's
+    canonical form, single-file batching
+- file
+  - **rule**: **every** path the call names — the top-level `path` (after
+    `:LINE` peeling) and each entry's `path` — must be **one** path
+- none named
+  - **rule**: `missing required field 'path'`
+- more than one
+  - **rule**: refused, naming `blocks` (this is the multi-file pi form; pi
+    itself cannot express it — `doc/batch_editing_v2.md:649` gives one `path`
+    per call and entries without one)
+- anchor, per entry
+  - **rule**: entry `path:LINE` → entry `startLine` → call `path:LINE` → call
+    `startLine` → none
+- entry with both its own `path:LINE` and `startLine`
+  - **rule**: must agree, else the single-edit form's existing disagreement
+    error, verbatim
+- `[]`
+  - **rule**: error — never a vacuous success
+- entry not an object / missing either text field
+  - **rule**: named error naming `edits[i]`
+- precedence
+  - **rule**: the array wins over top-level `oldText`/`newText`, and a
+    **malformed** array must not fall through to a healthy single edit — the
+    same rule as `blocks` over a legacy `edits` string (`wire.rs:582-601`)
+- `origin`
+  - **rule**: the entry's `path:LINE` as spelled, else the call path (+
+    `:LINE`), so one failed entry of ten is identifiable
 
 Redundant *agreeing* entry paths are accepted, and so is an array with no
 top-level `path` when its entries agree on one file. One rule — "the call names
@@ -183,9 +202,12 @@ top-level `oldText`/`newText`; stringified array recovered; unparseable
 stringified array named; catch-all naming fields and the alias line; the alias
 line choosing the JSON example.
 
-Rewritten (each currently *specifies* the removal): `the_edits_array_is_rejected_with_a_named_correction`,
-`the_two_field_names_are_not_interchangeable`, `every_wire_shape_this_tool_has_ever_accepted_is_accounted_for`,
-`an_empty_edits_array_is_rejected_too`, `a_blob_field_holding_an_object_is_diagnosed_rather_than_ignored`.
+Rewritten (each currently *specifies* the removal):
+`the_edits_array_is_rejected_with_a_named_correction`,
+`the_two_field_names_are_not_interchangeable`,
+`every_wire_shape_this_tool_has_ever_accepted_is_accounted_for`,
+`an_empty_edits_array_is_rejected_too`,
+`a_blob_field_holding_an_object_is_diagnosed_rather_than_ignored`.
 
 `src/tools.rs` — `an_edits_array_is_rejected_and_writes_nothing` becomes the
 end-to-end inverse: an array call applies N edits to one file. New: a

@@ -25,7 +25,8 @@ that providers return.
   - `AgentConfig::thinking_level: Option<String>` carries the selected level.
   - `create_agent` builds `think_json` via `thinking::mapping_opt` and injects
     it into the rig `Agent` through `build_rig_agent(..., think_json)`.
-  - The agent is rebuilt on `/thinking` / `/model` changes so params take effect.
+  - The agent is rebuilt on `/thinking` / `/model` changes so params take
+    effect.
 
 - `src/model_catalog.rs`
   - Tracks a `reasoning: bool` capability flag per model (from
@@ -33,8 +34,8 @@ that providers return.
     catalog **metadata only** — it does not affect response handling.
 
 - `src/repl.rs`
-  - Exposes a `/thinking` slash command plus an overlay (`thinking_overlay_entries`)
-    to set the level (off/low/med/high).
+  - Exposes a `/thinking` slash command plus an overlay
+    (`thinking_overlay_entries`) to set the level (off/low/med/high).
 
 ## What the codebase does NOT do (response side — surfacing thinking content)
 
@@ -58,13 +59,21 @@ that providers return.
 
 ## Summary
 
-| Concern                         | Supported? | Notes                                              |
-|---------------------------------|------------|----------------------------------------------------|
-| Request thinking (level)        | Yes        | Anthropic / OpenAI / OpenRouter via `additional_params` |
-| Catalog `reasoning` capability  | Yes        | Display-only metadata in `/model`                  |
-| `/thinking` command + overlay   | Yes        | Set level off/low/med/high                         |
-| Surface returned thinking text  | **No**     | `display_thinking` is a spinner, not real content  |
-| Extract provider thinking blocks| **No**     | Response handled as `response.to_string()` only    |
+- **Concern**: Request thinking (level)
+  - **Supported?**: Yes
+  - **Notes**: Anthropic / OpenAI / OpenRouter via `additional_params`
+- **Concern**: Catalog `reasoning` capability
+  - **Supported?**: Yes
+  - **Notes**: Display-only metadata in `/model`
+- **Concern**: `/thinking` command + overlay
+  - **Supported?**: Yes
+  - **Notes**: Set level off/low/med/high
+- **Concern**: Surface returned thinking text
+  - **Supported?**: **No**
+  - **Notes**: `display_thinking` is a spinner, not real content
+- **Concern**: Extract provider thinking blocks
+  - **Supported?**: **No**
+  - **Notes**: Response handled as `response.to_string()` only
 
 ## If surfacing thinking content is desired
 
@@ -72,6 +81,6 @@ that providers return.
    `src/agent.rs::prompt`.
 2. Extract provider-specific thinking fields (Anthropic `thinking`/`signature`,
    OpenAI `reasoning`, OpenRouter reasoning, etc.).
-3. Route that text through a new `Output` method (e.g. `display_thinking_content`)
-   that is **gated by `thinking_level`**, replacing/augmenting the current
-   spinner-only `display_thinking`.
+3. Route that text through a new `Output` method (e.g.
+   `display_thinking_content`) that is **gated by `thinking_level`**,
+   replacing/augmenting the current spinner-only `display_thinking`.

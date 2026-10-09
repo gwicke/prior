@@ -49,7 +49,7 @@ the first draft and tightens the caching story. The substantive changes:
 
 Thin wrapper. Nothing lives here but the epoch (design §2).
 
-```
+```rust
 eval_prompt(prompt, key):
   let result = self.root.node_traverse(self.epoch, key, prompt, /*path*/ vec![]);
   match result {
@@ -71,7 +71,7 @@ This is the structural logic of how keys route through the tree. The view
 state (filter, rank, cursor) is a separate concern used only when displaying
 a listing or completing a row.
 
-```
+```text
 node_traverse(epoch, key, prompt_section, path):
 
   1. Epoch gate: if epoch != cache_epoch, reset EpochState (view_args,
@@ -120,7 +120,7 @@ node's view args.
 The `row_index` HashMap (row_id → child_index) is the lookup. It is
 rebuilt only when a child's `node_data()` returns a new `Rc` (§3.2).
 
-```
+```text
 let trailing_space = prompt_section.ends_with(' ');
 let mut matched_child: Option<(String, usize)> = None;
 let mut args = Args::default();
@@ -189,7 +189,8 @@ Notes:
 ### 2.2 Restore logic (phase 4)
 
 High level intuition: Tab / enter drill replaces local view args with just ID
-+ trailing space, which then hits the next child down. The restore logic
+
+- trailing space, which then hits the next child down. The restore logic
 restores the local view args on the way up, triggered by Esc. Basically,
 restore to a filtered view in a level above, at the cursor position you were
 in.
@@ -204,7 +205,7 @@ state. Each node carries exactly two pieces of restoration state:
 - `should_restore_view_args: bool` — set when this node drills into a
   child (phase 5 Tab/Enter); consumed once by the restore below.
 
-```
+```text
 // Restore trigger (design §5.1 step 1): this node's section is exactly
 // one valid child ID, no trailing space, and this node drilled earlier.
 // This applies even without Esc — walking back into a bare drilled ID
@@ -241,7 +242,7 @@ level's listing is hidden (§2.5).
 Esc handling when there is no restore to perform (no matched ID, no
 trailing space):
 
-```
+```text
 if key == Esc {
     // Step 2: clear refinement — terms, modifiers, and selection all
     // dropped (e.g. `/model sonnet` → Esc → `/model `). The cursor
@@ -276,7 +277,7 @@ can only be true immediately after a drill of this node.
 Leaf nodes (no children) handle Enter directly — no view state needed.
 Call `prepare()` which defaults to `submit()`.
 
-```
+```text
 if self.children.is_empty() && matches!(key, Enter) {
     // path_args carries PathArgs.ids (= `path`, the drilled route),
     // the parsed args, and the leaf's suffix.
@@ -308,7 +309,7 @@ with the new prompt.
 When no row ID matches, handle the key at this level. For listing nodes,
 this means display + cursor + Tab/Enter drill.
 
-```
+```text
 // Ensure view state is fresh (filter + rank from this node's view args).
 // After this call, every handle in ranked_rows was minted from the
 // current data_rc (§3.3), so handle resolution below is infallible —
@@ -389,7 +390,7 @@ Two corrections vs the first draft:
   (section becomes `id + ' '`), then the child renders; no key action at
   the child.
 - **Enter forwards the key but the child's section is the appended ID +
-  space**, so the child's parse sees exactly `<id> ` — its own level —
+  space**, so the child's parse sees exactly `<id>` — its own level —
   not the parent's view args. The *recursion* argument is only the
   section; parents `return` the child's result unchanged (§2.7).
 - **Restoration state lives on the drilling node** (`self.epoch`, not the
@@ -591,7 +592,7 @@ node_data() calls. Filter/sort queries use it via the node's own method.
 Always call `node_data()` on each child. `Rc::ptr_eq` against the cached
 Rc detects no-change without touching rows.
 
-```
+```text
 refresh_data(epoch) -> Result<(), NodeError>:
   // Always call node_data() — data may be dynamic within a single
   // activation (e.g. fs autocomplete). Rc::ptr_eq detects no-change.
@@ -672,7 +673,7 @@ Points the first draft got wrong:
 Only called when displaying a listing. Re-derives from the child `Rc`s
 when inputs change.
 
-```
+```text
 ensure_view(epoch, view_args):
   // Skip if nothing changed: view_args the same AND content not dirty
   if !self.content.dirty && self.epoch.view_args == *view_args {
@@ -752,7 +753,7 @@ Efficiency notes:
 The cursor is a row ID, not an index. It survives re-rank and re-filter
 because the row ID stays with the row regardless of order.
 
-```
+```text
 seed_or_keep_cursor(view, parsed):
   // If cursor_id is still present in the current ranked_rows, keep it
   // and refresh the cached index. Row IDs resolve through the handle:
@@ -779,7 +780,7 @@ seed_or_keep_cursor(view, parsed):
 `MoveCursor` (§2.4) updates both `cursor_idx` (for display) and
 `cursor_id` (for persistence across re-derives):
 
-```
+```text
 on_move_cursor(delta):
   cursor_idx = (cursor_idx + delta).rem_euclid(n);
   cursor_id  = ranked_rows[cursor_idx].resolve(&data_rc).id.clone();
@@ -893,15 +894,36 @@ decides which to display.
 
 ### 4.3 What is stored where (single source of truth)
 
-| State | Struct | Survives | First draft's bug |
-|---|---|---|---|
-| `data_rc`, `row_index` | `ContentCache` | until a child returns a new Rc | `data_rc` compacted on `DataError` |
-| `ranked_rows`, `active_ids`, `dirty` | `ContentCache` | until next ensure_view | split across two structs |
-| `cache_epoch` | `NodeEntry` | until next epoch change | triggers EpochState reset on new activation; belongs at node level since it bridges both caches |
-| `render.lines`, `columns`, `term_width` | `RenderCache` (inside ContentCache) | until dirty/resize | — |
-| `cursor_id` + `cursor_idx` | `EpochState` | epoch | ID and index in two structs, out of sync |
-| `view_args` + `should_restore_view_args` | `EpochState` | epoch | first draft had no per-node restore state (single `saved_filter` slot / frame-stack detour) |
-| `confirm_pending` | `EpochState` | epoch | — |
+- **State**: `data_rc`, `row_index`
+  - **Struct**: `ContentCache`
+  - **Survives**: until a child returns a new Rc
+  - **First draft's bug**: `data_rc` compacted on `DataError`
+- **State**: `ranked_rows`, `active_ids`, `dirty`
+  - **Struct**: `ContentCache`
+  - **Survives**: until next ensure_view
+  - **First draft's bug**: split across two structs
+- **State**: `cache_epoch`
+  - **Struct**: `NodeEntry`
+  - **Survives**: until next epoch change
+  - **First draft's bug**: triggers EpochState reset on new activation; belongs
+    at node level since it bridges both caches
+- **State**: `render.lines`, `columns`, `term_width`
+  - **Struct**: `RenderCache` (inside ContentCache)
+  - **Survives**: until dirty/resize
+  - **First draft's bug**: —
+- **State**: `cursor_id` + `cursor_idx`
+  - **Struct**: `EpochState`
+  - **Survives**: epoch
+  - **First draft's bug**: ID and index in two structs, out of sync
+- **State**: `view_args` + `should_restore_view_args`
+  - **Struct**: `EpochState`
+  - **Survives**: epoch
+  - **First draft's bug**: first draft had no per-node restore state (single
+    `saved_filter` slot / frame-stack detour)
+- **State**: `confirm_pending`
+  - **Struct**: `EpochState`
+  - **Survives**: epoch
+  - **First draft's bug**: —
 
 ### 4.4 `NodeResult` (internal)
 
@@ -923,7 +945,7 @@ RenderCache — zero-copy on cursor moves.
 
 Clean new path, independent of old `PlanBuilder`/`MenuState`.
 
-```
+```text
 fn build_render_plan(cache: &ContentCache, header_lines: &[String],
                      field_space: &Option<FieldSpace>, term_width: usize) -> RenderPlan {
   // No Rc::new(...) of row data here — ranked_rows are RowRef handles
@@ -991,7 +1013,7 @@ text*, rebuilt only when `dirty || term_width changed`.
 assembled from the cached `lines` Rc with only `selected` and
 `active_rows` changed:
 
-```
+```text
 fn plan_from_cache(cache: &RenderCache, cursor_idx: usize,
                    active_rows: &[usize]) -> RenderPlan {
     RenderPlan {
@@ -1036,6 +1058,7 @@ is returned unmodified (§2.7).
 ## 7. Implementation order
 
 ### 4a. Traversal skeleton
+
 - `NodeEntry`, `ContentCache`, `EpochState` (view_args + restore flag)
 - Section parse (phase 2)
 - Restore logic (phase 4) — prompt manipulation + flag lifecycle
@@ -1046,59 +1069,125 @@ is returned unmodified (§2.7).
 - `NodeResult`, `eval_prompt` wiring
 
 ### 4b. View state
+
 - Data refresh with index-aligned `data_rc` (Rc::ptr_eq change detection)
 - Filter + rank over `RowRef` handles (§3.3)
 - Cursor seeding + `cursor_id`/`cursor_idx` sync (§3.4)
 - Active marker collection (§3.5)
 
 ### 4c. Render plan
+
 - `RenderCache` with cached lines + `term_width` key
 - `build_render_plan()` (dirty path) + `plan_from_cache()` (cursor path)
 - Table layout from field_space
 
 ### 4d. MoveCursor
+
 - Update cursor_id + cursor_idx, reuse cached lines via `plan_from_cache`
 - Test end-to-end
 
 ### 4e. Tab completion + drill
+
 - Complete cursor row's ID, snapshot view_args, set restore flag, drill
   with section only
 
 ### 4f. Esc + restore
+
 - §5.1 restore trigger (applies without Esc) + Esc steps 2–4
 - Flag lifecycle tests: typed `/model` does NOT restore; drilled
   `/model claude-4` → Esc → `/model sonnet` does
 - Multi-level test scenarios (`/tree <id> compact` two-deep)
 
 ### 4g. Tests
+
 - Port interpreter tests to new harness
 
 ---
 
 ## 8. Key design decisions
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| Traversal vs view | Separate concerns | Traversal is structural (section parse, key dispatch, Esc). View is data (filter, rank, cursor). View only used for listing display. |
-| State split | `ContentCache` + `EpochState` | Invalidation triggers differ: content vs user intent. First draft's `ViewCache` overlapped both. |
-| Rows in caches | `RowRef` handles + encapsulated `resolve`, never owned clones or per-row Rcs | Rows live in the child's `Rc<DataResponse>.rows`; handles are two Copy ints and the deref chain lives in one method (`RowRef::resolve`). An intermediate `Rc<Row>` design would re-wrap every row (each `Rc<Row>` must own its row). |
-| filtered_rows cache | None | Filter is fused into the rank pass; an intermediate vec is dead weight. |
-| Cursor identifier | Row ID (String), authoritative | Survives re-rank/re-filter. |
-| cursor_idx | Cached, kept in sync on MoveCursor | O(1) display lookup; re-resolved from ID on re-derive (once per re-derive, not per keypress). |
-| active_rows | `Vec<String>` IDs in cache, `Vec<usize>` in plan | IDs stable across filter/sort; indices resolved at display time. |
-| Child index lookup | `HashMap<String, u16>` (row_index) | O(1) by row ID; `u16` shrinks entries; no parallel Vec. |
-| data_rc shape | `Vec<Option<Rc<DataResponse>>>` parallel to children | Errors keep slot alignment; dispatch never shifts. |
-| Esc restoration | removed — per-node `view_args` + `should_restore_view_args` | The prompt is the state; restore is per-node undo of a drill, not a traversal stack. |
-| `path` | Parameter of node_traverse, consumed by leaves | `prepare()`/`submit()` need the full route; passed down, never shared state. |
-| Data refresh | Always call node_data(), Rc::ptr_eq | Design §2: "cheap nothing-changed signals." |
-| View re-derive | Only if view_args changed or dirty | String compare + bool; no hashing. |
-| MoveCursor | No re-derive, `plan_from_cache` | Cursor lives in the view (design §4); lines Rc-shared. |
-| Recursion payload | Section only, plus forwarded key on Enter | Each level parses exactly its own slice; no ancestor re-parse. |
-| Tab forwarding | `HostKey::None` at child | Tab is a prompt mutation + render, not a key action. |
-| Restoration | Per-node `view_args` + flag, no stack | Prompt is the state; drill sets flag, bare-ID re-entry consumes it; any non-bare-ID render clears it (§2.6). |
-| Return flow | Pass-through on the way up | Child's NodeResult is returned unmodified; leaf owns newprompt; NewPath rewrites restart at root (§2.7). |
-| Columns | Derived from field_space at render time | Not per-row state; `RenderCache.columns` populated only when a field space exists. |
-| is_leaf | Not cached | `children.is_empty()` is O(1). |
-| RenderCache | Caller-driven invalidation, Rc share | No hash: caller passes dirty flag. Lives inside ContentCache. |
-| Render marker precedence | `>` cursor wins over `*` active | Cursor must stay visible when it rests on the active row. |
-| Vertical pagination | Deferred | Host already windows via overlay_window(). Send all ranked rows. |
+- **Decision**: Traversal vs view
+  - **Choice**: Separate concerns
+  - **Rationale**: Traversal is structural (section parse, key dispatch, Esc).
+    View is data (filter, rank, cursor). View only used for listing display.
+- **Decision**: State split
+  - **Choice**: `ContentCache` + `EpochState`
+  - **Rationale**: Invalidation triggers differ: content vs user intent. First
+    draft's `ViewCache` overlapped both.
+- **Decision**: Rows in caches
+  - **Choice**: `RowRef` handles + encapsulated `resolve`, never owned clones or
+    per-row Rcs
+  - **Rationale**: Rows live in the child's `Rc<DataResponse>.rows`; handles are
+    two Copy ints and the deref chain lives in one method (`RowRef::resolve`).
+    An intermediate `Rc<Row>` design would re-wrap every row (each `Rc<Row>`
+    must own its row).
+- **Decision**: filtered_rows cache
+  - **Choice**: None
+  - **Rationale**: Filter is fused into the rank pass; an intermediate vec is
+    dead weight.
+- **Decision**: Cursor identifier
+  - **Choice**: Row ID (String), authoritative
+  - **Rationale**: Survives re-rank/re-filter.
+- **Decision**: cursor_idx
+  - **Choice**: Cached, kept in sync on MoveCursor
+  - **Rationale**: O(1) display lookup; re-resolved from ID on re-derive (once
+    per re-derive, not per keypress).
+- **Decision**: active_rows
+  - **Choice**: `Vec<String>` IDs in cache, `Vec<usize>` in plan
+  - **Rationale**: IDs stable across filter/sort; indices resolved at display
+    time.
+- **Decision**: Child index lookup
+  - **Choice**: `HashMap<String, u16>` (row_index)
+  - **Rationale**: O(1) by row ID; `u16` shrinks entries; no parallel Vec.
+- **Decision**: data_rc shape
+  - **Choice**: `Vec<Option<Rc<DataResponse>>>` parallel to children
+  - **Rationale**: Errors keep slot alignment; dispatch never shifts.
+- **Decision**: Esc restoration
+  - **Choice**: removed — per-node `view_args` + `should_restore_view_args`
+  - **Rationale**: The prompt is the state; restore is per-node undo of a drill,
+    not a traversal stack.
+- **Decision**: `path`
+  - **Choice**: Parameter of node_traverse, consumed by leaves
+  - **Rationale**: `prepare()`/`submit()` need the full route; passed down,
+    never shared state.
+- **Decision**: Data refresh
+  - **Choice**: Always call node_data(), Rc::ptr_eq
+  - **Rationale**: Design §2: "cheap nothing-changed signals."
+- **Decision**: View re-derive
+  - **Choice**: Only if view_args changed or dirty
+  - **Rationale**: String compare + bool; no hashing.
+- **Decision**: MoveCursor
+  - **Choice**: No re-derive, `plan_from_cache`
+  - **Rationale**: Cursor lives in the view (design §4); lines Rc-shared.
+- **Decision**: Recursion payload
+  - **Choice**: Section only, plus forwarded key on Enter
+  - **Rationale**: Each level parses exactly its own slice; no ancestor
+    re-parse.
+- **Decision**: Tab forwarding
+  - **Choice**: `HostKey::None` at child
+  - **Rationale**: Tab is a prompt mutation + render, not a key action.
+- **Decision**: Restoration
+  - **Choice**: Per-node `view_args` + flag, no stack
+  - **Rationale**: Prompt is the state; drill sets flag, bare-ID re-entry
+    consumes it; any non-bare-ID render clears it (§2.6).
+- **Decision**: Return flow
+  - **Choice**: Pass-through on the way up
+  - **Rationale**: Child's NodeResult is returned unmodified; leaf owns
+    newprompt; NewPath rewrites restart at root (§2.7).
+- **Decision**: Columns
+  - **Choice**: Derived from field_space at render time
+  - **Rationale**: Not per-row state; `RenderCache.columns` populated only when
+    a field space exists.
+- **Decision**: is_leaf
+  - **Choice**: Not cached
+  - **Rationale**: `children.is_empty()` is O(1).
+- **Decision**: RenderCache
+  - **Choice**: Caller-driven invalidation, Rc share
+  - **Rationale**: No hash: caller passes dirty flag. Lives inside ContentCache.
+- **Decision**: Render marker precedence
+  - **Choice**: `>` cursor wins over `*` active
+  - **Rationale**: Cursor must stay visible when it rests on the active row.
+- **Decision**: Vertical pagination
+  - **Choice**: Deferred
+  - **Rationale**: Host already windows via overlay_window(). Send all ranked
+    rows.

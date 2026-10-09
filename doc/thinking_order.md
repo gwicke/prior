@@ -31,12 +31,13 @@ That fix lives in `crates/rig-core/src/streaming.rs` and only intercepts the
 OpenRouter / OpenAI-compatible streaming path
 (`crates/rig-core/src/providers/internal/openai_chat_completions_compatible.rs`)
 **never yields `RawStreamingChoice::Reasoning`**; it only ever yields
-`ReasoningDelta` and `Message`. A grep confirms there is no `RawStreamingChoice::Reasoning`
-yield in that loop. OpenRouter is wired through the shared OpenAI Chat
-Completions path (`openrouter/completion.rs` → `OpenAICompatibleProfile`), so
-the fork's dedup logic is **unreachable for OpenRouter**. The fix was correct
-for Anthropic's thinking-block replay and the OpenAI Responses-API reasoning
-replay, but cannot touch OpenRouter's ordering.
+`ReasoningDelta` and `Message`. A grep confirms there is no
+`RawStreamingChoice::Reasoning` yield in that loop. OpenRouter is wired through
+the shared OpenAI Chat Completions path (`openrouter/completion.rs` →
+`OpenAICompatibleProfile`), so the fork's dedup logic is
+**unreachable for OpenRouter**. The fix was correct for Anthropic's
+thinking-block replay and the OpenAI Responses-API reasoning replay, but cannot
+touch OpenRouter's ordering.
 
 ### 2.2 Reasoning and text are forwarded to the client in provider order
 
@@ -44,9 +45,10 @@ In `crates/rig-core/src/agent/prompt_request/streaming.rs`, the agent runner
 forwards `ReasoningDelta` / `Text` items to the consumer via
 `StreamedTurnEvent::EmitIngested` **as-is** (no reordering for display). The
 only place reasoning is moved *before* text is `canonical_choice` /
-`ordered_streaming_assistant_content` (`crates/rig-core/src/agent/run/streamed.rs`),
-and that reordering is used **only for the persisted turn history**, never for
-what the consumer renders. So display order == provider chunk order.
+`ordered_streaming_assistant_content`
+(`crates/rig-core/src/agent/run/streamed.rs`), and that reordering is used
+**only for the persisted turn history**, never for what the consumer renders. So
+display order == provider chunk order.
 
 ### 2.3 picocode renders thinking inline, in stream order
 
@@ -98,6 +100,7 @@ to a (non-existent) "more reasoning coming" signal.
 ### 3.2 Changes
 
 **`src/output.rs`**
+
 - `Output` trait: added `fn set_answer_hold(&self, _hold: bool) {}` (default
   no-op).
 - `ConsoleOutput`: added `answer_held: Mutex<bool>` and `answer_buffer:
@@ -115,10 +118,12 @@ to a (non-existent) "more reasoning coming" signal.
   thinking-commit when it already flushed (avoiding a double render).
 
 **`src/agent.rs`**
+
 - Threaded `thinking_level` through `CodeAgent` (struct field + `new` +
   the `build!` macro in `create_agent`).
-- In `prompt()`, after `begin_response()`, compute `reasoning_expected =
-  thinking_level != Off` and call `self.output.set_answer_hold(reasoning_expected)`.
+- In `prompt()`, after `begin_response()`, compute
+  `reasoning_expected = thinking_level != Off` and call
+  `self.output.set_answer_hold(reasoning_expected)`.
 
 ### 3.3 Tests
 

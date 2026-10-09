@@ -6,11 +6,11 @@
 
 ## 1. Current structure at a glance
 
-`read_input` is the heart of the REPL.  Its inner event loop (~750 lines) has three
-distinct phases on every iteration:
+`read_input` is the heart of the REPL. Its inner event loop (~750 lines) has
+three distinct phases on every iteration:
 
-1. **Overlay computation** — inspect the buffer, set `kind: u8` (0–9),
-   produce `opts: Vec<String>` (display rows), `title`, `cur_word`, `cur_filter`,
+1. **Overlay computation** — inspect the buffer, set `kind: u8` (0–9), produce
+   `opts: Vec<String>` (display rows), `title`, `cur_word`, `cur_filter`,
    `active`.
 2. **Redraw** — call the `redraw` closure with the computed rows.
 3. **Key dispatch** — match on `key.code` and then, inside each arm, match on
@@ -19,7 +19,7 @@ distinct phases on every iteration:
 The nine overlay "kinds" are:
 
 | kind | Meaning          | Trigger                          |
-|------|------------------|----------------------------------|
+| ---- | ---------------- | -------------------------------- |
 | 0    | No overlay       | bare prompt                      |
 | 1    | Command list     | `/` + unknown word               |
 | 2    | Model picker     | `/model …`                       |
@@ -76,39 +76,39 @@ KeyCode::Esc => match kind {
 }
 ```
 
-Three parallel ladders over the same space.  Adding a new overlay requires
-edits in all three places, plus the overlay-computation block above.  There is
+Three parallel ladders over the same space. Adding a new overlay requires
+edits in all three places, plus the overlay-computation block above. There is
 no type system help ensuring consistency — a new overlay kind 10 that handles
 Tab but not Esc silently does nothing on Esc.
 
 ### 2.2 Double (or triple) computation of overlay entries
 
 The display rows and the "value" needed by Tab/Enter come from the same
-underlying data, but are computed separately.  For example, the `/model`
+underlying data, but are computed separately. For example, the `/model`
 overlay calls `model_overlay_entries(ctx, &cur_filter)` once during
-overlay-computation and again in both the Tab and Enter handlers.  Same for
+overlay-computation and again in both the Tab and Enter handlers. Same for
 `/thinking`, `/persona`, `/sandbox`.
 
 The `/set` value-pick mode has a `value_cands: Vec<ValueCandidate>` variable
 that lives *outside* the loop precisely to work around this: it is populated
-during overlay-computation and read by the Enter handler.  This is an ad-hoc
+during overlay-computation and read by the Enter handler. This is an ad-hoc
 cache for one overlay; there is no general mechanism.
 
 ### 2.3 Bridge variables pollute the loop scope
 
 `cur_word`, `cur_filter`, `value_cands`, `path_completions`, and
 `completion_pos` are all declared before the loop and mutated by the
-overlay-computation phase so the key-dispatch phase can read them.  They are
+overlay-computation phase so the key-dispatch phase can read them. They are
 effectively a manual, partial re-encoding of the overlay's computed state as
-loose local variables.  The loop carries ~8 such bookkeeping variables.
+loose local variables. The loop carries ~8 such bookkeeping variables.
 
 ### 2.4 `help_view` escapes the `kind` system
 
 `help_view` is a separate `bool` that gate-sets `kind = 4` early in the
-overlay-computation block.  Rather than a ninth kind in the table, help gets
+overlay-computation block. Rather than a ninth kind in the table, help gets
 special-cased with its own `if kind == 4 { ... continue; }` guard before the
-general overlay dispatch.  It also routes *all* non-modifier key events to the
-editor (a unique behavior not shared by any other overlay).  This makes "help"
+general overlay dispatch. It also routes *all* non-modifier key events to the
+editor (a unique behavior not shared by any other overlay). This makes "help"
 harder to reason about as a regular overlay.
 
 ### 2.5 Verbosity from repeated table construction
@@ -135,16 +135,16 @@ for row in table.render_multiline(avail) { opts.push(row); }
 // ... same pattern twice more
 ```
 
-Each arm computes `avail = term_width().saturating_sub(2)` independently.  A
+Each arm computes `avail = term_width().saturating_sub(2)` independently. A
 shared helper would collapse these to one or two lines each.
 
 ### 2.6 The Esc ladder is structurally wrong for `/set`
 
 `/set` value-mode's Esc "pops one level" (strips the last token, reverting to
-the setting-list view) rather than clearing the buffer entirely.  This is a
+the setting-list view) rather than clearing the buffer entirely. This is a
 real design choice — `/set` has two nested levels — but it is expressed as a
 special case inside a flat `match kind { ... }` rather than as a property of
-the overlay type.  If a future overlay ever wants a third level, this structure
+the overlay type. If a future overlay ever wants a third level, this structure
 does not compose.
 
 ### 2.7 Sel-clamping and active-marker logic is separated from the overlay
@@ -167,7 +167,7 @@ loop as free-floating mutations.
 
 ## 3. Refactoring options
 
-### Option A — `ActiveOverlay` enum carrying computed state  *(recommended)*
+### Option A — `ActiveOverlay` enum carrying computed state *(recommended)*
 
 Replace `kind: u8` and the bridge variables with a single enum whose variants
 carry the computed data:
@@ -216,8 +216,9 @@ impl ActiveOverlay {
 
 - Each variant's Enter handler indexes `self.entries[sel]` or `self.cands[sel]`
   — no recomputation, no `value_cands` hack.
-- Three parallel match ladders collapse to three one-liner calls in the event loop.
-- Adding a new overlay = add one variant + implement three methods.  The
+- Three parallel match ladders collapse to three one-liner calls in the event
+  loop.
+- Adding a new overlay = add one variant + implement three methods. The
   compiler enforces completeness.
 - `help_view` disappears; Help is just `ActiveOverlay::Help` with a
   passthrough-key impl.
@@ -279,18 +280,18 @@ enum OverlayValue {
 ```
 
 The `ActiveOverlay` then holds `items: Vec<OverlayItem>` instead of a
-variant-specific `Vec<ModelEntry>`, `Vec<ValueCandidate>`, etc.  Tab and Enter
+variant-specific `Vec<ModelEntry>`, `Vec<ValueCandidate>`, etc. Tab and Enter
 pattern-match on `items[sel].value` — a single match replaces the three
 parallel ladders.
 
 This is more uniform but slightly less type-safe per-variant (a Model overlay
-variant *could* accidentally hold a `Path` item).  The `ActiveOverlay` enum
+variant *could* accidentally hold a `Path` item). The `ActiveOverlay` enum
 from Option A can be kept as the outer type while `OverlayItem` carries the
 individual row values.
 
 ---
 
-### Option C — Data-driven `OverlayDef` table  *(evolutionary, lower impact)*
+### Option C — Data-driven `OverlayDef` table *(evolutionary, lower impact)*
 
 Rather than a trait or rich enum, register each overlay as a `&'static`
 descriptor:
@@ -311,7 +312,7 @@ enum EscBehavior { Clear, PopLastToken, DismissLocal }
 
 The variable parts (item generation, Tab/Enter actions) still live as functions
 or closures, but the static structural properties move into one table that is
-trivially audited.  Adding a new command is a two-step: add a `OverlayDef`
+trivially audited. Adding a new command is a two-step: add a `OverlayDef`
 entry and implement the dynamic callbacks.
 
 This is the least invasive option — it can be adopted incrementally alongside
@@ -327,35 +328,39 @@ split into:
 
 ```rust
 fn compute_overlay(buf: &str, ctx: &ReplCtx, settings: &SettingsStore, ...) -> OverlayState;
-fn handle_overlay_key(state: &OverlayState, key: KeyEvent, editor: &mut LineEditor, ...) -> OverlayKeyResult;
+fn handle_overlay_key(
+    state: &OverlayState,
+    key: KeyEvent,
+    editor: &mut LineEditor,
+    ...) -> OverlayKeyResult;
 ```
 
 This does not reduce the number of match arms (they just move to separate
 functions) but it isolates the two concerns so they can be read and tested
-independently.  A worthwhile first step even if Options A–C are adopted later.
+independently. A worthwhile first step even if Options A–C are adopted later.
 
 ---
 
 ## 4. Recommended path
 
 1. **Short term — Option D first:** Extract `compute_overlay` and
-   `handle_overlay_key` without changing the data model.  Each function is
+   `handle_overlay_key` without changing the data model. Each function is
    still long but the event loop itself shrinks to ~80 lines and the two
-   concerns stop interleaving.  Adds no new abstractions; low risk.
+   concerns stop interleaving. Adds no new abstractions; low risk.
 
-2. **Medium term — Option A:** Introduce `ActiveOverlay` enum.  This is the
+2. **Medium term — Option A:** Introduce `ActiveOverlay` enum. This is the
    change with the highest payoff: it eliminates double computation, the
    `value_cands` hack, the `help_view` bool, and the three parallel match
-   ladders.  The overlay-computation phase becomes testable in pure unit tests
+   ladders. The overlay-computation phase becomes testable in pure unit tests
    (no TTY, no event loop).
 
 3. **Opportunistic — shared table builder:** Add a
    `render_two_col_table(rows: &[(&str, &str)], avail: usize) -> Vec<String>`
    free function (and a four-col variant for models) called from
-   `display_rows()` in each variant.  Eliminates the repeated Table setup.
+   `display_rows()` in each variant. Eliminates the repeated Table setup.
 
 4. **Future — Option C / B:** If the command set grows significantly, a
-   `OverlayDef` table makes adding slash commands nearly mechanical.  Option B
+   `OverlayDef` table makes adding slash commands nearly mechanical. Option B
    (`OverlayItem` typed values) is worth considering if the per-item match arms
    in Tab/Enter remain noisy after Option A.
 
@@ -363,25 +368,38 @@ independently.  A worthwhile first step even if Options A–C are adopted later.
 
 ## 5. Consistency guarantees the refactor provides
 
-| Behaviour                                   | Current                            | After Option A                        |
-|---------------------------------------------|------------------------------------|---------------------------------------|
-| Overlay entries computed once               | No (double or triple)              | Yes — carried in enum variant         |
-| Esc defined once per overlay                | No — match ladder, /set special    | Yes — `handle_esc` per variant        |
-| Tab/Enter defined once per overlay          | No — two parallel match ladders    | Yes — two methods per variant         |
-| New overlay requires edits in N places      | 4+ (compute, Tab, Enter, Esc)      | 1 (add variant + impl methods)        |
-| Help overlay treated uniformly              | No — `help_view` bool special-case | Yes — `ActiveOverlay::Help` variant   |
-| Compiler checks completeness of key dispatch| No                                 | Yes (match on enum)                   |
-| Overlay computation is unit-testable        | Hard (entangled with event loop)   | Yes (`from_buffer` is pure)           |
+- **Behaviour**: Overlay entries computed once
+  - **Current**: No (double or triple)
+  - **After Option A**: Yes — carried in enum variant
+- **Behaviour**: Esc defined once per overlay
+  - **Current**: No — match ladder, /set special
+  - **After Option A**: Yes — `handle_esc` per variant
+- **Behaviour**: Tab/Enter defined once per overlay
+  - **Current**: No — two parallel match ladders
+  - **After Option A**: Yes — two methods per variant
+- **Behaviour**: New overlay requires edits in N places
+  - **Current**: 4+ (compute, Tab, Enter, Esc)
+  - **After Option A**: 1 (add variant + impl methods)
+- **Behaviour**: Help overlay treated uniformly
+  - **Current**: No — `help_view` bool special-case
+  - **After Option A**: Yes — `ActiveOverlay::Help` variant
+- **Behaviour**: Compiler checks completeness of key dispatch
+  - **Current**: No
+  - **After Option A**: Yes (match on enum)
+- **Behaviour**: Overlay computation is unit-testable
+  - **Current**: Hard (entangled with event loop)
+  - **After Option A**: Yes (`from_buffer` is pure)
 
 ---
 
 ## 6. What should *not* change
 
-- `LineEditor` — already well-factored, pure, and exhaustively tested.  Leave it alone.
+- `LineEditor` — already well-factored, pure, and exhaustively tested. Leave it
+  alone.
 - `History` — simple and self-contained.
 - `TermGuard` — lifecycle and signal-safety concerns are correctly isolated.
 - `overlay_lines` / `overlay_window` / `next_input_row` / `clear_rows_to` —
-  pure rendering helpers, well-named, unit-tested.  They remain free functions
+  pure rendering helpers, well-named, unit-tested. They remain free functions
   called from `display_rows()`.
 - The `redraw` closure API — the way it takes `&[&str]` rows is fine; it just
   gets called with the output of `display_rows()`.
