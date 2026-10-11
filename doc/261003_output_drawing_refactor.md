@@ -1,306 +1,273 @@
 # `output.rs` / `ui/` — a drawing layer between content and the terminal
 
-Status: **design only.** Describes the end state.
+Status: **design only.** Describes the end state. Module layout, channels, capture, testing and
+migration detail: `./261003_output_drawing_refactor_impl.md`.
 
 ## Goals
 
 - Clear layering and code organization; one obvious place for each piece
 - Clear control and content flow hierarchy
 
+## Principles
+
+- Direct calls go **down** the layers; bottom-up facts travel as **owned** channels / handles
+  (`Receiver`, `watch::Receiver`, `Notify`) acquired once at setup — never a borrow of a lower
+  layer, never a callback into the hub (non-reentrancy).
+- Upper layers (UI, content) always render full ANSI + OSC-8 and know nothing about the backend;
+  geometry is decided once, at the layers that own the size.
+- A batch is repeated `render_batch()` calls (one write / block each) plus one frame re-apply with a
+  regular `render()`.
+
 ## End state layering
 
 ```text
-Repl
-UI               Agent streaming
-Render           Content
-------------------------
-         Draw
-------------------------
-        Output
+ Repl          Agent streaming
+ UI               Content
+ ------------------------
+         Render
+          Draw
+ ------------------------
+         TermIO
 ```
 
 ## End state UI flow
 
-1) repl - control, pulls data from data layers assembles UI
-2) ui - chrome; compose Elements; render to Frame, cursor ownership
-3) draw - scrollback & frame drawing; Frame caching; request render from UI
-4) output - tty and stdout adapters
+1) repl — control; consumes TermIO's input-event channel (keys/paste/resize); pulls data, assembles
+   UI
+2) ui — chrome; compose RenderElements, configure the render stack
+3) render — compose RenderElements into a frame; accept content writes
+4) draw — scrollback & frame drawing, Frame caching; merges content + frame
+5) TermIO — tty / stdout / stderr adapters; input events; size watch
 
 ## End state Content flow
 
-1) agent - streaming content; also: session for replays
-2) content - formatting
-3) draw - same as UI, shared from here down
-4) output
+1) agent — streaming content; also: session for replays
+2) content — formatting, at the current watched width
+3) render — same as UI, shared from here down
+4) draw
+5) TermIO
 
 ## Content layer
 
-Render content stream segments / blocks to TTY bytes. Same level as UI.
+Render content segments / blocks to TTY bytes. Same level as UI. It is the agent's rendering seam:
+the agent holds a `Content` handle (never the hub); confirmation keeps its own `ConfirmPort`.
 
-- source: content/*; files: preview.rs · panel.rs · markdown.rs
-
-Cleanups
-
-- Remove: `console::set_colors_enabled()` is a process global that `style()` honours and that
-  already respects `CLICOLOR`/`CLICOLOR_FORCE` (`console-0.15.11/src/utils.rs:44`).
-  - `render_markdown(src, w, color)` takes the flag directly.
+- source: content/*; files: text.rs, markdown.rs, panel.rs, preview.rs, composition.rs
+- Owns all content classification: kinds (`ContentDisplayKind`), boundary / separator bookkeeping
+  (today's separator matrix, `last_content_*`, `held_blank`). None crosses below: the only
+  vocabulary going down is `Stream` (main / meta).
+- Holds a cloned width-watch handle (from TermIO at setup) and formats at the current watched width
+  before each block — no hub round-trip — then hands a `ContentWrite { lines, stream }` to
+  `render()`. `lines` are complete, pre-wrapped, styled screen rows; boundary, hold and line-clear
+  (`EL`) bookkeeping stay here. Render re-checks the width and clamps / re-wraps (`WrapLines` with
+  ANSI restore) if it disagrees. A new width applies from the next block on; the width-change replay
+  stays the repl's, at its next size check — content never initiates it.
+- Capture (`begin_capture`/`end_capture`) taps the `ContentWrite` as handed to `render()` —
+  pre width-recheck, content only, never frame bytes — so `/replay Nl` and content-path tests
+  compare what Content produced. Byte-edge tests use `TermIO::recording()`.
+- No direct agent → output path remains: every write enters through render().
 
 ## UI layer
 
-Compose and render UI chrome into Frames. Same level as Content.
+Compose UI chrome into a RenderElement stack. Same level as Content.
 
-- source: ui/
-- files: ui.rs (menu chrome) · bar.rs (the bar)
+- source: ui/; files: ui.rs (menu chrome) · bar.rs (the bar)
+- Elements are long-lived and reused: the status bar and the input hold live state (the bar its
+  status, the input the shared editor), joined by transient elements (menus, dialogs) as repl/ui
+  state changes. Reuse is why `Element` is `Arc<Mutex<…>>`, not `Box`: the repl mutates the shared
+  editor / overlay cursor in place and the next render() paints it.
+- Confirmations are repl dialogs (session state). Batch / one-shot runs have no dialog: gated tools
+  there require yolo mode (the sandbox is mandatory).
 
 ## Render layer
 
-Directly underneath UI. Composes and renders widgets into Frame. Owns frame size, e.g. the 2/3 of
-vertical term size.
+The shared hub between UI and content; both hold `Arc<Mutex<RenderManager>>` and call in. Composes
+widgets into Frame, owns frame size — resolves `configure()`'s frame max ratio (e.g. 2/3 of the
+vertical) into concrete rows — and re-renders on resize by re-running the installed stack at the
+watched size.
+Also the front door for suspend/resume, so content / UI never touch TermIO.
 
 ```rust
-// New structure: Generalization of current usize must / might
-enum RowAsk {
+type Lines = Vec<String>;
+
+pub struct Rendered { lines: Lines, caret: Option<(usize, usize)> } // caret: element-relative
+
+// Generalization of the current usize must / might. Frame sizing uses the
+// concrete row count; the in-frame split may also consult the ratio.
+pub enum RowSpec {
     FixedNum(rows: usize),
-    // Fraction of *frame* vertical size, e.g. for a reasonable division of space
-    // between header and content rows.
-    VerticalRatio(ratio: f32),
+    // Fraction of the frame area, capped at `rows` (e.g. header vs content split).
+    RatioAndNum(ratio: f32, rows: usize),
 }
 
-struct Element {
-    // Row space requested by the element 
-    // Static so vertical stacking is only re-computed at configure() time,
-    // not per draw
-    // min/max replace must/might
-    min: RowAsk,
-    max: RowAsk,
-    // Each element knows how to render itself
-    /// `Box` rather than `Rc`: an element is owned by exactly one composition
-    /// and is only ever moved between them, so the shared ownership would buy
-    /// nothing. `Send + Sync` is not optional — `Output: Send + Sync` and
-    /// `draw: Mutex<DrawCache>` put the composition behind both.
-    render: Box<dyn RenderAt + Send + Sync>,
+pub struct RowAsk { min: RowSpec, max: RowSpec }
+
+pub trait RenderElement {
+    /// Min/max rows of the element at the given render width.
+    fn height(&self, width: usize) -> RowAsk;
+    /// Rows for an allocation of exactly `height` screen rows of `width`, plus
+    /// the element's caret if it has one. Must not return more than `height`
+    /// rows: the frame builds row ranges from the result, and nothing
+    /// downstream can clamp an over-tall impl.
+    fn render(&self, height: usize, width: usize) -> Rendered;
 }
 
-/// Stateful renderer
-struct Renderer {
-    stack: vec<Element>,
-    // Both content and UI Renderer use the Drawer to paint to the shared screen.
-    drawer: Arc<Mutex<Drawer>>,
+// Elements are reused across compositions (UI layer) — shared and dynamic.
+type Element = Arc<Mutex<dyn RenderElement + Send + Sync>>;
+
+/// A content write handed to render(): complete styled rows + the stream.
+/// All content-specific classification stays above this interface; below
+/// it the only vocabulary is main / meta, so Render and Draw stay generic.
+pub struct ContentWrite { lines: Lines, stream: Stream }
+
+/// The stream token shared by Content → Render → Draw → TermIO.
+pub enum Stream { Main, Meta }
+
+pub struct RenderManager {
+    stack: Vec<Element>,
+    draw: Draw,        // fully owned drawing + output path
+    size: SizeWatch,   // = watch::Receiver<TermSize>, cloned handle
 }
 
-impl Renderer {
-    fn configure(&mut self, vec<Element>);
-    fn render(&mut self, width: usize, height: usize) {
-        // Takes into account screen height / width. Budgets
-        // vertical space between elements.
-        let frame: Frame = self.render_internal();
-        // Submit frame for drawing. Consumes / moves
-        self.drawer.lock().unwrap().draw(frame);
-    }
+impl RenderManager {
+    fn configure(&mut self, frame_max_row_ratio: f32, frame_elements: Vec<Element>);
+
+    // UI calls with content = None; content paths pass one write. Composes at
+    // the watched size, hands frame + content to Draw. No return: width lives
+    // on the size watch; the repl keys off resize events + the current size,
+    // never off the applied size.
+    fn render(&mut self, content: Option<ContentWrite>);
+
+    // Bulk replay: one write / block per call; frame apply deferred
+    // (DrawCache::batch_active), re-drawn by a final regular render().
+    // Streaming stays on render() only. A missed final render() is benign:
+    // the next render() re-applies the frame.
+    fn render_batch(&mut self, content: ContentWrite);
+
+    // Pass-through to Draw/TermIO: raw mode off, reader stopped. Resume is
+    // implicit in the next render(), which re-anchors the caret itself (DSR
+    // answered inside TermIO — the repl never issues one).
+    fn suspend(&mut self);
 }
 ```
 
-- source: frame.rs (existing, composition)
+- source: render.rs (existing composition, moved from ui/frame.rs)
+- Allocation: frame size = min(max ratio × term height, sum of element concrete max asks); floors
+  first, then a **ratio-weighted** split — all-`FixedNum` (today) weights evenly, i.e. today's
+  semantics, pinned by `allocate_*`.
+- Resize: frame re-render is watch-driven and lazy — only at the next render(), never on the event
+  (today's delayed repaint, repl.rs:1761); mid-turn render() adapts on the fly. The scrollback
+  *replay* is the repl's, at its next size check (TermIO section).
 
 ## Draw layer
 
-Owns the screen, do all drawing to the output. Merges content and ui.
+Owns the screen; the only place content and frame meet. Called by, and owned by, RenderManager.
 
 ```rust
-pub struct Frame {
-    width: usize,
-    height: usize,
-    frame: vec<Line>,
-}
+pub struct TermSize { width: usize, height: usize }
+
+pub struct Frame { size: TermSize, rows: Lines, caret: Option<(usize, usize)> } // caret: frame-absolute
 
 struct Draw {
-    sink: Box<dyn Sink>,
-    cache: DrawCache
+    term_io: TermIO, // closed enum, not a trait object
+    cache: DrawCache,
 }
+
 impl Draw {
-    
-    /// Re-render the installed configuration
-    /// force_refresh for ctrl-l / startup / external cursor writers
-    ///   triggers DSR internally, forces full re-draw
-    pub fn draw(&mut self, force_refresh: bool)
+    pub fn term_size(&self) -> TermSize;
+
+    /// Append `content` to scrollback (consuming the frame's rows,
+    /// paint-forward per ui_draw_261001), then apply `frame` below it.
+    pub fn draw(&mut self, frame: &Frame, content: Option<&ContentWrite>);
+
+    /// Raw mode off. Resume is implicit in the next draw()/render(); the
+    /// RenderManager re-anchors the caret (DSR, answered by TermIO).
+    pub fn suspend(&mut self);
 }
 ```
 
-- files: draw.rs; maybe split out content / frame rendering specifics later output.rs Sink +
-  Confirmation + the `Output` verb interface
-- `DrawCache` (`ui/frame.rs:415`) is already the shared state needed `element_stack`, `applied`,
-  `consumed_rows`, `deferred`, `batch_active` for the frame side; `last_content_display_kind`,
-  `last_content_closes_segment` for the content side.
+- files: draw.rs; ansi.rs (byte / width / escape transforms and the write wrappers)
+- `DrawCache` (`ui/frame.rs:415`) keeps the frame-side state only: `applied`, `consumed_rows`,
+  `deferred`, `batch_active`, the tracked caret and the clear floor — not the recipe; RenderManager
+  recomposes each render(). Its content-side fields
+  (`last_content_display_kind`, `last_content_closes_segment`) move up to the Content layer —
+  boundary bookkeeping is content's, not the screen's. Writer + cache become this layer's fields,
+  so the lock order is encapsulated once.
+- Caps are cached here per stream from `TermIO::caps()` at construction — collapses the 7
+  `is_terminal()` sites (1950…3779 in output.rs) into two decisions (primary, meta).
+- Streams: `ContentWrite.stream` picks the sink — main → primary, meta → meta. The stream decision
+  (e.g. reasoning → meta when meta carries it to stderr — caps, decided once at setup) is Content's.
+  Frames target TTY primary only — no UI-on-stderr case.
+- `output.rs` dissolves: content verbs enter through render(), drawing verbs are Draw's, interactive
+  verbs are repl dialogs / TermIO's. The five no-op drawing stubs and their dummy `(w, h)` returns
+  disappear with the verbs.
 
-Utilities:
+## TermIO layer
 
-- ansi.rs: pure byte / width / escape transforms
-
-## Output layer
-
-TTY and pipe output variant adapter layer
+TTY and pipe adapters, owned by Draw. **Sole stdin owner**: one reader thread for the process
+lifetime. It hands out owned channel handles at setup; nothing borrows it.
 
 ```rust
-pub trait Sink: Send {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<()>;
-    // Pushing the TTY / non-TTY distinction up to Draw might be easier -
-    // changes rendering model
-    fn caps(&mut self) -> isTTY;
-    // Output owns low level TTY interfacing
-    fn screen_size(&self) -> Result({width, height});
-    fn absolute_cursor_position(&self) -> Result({top, left}); // DSR
-    // TODO: What is this about?
-    fn event(&self, e: Event);     // LogOutput's structured path
+pub enum InputEvent { Key(/* crossterm for now */), Paste(String), Resize(TermSize) }
+pub enum CaretEvent { Invalidated } // SIGCONT / resume
+
+/// Acquired once at setup, then distributed. `size` is `Clone` (two consumers).
+pub struct TermHandles {
+    pub input: Receiver<InputEvent>,     // repl: keys / paste / resize
+    pub size: watch::Receiver<TermSize>, // RenderManager (frame) + content (format width)
+    pub caret: Receiver<CaretEvent>,     // RenderManager only
+}
+
+// Closed enum, not a trait: exactly two runtime behaviors, and TermIO is not
+// an extension point. The variant picks the input / lifecycle side; caps adjust
+// output fidelity independently. A non-tty stdin selects Plain; stdout/stderr
+// caps are probed separately (`picocode "q" | cat` is Tty input with a non-tty
+// primary — frames dropped, primary stripped).
+pub enum TermIO {
+    Tty(TtyIo),     // raw mode, reader thread, DSR; caps probed at construction
+    Plain(PlainIo), // line stdin, plain stdout/stderr, no raw mode, non-tty caps
+}
+
+impl TermIO {
+    fn handles(&mut self) -> TermHandles;
+    // Per-stream caps: primary (stdout) and meta (stderr) can disagree.
+    fn caps(&self, s: Stream) -> Caps;
+    fn write(&mut self, s: Stream, bytes: &[u8]) -> io::Result<()>;
+    fn size(&self) -> TermSize;
+    fn suspend(&mut self) -> io::Result<()>;
+    fn resume(&mut self) -> io::Result<()>;
 }
 ```
 
-- `ConsoleOutput`: full-featured sink for ttys
-- `QuietOutput`: null sink + an interactive `confirm` on stderr/stdin
-- `NoOutput`: null sink, auto-approve
-- `RecordingOutput`: test double (`#[cfg(test)]`)
+- resize → both the `size` watch (RenderManager frame dims, content format width) **and** the
+  `input` channel — the repl consumes it without acting and runs wipe + replay + re-anchor at its
+  next size check — prompt entry after a turn or the next keystroke while idle (today repl.rs:1711;
+  a mid-turn key repaints at live dims and can clear the mismatch first — kept, pumps.rs:85). Acting
+  on arrival would repaint mid-drag, when the scroll state is arbitrary; a keystroke scrolls the
+  cursor into view first, a timer cannot (repl.rs:1761).
+- caret invalidation (SIGCONT, resume) → the `caret` channel to RenderManager only
+- keys / paste → the `input` channel (repl pumps: `read_input` at the prompt, the turn's select
+  during a turn)
+- Ctrl-C / Ctrl-Z handled here — process lifecycle, never queued
+- DSR cursor queries answered internally: pause dispatch, write the query, match the reply. Only for
+  exceptional events (startup, resume, reflow) — never per render. This replaces `confirm_gate` /
+  `reader_paused` entirely (including `$EDITOR`'s hand-off); all five `Output::cursor_row()`
+  re-anchor sites (repl ×4, editor ×1) dissolve into it.
+- `suspend()` stops the reader and drops raw mode ($EDITOR, Ctrl-Z); `resume()` reverses it. Upper
+  layers reach it only through the RenderManager / Draw pass-throughs.
+- Two variants only. Constructors over Plain, not variants: `recording()` (memory writers,
+  `#[cfg(test)]` — stripped bytes, frames dropped by caps) and `null()` (sinkhole). `--quiet` is not
+  a backend: it selects Plain, whose answer is printed from `run_once`'s return (main.rs:366).
+- Degradation: layers above always emit ANSI + OSC-8; a `StripAnsi` writer wrapper (per stream from
+  caps) strips CSI/OSC-8 at the very edge — zero-width, so geometry is untouched. Non-tty primaries
+  additionally drop frames wholesale at Draw.
+- **Width is exposed because it cannot degrade late**: wrapping, table columns, panel and bar fit
+  are decided at render time and destructive: a wrapped line cannot be unwrapped. ANSI is
+  recoverable, geometry is not; height feeds only the frame budget.
 
-Non byte sinks
+## Related
 
-- `ScrollbackOutput`: **decorator** over `Arc<dyn Output>`, tapping verb *arguments*
-- `LogOutput`: **not a byte sink** — a structured logger; never renders
-
-`LineClass` exists because five of six impls carry no-op stubs for all 11 drawing verbs, returning
-dummies like `(dims.0.max(1), dims.1.max(1))`. A non-tty sink drops `Frame` wholesale.
-
-`Draw` holds **two** sinks: `reasoning_on_stderr` (1950) means content goes to stdout while
-reasoning goes to stderr in the same run, so one `Box<dyn Sink>` is insufficient.
-`begin_capture`/`end_capture` stop being verbs and become the writer swap they already are
-(`saved_writer`).
-
-`Caps` is never on `Draw`'s public surface. It is cached there from `Sink::caps()` at construction,
-which collapses the **7 independent `is_terminal()` sites** (1950, 2990, 3098, 3229, 3268, 3516,
-3779) into one decision.
-
-- Render layers always target TTY with ANSI, OSC-8 - do not know about output
-- Lower fidelity outputs strip ANSI / OSC-8 in the sink
-
-**Width is exposed because it cannot degrade late.** Wrapping, table column widths, panel fit and
-bar fitting are decided at render time and are destructive — a wrapped line cannot be unwrapped. So
-the split is asymmetric on purpose: ANSI is recoverable, geometry is not. Raw height needs no
-accessor: all five sites only feed `live_budget`, `DrawCache::new`, `reanchor` or `frame_size`.
-
-### Output cleanups
-
-- `ScrollbackOutput` is **dead code**: zero references outside its own `#[allow(dead_code)]` impl.
-  `LogOutput` emits four semantic events at four `tracing` levels, one carrying the tool `name` and
-  `args` structurally, which bytes cannot express.
-- `confirm` alone has **three answers** across the impls (`Console`/`Log` → `No`, `No`/`Recording` →
-  `Yes`) plus `Quiet`'s interactive prompt. That is interaction policy, not transport, so it stays
-  on the verb layer.
-
-## 3. The sink, the degradation rule, and `Draw`'s surface
-
-### 3.1 Two paths, by decision
-
-There is a **content path** and a **frame path**, and they are separate on purpose. An earlier shape
-had `draw_frame` *return* the applied geometry, so a content write could read the frame's grant.
-That was rejected: a return value ties content to whoever drew the frame, which routes content
-writes through the repl layers.
-
-Instead the drawing layer **holds** the frame configuration. `remember_compose` (3939) installs
-`element_stack` + `applied` under one lock —
-*"the recipe and the geometry it was rendered at describe one paint and must not be read apart"* —
-and `reposition_area` re-renders from that install. So:
-
-```rust
-impl Draw {
-    /// Configure the live frame and paint it. The installed configuration is
-    /// what every later content write re-renders from, until the next call.
-    fn configure_and_draw_frame(&mut self, elements: Vec<Element>, policy: ApplyPolicy);
-
-    /// Re-render the installed configuration at its shifted rows, after
-    /// `written` rows of content moved the seam. Elements that resolve at
-    /// render time (the bar) pick up their new values; no caller involved.
-    fn refresh(&mut self, written: usize);
-
-    fn width(&self) -> usize;                 // every renderer
-    fn dims(&self) -> (usize, usize);         // resize detection
-    fn set_dims(&self, d: (usize, usize));    // the reader's resize branch
-    fn painted_size(&self) -> (usize, usize); // already in the cache
-}
-```
-
-`refresh` is `reposition_area` under its real name. Making it an entry point turns "a content write
-refreshes the UI" from an accident into a contract.
-
-### 3.2 `live_budget` goes private; `rows_grant` goes away
-
-Vertical composition belongs to `configure_and_draw_frame`, so the `2/3` rule stops being a public
-function. Of 12 `allocate` + `live_budget` call sites, 4 are production and
-**8 are tests hardcoding `live_budget(24)`** (`ui.rs` ×5, `v25_model.rs`, `output.rs` ×2,
-`repl.rs`). Under `Draw` those eight read a real budget instead of a copied literal — they change,
-not just move.
-
-`rows_grant` (701) is a **redundant query on a mechanism that already works**: its own doc says it
-re-runs *"the same composition and the same `allocate` the frame will, so the two cannot differ"*,
-and it exists only because the grant isn't otherwise obtainable. But widgets already own their
-windows — `slashdot_menu` sends `RenderPlan`s of `LogicalLine`s for generic windowing and
-cursor/active-marker rendering, driven by the row grant
-(`window_heights(heights, selected, budget)`), and `StatusItem` likewise. The rows element is handed
-`h` in `render_at(h, term_w)`. So `rows_grant` is deleted rather than replaced: no `measure`, and no
-`Applied` return type.
-
-### 3.3 `Sink`: where bytes land
-
-## 4. What stays
-
-`Content` implements the `Output` verb interface, so all ~20 `&dyn Output` call sites in
-`interactive.rs`, `agent.rs`, `agent/turn.rs`, `repl.rs` and the tests are untouched. The 34-verb
-trait keeps the 11 drawing methods for now (§5); the content half is `Content`'s.
-
-`repl::read_input` is **drawing-only** — it calls exactly `cursor_row`, `painted_size`,
-`set_status`. Splitting its signature is the one phase-2 change worth doing, and the table for it is
-`agent/turn.rs:248,596,649` (all three `frame_size` uses feed the in-turn REPL input) plus
-`set_status` at 187.
-
-## 5. Deferred
-
-- **Phase 2 — `Draw` out of the `Output` verb trait.** The 11 drawing verbs move to `Draw`'s own
-  surface; `read_input` takes it instead of `&dyn Output`. This makes visible a fact the single
-  trait currently hides: the turn loop is *both* a content producer and a frame driver, because
-  in-turn input is a drawing operation.
-- **`draw.rs` stays one module** (~2,900 lines after the move). Split `content`-side from
-  `frame`-side branches only if it lands unwieldy.
-- **Making content an `Element` citizen.** Not a refactor. `Element` rows are in-place-repaintable
-  (`ui/frame.rs:17–20`) and content is append-only; that is a redesign of the streaming path, and it
-  belongs in `doc/ui_draw_v2.md`.
-
-## 6. Phase 0 — preliminary cleanup
-
-`reset_renderer_gaps` (`output.rs:2590`) is called from exactly one place, `end_tool_block` (2652).
-Both its effects are covered systematically elsewhere:
-
-- **effect**: width refresh
-  - **covered by**: `stream_text` (3588) — `set_width` per chunk, both renderers
-- **effect**: drop `pending_gap`
-  - **covered by**: `end_response_segment` (3665) — fresh answer renderer per segment
-
-So the tool boundary is the last ad-hoc holderover. Remove it: `end_tool_block` becomes a pure
-boundary declaration, and `Boundary::closes` then means *only* the content rule, with no renderer
-mechanic fused in.
-
-**This is the plan's one behaviour change.** It is also the one thing the suite does not cover — the
-only `pending_gap` hits are comments (3679, 5564). Add a tool-boundary pin *first*, then delete the
-reset. If the pin fails, we have found something.
-
-## 7. Net
-
-`output.rs` 6,624 → ~500 (`Sink`, `Confirmation`, the verb interface); `ui/frame.rs` 2,308 folds
-into `draw.rs`; `ui.rs` + a new `bar.rs` hold chrome; five new leaf modules (`ansi`,
-`content/{preview,panel,markdown}`, `ui/bar`). No cycles; the `ui → content` edge disappears
-entirely (the bar was the only thing that crossed).
-
-Three payoffs beyond line counts:
-
-- **`ScrollbackOutput` deleted** — 78 lines of dead decorator.
-- **29 `#[serial]` attributes** in `output.rs` exist only because tests pin width through
-  `repl::TERMINAL_WIDTH`. `Draw::set_dims` retires the global, and with it the serialization.
-- **7 `is_terminal()` sites → one `Caps`**, decided at construction.
-
-Related: `doc/261002_agent_refactor.md` (the same treatment for `agent.rs`), `doc/ui_draw_261001.md`
-(the design this consolidates), `doc/row_accounting.md`.
+- ./261003_output_drawing_refactor_impl.md — module layout, channels, capture, testing, migration
+- doc/row_accounting.md
+- ./ui_draw_261001.md
+- ./261002_agent_refactor.md: similar refactor for `agent.rs`
