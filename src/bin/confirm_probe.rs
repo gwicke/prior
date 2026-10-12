@@ -60,9 +60,7 @@ async fn main() {
     //
     // Sampled here, *printed* at the end: a `println!` now would land on the
     // pty's own rows and overwrite the frame the positional assertions measure.
-    let gate_up = out
-        .confirm_gate()
-        .is_some_and(|g| g.load(std::sync::atomic::Ordering::SeqCst));
+    let gate_up = picocode::termio::reader_paused();
 
     let decision = loop {
         // Raw mode delivers `Enter` as CR and no line discipline translates it,
@@ -121,9 +119,5 @@ async fn main() {
     println!("APPROVED={approved}");
     // Printed after RESULT so a harness waiting on RESULT has captured it too.
     println!("GATE_WHILE_UP={gate_up}");
-    println!(
-        "GATE_AFTER={}",
-        out.confirm_gate()
-            .is_some_and(|g| g.load(std::sync::atomic::Ordering::SeqCst))
-    );
+    println!("GATE_AFTER={}", picocode::termio::reader_paused());
 }

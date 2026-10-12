@@ -3,8 +3,8 @@ use crate::ansi::{
 };
 use crate::draw::{plan_consume, ApplyPolicy, Draw};
 use crate::render::{allocate, live_budget, render, Element, Extent, Frame, RenderAt, Rendered};
-use crate::repl::current_term_width;
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
+use crate::termio::{Caps, TermSize};
 use crate::tools::EditOp;
 use console::{style, StyledObject};
 use markdown_stream::{Parser, StreamParser};
@@ -12,11 +12,11 @@ use markdown_terminal::{Renderer, Theme};
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 use std::collections::VecDeque;
-use std::io::IsTerminal;
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use termimad;
+use tokio::sync::watch;
 use unicode_width::UnicodeWidthStr;
 
 use crate::row_count::RowCounter;
@@ -473,28 +473,6 @@ pub trait Output: Send + Sync {
             .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
             .unwrap_or((80, 24))
     }
-
-    /// Gate the background in-flight reader should honor. While it is `true`,
-    /// the reader must not read stdin, because **something else owns stdin**.
-    ///
-    /// That used to mean a confirmation dialog: `ui::confirm` was a blocking
-    /// loop on the main task, so the reader had to stand down or it would
-    /// swallow the dialog's keystrokes — and a gate left raised froze every
-    /// later in-flight reader for the rest of the session (plan §9 latent issue
-    /// 1, which is why the release discipline was spread across every exit).
-    ///
-    /// A confirmation is no longer that thing. It is session state in the
-    /// REPL's own pump, so there is one stdin consumer and the gate is never
-    /// touched (doc/confirm_as_menu_261002.md). **The remaining user is
-    /// `$EDITOR`** ([`crate::editor::run_editor`]), which genuinely hands the
-    /// tty to a foreground child — and whose DSR reply arrives on stdin, so the
-    /// reader must stay down across that query too.
-    ///
-    /// Returns `None` for outputs that don't run the raw-mode REPL (so there is
-    /// no background reader to coordinate with).
-    fn confirm_gate(&self) -> Option<Arc<AtomicBool>> {
-        None
-    }
 }
 
 /// Output for a non-terminal consumer (`picocode "q" | cat`): no interactive UI
@@ -684,11 +662,16 @@ pub struct ConsoleOutput {
     /// The live screen: byte sink plus the bookkeeping of what is believed to
     /// be on it. Writer before cache, always — see [`Draw`].
     draw: Draw,
-    /// Set `true` while `confirm` is reading a keystroke, so the background
-    /// in-flight reader thread backs off and doesn't swallow the input.
-    /// The in-flight reader's stdin gate, for `$EDITOR`'s takeover — see
-    /// [`Output::confirm_gate`]. A confirmation no longer touches it.
-    reader_paused: Arc<AtomicBool>,
+    /// This instance's view of the size watch (step 2 commit A) — the same
+    /// channel `draw` holds, so the content path's width reads and the frame
+    /// path's geometry cannot disagree. In production a subscriber of the
+    /// process-wide channel; in tests, a private seeded one, which is what
+    /// makes the width per-instance state (no `#[serial]`).
+    size: watch::Receiver<TermSize>,
+    /// Per-stream capabilities, probed once (step 2 commit A): colour and
+    /// the reasoning routing below read this instead of calling
+    /// `is_terminal()` per site.
+    caps: Caps,
     /// Whether the current response is being rendered live (TTY) or buffered
     /// (non-TTY). Decided once per response in `begin_response`.
     /// Where reasoning goes: `true` = stderr, so a consumer of
@@ -762,25 +745,21 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Terminal width in columns. Prefers the width tracked by the in-flight
-/// reader (updated on resize), falls back to querying the terminal, then 80.
+/// Terminal width in columns, from the size watch (`crate::termio`, step 2
+/// commit A). The 20-column floor is load-bearing: `plan_apply` misbehaves
+/// on a narrower geometry, and an uninitialized one must not get there.
+/// `ConsoleOutput`'s methods read their own subscribed receiver instead —
+/// this free function serves the callers with no output handle (the REPL
+/// loop, `v25_listing_node`).
 pub fn term_width() -> usize {
-    let w = crate::repl::current_term_width();
-    if w > 20 {
-        return w;
-    }
-    crossterm::terminal::size()
-        .map(|(w, _)| w as usize)
-        .unwrap_or(80)
+    crate::termio::size().width.max(20)
 }
 
-/// Terminal height in rows, or 24 if it cannot be determined. Symmetric to
-/// [`term_width`] — callers use it to budget vertical space for pop-up
-/// overlays (e.g. reserving room for menu items below a multi-line header).
+/// Terminal height in rows. Symmetric to [`term_width`] — callers use it to
+/// budget vertical space for pop-up overlays (e.g. reserving room for menu
+/// items below a multi-line header).
 pub fn term_height() -> usize {
-    crossterm::terminal::size()
-        .map(|(_, h)| h as usize)
-        .unwrap_or(24)
+    crate::termio::size().height.max(1)
 }
 
 /// Render `src` as a styled terminal string via `codewandler-markdown-terminal`.
@@ -942,12 +921,12 @@ fn wrap_with_diff_markers(text: &str, width: usize) -> Vec<String> {
 /// the line untouched. The renderer's 2-space code indent and trailing newline
 /// are stripped, leaving one line of styled text. Each call builds a fresh
 /// fenced block, so the formatter is fully isolated/flushed per line.
-fn highlight_code_fg(text: &str, lang: &str, color: bool) -> String {
+fn highlight_code_fg(text: &str, lang: &str, color: bool, width: usize) -> String {
     if !color || text.is_empty() {
         return text.to_string();
     }
     let md = format!("```{lang}\n{text}\n```\n");
-    let rendered = render_markdown(&md, term_width(), true);
+    let rendered = render_markdown(&md, width, true);
     let body = rendered
         .strip_prefix("  ")
         .unwrap_or_else(|| rendered.strip_prefix(' ').unwrap_or(&rendered));
@@ -1578,11 +1557,22 @@ fn refined_diff_lines(old: &str, new: &str) -> Vec<String> {
 }
 
 impl ConsoleOutput {
+    /// The production constructor: subscribes to the process-wide size watch
+    /// and probes the caps once.
     pub fn new(show_reasoning: ShowReasoningHandle) -> Self {
+        Self::with_geometry(show_reasoning, crate::termio::subscribe())
+    }
+
+    /// The one constructor — everything that is per-process state (the size
+    /// watch, the caps probe) arrives here, so a test can substitute the
+    /// watch via [`Self::with_size`] without forking the rest of the wiring.
+    fn with_geometry(show_reasoning: ShowReasoningHandle, size: watch::Receiver<TermSize>) -> Self {
+        let caps = Caps::probe();
         Self {
-            draw: Draw::new(term_height()),
-            reader_paused: Arc::new(AtomicBool::new(false)),
-            reasoning_on_stderr: !std::io::stdout().is_terminal(),
+            draw: Draw::new(size.clone()),
+            size,
+            caps,
+            reasoning_on_stderr: !caps.primary,
             parser: Mutex::new(StreamParser::new_gfm_stream()),
             renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
             thinking_parser: Mutex::new(StreamParser::new_gfm_stream()),
@@ -1594,6 +1584,25 @@ impl ConsoleOutput {
             streaming: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             held_blank: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// A `ConsoleOutput` on a privately seeded size watch — the test
+    /// harness's answer to [`Self::new`]. The geometry becomes
+    /// per-instance state, so tests that pin a width need no serialization.
+    #[cfg(test)]
+    pub(crate) fn with_size(show_reasoning: ShowReasoningHandle, size: TermSize) -> Self {
+        Self::with_geometry(show_reasoning, crate::termio::fixed(size))
+    }
+
+    /// This instance's width: its subscribed watch, with the same 20-column
+    /// floor as the [`term_width`] free function.
+    fn term_width(&self) -> usize {
+        self.size.borrow().width.max(20)
+    }
+
+    /// This instance's height — symmetric to [`Self::term_width`].
+    fn term_height(&self) -> usize {
+        self.size.borrow().height.max(1)
     }
 }
 
@@ -1658,7 +1667,7 @@ impl ConsoleOutput {
         // choke every writer passes — batch strings, streamed renderer
         // output, everything — so a line can no longer reach the terminal
         // wider than the terminal.
-        let width = term_width();
+        let width = self.term_width();
         self.with_content_writer(width, kind, closes, |out| {
             let _ = out.write_all(bytes);
         });
@@ -1989,7 +1998,7 @@ impl ConsoleOutput {
     }
 
     fn separator(&self) {
-        self.write_content(separator_line(term_width()).as_bytes());
+        self.write_content(separator_line(self.term_width()).as_bytes());
     }
 
     /// Start the renderers fresh, so the next block either of them renders
@@ -2007,9 +2016,9 @@ impl ConsoleOutput {
     /// The renderers hold no state the parser does not, so replacing them is
     /// free: the parser keeps the document, the renderer starts a block.
     fn reset_renderer_gaps(&self) {
-        let width = current_term_width();
+        let width = self.term_width();
         let mut renderer = self.renderer.lock().unwrap();
-        *renderer = Renderer::new(answer_theme(), width);
+        *renderer = Renderer::new(answer_theme(self.caps.primary), width);
         let mut trenderer = self.thinking_renderer.lock().unwrap();
         *trenderer = Renderer::new(Theme::dimmed(), width);
     }
@@ -2088,7 +2097,7 @@ impl ConsoleOutput {
         // own `\x1b[0m` cannot drop the grey behind the rest of the line.
         let painted = format!("{BG}{}", content.replace(RESET, &format!("{RESET}{BG}")));
         let vis = UnicodeWidthStr::width(strip_ansi(&painted).as_str());
-        let width = term_width();
+        let width = self.term_width();
         let pad = if width == 0 {
             0
         } else if indent {
@@ -2120,7 +2129,7 @@ impl ConsoleOutput {
     /// errors); `-`/`+` diff markers keep their red/green. For pre-styled /
     /// syntax-highlighted content, call `paint_panel` directly.
     fn tool_panel(&self, text: &str, is_error: bool, indent: bool) {
-        let width = term_width();
+        let width = self.term_width();
         // When indented, leave one column for the indent; keep the background
         // full-width in both cases.
         let inner = if indent {
@@ -2384,9 +2393,10 @@ pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> St
 /// The theme the answer renderer is built with: colours and clickable links on
 /// a terminal, plain otherwise. Shared with the tests, whose "what did the
 /// renderer alone produce" reference has to agree with it byte for byte or the
-/// comparison flags styling as host contribution.
-fn answer_theme() -> Theme {
-    if std::io::stdout().is_terminal() {
+/// comparison flags styling as host contribution. `color` is the primary
+/// stream's caps (`ConsoleOutput`), pinned by the one test that asks.
+fn answer_theme(color: bool) -> Theme {
+    if color {
         Theme {
             clickable_links: true,
             ..Theme::default()
@@ -2494,8 +2504,8 @@ impl ConsoleOutput {
         // reads as a distinct block. The command itself is syntax-highlighted
         // through the same formatter the answer/result path uses (flushed per
         // block via a fresh fenced code render).
-        let color = std::io::stdout().is_terminal();
-        let label_styled = highlight_code_fg(&label, command_lang(name), color);
+        let color = self.caps.primary;
+        let label_styled = highlight_code_fg(&label, command_lang(name), color, self.term_width());
         self.paint_panel(&label_styled, false);
         for line in &extra {
             self.tool_panel(line, false, true);
@@ -2585,7 +2595,7 @@ impl ConsoleOutput {
         // `tool_panel` re-wraps through `wrap()`, which collapses the interior
         // spaces that alignment depends on.
         {
-            let width = term_width();
+            let width = self.term_width();
             let avail = width.saturating_sub(1).max(1);
             if let Some(table) = blockedit::arg_error_view::render_arg_error_table(cleaned, avail) {
                 for line in &table {
@@ -2625,15 +2635,16 @@ impl ConsoleOutput {
                     v.get("lines").and_then(|x| x.as_u64()),
                 ) {
                     // Show the path as a header with line count
-                    let color = std::io::stdout().is_terminal();
+                    let color = self.caps.primary;
                     let lang = guess_lang(path);
                     let header = format!("write {} [{} lines]", path, total_lines);
-                    let header_styled = highlight_code_fg(&header, "bash", color);
+                    let header_styled =
+                        highlight_code_fg(&header, "bash", color, self.term_width());
                     self.paint_panel(&header_styled, true);
 
                     // Render the content with syntax highlighting (like read_file)
                     let show_max = 10; // Limit preview to 10 lines (match read_file)
-                    let width = term_width();
+                    let width = self.term_width();
                     let inner = width.saturating_sub(1).max(1);
                     let content_lines: Vec<_> = content.lines().collect();
                     for (printed, line) in content_lines.iter().enumerate() {
@@ -2641,7 +2652,7 @@ impl ConsoleOutput {
                             break;
                         }
                         for wline in wrap(line, inner) {
-                            let styled = highlight_code_fg(&wline, lang, color);
+                            let styled = highlight_code_fg(&wline, lang, color, self.term_width());
                             self.paint_panel(&styled, true);
                         }
                     }
@@ -2664,7 +2675,7 @@ impl ConsoleOutput {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let color = std::io::stdout().is_terminal();
+        let color = self.caps.primary;
         // Error output is shown verbatim (red). Everything else is highlighted:
         // `read_file` output is colored by the file's guessed language, bash
         // command output gets token highlighting, and other tools' output is
@@ -2689,7 +2700,7 @@ impl ConsoleOutput {
             8
         };
 
-        let width = term_width();
+        let width = self.term_width();
         let inner = width.saturating_sub(1).max(1);
         for (printed, line) in lines.iter().enumerate() {
             if printed >= show_max {
@@ -2708,7 +2719,7 @@ impl ConsoleOutput {
                 } else {
                     // Syntax-highlight through the result-path formatter, then
                     // layer the grey tool panel on top (flushed per line).
-                    let styled = highlight_code_fg(&wline, lang, color);
+                    let styled = highlight_code_fg(&wline, lang, color, self.term_width());
                     self.paint_panel(&styled, true);
                 }
             }
@@ -2727,11 +2738,16 @@ impl ConsoleOutput {
 
 impl Output for ConsoleOutput {
     fn cursor_row(&self) -> usize {
-        self.draw.reanchor_to_cursor()
+        // The DSR answer is obtained through the terminal I/O layer (step 2
+        // commit C): `termio::query_cursor_row` pauses the sole stdin owner
+        // around the query so the reply cannot be swallowed, then this re-anchors
+        // the draw cache with the answer.
+        let row = crate::termio::query_cursor_row();
+        self.draw.reanchor_to_cursor(row)
     }
 
     fn frame_size(&self) -> (usize, usize) {
-        (term_width(), term_height())
+        (self.term_width(), self.term_height())
     }
 
     fn painted_size(&self) -> (usize, usize) {
@@ -2749,7 +2765,7 @@ impl Output for ConsoleOutput {
     }
 
     fn end_batch(&self) {
-        self.draw.end_batch(term_width());
+        self.draw.end_batch(self.term_width());
     }
 
     /// Bracketed, and — where the previous content was also a committed
@@ -2777,7 +2793,7 @@ impl Output for ConsoleOutput {
     fn display_committed_prompt(&self, line: &str) {
         let shares_rule = self.draw.cache.lock().unwrap().last_content_display_kind
             == Some(ContentDisplayKind::Prompt);
-        let rule = separator_line(term_width());
+        let rule = separator_line(self.term_width());
         let block = if shares_rule {
             format!("{line}\n{rule}")
         } else {
@@ -2809,8 +2825,8 @@ impl Output for ConsoleOutput {
     }
 
     fn display_markdown(&self, text: &str) {
-        let color = std::io::stdout().is_terminal();
-        let rendered = render_markdown(text, term_width(), color);
+        let color = self.caps.primary;
+        let rendered = render_markdown(text, self.term_width(), color);
         let mut block = String::with_capacity(rendered.len() + 1);
         block.push_str(&rendered);
         block.push('\n');
@@ -2853,8 +2869,8 @@ impl Output for ConsoleOutput {
         // incremental renderer, where the separator bugs live, went untested.
         // Colour still follows the terminal: that is a property of the bytes,
         // not of the render path.
-        let theme = answer_theme();
-        let current_width = current_term_width();
+        let theme = answer_theme(self.caps.primary);
+        let current_width = self.term_width();
         let mut parser = self.parser.lock().unwrap();
         *parser = StreamParser::new_gfm_stream();
         let mut renderer = self.renderer.lock().unwrap();
@@ -2877,7 +2893,7 @@ impl Output for ConsoleOutput {
     fn stream_text(&self, delta: &str) {
         // Sync terminal width (updated by in-flight reader on resize) so
         // renderers reflow on the next feed.
-        let current_width = current_term_width();
+        let current_width = self.term_width();
         {
             let mut renderer = self.renderer.lock().unwrap();
             if renderer.width() != current_width {
@@ -2938,7 +2954,7 @@ impl Output for ConsoleOutput {
         }
         // Sync terminal width (updated by in-flight reader on resize) so
         // renderers reflow on the next feed.
-        let current_width = current_term_width();
+        let current_width = self.term_width();
         {
             let mut trenderer = self.thinking_renderer.lock().unwrap();
             if trenderer.width() != current_width {
@@ -2959,7 +2975,7 @@ impl Output for ConsoleOutput {
     }
 
     fn end_response_segment(&self) {
-        let current_width = current_term_width();
+        let current_width = self.term_width();
         // One counted block: the answer commit, the thinking commit, the
         // boundary blank and the dim reset. Inside the turn, so `Response`:
         // the separators between a segment and the tool panel below are the
@@ -3005,7 +3021,7 @@ impl Output for ConsoleOutput {
         // one; the bar painted after this is the idle one.
         self.streaming
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        let current_width = current_term_width();
+        let current_width = self.term_width();
         // Streaming is over, so each remainder comes back as one buffer: strip
         // it whole rather than carry a "might still be trailing" state across
         // chunks `end_response` will never see again. Each half is then emitted
@@ -3072,9 +3088,14 @@ impl Output for ConsoleOutput {
         // call half, and so the diff, is gone, but the report is still per
         // file and still needs its path to attribute a failure.
         if let Some(files) = blockedit::parse_file_results(result) {
-            let color = std::io::stdout().is_terminal();
+            let color = self.caps.primary;
             for fr in files {
-                let label = highlight_code_fg(&format!("edit {}", fr.path), "bash", color);
+                let label = highlight_code_fg(
+                    &format!("edit {}", fr.path),
+                    "bash",
+                    color,
+                    self.term_width(),
+                );
                 self.paint_panel(&label, true);
                 let single = match &fr.result {
                     Value::String(s) => s.clone(),
@@ -3097,10 +3118,6 @@ impl Output for ConsoleOutput {
         let mut input = String::new();
         let _ = io::stdin().read_line(&mut input);
         input.trim().to_string()
-    }
-
-    fn confirm_gate(&self) -> Option<Arc<AtomicBool>> {
-        Some(self.reader_paused.clone())
     }
 
     fn display_error(&self, error: &str) {
@@ -3150,7 +3167,7 @@ impl Output for ConsoleOutput {
         limit: usize,
         persona: Option<&str>,
     ) {
-        let width = term_width();
+        let width = self.term_width();
         let avatar = [
             "    ▄     ▄    ",
             "   ███   ███   ",
@@ -3312,9 +3329,6 @@ impl Output for ScrollbackOutput {
     fn confirm(&self, message: &str) -> Confirmation {
         self.inner.confirm(message)
     }
-    fn confirm_gate(&self) -> Option<Arc<AtomicBool>> {
-        self.inner.confirm_gate()
-    }
     fn display_separator(&self) {
         let line = "─".repeat(term_width());
         self.append(&line);
@@ -3339,9 +3353,6 @@ mod tests {
     use super::*;
     // The test-local `strip_ansi` helper below needs the lead-byte table.
     use crate::ansi::utf8_len;
-    // `TERMINAL_WIDTH` is a process-global (the in-flight reader owns it in
-    // production), so every test that pins the width must run alone.
-    use serial_test::serial;
 
     // --- Row accounting: the tracked cursor vs. the real one (phase B) ---
     //
@@ -3391,7 +3402,6 @@ mod tests {
     /// check that the element reads the flag; a flag set and never consulted
     /// would pass a state assertion alone.
     #[test]
-    #[serial]
     fn the_dot_follows_the_response_lifecycle() {
         let (out, _reasoning) = capturing_output(60);
         out.set_status(&bar_of("[bar]"));
@@ -3442,7 +3452,6 @@ mod tests {
     /// caller that could add either would make it a second place deciding what
     /// the area is made of (ui_draw_v2 §5.1.1).
     #[test]
-    #[serial]
     fn compose_area_resolves_every_row_it_owns() {
         let (out, _reasoning) = capturing_output(60);
         out.set_status(&bar_of("[bar]"));
@@ -3491,7 +3500,6 @@ mod tests {
     /// content path cannot render the same turn differently. Asserted on the
     /// rendered bytes: a flag nobody reads would still pass a flag check.
     #[test]
-    #[serial]
     fn compose_area_reads_streaming_rather_than_being_told_it() {
         let (out, _reasoning) = capturing_output(60);
         out.set_status(&bar_of("[bar]"));
@@ -3522,7 +3530,6 @@ mod tests {
     /// same answers the content path uses, so the two bars cannot disagree
     /// about whether they exist.
     #[test]
-    #[serial]
     fn compose_area_drops_a_status_that_has_nothing_to_say() {
         let (out, _reasoning) = capturing_output(60);
         assert!(
@@ -3551,9 +3558,17 @@ mod tests {
     }
 
     fn capturing_output(width: u16) -> (ConsoleOutput, crate::settings::ShowReasoningHandle) {
-        crate::repl::TERMINAL_WIDTH.store(width as usize, std::sync::atomic::Ordering::SeqCst);
         let reasoning = crate::settings::default_show_reasoning_handle();
-        let mut out = ConsoleOutput::new(reasoning.clone());
+        let mut out = ConsoleOutput::with_size(
+            reasoning.clone(),
+            TermSize {
+                width: width as usize,
+                height: 24,
+            },
+        );
+        // Pinned rather than probed: the routing is not this suite's subject,
+        // and a capture harness should capture everything the code might
+        // write (the doc on this helper says why in full).
         out.reasoning_on_stderr = false;
         (out, reasoning)
     }
@@ -3602,7 +3617,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn display_text_row_is_measured_not_predicted() {
         // A message that exactly fills the width, and one that is a column
         // wider: the old `wrap(text).len()` count called both one row.
@@ -3620,7 +3634,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn display_text_counts_a_wide_character_as_two_columns() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
@@ -3632,7 +3645,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn streamed_answer_is_counted() {
         // The untracked path (§9 #10): a streamed paragraph used to leave the
         // tracked row where it was.
@@ -3651,7 +3663,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn streamed_thinking_is_counted() {
         let (out, reasoning) = capturing_output(40);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
@@ -3663,7 +3674,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn tool_panel_is_counted() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
@@ -3675,7 +3685,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn markdown_and_error_and_plain_are_counted() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
@@ -3814,7 +3823,7 @@ mod tests {
         events.extend(parser.flush());
         // The same theme production builds the answer renderer with, or its
         // styling would look like host contribution.
-        let mut r = Renderer::new(answer_theme(), 80);
+        let mut r = Renderer::new(answer_theme(false), 80);
         let mut out: Vec<u8> = Vec::new();
         let _ = r.feed(&events, &mut out);
         String::from_utf8_lossy(&out).into_owned()
@@ -3872,7 +3881,6 @@ mod tests {
     /// renderer produced, ending at a line boundary. Anything else is a byte
     /// the host contributed on its own.
     #[test]
-    #[serial]
     fn host_adds_nothing_inside_a_segment() {
         for text in [
             "A single paragraph answer.\n\n",
@@ -3910,7 +3918,6 @@ mod tests {
     /// The same answer split across deltas must paint identically to the
     /// one-call version: chunking is not allowed to be visible.
     #[test]
-    #[serial]
     fn chunking_is_not_visible() {
         let text = "First paragraph of the answer.\n\nSecond paragraph here.\n\n";
         let whole = run_script(&[Step::Say(text), Step::ResponseEnd], Chunking::Whole);
@@ -3926,7 +3933,6 @@ mod tests {
 
     /// At a segment boundary, exactly one blank line — not zero, not two.
     #[test]
-    #[serial]
     fn one_blank_line_at_a_segment_boundary() {
         for chunk in Chunking::all() {
             assert_no_doubled_blank(
@@ -3957,7 +3963,6 @@ mod tests {
     /// (`capturing_output`); the two values are named here because they are this
     /// test's subject.
     #[test]
-    #[serial]
     fn reasoning_is_routed_by_the_output_layer() {
         let script = [Step::Think("Weighing the options.\n\n"), Step::ResponseEnd];
 
@@ -3994,7 +3999,6 @@ mod tests {
     /// A tool round then the next segment's answer: one blank at the
     /// boundary, with the panel rows above it.
     #[test]
-    #[serial]
     fn one_blank_line_after_a_tool_block() {
         for chunk in Chunking::all() {
             assert_no_doubled_blank(
@@ -4036,7 +4040,6 @@ mod tests {
     /// assertions below are the two halves: the block *between* the retries,
     /// and the block *before* the first one.
     #[test]
-    #[serial]
     fn an_empty_segment_puts_no_blank_between_retries() {
         let (mut out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
@@ -4081,7 +4084,6 @@ mod tests {
     /// line, losing the separation between a turn's answer and the status
     /// message that follows it.
     #[test]
-    #[serial]
     fn a_segment_that_streamed_still_closes_for_the_notice_after_it() {
         let (mut out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
@@ -4115,7 +4117,6 @@ mod tests {
     /// order the renderer can accept (a `\n` before the reset would be
     /// swallowed as a block's closing newline).
     #[test]
-    #[serial]
     fn reasoning_then_answer_has_one_blank() {
         for chunk in Chunking::all() {
             assert_no_doubled_blank(
@@ -4920,7 +4921,6 @@ mod tests {
     /// the line-clear arming there. Pre-fix: one 120-cell run, no arm, and
     /// whatever the frame below painted survived in the continuation.
     #[test]
-    #[serial]
     fn content_choke_wraps_an_overwide_line_before_the_line_clear() {
         let (mut out, _reasoning) = capturing_output(60);
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
@@ -4943,7 +4943,6 @@ mod tests {
     /// inserted newline and closes after it — SGR state is the terminal's and
     /// carries the green across the continuation row.
     #[test]
-    #[serial]
     fn wrapped_content_keeps_its_sgr_across_the_inserted_newline() {
         let (mut out, _reasoning) = capturing_output(60);
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
@@ -4962,7 +4961,6 @@ mod tests {
     /// A capture is an assertion against content, not a screen: the width
     /// guard steps aside and the bytes come back as they went in.
     #[test]
-    #[serial]
     fn captures_stay_raw_no_wrap_no_clear() {
         let (out, _reasoning) = capturing_output(60);
         let y = "y".repeat(120);
@@ -4993,7 +4991,6 @@ mod tests {
     /// (⌈2/3·20⌉ = 14) and below the raw height, so the two paths only agree if
     /// they derive the *same* budget, not just the same items.
     #[test]
-    #[serial]
     fn draw_elements_paints_exactly_what_the_hand_rolled_path_paints() {
         let tall: Vec<String> = (0..16).map(|i| format!("row {i}")).collect();
         let tall: Vec<&str> = tall.iter().map(|s| s.as_str()).collect();
@@ -5047,7 +5044,6 @@ mod tests {
     /// reposition puts the frame back underneath, one fold lower — still on
     /// screen, still below the content, and with no gap the erase left behind.
     #[test]
-    #[serial]
     fn content_over_a_live_frame_reemits_it_below() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
@@ -5136,7 +5132,6 @@ mod tests {
     /// exactly those cases, so the decision reads the frame rather than
     /// tracking input state separately.
     #[test]
-    #[serial]
     fn the_cursor_follows_the_frames_own_caret() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
@@ -5176,7 +5171,6 @@ mod tests {
     /// append, so the tracked row stays in step with the screen and a
     /// scrolled-back viewport is never written into.
     #[test]
-    #[serial]
     fn content_without_a_live_frame_is_untouched() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
@@ -5202,7 +5196,6 @@ mod tests {
     /// always put back — is not relaxed here, it is satisfied once at the end
     /// instead of once per write.
     #[test]
-    #[serial]
     fn a_content_batch_emits_the_frame_once_at_the_end() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
@@ -5290,7 +5283,6 @@ mod tests {
     /// renderer mid-document; without it the gap never fires and the bug hides,
     /// which is why this case exists.
     #[test]
-    #[serial]
     fn one_blank_line_between_a_tool_block_and_reasoning() {
         for (name, steps) in [
             (
@@ -5354,7 +5346,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn reasoning_list_before_answer_has_blank_line() {
         // Regression for two related bugs (see `doc/reasoning_order_opus.md`
         // §4 and §10):
@@ -5425,7 +5416,7 @@ mod tests {
         assert_eq!(guess_lang("a/b.py"), "python");
         assert_eq!(guess_lang("x.unknown"), "text");
         // highlighting: colored path keeps the source text and emits ANSI
-        let colored = highlight_code_fg("let x = 1;", "rust", true);
+        let colored = highlight_code_fg("let x = 1;", "rust", true, term_width());
         // ANSI escapes break the literal substring, so strip them first
         let plain = strip_ansi(&colored);
         assert!(
@@ -5434,11 +5425,13 @@ mod tests {
         );
         assert!(colored.contains('\x1b'), "color path must emit ANSI");
         // non-color path returns the line untouched
-        assert_eq!(highlight_code_fg("let x = 1;", "rust", false), "let x = 1;");
+        assert_eq!(
+            highlight_code_fg("let x = 1;", "rust", false, term_width()),
+            "let x = 1;"
+        );
     }
 
     #[test]
-    #[serial_test::serial]
     fn edit_arg_error_pipes_align_in_the_rendered_panel() {
         // Regression. The renderer emits correct padding, but the panel pipeline
         // re-wraps lines through `wrap()`, which collapses interior runs of
@@ -5451,7 +5444,13 @@ Invalid block: an edit block is missing its `@@@NEW` section\n\
 Expected:\nsome/path:1234\n@@@OLD\nold text\n@@@NEW\nnew text\n@@@END\n\
 \n\
 Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock().unwrap().anchor()\n";
-        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        let out = ConsoleOutput::with_size(
+            crate::settings::default_show_reasoning_handle(),
+            TermSize {
+                width: 80,
+                height: 24,
+            },
+        );
         out.display_tool_call("edit", &serde_json::json!({"path": "src/x.rs"}));
         out.draw.begin_capture();
         out.display_tool_result(msg);
@@ -5492,7 +5491,6 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     /// fixture only escaped because its `Actual:` leaves a dangling `@@@NEW`,
     /// which breaks the parse. These fixtures are the shapes that do not.
     #[test]
-    #[serial_test::serial]
     fn an_edit_arg_error_is_never_rendered_as_a_diff() {
         for raw in [
             // `Actual` is a JSON echo, and an echo elided to a single line.
@@ -5535,7 +5533,6 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     /// markers* against what the model sent, so against a JSON `Actual:` it was five
     /// `@@@OLD` rows with one row of JSON beside them.
     #[test]
-    #[serial_test::serial]
     fn a_single_edit_failure_renders_as_a_definition_list() {
         let (out, _reasoning) = capturing_output(80);
         out.draw.begin_capture();
@@ -5564,7 +5561,6 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     /// and it is a different function on a different input, which is why the two
     /// renderings can be gated independently.
     #[test]
-    #[serial_test::serial]
     fn an_edit_call_still_renders_its_blocks_as_a_diff() {
         let (out, _reasoning) = capturing_output(80);
         out.draw.begin_capture();
@@ -5585,7 +5581,6 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     /// replayed result arrives without a preceding `display_tool_call`, so the
     /// gate has to rest on the result's own banner rather than on panel state.
     #[test]
-    #[serial_test::serial]
     fn a_sed_preview_renders_without_a_call_context() {
         let (out, _reasoning) = capturing_output(80);
         out.draw.begin_capture();
@@ -5653,7 +5648,6 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     /// path uses, so the only thing under test is that the view layer treats
     /// them as the same sequence of call-result pairs.
     #[test]
-    #[serial]
     fn a_multi_file_batch_renders_identically_to_n_single_file_batches() {
         let blob = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
                     b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END";

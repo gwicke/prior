@@ -27,19 +27,29 @@ use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 /// Set by the `SIGCONT` handler on resume from `Ctrl-Z`. Read by the
-/// in-flight reader thread, which re-enters raw mode once it sees the
-/// flag cleared.
+/// **persistent stdin reader** (step 2 commit B), which re-enters raw mode
+/// once it sees the flag. Kept separate from [`RESUMED_REANCHOR`] so the
+/// reader and the prompt loop never race to clear one another's work.
 pub(crate) static RESUMED: AtomicBool = AtomicBool::new(false);
+
+/// Also set by the `SIGCONT` handler, read by [`Repl::read_input`] alone:
+/// a resume means the shell may have repainted, so the prompt loop re-anchors
+/// the draw cache (DSR) on its next iteration. Split from [`RESUMED`] because
+/// with a single always-running reader both the reader (raw mode) and the loop
+/// (re-anchor) act on a resume, and a shared flag would let one clear it before
+/// the other saw it.
+pub(crate) static RESUMED_REANCHOR: AtomicBool = AtomicBool::new(false);
 
 /// The entry DSR at [`read_input`] has run once this process.
 ///
@@ -57,20 +67,12 @@ static ENTRY_DSR_DONE: AtomicBool = AtomicBool::new(false);
 /// `SIGCONT` handler: we just record that the process resumed.
 /// It must stay async-signal-safe (no I/O, no allocation), so the
 /// actual terminal re-entry is performed by the reader thread (a normal
-/// thread context) or by `read_input`'s loop, which poll this flag.
+/// thread context) or by `read_input`'s loop, which poll these flags.
+/// Two flags because two different consumers act on one resume (see
+/// [`RESUMED`] / [`RESUMED_REANCHOR`]).
 extern "C" fn on_sigcont(_sig: i32) {
     RESUMED.store(true, Ordering::SeqCst);
-}
-
-/// Current terminal width in columns, updated by the in-flight reader
-/// on `Event::Resize`. Defaults to 80; renderers read this to pick up
-/// size changes mid-stream.
-pub(crate) static TERMINAL_WIDTH: AtomicUsize = AtomicUsize::new(80);
-
-/// Get the current terminal width (updated by the in-flight reader).
-/// Falls back to 80 if not yet initialized.
-pub(crate) fn current_term_width() -> usize {
-    TERMINAL_WIDTH.load(Ordering::SeqCst).max(20)
+    RESUMED_REANCHOR.store(true, Ordering::SeqCst);
 }
 
 /// Register the `SIGCONT` handler exactly once. Safe to call multiple
@@ -82,9 +84,9 @@ pub(crate) fn register_sigcont() {
     }
 }
 
-/// Where the in-flight reader sends one terminal event.
+/// Where the persistent stdin reader sends one terminal event.
 ///
-/// Split out of `spawn_in_flight_reader` because the *policy* is the part
+/// Split out of [`spawn_stdin_reader`] because the *policy* is the part
 /// worth arguing about and the part worth testing: which keys may wait, and
 /// which may not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,17 +94,17 @@ pub(crate) enum ReaderRoute {
     /// Deal with it here — process/terminal/abort state, or an event with
     /// nobody to hand it to.
     Inline,
-    /// Hand it to the turn's key branch on the channel.
+    /// Hand it to the prompt loop / turn's key branch on the channel.
     Forward,
 }
 
-/// Route one terminal event arriving while a request is in flight.
+/// Route one terminal event as it arrives on stdin.
 ///
 /// **Inline — must not wait:**
-/// - `Resize`: the streaming renderers read `TERMINAL_WIDTH`, and only this
-///   thread can update it while the main task is parked on the turn.
-///   Forwarding it too would make the turn consume the width instead of the
-///   renderers reading it directly.
+/// - `Resize`: the streaming renderers read the size watch
+///   (`crate::termio`, step 2), and only this thread can update it while
+///   the main task is parked on the turn. Forwarding it too would make the
+///   turn consume the resize instead of the renderers reading it directly.
 /// - `Ctrl-C` / `Ctrl-Z`: process and terminal state (`exit`,
 ///   `killpg(SIGTSTP)`), handled where they land, never queued.
 ///
@@ -147,51 +149,60 @@ pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
 /// `keys` is **unbounded** on purpose: a bounded channel that filled would
 /// block this thread at precisely the moment it has to deliver `Ctrl-C`.
 ///
-/// Spawned *only* while an LLM request is in flight (`prompt().await`
-/// blocks the main task). In raw mode `event::read` is blocking and the
-/// main task cannot read keys during the await, so this thread is what
-/// sees `Ctrl-C`/`Ctrl-Z` arriving mid-request. `Esc` was this thread's
-/// until U4.3 made it menu-first — a decision it cannot make without a
-/// session to look at — so it is forwarded now and the turn decides; see
-/// [`route_event`].
+/// This is the **sole stdin owner** (step 2 commit B). It is spawned once,
+/// when the REPL starts, and runs for the process lifetime — it, and only
+/// it, calls `event::poll`/`event::read`. The prompt loop and every in-flight
+/// turn consume the events it forwards on `keys` instead of touching stdin,
+/// which is what removes the three-way race between the prompt's blocking
+/// reads, the turn's reader, and the DSR query (the last of which is answered
+/// by pausing this reader — see `ConsoleOutput::cursor_row`).
 ///
-/// `done` is set by the caller once the await returns, so the loop can
-/// exit and be joined. `guard` is `Arc` and `stop()` is process-wide, so
-/// calling it from this thread is safe. `paused` is set by a confirmation
-/// dialog on the main task while it owns stdin; while it is `true` this
-/// reader must not read, or it would swallow the dialog's keystrokes.
-pub(crate) fn spawn_in_flight_reader(
-    guard: Arc<TermGuard>,
-    done: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    keys: tokio::sync::mpsc::UnboundedSender<Event>,
-) -> std::thread::JoinHandle<()> {
-    thread::spawn(move || loop {
-        if done.load(Ordering::SeqCst) {
-            break;
-        }
+/// In raw mode `event::read` is blocking, so a background thread is what sees
+/// `Ctrl-C`/`Ctrl-Z` arriving while the main task is parked on a turn. `Esc`
+/// is forwarded, not handled here: U4.3 made it menu-first, a decision this
+/// thread cannot make without a session to look at; see [`route_event`].
+///
+/// `guard` is `Arc` and `stop()` is process-wide, so calling it from this
+/// thread is safe. The process-wide pause gate (`termio::PAUSE_GATE`) is raised
+/// by the main task whenever *it* owns stdin — `$EDITOR`'s takeover, a DSR
+/// query, or the compaction window — and while it is `true` this reader backs
+/// off (sleeps, does not read) so it cannot swallow the bytes the main task is
+/// waiting for; `termio::READER_PARKED` signals that it has genuinely parked.
+pub(crate) fn spawn_stdin_reader(guard: Arc<TermGuard>, keys: UnboundedSender<Event>) {
+    // A gate-raiser only waits for a park when a reader exists to park; set it
+    // before the thread starts so the entry-DSR's pause below sees it.
+    crate::termio::READER_RUNNING.store(true, Ordering::SeqCst);
+    let _ = thread::spawn(move || loop {
         if RESUMED.swap(false, Ordering::SeqCst) {
             let _ = guard.start();
         }
-        // A confirmation dialog on the main task owns stdin right now; back
-        // off so we don't consume the keystrokes it is waiting for.
-        if paused.load(Ordering::SeqCst) {
+        // The main task owns stdin right now ($EDITOR, a DSR query, or the
+        // compaction window); back off so we don't consume the bytes it is
+        // waiting for. `READER_PARKED` tells a gate-raiser that we have
+        // left any in-flight poll and are genuinely not reading.
+        if crate::termio::PAUSE_GATE.load(Ordering::SeqCst) {
+            crate::termio::READER_PARKED.store(true, Ordering::SeqCst);
             thread::sleep(Duration::from_millis(10));
             continue;
         }
+        crate::termio::READER_PARKED.store(false, Ordering::SeqCst);
         if let Ok(true) = event::poll(Duration::from_millis(50)) {
             match event::read() {
-                // U4.2: edit keys this thread used to drop now go to the turn.
-                // `send` on an unbounded tokio mpsc never blocks, so this is
-                // safe from a plain OS thread — and being non-blocking is the
-                // whole reason the channel is unbounded (see `route_event`).
+                // U4.2: edit keys this thread used to drop now go to the
+                // prompt loop or the turn. `send` on an unbounded tokio mpsc
+                // never blocks, so this is safe from a plain OS thread — and
+                // being non-blocking is the whole reason the channel is
+                // unbounded (see `route_event`).
                 Ok(ev) if route_event(&ev) == ReaderRoute::Forward => {
                     let _ = keys.send(ev);
                 }
-                Ok(Event::Resize(w, _h)) => {
-                    // Update the shared terminal width so renderers pick up
-                    // the change on their next streaming call.
-                    TERMINAL_WIDTH.store(w as usize, Ordering::SeqCst);
+                Ok(Event::Resize(w, h)) => {
+                    // Publish the new geometry so renderers pick up the
+                    // change on their next streaming call.
+                    crate::termio::set_size(crate::termio::TermSize {
+                        width: w as usize,
+                        height: h as usize,
+                    });
                 }
                 Ok(Event::Key(key)) => {
                     if let KeyCode::Char('c') = key.code {
@@ -211,7 +222,28 @@ pub(crate) fn spawn_in_flight_reader(
                 _ => {}
             }
         }
-    })
+    });
+}
+
+/// A fresh stdin-event channel: the sender half goes to the persistent reader
+/// ([`spawn_stdin_reader`]), the receiver half is consumed by the prompt loop
+/// and each turn. One channel for the process, so a key typed at the end of a
+/// turn lands in the next prompt rather than being dropped with a per-turn
+/// queue.
+pub(crate) fn stdin_channel() -> (UnboundedSender<Event>, UnboundedReceiver<Event>) {
+    unbounded_channel()
+}
+
+/// The entry DSR: anchor the draw cache to the real cursor once, at startup,
+/// **before the persistent reader starts consuming stdin** (step 2 commit B).
+/// Running it here — with the reader still paused — is what guarantees the
+/// terminal's reply (or a test harness's pre-written one) is not swallowed by
+/// the reader's first poll. Idempotent via [`ENTRY_DSR_DONE`], so
+/// `read_input`'s own entry check becomes a no-op.
+pub(crate) fn run_entry_dsr(output: &dyn Output) {
+    if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
+        let _ = output.cursor_row();
+    }
 }
 
 /// Owns terminal mode transitions. [`TermGuard::start`] enters raw mode and
@@ -1444,14 +1476,14 @@ impl PromptSession {
                         // composition and the same `allocate` the frame will
                         // run. Measured on the rows as the engine wrote them,
                         // which is the unit the rows element windows in.
-                        let (_, cur_h) = crossterm::terminal::size().unwrap_or((80, 24));
+                        let cur_h = crate::termio::size().height;
                         let term_w = crate::output::term_width().max(1);
                         let page = rows_grant(
                             &self.editor,
                             prompt,
                             overlay_elements(overlay, term_w),
                             term_w,
-                            cur_h.max(1) as usize,
+                            cur_h.max(1),
                         );
                         let direction = if matches!(key.code, KeyCode::PageDown) {
                             1
@@ -1466,10 +1498,7 @@ impl PromptSession {
                         }
                         return KeyOutcome::Continue;
                     }
-                    let page = {
-                        let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                        (h as usize).saturating_sub(2).max(1)
-                    };
+                    let page = crate::termio::size().height.saturating_sub(2).max(1);
                     let max = opts_len.saturating_sub(1);
                     if matches!(key.code, KeyCode::PageDown) {
                         *sel = (*sel + page).min(max);
@@ -1596,6 +1625,10 @@ impl Repl {
         ctx: &ReplCtx,
         app_state: &Arc<AppState>,
         output: &dyn Output,
+        // The persistent reader's event queue (step 2 commit B). The reader is
+        // the sole stdin owner; this loop consumes what it forwards rather
+        // than calling `event::poll`/`event::read` itself.
+        keys: &mut UnboundedReceiver<Event>,
     ) -> Option<InputAction> {
         // Re-anchor the draw cache to the real cursor (DSR) before the first
         // paint (plan §4.2).
@@ -1689,12 +1722,15 @@ impl Repl {
         // lands mid-edit re-flows the bar with the frame instead of leaving a
         // bar sized for the old terminal.
         loop {
-            // On resume from Ctrl-Z (editing phase; the in-flight reader thread
-            // is not running then), re-enter raw mode so the next keystroke is
-            // read correctly. Idempotent; a no-op on every normal iteration.
-            // The shell may have repainted while we were stopped, so re-anchor
-            // the draw cache (DSR) before the next paint (plan §4.2).
-            if RESUMED.swap(false, Ordering::SeqCst) {
+            // On resume from Ctrl-Z, re-anchor the draw cache (DSR): the shell
+            // may have repainted while we were stopped, so the cached frame
+            // rows can no longer be trusted (plan §4.2). Raw-mode re-entry is
+            // the persistent reader's job (`RESUMED`); this flag is this
+            // loop's own resume signal, so the two never race. `guard.start()`
+            // here is a harmless idempotent belt-and-suspenders — the DSR below
+            // needs raw mode, and this keeps it correct regardless of whether
+            // the reader has re-entered yet.
+            if RESUMED_REANCHOR.swap(false, Ordering::SeqCst) {
                 let _ = self.guard.start();
                 let _ = output.cursor_row();
             }
@@ -1707,6 +1743,11 @@ impl Repl {
             // stale `prev_term_h` used to provide lives in `plan_apply`
             // (`screen_bottom`) now, so a grow's revealed scrollback survives
             // without any state here.
+            // The one place that still queries the terminal live: a resize
+            // that produced no event has to be caught somewhere, and this is
+            // the loop that runs per keystroke. The answer is *published*
+            // (`set_size`) so every reader below and around consumes the
+            // watch rather than a private query.
             let (cur_w_u16, cur_h_u16) = crossterm::terminal::size().unwrap_or((80, 24));
             let cur_h = cur_h_u16 as usize;
             let cur_w = cur_w_u16 as usize;
@@ -1733,9 +1774,12 @@ impl Repl {
                 }
                 let _ = output.cursor_row();
             }
-            // Keep the shared width in sync (covers width changes even without
-            // an explicit Resize event, e.g. on some terminals).
-            TERMINAL_WIDTH.store(cur_w, Ordering::SeqCst);
+            // Keep the watch in sync (covers size changes even without an
+            // explicit Resize event, e.g. on some terminals).
+            crate::termio::set_size(crate::termio::TermSize {
+                width: cur_w,
+                height: cur_h,
+            });
             // --- Eval → outcome → sync → paint, and end the read if that
             // produced an action. The whole sequence lives in `settle`
             // because the turn's `select!` branch runs it too (ui_draw_v2
@@ -1752,19 +1796,19 @@ impl Repl {
             }
 
             // --- Wait for a key (or a prose-completion wake). While a
-            // prose request is armed/in flight, poll with a deadline so
+            // prose request is armed/in flight, wait with a deadline so
             // the dialog can open (or the debounce fire) without a
             // keystroke; otherwise block as before. Slash frames block —
             // prose state is not consulted while `/` owns the buffer.
             //
-            // Resize events are consumed *here, without repainting*. A drag
-            // emits a stream of them, and repainting per event writes
-            // absolute-positioned frames while a reflowing terminal is still
-            // moving rows around (wezterm) — interleaving that strands stale
-            // frames; xterm doesn't reflow, which is why it never corrupted.
-            // The painted frame is left for the terminal to reflow on its own;
-            // the next keystroke re-anchors via DSR at the top of the loop and
-            // repaints once, against the settled size. ---
+            // Events come from the **persistent reader** (`keys`), the sole
+            // stdin owner — this loop no longer calls `event::poll`/`read`.
+            // Resize is handled *by the reader*, inline: it publishes the new
+            // geometry (`set_size`) and does not forward the event, so a drag's
+            // stream of resizes never reaches here to force a per-event repaint
+            // (which would strand frames while a reflowing terminal is still
+            // moving rows). The loop-top probe above notices the settled size
+            // and repaints once, re-anchoring via DSR. ---
             let prose_wait = if session.editor.chars().first() == Some(&'/') {
                 None
             } else {
@@ -1780,30 +1824,42 @@ impl Repl {
                 // waiting in the tty.
                 if let Some(parked) = app_state.take_parked_key() {
                     match parked {
-                        Event::Resize(w, _) => {
-                            TERMINAL_WIDTH.store(w as usize, Ordering::SeqCst);
+                        Event::Resize(w, h) => {
+                            crate::termio::set_size(crate::termio::TermSize {
+                                width: w as usize,
+                                height: h as usize,
+                            });
                             continue;
                         }
                         e => break Some(e),
                     }
                 }
-                let e = match prose_wait {
-                    Some(d) => match event::poll(d) {
-                        Ok(true) => event::read(),
-                        Ok(false) => break None, // prose wake: re-eval
-                        Err(_) => return None,
+                // One event off the reader's queue. A deadline when a prose
+                // request may wake us; a block otherwise. The reader is the
+                // sole sender and lives for the process, so a `None` here means
+                // it is gone — treated as a read error, as `event::read`'s `Err`
+                // was.
+                let e: Option<Event> = match prose_wait {
+                    Some(d) => match tokio::time::timeout(d, keys.recv()).await {
+                        Ok(Some(ev)) => Some(ev),
+                        Ok(None) => return None,
+                        Err(_) => break None, // prose wake: re-eval
                     },
-                    None => event::read(),
+                    None => keys.recv().await,
                 };
                 match e {
-                    Ok(Event::Resize(w, _)) => {
-                        // Track the width for renderers; the repaint is
-                        // deferred to the next key / content wake.
-                        TERMINAL_WIDTH.store(w as usize, Ordering::SeqCst);
+                    // Defensive: the reader handles Resize inline and does not
+                    // forward it, so this should not fire; if it does, publish
+                    // and keep waiting rather than treating it as a key.
+                    Some(Event::Resize(w, h)) => {
+                        crate::termio::set_size(crate::termio::TermSize {
+                            width: w as usize,
+                            height: h as usize,
+                        });
                         continue;
                     }
-                    Ok(e) => break Some(e),
-                    Err(_) => return None,
+                    Some(e) => break Some(e),
+                    None => return None,
                 }
             };
             // --- Dispatch one key. ---
@@ -2294,10 +2350,10 @@ impl Repl {
                 None
             }
             KeyCode::Up => {
-                let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
+                let w = crate::termio::size().width;
                 // Not on the first visual row: this is cursor movement inside a
                 // multi-line line, not recall.
-                if !editor.visual_up(w as usize, prompt) {
+                if !editor.visual_up(w, prompt) {
                     // History is browsed only from an *empty* line, plus while a
                     // walk is in progress — the recalled entry on screen is not
                     // a draft, so `Up` keeps stepping back through it. Any text
@@ -2314,8 +2370,8 @@ impl Repl {
                 None
             }
             KeyCode::Down => {
-                let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
-                if !editor.visual_down(w as usize, prompt) {
+                let w = crate::termio::size().width;
+                if !editor.visual_down(w, prompt) {
                     // Forward-only: `Down` moves through a walk that `Up` began,
                     // and does nothing at all otherwise. With no walk in progress
                     // `nav` is `None` — the line is either empty or the user's own
@@ -3117,17 +3173,18 @@ mod tests {
     ///
     /// What is asserted is the *order and kind* of the three writes, which is
     /// the whole contract: `display_separator`, `display_plain`, `display_separator`.
-    // `#[serial]`: this test pins the process-global `TERMINAL_WIDTH`, and the
-    // `output` tests pin it to their own widths through `capturing_output`. Two
-    // tests that write the same global must not run concurrently, or one
-    // renders at the other's width and reports a phantom row-accounting
-    // failure. (Parallel-only: the whole suite passes under `--test-threads=1`.)
     #[test]
-    #[serial_test::serial]
     fn a_committed_line_is_written_between_two_rules() {
         let reasoning = crate::settings::default_show_reasoning_handle();
-        crate::repl::TERMINAL_WIDTH.store(80, std::sync::atomic::Ordering::SeqCst);
-        let out = crate::output::ConsoleOutput::new(reasoning);
+        // The width is per-instance state since step 2 commit A (`with_size`
+        // seeds a private size watch), so no serialization is needed.
+        let out = crate::output::ConsoleOutput::with_size(
+            reasoning,
+            crate::termio::TermSize {
+                width: 80,
+                height: 24,
+            },
+        );
         let mut editor = LineEditor::new();
         // Built by hand rather than `History::load()`, which reads the real
         // history file — a test that depends on the machine's `~/.picocode`, and
@@ -3212,8 +3269,13 @@ mod tests {
     /// expects: compose the area and draw it, the way `read_input` does.
     fn commit_harness() -> (crate::output::ConsoleOutput, LineEditor) {
         let reasoning = crate::settings::default_show_reasoning_handle();
-        crate::repl::TERMINAL_WIDTH.store(40, Ordering::SeqCst);
-        let out = crate::output::ConsoleOutput::new(reasoning);
+        let out = crate::output::ConsoleOutput::with_size(
+            reasoning,
+            crate::termio::TermSize {
+                width: 40,
+                height: 24,
+            },
+        );
         out.set_status(&crate::agent::status::status_text(
             Some("sess"),
             None,
@@ -3246,7 +3308,6 @@ mod tests {
     /// (its status and input rows), and if the re-draw's position leaves a row
     /// of air, the next commit's opening rule lands below it.
     #[test]
-    #[serial_test::serial]
     fn two_committed_prompts_render_without_a_blank_between_their_rules() {
         let (out, mut editor) = commit_harness();
         let mut history = History {
@@ -3299,7 +3360,6 @@ mod tests {
     /// its own trailing blank, and the commit's opening rule has to land on the
     /// row directly after it rather than be absorbed into the gap.
     #[test]
-    #[serial_test::serial]
     fn a_committed_prompt_after_turn_content_keeps_its_upper_rule() {
         let (out, mut editor) = commit_harness();
         let mut history = History {

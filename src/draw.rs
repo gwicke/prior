@@ -15,19 +15,18 @@
 //! may rewrite any subset of rows unconditionally. Composition is
 //! [`crate::render`].
 
-use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
+use std::io::{self, Write};
 use std::sync::Mutex;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use crate::ansi::{HIDE_CURSOR, SHOW_CURSOR};
-// Transitional back-edges into `output.rs`: the terminal-size queries move to
-// the terminal I/O layer (step 2), `ContentDisplayKind` and the content-path
-// cache fields it names to `content/` (step 3).
-use crate::output::{term_height, term_width, ContentDisplayKind};
+// Transitional back-edge into `output.rs`: `ContentDisplayKind` and the
+// content-path cache fields it names move to `content/` (step 3). Terminal
+// geometry comes from the size watch (`crate::termio`, step 2 commit A).
+use crate::output::ContentDisplayKind;
 use crate::render::{allocate, live_budget, render, Element, Extent, Frame};
 use crate::slashdot_menu::table::display_width;
+use crate::termio::TermSize;
+use tokio::sync::watch;
 
 /// How [`plan_apply`] treats a frame's screen region (plan §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,70 +727,9 @@ fn erase_down(s: &mut String, h: usize) {
     }
 }
 
-// --- DSR --------------------------------------------------------------------
-
-/// Non-blocking Device Status Report: ask the terminal for the real
-/// cursor row, timing out fast so we never hang on a terminal that
-/// does not answer (e.g. a headless test pty). Returns a 1-indexed
-/// row. Reads the reply raw (bypassing crossterm's event parser).
-///
-/// Moves with the terminal I/O layer (the sole stdin owner) in step 2.
-fn query_real_cursor_row() -> Option<usize> {
-    let stdin = io::stdin();
-    let fd = stdin.as_raw_fd();
-    // Make stdin non-blocking so a missing DSR reply cannot hang us.
-    let old = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if old < 0 {
-        return None;
-    }
-    unsafe { libc::fcntl(fd, libc::F_SETFL, old | libc::O_NONBLOCK) };
-    let restore = |f: i32, o: i32| unsafe {
-        libc::fcntl(f, libc::F_SETFL, o);
-    };
-
-    let mut out = io::stdout();
-    if out.write_all(b"\x1b[6n").is_err() || out.flush().is_err() {
-        restore(fd, old);
-        return None;
-    }
-
-    let mut guard = stdin.lock();
-    let start = Instant::now();
-    let mut buf = Vec::new();
-    let mut got = false;
-    while start.elapsed() < Duration::from_millis(60) {
-        let mut b = [0u8; 1];
-        match guard.read(&mut b) {
-            Ok(0) => break,
-            Ok(_) => {
-                buf.push(b[0]);
-                if b[0] == b'R' {
-                    got = true;
-                    break;
-                }
-            }
-            Err(_) => thread::sleep(Duration::from_millis(5)),
-        }
-    }
-    restore(fd, old);
-    if got {
-        parse_dsr(&buf)
-    } else {
-        None
-    }
-}
-
-/// Parse a Device Status Report reply `ESC[<row>;<col>R` into the 1-indexed row.
-fn parse_dsr(buf: &[u8]) -> Option<usize> {
-    if buf.len() < 4 || buf[0] != 0x1b || buf[1] != b'[' || *buf.last()? != b'R' {
-        return None;
-    }
-    let inner = &buf[2..buf.len() - 1];
-    let mut it = inner.splitn(2, |&c| c == b';');
-    let row = it.next()?;
-    let row_s = std::str::from_utf8(row).ok()?;
-    row_s.parse::<usize>().ok()
-}
+// The DSR query moved to `crate::termio` (the sole stdin owner) in step 2
+// commit C: it pauses the reader around the query so the reply cannot be
+// swallowed. `Draw::reanchor_to_cursor` now takes the answer as a parameter.
 
 // --- the live screen --------------------------------------------------------
 
@@ -809,6 +747,11 @@ pub(crate) struct Draw {
     /// Where the bytes go. Defaults to stdout; [`Self::begin_capture`] swaps
     /// in a `Cursor<Vec<u8>>` and [`Self::end_capture`] swaps it back.
     pub(crate) writer: Mutex<Box<dyn Write + Send>>,
+    /// The size watch (step 2 commit A): the latest `TermSize`, without a
+    /// per-call terminal query. Seeded by `ConsoleOutput` from the process
+    /// watch — or from a test's private one, which is what lets the width
+    /// tests run concurrently.
+    pub(crate) size: watch::Receiver<TermSize>,
     /// Live-screen bookkeeping (plan §4.1): tracked cursor row, clear floor,
     /// last applied frame — plus the content-path state (`ContentDisplayKind`
     /// and friends) that `ConsoleOutput`'s content writers record.
@@ -818,11 +761,13 @@ pub(crate) struct Draw {
 }
 
 impl Draw {
-    pub(crate) fn new(term_h: usize) -> Self {
+    pub(crate) fn new(size: watch::Receiver<TermSize>) -> Self {
+        let term_h = size.borrow().height;
         Draw {
             writer: Mutex::new(Box::new(io::stdout())),
             cache: Mutex::new(DrawCache::new(term_h)),
             saved_writer: Mutex::new(None),
+            size,
         }
     }
 
@@ -875,10 +820,10 @@ impl Draw {
     /// so we *clamp* to the height rather than wrapping (a modulo wrap would
     /// teleport the tracked row to the top of the screen after a long session).
     pub(crate) fn note_lines(&self, n: usize) {
-        let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let h = self.size.borrow().height;
         // Advance the tracked cursor and drop the frame region — the write that
         // called us moved the cursor off the frame (plan §4.2).
-        self.cache.lock().unwrap().note_lines(n, h as usize);
+        self.cache.lock().unwrap().note_lines(n, h);
     }
 
     /// The area's re-emit: re-render the stored recipe (§5.1.1) and walk it to
@@ -897,7 +842,7 @@ impl Draw {
     /// half-consumed frame is never left stranded on screen.
     pub(crate) fn reposition_area(&self, width: usize, taken: Frame) -> String {
         let tw = width.max(1);
-        let th = term_height().max(1);
+        let th = self.size.borrow().height.max(1);
         let mut cache = self.cache.lock().unwrap();
         // The consumed frame's height is the `old_h` of the below-frame clear
         // (`old_h - h_new - consumed_rows`) — read before `taken` moves into
@@ -933,13 +878,11 @@ impl Draw {
     /// Sync the tracked row with the terminal's real cursor, write any
     /// re-anchor bytes, and return the row to use.
     ///
-    /// Prefer the real cursor position (robust to wrapping, ANSI escapes, and
-    /// termimad-rendered responses); fall back to the tracked prediction if the
-    /// terminal does not answer the Device Status Report (e.g. a headless pty).
-    /// Neither path retires the frame by reflex: `reanchor` invalidates only on
-    /// disagreement (a foreign cursor, a reflow); a silent terminal is no new
-    /// information, and this query runs for exceptional events only, so between
-    /// calls nothing external has run (ui_draw_261001).
+    /// `row` is the DSR answer the caller already obtained (via
+    /// `termio::query_cursor_row`, which pauses the sole stdin owner around the
+    /// query — step 2 commit C). Passing `None` (a terminal that did not answer)
+    /// is "no new information": `reanchor` invalidates only on disagreement (a
+    /// foreign cursor, a reflow), never on a silent terminal (ui_draw_261001).
     ///
     /// The re-anchor erases the live frame's rows, which is why it returns
     /// bytes: a resize or a foreign writer can leave the cursor outside the
@@ -949,15 +892,18 @@ impl Draw {
     /// is live — every streamed block, and every commit — because the bytes
     /// are then just the cursor park. So it lives here, with the writer: every
     /// caller treats it as a side-effecting re-anchor, and none of them writes.
-    pub(crate) fn reanchor_to_cursor(&self) -> usize {
-        let row = query_real_cursor_row();
+    pub(crate) fn reanchor_to_cursor(&self, row: Option<usize>) -> usize {
         // Writer before cache, as in `draw_frame`: one atomic step for the
         // emission and the cache advance, and never the cache held while
         // acquiring the writer.
         let mut out = self.writer.lock().unwrap();
         let (row, bytes) = {
             let mut cache = self.cache.lock().unwrap();
-            cache.reanchor(row, term_width(), term_height())
+            // Same floors the `output::term_width` free function applies: the
+            // 20-column floor is load-bearing for `plan_apply` when the
+            // geometry is still uninitialized.
+            let size = *self.size.borrow();
+            cache.reanchor(row, size.width.max(20), size.height.max(1))
         };
         let _ = out.write_all(bytes.as_bytes());
         let _ = out.flush();
@@ -971,9 +917,8 @@ impl Draw {
     /// start from what is actually on screen, not from a size nobody drew at.
     pub(crate) fn painted_size(&self) -> (usize, usize) {
         self.cache.lock().unwrap().applied.unwrap_or_else(|| {
-            crossterm::terminal::size()
-                .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
-                .unwrap_or((80, 24))
+            let size = *self.size.borrow();
+            (size.width.max(1), size.height.max(1))
         })
     }
 

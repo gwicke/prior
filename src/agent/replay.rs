@@ -504,7 +504,6 @@ mod tests {
     use super::*;
 
     use crate::output::ConsoleOutput;
-    use serial_test::serial;
 
     // ── Phase 2: replay units ─────────────────────────────────────────
 
@@ -721,17 +720,23 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn replay_paints_what_the_live_path_paints() {
         let turn = two_segment_turn();
         let reasoning = crate::settings::default_show_reasoning_handle();
         *reasoning.lock().unwrap() = crate::settings::ShowReasoning::Content;
+        // Both sides on the same private size watch (step 2 commit A): the
+        // byte comparison must not depend on the runner's terminal, and the
+        // width is per-instance state now, so no serialization either.
+        let size = crate::termio::TermSize {
+            width: 80,
+            height: 24,
+        };
 
         // The live path, exactly as the streaming loop drives it. Reasoning is
         // asked onto the captured stream so the comparison sees it (a test's
         // stdout is not a terminal, and without this it would be routed to
         // stderr by both sides and the test would prove nothing).
-        let mut live = ConsoleOutput::new(reasoning.clone());
+        let mut live = ConsoleOutput::with_size(reasoning.clone(), size);
         live.reasoning_on_stderr = false;
         live.begin_capture();
         live.begin_response();
@@ -754,7 +759,7 @@ mod tests {
         // The same turn through replay. `render_turn` draws the user prompt
         // (bracketed) and then the response, so the live output should be the
         // *tail* of what replay paints — byte for byte, reasoning included.
-        let mut replay = ConsoleOutput::new(reasoning);
+        let mut replay = ConsoleOutput::with_size(reasoning, size);
         replay.reasoning_on_stderr = false;
         replay.begin_capture();
         render_turn(&replay, &turn);

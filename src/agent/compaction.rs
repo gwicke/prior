@@ -757,11 +757,12 @@ pub(crate) async fn apply_branch_summary(
 /// `run_interactive`).
 ///
 /// `keys` is the window pump's source (see [`WindowKeySource`]): while the
-/// caller awaits this future, the REPL loop is suspended inside `settle` —
-/// no `read_input`, no in-flight reader — so *nothing* reads stdin unless
-/// this future polls it. The pump runs beside both phases: a root `Esc`
-/// cancels the in-flight attempt (the select arm fires the signal; the rig
-/// hook and this loop's `cancel_observed` both watch it) *and* any back-off
+/// caller awaits this future, the REPL loop is suspended inside `settle` and
+/// this future owns stdin — the persistent reader (step 2 commit B) is paused
+/// for the window (`ReaderPauseGuard`), so *only* this future's pump reads it.
+/// The pump runs beside both phases: a root `Esc` cancels the in-flight
+/// attempt (the select arm fires the signal; the rig hook and this loop's
+/// `cancel_observed` both watch it) *and* any back-off
 /// (`cancellable_sleep_windowed`); other keys are parked for `read_input`'s
 /// next iteration. `None` (tests) and inactive windows (piped/batch) leave
 /// the arms pending — the signal-only behaviour, stdin untouched.
@@ -793,6 +794,12 @@ where
     // the same fresh-request rule; nothing else clears the flag on this
     // path (compaction runs between turns).
     user_cancel.store(false, Ordering::SeqCst);
+    // The compaction window reads stdin directly (via `WindowKeySource`), so
+    // the persistent reader (step 2 commit B) must stand down for the whole
+    // window or the two would race for the same bytes — the reader would
+    // forward a key to the prompt queue the window cannot see. `keys: None`
+    // (tests, piped/batch) means nothing reads stdin, so no pause is needed.
+    let _reader_pause = keys.map(|_| crate::termio::ReaderPauseGuard::raise());
     let mut consecutive_failures: u8 = 0;
     loop {
         // One attempt with the pump live beside it. The attempt future is

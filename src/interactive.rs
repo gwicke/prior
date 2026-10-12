@@ -163,6 +163,12 @@ struct Interactive {
     last_attempted_target: Option<RebuildFingerprint>,
     guard: Option<Arc<TermGuard>>,
     prompt_session: Option<PromptSession>,
+    /// The persistent reader's event queue (step 2 commit B): the receiver
+    /// half of the one channel the sole stdin owner feeds. `read_input`
+    /// consumes it at the prompt; each turn borrows it as `InTurnInput::keys`.
+    /// Created once so a key typed at the end of a turn lands in the next
+    /// prompt instead of dying with a per-turn queue.
+    keys_rx: tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
 }
 
 /// Whether the input loop keeps going after an arm runs.
@@ -327,6 +333,29 @@ impl Interactive {
         if guard.is_some() {
             crate::repl::register_sigcont();
         }
+        // The persistent stdin reader (step 2 commit B): one thread, spawned
+        // once here (raw mode is already on), owning stdin for the process
+        // lifetime. It forwards keys/paste on this channel; the prompt loop
+        // and every turn consume the receiver half. The reader backs off
+        // whenever the main task owns stdin — `$EDITOR`, a DSR query, or the
+        // compaction window — via the output's confirm gate, the same flag
+        // `editor::ReaderHold` raises.
+        //
+        // The gate is raised *before* the spawn so the reader starts parked
+        // and cannot consume the entry DSR's reply: the draw cache is anchored
+        // (`run_entry_dsr`) while nothing reads stdin, then the gate is lowered
+        // and the reader takes over for the prompt. Without this ordering the
+        // reader's first poll would swallow the terminal's cursor-position
+        // report before `cursor_row` could read it.
+        let (keys_tx, keys_rx) = crate::repl::stdin_channel();
+        if let Some(g) = guard.clone() {
+            crate::termio::PAUSE_GATE.store(true, Ordering::SeqCst);
+            crate::repl::spawn_stdin_reader(g, keys_tx);
+            crate::repl::run_entry_dsr(config.output.as_ref());
+            crate::termio::PAUSE_GATE.store(false, Ordering::SeqCst);
+        }
+        // (When there is no REPL — piped/quiet — `keys_tx` drops, closing the
+        // channel; nothing calls `recv` on it in that mode, so it never reads.)
         // Warm the model catalog cache in the background so the `/model`
         // overlay is populated within a few seconds *without* blocking the
         // first prompt. The overlay falls back to the cached/static list
@@ -377,6 +406,7 @@ impl Interactive {
             last_attempted_target,
             guard,
             prompt_session,
+            keys_rx,
         }
     }
 
@@ -721,43 +751,21 @@ impl Interactive {
         // Clone-out for this turn (lock rule 3: no guard across await).
         let agent = self.app_state.agent();
         let session = self.app_state.session();
-        // Single attempt + auto-retry, with the in-flight reader
-        // (if any) spanning the whole window. `Esc` is dispatched by
-        // the turn's one key dispatcher wherever the turn is: inside
-        // `prompt()` while an attempt streams, by the back-off pump
-        // while a retry delay runs (`cancellable_sleep_pumped`) —
-        // either way it fires the cancel signal, and the wait (or the
-        // stream) ends immediately, returning `Cancelled`.
-        // U4.2/U4.3: edit keys typed while the turn runs. The reader
-        // owns the sender; the receiver is bound for the whole turn so
-        // the queue lives exactly as long as the reader can feed it,
-        // and it is handed into `prompt()` as `InTurnInput::keys` for
-        // the key branch to drain.
+        // Single attempt + auto-retry, with the persistent reader spanning the
+        // whole window. `Esc` is dispatched by the turn's one key dispatcher
+        // wherever the turn is: inside `prompt()` while an attempt streams, by
+        // the back-off pump while a retry delay runs (`cancellable_sleep_pumped`)
+        // — either way it fires the cancel signal, and the wait (or the stream)
+        // ends immediately, returning `Cancelled`.
         //
-        // Holding it is what keeps `send` working — a dropped receiver
-        // makes every send a no-op, which would silently turn the
-        // forwarding back into the drop U4.2 existed to remove. It
-        // dies with this scope, so the queue dies with it and a
-        // keystroke queued at the end of one turn cannot leak into the
-        // next prompt.
-        let (in_turn_keys_tx, mut in_turn_keys) = tokio::sync::mpsc::unbounded_channel();
-        let reader_handle = if let Some(g) = &self.guard {
-            let done = Arc::new(AtomicBool::new(false));
-            let confirm_gate = self
-                .config
-                .output
-                .confirm_gate()
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-            let h = crate::repl::spawn_in_flight_reader(
-                g.clone(),
-                done.clone(),
-                confirm_gate,
-                in_turn_keys_tx,
-            );
-            Some((h, done))
-        } else {
-            None
-        };
+        // U4.2/U4.3: edit keys typed while the turn runs come from the **one
+        // process-lifetime channel** the persistent reader feeds (`self.keys_rx`,
+        // step 2 commit B) — no per-turn reader, no per-turn queue. The
+        // receiver is borrowed for the whole turn and handed into `prompt()` as
+        // `InTurnInput::keys`; because the channel is never dropped between
+        // turns, a key typed at the very end of a turn lands in the next
+        // prompt rather than being discarded (a deliberate change from the
+        // per-turn queue, which died with the turn).
         let response: std::result::Result<String, crate::PicocodeError> = {
             let mut consecutive_failures: u8 = 0;
             let mut next_input: String = input.clone();
@@ -796,17 +804,18 @@ impl Interactive {
                         session.as_deref(),
                         &turn,
                         &turn_params,
-                        // `zip`: the key branch exists only where there
-                        // is both a session to receive the key and a
-                        // guard to stop the reader for it. Piped input
-                        // has neither, and piped input with a guard
-                        // has no reader, so there is no key either.
+                        // `zip`: the key branch exists only where there is both
+                        // a session to receive the key and a guard (interactive
+                        // mode). Piped input has neither, so it gets no key
+                        // branch — the persistent reader's queue is simply not
+                        // read there. `keys` is the one process-lifetime
+                        // channel the reader feeds.
                         self.prompt_session
                             .as_mut()
                             .zip(self.guard.as_deref())
                             .map(|(sess, g)| crate::repl::InTurnInput {
                                 session: sess,
-                                keys: &mut in_turn_keys,
+                                keys: &mut self.keys_rx,
                                 confirms: &mut self.confirm_bridge.requests,
                                 label: &self.prompt_str,
                                 history: &mut self.line_history,
@@ -852,7 +861,7 @@ impl Interactive {
                             ms,
                             turn_backoff_pump(
                                 &mut self.prompt_session,
-                                &mut in_turn_keys,
+                                &mut self.keys_rx,
                                 &mut self.line_history,
                                 &self.prompt_str,
                                 &self.guard,
@@ -929,7 +938,7 @@ impl Interactive {
                             ms,
                             turn_backoff_pump(
                                 &mut self.prompt_session,
-                                &mut in_turn_keys,
+                                &mut self.keys_rx,
                                 &mut self.line_history,
                                 &self.prompt_str,
                                 &self.guard,
@@ -971,10 +980,9 @@ impl Interactive {
             };
             outcome
         };
-        if let Some((h, done)) = reader_handle {
-            done.store(true, Ordering::SeqCst);
-            let _ = h.join();
-        }
+        // No reader teardown here: the stdin reader is process-lifetime now
+        // (step 2 commit B) — it keeps feeding the one channel across turns
+        // and into the next prompt.
         match response {
             Ok(_) => {}
             Err(crate::PicocodeError::Cancelled(msg)) => {
@@ -1075,6 +1083,7 @@ impl Interactive {
                         &ctx,
                         &self.app_state,
                         self.config.output.as_ref(),
+                        &mut self.keys_rx,
                     )
                     .await
                 }

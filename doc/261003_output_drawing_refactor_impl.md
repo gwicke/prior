@@ -218,6 +218,26 @@ until the last step.
    sites with the watch; collapse the 7 `is_terminal()` sites into per-stream caps. Un-`#[serial]`
    the width tests. Repoint `editor.rs` (`run_editor`'s `confirm_gate` + `cursor_row`) at the
    suspend/DSR pass-throughs; delete `GatedOutput`/`NoGateOutput`.
+
+   > **Status (2026-10-04).** The *moves* are landed as module-level primitives in `termio.rs`: the
+   > size watch + per-stream caps, the sole persistent stdin reader, the DSR query, and the
+   > process-wide pause handshake (the gate is process-wide — one reader, so it is a mutual-exclusion
+   > flag, not per-instance config like the size watch). That handshake is what let `confirm_gate`,
+   > `reader_paused`, `editor::ReaderHold`, `GatedOutput`, and `NoGateOutput` be deleted and
+   > `run_editor` be repointed.
+   >
+   > What is **not** done is step 2's headline: the `TermIO` **type** itself — the closed `Tty`/`Plain`
+   > enum that owns the reader thread and folds `TermGuard` (raw mode) into it, plus `TermHandles`
+   > and the `recording()`/`null()` constructors. That unification is **deferred to step 4**, where
+   > `TermIO` moves into `Draw`/`RenderManager` and the ownership actually restructures; the
+   > pause/DSR/deletions above do not need the type now, and folding `TermGuard` across its call
+   > sites is safest done alongside that restructure.
+   >
+   > Minor remainder, also riding with step 4: the three `Output` trait-default size queries
+   > (`cursor_row`, `frame_size`, `painted_size`) still fall back to a live `crossterm::terminal::size()`.
+   > They serve non-console outputs only — `ConsoleOutput` overrides all three to read the watch — and
+   > the loop-top resize probe (`repl.rs`, one per keystroke) is a deliberate live query that publishes
+   > to the watch, not a leftover.
 3. **Split `content/`.** Move classification, the separator matrix, the write pipeline, and the
    content rendering there; add the `Content` handle and switch `AgentConfig.output` →
    `AgentConfig.content`, along with `AppState.output` and the settings test helpers.

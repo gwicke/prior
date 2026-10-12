@@ -1,9 +1,10 @@
 //! The single external-editor entry point (doc/editor_cleanup.md §2).
 //!
 //! Every `$EDITOR` interaction goes through [`run_editor`], which owns the
-//! whole terminal turnover: the in-flight reader's stdin gate, raw mode off
-//! for the child's lifetime, raw mode back on, and the DSR re-anchor after a
-//! foreign screen writer. No call site keeps local guard/DSR logic.
+//! whole terminal turnover: pausing the sole stdin owner (the persistent
+//! reader), raw mode off for the child's lifetime, raw mode back on, and the
+//! DSR re-anchor after a foreign screen writer. No call site keeps local
+//! guard/DSR logic.
 //!
 //! [`edit_in_editor`] is this module's private mechanism (tempfile + spawn +
 //! read-back); everything outside this module must use [`run_editor`].
@@ -12,8 +13,6 @@ use crate::output::Output;
 use crate::repl::TermGuard;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 /// What the caller intends to do with the editor session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,40 +28,18 @@ pub enum EditorMode {
     View,
 }
 
-/// Raise the in-flight reader's stdin gate for the duration of an operation
-/// that owns stdin, restoring the *previous* value on drop (nesting-safe: an
-/// outer pause survives an inner one).
-struct ReaderHold(Option<Arc<AtomicBool>>, bool);
-
-impl ReaderHold {
-    fn raise(out: &dyn Output) -> Self {
-        let gate = out.confirm_gate();
-        let prev = gate
-            .as_ref()
-            .map(|g| g.swap(true, Ordering::SeqCst))
-            .unwrap_or(false);
-        Self(gate, prev)
-    }
-}
-
-impl Drop for ReaderHold {
-    fn drop(&mut self) {
-        if let Some(g) = &self.0 {
-            g.store(self.1, Ordering::SeqCst);
-        }
-    }
-}
-
 /// Hand the terminal to an external editor and take it back — the only place
 /// that sequence exists (doc/editor_cleanup.md §2):
 ///
-/// 1. Raise the reader gate for the whole window — including the DSR below:
-///    its reply arrives on stdin, so an unguarded reader would swallow it.
+/// 1. Pause the sole stdin owner (the persistent reader) for the whole window —
+///    the editor child's keystrokes *and* the DSR reply below arrive on stdin,
+///    so an unpaused reader would swallow them. Nesting-safe.
 /// 2. Drop raw mode, run `$EDITOR` on a tempfile (foreground child with
 ///    inherited stdio), re-enter raw mode.
 /// 3. Re-anchor the draw cache (DSR): the editor was a foreign screen writer,
 ///    so the frame region can no longer be trusted (plan §4.2). Unconditional
-///    — even a failed launch may have touched the screen.
+///    — even a failed launch may have touched the screen. The pause is still
+///    held across this query (the outer guard), so its reply is safe too.
 ///
 /// Blocking by design: while the editor owns the tty nothing else may write
 /// to it, so there is nothing for a concurrent task to do (§7 of the plan).
@@ -72,12 +49,11 @@ pub(crate) fn run_editor(
     current: &str,
     mode: EditorMode,
 ) -> io::Result<String> {
-    let hold = ReaderHold::raise(out);
+    let _pause = crate::termio::ReaderPauseGuard::raise();
     let _ = guard.stop();
     let edited = edit_in_editor(current, mode);
     let _ = guard.start();
     let _ = out.cursor_row();
-    drop(hold); // gate down only after the DSR has consumed its reply
     edited
 }
 
@@ -389,159 +365,5 @@ mod tests {
             "readonly",
             "View must create the tempfile read-only (0400)"
         );
-    }
-
-    /// Output with a live reader gate; `cursor_row()` records whether the
-    /// gate was still raised when the DSR ran.
-    struct GatedOutput {
-        gate: Arc<AtomicBool>,
-        dsr_saw_gate: AtomicBool,
-    }
-
-    impl Output for GatedOutput {
-        fn confirm_gate(&self) -> Option<Arc<AtomicBool>> {
-            Some(self.gate.clone())
-        }
-        fn cursor_row(&self) -> usize {
-            self.dsr_saw_gate
-                .store(self.gate.load(Ordering::SeqCst), Ordering::SeqCst);
-            1
-        }
-        fn display_text(&self, _text: &str) {}
-        fn display_tool_call(&self, _name: &str, _args: &serde_json::Value) {}
-        fn display_tool_result(&self, _result: &str) {}
-        fn get_user_input(&self) -> String {
-            String::new()
-        }
-        fn display_error(&self, _error: &str) {}
-        fn display_system(&self, _text: &str) {}
-        fn confirm(&self, _message: &str) -> crate::output::Confirmation {
-            crate::output::Confirmation::No
-        }
-        fn display_separator(&self) {}
-        fn display_header(
-            &self,
-            _provider: &str,
-            _model: &str,
-            _yolo: bool,
-            _limit: usize,
-            _persona: Option<&str>,
-        ) {
-        }
-    }
-
-    /// Run `run_editor` with a no-op mock editor against a gated output.
-    /// Returns `(gate seen raised during DSR, gate value after the call)`.
-    fn gated_run(pre_raised: bool) -> (bool, bool) {
-        let gate = Arc::new(AtomicBool::new(pre_raised));
-        let out = GatedOutput {
-            gate: gate.clone(),
-            dsr_saw_gate: AtomicBool::new(false),
-        };
-        let guard = TermGuard::new();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script = write_script(dir.path(), "noop_editor.sh", "exit 0\n");
-
-        with_env(
-            &[
-                ("VISUAL", Some(script.to_string_lossy().as_ref())),
-                ("EDITOR", None),
-            ],
-            || {
-                let r = run_editor(&guard, &out, "text", EditorMode::View);
-                assert!(r.is_ok(), "run_editor failed: {:?}", r.err());
-            },
-        );
-        let _ = guard.stop(); // undo a possible raw-mode entry on a real tty
-        (
-            out.dsr_saw_gate.load(Ordering::SeqCst),
-            gate.load(Ordering::SeqCst),
-        )
-    }
-
-    /// Same root cause as `run_editor_edit_roundtrip`: `run_editor`'s DSR
-    /// round-trip has no terminal to answer it under `cargo test`.
-    #[test]
-    #[ignore = "blocks waiting for a DSR reply that never arrives without a tty"]
-    fn run_editor_holds_the_gate_across_the_dsr() {
-        let (saw_dsr, after) = gated_run(false);
-        assert!(
-            saw_dsr,
-            "the DSR reply arrives on stdin — the reader gate must still be up"
-        );
-        assert!(!after, "gate restored to its pre-call value");
-    }
-
-    /// Same root cause as `run_editor_edit_roundtrip`: `run_editor`'s DSR
-    /// round-trip has no terminal to answer it under `cargo test`.
-    #[test]
-    #[ignore = "blocks waiting for a DSR reply that never arrives without a tty"]
-    fn run_editor_restores_an_outer_pause() {
-        let (saw_dsr, after) = gated_run(true);
-        assert!(saw_dsr);
-        assert!(after, "an outer pause must survive the editor's hold");
-    }
-
-    /// Disabled: it blocks forever instead of failing.
-    ///
-    /// `run_editor` finishes by querying the cursor position (DSR, `ESC[6n`) and
-    /// reading the reply from stdin. Under `cargo test` stdin is not a terminal, so
-    /// nothing ever replies and the test hangs until the harness is killed — which
-    /// silently truncated the tail of the suite, hiding whatever came after.
-    ///
-    /// Run it interactively (on a real tty) with
-    /// `cargo test --lib -- --ignored run_editor`. The proper fix is a pty:
-    /// `portable-pty` and `vt100` are already dev-deps, so the roundtrip can be
-    /// driven against a terminal that answers the DSR.
-    #[test]
-    #[ignore = "blocks waiting for a DSR reply that never arrives without a tty"]
-    fn run_editor_edit_roundtrip() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script = write_script(
-            dir.path(),
-            "mock_editor.sh",
-            "printf '%s' 'edited content' > \"$1\"\n",
-        );
-        let out = NoGateOutput;
-        let guard = TermGuard::new();
-
-        with_env(
-            &[
-                ("VISUAL", Some(script.to_string_lossy().as_ref())),
-                ("EDITOR", None),
-            ],
-            || {
-                let r = run_editor(&guard, &out, "hello world", EditorMode::Edit);
-                let _ = guard.stop(); // undo a possible raw-mode entry on a real tty
-                assert_eq!(r.expect("run_editor"), "edited content");
-            },
-        );
-    }
-
-    /// Minimal output without a reader gate (quiet/pipe-style).
-    struct NoGateOutput;
-
-    impl Output for NoGateOutput {
-        fn display_text(&self, _text: &str) {}
-        fn display_tool_call(&self, _name: &str, _args: &serde_json::Value) {}
-        fn display_tool_result(&self, _result: &str) {}
-        fn get_user_input(&self) -> String {
-            String::new()
-        }
-        fn display_error(&self, _error: &str) {}
-        fn display_system(&self, _text: &str) {}
-        fn confirm(&self, _message: &str) -> crate::output::Confirmation {
-            crate::output::Confirmation::No
-        }
-        fn display_separator(&self) {}
-        fn display_header(
-            &self,
-            _provider: &str,
-            _model: &str,
-            _yolo: bool,
-            _limit: usize,
-            _persona: Option<&str>,
-        ) {
-        }
     }
 }
