@@ -1,26 +1,21 @@
 use crate::ansi::{
     at_line_start, strip_ansi, EscState, HoldTrailing, LineClear, StripLeading, WrapLines,
-    HIDE_CURSOR, SHOW_CURSOR,
 };
-use crate::draw::{plan_apply, plan_consume, plan_reposition, ApplyPolicy, DrawCache};
+use crate::draw::{plan_consume, ApplyPolicy, Draw};
 use crate::render::{allocate, live_budget, render, Element, Extent, Frame, RenderAt, Rendered};
 use crate::repl::current_term_width;
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
 use crate::tools::EditOp;
 use console::{style, StyledObject};
-use libc;
 use markdown_stream::{Parser, StreamParser};
 use markdown_terminal::{Renderer, Theme};
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 use std::collections::VecDeque;
 use std::io::IsTerminal;
-use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
+use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 use termimad;
 use unicode_width::UnicodeWidthStr;
 
@@ -222,8 +217,7 @@ pub trait Output: Send + Sync {
     /// Default impl formats `{tool_name} failed [{kind}]: {message}` and
     /// forwards to `display_error`. `ConsoleOutput` overrides this with
     /// a styled error panel using the same `paint_panel` /
-    /// `tool_panel` helpers as the tool-call and tool-result panels
-    /// (`src/output.rs:1388` / `~1423`).
+    /// `tool_panel` helpers as the tool-call and tool-result panels.
     fn display_tool_error(&self, tool_name: &str, kind: &str, message: &str) {
         self.display_error(&format!("{tool_name} failed [{kind}]: {message}"));
     }
@@ -687,10 +681,9 @@ impl Output for LogOutput {
 }
 
 pub struct ConsoleOutput {
-    /// Live-screen bookkeeping for the frame pipeline (plan §4): tracked cursor
-    /// row, the clear floor, and the last applied frame. Always updated together
-    /// with a write under the same lock order (writer, then `draw`).
-    draw: Mutex<DrawCache>,
+    /// The live screen: byte sink plus the bookkeeping of what is believed to
+    /// be on it. Writer before cache, always — see [`Draw`].
+    draw: Draw,
     /// Set `true` while `confirm` is reading a keystroke, so the background
     /// in-flight reader thread backs off and doesn't swallow the input.
     /// The in-flight reader's stdin gate, for `$EDITOR`'s takeover — see
@@ -706,10 +699,6 @@ pub struct ConsoleOutput {
     /// `live` in the first place (row_accounting_b3.md §4.1). `pub(crate)` so
     /// the tests that pin the routing can ask for the other stream.
     pub(crate) reasoning_on_stderr: bool,
-    /// The destination for rendered output.  Defaults to `std::io::stdout()`;
-    /// a `Vec<u8>` writer is used by the `/replay Nl` capture path so the
-    /// fully-rendered ANSI output can be tailed and re-printed.
-    writer: Mutex<Box<dyn io::Write + Send>>,
     /// Incremental GFM markdown parser for the current response (TTY only).
     /// Fed the streamed deltas; emits events for *completed* blocks so the
     /// renderer can print them once, avoiding whole-document re-renders.
@@ -763,9 +752,6 @@ pub struct ConsoleOutput {
     /// the response's last separator without needing to know, at the time it is
     /// written, whether anything comes after it.
     held_blank: std::sync::atomic::AtomicUsize,
-    /// Stores the previous writer during a capture session (see
-    /// [`ConsoleOutput::begin_capture`] / [`ConsoleOutput::end_capture`]).
-    saved_writer: Mutex<Option<Box<dyn io::Write + Send>>>,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -1594,10 +1580,9 @@ fn refined_diff_lines(old: &str, new: &str) -> Vec<String> {
 impl ConsoleOutput {
     pub fn new(show_reasoning: ShowReasoningHandle) -> Self {
         Self {
-            draw: Mutex::new(DrawCache::new(term_height())),
+            draw: Draw::new(term_height()),
             reader_paused: Arc::new(AtomicBool::new(false)),
             reasoning_on_stderr: !std::io::stdout().is_terminal(),
-            writer: Mutex::new(Box::new(io::stdout())),
             parser: Mutex::new(StreamParser::new_gfm_stream()),
             renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
             thinking_parser: Mutex::new(StreamParser::new_gfm_stream()),
@@ -1608,31 +1593,7 @@ impl ConsoleOutput {
             status_text: Arc::new(Mutex::new(StatusText::default())),
             streaming: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             held_blank: std::sync::atomic::AtomicUsize::new(0),
-            saved_writer: Mutex::new(None),
         }
-    }
-
-    /// Swap the output writer for a `Cursor<Vec<u8>>` capture buffer.
-    /// Call [`end_capture`] to restore the original writer and retrieve
-    /// the captured bytes.
-    fn begin_capture_inner(&self) {
-        let mut writer = self.writer.lock().unwrap();
-        let old = std::mem::replace(&mut *writer, Box::new(std::io::Cursor::new(Vec::new())));
-        *self.saved_writer.lock().unwrap() = Some(old);
-    }
-
-    /// End a capture session: restore the original writer and return the
-    /// captured bytes.
-    fn end_capture_inner(&self) -> Vec<u8> {
-        let mut writer = self.writer.lock().unwrap();
-        let saved = self.saved_writer.lock().unwrap().take();
-        let old = saved.expect("end_capture without begin_capture");
-        let current = std::mem::replace(&mut *writer, old);
-        // Safety: we know current is a Box<Cursor<Vec<u8>>> because
-        // begin_capture_inner always creates one.
-        let raw = Box::into_raw(current);
-        let cursor = unsafe { Box::from_raw(raw as *mut std::io::Cursor<Vec<u8>>) };
-        cursor.into_inner()
     }
 }
 
@@ -1642,79 +1603,7 @@ impl Default for ConsoleOutput {
     }
 }
 
-/// Non-blocking Device Status Report: ask the terminal for the real
-/// cursor row, timing out fast so we never hang on a terminal that
-/// does not answer (e.g. a headless test pty). Returns a 1-indexed
-/// row. Reads the reply raw (bypassing crossterm's event parser).
-fn query_real_cursor_row() -> Option<usize> {
-    let stdin = io::stdin();
-    let fd = stdin.as_raw_fd();
-    // Make stdin non-blocking so a missing DSR reply cannot hang us.
-    let old = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if old < 0 {
-        return None;
-    }
-    unsafe { libc::fcntl(fd, libc::F_SETFL, old | libc::O_NONBLOCK) };
-    let restore = |f: i32, o: i32| unsafe {
-        libc::fcntl(f, libc::F_SETFL, o);
-    };
-
-    let mut out = io::stdout();
-    if out.write_all(b"\x1b[6n").is_err() || out.flush().is_err() {
-        restore(fd, old);
-        return None;
-    }
-
-    let mut guard = stdin.lock();
-    let start = Instant::now();
-    let mut buf = Vec::new();
-    let mut got = false;
-    while start.elapsed() < Duration::from_millis(60) {
-        let mut b = [0u8; 1];
-        match guard.read(&mut b) {
-            Ok(0) => break,
-            Ok(_) => {
-                buf.push(b[0]);
-                if b[0] == b'R' {
-                    got = true;
-                    break;
-                }
-            }
-            Err(_) => thread::sleep(Duration::from_millis(5)),
-        }
-    }
-    restore(fd, old);
-    if got {
-        parse_dsr(&buf)
-    } else {
-        None
-    }
-}
-
-/// Parse a Device Status Report reply `ESC[<row>;<col>R` into the 1-indexed row.
-fn parse_dsr(buf: &[u8]) -> Option<usize> {
-    if buf.len() < 4 || buf[0] != 0x1b || buf[1] != b'[' || *buf.last()? != b'R' {
-        return None;
-    }
-    let inner = &buf[2..buf.len() - 1];
-    let mut it = inner.splitn(2, |&c| c == b';');
-    let row = it.next()?;
-    let row_s = std::str::from_utf8(row).ok()?;
-    row_s.parse::<usize>().ok()
-}
-
 impl ConsoleOutput {
-    /// Advance the tracked cursor by `n` physical lines. The real terminal
-    /// scrolls and keeps the cursor on the bottom row when content overflows,
-    /// so we *clamp* to the height rather than wrapping (a modulo wrap would
-    /// teleport the tracked row to the top of the screen after a long session).
-    fn note_lines(&self, n: usize) {
-        let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-        // Advance the tracked cursor and drop the frame region — the write that
-        // called us moved the cursor off the frame (plan §4.2).
-        self.draw.lock().unwrap().note_lines(n, h as usize);
-    }
-
     /// A `Write` for one block of reasoning. The bytes are routed when the
     /// block is committed: to the screen (and counted, like any other
     /// content) when there is a terminal, to stderr when there is not, so a
@@ -1775,10 +1664,10 @@ impl ConsoleOutput {
         });
     }
 
-    /// Run `f` with the writer lock wrapped in a [`RowCounter`], then advance
-    /// the draw cache by the rows `f` wrote. For the writers that produce
-    /// their own bytes — the streaming markdown renderers, which want a
-    /// `Write` to feed.
+    /// Run `f` with `Draw`'s writer lock wrapped in a [`RowCounter`], then
+    /// advance the draw cache by the rows `f` wrote. For the writers that
+    /// produce their own bytes — the streaming markdown renderers, which want
+    /// a `Write` to feed.
     ///
     /// `f` gets a `&mut dyn io::Write`, which keeps the counter's type (and
     /// its borrow of the lock) out of the signature. A caller handing it to
@@ -1823,7 +1712,7 @@ impl ConsoleOutput {
     where
         F: FnOnce(&mut dyn io::Write) -> T,
     {
-        let mut out = self.writer.lock().unwrap();
+        let mut out = self.draw.writer.lock().unwrap();
         // The *caller* declares the kind — the choke point never guesses from
         // bytes — and the previous one is read first, because the whole
         // boundary rule is a statement about the pair. Recording before `f`
@@ -1831,7 +1720,7 @@ impl ConsoleOutput {
         // block then reads back its own kind, so its internal separators are
         // (kind, kind) and contribute nothing.
         let (old, closed) = {
-            let mut cache = self.draw.lock().unwrap();
+            let mut cache = self.draw.cache.lock().unwrap();
             let old = cache.last_content_display_kind;
             let closed = cache.last_content_closes_segment;
             cache.last_content_display_kind = kind;
@@ -1879,7 +1768,7 @@ impl ConsoleOutput {
         //
         // Captures get the raw bytes — they are assertions against content,
         // not against a screen.
-        let capturing = self.saved_writer.lock().unwrap().is_some();
+        let capturing = self.draw.saved_writer.lock().unwrap().is_some();
         let mut buf: Vec<u8> = Vec::new();
         let mut clear = LineClear {
             inner: &mut buf,
@@ -1996,7 +1885,7 @@ impl ConsoleOutput {
             //     This prevents an empty turn end (old=None, kind=ResponseText) from
             //     spuriously setting closed=true, which would inject blank lines
             //     before subsequent retry messages.
-            let mut cache = self.draw.lock().unwrap();
+            let mut cache = self.draw.cache.lock().unwrap();
             cache.last_content_display_kind = old;
             let genuinely_closes = closes_segment && old == kind && !closed;
             cache.last_content_closes_segment = closed || genuinely_closes;
@@ -2020,7 +1909,7 @@ impl ConsoleOutput {
         // walk: each line clears the row it enters, and rows the content never
         // reaches are the reposition's `old_h` tail to clear in its own pass.
         let (walk, taken) = {
-            let mut cache = self.draw.lock().unwrap();
+            let mut cache = self.draw.cache.lock().unwrap();
             match plan_consume(&mut cache) {
                 Some((walk, frame)) => (walk, Some(frame)),
                 // No live area: the cursor is wherever the last write left it,
@@ -2038,7 +1927,7 @@ impl ConsoleOutput {
         drop(out);
         // Zero rows means nothing moved, and a frame stays live.
         if rows > 0 {
-            self.note_lines(rows);
+            self.draw.note_lines(rows);
         }
         // The area comes back below what was just written — re-rendered rather
         // than replayed, so its status row is whatever it is *now*: the turn's
@@ -2050,7 +1939,7 @@ impl ConsoleOutput {
         // Inside a batch the reposition waits: the frame stays consumed for
         // the whole burst and the guard's drop emits it once (ui_draw_v2 R5).
         let taken = {
-            let mut cache = self.draw.lock().unwrap();
+            let mut cache = self.draw.cache.lock().unwrap();
             if taken.is_some() || cache.deferred.is_some() {
                 cache.consumed_rows += rows;
             }
@@ -2069,61 +1958,12 @@ impl ConsoleOutput {
             }
         };
         if let Some(taken) = taken {
-            let bytes = self.reposition_area(width, taken);
-            let mut out = self.writer.lock().unwrap();
+            let bytes = self.draw.reposition_area(width, taken);
+            let mut out = self.draw.writer.lock().unwrap();
             let _ = out.write_all(bytes.as_bytes());
             let _ = out.flush();
         }
         r
-    }
-
-    /// The area's re-emit: re-render the stored recipe (§5.1.1) and walk it to
-    /// where the content write left off.
-    ///
-    /// Re-render rather than replay `taken`: a `Frame` is a snapshot of the
-    /// status as of the last compose, and the bar moves without the REPL
-    /// composing — `set_status` at turn start, the dot at
-    /// `begin_response`/`end_response`. The recipe is the thing that stays
-    /// current, which is why `DrawCache` keeps it and not the rendered rows.
-    ///
-    /// `taken` is not a formality: it is the fallback when no recipe recorded
-    /// itself — a frame applied without a composition behind it (a test, or a
-    /// direct `draw_frame`). Falling back keeps the invariant that matters more
-    /// than freshness, I5: an area that was consumed is always put back, so a
-    /// half-consumed frame is never left stranded on screen.
-    fn reposition_area(&self, width: usize, taken: Frame) -> String {
-        let tw = width.max(1);
-        let th = term_height().max(1);
-        let mut cache = self.draw.lock().unwrap();
-        // The consumed frame's height is the `old_h` of the below-frame clear
-        // (`old_h - h_new - consumed_rows`) — read before `taken` moves into
-        // the fallback below.
-        let old_h = taken.height();
-        let frame = if cache.element_stack.is_empty() {
-            taken
-        } else {
-            let heights = {
-                let extents: Vec<Extent> =
-                    cache.element_stack.iter().map(Element::extent).collect();
-                allocate(&extents, live_budget(th))
-            };
-            render(&cache.element_stack, &heights, tw)
-        };
-        // **A frame with no rows has nothing to put back.** `ui::resolve` clears
-        // a dialog by applying `Frame::empty()`, and `plan_apply` records that
-        // as a live frame of height 0 — so a content write right after a
-        // resolve consumes a zero-height area. Repositioning it would ask
-        // `plan_reposition` to paint nothing, which is a no-op at best and a
-        // `debug_assert!(h > 0)` panic in a debug build at worst. Returning
-        // empty is the honest answer: there is no area to re-emit, and the
-        // tracked row already moved with the content that consumed it. The
-        // accumulator goes with it — a stale count would misplace the *next*
-        // reposition's below-frame clear.
-        if frame.height() == 0 {
-            cache.consumed_rows = 0;
-            return String::new();
-        }
-        plan_reposition(&mut cache, &frame, old_h, tw, th)
     }
 
     /// Commit all buffered *thinking* to the (dimmed) thinking renderer and
@@ -2887,37 +2727,7 @@ impl ConsoleOutput {
 
 impl Output for ConsoleOutput {
     fn cursor_row(&self) -> usize {
-        // Prefer the real terminal cursor position (robust to wrapping,
-        // ANSI escapes, and termimad-rendered responses). Fall back
-        // to the tracked/ANSI-stripped prediction if the terminal
-        // does not answer the Device Status Report (e.g. a headless pty).
-        // Neither path retires the frame by reflex: `reanchor` invalidates
-        // only on disagreement (a foreign cursor, a reflow); a silent
-        // terminal is no new information, and this query runs for exceptional
-        // events only, so between calls nothing external has run
-        // (ui_draw_261001).
-        let row = query_real_cursor_row();
-        // The re-anchor erases the live frame's rows, which is why it returns
-        // bytes: a resize or a foreign writer can leave the cursor outside the
-        // block, and the relative walks the frame path uses cannot reach rows
-        // above the cursor from there. This is the one absolute address in a
-        // frame apply (row_accounting §6b), and it costs nothing when no frame
-        // is live — every streamed block, and every commit — because the bytes
-        // are then just the cursor park. So it belongs here rather than at the
-        // call sites: all of them already treat this as a side-effecting
-        // re-anchor, and none of them writes.
-        //
-        // Writer before cache, as in `draw_frame`: one atomic step for the
-        // emission and the cache advance, and never `draw` held while
-        // acquiring `writer`.
-        let mut out = self.writer.lock().unwrap();
-        let (row, bytes) = {
-            let mut cache = self.draw.lock().unwrap();
-            cache.reanchor(row, term_width(), term_height())
-        };
-        let _ = out.write_all(bytes.as_bytes());
-        let _ = out.flush();
-        row
+        self.draw.reanchor_to_cursor()
     }
 
     fn frame_size(&self) -> (usize, usize) {
@@ -2925,62 +2735,21 @@ impl Output for ConsoleOutput {
     }
 
     fn painted_size(&self) -> (usize, usize) {
-        // The size of the last frame actually applied, so a painter comparing
-        // the terminal against it notices a change made since — including one
-        // that happened while someone else (a turn) held the screen.
-        self.draw.lock().unwrap().applied.unwrap_or_else(|| {
-            crossterm::terminal::size()
-                .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
-                .unwrap_or((80, 24))
-        })
+        self.draw.painted_size()
     }
 
     fn begin_batch(&self) -> BatchGuard<'_> {
-        let mut cache = self.draw.lock().unwrap();
-        // Flat, not recursive: a nested open adds no state, because the outer
-        // batch already covers everything written inside it. So it collapses
-        // to a guard that owns nothing — only the guard that raised the flag
-        // ever clears it, which is what keeps a stray inner scope from ending
-        // the outer batch's repositioning early.
-        //
-        // The assert exists because that collapse is *silent*: `out: None`
-        // ends nothing, and someone who wrote an inner batch almost certainly
-        // meant an independent one. Loud where it is free (debug builds), and
-        // harmless where it is not (release keeps batching correctly) —
-        // rather than a missing redraw to chase at runtime.
-        debug_assert!(
-            !cache.batch_active,
-            "batches do not nest: this begin_batch is a no-op, because the \
-             open batch above already covers everything written inside it"
-        );
-        if cache.batch_active {
-            return BatchGuard { out: None };
+        // The mechanics (flag, debug assert) live on `Draw`; only the guard,
+        // which has to name an `Output` for its drop, is this layer's.
+        if self.draw.begin_batch() {
+            BatchGuard { out: Some(self) }
+        } else {
+            BatchGuard { out: None }
         }
-        cache.batch_active = true;
-        BatchGuard { out: Some(self) }
     }
 
     fn end_batch(&self) {
-        // Locks taken separately and never nested the other way round: every
-        // other frame path holds `writer` *then* `draw`, so acquiring `draw`
-        // while holding `writer` here is the same order, and dropping it
-        // before `reposition_area` (which takes it again) keeps the two from
-        // ever being held inverted.
-        let taken = {
-            let mut cache = self.draw.lock().unwrap();
-            if !cache.batch_active {
-                return;
-            }
-            cache.batch_active = false;
-            cache.deferred.take()
-        };
-        let Some(taken) = taken else {
-            return;
-        };
-        let bytes = self.reposition_area(term_width(), taken);
-        let mut out = self.writer.lock().unwrap();
-        let _ = out.write_all(bytes.as_bytes());
-        let _ = out.flush();
+        self.draw.end_batch(term_width());
     }
 
     /// Bracketed, and — where the previous content was also a committed
@@ -3006,8 +2775,8 @@ impl Output for ConsoleOutput {
     /// against model output reads as a turn while two adjacent prompts read as
     /// two commits sharing one rule.
     fn display_committed_prompt(&self, line: &str) {
-        let shares_rule =
-            self.draw.lock().unwrap().last_content_display_kind == Some(ContentDisplayKind::Prompt);
+        let shares_rule = self.draw.cache.lock().unwrap().last_content_display_kind
+            == Some(ContentDisplayKind::Prompt);
         let rule = separator_line(term_width());
         let block = if shares_rule {
             format!("{line}\n{rule}")
@@ -3023,39 +2792,7 @@ impl Output for ConsoleOutput {
         policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
-        // Paint exactly the size the caller composed for (`dims`) — one
-        // source for both phases of the frame (ui_draw_v2 §9 #3). Clamped
-        // to what `plan_apply` stores as the live frame's `term_w`/`term_h`.
-        let (tw, th) = (dims.0.max(1), dims.1.max(1));
-        // Lock the writer before the cache so the byte emission and the cache
-        // advance are one atomic step, and so we never hold `draw` while
-        // acquiring `writer` (matching `display_*`: writer, then `note_lines`).
-        let mut out = self.writer.lock().unwrap();
-        let bytes = {
-            let mut cache = self.draw.lock().unwrap();
-            // The recipe belongs to whatever composed *this* frame. Reaching
-            // `draw_frame` directly (a test, `ui::resolve`'s empty frame) means
-            // nothing composed an area, so the previous one is not what is on
-            // screen any more — and a content write must not re-emit it.
-            // `draw_elements` re-stores immediately after, so its own
-            // composition survives the clear.
-            cache.element_stack.clear();
-            plan_apply(&mut cache, frame, policy, tw, th)
-        };
-        let _ = out.write_all(bytes.as_bytes());
-        // The cursor follows the frame's own caret. A composed frame with one is
-        // where the user types; a frame whose input is hidden mid-turn (R1) has
-        // none to place, so hiding is the honest reading of the same fact rather
-        // than a second piece of input state kept in step by hand. Either way
-        // this is the cheapest place to be sure — `TermGuard` and the shell can
-        // also leave it hidden.
-        let _ = out.write_all(if frame.caret.is_some() {
-            SHOW_CURSOR
-        } else {
-            HIDE_CURSOR
-        });
-        let _ = out.flush();
-        (tw, th)
+        self.draw.draw_frame(frame, policy, dims)
     }
 
     fn display_plain(&self, text: &str) {
@@ -3468,7 +3205,7 @@ impl Output for ConsoleOutput {
     }
 
     fn begin_capture(&self) {
-        self.begin_capture_inner();
+        self.draw.begin_capture();
     }
 
     /// The frame path's bar, from the same two facts the content path's is
@@ -3496,11 +3233,7 @@ impl Output for ConsoleOutput {
     /// output that has a screen has something to keep; everyone else drops it
     /// (the default), which is also why nothing here can be read by mistake.
     fn remember_compose(&self, stack: Vec<Element>, applied: (usize, usize)) {
-        // One lock for both: the recipe and the geometry it was rendered at
-        // describe one paint and must not be read apart.
-        let mut draw = self.draw.lock().unwrap();
-        draw.element_stack = stack;
-        draw.applied = Some(applied);
+        self.draw.remember_compose(stack, applied);
     }
 
     /// Remember the status line to paint after each content block; see
@@ -3515,7 +3248,7 @@ impl Output for ConsoleOutput {
     }
 
     fn end_capture(&self) -> Vec<u8> {
-        self.end_capture_inner()
+        self.draw.end_capture()
     }
 }
 
@@ -3841,7 +3574,7 @@ mod tests {
 
     /// Tracked cursor row of `out` (0-based, as the screen reports it).
     fn tracked_row(out: &ConsoleOutput) -> usize {
-        out.draw.lock().unwrap().tracked_row() - 1
+        out.draw.cache.lock().unwrap().tracked_row() - 1
     }
 
     /// Row the cursor ends on when `bytes` are replayed into a `width`x24
@@ -5191,7 +4924,7 @@ mod tests {
     fn content_choke_wraps_an_overwide_line_before_the_line_clear() {
         let (mut out, _reasoning) = capturing_output(60);
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
-        out.writer = Mutex::new(Box::new(sink.clone()));
+        out.draw.writer = Mutex::new(Box::new(sink.clone()));
         let y = "y".repeat(120);
         out.with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
             w.write_all(y.as_bytes()).unwrap();
@@ -5214,7 +4947,7 @@ mod tests {
     fn wrapped_content_keeps_its_sgr_across_the_inserted_newline() {
         let (mut out, _reasoning) = capturing_output(60);
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
-        out.writer = Mutex::new(Box::new(sink.clone()));
+        out.draw.writer = Mutex::new(Box::new(sink.clone()));
         let y = "y".repeat(120);
         let input = format!("\x1b[32m{y}\x1b[0m\n");
         out.with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
@@ -5720,9 +5453,9 @@ Expected:\nsome/path:1234\n@@@OLD\nold text\n@@@NEW\nnew text\n@@@END\n\
 Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock().unwrap().anchor()\n";
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.display_tool_call("edit", &serde_json::json!({"path": "src/x.rs"}));
-        out.begin_capture_inner();
+        out.draw.begin_capture();
         out.display_tool_result(msg);
-        let bytes = out.end_capture_inner();
+        let bytes = out.draw.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         let columns: Vec<usize> = text
@@ -5771,9 +5504,9 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         ] {
             let err = crate::tools::EditArgs::from_wire(&raw).expect_err("must fail");
             let (out, _reasoning) = capturing_output(80);
-            out.begin_capture_inner();
+            out.draw.begin_capture();
             out.display_tool_result(&format!("failed to parse tool arguments: {err}"));
-            let bytes = out.end_capture_inner();
+            let bytes = out.draw.end_capture();
             let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
             assert!(!text.contains("@@ -"), "phantom diff for {raw}:\n{text}");
@@ -5805,13 +5538,13 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     #[serial_test::serial]
     fn a_single_edit_failure_renders_as_a_definition_list() {
         let (out, _reasoning) = capturing_output(80);
-        out.begin_capture_inner();
+        out.draw.begin_capture();
         out.display_tool_result(
             "missing required field 'path'\n\nExpected:\n\
              {\"path\": \"some/path.rs\", \"startLine\": 1234, \"oldText\": \"old text\", \
              \"newText\": \"new text\"}\n\nActual:\n{\"newText\":\"b\",\"oldText\":\"a\"}",
         );
-        let bytes = out.end_capture_inner();
+        let bytes = out.draw.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         assert!(!text.contains("|"), "a table was drawn:\n{text}");
@@ -5834,12 +5567,12 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     #[serial_test::serial]
     fn an_edit_call_still_renders_its_blocks_as_a_diff() {
         let (out, _reasoning) = capturing_output(80);
-        out.begin_capture_inner();
+        out.draw.begin_capture();
         out.display_tool_call(
             "edit",
             &serde_json::json!({"blocks": "src/x.rs:5\n@@@OLD\n    run();\n@@@NEW\n    walk();\n@@@END"}),
         );
-        let bytes = out.end_capture_inner();
+        let bytes = out.draw.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         assert!(text.contains("edit src/x.rs"), "no label:\n{text}");
@@ -5855,13 +5588,13 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     #[serial_test::serial]
     fn a_sed_preview_renders_without_a_call_context() {
         let (out, _reasoning) = capturing_output(80);
-        out.begin_capture_inner();
+        out.draw.begin_capture();
         out.display_tool_result(
             "sed preview: 1 block for src/x.rs (1 expression). Review the blocks below, \
              then pass them to the `edit` tool as its `blocks` argument.\n\
              src/x.rs:5\n@@@OLD\n    run();\n@@@NEW\n    walk();\n@@@END\n",
         );
-        let bytes = out.end_capture_inner();
+        let bytes = out.draw.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         assert!(
@@ -5877,7 +5610,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     fn tmp_repro_separator_blanks() {
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response();
-        out.begin_capture_inner();
+        out.draw.begin_capture();
 
         // Case A: turn ends with a tool result (no trailing answer text).
         out.stream_text("Let me sleep.\n");
@@ -5886,23 +5619,23 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         out.display_tool_result("\"2. sleep 30 — done\"");
         out.end_response();
         out.display_separator();
-        let a = out.end_capture_inner();
+        let a = out.draw.end_capture();
         let a = strip_ansi(&String::from_utf8_lossy(&a));
         eprintln!("=== Case A (tool-result end) ===\n{:?}", a);
 
         // Case B: turn ends with plain text answer.
         out.begin_response();
-        out.begin_capture_inner();
+        out.draw.begin_capture();
         out.stream_text("All done.\n");
         out.end_response();
         out.display_separator();
-        let b = out.end_capture_inner();
+        let b = out.draw.end_capture();
         let b = strip_ansi(&String::from_utf8_lossy(&b));
         eprintln!("=== Case B (text end) ===\n{:?}", b);
 
         // Case C: turn ends with trailing thinking after a tool result.
         out.begin_response();
-        out.begin_capture_inner();
+        out.draw.begin_capture();
         out.stream_text("Let me sleep.\n");
         out.end_response_segment();
         out.display_tool_call("bash", &serde_json::json!({"command": "sleep 30"}));
@@ -5910,7 +5643,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         out.stream_thinking("wrapping up\n");
         out.end_response();
         out.display_separator();
-        let c = out.end_capture_inner();
+        let c = out.draw.end_capture();
         let c = strip_ansi(&String::from_utf8_lossy(&c));
         eprintln!("=== Case C (tool + trailing thinking) ===\n{:?}", c);
     }
@@ -5945,19 +5678,19 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
 
         // A: two single-file pairs, as a sequence of real calls would render.
         let (a, _) = capturing_output(40);
-        a.begin_capture_inner();
+        a.draw.begin_capture();
         for (i, single) in singles.iter().enumerate() {
             a.display_tool_call("edit", single);
             a.display_tool_result(notes[i]);
         }
-        let a = strip_ansi(&String::from_utf8_lossy(&a.end_capture_inner()));
+        let a = strip_ansi(&String::from_utf8_lossy(&a.draw.end_capture()));
 
         // B: one multi-file pair.
         let (b, _) = capturing_output(40);
-        b.begin_capture_inner();
+        b.draw.begin_capture();
         b.display_tool_call("edit", &multi_args);
         b.display_tool_result(&array);
-        let b = strip_ansi(&String::from_utf8_lossy(&b.end_capture_inner()));
+        let b = strip_ansi(&String::from_utf8_lossy(&b.draw.end_capture()));
 
         assert_eq!(
             a, b,
@@ -5990,12 +5723,12 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         // batch per file — a failure's short ui_view and a success's note — with
         // no aggregate line and no model_view diff leaking into scrollback.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
-        out.begin_capture_inner();
+        out.draw.begin_capture();
         out.display_tool_result(
             r#"[{"path":"src/a.rs","result":"Replaced 1 block(s) in ./a.rs"},
                 {"path":"src/b.rs","result":{"ui_view":"edit failed: nope","model_view":"SECRET DIFF"}}]"#,
         );
-        let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture_inner()));
+        let d = strip_ansi(&String::from_utf8_lossy(&out.draw.end_capture()));
         assert!(d.contains("edit src/a.rs"), "{d}");
         assert!(d.contains("Replaced 1 block(s) in ./a.rs"), "{d}");
         assert!(d.contains("edit src/b.rs"), "{d}");
@@ -6010,9 +5743,9 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         // Another tool's list must keep its existing rendering; the multi-file
         // branch must not swallow it.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
-        out.begin_capture_inner();
+        out.draw.begin_capture();
         out.display_tool_result(r#"["alpha","beta"]"#);
-        let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture_inner()));
+        let d = strip_ansi(&String::from_utf8_lossy(&out.draw.end_capture()));
         assert!(d.contains("alpha") && d.contains("beta"), "{d}");
     }
 
@@ -6024,7 +5757,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         // is separated from the tool-result line by a blank line.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response();
-        out.begin_capture_inner();
+        out.draw.begin_capture();
         out.stream_text("Let me edit.\n");
         out.end_response_segment();
         out.display_tool_call(
@@ -6036,7 +5769,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         out.end_response_segment();
         out.stream_text("Done.\n");
         out.end_response();
-        let d = out.end_capture_inner();
+        let d = out.draw.end_capture();
         let d = strip_ansi(&String::from_utf8_lossy(&d));
         let after = d.find("Replaced 1 block(s) in ./no_such.rs").unwrap()
             + "Replaced 1 block(s) in ./no_such.rs".len();
@@ -6054,7 +5787,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         // content preview (first 10 lines), matching read_file's rendering.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response();
-        out.begin_capture_inner();
+        out.draw.begin_capture();
 
         // Simulate a write tool call with structured result (as write_file returns)
         out.display_tool_call(
@@ -6065,7 +5798,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         out.display_tool_result(result);
 
         out.end_response();
-        let captured = out.end_capture_inner();
+        let captured = out.draw.end_capture();
         let output = strip_ansi(&String::from_utf8_lossy(&captured));
 
         // Should contain the path header with line count
@@ -6104,9 +5837,9 @@ mod ui_render_scope_tests {
 
     fn render(result: &str) -> String {
         let out = ConsoleOutput::new(default_show_reasoning_handle());
-        out.begin_capture_inner();
+        out.draw.begin_capture();
         out.display_tool_result(result);
-        let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture_inner()));
+        let d = strip_ansi(&String::from_utf8_lossy(&out.draw.end_capture()));
         d
     }
 

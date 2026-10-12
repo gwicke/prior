@@ -55,7 +55,7 @@ and link a doc/ and/or commit hash
   - [x] Deferred: `CodeAgent::prompt` — deliberately, not cleanup (§4)
 - [ ] audit output, repl
 - [ ] output.rs drawing refactor — 261003_output_drawing_refactor.md (+ impl companion)
-  - [ ] Step 1: extract `render.rs` / `draw.rs` / `ansi.rs` mechanically; Output facade kept (§8.1)
+  - [x] Step 1: extract `render.rs` / `draw.rs` / `ansi.rs` mechanically; Output facade kept (§8.1)
   - [ ] Step 2: `TermIO` — reader, raw mode, DSR, size watch; un-`#[serial]` width tests (§8.2)
   - [ ] Step 3: split `content/`; `AgentConfig.output` → `.content`, `AppState.output` (§8.3)
   - [ ] Step 4: fold in `RenderManager` + UI; elements → `Arc<Mutex<…>>`, shared editor (§8.4)
