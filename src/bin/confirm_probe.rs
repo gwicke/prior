@@ -18,7 +18,7 @@
 
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, KeyModifiers};
 use picocode::confirm::{ConfirmBridge, ConfirmDecision};
-use picocode::ui::frame::ApplyPolicy;
+use picocode::draw::ApplyPolicy;
 use picocode::{ConsoleOutput, Output};
 
 #[tokio::main]

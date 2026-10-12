@@ -2,13 +2,11 @@ use crate::ansi::{
     at_line_start, strip_ansi, EscState, HoldTrailing, LineClear, StripLeading, WrapLines,
     HIDE_CURSOR, SHOW_CURSOR,
 };
+use crate::draw::{plan_apply, plan_consume, plan_reposition, ApplyPolicy, DrawCache};
+use crate::render::{allocate, live_budget, render, Element, Extent, Frame, RenderAt, Rendered};
 use crate::repl::current_term_width;
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
 use crate::tools::EditOp;
-use crate::ui::frame::{
-    allocate, live_budget, plan_apply, plan_consume, plan_reposition, render, ApplyPolicy,
-    DrawCache, Element, Extent, Frame, RenderAt, Rendered,
-};
 use console::{style, StyledObject};
 use libc;
 use markdown_stream::{Parser, StreamParser};

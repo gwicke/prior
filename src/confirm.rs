@@ -227,7 +227,7 @@ impl ConfirmPrompt {
     /// The option rows are pinned to the full option count, so a starved
     /// budget cannot squeeze the choices away — a consent prompt you cannot read
     /// is not a consent prompt.
-    pub fn elements(&self, term_w: usize) -> Vec<crate::ui::frame::Element> {
+    pub fn elements(&self, term_w: usize) -> Vec<crate::render::Element> {
         crate::ui::overlay_elements_with(&self.plan, term_w, Some(self.sel), OPTIONS.len())
     }
 
@@ -310,7 +310,7 @@ pub fn paint(out: &dyn crate::output::Output, confirm: &ConfirmPrompt, dims: (us
     out.draw_elements(
         None,
         confirm.elements(tw),
-        crate::ui::frame::ApplyPolicy::Frame,
+        crate::draw::ApplyPolicy::Frame,
         (tw, th),
     );
 }

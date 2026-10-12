@@ -1454,10 +1454,10 @@ mod tests {
 
         // And the `*` is actually painted on that row.
         let els = crate::ui::overlay_elements(&second, 80, second.selected);
-        let extents: Vec<crate::ui::frame::Extent> =
-            els.iter().map(crate::ui::frame::Element::extent).collect();
-        let heights = crate::ui::frame::allocate(&extents, crate::ui::frame::live_budget(24));
-        let f = crate::ui::frame::render(&els, &heights, 80);
+        let extents: Vec<crate::render::Extent> =
+            els.iter().map(crate::render::Element::extent).collect();
+        let heights = crate::render::allocate(&extents, crate::render::live_budget(24));
+        let f = crate::render::render(&els, &heights, 80);
         let starred: Vec<bool> = (0..f.height()).map(|i| f.row(i).contains('*')).collect();
         assert_eq!(
             starred.iter().filter(|s| **s).count(),

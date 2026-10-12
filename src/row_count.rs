@@ -1,7 +1,7 @@
 //! Terminal row accounting: how many screen rows a byte stream occupies.
 //!
 //! The draw cache tracks the cursor so the next frame can anchor to it
-//! (`ui::frame::DrawCache`), and every content writer has to tell it how far
+//! (`draw::DrawCache`), and every content writer has to tell it how far
 //! the cursor moved. Guessing that from the *source* text is where the drift
 //! came from: the bytes that reach the terminal are a prefix plus rendered
 //! markdown, ANSI styling, panels, and lines that wrap — none of which the

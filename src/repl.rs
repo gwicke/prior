@@ -9,20 +9,19 @@
 //! hard line break) plus a char-index cursor. Rendering wraps the buffer to
 //! visual rows via [`layout`] (word-boundary wrap, CJK char-wrap) and positions
 //! the cursor. All editor *logic* is pure and unit-tested; the on-screen frame
-//! is composed and applied by the shared draw pipeline (`crate::ui::frame`,
-//! plan `doc/ui_draw_v2.md`).
+//! is composed and applied by the shared draw pipeline (`crate::render`,
+//! `crate::draw`, plan `doc/ui_draw_v2.md`).
 
 use crate::agent::SessionUsage;
 use crate::app_state::AppState;
+use crate::draw::{el_if_short, ApplyPolicy};
 use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
 use crate::output::Output;
-use crate::session::SessionTreeNode;
-use crate::ui::frame::{
-    allocate, el_if_short, live_budget, window, ApplyPolicy, Element, Extent, RenderAt, Rendered,
-};
+use crate::render::{allocate, live_budget, window, Element, Extent, RenderAt, Rendered};
 #[cfg(test)]
-use crate::ui::frame::{render, Frame};
+use crate::render::{render, Frame};
+use crate::session::SessionTreeNode;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -594,7 +593,7 @@ enum V25Frame {
 //
 // The editor's own element, carrying the editor's own squeeze policy: how
 // many rows of context to keep above a caret is an opinion about *editing*
-// (ui_draw_v2 §3.2.2). It used to sit in `frame.rs` as `render`'s `Input`
+// (ui_draw_v2 §3.2.2). It used to sit in the frame layer as `render`'s `Input`
 // arm, where the frame layer could not help but accumulate opinions like it.
 
 /// Rows of context preferred above the caret when an input window must clip
@@ -4159,7 +4158,7 @@ mod tests {
     }
 
     // `next_input_row` / `clear_rows_to` were folded into `plan_apply` by
-    // ui_draw_v2 P3; their cases live on in `ui::frame::apply_tests`
+    // ui_draw_v2 P3; their cases live on in `draw::apply_tests`
     // (`frame_tracks_scroll_then_stays_on_shrink`,
     // `full_clears_nothing_when_frame_sits_below_the_old_bottom`,
     // `grow_preserves_revealed_rows_below_old_bottom`).
@@ -4584,8 +4583,8 @@ mod tests {
     // cursor position — the strongest test possible without a real TTY.
     #[cfg(test)]
     mod vt100_tests {
+        use crate::draw::{plan_apply, ApplyPolicy, DrawCache};
         use crate::repl::{LineEditor, Repl};
-        use crate::ui::frame::{plan_apply, ApplyPolicy, DrawCache};
         use vt100::Parser;
 
         /// Simulate the tty's OPOST/ONLCR: `plan_apply` emits bare `\n` (the
@@ -4996,7 +4995,7 @@ mod tests {
 
         // And through the real pipeline, a zero-row element really yields a zero-row
         // frame — otherwise `must == might == 0` would only be a claim.
-        use crate::ui::frame::{allocate, live_budget, render};
+        use crate::render::{allocate, live_budget, render};
         let height = |streaming: bool| {
             let e = input_element(&empty, "> ", streaming, 60);
             let heights = allocate(&[e.extent()], live_budget(24));
@@ -5073,8 +5072,8 @@ mod confirm_tests {
         let mut els = overlay_elements(&sess.overlay, 40);
         els.extend(sess.confirm.as_ref().unwrap().elements(40));
         let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
-        let heights = crate::ui::frame::allocate(&extents, 40);
-        let frame = crate::ui::frame::render(&els, &heights, 40);
+        let heights = crate::render::allocate(&extents, 40);
+        let frame = crate::render::render(&els, &heights, 40);
         let joined = (0..frame.height())
             .map(|i| frame.row(i).to_string())
             .collect::<Vec<_>>()
@@ -5187,7 +5186,7 @@ mod confirm_tests {
         // Under a budget that cannot fit the header, the rows still get their
         // three: `allocate` serves every `must` before any `might`.
         let all: Vec<_> = els.iter().map(Element::extent).collect();
-        let heights = crate::ui::frame::allocate(&all, 3);
+        let heights = crate::render::allocate(&all, 3);
         assert_eq!(
             heights[heights.len() - 1],
             3,

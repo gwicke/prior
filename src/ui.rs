@@ -10,33 +10,31 @@
 //! [`overlay_elements`] the slash menu uses
 //! ([`doc/confirm_as_menu_261002.md`](../../doc/confirm_as_menu_261002.md)).
 
-pub mod frame;
-
+use crate::render::{pad_row, Element, RenderAt, Rendered};
 use crate::slashdot_menu::render::{
     paint_detail, paint_header, paint_rows, visual_height, window_heights, LogicalLine,
     PaintedSection, RenderPlan,
 };
-use crate::ui::frame::{pad_row, Element, RenderAt, Rendered};
 // The apply vocabulary is the tests' — they drive the pipeline directly rather
 // than through `Output::draw_elements`, which is the only production caller.
 #[cfg(test)]
-use crate::ui::frame::ApplyPolicy;
+use crate::draw::ApplyPolicy;
 // Only the element tests drive the pipeline themselves; naming these
 // unconditionally would trip `unused_imports` on a normal build.
 #[cfg(test)]
-use crate::ui::frame::{allocate, live_budget, render, Extent};
+use crate::render::{allocate, live_budget, render, Extent};
 use std::sync::Arc;
 
 // --- the overlay element ----------------------------------------------------
 //
 // The pop-up's own element, carrying the pop-up's own squeeze policy: half the
 // allocation above the selection is the *menu's* preference about how much
-// context to show. It used to live in `frame.rs` as `render`'s `h / 2` — where
+// context to show. It used to live in the frame layer as `render`'s `h / 2` — where
 // the frame layer had no business holding an opinion about what a menu wants
 // (ui_draw_v2 §3.2.2).
 //
 // It is here rather than in the menu crate because both this module and
-// `repl.rs` build overlays, and neither the menu crate nor `frame.rs` sits
+// `repl.rs` build overlays, and neither the menu crate nor the frame layer sits
 // below both of them.
 //
 // An overlay is **three elements**, not one: the node's `header()` detail, the
@@ -95,7 +93,7 @@ impl Element {
     /// A menu asks for `1`; a confirmation asks for its option count, because
     /// a dialog whose options have been squeezed away is not a consent prompt.
     /// `allocate` serves every `must` before any `might`
-    /// (`ui/frame.rs:219`), so this floor holds under pressure — with the
+    /// (`render::allocate`), so this floor holds under pressure — with the
     /// caveat that below the summed `must`s `fill` degrades to one row each in
     /// element order, and this element is last.
     fn rows_pinned_to(
@@ -127,7 +125,7 @@ impl Element {
 /// One elastic section: already-painted rows, clipped to the allocation.
 ///
 /// The shape both `detail` and `table_header` want, and deliberately *not*
-/// `frame::Element::lines`: that one has `must == might`, which is what keeps
+/// `render::Element::lines`: that one has `must == might`, which is what keeps
 /// the status row from ever competing. These two must compete — they yield.
 struct SectionItem {
     section: PaintedSection,
