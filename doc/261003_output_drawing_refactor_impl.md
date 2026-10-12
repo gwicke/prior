@@ -42,11 +42,11 @@ Three structural faults:
    owns), from `crossterm::terminal::size()` (**12 independent call sites**, 7 in `output.rs` and 5
    in `repl.rs`, each with its own `.unwrap_or(...)` fallback — 80, 24, or `(80, 24)`), or from
    `term_width()`/`term_height()` — and those last two disagree about their own source, since only
-   the first consults the global.
-   Separately, `is_terminal()` is consulted at **7 sites** in `output.rs` (1950, 2990, 3098, 3229,
-   3268, 3516, 3779) rather than once. The cost is in the test suite (see §7): **32 tests** call
-   `capturing_output(width)`, which stores into `crate::repl::TERMINAL_WIDTH` — output's own tests
-   mutating repl's global — and that is why 29 of them are `#[serial]`.
+   the first consults the global. Separately, `is_terminal()` is consulted at **7 sites** in
+   `output.rs` (1950, 2990, 3098, 3229, 3268, 3516, 3779) rather than once. The cost is in the test
+   suite (see §7): **32 tests** call `capturing_output(width)`, which stores into
+   `crate::repl::TERMINAL_WIDTH` — output's own tests mutating repl's global — and that is why 29 of
+   them are `#[serial]`.
 
 The end state removes all three: geometry has one owner (the TermIO watch), the hub is one module,
 and the ui/content edge points the one way (content kinds stay above Draw).
@@ -70,10 +70,10 @@ Agent → Content ─┐
 Repl  → UI ──────┴→ RenderManager → Draw → TermIO
 ```
 
-`Content` and the UI both hold `Arc<Mutex<RenderManager>>`. Dependencies point downward only:
-shared vocabulary (`Lines`, `TermSize`, `Stream`) lives in the `screen.rs` leaf, imported by all
-four layers — no upward or sideways edges. `draw` never imports `content` kinds; `render` depends
-on neither.
+`Content` and the UI both hold `Arc<Mutex<RenderManager>>`. Dependencies point downward only: shared
+vocabulary (`Lines`, `TermSize`, `Stream`) lives in the `screen.rs` leaf, imported by all four
+layers — no upward or sideways edges. `draw` never imports `content` kinds; `render` depends on
+neither.
 
 ## 3. Channels and ownership
 
@@ -131,9 +131,9 @@ drives stay with the repl/setup (`get_user_input`, `set_status`, `is_streaming`,
 called by the repl (`interactive.rs:1089`) → not on `Content` at all.
 
 `Content` is a struct, not a trait: backend variance moved down into `TermIO`, and every run's
-Content behavior is now identical. The test seam is a `tap: Option<…>` field instead — when set,
-the verbs record to a shared sink and short-circuit, covering the `RecordingOutput` /
-`ScriptOutput` patterns without a live render stack.
+Content behavior is now identical. The test seam is a `tap: Option<…>` field instead — when set, the
+verbs record to a shared sink and short-circuit, covering the `RecordingOutput` / `ScriptOutput`
+patterns without a live render stack.
 
 Capture taps the `ContentWrite` exactly as handed to `render()` — pre width-recheck, content only.
 Today's writer swap also caught frame bytes (`draw_frame` writes through the same `writer`,
@@ -163,9 +163,9 @@ Consequences:
   element holds the selection, and a cursor key mutates it in place.
 - `height()` / `render()` now read live session state; allowed under non-reentrancy (the editor is
   not the hub), but it is a shift from "the repl supplies what changed" to "the element reads what
-  changed". The repl mutates, releases the editor lock, then triggers `render()` — the element
-  locks the editor again inside `height()`/`render()` and the mutex is non-reentrant, so holding it
-  across the call would deadlock.
+  changed". The repl mutates, releases the editor lock, then triggers `render()` — the element locks
+  the editor again inside `height()`/`render()` and the mutex is non-reentrant, so holding it across
+  the call would deadlock.
 - `configure()` runs when the element *set* changes (menu open/close), not per keystroke; the frame
   is re-rendered from the same stack each keystroke.
 - Two locks per compose (allocate then render) on the editor; order is always
@@ -181,9 +181,9 @@ shared and the `Arc<Mutex<…>>` justification narrows to it.
 concrete `rows` of every element's max ask (so `frame = min(max_ratio·term_h, Σ max.rows)`), and
 only the **in-frame split** consults `ratio` against the already-resolved frame height — the split
 is **ratio-weighted**. `FixedNum(n)` is the common case (status/divider) and weights evenly, so
-all-`FixedNum` (today) stays byte-identical to the even split the `allocate_*` tests pin. No
-element needs a ratio today; the variant exists so a future header/content split can express it
-without reopening the allocator.
+all-`FixedNum` (today) stays byte-identical to the even split the `allocate_*` tests pin. No element
+needs a ratio today; the variant exists so a future header/content split can express it without
+reopening the allocator.
 
 ## 7. Testing strategy
 
@@ -221,27 +221,103 @@ until the last step.
 
    > **Status (2026-10-04).** The *moves* are landed as module-level primitives in `termio.rs`: the
    > size watch + per-stream caps, the sole persistent stdin reader, the DSR query, and the
-   > process-wide pause handshake (the gate is process-wide — one reader, so it is a mutual-exclusion
-   > flag, not per-instance config like the size watch). That handshake is what let `confirm_gate`,
-   > `reader_paused`, `editor::ReaderHold`, `GatedOutput`, and `NoGateOutput` be deleted and
-   > `run_editor` be repointed.
+   > process-wide pause handshake (the gate is process-wide — one reader, so it is a
+   > mutual-exclusion flag, not per-instance config like the size watch). That handshake is what let
+   > `confirm_gate`, `reader_paused`, `editor::ReaderHold`, `GatedOutput`, and `NoGateOutput` be
+   > deleted and `run_editor` be repointed.
    >
-   > What is **not** done is step 2's headline: the `TermIO` **type** itself — the closed `Tty`/`Plain`
-   > enum that owns the reader thread and folds `TermGuard` (raw mode) into it, plus `TermHandles`
-   > and the `recording()`/`null()` constructors. That unification is **deferred to step 4**, where
-   > `TermIO` moves into `Draw`/`RenderManager` and the ownership actually restructures; the
-   > pause/DSR/deletions above do not need the type now, and folding `TermGuard` across its call
-   > sites is safest done alongside that restructure.
+   > What is **not** done is step 2's headline: the `TermIO` **type** itself — the closed
+   > `Tty`/`Plain` enum that owns the reader thread and folds `TermGuard` (raw mode) into it, plus
+   > `TermHandles` and the `recording()`/`null()` constructors. That unification is
+   > **deferred to step 4**, where `TermIO` moves into `Draw`/`RenderManager` and the ownership
+   > actually restructures; the pause/DSR/deletions above do not need the type now, and folding
+   > `TermGuard` across its call sites is safest done alongside that restructure.
    >
    > Minor remainder, also riding with step 4: the three `Output` trait-default size queries
-   > (`cursor_row`, `frame_size`, `painted_size`) still fall back to a live `crossterm::terminal::size()`.
-   > They serve non-console outputs only — `ConsoleOutput` overrides all three to read the watch — and
-   > the loop-top resize probe (`repl.rs`, one per keystroke) is a deliberate live query that publishes
-   > to the watch, not a leftover.
+   > (`cursor_row`, `frame_size`, `painted_size`) still fall back to a live
+   > `crossterm::terminal::size()`. They serve non-console outputs only — `ConsoleOutput` overrides
+   > all three to read the watch — and the loop-top resize probe (`repl.rs`, one per keystroke) is a
+   > deliberate live query that publishes to the watch, not a leftover.
 3. **Split `content/`.** Move classification, the separator matrix, the write pipeline, and the
    content rendering there; add the `Content` handle and switch `AgentConfig.output` →
-   `AgentConfig.content`, along with `AppState.output` and the settings test helpers.
-   `ConfirmPort` unchanged.
+   `AgentConfig.content`, along with `AppState.output` and the settings test helpers. `ConfirmPort`
+   unchanged.
+
+   **Transition contract (pre-RenderManager).** `render()` / `ContentWrite` arrive in step 4, so
+   step 3 cannot hand off to the hub yet. The shape it must hold to:
+
+   - `Content` is the new agent-facing handle. It *owns* content classification
+     (`ContentDisplayKind`), the separator matrix (`boundary_spacer`, `last_content_*`,
+     `held_blank`), the block write pipeline (`with_content_writer`), and the renderers; it holds a
+     cloned **width watch** (from step 2) and formats at the current watched width per block; it
+     writes bytes through the existing `Arc<dyn Output>` sink unchanged.
+   - **Frame methods stay on `Output`** for now (`draw_frame`, `draw_elements`, `frame_size`,
+     `painted_size`, `begin_batch`, DSR, `set_status`). `Content` carries a *temporary*
+     pass-through to its sink for the few frame calls the agent still makes on the same handle
+     (turn/pumps `frame_size`, `set_status`, `paint`, `begin_batch`). That pass-through dissolves
+     in step 4, when RenderManager becomes the frame front door.
+   - **The status line is pure UI — no content path.** `set_status` / `StatusText` /
+     `status_text()` / `BarModel` / `status_bar` / `status_line` / `Element::status` are the
+     frame's, never Content's. The row is a `RenderElement` (`Element::status` today, moving into
+     `ui/` with step 4) that formats *itself* on each `render()` from the `Arc<Mutex<StatusText>>`
+     the push fills — content never composes or writes it. In step 3 `set_status` simply rides the
+     frame pass-through above; nothing under `content/` may absorb any of these symbols.
+   - **Sinks untouched**: Quiet/No/Recording/Log/Scrollback remain `Output` impls and stay the byte
+     sink; `begin_capture`/`end_capture` still tap at the sink. Re-pointing capture at the
+     `ContentWrite` hand-off is step 4/5.
+   - **Exactly one content writer.** Every content writer — agent, `interactive.rs`, repl
+     (`display_text`/`display_committed_prompt`/`display_plain`), tools/session — routes through the
+     single `Content`, so the shared boundary state stays consistent. A repl write bypassing
+     `Content` would corrupt the matrix.
+   - `ConfirmPort` / `confirm.rs` untouched; `Confirmation` (output.rs:25) stays put.
+
+   **Commits:**
+
+   - **3a — `content/composition.rs`: classification + separator matrix + write pipeline (moves).**
+     Create `src/content/` (`mod.rs`, `composition.rs`). Move `ContentDisplayKind`,
+     `boundary_spacer`, `held_blank`, and the `last_content_display_kind` /
+     `last_content_closes_segment` bookkeeping (currently in `DrawCache`, mutated at
+     ConsoleOutput:1733) into one `ContentBoundary` state owned by content; move the block write
+     pipeline `with_content_writer` (WrapLines + boundary apply + EL) behind it. `draw.rs` /
+     `ConsoleOutput` delegate. Pure move, no behavior change. *Pin:*
+     `one_blank_line_at_a_segment_boundary`, `one_blank_line_after_a_tool_block`,
+     `wrap_preserves_blank_line`, `one_blank_line_between_a_tool_block_and_reasoning`,
+     `reasoning_list_before_answer_has_blank_line`,
+     `an_empty_segment_puts_no_blank_between_retries`,
+     `two_committed_prompts_render_without_a_blank_between_their_rules` (repl.rs).
+
+   - **3b — content rendering into `content/{markdown,panel,preview,text}.rs` (moves).**
+     `render_markdown` (output.rs:770) → `content/markdown.rs`; `render_call_panel` /
+     `render_result_panel` / `paint_panel` → `content/panel.rs`; `get_preview` / `edit_preview`
+     (output.rs:1011/1175) → `content/preview.rs`; text / stream / thinking formatting and
+     header composition → `content/text.rs`. `StatusText` stays (UI). `ConsoleOutput` calls into
+     `content::`. Pure move. *Pin:* `render_markdown_*` (gfm table / code / heading / osc8),
+     `display_text_*` width tests, `content_choke_wraps_an_overwide_line_before_the_line_clear`,
+     `draw_elements_paints_exactly_what_the_hand_rolled_path_paints`,
+     `markdown_and_error_and_plain_are_counted`.
+
+   - **3c — the `Content` handle.**
+     `pub struct Content { boundary: ContentBoundary, width: SizeWatch, sink: Arc<dyn Output> }` —
+     owns 3a+3b, holds the cloned width watch, formats at the watched width per block, writes via
+     the sink. Exposes the content API (`display_*`, `stream_*`, `begin/end_response(_segment)`,
+     header, prompts, capture) plus the temporary frame pass-through. `Output::` content
+     methods on `ConsoleOutput` forward through the shared `Content`, so still-`Output` writers keep
+     sharing state until 3d. Full suite green (no behavior change).
+
+   - **3d — repoint writers; `AgentConfig.output` → `AgentConfig.content`.** Field rename + type:
+     `AgentConfig.content: Arc<Content>`; every `with_config(|c| c.output)` / `config.output` site
+     (main.rs:309, settings.rs ×3, app_state.rs, interactive.rs ×4, build.rs ×2, compaction ×2,
+     v25_replay, v25_session, agent.rs); interactive / repl / tools content calls → `content.*`;
+     test helpers `for_test_with_output` → content, `test_settings()` and the `AgentConfig` builders
+     follow. `ConfirmPort` unchanged. *Pin:* full suite + `/replay` + confirm tests.
+
+   *Open questions to settle during 3c/3d:* (1) frame pass-through shape — `Content` method refs to
+   the sink vs the agent carrying `Content` + `Output` as two handles; (2) `RecordingOutput` /
+   `ScrollbackOutput` keep recording at the sink until the `ContentWrite` tap exists.
+
+   *Resolved:* the status line is **pure UI** — a self-formatting `RenderElement` on the frame
+   path, no content involvement. `set_status` and every status symbol are frame, not content (see
+   the contract above); question (2) is answered.
 4. **Fold in `RenderManager` and UI.** `configure` / `render` / `render_batch`; convert elements to
    `Arc<Mutex<…>>` with the shared editor; move element construction into `ui/`/repl.
 5. **Delete `output.rs`.** Remove the four sinks, the dead taps (`ScrollbackOutput`, `LogOutput`),
