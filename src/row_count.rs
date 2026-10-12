@@ -19,7 +19,7 @@
 //! Design notes (doc/row_accounting.md §6, phase B):
 //! - Counting happens per *block*, not per delta, so the streaming path pays
 //!   one scan per rendered block.
-//! - Escape handling mirrors [`crate::output::strip_ansi`] — CSI, and OSC
+//! - Escape handling mirrors [`crate::ansi::strip_ansi`] — CSI, and OSC
 //!   terminated by BEL or ST. The OSC case is load-bearing: the markdown
 //!   renderer emits OSC 8 hyperlinks on a real tty
 //!   (`Theme::clickable_links`), and a scanner that stopped at the first
@@ -156,7 +156,7 @@ pub fn rows_of(text: &str, term_w: usize) -> usize {
 /// pinned by `wrap_to_width_keeps_rows_of_honest`.
 ///
 /// The batch form of the guard: production wraps incrementally in
-/// `output::WrapLines` (the one choke `with_content_writer` puts under every
+/// `ansi::WrapLines` (the one choke `with_content_writer` puts under every
 /// writer). This stays as the readable specification of the break rule and
 /// the accounting pin both forms share.
 pub fn wrap_to_width(text: &str, width: usize) -> String {
@@ -421,7 +421,7 @@ mod tests {
         ] {
             assert_eq!(
                 display_width_ansi(s),
-                crate::output::strip_ansi(s)
+                crate::ansi::strip_ansi(s)
                     .chars()
                     .map(|c| { unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) })
                     .sum::<usize>(),

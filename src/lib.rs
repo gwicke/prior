@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 pub mod agent;
+pub mod ansi;
 pub mod config;
 pub mod edit_blocks;
 pub mod edit_match;

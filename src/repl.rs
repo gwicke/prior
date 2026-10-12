@@ -287,7 +287,7 @@ impl TermGuard {
         // Unconditional and idempotent: showing a cursor that was never hidden
         // costs nothing, and this is the last writer before the tty is the
         // user's again.
-        io::stdout().write_all(crate::output::SHOW_CURSOR)?;
+        io::stdout().write_all(crate::ansi::SHOW_CURSOR)?;
         disable_raw_mode()?;
         self.active.store(false, Ordering::SeqCst);
         Ok(())

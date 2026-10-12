@@ -191,7 +191,7 @@ pub fn status_text(
 /// a long message on a 120-column bar and left a hole before the pipe.
 fn message_preview(msg: &str) -> String {
     let flat = msg.split_whitespace().collect::<Vec<_>>().join(" ");
-    crate::output::strip_ansi(&flat)
+    crate::ansi::strip_ansi(&flat)
 }
 
 #[cfg(test)]
@@ -264,7 +264,7 @@ mod status_bar_tests {
                 w,
                 true,
             );
-            let visible = crate::output::strip_ansi(&s);
+            let visible = crate::ansi::strip_ansi(&s);
             assert_eq!(display(&s), w, "width {w}: one row: {visible:?}");
             assert!(
                 visible.contains("\u{25cf} "),
@@ -303,7 +303,7 @@ mod status_bar_tests {
         );
         // The dot cell leads, then padding, then the text against the right
         // margin — the right margin is the point, the dot is the price of it.
-        let visible = crate::output::strip_ansi(&s);
+        let visible = crate::ansi::strip_ansi(&s);
         assert!(
             visible.starts_with(" \u{25cf}  "),
             "the bar should lead with the dot cell: {visible:?}"
@@ -352,7 +352,7 @@ mod status_bar_tests {
             true,
         );
         assert_eq!(crate::row_count::display_width_ansi(&s), 20, "{s:?}");
-        assert!(crate::output::strip_ansi(&s).contains('…'), "{s:?}");
+        assert!(crate::ansi::strip_ansi(&s).contains('…'), "{s:?}");
     }
 
     /// With no session name, the opening message stands in — so the line still
@@ -366,7 +366,7 @@ mod status_bar_tests {
             60,
             true,
         );
-        let visible = crate::output::strip_ansi(&s);
+        let visible = crate::ansi::strip_ansi(&s);
         assert!(visible.contains("fix the flaky resize test"), "{visible:?}");
         let named = bar(
             Some("main"),
@@ -375,7 +375,7 @@ mod status_bar_tests {
             60,
             true,
         );
-        let named_visible = crate::output::strip_ansi(&named);
+        let named_visible = crate::ansi::strip_ansi(&named);
         assert!(named_visible.contains("main"), "{named_visible:?}");
         assert!(
             !named_visible.contains("fix the flaky"),
@@ -403,7 +403,7 @@ mod status_bar_tests {
             60,
             true,
         );
-        let visible = crate::output::strip_ansi(&s);
+        let visible = crate::ansi::strip_ansi(&s);
         assert!(
             visible.ends_with("main | ollama:llama3 high 61% 5k"),
             "one pipe, model then level then the figure, single spaces: {visible:?}"
@@ -431,7 +431,7 @@ mod status_bar_tests {
             60,
             true,
         );
-        let visible = crate::output::strip_ansi(&s);
+        let visible = crate::ansi::strip_ansi(&s);
         assert!(
             visible.ends_with("main | llamacpp:test high 78k"),
             "the count alone when there is no window to take a percentage of: {visible:?}"
@@ -457,7 +457,7 @@ mod status_bar_tests {
                 w,
                 true,
             );
-            let visible = crate::output::strip_ansi(&s);
+            let visible = crate::ansi::strip_ansi(&s);
             assert_eq!(display(&s), w, "width {w}: the bar is one row: {visible:?}");
             assert!(
                 visible.ends_with(group),
@@ -519,7 +519,7 @@ mod status_bar_tests {
                 w,
                 true,
             );
-            let visible = crate::output::strip_ansi(&s);
+            let visible = crate::ansi::strip_ansi(&s);
             assert_eq!(display(&s), w, "width {w}: one row: {visible:?}");
             // The dot cell leads and the padding is all that is left over, so
             // what remains in the middle is the group and nothing else.
@@ -556,7 +556,7 @@ mod status_bar_tests {
             40,
             true,
         );
-        let visible = crate::output::strip_ansi(&s);
+        let visible = crate::ansi::strip_ansi(&s);
         assert!(visible.ends_with("llamacpp:test"), "{visible:?}");
         assert_eq!(display(&s), 40, "{visible:?}");
     }
@@ -665,7 +665,7 @@ mod status_bar_tests {
             20,
             true,
         );
-        let visible = crate::output::strip_ansi(&s);
+        let visible = crate::ansi::strip_ansi(&s);
         let text = visible.trim().strip_prefix('\u{25cf}').unwrap().trim_end();
         assert_eq!(display(&s), 20, "{visible:?}");
         assert!(
@@ -683,7 +683,7 @@ mod status_bar_tests {
             20,
             true,
         );
-        let text = crate::output::strip_ansi(&wide);
+        let text = crate::ansi::strip_ansi(&wide);
         // `trim` first: the dot cell is a space and a glyph, and the space would
         // otherwise be the first character the assertion looks at.
         // `trim` again after the strip: the text is right-aligned, so the
