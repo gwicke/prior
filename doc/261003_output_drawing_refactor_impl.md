@@ -273,13 +273,17 @@ until the last step.
 
    **Commits:**
 
-   - **3a — `content/composition.rs`: classification + separator matrix + write pipeline (moves).**
+   - **3a — `content/composition.rs`: classification + separator matrix + boundary state (moves).**
      Create `src/content/` (`mod.rs`, `composition.rs`). Move `ContentDisplayKind`,
-     `boundary_spacer`, `held_blank`, and the `last_content_display_kind` /
-     `last_content_closes_segment` bookkeeping (currently in `DrawCache`, mutated at
-     ConsoleOutput:1733) into one `ContentBoundary` state owned by content; move the block write
-     pipeline `with_content_writer` (WrapLines + boundary apply + EL) behind it. `draw.rs` /
-     `ConsoleOutput` delegate. Pure move, no behavior change. *Pin:*
+     `boundary_spacer`, `separator_line`, `held_blank`, `last_content_display_kind` and
+     `last_content_closes_segment` (out of `DrawCache`) into one content-owned
+     `ContentBoundary` (`record` / `restore_empty` / `take_held`+`store_held` / `last_kind`).
+     `ConsoleOutput` holds it; `with_content_writer` delegates its boundary apply to it, and
+     `draw.rs` no longer carries the state. Pure move, no behavior change.
+     *Follow-up (step 4):* `with_content_writer`'s **body** stays put — it is Draw-coupled
+     (`plan_consume` / `note_lines` / `reposition`); the `WrapLines`/EL stack is `ansi.rs`'s.
+     Splitting the byte-production half into content (handing `ContentWrite` to `render()`) is
+     step 4, not 3a. *Pin:*
      `one_blank_line_at_a_segment_boundary`, `one_blank_line_after_a_tool_block`,
      `wrap_preserves_blank_line`, `one_blank_line_between_a_tool_block_and_reasoning`,
      `reasoning_list_before_answer_has_blank_line`,

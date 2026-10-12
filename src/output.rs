@@ -1,6 +1,7 @@
 use crate::ansi::{
     at_line_start, strip_ansi, EscState, HoldTrailing, LineClear, StripLeading, WrapLines,
 };
+use crate::content::{boundary_spacer, separator_line, ContentBoundary, ContentDisplayKind};
 use crate::draw::{plan_consume, ApplyPolicy, Draw};
 use crate::render::{allocate, live_budget, render, Element, Extent, Frame, RenderAt, Rendered};
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
@@ -48,72 +49,6 @@ pub(crate) fn area_body(input: Option<Element>, overlay: Vec<Element>) -> Vec<El
     }
     items.extend(overlay);
     items
-}
-
-/// The logical kind of one transcript content write.
-///
-/// Kinds, not formatting: `Prompt` is a committed user line, whoever decided to
-/// draw it with rules or without. Only what was *written* goes here, so
-/// changing the separators around a kind cannot invalidate the record.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ContentDisplayKind {
-    /// A user line committed with Enter — a turn's prompt, a slash command, or
-    /// a `!command`. Consecutive ones share a divider rather than stacking one
-    /// between each pair.
-    Prompt,
-    /// `stream_text`, and the segment flushes that close a segment: the answer
-    /// of a turn, written through the GFM answer renderer.
-    ResponseText,
-    /// `stream_thinking` — the reasoning a turn shows, dimmed inline. Its
-    /// dimming is internal to the block: the escape that ends it, and the
-    /// newline that ends its last line, belong to this kind's content, and the
-    /// row that follows it is the boundary matrix's, not this block's.
-    ResponseReasoning,
-    /// A tool block — `render_call_panel` / `render_result_panel`, which is
-    /// every row `paint_panel` writes. One kind for call and result alike:
-    /// the two halves of a pair are one block, so the second must not draw a
-    /// separator above itself.
-    ResponseTool,
-    /// `display_text` / `display_error` — a discrete message or error block.
-    SystemMessage,
-    /// `display_markdown` / `display_system` — a generated block: a compaction
-    /// summary, a marker, a notice.
-    SystemContent,
-}
-
-/// The single line the opener draws between two blocks — the *formatting*
-/// half of the rule, separated from the writing so an emitter can draw a whole
-/// block in one `with_content_writer` and still get its boundaries right.
-///
-/// Different kinds separate; the same kind does not, which is what lets a
-/// response's internals (a tool panel, a segment flush) stay inside one block,
-/// and what collapses two adjacent prompts onto one rule. `None` — the stream's
-/// start, or content that did not declare itself — never separates, so the
-/// first thing written never gains a blank line above it.
-///
-/// `closed` is the second dimension of the pair: the previous write declared
-/// itself the last flush of its segment, so whatever comes next opens a new
-/// block even under this very same kind. Two text blocks that share a kind are
-/// still two blocks when a parser and a renderer were reset between them, and
-/// this is how the opener learns that — from what the writer said about itself,
-/// never from the stream, which cannot see a row that has been held back.
-fn boundary_spacer(
-    old: Option<ContentDisplayKind>,
-    closed: bool,
-    new: Option<ContentDisplayKind>,
-) -> Option<&'static [u8]> {
-    match (old, new) {
-        (Some(a), Some(b)) if a != b => Some(b"\n"),
-        (_, Some(_)) if closed => Some(b"\n"),
-        _ => None,
-    }
-}
-
-/// The `──────` rule at a width — the *formatting* of a separator, kept apart
-/// from writing it so an emitter can draw a whole block in a single
-/// `with_content_writer` under one kind.
-fn separator_line(width: usize) -> String {
-    format!("{}\n", style("─".repeat(width)).dim())
 }
 
 /// Ends a content batch when dropped: one frame re-emit for the whole burst,
@@ -724,16 +659,11 @@ pub struct ConsoleOutput {
     /// one function. The flag flips in `begin_response`/`end_response`, so the
     /// bar's state cannot disagree with whether a turn is actually running.
     streaming: Arc<std::sync::atomic::AtomicBool>,
-    /// Blank rows withheld from the end of the last content write.
-    ///
-    /// Trailing separators are **held, not dropped**: a following write of the
-    /// same kind releases them (the internal spacing is unchanged — only *when*
-    /// it is written moved), a write of a different kind discards them (that
-    /// boundary's divider belongs to the next block), and the end of the
-    /// stream discards them by simply never releasing. Which is what strips
-    /// the response's last separator without needing to know, at the time it is
-    /// written, whether anything comes after it.
-    held_blank: std::sync::atomic::AtomicUsize,
+    /// The content boundary/separator state (step 3a): the last declared kind,
+    /// its segment-closed flag, and the held blank rows. Owned by `content/` —
+    /// the content writers record into it and `display_committed_prompt` reads
+    /// it; `draw_frame` never touches it.
+    boundary: ContentBoundary,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -1581,7 +1511,7 @@ impl ConsoleOutput {
             last_tool: Mutex::new(None),
             status_text: Arc::new(Mutex::new(StatusText::default())),
             streaming: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            held_blank: std::sync::atomic::AtomicUsize::new(0),
+            boundary: ContentBoundary::new(),
         }
     }
 
@@ -1727,14 +1657,7 @@ impl ConsoleOutput {
         // runs is deliberate: an emitter drawing several things inside this one
         // block then reads back its own kind, so its internal separators are
         // (kind, kind) and contribute nothing.
-        let (old, closed) = {
-            let mut cache = self.draw.cache.lock().unwrap();
-            let old = cache.last_content_display_kind;
-            let closed = cache.last_content_closes_segment;
-            cache.last_content_display_kind = kind;
-            cache.last_content_closes_segment = closes_segment;
-            (old, closed)
-        };
+        let (old, closed) = self.boundary.record(kind, closes_segment);
         // A write opens a new block when its kind differs from the last, or
         // when the last one said it closed its segment. Everything the opener
         // does — drawing the boundary row, stripping this block's leading
@@ -1748,7 +1671,7 @@ impl ConsoleOutput {
         // separators it is not entitled to, and the backtrace below is how the
         // offender is found — a diagnostic, not a policy decision about what to
         // do with them, which stays "drop".
-        let held = self.held_blank.swap(0, std::sync::atomic::Ordering::SeqCst);
+        let held = self.boundary.take_held();
         // Two distinct findings, both about what the *previous* write left
         // behind, and both no more than a backtrace with which to find the
         // emitter:
@@ -1873,8 +1796,7 @@ impl ConsoleOutput {
         // write that did write carries on, capped at one row: one separator is
         // all a gap ever is, and anything past it was already blamed above.
         let held_next = if wrote_any { carried.min(1) } else { held };
-        self.held_blank
-            .store(held_next, std::sync::atomic::Ordering::SeqCst);
+        self.boundary.store_held(held_next);
         if !wrote_content {
             // A write with no content in it changes no boundary: its new kind
             // never happened, so the predecessor still stands and the next
@@ -1893,10 +1815,8 @@ impl ConsoleOutput {
             //     This prevents an empty turn end (old=None, kind=ResponseText) from
             //     spuriously setting closed=true, which would inject blank lines
             //     before subsequent retry messages.
-            let mut cache = self.draw.cache.lock().unwrap();
-            cache.last_content_display_kind = old;
-            let genuinely_closes = closes_segment && old == kind && !closed;
-            cache.last_content_closes_segment = closed || genuinely_closes;
+            self.boundary
+                .restore_empty(old, closed, kind, closes_segment);
         }
         let rows = counter.rows();
         let _ = counter.flush();
@@ -2790,8 +2710,7 @@ impl Output for ConsoleOutput {
     /// against model output reads as a turn while two adjacent prompts read as
     /// two commits sharing one rule.
     fn display_committed_prompt(&self, line: &str) {
-        let shares_rule = self.draw.cache.lock().unwrap().last_content_display_kind
-            == Some(ContentDisplayKind::Prompt);
+        let shares_rule = self.boundary.last_kind() == Some(ContentDisplayKind::Prompt);
         let rule = separator_line(self.term_width());
         let block = if shares_rule {
             format!("{line}\n{rule}")
