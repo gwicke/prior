@@ -11,7 +11,6 @@ use markdown_stream::{Parser, StreamParser};
 use markdown_terminal::{Renderer, Theme};
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
-use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -3266,85 +3265,6 @@ impl Output for ConsoleOutput {
 
     fn end_capture(&self) -> Vec<u8> {
         self.draw.end_capture()
-    }
-}
-
-/// An `Output` wrapper no longer used: the REPL relies on the terminal's
-/// native scrollback (the session scrolls there naturally during the session),
-/// so a separate ring buffer is unnecessary.
-#[allow(dead_code)]
-pub struct ScrollbackOutput {
-    inner: Arc<dyn Output>,
-    sb: Arc<Mutex<VecDeque<String>>>,
-}
-
-#[allow(dead_code)]
-impl ScrollbackOutput {
-    pub fn new(inner: Arc<dyn Output>, sb: Arc<Mutex<VecDeque<String>>>) -> Self {
-        Self { inner, sb }
-    }
-
-    fn append(&self, text: &str) {
-        let mut sb = self.sb.lock().unwrap();
-        for line in text.split('\n') {
-            sb.push_back(line.to_string());
-        }
-        const CAP: usize = 1000;
-        while sb.len() > CAP {
-            sb.pop_front();
-        }
-    }
-}
-
-impl Output for ScrollbackOutput {
-    fn cursor_row(&self) -> usize {
-        self.inner.cursor_row()
-    }
-    fn display_plain(&self, text: &str) {
-        self.append(text);
-        self.inner.display_plain(text);
-    }
-    fn display_text(&self, text: &str) {
-        self.append(text);
-        self.inner.display_text(text);
-    }
-    fn display_tool_call(&self, name: &str, args: &Value) {
-        self.inner.display_tool_call(name, args);
-    }
-    fn display_tool_result(&self, result: &str) {
-        self.append(result);
-        self.inner.display_tool_result(result);
-    }
-    fn get_user_input(&self) -> String {
-        self.inner.get_user_input()
-    }
-    fn display_error(&self, error: &str) {
-        self.append(error);
-        self.inner.display_error(error);
-    }
-    fn display_system(&self, text: &str) {
-        self.append(text);
-        self.inner.display_system(text);
-    }
-    fn confirm(&self, message: &str) -> Confirmation {
-        self.inner.confirm(message)
-    }
-    fn display_separator(&self) {
-        let line = "─".repeat(term_width());
-        self.append(&line);
-        self.inner.display_separator();
-    }
-
-    fn display_header(
-        &self,
-        provider: &str,
-        model: &str,
-        yolo: bool,
-        limit: usize,
-        persona: Option<&str>,
-    ) {
-        self.inner
-            .display_header(provider, model, yolo, limit, persona);
     }
 }
 
