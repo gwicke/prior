@@ -1,23 +1,30 @@
-use crate::ansi::{
-    at_line_start, strip_ansi, EscState, HoldTrailing, LineClear, StripLeading, WrapLines,
+#[cfg(test)]
+use crate::ansi::strip_ansi;
+use crate::ansi::{at_line_start, EscState, HoldTrailing, LineClear, StripLeading, WrapLines};
+use crate::content;
+use crate::content::markdown::{
+    answer_theme, command_lang, guess_lang, highlight_code_fg, render_markdown,
 };
+#[cfg(test)]
+use crate::content::preview::{
+    edit_preview, refined_diff_lines, short_banner, truncate, wrap_with_diff_markers,
+    SED_PREVIEW_BANNER,
+};
+use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno};
+use crate::content::text::wrap;
 use crate::content::{boundary_spacer, separator_line, ContentBoundary, ContentDisplayKind};
 use crate::draw::{plan_consume, ApplyPolicy, Draw};
 use crate::render::{allocate, live_budget, render, Element, Extent, Frame, RenderAt, Rendered};
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
 use crate::termio::{Caps, TermSize};
-use crate::tools::EditOp;
-use console::{style, StyledObject};
+use console::style;
 use markdown_stream::{Parser, StreamParser};
 use markdown_terminal::{Renderer, Theme};
 use serde_json::Value;
-use similar::{ChangeTag, TextDiff};
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use termimad;
 use tokio::sync::watch;
-use unicode_width::UnicodeWidthStr;
 
 use crate::row_count::RowCounter;
 
@@ -666,14 +673,6 @@ pub struct ConsoleOutput {
     boundary: ContentBoundary,
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.chars().count() > max_len {
-        format!("{}...", s.chars().take(max_len).collect::<String>())
-    } else {
-        s.to_string()
-    }
-}
-
 /// Terminal width in columns, from the size watch (`crate::termio`, step 2
 /// commit A). The 20-column floor is load-bearing: `plan_apply` misbehaves
 /// on a narrower geometry, and an uninitialized one must not get there.
@@ -689,583 +688,6 @@ pub fn term_width() -> usize {
 /// items below a multi-line header).
 pub fn term_height() -> usize {
     crate::termio::size().height.max(1)
-}
-
-/// Render `src` as a styled terminal string via `codewandler-markdown-terminal`.
-///
-/// Uses GFM (`parse_gfm`) so tables / task-lists / strikethrough render as users
-/// expect. `color` selects the default ANSI theme (TTY) vs `no_color` (pipes,
-/// logs, CI) so non-terminal output stays clean.
-pub(crate) fn render_markdown(src: &str, width: usize, color: bool) -> String {
-    // In callers, `color` is `is_terminal()`, so enabling OSC 8 clickable
-    // links here gates them to a real TTY (pipes/CI stay escape-free).
-    let mut theme = if color {
-        Theme::default()
-    } else {
-        Theme::no_color()
-    };
-    theme.clickable_links = color;
-    markdown_terminal::render_with(&markdown_stream::parse_gfm(src), &theme, width)
-}
-
-/// Wrap `text` to fit `width` characters per line.
-///
-/// Each logical line (split on `\n`) is wrapped independently; blank lines are
-/// preserved. The leading whitespace of each logical line is captured and
-/// re-emitted at the start of the first wrapped line *and* every continuation
-/// line, so indentation survives a reflow.
-///
-/// Tokenization inside the body uses `split_whitespace`, collapsing any run of
-/// whitespace between words to a single space. A word longer than the available
-/// width (after subtracting the indent) is hard-split into `width`-sized
-/// character chunks (CJK-safe). The first chunk keeps the indent; subsequent
-/// chunks are emitted plain so the overlay renderer can prepend its own marker.
-///
-/// Unlike a grapheme-boundary splitter, this keeps trailing punctuation
-/// attached to its word (e.g. `"Commands:"` stays `"Commands:"`, not
-/// `"Commands :"`) and never inserts a space adjacent to existing whitespace
-/// between words.
-pub fn wrap(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return text.lines().map(|l| l.to_string()).collect();
-    }
-    let width = width.max(1);
-    let mut out: Vec<String> = Vec::new();
-    for logical in text.split('\n') {
-        if logical.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        // Capture leading whitespace so the indent survives wrap.
-        let indent: String = logical.chars().take_while(|c| c.is_whitespace()).collect();
-        let body = &logical[indent.len()..];
-        if body.is_empty() {
-            // All-whitespace line: preserve the indent itself.
-            out.push(indent);
-            continue;
-        }
-        let indent_chars = indent.chars().count();
-        let content_width = width.saturating_sub(indent_chars).max(1);
-        let words: Vec<&str> = body.split_whitespace().collect();
-        let mut line = String::from(&indent);
-        for word in words {
-            if word.chars().count() > content_width {
-                // Flush any pending line, then hard-split the long word.
-                if line.chars().count() > indent_chars {
-                    out.push(std::mem::take(&mut line));
-                }
-                let chunks: Vec<String> = word
-                    .chars()
-                    .collect::<Vec<_>>()
-                    .chunks(content_width)
-                    .map(|c| c.iter().collect())
-                    .collect();
-                let last_idx = chunks.len().saturating_sub(1);
-                for (i, c) in chunks.iter().enumerate() {
-                    if i == 0 {
-                        out.push(format!("{}{}", indent, c));
-                    } else if i < last_idx {
-                        out.push(c.clone());
-                    }
-                }
-                line = chunks.last().cloned().unwrap_or_default();
-                continue;
-            }
-            let content_len = line.chars().count() - indent_chars;
-            if content_len == 0 {
-                line.push_str(word);
-            } else if content_len + 1 + word.chars().count() > content_width {
-                out.push(std::mem::take(&mut line));
-                line.push_str(&indent);
-                line.push_str(word);
-            } else {
-                line.push(' ');
-                line.push_str(word);
-            }
-        }
-        if !line.is_empty() {
-            out.push(line);
-        }
-    }
-    out
-}
-
-/// Like [`wrap`], but recognizes a leading `- ` / `+ ` as a diff marker: the
-/// marker is stripped, the body is wrapped (which preserves the body's
-/// leading indent), and the marker is re-prepended to the first wrapped
-/// line. Continuation lines are prefixed with two spaces so they visually
-/// align under the marker column.
-///
-/// `wrap()` alone would collapse the run of whitespace between the `-` and
-/// the original line's first non-whitespace character — for an indented
-/// source line such as `    if foo {`, `format!("- {l}")` produces
-/// `-     if foo {`, which `split_whitespace` then reduces to `- if foo {`,
-/// losing the indentation. Routing diff lines through this helper instead
-/// keeps the original indentation visible.
-fn wrap_with_diff_markers(text: &str, width: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for logical in text.split('\n') {
-        if logical.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        // A diff line is exactly `<marker><space><original line>` with the
-        // marker being `-` or `+`. Anything else (e.g. `---` from a header
-        // divider or `--foo`) is treated as plain text.
-        let is_diff = matches!(logical.as_bytes(), [b'-' | b'+', b' ', ..]);
-        if is_diff {
-            let marker = &logical[..2];
-            let rest = &logical[2..];
-            // Reserve two columns for the marker + the space that follows it
-            // on the first line. Continuation lines also need two leading
-            // spaces to keep their content aligned under the marker column.
-            let content_width = width.saturating_sub(2).max(1);
-            if rest.is_empty() {
-                // Marker with no body (degenerate but possible): emit the
-                // marker on its own.
-                out.push(marker.to_string());
-                continue;
-            }
-            let wrapped = wrap(rest, content_width);
-            for (i, line) in wrapped.into_iter().enumerate() {
-                if i == 0 {
-                    out.push(format!("{}{}", marker, line));
-                } else {
-                    out.push(format!("  {}", line));
-                }
-            }
-        } else {
-            out.extend(wrap(logical, width));
-        }
-    }
-    out
-}
-
-/// Highlight a single physical line of `text` as `lang` using the *same*
-/// markdown code-block formatter the answer/result path uses
-/// (`markdown_terminal` driven by `markdown_stream` via `render_markdown`).
-///
-/// Returns **foreground-only** ANSI (no background) so the caller can layer the
-/// dark-grey tool panel on top via `paint_panel`. `color` off (non-TTY) returns
-/// the line untouched. The renderer's 2-space code indent and trailing newline
-/// are stripped, leaving one line of styled text. Each call builds a fresh
-/// fenced block, so the formatter is fully isolated/flushed per line.
-fn highlight_code_fg(text: &str, lang: &str, color: bool, width: usize) -> String {
-    if !color || text.is_empty() {
-        return text.to_string();
-    }
-    let md = format!("```{lang}\n{text}\n```\n");
-    let rendered = render_markdown(&md, width, true);
-    let body = rendered
-        .strip_prefix("  ")
-        .unwrap_or_else(|| rendered.strip_prefix(' ').unwrap_or(&rendered));
-    body.trim_end_matches('\n').to_string()
-}
-
-/// Language id used to colorize a tool *command* label (e.g. `read …`,
-/// `$ ls …`). Any non-empty id engages token highlighting; the highlighter is
-/// language-agnostic for tokens, so `bash` is a safe, consistent default.
-fn command_lang(_name: &str) -> &'static str {
-    "bash"
-}
-
-/// Guess a syntax-highlight id from a file path's extension, for coloring
-/// `read_file` output. Unknown extensions fall back to `text` (no token
-/// highlighting, just the uniform code color).
-fn guess_lang(path: &str) -> &'static str {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("rs") => "rust",
-        Some("py") => "python",
-        Some("js" | "mjs" | "cjs") => "javascript",
-        Some("ts") => "typescript",
-        Some("tsx") => "tsx",
-        Some("jsx") => "jsx",
-        Some("go") => "go",
-        Some("java") => "java",
-        Some("c" | "h") => "c",
-        Some("cpp" | "cc" | "cxx" | "c++" | "hpp") => "cpp",
-        Some("rb") => "ruby",
-        Some("sh" | "bash" | "zsh") => "bash",
-        Some("json") => "json",
-        Some("toml") => "toml",
-        Some("yaml" | "yml") => "yaml",
-        Some("md" | "markdown") => "markdown",
-        Some("html" | "htm") => "html",
-        Some("css") => "css",
-        Some("sql") => "sql",
-        Some("xml") => "xml",
-        Some("php") => "php",
-        Some("swift") => "swift",
-        Some("kt" | "kts") => "kotlin",
-        Some("diff") => "diff",
-        _ => "text",
-    }
-}
-
-/// Drop the `NNNN| ` line-number gutter that `read_file` prepends to each line,
-/// so the displayed file content is clean (the model still receives the numbers
-/// in the raw tool result). Lines without a numeric gutter are returned as-is.
-fn strip_read_lineno(line: &str) -> &str {
-    if let Some(pos) = line.find('|') {
-        let (gutter, rest) = line.split_at(pos);
-        let g = gutter.trim();
-        if !g.is_empty() && g.chars().all(|c| c.is_ascii_digit()) {
-            return rest
-                .strip_prefix("| ")
-                .unwrap_or_else(|| rest.strip_prefix('|').unwrap_or(rest));
-        }
-    }
-    line
-}
-
-/// Per-file call arguments for a multi-file `edit` block, or `None` if the
-/// arguments are not one.
-///
-/// Each entry is a complete single-file argument value in the same form a
-/// genuine single-file call would carry, so passing it to the normal renderers
-/// yields exactly what that call would have rendered.
-fn multi_file_blobs(args: &Value) -> Option<Vec<Value>> {
-    crate::edit_blocks::per_file_blocks(args).map(|blocks| {
-        blocks
-            .into_iter()
-            .map(|b| Value::Object([("blocks".into(), Value::String(b))].into_iter().collect()))
-            .collect()
-    })
-}
-
-fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
-    let obj = args.as_object();
-    let get_str = |key: &str| obj.and_then(|o| o.get(key)).and_then(|v| v.as_str());
-    let get_u64 = |key: &str| obj.and_then(|o| o.get(key)).and_then(|v| v.as_u64());
-
-    match name.to_lowercase().as_str() {
-        "read" | "read_file" => {
-            let path = get_str("path").unwrap_or("");
-            let offset = get_u64("offset").unwrap_or(0);
-            let limit = get_u64("limit").unwrap_or(0);
-            let mut s = format!("read {}", path);
-            // `offset` is 0-based; `limit` is a count. Display is 1-based, so the
-            // affected window is [offset+1, offset+limit]. A zero `limit` means
-            // "to end of file" -> omit the (optional) range.
-            if limit > 0 {
-                s.push_str(&format!(" [{}..{}]", offset + 1, offset + limit));
-            } else if offset > 0 {
-                s.push_str(&format!(" [{}..]", offset + 1));
-            }
-            (s, Vec::new())
-        }
-        "bash" => {
-            // Show the *entire* command line; never shorten it. Prefix with `$`
-            // so it reads like a shell prompt. The canonical field is "command";
-            // old sessions may have "cmd".
-            let cmd = get_str("command")
-                .or_else(|| get_str("cmd"))
-                .unwrap_or("")
-                .trim();
-            (format!("$ {}", cmd), Vec::new())
-        }
-        "sed" | "sed_preview" => {
-            // Like `bash`, show what was asked for: the path, then the script on
-            // one line, `$`-prefixed so it reads as a command. The long "review
-            // these and pass them to `edit`" sentence stays in the tool result,
-            // where the model reads it — putting it in the panel spent a human's
-            // screen on instructions meant for the model.
-            let path = get_str("path").unwrap_or("");
-            let one_line = get_str("expressions")
-                .unwrap_or("")
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .collect::<Vec<_>>()
-                .join("; ");
-            let mut label = format!("sed {path}");
-            if !one_line.is_empty() {
-                label.push_str(&format!("  $ {}", truncate(&one_line, 56)));
-            }
-            // The body needs the *result* (the blocks), which this function does
-            // not have; `display_tool_result` renders those instead.
-            (label, Vec::new())
-        }
-        s if s.starts_with("grep") => {
-            // Grep tool: show pattern (from "pattern" or "pat") and path.
-            let pat = get_str("pattern").or_else(|| get_str("pat")).unwrap_or("");
-            let path = get_str("path").unwrap_or("");
-            (format!("grep {} {}", pat, path), Vec::new())
-        }
-        s if s == "ls" || s.starts_with("list") => {
-            // `ls` (canonical) or `list_dir` / `List*` (old): shorten to `ls`.
-            let path = get_str("path").unwrap_or("");
-            (format!("ls {}", path), Vec::new())
-        }
-        "edit" | "edit_file" => {
-            // The canonical form (`edits` array) is what `on_tool_call` hands us;
-            // the model-facing blob (`blocks` string) is what we get when
-            // canonicalization failed, so resolve that here rather than printing
-            // a phantom diff. A blob that still won't resolve (malformed, or
-            // spanning files) yields no edits at all, and the label below then
-            // carries no range and no diff — which is the honest rendering.
-            let canonical = crate::edit_blocks::canonicalize_edit_value(args);
-            // Prefer the canonical `path`: resolving a blob can *supply* one
-            // from a header line, which the raw args may not carry at all.
-            let path = canonical
-                .get("path")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .or_else(|| get_str("path"))
-                .unwrap_or("");
-            let obj = canonical.as_object();
-            let edits: Vec<EditOp> = if let Some(edits_array) =
-                obj.and_then(|o| o.get("edits")).and_then(|v| v.as_array())
-            {
-                edits_array
-                    .iter()
-                    .filter_map(|e| {
-                        Some(EditOp {
-                            old_text: e.get("oldText")?.as_str()?.to_string(),
-                            new_text: e.get("newText")?.as_str()?.to_string(),
-                            start_line: e
-                                .get("startLine")
-                                .and_then(|v| v.as_u64())
-                                .map(crate::config::EditStartLine),
-                            origin: None,
-                        })
-                    })
-                    .collect()
-            } else if let (Some(old), Some(new)) = (get_str("oldText"), get_str("newText")) {
-                // Legacy single-edit shape (accepted but undocumented).
-                vec![EditOp {
-                    old_text: old.to_string(),
-                    new_text: new.to_string(),
-                    start_line: None,
-                    origin: None,
-                }]
-            } else {
-                vec![]
-            };
-            let (range, diff) = if !edits.is_empty() {
-                edit_preview(path, &edits)
-            } else {
-                // Old format: old/new fields.
-                let old = get_str("old").unwrap_or("");
-                let new_str = get_str("new").unwrap_or("");
-                edit_preview(
-                    path,
-                    &[EditOp {
-                        old_text: old.to_string(),
-                        new_text: new_str.to_string(),
-                        start_line: None,
-                        origin: None,
-                    }],
-                )
-            };
-            let mut s = format!("edit {}", path);
-            if let Some(r) = range {
-                s.push_str(&format!(" [{}]", r));
-            }
-            (s, diff)
-        }
-        _ => {
-            let first = obj
-                .and_then(|o| o.values().next())
-                .map(|v| match v {
-                    Value::String(s) => s.clone(),
-                    _ => v.to_string(),
-                })
-                .unwrap_or_else(|| args.to_string());
-            let cap = name
-                .chars()
-                .next()
-                .map(|c| c.to_uppercase().collect::<String>() + &name[1..])
-                .unwrap_or_else(|| name.to_string());
-            (
-                format!("{} {}", cap, truncate(&first.replace('\n', " "), 50)),
-                Vec::new(),
-            )
-        }
-    }
-}
-
-/// Best-effort line range + diff preview for an edit tool call.
-///
-/// The refined unified diff for **every** edit in the batch is derived from
-/// each edit's `old_text` vs `new_text`, so all diffs render even when the file
-/// can't be read or `old_text` has drifted (e.g. session replay after the edit
-/// already applied). Each unioned `@@` hunk header already conveys the change
-/// regions, so small batches concatenate their diffs directly with no
-/// separators or labels; very large batches are truncated so the preview
-/// doesn't flood the scrollback. The 1-based line *range* in the label
-/// reflects the first edit and requires reading the file and finding its
-/// `old_text`; otherwise the range is omitted but the diffs are still shown.
-/// Empty edits yield `(None, [])`.
-fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec<String>) {
-    let first = match edits.first() {
-        Some(e) => e,
-        None => return (None, Vec::new()),
-    };
-
-    // The refined diffs are derived purely from each edit's oldText vs newText,
-    // so they are always available — even during replay or after the target text
-    // has drifted in the on-disk file. Only the 1-based line *range* requires
-    // reading the file and finding `old_text` in its current contents; a
-    // missing/read-error file or a no-longer-present oldText degrades to a
-    // `None` range while still yielding the diff previews.
-    const MAX_OUT: usize = 80;
-    let mut diff: Vec<String> = Vec::new();
-    let mut truncated = false;
-
-    for edit in edits {
-        if diff.len() >= MAX_OUT {
-            truncated = true;
-            break;
-        }
-        for line in refined_diff_lines(&edit.old_text, &edit.new_text) {
-            if diff.len() >= MAX_OUT {
-                truncated = true;
-                break;
-            }
-            diff.push(line);
-        }
-        if truncated {
-            break;
-        }
-    }
-
-    if truncated {
-        diff.push("    … (diff truncated)".to_string());
-    }
-
-    let range = (|| {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return None;
-        };
-        let idx = content.find(&first.old_text)?;
-        // 1-based line number of the first line of `old_text`.
-        let start = content[..idx].matches('\n').count() + 1;
-        let end = start + first.old_text.matches('\n').count();
-        Some(if start == end {
-            format!("{start}")
-        } else {
-            format!("{start}..{end}")
-        })
-    })();
-
-    (range, diff)
-}
-
-/// The opening words of every `bsed` preview result (`crates/bsed` emits two
-/// banner shapes — "N blocks for PATH" and "N block(s) in M of K file(s) under
-/// DIR" — and both start with this).
-const SED_PREVIEW_BANNER: &str = "sed preview: ";
-
-/// Render a `sed` preview result as diff lines, or `None` if it is not one.
-///
-/// Identified by that banner, **not** by "the text happens to contain
-/// `@@@OLD`". This renderer is applied to *every* tool result before the
-/// result-specific ones, and the `edit` tool's own argument errors embed the
-/// fixed `Expected:` example (`blockedit::wire::EDIT_ARGS_EXAMPLE`) — which is a
-/// well-formed block. So a content sniff parsed the example out of the error,
-/// drew it as a phantom `-`/`+` diff, and returned before the error itself was
-/// ever rendered; its trailing "summary" was the error's first line cut at the
-/// first `@@@OLD`, which is the one *inside backticks* mid-sentence. The banner
-/// is a property of the result rather than of panel state (a replayed result
-/// arrives with no `last_tool`), so it is what this keys on.
-///
-/// The banner is kept verbatim (it is the part that says how many blocks are
-/// shown, whether growth ran, and what was *not* included) and each block's
-/// contents become `-`/`+` pairs under a hunk header carrying its anchor. An
-/// empty `NEW` — a deletion — simply has no `+` lines.
-fn sed_preview_body(result: &str) -> Option<Vec<String>> {
-    if !result.starts_with(SED_PREVIEW_BANNER) {
-        return None;
-    }
-    let parsed = crate::edit_blocks::parse_blocks(result).ok()?;
-
-    let mut out: Vec<String> = Vec::new();
-    let mut summary = String::new();
-    // The banner is model-facing; only the parts a human needs are lifted out —
-    // the counts as a closing line, and any NOTE, which is a warning about what
-    // is *missing* from the preview and must not be scrolled past.
-    if let Some(first) = result.find("@@@OLD") {
-        for line in result[..first].lines() {
-            let t = line.trim();
-            if t.is_empty() {
-                continue;
-            }
-            if t.starts_with("NOTE:") {
-                out.push(t.to_string());
-            } else if summary.is_empty() {
-                // "sed preview: 3 blocks for src/x.rs (1 expression). Review ..."
-                // → "3 blocks in src/x.rs from 1 expression"
-                summary = short_banner(t);
-            }
-        }
-    }
-
-    for e in &parsed.edits {
-        let old_n = e.old_text.lines().count().max(1) as u64;
-        let new_n = e.new_text.lines().count().max(1) as u64;
-        let at = e.start_line.unwrap_or(0);
-        out.push(format!("@@ -{at},{old_n} +{at},{new_n} @@"));
-        for line in e.old_text.lines() {
-            out.push(format!("- {line}"));
-        }
-        for line in e.new_text.lines() {
-            out.push(format!("+ {line}"));
-        }
-    }
-
-    if !summary.is_empty() {
-        out.push(String::new());
-        out.push(summary);
-    }
-    Some(out)
-}
-
-/// Condense the model-facing banner into one line for a human.
-///
-/// The banner is written for the model — it ends with an instruction about
-/// passing the blocks to `edit`, which is noise to someone reading a panel —
-/// so keep the counts and the file, drop the instruction.
-fn short_banner(banner: &str) -> String {
-    // "sed preview: 3 blocks for src/x.rs (1 expression). Review the blocks ..."
-    let head = banner
-        .split(". ")
-        .next()
-        .unwrap_or(banner)
-        .trim_end_matches('.');
-    let head = head.strip_prefix("sed preview: ").unwrap_or(head);
-    let (counts, file) = match head.find(" for ") {
-        Some(i) => (&head[..i], head[i + 5..].trim()),
-        None => (head, ""),
-    };
-    // The parenthetical is moved out of the path rather than left to be printed
-    // twice.
-    let (file, exprs) = match file.split_once(" (") {
-        Some((f, rest)) => (f, rest.strip_suffix(')').unwrap_or(rest)),
-        None => (file, ""),
-    };
-    let mut out = String::new();
-    if !counts.is_empty() {
-        out.push_str(counts);
-        // "3 blocks for x" → "3 blocks in x"; keep the counts wording otherwise.
-        if !file.is_empty() {
-            out.push_str(" in");
-        }
-    }
-    if !file.is_empty() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(file);
-    }
-    if !exprs.is_empty() {
-        out.push_str(&format!(", from {exprs}"));
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1425,64 +847,6 @@ src/x.rs:9
             );
         }
     }
-}
-
-/// Build a refined unified-diff preview of `old -> new`.
-///
-/// Uses Myers diff (via `similar`) so only genuinely changed regions show up,
-/// each with two lines of context. Changed lines are emitted as `<marker>
-/// <content>` (`-` removed, `+` added) and unchanged context as `<marker>
-/// <content>` with `<marker>` a single space — the space after the marker keeps
-/// all content columns aligned and matches `tool_panel`'s `- ` / `+ ` diff
-/// detection. Lines are free of trailing newlines, so `tool_panel` can reflow
-/// them without inserting spurious blank rows. A cap keeps pathological
-/// replacements (e.g. replacing the whole file) from flooding the scrollback.
-fn refined_diff_lines(old: &str, new: &str) -> Vec<String> {
-    const MAX: usize = 60;
-    const CONTEXT: usize = 2;
-
-    let diff = TextDiff::from_lines(old, new);
-    let mut unified = diff.unified_diff();
-    unified.context_radius(CONTEXT);
-
-    let mut out: Vec<String> = Vec::new();
-    let mut truncated = false;
-
-    for hunk in unified.iter_hunks() {
-        for (idx, change) in hunk.iter_changes().enumerate() {
-            if idx == 0 {
-                // Emit a hunk header as its own neutral context line.
-                out.push(format!("{}", hunk.header()));
-                if out.len() >= MAX {
-                    truncated = true;
-                    break;
-                }
-            }
-            if out.len() >= MAX {
-                truncated = true;
-                break;
-            }
-            let marker = match change.tag() {
-                ChangeTag::Delete => "-",
-                ChangeTag::Insert => "+",
-                ChangeTag::Equal => " ",
-            };
-            // `from_lines` includes the trailing newline on each value; strip it
-            // so `tool_panel` wraps the line as one physical row. The space
-            // after the marker keeps `- ` / `+ ` recognizable to `tool_panel`
-            // and aligns context lines with changed lines.
-            let value = change.value().trim_end_matches('\n');
-            out.push(format!("{marker} {value}"));
-        }
-        if truncated {
-            break;
-        }
-    }
-
-    if truncated {
-        out.push("    … (diff truncated)".to_string());
-    }
-    out
 }
 
 impl ConsoleOutput {
@@ -2001,35 +1365,11 @@ impl ConsoleOutput {
         self.reset_renderer_gaps();
     }
 
-    /// Paint the dark-grey tool-panel background behind `content`, which already
-    /// carries any *foreground* ANSI it needs — dim text, red/green diff
-    /// markers, or syntax-highlight tokens from `highlight_code_fg`. The
-    /// background is re-applied after every internal `\x1b[0m` the highlighter
-    /// emitted, so the grey stays solid across a whole line even when the
-    /// content changes foreground color several times. `indent` leaves one
-    /// leading column so the line reads as a command's *output*; padding uses
-    /// display-column width so wide/CJK characters keep the panel edge aligned.
+    /// Emit one dark-grey tool-panel row: [`content::panel::panel_row`] builds
+    /// the grey background around `content` (which already carries its own
+    /// foreground ANSI), and this writes it with the `ResponseTool` kind.
     fn paint_panel(&self, content: &str, indent: bool) {
-        const BG: &str = "\x1b[48;2;22;22;26m";
-        const RESET: &str = "\x1b[0m";
-        // Prepend the background and re-apply it after each reset, so a token's
-        // own `\x1b[0m` cannot drop the grey behind the rest of the line.
-        let painted = format!("{BG}{}", content.replace(RESET, &format!("{RESET}{BG}")));
-        let vis = UnicodeWidthStr::width(strip_ansi(&painted).as_str());
-        let width = self.term_width();
-        let pad = if width == 0 {
-            0
-        } else if indent {
-            width.saturating_sub(vis + 1)
-        } else {
-            width.saturating_sub(vis)
-        };
-        let lead = if indent {
-            format!("{BG} ")
-        } else {
-            String::new()
-        };
-        let row = format!("{lead}{painted}{BG}{}{RESET}", " ".repeat(pad));
+        let row = content::panel::panel_row(content, indent, self.term_width());
         // Hard-coded `ResponseTool`: a panel is a tool block, and tool blocks
         // only ever occur between `begin_response` and `end_response`. Nothing
         // here is ever drawn as anything else, so there is no caller to pass a
@@ -2043,37 +1383,13 @@ impl ConsoleOutput {
         );
     }
 
-    /// Render one full-width dark-grey panel row for plain `text` (no ANSI).
-    /// `text` is wrapped to the available width and painted dim (or red for
-    /// errors); `-`/`+` diff markers keep their red/green. For pre-styled /
-    /// syntax-highlighted content, call `paint_panel` directly.
+    /// Emit a full-width panel for plain `text`: each wrapped+styled line (see
+    /// [`content::panel::tool_row_contents`]) becomes one [`Self::paint_panel`]
+    /// row.
     fn tool_panel(&self, text: &str, is_error: bool, indent: bool) {
-        let width = self.term_width();
-        // When indented, leave one column for the indent; keep the background
-        // full-width in both cases.
-        let inner = if indent {
-            width.saturating_sub(1).max(1)
-        } else {
-            width.max(1)
-        };
-        let lines = if text.is_empty() {
-            vec![String::new()]
-        } else {
-            wrap_with_diff_markers(text, inner)
-        };
-        for line in lines {
-            // Foreground-only styling here; `paint_panel` adds the grey
-            // background (and re-applies it across any internal resets).
-            let content = if is_error {
-                style(line.clone()).red().to_string()
-            } else if let Some(rest) = line.strip_prefix("- ") {
-                format!("{}{}", style("-").red(), style(format!(" {rest}")).dim())
-            } else if let Some(rest) = line.strip_prefix("+ ") {
-                format!("{}{}", style("+").green(), style(format!(" {rest}")).dim())
-            } else {
-                style(line.clone()).dim().to_string()
-            };
-            self.paint_panel(&content, indent);
+        let contents = content::panel::tool_row_contents(text, is_error, indent, self.term_width());
+        for content in &contents {
+            self.paint_panel(content, indent);
         }
     }
 }
@@ -2307,22 +1623,6 @@ pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> St
         "{STATUS_RESET}{STATUS_BG}{air}{dot}{DOT}{gap}{STATUS_FG}{}{line}{STATUS_RESET}",
         " ".repeat(pad)
     )
-}
-
-/// The theme the answer renderer is built with: colours and clickable links on
-/// a terminal, plain otherwise. Shared with the tests, whose "what did the
-/// renderer alone produce" reference has to agree with it byte for byte or the
-/// comparison flags styling as host contribution. `color` is the primary
-/// stream's caps (`ConsoleOutput`), pinned by the one test that asks.
-fn answer_theme(color: bool) -> Theme {
-    if color {
-        Theme {
-            clickable_links: true,
-            ..Theme::default()
-        }
-    } else {
-        Theme::no_color()
-    }
 }
 
 /// Buffered reasoning bytes awaiting routing. See
@@ -2767,7 +2067,7 @@ impl Output for ConsoleOutput {
         // rewrites the text, and a message that exactly fills the width wraps
         // onto another row (§9 #6). Measuring the bytes removes the guess *and*
         // the DSR that used to correct for it.
-        let block = format!("{} {}\n", style("⏺").cyan(), termimad::inline(text));
+        let block = content::text::system_message(text);
         self.write_content_kinded(
             &at_line_start(block.as_bytes()),
             Some(ContentDisplayKind::SystemMessage),
@@ -3085,57 +2385,8 @@ impl Output for ConsoleOutput {
         limit: usize,
         persona: Option<&str>,
     ) {
-        let width = self.term_width();
-        let avatar = [
-            "    ▄     ▄    ",
-            "   ███   ███   ",
-            "  ███████████  ",
-            " ███ █   █ ███ ",
-            " █████████████ ",
-            "   ███   ███   ",
-            "  ██       ██  ",
-        ];
-
-        // One counted block: the greeter's height used to be a hardcoded 9
-        // (blank + 3 avatar lines + blank + status), which is a guess like the
-        // ones this phase exists to remove.
-        let mut block = String::from("\n");
-        for line in avatar {
-            let padding = width.saturating_sub(15) / 2;
-            block.push_str(&format!("{}{}\n", " ".repeat(padding), style(line).cyan()));
-        }
-        block.push('\n');
-
-        let status = |active, label, color: fn(StyledObject<String>) -> StyledObject<String>| {
-            let s = style(format!("[{}] {}", if active { "x" } else { " " }, label));
-            if active {
-                color(s)
-            } else {
-                s.dim()
-            }
-        };
-
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "unknown".into());
-
-        block.push_str(&format!(
-            "{} | {} ({})",
-            style("picocode").bold(),
-            style(provider).cyan(),
-            style(model).blue(),
-        ));
-
-        if let Some(p) = persona {
-            block.push_str(&format!(" | {}", style(p).magenta()));
-        }
-
-        block.push_str(&format!(
-            " | {} | {} | {}\n",
-            status(yolo, "yolo", |s| s.red()),
-            style(format!("limit:{}", limit)).yellow(),
-            style(cwd).dim()
-        ));
+        let block =
+            content::text::header_block(provider, model, yolo, limit, persona, self.term_width());
         self.write_content(block.as_bytes());
     }
 

@@ -4160,7 +4160,7 @@ mod tests {
         // marked and every continuation indented under the option text.
         use crate::slashdot_menu::render::{paint_rows, LogicalLine};
         let long = "deepseek:deepseek-v4-flash ctx 1048576 $0.000000435/0.00000087 per M (est) and some extra trailing text to force a wrap";
-        let wrapped = crate::output::wrap(long, 60);
+        let wrapped = crate::content::text::wrap(long, 60);
         assert!(wrapped.len() > 1, "long option must wrap at 60 cols");
         let s = paint_rows(&[LogicalLine::new(wrapped.join("\n"))], Some(0), &[], 60);
         assert!(s.heights[0] > 1, "the option wraps: {:?}", s.heights);

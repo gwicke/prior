@@ -320,7 +320,7 @@ impl SlashDotNode for ModelNode {
         // the summary is what you read if one of them was unclear.
         if let Some(d) = entry.as_ref().and_then(|e| e.description.as_deref()) {
             lines.extend(
-                crate::output::wrap(d, width.saturating_sub(indent.len()).max(20))
+                crate::content::text::wrap(d, width.saturating_sub(indent.len()).max(20))
                     .into_iter()
                     .map(|l| format!("{indent}{l}")),
             );
@@ -350,9 +350,12 @@ impl SlashDotNode for ModelNode {
                     .map(crate::settings_editor::summarize)
                     .unwrap_or_else(|| "not configured".to_string());
                 lines.extend(
-                    crate::output::wrap(&summary, width.saturating_sub(indent.len() + 7).max(20))
-                        .into_iter()
-                        .map(|l| format!("{indent}defaults: {l}")),
+                    crate::content::text::wrap(
+                        &summary,
+                        width.saturating_sub(indent.len() + 7).max(20),
+                    )
+                    .into_iter()
+                    .map(|l| format!("{indent}defaults: {l}")),
                 );
             }
             lines.push(format!("{indent}ctrl-e to edit these settings"));
