@@ -704,7 +704,11 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                 "call {i} must carry one file only: {blocks}"
             );
             // The id is derived, not minted, so both split sites agree.
-            assert_eq!(calls[i].id.to_string(), format!("t1~f{i}n3"));
+            if i == 0 {
+                assert_eq!(calls[i].id.to_string(), format!("t1"));
+            } else {
+                assert_eq!(calls[i].id.to_string(), format!("t1~f{i}n3"));
+            }
             // A synthesized call has no provider id or signature: Anthropic
             // keys tool_result on the id it issued, and N copies of one would
             // be unmatchable.
@@ -715,7 +719,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // Three results, one per call, paired by that same derived id.
         let results = results_of(&out[1]);
         assert_eq!(results.len(), 3, "{:?}", results);
-        assert_eq!(results[0].0, "t1~f0n3");
+        assert_eq!(results[0].0, "t1");
         assert_eq!(results[1].0, "t1~f1n3");
         assert_eq!(results[2].0, "t1~f2n3");
         assert!(results[0].1.contains("Replaced 1 block(s) in ./a.rs"));

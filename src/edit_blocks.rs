@@ -26,8 +26,15 @@ pub fn split_id(
     i: usize,
     n: usize,
 ) -> rig_core::message::ToolCallId {
-    rig_core::message::ToolCallId::new(format!("{orig}~f{i}n{n}"))
-        .expect("a derived id is never empty")
+    // Use the original tool call ID for the first file, only assign derived IDs for additional
+    // files. This ensures that the original tool call ID has a valid matching result, which some
+    // providers (e.g. deepseek) require within a turn.
+    if i == 0 {
+        orig.clone()
+    } else {
+        rig_core::message::ToolCallId::new(format!("{orig}~f{i}n{n}"))
+            .expect("a derived id is never empty")
+    }
 }
 
 /// Split one multi-file `edit` call's `blocks` argument into one blob per file,

@@ -32,6 +32,9 @@ and link a doc/ and/or commit hash
   - More aggressive truncation for long `read` / `bash` outputs
 - [ ] Strip reasoning content for older aborted / failed turns once a newer turn completes
       successfully with a final answer.
+- [x] Multi-file edits - Error: Provider rejected the request (HTTP 400); An assistant message with
+      'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
+      (insufficient tool messages following tool_calls message)
 
 ## Cleanup
 

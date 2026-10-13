@@ -2714,7 +2714,11 @@ mod tests {
                 "block form must not persist: {args}"
             );
             // The derived id is the same one the result half uses.
-            assert_eq!(calls[i].id.to_string(), format!("t1~f{i}n2"));
+            if i == 0 {
+                assert_eq!(calls[i].id.to_string(), format!("t1"));
+            } else {
+                assert_eq!(calls[i].id.to_string(), format!("t1~f{i}n2"));
+            }
             assert!(calls[i].provider.is_none());
             assert!(calls[i].signature.is_none());
         }
