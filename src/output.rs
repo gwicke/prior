@@ -1091,9 +1091,10 @@ impl Output for ConsoleOutput {
     }
 
     fn begin_batch(&self) -> BatchGuard<'_> {
-        // The mechanics (flag, debug assert) live on `Draw`; only the guard,
-        // which has to name an `Output` for its drop, is this layer's.
-        if self.content.manager.lock().unwrap().draw().begin_batch() {
+        // The mechanics (flag, debug assert, the deferred reposition) live on
+        // the hub (step 4e); only the guard, which has to name an `Output`
+        // for its drop, is this layer's.
+        if self.content.manager.lock().unwrap().begin_batch() {
             BatchGuard { out: Some(self) }
         } else {
             BatchGuard { out: None }
@@ -1101,12 +1102,7 @@ impl Output for ConsoleOutput {
     }
 
     fn end_batch(&self) {
-        self.content
-            .manager
-            .lock()
-            .unwrap()
-            .draw()
-            .end_batch(self.term_width());
+        self.content.manager.lock().unwrap().end_batch();
     }
 
     /// Bracketed, and — where the previous content was also a committed
@@ -1141,11 +1137,13 @@ impl Output for ConsoleOutput {
         policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
+        // Through the hub, not straight to `Draw` (step 4e): a frame no
+        // composition produced clears the hub's recipe, so a content write
+        // must not re-emit an area that is no longer on screen.
         self.content
             .manager
             .lock()
             .unwrap()
-            .draw()
             .draw_frame(frame, policy, dims)
     }
 

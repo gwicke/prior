@@ -19,14 +19,16 @@
 //! Since 4d the manager is also content's only way onto the screen: the
 //! content path hands each formatted block over as a [`ContentWrite`]
 //! (`render_content` / `render_batch`), and nothing above the manager
-//! writes bytes of its own. What remains of the design's shape comes with
-//! the steps that give it meaning: batching and the recipe field (4e),
-//! the compose + content round trip of `render(Some(w))` with the frame
-//! verbs (4f), and the element stack (4h).
+//! writes bytes of its own; 4e made it batching's and reposition's home
+//! too (the guard, the recipe). What remains of the design's shape comes
+//! with the steps that give it meaning: the compose + content round trip
+//! of `render(Some(w))` with the frame verbs (4f), and the element stack
+//! (4h).
 
 use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
-use crate::draw::{el_if_short, plan_consume, ApplyPolicy, Draw};
+use crate::draw::{el_if_short, plan_consume, plan_reposition, ApplyPolicy, Draw};
 use crate::slashdot_menu::table::display_width;
 use crate::termio::TermSize;
 use tokio::sync::watch;
@@ -430,12 +432,12 @@ pub(crate) struct ContentWrite {
 /// The frame hub (design §Render layer): where a composition comes to be
 /// budgeted, rendered, applied and remembered. Step 4b moved the pipeline
 /// here — what was `Output::draw_elements`' default body — 4c moved the
-/// drawing edge (`Draw`) under this roof, and 4d made this the content
-/// path's only door onto the screen (the `ContentWrite` hand-off below).
-/// What remains of the design's shape comes with the steps that give it
-/// meaning: batching and the recipe field (4e, when reposition stops
-/// reading it from `DrawCache`), the frame verbs off the watch and the
-/// compose + content round trip (4f), and the element stack (4h).
+/// drawing edge (`Draw`) under this roof, 4d made this the content
+/// path's only door onto the screen (the `ContentWrite` hand-off below),
+/// and 4e moved batching and reposition here with the recipe they re-
+/// draw. What remains of the design's shape comes with the steps that
+/// give it meaning: the frame verbs off the watch and the compose +
+/// content round trip (4f), and the element stack (4h).
 pub struct RenderManager {
     /// The drawing edge (step 4c): the byte sink and its live-screen
     /// bookkeeping, owned — the design's `Draw { … }` under this roof. Plain
@@ -446,6 +448,19 @@ pub struct RenderManager {
     /// Content bytes only — frame bytes can never be caught, which is the
     /// deliberate narrowing over the old writer swap.
     captured: Option<Vec<u8>>,
+    /// The last composition, kept as its **recipe** — the element list, not
+    /// the rendered rows it produced (ui_draw_v2 §5.1.1). [`Self::reposition_area`]
+    /// re-draws this instead of recomposing: re-rendering is cheap and always
+    /// current, where the rendered rows would be a snapshot of whatever the
+    /// status said at the moment of compose.
+    ///
+    /// The hub's since 4e (it moved out of `DrawCache` with reposition): the
+    /// recipe belongs to the composition `render` applied, so a direct
+    /// [`Self::draw_frame`] — one no composition produced — clears it, and a
+    /// later `render` overwrites it. Deliberately *not* retired by a
+    /// consume or note: those retire the frame's *position*, and the recipe
+    /// is exactly what survives it.
+    recipe: Vec<Element>,
     /// The fraction of the frame's terminal height the area may occupy —
     /// [`configure`](Self::configure)'s, resolved against the render's
     /// height on every call.
@@ -468,6 +483,7 @@ impl RenderManager {
         Self {
             draw: Draw::new(size.clone()),
             captured: None,
+            recipe: Vec::new(),
             frame_max_row_ratio: FRAME_MAX_ROW_RATIO,
             size,
         }
@@ -517,12 +533,29 @@ impl RenderManager {
         let heights = allocate(&extents, self.budget(th));
         let frame = render(&stack, &heights, tw);
         let applied = self.draw.draw_frame(&frame, policy, dims);
-        // Moved, never copied: the recipe belongs to the composition that built
-        // it, and `DrawCache` is where the content path reads it — until the
-        // hub takes reposition (4e). Written together, so the recipe and the
-        // geometry it was rendered at can never be read apart.
-        self.draw.remember_compose(stack, applied);
+        // Moved, never copied: the recipe belongs to the composition that
+        // built it, and the hub is where reposition reads it (step 4e).
+        // Written after the apply, so the recipe that described the *last*
+        // paint is never the one a concurrent content write re-renders.
+        self.recipe = stack;
+        self.draw.cache.applied = Some(applied);
         applied
+    }
+
+    /// Apply a frame that no composition produced *through this hub* —
+    /// `ui::resolve`'s empty frame, the direct `Output::draw_frame` paths,
+    /// tests. Whatever recipe recorded itself no longer describes the
+    /// screen, so it is cleared — the counterpart of [`Self::render`]
+    /// storing its own right after. (The clear moved here from
+    /// `Draw::draw_frame` with the recipe, step 4e.)
+    pub(crate) fn draw_frame(
+        &mut self,
+        frame: &Frame,
+        policy: ApplyPolicy,
+        dims: (usize, usize),
+    ) -> (usize, usize) {
+        self.recipe.clear();
+        self.draw.draw_frame(frame, policy, dims)
     }
 
     // --- the content hand-off (step 4d, design §Content/§Render) -----------
@@ -538,20 +571,70 @@ impl RenderManager {
 
     /// One content block on the replay path (§Render): bulk writes, one
     /// per call inside a batch, with the frame's re-emit deferred to a
-    /// final regular apply. Today the deferral is the same `batch_active`
-    /// flag the streaming path obeys inside [`Self::put_content`] — the
-    /// two verbs are one choreography under two names until the batching
-    /// guard moves here (4e) and the batch's deferral becomes its own
-    /// semantics rather than the shared flag's.
+    /// final regular apply. The guard that opens such a batch is this
+    /// module's too ([`ContentBatchGuard`], step 4e); the deferral itself
+    /// is still the shared `batch_active` flag inside [`Self::put_content`]
+    /// — the two verbs remain one choreography under two names until the
+    /// design's final regular `render()` — compose + content in one call —
+    /// replaces the guard's `end_batch` reposition (4f/4h).
     pub(crate) fn render_batch(&mut self, content: ContentWrite) {
         self.put_content(content);
     }
 
     /// Is a content batch open — its writes defer the frame's re-emit to
-    /// the guard's drop? The read side of `Draw`'s flag, for the content
+    /// the guard's drop? The read side of the flag, for the content
     /// hand-off to pick its verb.
     pub(crate) fn batching(&self) -> bool {
         self.draw.cache.batch_active
+    }
+
+    /// Raise the batch flag if none is open; `true` means the caller's guard
+    /// owns the batch (and must [`Self::end_batch`] on drop). The hub's
+    /// since 4e — batching defers *reposition*, and reposition is the hub's.
+    ///
+    /// Flat, not recursive: a nested open adds no state, because the outer
+    /// batch already covers everything written inside it. So it collapses to
+    /// `false` — only the guard that raised the flag ever clears it, which is
+    /// what keeps a stray inner scope from ending the outer batch's
+    /// repositioning early.
+    ///
+    /// The assert exists because that collapse is *silent*: `false` ends
+    /// nothing, and someone who wrote an inner batch almost certainly meant an
+    /// independent one. Loud where it is free (debug builds), and harmless
+    /// where it is not (release keeps batching correctly) — rather than a
+    /// missing redraw to chase at runtime.
+    pub(crate) fn begin_batch(&mut self) -> bool {
+        debug_assert!(
+            !self.draw.cache.batch_active,
+            "batches do not nest: this begin_batch is a no-op, because the \
+             open batch above already covers everything written inside it"
+        );
+        if self.draw.cache.batch_active {
+            return false;
+        }
+        self.draw.cache.batch_active = true;
+        true
+    }
+
+    /// End the open batch: emit the deferred frame once, at this manager's
+    /// watched width (ui_draw_v2 R5). Called by [`ContentBatchGuard`]'s
+    /// drop; a no-op when no batch is open or nothing was deferred.
+    pub(crate) fn end_batch(&mut self) {
+        // The width the deferred frame re-renders at is this manager's own
+        // watched geometry — the same channel `Content` formats at, with
+        // the same 20-column floor as `Content::width` and the
+        // `term_width` free function.
+        let width = self.size.borrow().width.max(20);
+        if !self.draw.cache.batch_active {
+            return;
+        }
+        self.draw.cache.batch_active = false;
+        let Some(taken) = self.draw.cache.deferred.take() else {
+            return;
+        };
+        let bytes = self.reposition_area(width, taken);
+        let _ = self.draw.writer.write_all(bytes.as_bytes());
+        let _ = self.draw.writer.flush();
     }
 
     /// True while a capture is open on the content hand-off (design
@@ -577,6 +660,57 @@ impl RenderManager {
             .expect("end_capture without begin_capture")
     }
 
+    /// The area's re-emit: re-render the stored recipe (§5.1.1) and walk it
+    /// to where the content write left off. Moved here from `Draw` in 4e —
+    /// the hub owns reposition, and the recipe is the hub's.
+    ///
+    /// Re-render rather than replay `taken`: a `Frame` is a snapshot of the
+    /// status as of the last compose, and the bar moves without the REPL
+    /// composing — `set_status` at turn start, the dot at
+    /// `begin_response`/`end_response`. The recipe is the thing that stays
+    /// current, which is why the hub keeps it and not the rendered rows.
+    ///
+    /// `taken` is not a formality: it is the fallback when no recipe recorded
+    /// itself — a frame applied without a composition behind it (a test, or
+    /// a direct `draw_frame`). Falling back keeps the invariant that matters
+    /// more than freshness, I5: an area that was consumed is always put
+    /// back, so a half-consumed frame is never left stranded on screen.
+    pub(crate) fn reposition_area(&mut self, width: usize, taken: Frame) -> String {
+        let tw = width.max(1);
+        let th = self.draw.size.borrow().height.max(1);
+        // The consumed frame's height is the `old_h` of the below-frame clear
+        // (`old_h - h_new - consumed_rows`) — read before `taken` moves into
+        // the fallback below.
+        let old_h = taken.height();
+        let frame = if self.recipe.is_empty() {
+            taken
+        } else {
+            let heights = {
+                let extents: Vec<Extent> = self.recipe.iter().map(Element::extent).collect();
+                // The hub's own budget (step 4e): the recipe re-renders at
+                // the same knob `render` composes under, so a configured
+                // ratio cannot make the two disagree.
+                allocate(&extents, self.budget(th))
+            };
+            render(&self.recipe, &heights, tw)
+        };
+        // **A frame with no rows has nothing to put back.** `ui::resolve` clears
+        // a dialog by applying `Frame::empty()`, and `plan_apply` records that
+        // as a live frame of height 0 — so a content write right after a
+        // resolve consumes a zero-height area. Repositioning it would ask
+        // `plan_reposition` to paint nothing, which is a no-op at best and a
+        // `debug_assert!(h > 0)` panic in a debug build at worst. Returning
+        // empty is the honest answer: there is no area to re-emit, and the
+        // tracked row already moved with the content that consumed it. The
+        // accumulator goes with it — a stale count would misplace the *next*
+        // reposition's below-frame clear.
+        if frame.height() == 0 {
+            self.draw.cache.consumed_rows = 0;
+            return String::new();
+        }
+        plan_reposition(&mut self.draw.cache, &frame, old_h, tw, th)
+    }
+
     /// The choreography every content write takes (moved from
     /// `Content::with_content_writer` in 4d): consume the live frame, put
     /// the block down at the fold, advance the tracked cursor by its
@@ -584,7 +718,6 @@ impl RenderManager {
     /// batch is open, whose guard's drop emits it once (ui_draw_v2 R5).
     fn put_content(&mut self, content: ContentWrite) {
         let ContentWrite { bytes, rows, width } = content;
-        let Self { draw, captured, .. } = self;
         // **Consume, then write** (ui_draw_v2 §4.5 P1 / ui_draw_261001): the
         // walk goes ahead of the bytes — cursor movement, straight to the
         // writer, never through content's row counter — and the content
@@ -592,7 +725,7 @@ impl RenderManager {
         // walk: each line clears the row it enters, and rows the content
         // never reaches are the reposition's `old_h` tail to clear in its
         // own pass.
-        let (walk, taken) = match plan_consume(&mut draw.cache) {
+        let (walk, taken) = match plan_consume(&mut self.draw.cache) {
             Some((walk, frame)) => (walk, Some(frame)),
             // No live area: the cursor is wherever the last write left it,
             // which is where the content belongs. Nothing to walk and no
@@ -601,22 +734,22 @@ impl RenderManager {
             None => (String::new(), None),
         };
         if !walk.is_empty() {
-            let _ = draw.writer.write_all(walk.as_bytes());
+            let _ = self.draw.writer.write_all(walk.as_bytes());
         }
         // The tap (design §Content): with a capture open the block's bytes
         // stop here — exactly as Content produced them, content only. The
         // choreography runs either way: the cursor advance and the consume
         // are facts about the screen, and a capture does not pause it.
-        match captured.as_mut() {
+        match self.captured.as_mut() {
             Some(cap) => cap.extend_from_slice(&bytes),
             None => {
-                let _ = draw.writer.write_all(&bytes);
-                let _ = draw.writer.flush();
+                let _ = self.draw.writer.write_all(&bytes);
+                let _ = self.draw.writer.flush();
             }
         }
         // Zero rows means nothing moved, and a frame stays live.
         if rows > 0 {
-            draw.note_lines(rows);
+            self.draw.note_lines(rows);
         }
         // The area comes back below what was just written — re-rendered
         // rather than replayed, so its status row is whatever it is *now*:
@@ -629,7 +762,7 @@ impl RenderManager {
         // Inside a batch the reposition waits: the frame stays consumed for
         // the whole burst and the guard's drop emits it once (ui_draw_v2 R5).
         let taken = {
-            let cache = &mut draw.cache;
+            let cache = &mut self.draw.cache;
             if taken.is_some() || cache.deferred.is_some() {
                 cache.consumed_rows += rows;
             }
@@ -648,9 +781,45 @@ impl RenderManager {
             }
         };
         if let Some(taken) = taken {
-            let bytes = draw.reposition_area(width, taken);
-            let _ = draw.writer.write_all(bytes.as_bytes());
-            let _ = draw.writer.flush();
+            let bytes = self.reposition_area(width, taken);
+            let _ = self.draw.writer.write_all(bytes.as_bytes());
+            let _ = self.draw.writer.flush();
+        }
+    }
+}
+
+/// Ends a content batch when dropped — see [`RenderManager::begin_batch`].
+/// The hub's since 4e: batching defers *reposition*, and reposition is the
+/// hub's, so the guard names the hub rather than a `Content` (its step-3d
+/// shape) or an `Output` ([`crate::output::BatchGuard`]). Both exist so that
+/// forgetting to end a batch — which would suppress a reposition forever,
+/// stranding a consumed area on screen — is unreachable rather than merely
+/// documented.
+pub struct ContentBatchGuard<'a> {
+    /// `Some` when this guard owns the batch (raised the flag); `None` when
+    /// it collapsed into an open one, whose guard owns it.
+    manager: Option<&'a Arc<Mutex<RenderManager>>>,
+}
+
+impl<'a> ContentBatchGuard<'a> {
+    /// Open a batch over `manager`: the flag goes up, and the returned
+    /// guard's drop emits the deferred frame once. A nested open collapses
+    /// (see [`RenderManager::begin_batch`]).
+    pub(crate) fn open(manager: &'a Arc<Mutex<RenderManager>>) -> Self {
+        if manager.lock().unwrap().begin_batch() {
+            ContentBatchGuard {
+                manager: Some(manager),
+            }
+        } else {
+            ContentBatchGuard { manager: None }
+        }
+    }
+}
+
+impl Drop for ContentBatchGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(manager) = self.manager {
+            manager.lock().unwrap().end_batch();
         }
     }
 }
@@ -743,9 +912,9 @@ mod tests {
             "applied size remembered"
         );
         assert_eq!(
-            manager.draw.cache.element_stack.len(),
+            manager.recipe.len(),
             2,
-            "the recipe is remembered where the content path reads it"
+            "the recipe is remembered on the hub, where reposition reads it"
         );
     }
 

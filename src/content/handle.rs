@@ -472,8 +472,9 @@ impl Content {
         // writes inside a batch and hands off as `render_batch`, the
         // streaming path as `render_content` — today one body under both
         // names, the batch flag inside deferring the reposition (ui_draw_v2
-        // R5) either way. 4e, where the guard moves to the hub, is when the
-        // batch's deferral can become its own semantics.
+        // R5) either way. The guard moved to the hub in 4e; the deferral
+        // stays the shared flag's until the final `render()` round trip
+        // (4f/4h) gives `render_batch` its own end.
         if mgr.batching() {
             mgr.render_batch(write);
         } else {
@@ -1296,33 +1297,6 @@ impl Content {
         self.write_content(block.as_bytes());
     }
 
-    /// Open a batch of content writes: `Draw`'s reposition is suppressed until
-    /// the returned guard drops, which emits the frame once (ui_draw_v2 R5).
-    ///
-    /// Batching belongs to content because the thing being deferred is
-    /// `Draw`'s — so the guard names a `Content`, not an `Output` (step 3d).
-    /// With the seam set nothing reaches `Draw`, so there is no batch to open.
-    pub(crate) fn begin_batch(&self) -> ContentBatchGuard<'_> {
-        if self.tap.is_some() {
-            return ContentBatchGuard { content: None };
-        }
-        ContentBatchGuard {
-            content: self
-                .manager
-                .lock()
-                .unwrap()
-                .draw()
-                .begin_batch()
-                .then_some(self),
-        }
-    }
-
-    /// End the open batch: emit the deferred frame once, at this handle's
-    /// watched width. Called by [`ContentBatchGuard`]'s drop.
-    pub(crate) fn end_batch(&self) {
-        self.manager.lock().unwrap().draw().end_batch(self.width());
-    }
-
     /// Begin capturing everything content hands to the hub (§4: capture is
     /// content's, tapped at the hand-off — step 4d reads each
     /// `ContentWrite` exactly as `render()` receives it: content bytes
@@ -1357,23 +1331,6 @@ impl Content {
 
 /// Buffered reasoning bytes awaiting routing. See
 /// [`ConsoleOutput::reasoning_sink`].
-/// Ends a content batch when dropped — see [`Content::begin_batch`]. The
-/// content twin of [`crate::output::BatchGuard`]: both exist so that
-/// forgetting to end a batch (which would suppress a reposition forever) is
-/// unreachable rather than merely documented, but this one names the handle it
-/// batches for.
-pub struct ContentBatchGuard<'a> {
-    content: Option<&'a Content>,
-}
-
-impl Drop for ContentBatchGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(content) = self.content {
-            content.end_batch();
-        }
-    }
-}
-
 pub(crate) struct ReasoningSink {
     buf: Vec<u8>,
     to_stderr: bool,

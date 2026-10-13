@@ -329,10 +329,15 @@ pub(crate) fn replay_units(content: &Content, units: &[ReplayUnit], start: usize
     // Ctrl-Z restore — arrive here, so this is the one place the batching has
     // to be declared.
     //
+    // The guard names the hub, not the content (step 4e): batching defers
+    // *reposition*, and reposition is the hub's. The manager handle comes
+    // from beside `Content` — the handle its own layer holds down to
+    // (design §Content: content holds `Arc<Mutex<RenderManager>>`).
+    //
     // Deliberately *not* around live streaming: `stream_text` enters the same
     // writer once per delta, and there the per-write re-emit is what keeps the
     // input row visible while text flows past it.
-    let _batch = content.begin_batch();
+    let _batch = crate::render::ContentBatchGuard::open(&content.manager);
     // No leading-separator bookkeeping: a turn's prompt brackets itself, and
     // the rule that used to be forced between turns *after* the first is
     // the closing rule of the turn above. Compaction markers are not turns

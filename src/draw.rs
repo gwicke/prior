@@ -18,7 +18,7 @@
 use std::io::{self, Write};
 
 use crate::ansi::{HIDE_CURSOR, SHOW_CURSOR};
-use crate::render::{allocate, live_budget, render, Element, Extent, Frame};
+use crate::render::Frame;
 use crate::slashdot_menu::table::display_width;
 use crate::termio::TermSize;
 use tokio::sync::watch;
@@ -59,16 +59,6 @@ pub(crate) struct DrawCache {
     /// bottom survive. Never cleared by invalidation.
     screen_bottom: usize,
     live: Option<LiveFrame>,
-    /// The last composition, kept as its **recipe** — the element list, not the
-    /// rendered rows it produced (ui_draw_v2 §5.1.1). §4.5's content path
-    /// re-draws this instead of recomposing: re-rendering is cheap and always
-    /// current, where the rendered rows would be a snapshot of whatever the
-    /// status said at the moment of compose.
-    ///
-    /// Deliberately *not* cleared by `note_lines`, `plan_consume` or an
-    /// invalidation — those retire the frame's *position*, and the recipe is
-    /// exactly what survives it. A later `draw_elements` overwrites it.
-    pub(crate) element_stack: Vec<Element>,
     /// The size the last `draw_elements` actually applied (clamped), i.e. what
     /// the *next* compose can assume about what is on screen — the answer to
     /// "has the terminal changed shape since?" (ui_draw_v2 §9 #3).
@@ -108,12 +98,12 @@ pub(crate) struct DrawCache {
     /// The frame taken by a batch's *first* consume, held until the batch
     /// ends.
     ///
-    /// Needed because `reposition_area` falls back to `taken` when no recipe
-    /// recorded itself — reachable in production by `draw_frame` called
-    /// directly (`ui::resolve`'s empty frame), which applies a frame and
-    /// clears `element_stack`. Without this stash a batch would consume that
-    /// area and its final reposition would find an empty recipe and render
-    /// nothing, so the area would never return.
+    /// Needed because the hub's `reposition_area` falls back to `taken` when
+    /// no recipe recorded itself — reachable in production by a direct
+    /// `draw_frame` (`ui::resolve`'s empty frame), which applies a frame and
+    /// clears the hub's recipe. Without this stash a batch would consume
+    /// that area and its final reposition would find an empty recipe and
+    /// render nothing, so the area would never return.
     pub(crate) deferred: Option<Frame>,
 }
 
@@ -123,7 +113,6 @@ impl DrawCache {
             caret: (1, 0),
             screen_bottom: term_h.max(1),
             live: None,
-            element_stack: Vec::new(),
             applied: None,
             batch_active: false,
             consumed_rows: 0,
@@ -755,13 +744,6 @@ impl Draw {
         // source for both phases of the frame (ui_draw_v2 §9 #3). Clamped
         // to what `plan_apply` stores as the live frame's `term_w`/`term_h`.
         let (tw, th) = (dims.0.max(1), dims.1.max(1));
-        // The recipe belongs to whatever composed *this* frame. Reaching
-        // `draw_frame` directly (a test, `ui::resolve`'s empty frame) means
-        // nothing composed an area, so the previous one is not what is on
-        // screen any more — and a content write must not re-emit it.
-        // `RenderManager::render` re-stores immediately after, so its own
-        // composition survives the clear.
-        self.cache.element_stack.clear();
         let bytes = plan_apply(&mut self.cache, frame, policy, tw, th);
         let _ = self.writer.write_all(bytes.as_bytes());
         // The cursor follows the frame's own caret. A composed frame with one is
@@ -788,55 +770,6 @@ impl Draw {
         // Advance the tracked cursor and drop the frame region — the write that
         // called us moved the cursor off the frame (plan §4.2).
         self.cache.note_lines(n, h);
-    }
-
-    /// The area's re-emit: re-render the stored recipe (§5.1.1) and walk it to
-    /// where the content write left off.
-    ///
-    /// Re-render rather than replay `taken`: a `Frame` is a snapshot of the
-    /// status as of the last compose, and the bar moves without the REPL
-    /// composing — `set_status` at turn start, the dot at
-    /// `begin_response`/`end_response`. The recipe is the thing that stays
-    /// current, which is why `DrawCache` keeps it and not the rendered rows.
-    ///
-    /// `taken` is not a formality: it is the fallback when no recipe recorded
-    /// itself — a frame applied without a composition behind it (a test, or a
-    /// direct `draw_frame`). Falling back keeps the invariant that matters more
-    /// than freshness, I5: an area that was consumed is always put back, so a
-    /// half-consumed frame is never left stranded on screen.
-    pub(crate) fn reposition_area(&mut self, width: usize, taken: Frame) -> String {
-        let tw = width.max(1);
-        let th = self.size.borrow().height.max(1);
-        let cache = &mut self.cache;
-        // The consumed frame's height is the `old_h` of the below-frame clear
-        // (`old_h - h_new - consumed_rows`) — read before `taken` moves into
-        // the fallback below.
-        let old_h = taken.height();
-        let frame = if cache.element_stack.is_empty() {
-            taken
-        } else {
-            let heights = {
-                let extents: Vec<Extent> =
-                    cache.element_stack.iter().map(Element::extent).collect();
-                allocate(&extents, live_budget(th))
-            };
-            render(&cache.element_stack, &heights, tw)
-        };
-        // **A frame with no rows has nothing to put back.** `ui::resolve` clears
-        // a dialog by applying `Frame::empty()`, and `plan_apply` records that
-        // as a live frame of height 0 — so a content write right after a
-        // resolve consumes a zero-height area. Repositioning it would ask
-        // `plan_reposition` to paint nothing, which is a no-op at best and a
-        // `debug_assert!(h > 0)` panic in a debug build at worst. Returning
-        // empty is the honest answer: there is no area to re-emit, and the
-        // tracked row already moved with the content that consumed it. The
-        // accumulator goes with it — a stale count would misplace the *next*
-        // reposition's below-frame clear.
-        if frame.height() == 0 {
-            cache.consumed_rows = 0;
-            return String::new();
-        }
-        plan_reposition(cache, &frame, old_h, tw, th)
     }
 
     /// Sync the tracked row with the terminal's real cursor, write any
@@ -881,57 +814,6 @@ impl Draw {
             (size.width.max(1), size.height.max(1))
         })
     }
-
-    /// Raise the batch flag if none is open; `true` means the caller's guard
-    /// owns the batch (and must [`Draw::end_batch`] on drop).
-    ///
-    /// Flat, not recursive: a nested open adds no state, because the outer
-    /// batch already covers everything written inside it. So it collapses to
-    /// `false` — only the guard that raised the flag ever clears it, which is
-    /// what keeps a stray inner scope from ending the outer batch's
-    /// repositioning early.
-    ///
-    /// The assert exists because that collapse is *silent*: `false` ends
-    /// nothing, and someone who wrote an inner batch almost certainly meant an
-    /// independent one. Loud where it is free (debug builds), and harmless
-    /// where it is not (release keeps batching correctly) — rather than a
-    /// missing redraw to chase at runtime.
-    pub(crate) fn begin_batch(&mut self) -> bool {
-        debug_assert!(
-            !self.cache.batch_active,
-            "batches do not nest: this begin_batch is a no-op, because the \
-             open batch above already covers everything written inside it"
-        );
-        if self.cache.batch_active {
-            return false;
-        }
-        self.cache.batch_active = true;
-        true
-    }
-
-    /// End the open batch: emit the deferred frame once, at `width`
-    /// (ui_draw_v2 R5).
-    pub(crate) fn end_batch(&mut self, width: usize) {
-        if !self.cache.batch_active {
-            return;
-        }
-        self.cache.batch_active = false;
-        let Some(taken) = self.cache.deferred.take() else {
-            return;
-        };
-        let bytes = self.reposition_area(width, taken);
-        let _ = self.writer.write_all(bytes.as_bytes());
-        let _ = self.writer.flush();
-    }
-
-    /// Remember the composition so §4.5's content path can re-draw it, and the
-    /// size it was applied at.
-    pub(crate) fn remember_compose(&mut self, stack: Vec<Element>, applied: (usize, usize)) {
-        // The recipe and the geometry it was rendered at describe one paint
-        // and are written together.
-        self.cache.element_stack = stack;
-        self.cache.applied = Some(applied);
-    }
 }
 
 #[cfg(test)]
@@ -941,7 +823,7 @@ mod apply_tests {
     //! tests use — so the cache transitions and the emitted bytes are pinned
     //! together.
     use super::*;
-    use crate::render::render;
+    use crate::render::{render, Element};
     use crate::repl::LineEditor;
     use vt100::Parser;
 
