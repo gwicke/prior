@@ -210,128 +210,124 @@ Ordered so the geometry change lands first — it kills the test coupling that m
 expensive. Each step is independently green and revertible; the `Output` trait survives as a facade
 until the last step.
 
-1. **Extract the modules mechanically** — done (`257e8e3`, `799cd12`, `177aa64`).
-2. **Introduce `TermIO`.** The moves are landed (`74e987c`); the deferred remainder is below.
+### Step 1: Extract the modules mechanically
 
-   > **Deferred to step 4** (the moves landed in `74e987c`): the `TermIO` **type** — the closed
-   > `Tty`/`Plain` enum owning the reader and folding `TermGuard`, plus `TermHandles` and the
-   > `recording()`/`null()` constructors — rides with the step-4 ownership restructure. So do the
-   > three `Output` trait-default size queries (`cursor_row`/`frame_size`/`painted_size`) that still
-   > fall back to a live `crossterm::terminal::size()` (non-console outputs only; `ConsoleOutput`
-   > already reads the watch). The loop-top resize probe is deliberate, not a leftover.
-3. **Split `content/`.** Move classification, the separator matrix, the write pipeline, and the
-   content rendering there; add the `Content` handle and switch `AgentConfig.output` →
-   `AgentConfig.content`, along with `AppState.output` and the settings test helpers. `ConfirmPort`
-   unchanged.
+done (`257e8e3`, `799cd12`, `177aa64`).
 
-   **Transition contract (pre-RenderManager).** `render()` / `ContentWrite` arrive in step 4, so
-   step 3 cannot hand off to the hub yet. The shape it must hold to:
+### Step 2: Introduce `TermIO`
 
-   - `Content` is the new agent-facing handle. It *owns* content classification
-     (`ContentDisplayKind`), the separator matrix (`boundary_spacer`, `last_content_*`,
-     `held_blank`), the block write pipeline (`with_content_writer`), and the renderers; it holds a
-     cloned **width watch** (from step 2) and formats at the current watched width per block; it
-     writes bytes through the existing `Arc<dyn Output>` sink unchanged.
-   - **Frame methods stay on `Output`** for now (`draw_frame`, `draw_elements`, `frame_size`,
-     `painted_size`, `begin_batch`, DSR, `set_status`). `Content` carries a *temporary*
-     pass-through to its sink for the few frame calls the agent still makes on the same handle
-     (turn/pumps `frame_size`, `set_status`, `paint`, `begin_batch`). That pass-through dissolves
-     in step 4, when RenderManager becomes the frame front door.
-   - **The status line is pure UI — no content path.** `set_status` / `StatusText` /
-     `status_text()` / `BarModel` / `status_bar` / `status_line` / `Element::status` are the
-     frame's, never Content's. The row is a `RenderElement` (`Element::status` today, moving into
-     `ui/` with step 4) that formats *itself* on each `render()` from the `Arc<Mutex<StatusText>>`
-     the push fills — content never composes or writes it. In step 3 `set_status` simply rides the
-     frame pass-through above; nothing under `content/` may absorb any of these symbols.
-   - **Sinks untouched**: Quiet/No/Recording/Log remain `Output` impls and stay the byte
-     sink; `begin_capture`/`end_capture` still tap at the sink. Re-pointing capture at the
-     `ContentWrite` hand-off is step 4/5.
-   - **Exactly one content writer.** Every content writer — agent, `interactive.rs`, repl
-     (`display_text`/`display_committed_prompt`/`display_plain`), tools/session — routes through the
-     single `Content`, so the shared boundary state stays consistent. A repl write bypassing
-     `Content` would corrupt the matrix.
-   - `ConfirmPort` / `confirm.rs` untouched; `Confirmation` (output.rs:25) stays put.
+The moves are landed (`74e987c`); the deferred remainder is below.
 
-   **Landed (3a–3d — commits `47122b4` … `cf7b6a8`):** classification + separator matrix and
-   boundary state in `content/composition.rs`; rendering in
-   `content/{markdown,panel,preview,text}.rs`; the `Content` handle in `content/handle.rs`
-   (content state, width watch, streaming renderers, the `Draw` sink, the block write pipeline +
-   panel emitters, the content API); and step 3d, which made `Content` the handle every content
-   consumer reaches:
+> **Deferred to step 4** (the moves landed in `74e987c`): the `TermIO` **type** — the closed
+> `Tty`/`Plain` enum owning the reader and folding `TermGuard`, plus `TermHandles` and the
+> `recording()`/`null()` constructors — rides with step 4 (**4a**). So do the three
+> `Output` trait-default size queries (`cursor_row`/`frame_size`/`painted_size`) that still fall
+> back to a live `crossterm::terminal::size()` (non-console outputs only; `ConsoleOutput` already
+> reads the watch) — step 4 **4g**. The loop-top resize probe is deliberate, not a leftover.
 
-   - **`AgentConfig { content: Arc<Content>, output: Arc<dyn Output> }` — a dual field**, the
-     transition the §4 sketch compresses into one. `AgentConfig::content_for(&output)` wires the
-     seam: content verbs short-circuit through `output`, so `RecordingOutput` / `QuietOutput` /
-     `NoOutput` keep capturing and discarding with no render stack behind them (§4's `tap`).
-     `ConsoleOutput.content` is now `Arc<Content>` shared with the config through
-     `ConsoleOutput::content()`, so the two handles are one state; `--quiet` gets a tapped
-     `Content`, production the console's own (tap `None`, renders for real).
-   - **Agent core repointed:** `CodeAgent` and `LoggingHook` carry `content` (the hook held
-     `output` and used it only for content), so `turn.rs` / `build.rs` display, stream and response
-     calls go through `self.content` while frame calls (`set_status`, `frame_size`,
-     `paint`/`settle`) stay on `self.output`. `interactive.rs`, `agent.rs`, `compaction`,
-     `v25_replay` and `v25_session` follow.
-   - **Content-only helpers take `&Content`,** params renamed `output` → `content`: `render_turn`,
-     `replay_units`, `replay_last_turns`, `handle_replay`, `replay_last_turn_silent`,
-     `retry_summarization`, `resume_session`, `Repl::batch_slash` + `batch_commit`. They brought
-     `Content::begin_batch` + `ContentBatchGuard` (batching suppresses `Draw`'s reposition, so it
-     is content's) and gave `read_input` a second, `content` param beside `output` for its resize
-     repaint.
-   - Test knobs a shared `Arc<Content>` cannot field-assign: `reasoning_on_stderr` is now an
-     `AtomicBool` with a `#[cfg(test)]` setter, and `Draw::set_writer(&self)` replaces the direct
-     writer swap.
+### Step 3: Split `content/`
 
-   **Step 3 is complete.** The transition contract's structural debts are step-4/5 by nature and
-   are collected there; they are named here so none is lost:
+Landed 3a–3d (`47122b4` … `cf7b6a8`) — the commit messages record what moved where. What it leaves
+behind, for the steps below:
 
-   - `with_content_writer`'s byte-production half (`WrapLines`/EL stack) lives in `Content` but is
-     Draw-coupled; splitting it into `ContentWrite` handed to `render()` is step 4.
-   - `begin_capture`/`end_capture` tap the sink (`content.draw.saved_writer`), not the
-     `ContentWrite` hand-off — step 4/5.
-   - The moved rendering's unit tests still live in `output.rs`'s test modules → relocate to
-     `content/` when convenient.
+- `with_content_writer`'s byte-production half (`WrapLines`/EL stack) lives in `Content` but is
+  Draw-coupled; splitting it into `ContentWrite` handed to `render()` — **4d**.
+- `begin_capture`/`end_capture` tap the sink (`content.draw.saved_writer`), not the `ContentWrite`
+  hand-off — **4d** re-taps them there.
+- The moved rendering's unit tests still live in `output.rs`'s test modules → relocate to `content/`
+  when convenient (nothing claims it yet).
 
-   *Resolved (was: frame pass-through shape):* the agent carries **two handles** — `Content` for
-   content, `output` for frame/input — rather than `Content` growing method refs to its sink. The
-   cost is the dual field and one dual-parameter helper (`read_input`), both listed under step 4.
-4. **Fold in `RenderManager` and UI.** `configure` / `render` / `render_batch`; convert elements to
-   `Arc<Mutex<…>>` with the shared editor; move element construction into `ui/`/repl.
+### Step 4: Fold in `RenderManager` and UI
 
-   Follow-ups step 3 leaves here:
+`configure` / `render` / `render_batch`; convert elements to `Arc<Mutex<…>>` with the shared editor;
+move element construction into `ui/`/repl.
 
-   - **Re-point the frame helpers' content calls.** `settle` (`repl.rs:1329`, `:1351`),
-     `emit_commit` (`repl.rs:2266`) and `confirm::paint` (`confirm.rs:336`) take `&dyn Output` and
-     reach content through `ConsoleOutput`'s forwarders. Once each holds a `Content` (or a hub that
-     owns one) those forwarders go dead and `Output` shrinks to frame + input.
-   - **Collapse `read_input`'s two params.** It carries `output: &dyn Output` *and*
-     `content: &Content`; step 4 gives the frame/input half to RenderManager + the repl's `input`
-     channel, leaving one handle.
-   - **Re-home the agent's frame verbs.** `CodeAgent.output` survives only for `set_status`,
-     `frame_size` and `paint`/`settle`'s `&dyn Output`; `turn.rs`/`pumps.rs` re-point those at
-     RenderManager and the field goes. Same for `interactive.rs`'s `run_entry_dsr`,
-     `turn_backoff_pump`, `get_user_input`, and `app_state.rs:761`'s `run_editor`.
-   - **Decide where batching lives.** `Content::begin_batch`/`ContentBatchGuard` suppress `Draw`'s
-     reposition; if RenderManager owns reposition, the guard moves to the hub and `replay_units`
-     takes that instead of `Content`.
-   - **Re-shape the tap.** `Content::tap` is `Option<Arc<dyn Output>>`; once the trait is gone it
-     becomes a verb recorder (`FnMut` / sink) or folds into capture. `content_for` then reduces to
-     a quiet-vs-record switch, and `RecordingOutput`/`ScriptOutput` lose their content duties.
-   - **Revisit the interior-mutability stopgaps.** The `AtomicBool` routing flag and
-     `Draw::set_writer` exist only because `Content` is shared behind an `Arc`; both may fold into
-     the tap once the handle's shape settles.
-5. **Delete `output.rs`.** Remove the sinks, the dead taps (`LogOutput`),
-   and the trait; prune `lib.rs` re-exports.
+**Commit plan (4a–4h; each independently green — suite, fmt, clippy).** Ownership moves first,
+call-site repoints after; the design-led element conversion closes the step — last, where there is
+most runway to expand into separate sub-commits.
 
-   Follow-ups step 3 leaves here:
+- **4a — `TermIO { Tty | Plain }` as a closed type.** The step-2 deferral's first half: the enum
+  owning the reader and folding `TermGuard`, plus `TermHandles` and the `recording()`/`null()`
+  constructors. Mechanical `termio.rs` restructure + wiring; no behavior change.
+- **4b — `RenderManager` shell: composition + apply leave the `Output` trait.** New type in
+  `render.rs` — `{ stack, size: SizeWatch }` with `configure` / `render()` / `render_batch`;
+  `render()`'s body is today's `draw_elements` default (compose → allocate → render → apply →
+  `remember_compose`). Apply still paints through a `Draw` it is *given* — no ownership move yet.
+  Repl/confirm/ui call sites switch to the manager handle; `Output::draw_elements` /
+  `remember_compose` shrink to forwards. Frame-max-ratio resolution moves into `configure`.
+- **4c — `Draw` moves into `RenderManager`; `Content` gets the manager handle.**
+  `with_content_writer`, the capture writer-swap and the frame pass-through lock
+  `Arc<Mutex<RenderManager>>` instead of owning `draw: Draw`; `ConsoleOutput` shares the same Arc.
+  Kills the `content.draw` forwarders and frees `Content` for the `ContentWrite` split; tests can
+  lock the manager for `&mut`, so `Draw::set_writer` should fall here too.
+- **4d — `ContentWrite` + the `render()` hand-off; capture taps early.** Split
+  `with_content_writer`: emitters collect rows into `ContentWrite { lines, stream: Stream }` rather
+  than `&mut dyn io::Write`, and `Content` hands it to `render(Some(w))` (streaming) or
+  `render_batch(w)` (replay). **Capture re-taps here** — `begin_capture`/`end_capture` read the
+  hand-off (content bytes only; `draw_frame` bytes can never be caught) and `Draw::saved_writer`'s
+  writer-swap retires. Afterwards `Content` never touches Draw/writer: the end-state's "every write
+  enters through `render()`" holds, modulo the quiet/record tap.
+- **4e — Batching guard → the hub** (its own commit, deliberately). `Content::begin_batch` /
+  `ContentBatchGuard` move to `RenderManager`; `replay_units` and friends take the manager handle
+  beside `Content`. Settles "where batching lives": the hub owns reposition.
+- **4f — Frame verbs re-home: agent, interactive, repl, confirm.** `CodeAgent.output`'s last verbs:
+  `set_status` → a `StatusText` push the bar element reads on each `render()`,
+  `frame_size`/`painted_size` → the size watch, `paint`/`settle` → the manager. `settle`,
+  `emit_commit` and `confirm::paint`/`resolve` take content + manager instead of `&dyn Output`;
+  `run_entry_dsr`, `turn_backoff_pump`, `get_user_input`, `app_state`'s `run_editor` →
+  manager/TermIO; `read_input` collapses to one handle. `AgentConfig.output` survives this commit
+  for input — dropping it is step 5.
+- **4g — Suspend/resume + DSR through the manager; dead size fallbacks die.**
+  `RenderManager::suspend()` becomes the front door (content/UI never touch TermIO), DSR is
+  answered inside TermIO, and the three `Output` trait-default size queries still falling back to a
+  live `crossterm::terminal::size()` go — non-console outputs read the watch. The loop-top resize
+  probe stays (deliberate, step-2 note).
+- **4h — Elements → `Arc<Mutex<…>>`; construction into `ui/`** (design-led, kept last for runway;
+  expect it to split). `Element = Arc<Mutex<dyn RenderElement>>` with the shared editor held live
+  across compositions; `Element::status` moves into `ui/`; `ui.rs` becomes a `ui/` module (menu
+  chrome + bar); element construction centralizes in `ui/` + repl; `render.rs` becomes the
+  RenderManager home.
 
-   - **Drop `AgentConfig.output`,** reaching the §4 target `AgentConfig { content, confirm_port }`.
-     `AgentConfig::content_for` and `ConsoleOutput::content()` exist only for the dual field and go
-     with it, as does `ConsoleOutput` itself — ending the `Arc<Content>` sharing.
-   - **Retire the `Output`-shaped sinks.** `QuietOutput`/`NoOutput`/`RecordingOutput`/`ScriptOutput`
-     remain only for `content_for` + the frame handle; with the tap re-shaped (step 4) content is
-     covered and the frame is gone. `LogOutput` (§10) dies here regardless.
-   - **Capture narrows to the `ContentWrite` hand-off** — content bytes only, never frames (§4: the
-     writer swap also catches `draw_frame` bytes today).
+Follow-ups step 3 leaves here — each claimed by a commit above unless noted:
+
+- **Re-point the frame helpers' content calls.** `settle` (`repl.rs:1329`, `:1351`), `emit_commit`
+  (`repl.rs:2266`) and `confirm::paint` (`confirm.rs:336`) take `&dyn Output` and reach content
+  through `ConsoleOutput`'s forwarders. Once each holds a `Content` (or a hub that owns one) those
+  forwarders go dead and `Output` shrinks to frame + input. → **4f**
+- **Collapse `read_input`'s two params.** It carries `output: &dyn Output` *and*
+  `content: &Content`; step 4 gives the frame/input half to RenderManager + the repl's `input`
+  channel, leaving one handle. → **4f**
+- **Re-home the agent's frame verbs.** `CodeAgent.output` survives only for `set_status`,
+  `frame_size` and `paint`/`settle`'s `&dyn Output`; `turn.rs`/`pumps.rs` re-point those at
+  RenderManager and the field goes. Same for `interactive.rs`'s `run_entry_dsr`,
+  `turn_backoff_pump`, `get_user_input`, and `app_state.rs:761`'s `run_editor`. → **4f**
+- **Decide where batching lives.** `Content::begin_batch`/`ContentBatchGuard` suppress `Draw`'s
+  reposition; if RenderManager owns reposition, the guard moves to the hub and `replay_units` takes
+  that instead of `Content`. → **4e** (answer: the hub owns reposition)
+- **Revisit the interior-mutability stopgaps.** The `AtomicBool` routing flag and `Draw::set_writer`
+  exist only because `Content` is shared behind an `Arc`. `set_writer` should fall in **4c** (the
+  manager's `Mutex` restores `&mut` access); the flag folds with the tap re-shape (step 5) — or
+  earlier if a `Mutex` reads better.
+
+### Step 5: Delete `output.rs`
+
+Remove the sinks, the dead taps (`LogOutput`), and the trait; prune `lib.rs` re-exports.
+
+Follow-ups step 3 leaves here:
+
+- **Drop `AgentConfig.output`,** reaching the §4 target `AgentConfig { content, confirm_port }`.
+  `AgentConfig::content_for` and `ConsoleOutput::content()` exist only for the dual field and go
+  with it, as does `ConsoleOutput` itself — ending the `Arc<Content>` sharing.
+- **Re-shape the tap** (moved here from step 4 — it only pays once the trait is gone).
+  `Content::tap` is `Option<Arc<dyn Output>>`; it becomes a verb recorder (`FnMut` / sink) or folds
+  into capture. `content_for` then reduces to a quiet-vs-record switch, and
+  `RecordingOutput`/`ScriptOutput` lose their content duties.
+- **Retire the `Output`-shaped sinks.** `QuietOutput`/`NoOutput`/`RecordingOutput`/`ScriptOutput`
+  remain only for `content_for` + the frame handle; with the tap re-shaped here content is covered
+  and the frame is gone. `LogOutput` (§10) dies here regardless.
+- **Capture stays at the `ContentWrite` hand-off** — re-tapped early in **4d** (content bytes only,
+  never frames: the old writer-swap also caught `draw_frame` bytes). Nothing to migrate here;
+  verify it as the sinks die.
 
 ## 9. Resolved open questions
 
