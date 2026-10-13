@@ -76,6 +76,10 @@ Compose UI chrome into a RenderElement stack. Same level as Content.
   status, the input the shared editor), joined by transient elements (menus, dialogs) as repl/ui
   state changes. Reuse is why `Element` is `Arc<Mutex<…>>`, not `Box`: the repl mutates the shared
   editor / overlay cursor in place and the next render() paints it.
+- The bar's held state is **raw data, formatted by the bar**: session name, first message, the
+  model fields (provider/model/thinking/context). Its render() pulls the shared state and runs the
+  shaping (name fallback, field list, drop order) and the fit there — pushes store facts, never
+  formatted text, so a mid-turn figure is current at the next render without a re-shaping push.
 - Confirmations are repl dialogs (session state). Batch / one-shot runs have no dialog: gated tools
   there require yolo mode (the sandbox is mandatory).
 

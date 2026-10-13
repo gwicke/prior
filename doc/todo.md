@@ -63,5 +63,6 @@ and link a doc/ and/or commit hash
     until step 4 (follow-ups recorded in the impl doc)
   - [ ] Step 4: fold in `RenderManager` + UI; elements → `Arc<Mutex<…>>`, shared editor (§8.4) —
     sub-commit plan 4a–4h recorded in the impl doc — 4a (`8cc955d`), 4b (`38d9513`), 4c
-    (`33dc92c`), 4d (`98bcb85`), 4e (`bce38e7`) landed; 4f next
+    (`33dc92c`), 4d (`98bcb85`), 4e (`bce38e7`) landed; 4f next, broken into 4f-a…4f-f in the
+    impl doc (4f-a: the bar formats itself from raw data)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)

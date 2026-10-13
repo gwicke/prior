@@ -348,13 +348,62 @@ most runway to expand into separate sub-commits.
   - The two hand-off verbs remain one body under two names (see the 4d note above): the guard
     moving does not itself split the deferral — that is the final-`render()` round trip,
     **4f/4h**.
-- **4f — Frame verbs re-home: agent, interactive, repl, confirm.** `CodeAgent.output`'s last verbs:
-  `set_status` → a `StatusText` push the bar element reads on each `render()`,
-  `frame_size`/`painted_size` → the size watch, `paint`/`settle` → the manager. `settle`,
-  `emit_commit` and `confirm::paint`/`resolve` take content + manager instead of `&dyn Output`;
-  `run_entry_dsr`, `turn_backoff_pump`, `get_user_input`, `app_state`'s `run_editor` →
-  manager/TermIO; `read_input` collapses to one handle. `AgentConfig.output` survives this commit
-  for input — dropping it is step 5.
+- **4f — Frame verbs re-home: agent, interactive, repl, confirm.** The biggest step; broken into
+  sub-commits **4f-a … 4f-f**, each independently green (suite, fmt, clippy). Ownership moves
+  before call-site repoints within each; the deep wiring (TermIO under Draw) closes it.
+  - **4f-a — the bar formats itself from raw data.** Per the design decision on `set_status`: the
+    bar learns to format itself — the push carries *raw data*, and the shaping is pulled into the
+    bar's own render. Concretely: an owned raw type in `agent/status.rs` (session name, first
+    message, and the `BarModel` fields — provider, model, thinking level, context tokens, context
+    window — today's `status_text` *inputs*); the status element holds
+    `Arc<Mutex<…raw…>>` + the streaming flag and runs the shaping (`status_text`: name fallback to
+    the opening-message preview, the field list, the drop order) *and* the fit (`status_bar`) inside
+    `render_at`. The raw-data store moves beside the streaming flag it already shares — onto
+    `Content` (`set_status` becomes a content verb); `Output::set_status`'s callers re-point and
+    the trait verb dies with the rest of the frame surface (or in 4f-b, whichever is last).
+    Byte-identical: same shaping rules, one home later in the pipeline — and a mid-turn figure
+    (context tokens) is now current at the next render without a re-shaping push.
+  - **4f-b — the frame path leaves `&dyn Output`: compose head + `paint`/`settle`/`emit_commit`/
+    confirm on the manager.** With the bar self-contained (4f-a), `compose_area`'s head no longer
+    needs `ConsoleOutput`'s privates: the compose head moves out of `Output` into the paint path —
+    a helper that builds `[status, input, …overlays]` from content's handles (status raw data,
+    streaming) plus the session's elements and calls `manager.render(stack, …)` directly. The
+    head's *final* home is `render()` itself, with the bar an installed element — that much is
+    **4h**; this sub-commit only moves it out of `Output`. `paint_prompt`, `Repl::settle`/`paint`/
+    `emit_commit`, `confirm::paint`/`resolve` take content + manager instead of `&dyn Output`
+    (content for the text verbs and `cursor_row`, which rides the manager); pumps/turn/probe call
+    sites re-point. `is_streaming` leaves the trait with them.
+  - **4f-c — dims: `frame_size`/`painted_size` → the size watch.** The agent-side callers
+    (`pumps.rs`, `turn.rs`, interactive) read the watched size (frame dims) and the manager's
+    applied size (what a resize comparison needs) through the handles `AgentConfig` already
+    carries (`content.manager`, `content.size`). The two `Output` trait verbs and their
+    `ConsoleOutput` impls die.
+  - **4f-d — input collapses to one handle; the `TermGuard` holders convert.** `read_input` takes
+    the handle set (content + manager + the key receiver) rather than `&dyn Output` + guard;
+    `get_user_input`, `run_entry_dsr` (the caller side — the DSR *answer* moving inside TermIO is
+    **4g**), `turn_backoff_pump`, and `app_state`'s `run_editor` re-home to manager/TermIO. The
+    four cloneable `Arc<TermGuard>` holders (Repl, the prompt loop, `$EDITOR`, the back-off pump)
+    convert to the manager/TermIO suspend and the direct guard handle dies (the **4a** leftover).
+    The prompt-loop size probe and the parked-resize drain keep writing the process-wide sender
+    until 4f-e moves it. `AgentConfig.output` is left without a duty the agent itself needs; it
+    stays as a field to step 5's trait deletion unless a holder turns up here.
+  - **4f-e — TermIO into Draw: the setup rework.** TermIO is constructed first (in `Interactive`);
+    its handles are handed out (`input` → repl, `size` clones → content and the manager); caps are
+    probed at TermIO construction and handed to `Content::new` (the `Caps::probe` site leaves
+    content); TermIO moves under Draw — `Draw { term_io, cache }`, the `writer` field dies (Draw
+    writes through the main sink), and the size watch's sender comes under TermIO's roof (the
+    process-wide `LazyLock` dies; 4f-d's probe and drain write through the handle; the few
+    free-function subscribers with no handle are settled here). `TermIO::recording()` takes the
+    byte-edge seam wholesale — the `record_bytes`/`Sink`/`SharedBuf` helpers re-point.
+  - **4f-f — `Stream` + the meta sink; the formatting span unlocks.** `ContentWrite` gains
+    `stream: Stream`; the reasoning-to-stderr decision becomes a *stream* decision (content picks
+    Meta once at setup) and `put_content` routes Main → the screen choreography, Meta → TermIO's
+    meta sink with no choreography (byte-identical to today's `ReasoningSink` stderr bypass, which
+    dies). With the sinks under the hub, `with_content_writer`'s formatting span unlocks — build
+    the `ContentWrite` before the lock, the design's "no hub round-trip" — pending the
+    non-reentrancy proof the 4d note recorded; the last rider, and droppable on its own.
+  Out of 4f: the `render(Some(w))` compose + content round trip (waits for the installed stack,
+  **4h**).
 - **4g — Suspend/resume + DSR through the manager; dead size fallbacks die.**
   `RenderManager::suspend()` becomes the front door (content/UI never touch TermIO), DSR is answered
   inside TermIO, and the three `Output` trait-default size queries still falling back to a live
