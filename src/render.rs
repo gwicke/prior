@@ -514,11 +514,13 @@ impl RenderManager {
     /// `Output::draw_elements`' default body (step 4b), painting through the
     /// [`Draw`] this manager has owned since 4c.
     ///
-    /// The compose head is *not* here: the status row is the console side's
-    /// fact, so the caller composes (`Output::compose_area`) and hands the
-    /// stack in — the status row becomes an installed element in 4h and the
-    /// head moves in with it.
-    pub(crate) fn render(
+    /// The compose head is *not* here: the status row is content's facts
+    /// (raw store + streaming flag), so the caller composes
+    /// (`repl::compose_area`) and hands the stack in — the status row
+    /// becomes an installed element in 4h and the head moves in with it.
+    /// `pub` as the hub's face verb (step 4f-b): out-of-crate drivers (the
+    /// confirm probe) apply frames through it directly.
+    pub fn render(
         &mut self,
         stack: Vec<Element>,
         policy: ApplyPolicy,
@@ -540,6 +542,16 @@ impl RenderManager {
         self.recipe = stack;
         self.draw.cache.applied = Some(applied);
         applied
+    }
+
+    /// Re-anchor the live-screen cache to the real cursor (DSR): the query
+    /// goes through `termio` — the sole stdin owner pauses around the reply
+    /// (step 2 commit C) — and the answer syncs the draw cache. The frame
+    /// verb's home since 4f-b (what `Output::cursor_row` forwarded); the
+    /// query itself moves inside `TermIO` in 4g.
+    pub(crate) fn cursor_row(&mut self) -> usize {
+        let row = crate::termio::query_cursor_row();
+        self.draw.reanchor_to_cursor(row)
     }
 
     /// Apply a frame that no composition produced *through this hub* —

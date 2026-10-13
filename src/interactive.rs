@@ -886,6 +886,7 @@ impl Interactive {
                                 &mut self.line_history,
                                 &self.prompt_str,
                                 &self.guard,
+                                &self.config.content,
                                 self.config.output.as_ref(),
                             ),
                         )
@@ -963,6 +964,7 @@ impl Interactive {
                                 &mut self.line_history,
                                 &self.prompt_str,
                                 &self.guard,
+                                &self.config.content,
                                 self.config.output.as_ref(),
                             ),
                         )

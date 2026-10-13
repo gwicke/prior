@@ -243,7 +243,7 @@ impl CodeAgent {
         if let (Some(sess), Some(hist)) = (it_session.as_deref_mut(), it_history.as_deref_mut()) {
             let _ = sess
                 .settle(
-                    self.output.as_ref(),
+                    self.content.as_ref(),
                     it_label,
                     hist,
                     self.output.frame_size(),
@@ -594,7 +594,7 @@ impl CodeAgent {
                 } => {
                     if let Some(sess) = it_session.as_deref_mut() {
                         sess.open_confirm(req, self.confirm_approvals.clone());
-                        sess.paint(self.output.as_ref(), it_label, self.output.frame_size());
+                        sess.paint(self.content.as_ref(), it_label, self.output.frame_size());
                     }
                 }
 
@@ -624,6 +624,7 @@ impl CodeAgent {
                         it_history.as_deref_mut(),
                         it_label,
                         it_guard,
+                        self.content.as_ref(),
                         self.output.as_ref(),
                         &self.user_cancel,
                         &self.cancel_notify,
@@ -649,7 +650,7 @@ impl CodeAgent {
                     {
                         let dims = self.output.frame_size();
                         let _ = sess
-                            .settle(self.output.as_ref(), it_label, history, dims)
+                            .settle(self.content.as_ref(), it_label, history, dims)
                             .await;
                     }
                 }

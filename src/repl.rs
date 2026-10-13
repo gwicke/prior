@@ -461,6 +461,74 @@ pub(crate) fn overlay_elements(overlay: &ActiveOverlay, term_w: usize) -> Vec<El
     }
 }
 
+/// The area below the status row: `[Input?, Divider?, Overlay?]`.
+///
+/// The *rule*, stated once, for the two callers that must not be able to
+/// disagree about it: [`compose_area`] (production) and
+/// [`Repl::compose_elements`] (the test/grant twin, whose status arrives as a
+/// literal string). The only thing the two genuinely differ on is where the
+/// status row *came from*; how the rest of the area is laid out is this
+/// function's and only this function's (ui_draw_v2 §5.1.1).
+///
+/// `overlay` is empty when there is no menu: a separator with nothing below it
+/// is a rule nobody wanted, and the empty overlay case has no element to draw
+/// either.
+pub(crate) fn area_body(input: Option<Element>, overlay: Vec<Element>) -> Vec<Element> {
+    let mut items = Vec::new();
+    items.extend(input);
+    if !overlay.is_empty() {
+        items.push(Element::divider());
+    }
+    items.extend(overlay);
+    items
+}
+
+/// The area's composition: `[Status?, Blank, Input, Divider?, Overlay…]` —
+/// the compose head, from content's own handles (step 4f-b). The head moved
+/// out of `Output` once the bar became self-formatting (4f-a): presence is
+/// shaped here (an off bar reserves no row) and the row's *content* is
+/// formatted at render from the same raw store, so neither the shape nor the
+/// bytes are anyone's to carry through compose.
+///
+/// The status row takes the **divider's row**, above the input — which is
+/// what makes it permanent and what makes it safe. Being in the frame is
+/// the whole trick: a bar written as content would need a relative erase at
+/// submit, and by then the cursor has moved into the frame region below it,
+/// so the erase would land on the wrong rows. Here the frame's own union
+/// clear takes it, at the one moment the cursor is where the frame says it
+/// is — and the partial row-diff redraws it per keystroke, so the figures
+/// are never stale.
+///
+/// Presence is decided here and the bar's render does not, because presence
+/// is the part that does not move under it: every compose happens after the
+/// cycle's `set_status`, so the flag cannot flip between compose and draw.
+/// What the row says is `Element::status`'s own business, resolved when it
+/// is rendered — and at the width it is rendered at. The head's *final* home
+/// is `render()` itself, with the bar an installed element (**4h**).
+pub(crate) fn compose_area(
+    content: &Content,
+    input: Option<Element>,
+    overlay: Vec<Element>,
+) -> Vec<Element> {
+    let mut items = Vec::new();
+    if !crate::agent::status::status_text(&content.bar.lock().unwrap()).is_off() {
+        // The row between the last content and the bar is the **frame's**,
+        // not the content path's: synthetic content no longer emits a
+        // trailing separator, so without this there would be nothing
+        // between what was written and the status line. Static and part of
+        // the area, so it retires with it — a content write that consumes
+        // the frame takes this row too, and it can never become a
+        // permanent blank in the transcript.
+        items.push(Element::lines(vec![String::new()]));
+        items.push(Element::status(
+            content.bar.clone(),
+            content.streaming.clone(),
+        ));
+    }
+    items.extend(area_body(input, overlay));
+    items
+}
+
 /// Compose and apply the prompt frame: `[Input]`, or
 /// `[Input, Divider, Overlay]` while a pop-up shows (plan §5.2).
 ///
@@ -474,8 +542,12 @@ pub(crate) fn overlay_elements(overlay: &ActiveOverlay, term_w: usize) -> Vec<El
 /// (so a tall pop-up's scroll is followed without a row counter), and the
 /// scroll `delta` and bounded clear live in `plan_apply`. Content *above* the
 /// frame — greeter, status, session — is never touched.
+///
+/// Takes content, not `&dyn Output` (step 4f-b): the compose head reads the
+/// bar's raw store and the streaming flag from it, and the render goes
+/// through the manager content holds down to (design §Content).
 pub(crate) fn paint_prompt(
-    output: &dyn Output,
+    content: &Content,
     label: &str,
     editor: &LineEditor,
     overlay: Vec<Element>,
@@ -484,13 +556,23 @@ pub(crate) fn paint_prompt(
     let dims = (dims.0.max(1), dims.1.max(1));
     // The REPL supplies only what changes: the input, and the menu when one is
     // open. The status row is `compose_area`'s to resolve — it is made of
-    // `status_text` and `streaming`, which are this output's facts and not
-    // something this module may reason about — and so is the divider that
-    // separates the menu from the input above it (ui_draw_v2 §5.1.1).
-    let input = input_element(editor, label, output.is_streaming(), dims.0);
+    // content's own facts and not something this module may reason about —
+    // and so is the divider that separates the menu from the input above it
+    // (ui_draw_v2 §5.1.1).
+    let input = input_element(
+        editor,
+        label,
+        content.streaming.load(std::sync::atomic::Ordering::Relaxed),
+        dims.0,
+    );
     // Composition *and* division are the tail's now: pieces move in and nothing
     // comes back, so no `Vec<Element>` crosses a call site (ui_draw_v2 §5.1.1).
-    let _ = output.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
+    let stack = compose_area(content, Some(input), overlay);
+    content
+        .manager
+        .lock()
+        .unwrap()
+        .render(stack, ApplyPolicy::Frame, dims);
 }
 
 /// Editor content: the prompt on row 0, the wrapped buffer below it.
@@ -1007,7 +1089,7 @@ impl PromptSession {
     /// is already painted.
     pub(crate) async fn settle(
         &mut self,
-        output: &dyn Output,
+        content: &Content,
         prompt: &str,
         history: &mut History,
         dims: (usize, usize),
@@ -1016,7 +1098,7 @@ impl PromptSession {
         // the same one everything else uses, so this is an adapter over
         // `paint_prompt` and not a second composition.
         let redraw = |editor: &LineEditor, overlay: Vec<Element>, dims: (usize, usize)| {
-            paint_prompt(output, prompt, editor, overlay, dims);
+            paint_prompt(content, prompt, editor, overlay, dims);
         };
         // Bound before the `match` on purpose: a future in a match scrutinee
         // lives to the end of the `match`, and it would still hold the borrow
@@ -1025,9 +1107,9 @@ impl PromptSession {
         match eval {
             EvalOutcome::Frame => {}
             EvalOutcome::Commit { line, message } => {
-                Repl::emit_commit(output, &mut self.editor, &redraw, dims, &line, "", history);
+                Repl::emit_commit(content, &mut self.editor, &redraw, dims, &line, "", history);
                 if let Some(text) = message {
-                    output.display_text(&text);
+                    content.display_text(&text);
                 }
                 // Dismiss the overlay and hand control back to the agent loop,
                 // whose convergence step applies the targets this eval wrote.
@@ -1049,12 +1131,12 @@ impl PromptSession {
                 // stranded input region — not because the accounting needs
                 // rescuing.
                 redraw(&LineEditor::new(), Vec::new(), dims);
-                output.display_text(&message);
-                let _ = output.cursor_row();
+                content.display_text(&message);
+                let _ = content.manager.lock().unwrap().cursor_row();
             }
         }
         self.sync_selection();
-        self.paint(output, prompt, dims);
+        self.paint(content, prompt, dims);
         None
     }
 
@@ -1066,12 +1148,12 @@ impl PromptSession {
     /// A confirm *appends* rather than replaces (§3 of
     /// doc/confirm_as_menu_261002.md): it is modal over the menu, and the
     /// prompt that drives that menu stays exactly where it was.
-    pub(crate) fn paint(&self, output: &dyn Output, prompt: &str, dims: (usize, usize)) {
+    pub(crate) fn paint(&self, content: &Content, prompt: &str, dims: (usize, usize)) {
         let mut overlay = overlay_elements(&self.overlay, dims.0);
         if let Some(confirm) = &self.confirm {
             overlay.extend(confirm.elements(dims.0));
         }
-        paint_prompt(output, prompt, &self.editor, overlay, dims);
+        paint_prompt(content, prompt, &self.editor, overlay, dims);
     }
 
     /// Apply one key to the session.
@@ -1482,7 +1564,7 @@ impl Repl {
             // waiting for a key — which is exactly what the turn has instead
             // of a wait.
             if let Some(action) = session
-                .settle(output, prompt, history, (cur_w, cur_h))
+                .settle(content, prompt, history, (cur_w, cur_h))
                 .await
             {
                 return Some(action);
@@ -1607,7 +1689,7 @@ impl Repl {
                                 // the real one and paint that.
                                 session.editor.set("");
                                 paint_prompt(
-                                    output,
+                                    content,
                                     prompt,
                                     &session.editor,
                                     Vec::new(),
@@ -1629,14 +1711,14 @@ impl Repl {
 
     /// The prompt area's composition: `[Status?, Input, Divider?, Overlay…]`.
     ///
-    /// The twin of [`crate::output::Output::compose_area`] — same body
-    /// ([`crate::output::area_body`]), with the status row arriving as a literal
-    /// `&str` rather than a rendered bar. Two callers, and both need it to be
-    /// *this* composition: the tests, which assert against bytes they wrote, and
-    /// [`rows_grant`], which has to know the rows element's allocation before the
-    /// frame exists. Sharing it is what makes a page one screen of rows by
-    /// construction — a second composer here is how the page size and the
-    /// painted height drifted apart in the first place.
+    /// The twin of [`compose_area`] — same body ([`area_body`]), with the
+    /// status row arriving as a literal `&str` rather than a rendered bar.
+    /// Two callers, and both need it to be *this* composition: the tests,
+    /// which assert against bytes they wrote, and [`rows_grant`], which has to
+    /// know the rows element's allocation before the frame exists. Sharing it
+    /// is what makes a page one screen of rows by construction — a second
+    /// composer here is how the page size and the painted height drifted apart
+    /// in the first place.
     pub(crate) fn compose_elements(
         editor: &LineEditor,
         prompt: &str,
@@ -1651,7 +1733,7 @@ impl Repl {
         if let Some(bar) = status {
             items.push(Element::lines(vec![bar.to_string()]));
         }
-        items.extend(crate::output::area_body(Some(input), overlay));
+        items.extend(area_body(Some(input), overlay));
         items
     }
 
@@ -1919,7 +2001,7 @@ impl Repl {
     /// written at the caret, which pushes the tracked row down, so the next
     /// frame apply draws the area below what was just written.
     fn emit_commit<F: Fn(&LineEditor, Vec<Element>, (usize, usize))>(
-        output: &dyn Output,
+        content: &Content,
         editor: &mut LineEditor,
         redraw: &F,
         dims: (usize, usize),
@@ -1947,7 +2029,7 @@ impl Repl {
         // underneath, because the next `redraw` repaints the frame below
         // whatever was just written: content written at the caret pushes the
         // tracked row down, and the next apply clears from *there*.
-        output.display_committed_prompt(line);
+        content.display_committed_prompt(line);
         editor.set(next_input);
     }
 
@@ -2787,7 +2869,7 @@ mod tests {
         // writes, and the real closure's frame apply is covered by the REPL's
         // own tests. Passing a real one here would only add a bar row to search.
         Repl::emit_commit(
-            &out,
+            &out.content,
             &mut editor,
             &|_, _, _| {},
             (80, 24),
@@ -2876,8 +2958,7 @@ mod tests {
         out: &crate::output::ConsoleOutput,
     ) -> impl Fn(&LineEditor, Vec<Element>, (usize, usize)) + '_ {
         move |editor: &LineEditor, overlay: Vec<Element>, dims: (usize, usize)| {
-            let input = input_element(editor, "> ", out.is_streaming(), dims.0);
-            out.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
+            paint_prompt(&out.content, "> ", editor, overlay, dims);
         }
     }
 
@@ -2903,7 +2984,15 @@ mod tests {
             "/model xiaomimimo:mimo-v2.6-flash activate",
             "/reasoning high",
         ] {
-            Repl::emit_commit(&out, &mut editor, &redraw, (40, 24), line, "", &mut history);
+            Repl::emit_commit(
+                &out.content,
+                &mut editor,
+                &redraw,
+                (40, 24),
+                line,
+                "",
+                &mut history,
+            );
         }
         let rows = screen_rows(&out.end_capture());
 
@@ -2954,7 +3043,7 @@ mod tests {
         // Turn content the way a real turn leaves it: output ending in a blank.
         out.display_plain("git status output line\nmore output\n");
         Repl::emit_commit(
-            &out,
+            &out.content,
             &mut editor,
             &redraw,
             (40, 24),

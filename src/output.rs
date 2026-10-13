@@ -37,29 +37,6 @@ pub enum Confirmation {
     Always,
 }
 
-/// The area below the status row: `[Input?, Divider?, Overlay?]`.
-///
-/// The *rule*, stated once, for two callers that must not be able to disagree
-/// about it: [`Output::compose_area`] (production) and the `#[cfg(test)]` frame
-/// builder in `repl.rs`. That twin exists only to let a test hand a status
-/// through as a literal string — production cannot reach it — so the only thing
-/// the two genuinely differ on is where the status row *came from*; how the rest
-/// of the area is laid out is this function's and only this function's
-/// (ui_draw_v2 §5.1.1).
-///
-/// `overlay` is `None` when there is no menu: a separator with nothing below it
-/// is a rule nobody wanted, and the empty overlay case has no element to draw
-/// either.
-pub(crate) fn area_body(input: Option<Element>, overlay: Vec<Element>) -> Vec<Element> {
-    let mut items = Vec::new();
-    items.extend(input);
-    if !overlay.is_empty() {
-        items.push(Element::divider());
-    }
-    items.extend(overlay);
-    items
-}
-
 /// Ends a content batch when dropped: one frame re-emit for the whole burst,
 /// instead of one per write (ui_draw_v2 R5).
 ///
@@ -183,21 +160,6 @@ pub trait Output: Send + Sync {
     fn display_separator(&self);
     /// Set the transient status line the output should paint after each content
     /// block while a turn runs — the session / model / context readout.
-    ///
-    /// Transient and *relative* (never `CUP`, so a viewport scrolled back into
-    /// Is a turn running right now?
-    ///
-    /// The composer needs this to decide whether an empty input is a row (the
-    /// resting prompt, between turns) or no row at all (mid-turn, where there is
-    /// nothing to submit). `streaming` is already this output's fact — the
-    /// status row's dot is resolved from the same flag — so the phase is read
-    /// here rather than plumbed in from the caller.
-    ///
-    /// Default `false`: an output with no streaming phase has only the resting
-    /// case, and so always shows its input row.
-    fn is_streaming(&self) -> bool {
-        false
-    }
     fn display_header(
         &self,
         provider: &str,
@@ -257,74 +219,6 @@ pub trait Output: Send + Sync {
             .unwrap_or((80, 24))
     }
 
-    /// The one composer for the *area* (ui_draw_v2 §5.1.1):
-    /// `[Status?, Input?, Divider?, Overlay?]`.
-    ///
-    /// **The only place that reads state the pure phases must not see** — but
-    /// what it decides is *what the area is made of*, not what each row looks
-    /// like. The status row goes in as an element that resolves itself when it
-    /// is rendered (`Element::status`), so its text and dot are current on
-    /// every draw instead of frozen at compose time. That is not a violation of
-    /// purity, it is where it was moved to: the element owns its data source
-    /// rather than reaching back into `Output`, so `render_at` is still a
-    /// function of `(h, term_w)` plus state the element itself holds.
-    ///
-    /// The distinction matters because the two events disagree about timing.
-    /// Compose runs once per keystroke; `set_status` and the dot flip run at
-    /// turn start and end, *after* the REPL composed. Freezing the row at
-    /// compose would paint the previous turn's context figure for the whole of
-    /// the next one — which is what §4.5's content path re-draw makes visible.
-    ///
-    /// Callers supply only what changes: the input between turns, the overlay
-    /// when a menu is open. Neither the status row nor the divider that
-    /// separates an overlay from what is above it is a caller's to build — that
-    /// is the whole of what makes this the *one* composer rather than a
-    /// convention (§5.1.1).
-    ///
-    /// The status row takes the **divider's row**, above the input — which is
-    /// what makes it permanent and what makes it safe. Being in the frame is
-    /// the whole trick: a bar written as content would need a relative erase at
-    /// submit, and by then the cursor has moved into the frame region below it,
-    /// so the erase would land on the wrong rows. Here the frame's own union
-    /// clear takes it, at the one moment the cursor is where the frame says it
-    /// is — and the partial row-diff redraws it per keystroke, so the figures
-    /// are never stale.
-    fn compose_area(&self, input: Option<Element>, overlay: Vec<Element>) -> Vec<Element> {
-        let mut items = Vec::new();
-        if let Some(row) = self.status_row() {
-            // The row between the last content and the bar is the **frame's**,
-            // not the content path's: synthetic content no longer emits a
-            // trailing separator, so without this there would be nothing
-            // between what was written and the status line. Static and part of
-            // the area, so it retires with it — a content write that consumes
-            // the frame takes this row too, and it can never become a
-            // permanent blank in the transcript.
-            items.push(Element::lines(vec![String::new()]));
-            items.push(row);
-        }
-        items.extend(area_body(input, overlay));
-        items
-    }
-
-    /// The area's status row, or `None` when there is nothing to say: one
-    /// `Element`, `must == might == 1`.
-    ///
-    /// *Presence* is decided here and content is not, because presence is the
-    /// part that does not move under it: every compose happens after
-    /// `read_input`'s `set_status`, so the flag cannot flip between compose and
-    /// draw. What the row says is `Element::status`'s own business, resolved
-    /// when it is rendered — and at the width it is rendered at, so a width
-    /// arrives from `render_at` rather than being carried through compose.
-    ///
-    /// Default `None` — an output with no screen has no bar to show, which is
-    /// also what every non-console output wants from [`Self::compose_area`]:
-    /// the input and the overlay, and nothing standing in for a readout.
-    /// `ConsoleOutput` is the one that overrides it, and it reaches the raw
-    /// store and the streaming flag through its content (step 4f-a).
-    fn status_row(&self) -> Option<Element> {
-        None
-    }
-
     /// Draw a composed UI frame (ui_draw_v2 §5.1) with its top row at absolute
     /// `anchor` (1-based). `dims` is the (width, height) the frame was
     /// composed for: the apply uses exactly these, so the frame's bounding
@@ -336,36 +230,6 @@ pub trait Output: Send + Sync {
     fn draw_frame(
         &self,
         _frame: &Frame,
-        _policy: ApplyPolicy,
-        dims: (usize, usize),
-    ) -> (usize, usize) {
-        (dims.0.max(1), dims.1.max(1))
-    }
-
-    /// Compose and hand an area to the frame hub (ui_draw_v2 §5.1.1): the
-    /// pipeline — budget, render, apply, remember — is `RenderManager`'s as
-    /// of step 4b; this entry keeps its signature so the REPL/dialog call
-    /// sites stay put while the handles around them collapse (step 4f).
-    ///
-    /// Callers supply *content*: the pieces, **moved in**. Nothing comes back —
-    /// no `Vec<Element>` crosses a call site, because no caller ever used one
-    /// except to hand it straight to the next statement.
-    ///
-    /// The budget is derived from `dims`, never passed in — a caller that hands
-    /// a budget is being asked to know something it shouldn't. `dims` itself
-    /// stays as an argument because it is the caller's *belief* about the
-    /// terminal, and resize detection compares that belief against what was
-    /// painted.
-    ///
-    /// Default: drop the frame — non-console outputs carry no interactive UI,
-    /// so the raw-mode REPL never runs against them (the same contract
-    /// [`draw_frame`](Output::draw_frame)'s default states). `ConsoleOutput`
-    /// is the one that forwards: it composes the area (its status row is its
-    /// own fact) and hands the stack to the manager.
-    fn draw_elements(
-        &self,
-        _input: Option<Element>,
-        _overlay: Vec<Element>,
         _policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
@@ -811,7 +675,15 @@ impl Default for ConsoleOutput {
     }
 }
 
-impl ConsoleOutput {}
+impl ConsoleOutput {
+    /// The frame hub behind this output (step 4f-b): what the paint path
+    /// composes and renders through. Out-of-crate drivers (the confirm
+    /// probe) reach it here; the in-crate path goes through
+    /// `Content::manager`.
+    pub fn hub(&self) -> Arc<Mutex<crate::render::RenderManager>> {
+        self.content.manager.clone()
+    }
+}
 
 /// The status line's content, after shaping and before the fit: what names the
 /// session, and the model group as separate fields. `agent::status::status_text`
@@ -845,7 +717,7 @@ impl StatusText {
     /// supposed to be off.
     ///
     /// One definition for every path that asks: the compose-side presence
-    /// check ([`Output::status_row`], which must not reserve a row for an
+    /// check (`repl::compose_area`, which must not reserve a row for an
     /// off bar) and the bar's own render ([`StatusItem`], which must not
     /// draw one). Two answers to "is there a status?" is how the two end up
     /// disagreeing about their own existence.
@@ -983,8 +855,8 @@ impl RenderAt for StatusItem {
 
 impl Element {
     /// The status row: `must == might == 1`, data resolved at render time.
-    /// Presence is `status_row`'s decision; this is only ever built when there
-    /// is something to say (see [`StatusItem`]).
+    /// Presence is the compose's decision (`repl::compose_area`); this is
+    /// only ever built when there is something to say (see [`StatusItem`]).
     pub(crate) fn status(
         status: Arc<Mutex<crate::agent::status::BarStatus>>,
         streaming: Arc<AtomicBool>,
@@ -1076,17 +948,9 @@ impl ConsoleOutput {
 
 impl Output for ConsoleOutput {
     fn cursor_row(&self) -> usize {
-        // The DSR answer is obtained through the terminal I/O layer (step 2
-        // commit C): `termio::query_cursor_row` pauses the sole stdin owner
-        // around the query so the reply cannot be swallowed, then this re-anchors
-        // the draw cache with the answer.
-        let row = crate::termio::query_cursor_row();
-        self.content
-            .manager
-            .lock()
-            .unwrap()
-            .draw()
-            .reanchor_to_cursor(row)
+        // The verb's home is the hub since 4f-b (the query and the re-anchor
+        // are both its); this is the trait-facing forward.
+        self.content.manager.lock().unwrap().cursor_row()
     }
 
     fn frame_size(&self) -> (usize, usize) {
@@ -1152,26 +1016,6 @@ impl Output for ConsoleOutput {
             .lock()
             .unwrap()
             .draw_frame(frame, policy, dims)
-    }
-
-    /// The frame path's entry (step 4b): compose the area — the status row is
-    /// this output's own fact (see [`Self::status_row`]), so the compose head
-    /// stays here — then hand the stack to the manager, which budgets,
-    /// renders, applies and remembers it through the `Draw` under its roof
-    /// (step 4c).
-    fn draw_elements(
-        &self,
-        input: Option<Element>,
-        overlay: Vec<Element>,
-        policy: ApplyPolicy,
-        dims: (usize, usize),
-    ) -> (usize, usize) {
-        let stack = self.compose_area(input, overlay);
-        self.content
-            .manager
-            .lock()
-            .unwrap()
-            .render(stack, policy, dims)
     }
 
     fn display_plain(&self, text: &str) {
@@ -1274,34 +1118,6 @@ impl Output for ConsoleOutput {
         self.content.begin_capture();
     }
 
-    /// The frame path's bar, from the raw store content holds (step 4f-a) and
-    /// the streaming flag — the same two facts the row itself formats from.
-    ///
-    /// `streaming` is read here rather than passed in as `false` by whoever
-    /// composes: whether a turn is running is a fact about this output, and a
-    /// literal at a call site is a claim that can go stale — which is how the
-    /// two bars could ever have rendered the same turn differently.
-    ///
-    /// `None` when the status is off: there is no bar to show, and an off
-    /// status must not become an empty full-width row. Off is a shaped
-    /// answer — "nothing to say" is what the *shaping* decides — so the
-    /// presence check shapes too; the row formats itself again at render.
-    fn status_row(&self) -> Option<Element> {
-        if crate::agent::status::status_text(&self.content.bar.lock().unwrap()).is_off() {
-            return None;
-        }
-        Some(Element::status(
-            self.content.bar.clone(),
-            self.content.streaming.clone(),
-        ))
-    }
-
-    fn is_streaming(&self) -> bool {
-        self.content
-            .streaming
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     fn end_capture(&self) -> Vec<u8> {
         self.content.end_capture()
     }
@@ -1376,7 +1192,7 @@ mod tests {
         // Composed while idle — the REPL composes once per keystroke, and the
         // turn's flag flips *after* that (agent.rs `begin_response`), so a row
         // baked at compose time would show the previous turn's dot.
-        let area = out.compose_area(None, Vec::new());
+        let area = compose_area(&out, None, Vec::new());
         out.begin_response();
         let during = compose_rows(&area, 60);
         out.end_response();
@@ -1430,17 +1246,17 @@ mod tests {
 
         // Nothing supplied: the gap and the status, and they come first.
         assert_eq!(
-            compose_rows(&out.compose_area(None, Vec::new()), 60).len(),
+            compose_rows(&compose_area(&out, None, Vec::new()), 60).len(),
             2
         );
 
         // Input only: no separator, because a separator is for a menu.
-        let rows = compose_rows(&out.compose_area(Some(input()), Vec::new()), 60);
+        let rows = compose_rows(&compose_area(&out, Some(input()), Vec::new()), 60);
         assert_eq!(rows.len(), 3, "gap, status, input: {rows:?}");
 
         // Both: the divider arrives *with* the overlay, not from the caller.
         let overlay = crate::repl::test_overlay(&["row"], 0, 60);
-        let rows = compose_rows(&out.compose_area(Some(input()), overlay), 60);
+        let rows = compose_rows(&compose_area(&out, Some(input()), overlay), 60);
         assert_eq!(
             rows.len(),
             5,
@@ -1469,7 +1285,7 @@ mod tests {
     fn compose_area_reads_streaming_rather_than_being_told_it() {
         let (out, _reasoning) = capturing_output(60);
         out.content.set_status(bar_of("[bar]"));
-        let idle = compose_rows(&out.compose_area(None, Vec::new()), 60);
+        let idle = compose_rows(&compose_area(&out, None, Vec::new()), 60);
         assert!(
             !idle[1].contains(DOT_STREAMING),
             "no turn in flight, so the frame bar is idle: {:?}",
@@ -1479,7 +1295,7 @@ mod tests {
         out.begin_capture();
         out.begin_response();
         let _ = out.end_capture();
-        let during = compose_rows(&out.compose_area(None, Vec::new()), 60);
+        let during = compose_rows(&compose_area(&out, None, Vec::new()), 60);
         assert!(
             during[1].contains(DOT_STREAMING),
             "mid-turn the frame bar goes green: {:?}",
@@ -1491,32 +1307,29 @@ mod tests {
         let _ = out.end_capture();
     }
 
-    /// A status with nothing to say draws no row, and an output with no screen
-    /// never gets one. Both go through `is_off`/the default `status_row` — the
-    /// same answers the content path uses, so the two bars cannot disagree
-    /// about whether they exist.
+    /// A status with nothing to say draws no row. The check is the shaped
+    /// `is_off` — the same answer the bar's own render uses, so compose and
+    /// draw cannot disagree about whether the bar exists. (The old "an output
+    /// with no screen composes no status" arm went with the `Output`-side
+    /// composer in 4f-b: no screen is now *no `Content`*, and there is
+    /// nothing to compose from.)
     #[test]
     fn compose_area_drops_a_status_that_has_nothing_to_say() {
         let (out, _reasoning) = capturing_output(60);
         assert!(
-            out.compose_area(None, Vec::new()).is_empty(),
+            compose_area(&out, None, Vec::new()).is_empty(),
             "never set: there is no bar to show"
         );
         out.content.set_status(Default::default());
         assert!(
-            out.compose_area(None, Vec::new()).is_empty(),
+            compose_area(&out, None, Vec::new()).is_empty(),
             "explicitly off: there is no bar to show"
         );
         out.content.set_status(bar_of("[bar]"));
         assert_eq!(
-            out.compose_area(None, Vec::new()).len(),
+            compose_area(&out, None, Vec::new()).len(),
             2,
             "gap, then a bar"
-        );
-
-        assert!(
-            NoOutput.compose_area(None, Vec::new()).is_empty(),
-            "an output with no screen composes no status"
         );
     }
 
@@ -1548,6 +1361,16 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// The compose head's home since 4f-b: the tests drive it through the
+    /// content handle they already hold, the way `paint_prompt` does.
+    fn compose_area(
+        out: &ConsoleOutput,
+        input: Option<Element>,
+        overlay: Vec<Element>,
+    ) -> Vec<Element> {
+        crate::repl::compose_area(&out.content, input, overlay)
     }
 
     /// Swap `out`'s byte sink for a recording one, returning the handle a
@@ -3001,8 +2824,9 @@ mod tests {
         );
     }
 
-    /// `draw_elements` is the old hand-rolled path, not a new one: it must paint
-    /// **byte-identically** to `draw_frame(&compose_frame(...))`.
+    /// The paint path's pipeline (compose + `manager.render`, step 4f-b) is the
+    /// hand-rolled path, not a new one: it must paint **byte-identically** to
+    /// `draw_frame` fed exactly what it composes.
     ///
     /// Two paths that are meant to be the same are usually asserted against a
     /// transcript, which pins each independently and lets them drift together.
@@ -3037,15 +2861,22 @@ mod tests {
         tail.content.set_status(bar_of("[bar]"));
         let tail_sink = record_bytes(&tail);
         let (input, overlay) = pieces();
-        let a = tail.draw_elements(input, overlay, ApplyPolicy::Frame, dims);
+        let a = {
+            let stack = compose_area(&tail, input, overlay);
+            tail.content
+                .manager
+                .lock()
+                .unwrap()
+                .render(stack, ApplyPolicy::Frame, dims)
+        };
         let via_tail = tail_sink.0.lock().unwrap().clone();
 
         let (hand, _rh) = capturing_output(60);
         hand.content.set_status(bar_of("[bar]"));
-        // Feed `draw_frame` exactly what `draw_elements` composes — same
+        // Feed `draw_frame` exactly what the paint path composes — same
         // composer, same status, same dims — so the apply half is all that
         // differs.
-        let stack = hand.compose_area(pieces().0, pieces().1);
+        let stack = compose_area(&hand, pieces().0, pieces().1);
         let extents: Vec<Extent> = stack.iter().map(Element::extent).collect();
         let heights = allocate(&extents, live_budget(dims.1));
         let frame = render(&stack, &heights, dims.0);
@@ -3165,7 +2996,7 @@ mod tests {
         // and so no caret to place.
         out.begin_response();
         crate::repl::paint_prompt(
-            &out,
+            &out.content,
             "",
             &crate::repl::LineEditor::new(),
             Vec::new(),
@@ -3181,7 +3012,7 @@ mod tests {
         let sink = record_bytes(&out);
         let mut editor = crate::repl::LineEditor::new();
         editor.set("hi");
-        crate::repl::paint_prompt(&out, "", &editor, Vec::new(), (40, 24));
+        crate::repl::paint_prompt(&out.content, "", &editor, Vec::new(), (40, 24));
         let text = String::from_utf8_lossy(&sink.0.lock().unwrap().clone()).into_owned();
         assert!(
             text.contains("\x1b[?25h"),

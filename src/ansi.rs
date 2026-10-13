@@ -452,10 +452,10 @@ pub(crate) const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 /// so the decision reads the frame's own answer instead of tracking input
 /// state here.
 ///
-/// Not the hide that `paint_status` used to do and that went with the transient
-/// bar: that one hid the cursor *around a content write*, to stop it flickering
-/// over text arriving mid-render. This one describes the frame that was
-/// composed, decided once per apply.
+/// Not the hide the transient bar used to do, long gone with it: that one hid
+/// the cursor *around a content write*, to stop it flickering over text
+/// arriving mid-render. This one describes the frame that was composed,
+/// decided once per apply.
 pub(crate) const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 
 #[cfg(test)]

@@ -76,6 +76,7 @@ pub(crate) async fn dispatch_in_turn_event(
     history: Option<&mut crate::repl::History>,
     label: &str,
     guard: Option<&crate::termio::TermGuard>,
+    content: &crate::content::Content,
     output: &dyn Output,
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
@@ -99,15 +100,15 @@ pub(crate) async fn dispatch_in_turn_event(
                         let subject = sess.confirm_subject().unwrap_or_default();
                         sess.clear_confirm();
                         crate::confirm::resolve(
-                            output,
-                            || sess.paint(output, label, dims),
+                            content,
+                            || sess.paint(content, label, dims),
                             &subject,
                             decision,
                         );
                         InTurnDispatch::Handled
                     }
                     None => {
-                        sess.paint(output, label, dims);
+                        sess.paint(content, label, dims);
                         InTurnDispatch::Handled
                     }
                 };
@@ -139,7 +140,7 @@ pub(crate) async fn dispatch_in_turn_event(
             // as it does at the prompt. Its `MenuDone` is dropped: applying a
             // command needs the convergence machinery that runs *after*
             // `prompt()` returns, which is still post-turn only (U4.3+).
-            let _ = sess.settle(output, label, history, dims).await;
+            let _ = sess.settle(content, label, history, dims).await;
             InTurnDispatch::Handled
         }
         InputEvent::Paste(text) => {
@@ -150,7 +151,7 @@ pub(crate) async fn dispatch_in_turn_event(
                 return InTurnDispatch::Ignored;
             }
             sess.paste(&text);
-            let _ = sess.settle(output, label, history, dims).await;
+            let _ = sess.settle(content, label, history, dims).await;
             InTurnDispatch::Handled
         }
         _ => InTurnDispatch::Ignored,
@@ -166,6 +167,9 @@ pub(crate) struct TurnPump<'a> {
     history: &'a mut crate::repl::History,
     label: &'a str,
     guard: &'a crate::termio::TermGuard,
+    /// The paints and settles go through content's manager (step 4f-b);
+    /// `output` stays for what has not re-homed yet (dims, `$EDITOR`).
+    content: &'a crate::content::Content,
     output: &'a dyn Output,
 }
 
@@ -180,6 +184,7 @@ impl<'a> TurnPump<'a> {
         history: &'a mut crate::repl::History,
         label: &'a str,
         guard: &'a crate::termio::TermGuard,
+        content: &'a crate::content::Content,
         output: &'a dyn Output,
     ) -> Self {
         Self {
@@ -188,6 +193,7 @@ impl<'a> TurnPump<'a> {
             history,
             label,
             guard,
+            content,
             output,
         }
     }
@@ -204,6 +210,7 @@ pub(crate) fn turn_backoff_pump<'a>(
     history: &'a mut crate::repl::History,
     label: &'a str,
     guard: &'a Option<Arc<crate::termio::TermGuard>>,
+    content: &'a crate::content::Content,
     output: &'a dyn Output,
 ) -> Option<TurnPump<'a>> {
     match (prompt_session.as_mut(), history, guard.as_deref()) {
@@ -213,6 +220,7 @@ pub(crate) fn turn_backoff_pump<'a>(
             history,
             label,
             guard,
+            content,
             output,
         }),
         _ => None,
@@ -264,6 +272,7 @@ pub(crate) async fn cancellable_sleep_pumped(
                         Some(&mut *p.history),
                         p.label,
                         Some(p.guard),
+                        p.content,
                         p.output,
                         user_cancel,
                         cancel_notify,
@@ -289,7 +298,7 @@ pub(crate) async fn cancellable_sleep_pumped(
                     let dims = p.output.frame_size();
                     let _ = p
                         .session
-                        .settle(p.output, p.label, &mut *p.history, dims)
+                        .settle(p.content, p.label, &mut *p.history, dims)
                         .await;
                 }
             }
@@ -453,6 +462,7 @@ mod tests {
         let app_state = crate::app_state::AppState::for_test(test_settings());
         let (mut session, mut history, guard) = backoff_pump_parts(&app_state);
         let output = null_output();
+        let content = null_content();
         let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
         tx.send(InputEvent::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Esc,
@@ -467,6 +477,7 @@ mod tests {
             &mut history,
             "",
             &guard,
+            content.as_ref(),
             output.as_ref(),
         );
         let started = std::time::Instant::now();
@@ -490,6 +501,7 @@ mod tests {
         let app_state = crate::app_state::AppState::for_test(test_settings());
         let (mut session, mut history, guard) = backoff_pump_parts(&app_state);
         let output = null_output();
+        let content = null_content();
         let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
         tx.send(InputEvent::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('x'),
@@ -504,6 +516,7 @@ mod tests {
             &mut history,
             "",
             &guard,
+            content.as_ref(),
             output.as_ref(),
         );
         let started = std::time::Instant::now();

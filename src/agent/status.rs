@@ -334,9 +334,9 @@ mod status_bar_tests {
     }
 
     /// The bar is truncated to the terminal, so it never moves the cursor down
-    /// without a newline — the one row movement `paint_status` has to report
-    /// separately. Zero rows is the assertion, not one: writing a bar that fits
-    /// leaves the cursor *on* the row.
+    /// without a newline — a wrapping bar would be a row movement the frame
+    /// never accounted for. Zero rows is the assertion, not one: writing a bar
+    /// that fits leaves the cursor *on* the row.
     #[test]
     fn the_bar_never_moves_the_cursor_down() {
         let long = "x".repeat(200);

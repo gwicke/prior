@@ -305,14 +305,20 @@ pub fn decision_line(subject: &str, decision: ConfirmDecision) -> String {
 /// real bytes ([`ConfirmPrompt::elements`] → `Output::draw_elements`), which is
 /// what this exposes; the only thing it re-states is the tail the session also
 /// ends in.
-pub fn paint(out: &dyn crate::output::Output, confirm: &ConfirmPrompt, dims: (usize, usize)) {
+pub fn paint(
+    confirm: &ConfirmPrompt,
+    dims: (usize, usize),
+    manager: &std::sync::Arc<std::sync::Mutex<crate::render::RenderManager>>,
+) {
     let (tw, th) = (dims.0.max(1), dims.1.max(1));
-    out.draw_elements(
-        None,
-        confirm.elements(tw),
-        crate::draw::ApplyPolicy::Frame,
-        (tw, th),
-    );
+    // No compose head (step 4f-b): a probe's dialog is the whole area — the
+    // division below is the same `area_body` the session's own paint layers
+    // these elements under its bar and input with, so the two cannot drift.
+    let stack = crate::repl::area_body(None, confirm.elements(tw));
+    manager
+        .lock()
+        .unwrap()
+        .render(stack, crate::draw::ApplyPolicy::Frame, (tw, th));
 }
 
 /// Resolve a confirmed dialog: **repaint without it, then record the decision**.
@@ -326,14 +332,19 @@ pub fn paint(out: &dyn crate::output::Output, confirm: &ConfirmPrompt, dims: (us
 /// `redraw` repaints the area without the dialog. The REPL passes the session's
 /// own paint (it still owns the prompt and any menu underneath); the probe
 /// passes the empty stack.
+///
+/// Takes content for the decision line (step 4f-b): `display_plain` is a
+/// content verb — boundary rules and the tap seam included — and the line
+/// stays inside this function because the repaint-then-decide order is the
+/// invariant, not something each caller may remember.
 pub fn resolve(
-    out: &dyn crate::output::Output,
+    content: &crate::content::Content,
     redraw: impl FnOnce(),
     subject: &str,
     decision: ConfirmDecision,
 ) {
     redraw();
-    out.display_plain(&decision_line(subject, decision));
+    content.display_plain(&decision_line(subject, decision));
 }
 
 #[cfg(test)]
