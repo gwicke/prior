@@ -47,13 +47,13 @@ impl SlashDotNode for ReplayNode {
 
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let arg = path_args.suffix.trim().to_string();
-        // Data-plane inline: replay renders through the shared output
+        // Data-plane inline: replay renders through the shared content
         // handle; no active session → the same message the old applier
-        // showed. Session and output are both reachable via the slot.
-        let out = self.app_state.with_config(|c| c.output.clone());
+        // showed. Session and content are both reachable via the slot.
+        let content = self.app_state.with_config(|c| c.content.clone());
         match self.app_state.session() {
-            Some(s) => crate::agent::replay::handle_replay(&arg, &s, out.as_ref()).await,
-            None => out.display_text("No active session to replay"),
+            Some(s) => crate::agent::replay::handle_replay(&arg, &s, content.as_ref()).await,
+            None => content.display_text("No active session to replay"),
         }
         SubmitResult::Done(None)
     }

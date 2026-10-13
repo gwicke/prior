@@ -235,9 +235,9 @@ impl Interactive {
         if let Some(r) = repl.as_mut() {
             let _ = r.start();
             // First screen: a one-line hint
-            let ref output = config.output;
-            output.display_text("Welcome to picocode - type `/` for details.");
-            output.display_separator();
+            let content = &config.content;
+            content.display_text("Welcome to picocode - type `/` for details.");
+            content.display_separator();
         }
 
         // Persistent session storage.
@@ -487,7 +487,7 @@ impl Interactive {
                         "set persona"
                     };
                     self.config
-                        .output
+                        .content
                         .display_text(&format!("Cannot {}: {}", kind, e));
                 }
             }
@@ -562,11 +562,11 @@ impl Interactive {
                             format!("sandbox: restored {} (ok)", sandbox_path)
                         }
                     };
-                    self.config.output.display_text(&msg);
+                    self.config.content.display_text(&msg);
                 }
                 Err(e) => {
                     self.config
-                        .output
+                        .content
                         .display_text(&format!("sandbox error: {}", e));
                 }
             }
@@ -596,21 +596,21 @@ impl Interactive {
         // reaches the live params or the next turn.
         let split = crate::turn_overrides::split(&input);
         for w in &split.warnings {
-            self.config.output.display_text(w);
+            self.config.content.display_text(w);
         }
         // An overrides-only prompt has nothing to send. Checked *before*
         // `ensure_session` below, or a turn that never runs would still
         // create a session.
         if split.text.trim().is_empty() {
             self.config
-                .output
+                .content
                 .display_text("nothing to send — the prompt was only overrides");
             return LoopCtl::Continue;
         }
         let input = split.text;
         let (effective_params, notes) = effective_params(&self.app_state, &split.overrides);
         for n in &notes {
-            self.config.output.display_text(n);
+            self.config.content.display_text(n);
         }
         // Safety net: any code path that drops the in-memory session
         // (notably `/new` and `/clear`) must leave us with a fresh one
@@ -673,9 +673,9 @@ impl Interactive {
         // Reprint the submitted command (cleared by `read_input`),
         // bracketed like every other line the user committed with
         // Enter (ui_draw_v2 R4).
-        self.config.output.display_committed_prompt(input);
+        self.config.content.display_committed_prompt(input);
         if cmd.is_empty() {
-            self.config.output.display_plain(
+            self.config.content.display_plain(
                 "Usage: !<command> (capture output into context), or !!<command> (display only)",
             );
         } else {
@@ -691,9 +691,9 @@ impl Interactive {
                 Ok(out) => {
                     let out = out.trim();
                     if out.is_empty() {
-                        self.config.output.display_plain("(no output)");
+                        self.config.content.display_plain("(no output)");
                     } else {
-                        self.config.output.display_plain(out);
+                        self.config.content.display_plain(out);
                     }
                     if capture {
                         // Mirror a normal turn so the model sees
@@ -712,13 +712,13 @@ impl Interactive {
                         }
                     } else {
                         self.config
-                            .output
+                            .content
                             .display_plain("(output was displayed but not added to context)");
                     }
                 }
                 Err(e) => {
                     self.config
-                        .output
+                        .content
                         .display_text(&format!("shell error: {}", e));
                 }
             }
@@ -734,7 +734,7 @@ impl Interactive {
         input: String,
         effective_params: crate::params::ModelParams,
     ) {
-        self.config.output.display_committed_prompt(&input);
+        self.config.content.display_committed_prompt(&input);
         // Normal prompt — create the agent lazily on first use
         // (loop-side, applied config; published to the slot).
         if self.app_state.agent().is_none() {
@@ -742,7 +742,7 @@ impl Interactive {
                 Ok(a) => self.app_state.activate_agent(Arc::from(a)),
                 Err(e) => {
                     self.config
-                        .output
+                        .content
                         .display_text(&format!("Cannot start agent: {}", e));
                     return;
                 }
@@ -850,7 +850,7 @@ impl Interactive {
                         // so re-sending it would duplicate the user's
                         // request.
                         let ms = retry_delay_ms(&cause, 1);
-                        self.config.output.display_text(&format!(
+                        self.config.content.display_text(&format!(
                             "Error: {}. Retrying in {}s...",
                             cause,
                             ms / 1000
@@ -927,7 +927,7 @@ impl Interactive {
                     Err(e) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         let ms = retry_delay_ms(&e, consecutive_failures);
-                        self.config.output.display_text(&format!(
+                        self.config.content.display_text(&format!(
                             "Error: {}. Retrying in {}s...",
                             e,
                             ms / 1000
@@ -989,10 +989,10 @@ impl Interactive {
                 // Turn aborted via `<Esc>`; `prompt()` already persisted
                 // the in-flight history, so show a clear notice instead
                 // of a generic "Error:".
-                self.config.output.display_text(&msg);
+                self.config.content.display_text(&msg);
             }
             Err(e) => {
-                self.config.output.display_text(&format!("Error: {}", e));
+                self.config.content.display_text(&format!("Error: {}", e));
             }
         }
     }
@@ -1083,6 +1083,7 @@ impl Interactive {
                         &ctx,
                         &self.app_state,
                         self.config.output.as_ref(),
+                        self.config.content.as_ref(),
                         &mut self.keys_rx,
                     )
                     .await
@@ -1099,7 +1100,7 @@ impl Interactive {
                     match Repl::batch_slash(
                         &self.app_state,
                         &input,
-                        self.config.output.as_ref(),
+                        self.config.content.as_ref(),
                         &mut self.line_history,
                     )
                     .await

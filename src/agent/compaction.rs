@@ -21,8 +21,8 @@
 
 use super::pumps::{cancel_observed, cancellable_sleep_windowed, next_window_key, pump_window_key};
 use crate::app_state::{AppState, WindowKeySource};
+use crate::content::Content;
 use crate::session::Session;
-use crate::Output;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -283,12 +283,12 @@ async fn draft_at_pivot(
             let Some(a) = agent.as_ref() else {
                 return Err("no agent".to_string());
             };
-            let output = app_state.with_config(|c| c.output.clone());
+            let content = app_state.with_config(|c| c.content.clone());
             let (user_cancel, cancel_notify) =
                 app_state.with_config(|c| (c.user_cancel.clone(), c.cancel_notify.clone()));
             let instruction = instruction.clone();
             let reply = retry_summarization(
-                output.as_ref(),
+                content.as_ref(),
                 &user_cancel,
                 &cancel_notify,
                 Some(app_state),
@@ -605,11 +605,11 @@ pub(crate) async fn generate_branch_summary(
             let Some(a) = agent.as_ref() else {
                 return Err("no agent".to_string());
             };
-            let output = app_state.with_config(|c| c.output.clone());
+            let content = app_state.with_config(|c| c.content.clone());
             let (user_cancel, cancel_notify) =
                 app_state.with_config(|c| (c.user_cancel.clone(), c.cancel_notify.clone()));
             let reply = retry_summarization(
-                output.as_ref(),
+                content.as_ref(),
                 &user_cancel,
                 &cancel_notify,
                 Some(app_state),
@@ -779,7 +779,7 @@ pub(crate) async fn apply_branch_summary(
 /// helper agnostic between the compaction path (leaf moved to the predecessor
 /// for a conversation prefix) and the abandoned-branch path (no move).
 pub(crate) async fn retry_summarization<F, Fut>(
-    output: &dyn Output,
+    content: &Content,
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
     keys: Option<&dyn WindowKeySource>,
@@ -832,7 +832,7 @@ where
             Some(Err(e)) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 let ms = retry_delay_ms(&e, consecutive_failures);
-                output.display_text(&format!("Error: {}. Retrying in {}s...", e, ms / 1000));
+                content.display_text(&format!("Error: {}. Retrying in {}s...", e, ms / 1000));
                 let slept = cancellable_sleep_windowed(user_cancel, cancel_notify, ms, keys).await;
                 if !slept {
                     return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
@@ -877,10 +877,10 @@ mod tests {
     #[tokio::test]
     async fn retry_summarization_succeeds_on_first_attempt() {
         let mut calls = 0;
-        let output = null_output();
+        let content = null_content();
         let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
-        let r = retry_summarization(output.as_ref(), cancel, notify, None, &mut || {
+        let r = retry_summarization(content.as_ref(), cancel, notify, None, &mut || {
             calls += 1;
             async { Ok::<_, crate::PicocodeError>("summary".to_string()) }
         })
@@ -895,10 +895,10 @@ mod tests {
         // and the second attempt succeeds. Verify the retrier runs build
         // twice. (The sleep is 1s; acceptable for a focused test.)
         let mut calls = 0;
-        let output = null_output();
+        let content = null_content();
         let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
-        let r = retry_summarization(output.as_ref(), cancel, notify, None, &mut || {
+        let r = retry_summarization(content.as_ref(), cancel, notify, None, &mut || {
             calls += 1;
             async move {
                 if calls == 1 {
@@ -918,10 +918,10 @@ mod tests {
     #[tokio::test]
     async fn retry_summarization_propagates_non_retryable() {
         let mut calls = 0;
-        let output = null_output();
+        let content = null_content();
         let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
-        let r = retry_summarization(output.as_ref(), cancel, notify, None, &mut || {
+        let r = retry_summarization(content.as_ref(), cancel, notify, None, &mut || {
             calls += 1;
             async { Err(crate::PicocodeError::Llm("permanent".to_string())) }
         })
@@ -936,7 +936,7 @@ mod tests {
         // sleep's signal arm ends the wait and the retrier surfaces
         // `Cancelled` without a second attempt.
         let mut calls = 0;
-        let output = null_output();
+        let content = null_content();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
         let cancel_out = cancel.clone();
@@ -950,7 +950,7 @@ mod tests {
             cancel2.store(true, std::sync::atomic::Ordering::SeqCst);
             notify2.notify_one();
         });
-        let r = retry_summarization(output.as_ref(), &cancel_out, &notify, None, &mut || {
+        let r = retry_summarization(content.as_ref(), &cancel_out, &notify, None, &mut || {
             calls += 1;
             async {
                 Err(crate::PicocodeError::LlmRateLimited {
@@ -1055,11 +1055,13 @@ mod tests {
         }
     }
 
-    fn null_output() -> std::sync::Arc<dyn Output> {
-        // `retry_summarization` surfaces retry notices through the
-        // output; the existing `NoOutput` impl in `crate::output` is a
-        // no-op for everything we touch.
-        std::sync::Arc::new(crate::output::NoOutput) as std::sync::Arc<dyn Output>
+    fn null_content() -> std::sync::Arc<Content> {
+        // `retry_summarization` surfaces retry notices through content; a
+        // `Content` tapped through `NoOutput` discards them, which is what
+        // this suite wants — no rendering, no terminal behind it.
+        std::sync::Arc::new(Content::with_tap(std::sync::Arc::new(
+            crate::output::NoOutput,
+        )))
     }
 
     /// Test app state for the compaction data path: writable session and

@@ -1312,6 +1312,27 @@ impl Content {
         self.write_content(block.as_bytes());
     }
 
+    /// Open a batch of content writes: `Draw`'s reposition is suppressed until
+    /// the returned guard drops, which emits the frame once (ui_draw_v2 R5).
+    ///
+    /// Batching belongs to content because the thing being deferred is
+    /// `Draw`'s — so the guard names a `Content`, not an `Output` (step 3d).
+    /// With the seam set nothing reaches `Draw`, so there is no batch to open.
+    pub(crate) fn begin_batch(&self) -> ContentBatchGuard<'_> {
+        if self.tap.is_some() {
+            return ContentBatchGuard { content: None };
+        }
+        ContentBatchGuard {
+            content: self.draw.begin_batch().then_some(self),
+        }
+    }
+
+    /// End the open batch: emit the deferred frame once, at this handle's
+    /// watched width. Called by [`ContentBatchGuard`]'s drop.
+    pub(crate) fn end_batch(&self) {
+        self.draw.end_batch(self.width());
+    }
+
     /// Begin capturing everything content writes to the sink (§4: capture is
     /// content's, tapped at the byte sink). With a tap set there is nothing
     /// reaching the sink to capture, so the tap's own capture policy answers.
@@ -1344,6 +1365,23 @@ impl Content {
 
 /// Buffered reasoning bytes awaiting routing. See
 /// [`ConsoleOutput::reasoning_sink`].
+/// Ends a content batch when dropped — see [`Content::begin_batch`]. The
+/// content twin of [`crate::output::BatchGuard`]: both exist so that
+/// forgetting to end a batch (which would suppress a reposition forever) is
+/// unreachable rather than merely documented, but this one names the handle it
+/// batches for.
+pub struct ContentBatchGuard<'a> {
+    content: Option<&'a Content>,
+}
+
+impl Drop for ContentBatchGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(content) = self.content {
+            content.end_batch();
+        }
+    }
+}
+
 pub(crate) struct ReasoningSink {
     buf: Vec<u8>,
     to_stderr: bool,

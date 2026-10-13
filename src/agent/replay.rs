@@ -13,6 +13,10 @@
 //! `AssistantSegment` is the unit of grouping: the content between tool
 //! executions. A turn is a user prompt followed by a chain of them.
 
+use crate::content::Content;
+// Tests only: the byte-comparison below drives `ConsoleOutput` through the
+// `Output` trait's own verbs. Production content calls `Content` directly.
+#[cfg(test)]
 use crate::Output;
 use rig_core::message::{
     AssistantContent, Message, ReasoningContent, ToolResultContent, UserContent,
@@ -271,34 +275,34 @@ fn feed_turn_into(open: &mut Option<ConversationTurn>, msg: &Message) {
 /// turn draws its own. The rule that used to sit between the prompt and the
 /// response is that closing rule too — `begin_response` then puts the blank
 /// line on it, which is the spacing a turn's prompt and its output want.
-fn render_turn(output: &dyn Output, turn: &ConversationTurn) {
-    output.display_committed_prompt(&turn.user_text);
+fn render_turn(content: &Content, turn: &ConversationTurn) {
+    content.display_committed_prompt(&turn.user_text);
 
     if turn.segments.is_empty() {
         return;
     }
 
-    output.begin_response();
+    content.begin_response();
 
     let seg_count = turn.segments.len();
     for (seg_idx, segment) in turn.segments.iter().enumerate() {
         let is_last_segment = seg_idx + 1 == seg_count;
 
         for thinking in &segment.thinking {
-            output.stream_thinking(thinking);
+            content.stream_thinking(thinking);
         }
         for text in &segment.text {
-            output.stream_text(text);
+            content.stream_text(text);
         }
 
         if !segment.tool_calls.is_empty() {
-            output.end_response_segment();
+            content.end_response_segment();
             for (call_id, name, args) in &segment.tool_calls {
-                output.display_tool_call(name, args);
+                content.display_tool_call(name, args);
                 if let Some((_, result_text)) =
                     segment.tool_results.iter().find(|(rid, _)| rid == call_id)
                 {
-                    output.display_tool_result(result_text);
+                    content.display_tool_result(result_text);
                 }
             }
             // Mirror the live path, where each `CompletionCall` — including one
@@ -307,19 +311,19 @@ fn render_turn(output: &dyn Output, turn: &ConversationTurn) {
             // guarantees a blank line separates the tool result from any text
             // segment that follows it in the replay, exactly as in live output.
             if !is_last_segment {
-                output.end_response_segment();
+                content.end_response_segment();
             }
         } else if !is_last_segment {
-            output.end_response_segment();
+            content.end_response_segment();
         }
     }
-    output.end_response();
+    content.end_response();
 }
 
 /// Replay a slice of units starting at `start`. Compaction markers render as a
 /// dim system notice between turns; `Nt`/`Nl` limits count TURNS (markers are
 /// not turns and are always drawn when inside the selected window).
-pub(crate) fn replay_units(output: &dyn Output, units: &[ReplayUnit], start: usize) {
+pub(crate) fn replay_units(content: &Content, units: &[ReplayUnit], start: usize) {
     // One frame re-emit for the whole replay, not one per line of history
     // (ui_draw_v2 R5). All three callers — `/replay`, resume, and the silent
     // Ctrl-Z restore — arrive here, so this is the one place the batching has
@@ -328,7 +332,7 @@ pub(crate) fn replay_units(output: &dyn Output, units: &[ReplayUnit], start: usi
     // Deliberately *not* around live streaming: `stream_text` enters the same
     // writer once per delta, and there the per-write re-emit is what keeps the
     // input row visible while text flows past it.
-    let _batch = output.begin_batch();
+    let _batch = content.begin_batch();
     // No leading-separator bookkeeping: a turn's prompt brackets itself, and
     // the rule that used to be forced between turns *after* the first is
     // the closing rule of the turn above. Compaction markers are not turns
@@ -336,27 +340,27 @@ pub(crate) fn replay_units(output: &dyn Output, units: &[ReplayUnit], start: usi
     for unit in &units[start..] {
         match unit {
             ReplayUnit::Turn(turn) => {
-                render_turn(output, turn);
+                render_turn(content, turn);
             }
             ReplayUnit::Compaction {
                 tokens_before,
                 summary,
             } => {
-                output.display_system(&format!("[compaction: {}k tokens]", tokens_before / 1000,));
+                content.display_system(&format!("[compaction: {}k tokens]", tokens_before / 1000,));
                 // A text-only compaction carries its summary — render it as
                 // markdown right below the marker so the compaction point is
                 // self-documenting in the replay, exactly as it was shown
                 // immediately after the compaction was performed.
                 if !summary.is_empty() {
-                    output.display_markdown(summary);
+                    content.display_markdown(summary);
                 }
             }
             ReplayUnit::BranchSummary { from_id, summary } => {
                 // The id is opaque but copy-pasteable: `/tree <id>` switches
                 // there. Same shape as a compaction marker — dim system line,
                 // then the digest as markdown.
-                output.display_system(&format!("[branch summary from {}]", from_id));
-                output.display_markdown(summary);
+                content.display_system(&format!("[branch summary from {}]", from_id));
+                content.display_markdown(summary);
             }
         }
     }
@@ -399,9 +403,9 @@ pub(crate) fn last_turns_start(units: &[ReplayUnit], n: usize) -> usize {
 
 /// Replay the last `n` turns (plus any markers inside that window) from a
 /// unit list.
-pub(crate) fn replay_last_turns(output: &dyn Output, units: &[ReplayUnit], n: usize) {
+pub(crate) fn replay_last_turns(content: &Content, units: &[ReplayUnit], n: usize) {
     let start = last_turns_start(units, n);
-    replay_units(output, units, start);
+    replay_units(content, units, start);
 }
 
 /// Parse a replay-length argument: plain number `N`, `Nt` (turns), or `Nl`
@@ -430,11 +434,7 @@ pub(crate) fn parse_replay_len_arg(arg: &str, default: usize) -> (usize, bool) {
 ///
 /// Called from both the agent's submit handler and the v2.5 `ReplayNode`
 /// (via `block_on`).
-pub(crate) async fn handle_replay(
-    arg: &str,
-    session: &crate::session::Session,
-    output: &dyn Output,
-) {
+pub(crate) async fn handle_replay(arg: &str, session: &crate::session::Session, content: &Content) {
     let branch = session.get_branch().await;
     let units = build_replay_units(&branch);
     let total = count_turns(&units);
@@ -442,11 +442,11 @@ pub(crate) async fn handle_replay(
         let n: usize = arg.trim_end_matches('l').trim().parse().unwrap_or(0);
         if n > 0 {
             if total == 0 {
-                output.display_text("Session is empty");
+                content.display_text("Session is empty");
             } else {
-                output.begin_capture();
-                replay_units(output, &units, 0);
-                let bytes = output.end_capture();
+                content.begin_capture();
+                replay_units(content, &units, 0);
+                let bytes = content.end_capture();
                 let captured = String::from_utf8_lossy(&bytes);
                 let lines: Vec<&str> = captured.lines().collect();
                 let start = lines.len().saturating_sub(n);
@@ -459,7 +459,7 @@ pub(crate) async fn handle_replay(
                 let _ = handle.flush();
             }
         } else {
-            replay_units(output, &units, 0);
+            replay_units(content, &units, 0);
         }
     } else {
         let (count, _is_lines) = if arg.is_empty() {
@@ -468,10 +468,10 @@ pub(crate) async fn handle_replay(
             parse_replay_len_arg(arg, 0)
         };
         if total == 0 {
-            output.display_text("Session is empty");
+            content.display_text("Session is empty");
         } else {
             let count = if count == 0 { total } else { count.min(total) };
-            replay_last_turns(output, &units, count);
+            replay_last_turns(content, &units, count);
         }
     }
 }
@@ -482,10 +482,7 @@ pub(crate) async fn handle_replay(
 /// replays the last turn to push reflow corruption out of view; that path must
 /// stay silent (a session exists from startup, long before it has any turns to
 /// replay).
-pub(crate) async fn replay_last_turn_silent(
-    session: &crate::session::Session,
-    output: &dyn Output,
-) {
+pub(crate) async fn replay_last_turn_silent(session: &crate::session::Session, content: &Content) {
     let branch = session.get_branch().await;
     let units = build_replay_units(&branch);
     if count_turns(&units) == 0 {
@@ -496,7 +493,7 @@ pub(crate) async fn replay_last_turn_silent(
     // from. Its closing rule is also what the trailing `display_separator()`
     // used to paint — otherwise the repainted input sat flush against the
     // replayed turn — so the prompt's own bracket covers it.
-    replay_last_turns(output, &units, 1);
+    replay_last_turns(content, &units, 1);
 }
 
 #[cfg(test)]
@@ -647,7 +644,8 @@ mod tests {
         ];
         let units = build_replay_units(&branch);
         let (out, lines) = crate::output::RecordingOutput::new();
-        replay_units(out.as_ref(), &units, 0);
+        let content = Content::with_tap(out);
+        replay_units(&content, &units, 0);
         let captured = crate::output::RecordingOutput::joined(&lines);
         assert!(
             captured.contains("[branch summary from m0]"),
@@ -762,7 +760,7 @@ mod tests {
         let replay = ConsoleOutput::with_size(reasoning, size);
         replay.content.set_reasoning_on_stderr(false);
         replay.begin_capture();
-        render_turn(&replay, &turn);
+        render_turn(&replay.content, &turn);
         let replay_bytes = replay.end_capture();
 
         let live_text = String::from_utf8_lossy(&live_bytes).to_string();

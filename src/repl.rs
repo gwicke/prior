@@ -14,6 +14,7 @@
 
 use crate::agent::SessionUsage;
 use crate::app_state::AppState;
+use crate::content::Content;
 use crate::draw::{el_if_short, ApplyPolicy};
 use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
@@ -1625,6 +1626,9 @@ impl Repl {
         ctx: &ReplCtx,
         app_state: &Arc<AppState>,
         output: &dyn Output,
+        // Content (step 3d): the resize repaint below replays a turn through
+        // `Content`, while `output` stays this loop's frame + input seam.
+        content: &Content,
         // The persistent reader's event queue (step 2 commit B). The reader is
         // the sole stdin owner; this loop consumes what it forwards rather
         // than calling `event::poll`/`event::read` itself.
@@ -1769,7 +1773,7 @@ impl Repl {
                     if let Some(s) = app_state.session() {
                         let _ = io::stdout().write_all(b"\x1b[0J");
                         let _ = io::stdout().flush();
-                        crate::agent::replay::replay_last_turn_silent(&s, output).await;
+                        crate::agent::replay::replay_last_turn_silent(&s, content).await;
                     }
                 }
                 let _ = output.cursor_row();
@@ -2083,7 +2087,7 @@ impl Repl {
     pub(crate) async fn batch_slash(
         app_state: &Arc<AppState>,
         input: &str,
-        output: &dyn Output,
+        content: &Content,
         history: &mut History,
     ) -> Option<InputAction> {
         use crate::slashdot_menu::node_impl::MenuResult;
@@ -2142,11 +2146,11 @@ impl Repl {
                     press_enter = true;
                 }
                 MenuResult::DoneSuccess(msg, prompt) => {
-                    Self::batch_commit(output, history, &prompt, msg.as_deref());
+                    Self::batch_commit(content, history, &prompt, msg.as_deref());
                     return Some(InputAction::MenuDone);
                 }
                 MenuResult::DoneError(err, prompt) => {
-                    Self::batch_commit(output, history, &prompt, Some(&err));
+                    Self::batch_commit(content, history, &prompt, Some(&err));
                     return Some(InputAction::MenuDone);
                 }
             }
@@ -2159,12 +2163,12 @@ impl Repl {
     /// Echo a batch-committed prompt to the transcript and surface the
     /// node's message — the drawing-free counterpart of `emit_commit`
     /// (no input region to clear, no prefill to seed).
-    fn batch_commit(output: &dyn Output, history: &mut History, prompt: &str, msg: Option<&str>) {
+    fn batch_commit(content: &Content, history: &mut History, prompt: &str, msg: Option<&str>) {
         let committed = format!("/{}", prompt);
         history.add(&committed);
-        output.display_plain(&committed);
+        content.display_plain(&committed);
         if let Some(m) = msg {
-            output.display_text(m);
+            content.display_text(m);
         }
     }
 
@@ -3449,10 +3453,11 @@ mod tests {
     fn batch_slash_reasoning_high_commits_in_one_enter() {
         let state = batch_state();
         let (out, lines) = crate::output::RecordingOutput::new();
+        let content = Content::with_tap(out);
         let action = crate::agent::block_on_test(Repl::batch_slash(
             &state,
             "/reasoning high",
-            out.as_ref(),
+            &content,
             &mut batch_hist(),
         ));
         assert!(matches!(action, Some(InputAction::MenuDone)));
@@ -3471,10 +3476,11 @@ mod tests {
     fn batch_slash_quit_latches_control_target() {
         let state = batch_state();
         let (out, _lines) = crate::output::RecordingOutput::new();
+        let content = Content::with_tap(out);
         let action = crate::agent::block_on_test(Repl::batch_slash(
             &state,
             "/quit",
-            out.as_ref(),
+            &content,
             &mut batch_hist(),
         ));
         assert!(matches!(action, Some(InputAction::MenuDone)));
@@ -3487,11 +3493,12 @@ mod tests {
         // (the agent loop's `/q`/`exit` arm keeps owning them).
         let state = batch_state();
         let (out, _lines) = crate::output::RecordingOutput::new();
+        let content = Content::with_tap(out);
         for line in ["", "hello", "/q"] {
             let action = crate::agent::block_on_test(Repl::batch_slash(
                 &state,
                 line,
-                out.as_ref(),
+                &content,
                 &mut batch_hist(),
             ));
             assert!(action.is_none(), "{:?} should fall through", line);
@@ -3502,10 +3509,11 @@ mod tests {
     fn batch_slash_unknown_command_returns_instead_of_hanging() {
         let state = batch_state();
         let (out, _lines) = crate::output::RecordingOutput::new();
+        let content = Content::with_tap(out);
         let action = crate::agent::block_on_test(Repl::batch_slash(
             &state,
             "/definitely-not-a-command",
-            out.as_ref(),
+            &content,
             &mut batch_hist(),
         ));
         // Whatever the engine reports for garbage input, the driver must

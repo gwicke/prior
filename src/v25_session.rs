@@ -518,7 +518,7 @@ impl SlashDotNode for SessionResumeNode {
         } else {
             crate::agent::replay::parse_replay_len_arg(&replay_arg, default)
         };
-        let out = self.app_state.with_config(|c| c.output.clone());
+        let content = self.app_state.with_config(|c| c.content.clone());
         let qualified = self.app_state.with_config(|c| c.qualified_model_id());
         // Read beside the id: this is the level activating the running model
         // would install, which is what decides whether the session's own
@@ -528,7 +528,7 @@ impl SlashDotNode for SessionResumeNode {
             &repo,
             &meta,
             replay,
-            out.as_ref(),
+            content.as_ref(),
             &qualified,
             level_on_activate,
         )

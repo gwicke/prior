@@ -386,6 +386,7 @@ mod tests {
     // The window-pump tests need a long-running operation to pump during, and
     // a retried summarization is the one that exists.
     use super::super::compaction::retry_summarization;
+    use crate::content::Content;
     use crate::settings::SettingsStore;
     use serial_test::serial;
 
@@ -393,6 +394,14 @@ mod tests {
         // The pumps paint through `Output`; the existing `NoOutput` impl in
         // `crate::output` is a no-op for everything they touch.
         std::sync::Arc::new(crate::output::NoOutput) as std::sync::Arc<dyn Output>
+    }
+
+    /// The content half of the same idea (step 3d): `retry_summarization`
+    /// reaches content, and a `Content` tapped through `NoOutput` discards it.
+    fn null_content() -> std::sync::Arc<Content> {
+        std::sync::Arc::new(Content::with_tap(std::sync::Arc::new(
+            crate::output::NoOutput,
+        )))
     }
 
     fn test_settings() -> SettingsStore {
@@ -617,10 +626,10 @@ mod tests {
         keys.push(esc_event());
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let output = null_output();
+        let content = null_content();
         let started = std::time::Instant::now();
         let r = retry_summarization(
-            output.as_ref(),
+            content.as_ref(),
             &cancel,
             &notify,
             Some(&keys),
@@ -655,11 +664,11 @@ mod tests {
         });
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let output = null_output();
+        let content = null_content();
         let mut calls = 0;
         let started = std::time::Instant::now();
         let r = retry_summarization(
-            output.as_ref(),
+            content.as_ref(),
             &cancel,
             &notify,
             Some(keys.as_ref()),
@@ -691,9 +700,9 @@ mod tests {
         keys.push(char_event('x'));
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let output = null_output();
+        let content = null_content();
         let r = retry_summarization(
-            output.as_ref(),
+            content.as_ref(),
             &cancel,
             &notify,
             Some(&keys),
@@ -720,9 +729,9 @@ mod tests {
         keys.push(esc_event());
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let output = null_output();
+        let content = null_content();
         let r = retry_summarization(
-            output.as_ref(),
+            content.as_ref(),
             &cancel,
             &notify,
             Some(&keys),

@@ -1,4 +1,5 @@
 use crate::app_state::AppState;
+use crate::content::Content;
 use crate::session::repo::{ForkMode, SessionRepo};
 use crate::session::storage::SessionStorage;
 use crate::session::Session;
@@ -565,7 +566,7 @@ pub(crate) async fn resume_session(
     repo: &crate::session::repo::JsonlSessionRepo,
     meta: &crate::session::SessionMetadata,
     replay: (usize, bool),
-    output: &dyn Output,
+    content: &Content,
     qualified_id: &str,
     level_on_activate: Option<crate::params::ReasoningLevel>,
 ) -> std::result::Result<(Arc<Session>, String, Option<String>), String> {
@@ -607,9 +608,9 @@ pub(crate) async fn resume_session(
         let total = count_turns(&units);
         if is_lines {
             // Line-based: capture full replay via writer, tail lines.
-            output.begin_capture();
-            replay_units(output, &units, 0);
-            let bytes = output.end_capture();
+            content.begin_capture();
+            replay_units(content, &units, 0);
+            let bytes = content.end_capture();
             let captured = String::from_utf8_lossy(&bytes);
             let lines: Vec<&str> = captured.lines().collect();
             let start = lines.len().saturating_sub(count);
@@ -621,7 +622,7 @@ pub(crate) async fn resume_session(
             }
             let _ = handle.flush();
         } else {
-            replay_last_turns(output, &units, count.min(total));
+            replay_last_turns(content, &units, count.min(total));
         }
     }
     let prefill = compute_resume_model_prefill(&new_session, qualified_id, level_on_activate).await;
@@ -651,9 +652,9 @@ pub(crate) async fn start_fresh_session(app_state: &AppState, name: &str) {
     app_state.activate_session(fresh.clone(), id);
     if !name.is_empty() {
         if let Some(ref s) = fresh {
-            let out = app_state.with_config(|c| c.output.clone());
+            let content = app_state.with_config(|c| c.content.clone());
             if let Err(e) = s.set_session_name(name).await {
-                out.display_text(&format!("Could not name session: {}", e));
+                content.display_text(&format!("Could not name session: {}", e));
             } else if let Some(r) = app_state.repo() {
                 r.invalidate_cache();
             }
