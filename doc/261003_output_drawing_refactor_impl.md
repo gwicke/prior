@@ -136,8 +136,9 @@ verbs record to a shared sink and short-circuit, covering the `RecordingOutput` 
 patterns without a live render stack.
 
 Capture taps the `ContentWrite` exactly as handed to `render()` — pre width-recheck, content only.
-Today's writer swap also caught frame bytes (`draw_frame` writes through the same `writer`,
-`output.rs:3474`); the narrowing to content-only is deliberate.
+Done since **4d** (`98bcb85`): the tap is the manager's `captured` buffer, the writer swap that
+also caught frame bytes (`draw_frame` wrote through the same `writer`) is gone, and the narrowing
+to content-only is pinned by `capture_catches_content_but_never_frame_bytes`.
 
 ## 5. Element reuse and the shared editor
 
@@ -230,10 +231,15 @@ The moves are landed (`74e987c`); the deferred remainder is below.
 Landed 3a–3d (`47122b4` … `cf7b6a8`) — the commit messages record what moved where. What it leaves
 behind, for the steps below:
 
-- `with_content_writer`'s byte-production half (`WrapLines`/EL stack) lives in `Content` but is
-  Draw-coupled; splitting it into `ContentWrite` handed to `render()` — **4d**.
-- `begin_capture`/`end_capture` tap the sink (`content.draw.saved_writer`), not the `ContentWrite`
-  hand-off — **4d** re-taps them there.
+- ~~`with_content_writer`'s byte-production half (`WrapLines`/EL stack) lives in `Content` but is
+  Draw-coupled; splitting it into `ContentWrite` handed to `render()` — **4d**.~~ Landed (`98bcb85`)
+  — the split landed the other way round, deliberately: the byte-production half (boundary,
+  hold, wrap, line-clear) *stays* in `Content` (design §Content: those are content's bookkeeping),
+  and the Draw-coupled tail (consume → write → note → reposition) left for the hub as
+  `RenderManager::put_content`.
+- ~~`begin_capture`/`end_capture` tap the sink (`content.draw.saved_writer`), not the `ContentWrite`
+  hand-off — **4d** re-taps them there.~~ Landed (`98bcb85`): they tap the manager's
+  `captured` buffer, and `Draw::saved_writer` + `Draw::begin_capture`/`end_capture` are gone.
 - The moved rendering's unit tests still live in `output.rs`'s test modules → relocate to `content/`
   when convenient (nothing claims it yet).
 
@@ -260,10 +266,10 @@ most runway to expand into separate sub-commits.
     still probed at `Content::new` rather than at `TermIO` construction, and the size watch's
     sender is still the process-wide `LazyLock`. Re-scoped by **4c** (see below): the writer +
     caps + `TermIO`-into-`Draw` move needs `TermIO` constructed *before* `Content`/the manager —
-    today it is built later, in `Interactive` — and the capture writer-swap gone (**4d**), so it
-    rides with the **4f** setup rework; the watch sender moves with its producers — the prompt
-    loop's probe and the parked-resize drain — when `read_input` collapses (**4f**; 4b landed the
-    manager's receiver half).
+    today it is built later, in `Interactive` — and the capture writer-swap gone (**4d** landed,
+    `98bcb85`), so it rides with the **4f** setup rework; the watch sender moves with its producers —
+    the prompt loop's probe and the parked-resize drain — when `read_input` collapses (**4f**; 4b
+    landed the manager's receiver half).
 - **4b — `RenderManager` shell: composition + apply leave the `Output` trait.** Landed (`38d9513`)
   — the commit message records what moved. Leftovers, each claimed:
   - The call sites (repl, confirm, probe) keep their `&dyn Output` handles and reach the manager
@@ -275,9 +281,11 @@ most runway to expand into separate sub-commits.
   - The recipe field (`stack`) did not land: the recipe must leave `DrawCache` together with
     `reposition_area` (Elements cannot be cloned into two recipes), which is **4e** — the hub owns
     reposition there, and the recipe goes with it.
-  - `render_batch` has no body until the `ContentWrite` hand-off — **4d** (the batching guard
-    itself moves in **4e**); `configure`'s `frame_elements` half waits for **4h** with the rest of
-    the long-lived stack.
+  - `render_batch`'s body landed with the `ContentWrite` hand-off (**4d**, `98bcb85`) — it
+    delegates to the same `put_content` as `render_content`, the batch flag inside deferring the
+    reposition; the batching guard itself still moves in **4e**, and that is when the two verbs can
+    diverge. `configure`'s `frame_elements` half waits for **4h** with the rest of the long-lived
+    stack.
   - The size watch's *receiver* is the manager's; the *sender* is still the process-wide
     `LazyLock` — it moves with its producers (the prompt loop's probe, the parked-resize drain)
     when `read_input` collapses — **4f** (see the 4a note above).
@@ -288,19 +296,39 @@ most runway to expand into separate sub-commits.
   - The writer + caps + `TermIO`-into-`Draw` move (design §Draw: `Draw { term_io, cache }`,
     caps cached from `TermIO::caps()`) is **not** in 4c: `TermIO` is constructed after
     `Content`/the manager today (a setup rework — it rides with **4f**, where the handles start
-    flowing to the repl anyway), and the capture writer-swap has to be gone first — **4d**
-    retires it, else `TermIO` would need a capture mode of its own.
-  - `Content::draw()` accessor stays until `Content` stops touching the sink — **4d** ("every
-    write enters through `render()`" makes it dead).
+    flowing to the repl anyway), and the capture writer-swap had to be gone first — **4d**
+    retired it (`98bcb85`), else `TermIO` would need a capture mode of its own.
+  - ~~`Content::draw()` accessor stays until `Content` stops touching the sink — **4d** ("every
+    write enters through `render()`" makes it dead).~~ Settled by **4d** (`98bcb85`): the content
+    write path no longer names `Draw` at all; `RenderManager::draw()` survives as the frame verbs'
+    route (until **4f**) and the batch flag's (until **4e**).
   - `Draw` and the manager each hold a receiver of the same size watch; the duplication dies with
     `TermIO`'s move into `Draw` (**4f**, per the first point).
-- **4d — `ContentWrite` + the `render()` hand-off; capture taps early.** Split
-  `with_content_writer`: emitters collect rows into `ContentWrite { lines, stream: Stream }` rather
-  than `&mut dyn io::Write`, and `Content` hands it to `render(Some(w))` (streaming) or
-  `render_batch(w)` (replay). **Capture re-taps here** — `begin_capture`/`end_capture` read the
-  hand-off (content bytes only; `draw_frame` bytes can never be caught) and `Draw::saved_writer`'s
-  writer-swap retires. Afterwards `Content` never touches Draw/writer: the end-state's "every write
-  enters through `render()`" holds, modulo the quiet/record tap.
+- **4d — `ContentWrite` + the `render()` hand-off; capture taps early.** Landed (`98bcb85`) — the
+  commit message records what moved. What it leaves behind, for the steps below:
+  - The hand-off type is `ContentWrite { bytes, rows, width }`, not the sketch's
+    `{ lines, stream: Stream }`: the payload stays `Vec<u8>` (a block can carry non-UTF8 tool
+    output, so rows-as-`String` is not yet honest) with the measured row count and the rendered
+    width alongside, and `Stream` is **absent on purpose** — there is no meta sink under the hub
+    while `Draw` owns no `TermIO`, and today's reasoning-to-stderr path never reaches `Draw` at
+    all; the token arrives with the meta sink — **4f**.
+  - `Content` hands off through two verbs, `render_content` (streaming) and `render_batch`
+    (replay, inside a batch), which are today one `put_content` choreography under two names — the
+    `batch_active` flag defers the reposition either way. They diverge when the batching guard
+    moves to the hub (**4e**); the end state's single `render(Some(w))` — compose and content in
+    one call, the frame applied below the block — waits for the frame verbs (**4f**) and the
+    installed stack (**4h**).
+  - Capture now taps the hand-off exactly as designed: content bytes only, the deliberate
+    narrowing over the old writer swap (which also caught frame bytes), pinned by
+    `capture_catches_content_but_never_frame_bytes`. Captures stay *raw* — the width guard and
+    line-clear still step aside while one is open, as they always did, so content assertions
+    compare what Content produced. Frame-byte capture tests moved to the writer seam
+    (`output.rs`'s `record_bytes`, `render.rs`'s `SharedBuf`) — the seam `TermIO::recording()`
+    takes wholesale in **4f**.
+  - The design's "formats … before each block — no hub round-trip" is not yet real: the manager
+    lock still spans build + hand-off (deliberate — the same serialization 4c established, and the
+    boundary state is Content's under it). Formatting-only, unlocked, comes with the round trip
+    (**4f/4h**) once non-reentrancy is proven for the build span.
 - **4e — Batching guard → the hub** (its own commit, deliberately). `Content::begin_batch` /
   `ContentBatchGuard` move to `RenderManager`; `replay_units` and friends take the manager handle
   beside `Content`. Settles "where batching lives": the hub owns reposition.
