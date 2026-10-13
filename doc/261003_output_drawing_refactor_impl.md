@@ -259,14 +259,26 @@ most runway to expand into separate sub-commits.
   - `TermIO::write` has no production caller (Draw still owns the production writer), caps are
     still probed at `Content::new` rather than at `TermIO` construction, and the size watch's
     sender is still the process-wide `LazyLock`. The writer + caps move rides with `Draw` (**4c**,
-    per the point above); the watch sender moves when the render manager takes the `size` handle
-    (**4b**).
-- **4b — `RenderManager` shell: composition + apply leave the `Output` trait.** New type in
-  `render.rs` — `{ stack, size: SizeWatch }` with `configure` / `render()` / `render_batch`;
-  `render()`'s body is today's `draw_elements` default (compose → allocate → render → apply →
-  `remember_compose`). Apply still paints through a `Draw` it is *given* — no ownership move yet.
-  Repl/confirm/ui call sites switch to the manager handle; `Output::draw_elements` /
-  `remember_compose` shrink to forwards. Frame-max-ratio resolution moves into `configure`.
+    per the point above); the watch sender moves with its producers — the prompt loop's probe and
+    the parked-resize drain — when `read_input` collapses (**4f**; 4b landed the manager's
+    receiver half).
+- **4b — `RenderManager` shell: composition + apply leave the `Output` trait.** Landed (`38d9513`)
+  — the commit message records what moved. Leftovers, each claimed:
+  - The call sites (repl, confirm, probe) keep their `&dyn Output` handles and reach the manager
+    through `draw_elements`' `ConsoleOutput` forward; the handle-level switch — repl/confirm
+    holding the manager — is what the 4f follow-up below already schedules (threading a manager
+    through `settle`/`paint`/the turn pumps now would be re-done when those params collapse).
+  - The compose head stays on `Output::compose_area` (the status row is console state) — **4h**,
+    when the bar becomes an installed element and the head moves into `render()`.
+  - The recipe field (`stack`) did not land: the recipe must leave `DrawCache` together with
+    `reposition_area` (Elements cannot be cloned into two recipes), which is **4e** — the hub owns
+    reposition there, and the recipe goes with it.
+  - `render_batch` has no body until the `ContentWrite` hand-off — **4d** (the batching guard
+    itself moves in **4e**); `configure`'s `frame_elements` half waits for **4h** with the rest of
+    the long-lived stack.
+  - The size watch's *receiver* is the manager's; the *sender* is still the process-wide
+    `LazyLock` — it moves with its producers (the prompt loop's probe, the parked-resize drain)
+    when `read_input` collapses — **4f** (see the 4a note above).
 - **4c — `Draw` moves into `RenderManager`; `Content` gets the manager handle.**
   `with_content_writer`, the capture writer-swap and the frame pass-through lock
   `Arc<Mutex<RenderManager>>` instead of owning `draw: Draw`; `ConsoleOutput` shares the same Arc.

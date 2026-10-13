@@ -62,5 +62,5 @@ and link a doc/ and/or commit hash
     `&Content` (§8.3) — landed 3a–3d (`47122b4`…`cf7b6a8`); frame/input rides `AgentConfig.output`
     until step 4 (follow-ups recorded in the impl doc)
   - [ ] Step 4: fold in `RenderManager` + UI; elements → `Arc<Mutex<…>>`, shared editor (§8.4) —
-    sub-commit plan 4a–4h recorded in the impl doc — 4a landed (`8cc955d`), 4b next
+    sub-commit plan 4a–4h recorded in the impl doc — 4a (`8cc955d`), 4b (`38d9513`) landed; 4c next
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)
