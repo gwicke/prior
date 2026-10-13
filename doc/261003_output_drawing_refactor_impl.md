@@ -368,11 +368,17 @@ most runway to expand into separate sub-commits.
     needs `ConsoleOutput`'s privates: the compose head moves out of `Output` into the paint path —
     a helper that builds `[status, input, …overlays]` from content's handles (status raw data,
     streaming) plus the session's elements and calls `manager.render(stack, …)` directly. The
-    head's *final* home is `render()` itself, with the bar an installed element — that much is
-    **4h**; this sub-commit only moves it out of `Output`. `paint_prompt`, `Repl::settle`/`paint`/
-    `emit_commit`, `confirm::paint`/`resolve` take content + manager instead of `&dyn Output`
-    (content for the text verbs and `cursor_row`, which rides the manager); pumps/turn/probe call
-    sites re-point. `is_streaming` leaves the trait with them.
+   head's *final* home is `render()` itself, with the bar an installed element — that much is
+    **4h**; this sub-commit only moves it out of `Output`. What each function actually takes,
+    by what it consumes: `paint_prompt` and `Repl::paint` need content (the compose head reads the
+    bar's raw-data and streaming handles) + manager (the render); `Repl::settle` the same, plus its
+    error path's `display_text` (content) and `cursor_row` (manager); `emit_commit` content
+    (`display_committed_prompt`) plus the redraw closure it already takes.
+    `confirm::paint` needs **only the manager** — a bare overlay composition, no content anywhere;
+    `confirm::resolve` needs content for the decision line (`display_plain` is a content verb,
+    tap seam included) plus the redraw closure — the repaint-then-decide order is the invariant
+    the function exists to protect, so the line does not go back to the callers. Pumps/turn/probe
+    call sites re-point. `is_streaming` leaves the trait with them.
   - **4f-c — dims: `frame_size`/`painted_size` → the size watch.** The agent-side callers
     (`pumps.rs`, `turn.rs`, interactive) read the watched size (frame dims) and the manager's
     applied size (what a resize comparison needs) through the handles `AgentConfig` already
