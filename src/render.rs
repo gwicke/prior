@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::draw::{el_if_short, plan_consume, plan_reposition, ApplyPolicy, Draw};
 use crate::slashdot_menu::table::display_width;
-use crate::termio::TermSize;
+use crate::termio::{TermGuard, TermSize};
 use tokio::sync::watch;
 
 /// The size watch handle (design §3): what the manager reads its geometry
@@ -473,6 +473,16 @@ pub struct RenderManager {
     /// so nothing reads this field itself yet.
     #[allow(dead_code)]
     size: SizeWatch,
+    /// The mode guard (raw-mode lifecycle) — the design's front door so
+    /// content / UI never touch `TermIO` (§Render: "front door for
+    /// suspend/resume"). Installed once at setup (4f-d): the interactive
+    /// driver hands over `TermIO`'s canonical `Arc` via
+    /// [`Self::set_mode_guard`], replacing the four direct holders (`Repl`,
+    /// the prompt loop, `$EDITOR`, the back-off pump). `None` for Plain —
+    /// no raw mode to flip. 4f-e takes the whole `TermIO` under `Draw` and
+    /// this hand-off goes with it; the reader-stop half of `suspend` rides
+    /// in the same move.
+    mode_guard: Option<Arc<TermGuard>>,
 }
 
 impl RenderManager {
@@ -488,6 +498,43 @@ impl RenderManager {
             recipe: Vec::new(),
             frame_max_row_ratio: FRAME_MAX_ROW_RATIO,
             size,
+            mode_guard: None,
+        }
+    }
+
+    /// The setup hand-off (4f-d): where the interactive driver publishes the
+    /// mode guard its holders used to each carry an `Arc` of. `None` (Plain,
+    /// and every state built outside `Interactive`) leaves the pass-throughs
+    /// inert — the same answer the absent holders gave.
+    pub fn set_mode_guard(&mut self, guard: Option<Arc<TermGuard>>) {
+        self.mode_guard = guard;
+    }
+
+    /// Whether this terminal flips raw mode at all (TermIO's Tty, not Plain)
+    /// — what `$EDITOR` and the window pump ask before expecting a mode
+    /// turnover. The predicate the holders' mere presence used to answer.
+    pub fn is_tty(&self) -> bool {
+        self.mode_guard.is_some()
+    }
+
+    /// Raw mode off — the front door (design §Render: "suspend() stops the
+    /// reader and drops raw mode ($EDITOR, Ctrl-Z)"). Today a pass-through
+    /// to the mode guard's stop; the reader-stop half rides with `TermIO`
+    /// under `Draw` (4f-e). Idempotent; a no-op on Plain.
+    pub fn suspend(&self) {
+        if let Some(g) = &self.mode_guard {
+            let _ = g.stop();
+        }
+    }
+
+    /// Raw mode on — the reverse of [`Self::suspend`], and also the initial
+    /// entry at prompt-loop startup (both are the guard's idempotent
+    /// `start`). The design makes resume implicit in the next render; until
+    /// the DSR answers inside `TermIO` (4g) callers re-enter explicitly.
+    /// A no-op on Plain.
+    pub fn resume(&self) {
+        if let Some(g) = &self.mode_guard {
+            let _ = g.start();
         }
     }
 

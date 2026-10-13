@@ -1,8 +1,10 @@
 //! Raw-mode REPL input layer (Stages 2–4).
 //!
-//! - [`TermGuard`] owns terminal raw-mode lifecycle + capability negotiation
-//!   (plan §3.5.2) and is safe to call from `Drop`/panic hook/signal handler.
-//! - [`Repl`] is the raw-mode driver. [`Repl::read_input`] is a multi-line
+//! - Raw-mode lifecycle + capability negotiation live in `crate::termio`
+//!   (`TermGuard`, safe from `Drop`/panic hook/signal handler); since 4f-d
+//!   this module reaches them only through the content handle's manager —
+//!   the design's suspend/resume front door (§Render).
+//! - [`Repl`] is the input driver. [`Repl::read_input`] is a multi-line
 //!   line editor with the v2.5 slash-menu frame.
 //!
 //! The line editor keeps a single flat `Vec<char>` buffer (with `'\n'` as a
@@ -18,12 +20,11 @@ use crate::content::Content;
 use crate::draw::{el_if_short, ApplyPolicy};
 use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
-use crate::output::Output;
 use crate::render::{allocate, live_budget, window, Element, Extent, RenderAt, Rendered};
 #[cfg(test)]
 use crate::render::{render, Frame};
 use crate::session::SessionTreeNode;
-use crate::termio::{InputEvent, TermGuard, RESUMED_REANCHOR};
+use crate::termio::{InputEvent, RESUMED_REANCHOR};
 use crossterm::event::{self, KeyCode, KeyModifiers};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -51,17 +52,19 @@ static ENTRY_DSR_DONE: AtomicBool = AtomicBool::new(false);
 /// Running it here — with the reader still paused — is what guarantees the
 /// terminal's reply (or a test harness's pre-written one) is not swallowed by
 /// the reader's first poll. Idempotent via [`ENTRY_DSR_DONE`], so
-/// `read_input`'s own entry check becomes a no-op.
-pub(crate) fn run_entry_dsr(output: &dyn Output) {
+/// `read_input`'s own entry check becomes a no-op. The caller side takes the
+/// content handle since 4f-d (the query is the manager's `cursor_row`); the
+/// *answer* moving inside `TermIO` is 4g.
+pub(crate) fn run_entry_dsr(content: &Content) {
     if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
-        let _ = output.cursor_row();
+        let _ = content.manager.lock().unwrap().cursor_row();
     }
 }
 
-/// The interactive REPL driver.
-pub struct Repl {
-    guard: Arc<TermGuard>,
-}
+/// The interactive input driver — a unit since 4f-d: every duty its former
+/// guard/output handles served now takes the content handle, whose manager
+/// is the front door for raw mode, the DSR re-anchors and the frame.
+pub struct Repl;
 
 /// The currently-active model id, from the settings store (the authority).
 /// `provider:model` — the same canonical form rows carry (`qualified()`),
@@ -750,11 +753,6 @@ pub struct InTurnInput<'a> {
     pub label: &'a str,
     /// History the Up/Down keys page through.
     pub history: &'a mut History,
-    /// For [`open_editor`](PromptSession::open_editor) when `Ctrl-E` lands
-    /// mid-turn. There is no reader to stop in that case — the turn's own is
-    /// what handed us the key — but the raw-mode turnover and the DSR
-    /// re-anchor are still the wrapper's to do.
-    pub guard: &'a TermGuard,
 }
 
 impl PromptSession {
@@ -1059,8 +1057,8 @@ impl PromptSession {
     /// the raw-mode turnover and the DSR re-anchor — and a failure that
     /// surfaces differently depending on which pump took the key is a failure
     /// the user sees one way out of two.
-    pub(crate) fn open_editor(&mut self, guard: &TermGuard, output: &dyn Output) {
-        match run_editor(guard, output, &self.editor.text(), EditorMode::Edit) {
+    pub(crate) fn open_editor(&mut self, content: &Content) {
+        match run_editor(content, &self.editor.text(), EditorMode::Edit) {
             Ok(new_text) => self.editor.set(&new_text),
             Err(e) => {
                 let _ = io::stdout().write_all(format!("\r\neditor error: {}\r\n", e).as_bytes());
@@ -1351,20 +1349,6 @@ impl PromptSession {
 }
 
 impl Repl {
-    /// The interactive input-layer driver. The mode guard is *not* created
-    /// here: `TermIO::tty` owns the canonical instance and hands a clone to
-    /// this constructor (step 4a) — raw-mode entry stays [`start`](Self::start),
-    /// while the reader, the signal handler and the guard itself live with
-    /// `TermIO`.
-    pub fn new(guard: Arc<TermGuard>) -> Self {
-        Self { guard }
-    }
-
-    /// Enter raw mode (idempotent). Best-effort; `Drop` still restores.
-    pub fn start(&self) -> io::Result<()> {
-        self.guard.start()
-    }
-
     /// Read a multi-line input in raw mode, with the v2.5 slash-menu frame.
     ///
     /// Returns `Some(InputAction::Submit(text))` with the submitted prompt,
@@ -1398,9 +1382,9 @@ impl Repl {
         history: &mut History,
         ctx: &ReplCtx,
         app_state: &Arc<AppState>,
-        output: &dyn Output,
-        // Content (step 3d): the resize repaint below replays a turn through
-        // `Content`, while `output` stays this loop's frame + input seam.
+        // The one handle since 4f-d: content carries the resize-replay
+        // source, the frame pipeline (through its manager), and the manager's
+        // front door for raw mode + the DSR re-anchors.
         content: &Content,
         // The persistent reader's event queue (step 2 commit B). The reader is
         // the sole stdin owner; this loop consumes what it forwards rather
@@ -1423,7 +1407,7 @@ impl Repl {
         // First prompt of the process only — every later prompt's tracked row
         // is measured from the bytes it wrote (see `ENTRY_DSR_DONE`).
         if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
-            let _ = output.cursor_row();
+            let _ = content.manager.lock().unwrap().cursor_row();
         }
         // Refresh the menu-facing view from this cycle's context. The loop
         // is the sole writer of these display fields (one acquisition);
@@ -1502,13 +1486,13 @@ impl Repl {
             // may have repainted while we were stopped, so the cached frame
             // rows can no longer be trusted (plan §4.2). Raw-mode re-entry is
             // the persistent reader's job (`RESUMED`); this flag is this
-            // loop's own resume signal, so the two never race. `guard.start()`
-            // here is a harmless idempotent belt-and-suspenders — the DSR below
-            // needs raw mode, and this keeps it correct regardless of whether
-            // the reader has re-entered yet.
+            // loop's own resume signal, so the two never race. The manager's
+            // `resume()` here is a harmless idempotent belt-and-suspenders —
+            // the DSR below needs raw mode, and this keeps it correct
+            // regardless of whether the reader has re-entered yet.
             if RESUMED_REANCHOR.swap(false, Ordering::SeqCst) {
-                let _ = self.guard.start();
-                let _ = output.cursor_row();
+                content.manager.lock().unwrap().resume();
+                let _ = content.manager.lock().unwrap().cursor_row();
             }
             // Resize detection against the hub's `painted_size` (4f-c: the manager's
             // own applied size, not an `Output` verb). Resize events are
@@ -1549,7 +1533,7 @@ impl Repl {
                         crate::agent::replay::replay_last_turn_silent(&s, content).await;
                     }
                 }
-                let _ = output.cursor_row();
+                let _ = content.manager.lock().unwrap().cursor_row();
             }
             // Keep the watch in sync (covers size changes even without an
             // explicit Resize event, e.g. on some terminals).
@@ -1640,7 +1624,7 @@ impl Repl {
                     // Ctrl-C: restore terminal, hard exit.
                     if let KeyCode::Char('c') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            let _ = self.guard.stop();
+                            content.manager.lock().unwrap().suspend();
                             std::process::exit(1);
                         }
                     }
@@ -1650,7 +1634,7 @@ impl Repl {
                     // handled as a key event rather than relying on the kernel.
                     if let KeyCode::Char('z') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            let _ = self.guard.stop();
+                            content.manager.lock().unwrap().suspend();
                             unsafe {
                                 libc::killpg(libc::getpgrp(), libc::SIGTSTP);
                             }
@@ -1658,7 +1642,7 @@ impl Repl {
                             // resumes here (in the main thread, a safe context)
                             // once the shell sends `SIGCONT`. Re-enter raw mode so
                             // the next keystroke is read correctly.
-                            let _ = self.guard.start();
+                            content.manager.lock().unwrap().resume();
                         }
                     }
                     // The dispatcher. It answers with what *should* happen on
@@ -1676,7 +1660,7 @@ impl Repl {
                             // gate, raw mode, DSR re-anchor; no local logic
                             // here (doc/editor_cleanup.md §2). It is shared
                             // because the turn's arm calls it too.
-                            session.open_editor(&self.guard, output);
+                            session.open_editor(content);
                         }
                         KeyOutcome::Action(a) => {
                             if let InputAction::Submit(_) = &a {
@@ -2830,6 +2814,7 @@ fn history_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::Output;
 
     /// A committed line is bracketed by rules: one above, one below, and the
     /// line between them.

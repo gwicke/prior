@@ -185,9 +185,9 @@ mod tests {
 
     #[test]
     fn edit_with_a_header_needs_an_interactive_guard() {
-        // `AppState::for_test` has no term guard → `edit_text` reports
-        // `Unsupported`, surfaced as `Error` (the engine shows it and the
-        // menu stays open).
+        // `AppState::for_test`'s manager carries no mode guard → `edit_text`
+        // reports `Unsupported`, surfaced as `Error` (the engine shows it and
+        // the menu stays open).
         let state = app_state();
         let mut node = ListingNode::new(&state, &[]).with_header(vec!["hdr".into()]);
         match block_on(node.edit(1, &PathArgs::new(vec![], ""))) {

@@ -11,7 +11,6 @@
 //! Both are absolute-deadline waits. A dispatched or parked key must not extend
 //! the delay.
 
-use super::Output;
 use crate::app_state::WindowKeySource;
 use crate::termio::InputEvent;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,9 +74,10 @@ pub(crate) async fn dispatch_in_turn_event(
     sess: Option<&mut crate::repl::PromptSession>,
     history: Option<&mut crate::repl::History>,
     label: &str,
-    guard: Option<&crate::termio::TermGuard>,
+    // Content is the one handle (4f-d): the frame dims, the paint path, and —
+    // through its manager — the `$EDITOR` turnover the guard/output pair used
+    // to carry.
     content: &crate::content::Content,
-    output: &dyn Output,
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
 ) -> InTurnDispatch {
@@ -130,9 +130,7 @@ pub(crate) async fn dispatch_in_turn_event(
             let opts_len = sess.opts_len();
             match sess.handle_key(key, opts_len, label, history) {
                 crate::repl::KeyOutcome::RunEditor => {
-                    if let Some(g) = guard {
-                        sess.open_editor(g, output);
-                    }
+                    sess.open_editor(content);
                 }
                 crate::repl::KeyOutcome::Continue | crate::repl::KeyOutcome::Action(_) => {}
             }
@@ -166,12 +164,11 @@ pub(crate) struct TurnPump<'a> {
     session: &'a mut crate::repl::PromptSession,
     history: &'a mut crate::repl::History,
     label: &'a str,
-    guard: &'a crate::termio::TermGuard,
-    /// The paints and settles go through content's manager (step 4f-b); the
-    /// frame dims read content's watch (4f-c). `output` stays for what has
-    /// not re-homed yet (`$EDITOR`).
+    /// The one handle (4f-d): paints and settles go through content's manager
+    /// (step 4f-b), the frame dims read content's watch (4f-c), and the
+    /// `$EDITOR` turnover reaches the manager's front door through it too —
+    /// the guard/output pair this pump used to carry is gone.
     content: &'a crate::content::Content,
-    output: &'a dyn Output,
 }
 
 impl<'a> TurnPump<'a> {
@@ -184,18 +181,14 @@ impl<'a> TurnPump<'a> {
         session: &'a mut crate::repl::PromptSession,
         history: &'a mut crate::repl::History,
         label: &'a str,
-        guard: &'a crate::termio::TermGuard,
         content: &'a crate::content::Content,
-        output: &'a dyn Output,
     ) -> Self {
         Self {
             keys,
             session,
             history,
             label,
-            guard,
             content,
-            output,
         }
     }
 }
@@ -210,19 +203,17 @@ pub(crate) fn turn_backoff_pump<'a>(
     keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     history: &'a mut crate::repl::History,
     label: &'a str,
-    guard: &'a Option<Arc<crate::termio::TermGuard>>,
     content: &'a crate::content::Content,
-    output: &'a dyn Output,
 ) -> Option<TurnPump<'a>> {
-    match (prompt_session.as_mut(), history, guard.as_deref()) {
-        (Some(session), history, Some(guard)) => Some(TurnPump {
+    // A prompt session exists only in the REPL (interactive tty) — the same
+    // fact the old `guard` zip re-checked, since TermIO is Tty iff there is one.
+    match (prompt_session.as_mut(), history) {
+        (Some(session), history) => Some(TurnPump {
             keys,
             session,
             history,
             label,
-            guard,
             content,
-            output,
         }),
         _ => None,
     }
@@ -272,9 +263,7 @@ pub(crate) async fn cancellable_sleep_pumped(
                         Some(&mut *p.session),
                         Some(&mut *p.history),
                         p.label,
-                        Some(p.guard),
                         p.content,
-                        p.output,
                         user_cancel,
                         cancel_notify,
                     )
@@ -401,12 +390,6 @@ mod tests {
     use crate::settings::SettingsStore;
     use serial_test::serial;
 
-    fn null_output() -> std::sync::Arc<dyn Output> {
-        // The pumps paint through `Output`; the existing `NoOutput` impl in
-        // `crate::output` is a no-op for everything they touch.
-        std::sync::Arc::new(crate::output::NoOutput) as std::sync::Arc<dyn Output>
-    }
-
     /// The content half of the same idea (step 3d): `retry_summarization`
     /// reaches content, and a `Content` tapped through `NoOutput` discards it.
     fn null_content() -> std::sync::Arc<Content> {
@@ -431,19 +414,14 @@ mod tests {
         }
     }
     /// The pieces a back-off pump needs: a prompt session over the test app
-    /// state, a history, and a guard that never enters raw mode (the root-Esc
-    /// path returns before any terminal call, so none of it is exercised).
+    /// state and a history (4f-d: no guard — the pump no longer carries one,
+    /// and the root-Esc path returns before any terminal call anyway).
     fn backoff_pump_parts(
         app_state: &std::sync::Arc<crate::app_state::AppState>,
-    ) -> (
-        crate::repl::PromptSession,
-        crate::repl::History,
-        crate::termio::TermGuard,
-    ) {
+    ) -> (crate::repl::PromptSession, crate::repl::History) {
         (
             crate::repl::PromptSession::new(None, app_state),
             crate::repl::History::load(),
-            crate::termio::TermGuard::new(),
         )
     }
 
@@ -461,8 +439,7 @@ mod tests {
     #[serial]
     async fn backoff_pump_cancels_promptly_on_queued_esc() {
         let app_state = crate::app_state::AppState::for_test(test_settings());
-        let (mut session, mut history, guard) = backoff_pump_parts(&app_state);
-        let output = null_output();
+        let (mut session, mut history) = backoff_pump_parts(&app_state);
         let content = null_content();
         let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
         tx.send(InputEvent::Key(crossterm::event::KeyEvent::new(
@@ -472,15 +449,7 @@ mod tests {
         .unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let pump = TurnPump::new(
-            &mut keys,
-            &mut session,
-            &mut history,
-            "",
-            &guard,
-            content.as_ref(),
-            output.as_ref(),
-        );
+        let pump = TurnPump::new(&mut keys, &mut session, &mut history, "", content.as_ref());
         let started = std::time::Instant::now();
         let completed = cancellable_sleep_pumped(&cancel, &notify, 60_000, Some(pump)).await;
         assert!(
@@ -500,8 +469,7 @@ mod tests {
     #[tokio::test]
     async fn backoff_pump_plain_key_does_not_cancel_the_wait() {
         let app_state = crate::app_state::AppState::for_test(test_settings());
-        let (mut session, mut history, guard) = backoff_pump_parts(&app_state);
-        let output = null_output();
+        let (mut session, mut history) = backoff_pump_parts(&app_state);
         let content = null_content();
         let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
         tx.send(InputEvent::Key(crossterm::event::KeyEvent::new(
@@ -511,15 +479,7 @@ mod tests {
         .unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let pump = TurnPump::new(
-            &mut keys,
-            &mut session,
-            &mut history,
-            "",
-            &guard,
-            content.as_ref(),
-            output.as_ref(),
-        );
+        let pump = TurnPump::new(&mut keys, &mut session, &mut history, "", content.as_ref());
         let started = std::time::Instant::now();
         let completed = cancellable_sleep_pumped(&cancel, &notify, 1_000, Some(pump)).await;
         assert!(
@@ -759,9 +719,10 @@ mod tests {
         assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// The real source on a test state: no term guard was published, so the
-    /// window is inactive (poll yields nothing — stdin untouched), and the
-    /// park round-trips in order: that queue is what `read_input` drains.
+    /// The real source on a test state: its manager carries no mode guard
+    /// (test states never install one), so the window is inactive (poll
+    /// yields nothing — stdin untouched), and the park round-trips in order:
+    /// that queue is what `read_input` drains.
     #[test]
     fn appstate_window_gate_and_park_roundtrip() {
         let app_state = crate::app_state::AppState::for_test(test_settings());

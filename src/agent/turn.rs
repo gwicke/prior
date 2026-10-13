@@ -212,25 +212,23 @@ impl CodeAgent {
         // scopes its futures to their own block ("a scope to separate polling
         // from handling the output"), so by the time a handler runs these are
         // free again for the handler to take.
-        let (mut it_keys, mut it_confirms, mut it_session, it_label, mut it_history, it_guard) =
-            match in_turn {
-                Some(crate::repl::InTurnInput {
-                    session,
-                    keys,
-                    confirms,
-                    label,
-                    history,
-                    guard,
-                }) => (
-                    Some(keys),
-                    Some(confirms),
-                    Some(session),
-                    label,
-                    Some(history),
-                    Some(guard),
-                ),
-                None => (None, None, None, "", None, None),
-            };
+        let (mut it_keys, mut it_confirms, mut it_session, it_label, mut it_history) = match in_turn
+        {
+            Some(crate::repl::InTurnInput {
+                session,
+                keys,
+                confirms,
+                label,
+                history,
+            }) => (
+                Some(keys),
+                Some(confirms),
+                Some(session),
+                label,
+                Some(history),
+            ),
+            None => (None, None, None, "", None),
+        };
         // The area has to say the turn started *now*. `begin_response` above
         // flipped `streaming`, and the frame on screen was composed while it was
         // false — so until some keystroke happened to compose again, the input
@@ -623,9 +621,7 @@ impl CodeAgent {
                         it_session.as_deref_mut(),
                         it_history.as_deref_mut(),
                         it_label,
-                        it_guard,
                         self.content.as_ref(),
-                        self.output.as_ref(),
                         &self.user_cancel,
                         &self.cancel_notify,
                     )

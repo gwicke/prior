@@ -9,8 +9,7 @@
 //! [`edit_in_editor`] is this module's private mechanism (tempfile + spawn +
 //! read-back); everything outside this module must use [`run_editor`].
 
-use crate::output::Output;
-use crate::termio::TermGuard;
+use crate::content::Content;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -43,17 +42,29 @@ pub enum EditorMode {
 ///
 /// Blocking by design: while the editor owns the tty nothing else may write
 /// to it, so there is nothing for a concurrent task to do (§7 of the plan).
-pub(crate) fn run_editor(
-    guard: &TermGuard,
-    out: &dyn Output,
-    current: &str,
-    mode: EditorMode,
-) -> io::Result<String> {
+pub(crate) fn run_editor(content: &Content, current: &str, mode: EditorMode) -> io::Result<String> {
+    // One handle since 4f-d: the content handle's manager is the design's
+    // front door for suspend/resume (§Render) and the owner of the DSR
+    // re-anchor (`cursor_row`). Without a mode guard — Plain, quiet, test
+    // states — there is no tty to hand over, so this reports `Unsupported`,
+    // the answer the caller-side missing-guard check used to give. The locks
+    // are taken only for the flips themselves: holding the manager across a
+    // human edit would freeze every render behind it.
+    let manager = content.manager.clone();
+    if !manager.lock().unwrap().is_tty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "editor requires an interactive terminal",
+        ));
+    }
     let _pause = crate::termio::ReaderPauseGuard::raise();
-    let _ = guard.stop();
+    manager.lock().unwrap().suspend();
     let edited = edit_in_editor(current, mode);
-    let _ = guard.start();
-    let _ = out.cursor_row();
+    {
+        let mut m = manager.lock().unwrap();
+        m.resume();
+        let _ = m.cursor_row();
+    }
     edited
 }
 

@@ -183,10 +183,6 @@ pub struct State {
     /// handlers/appliers/the loop, **taken by the loop** right before
     /// the next `read_input` (sole consumer).
     pub(crate) prefill: Option<String>,
-    /// REPL raw-mode guard — a service handle published once at startup;
-    /// the compaction review closure clones it out to suspend raw mode
-    /// around `$EDITOR` (same pattern as the Ctrl-E path).
-    pub(crate) term_guard: Option<Arc<crate::termio::TermGuard>>,
     /// Key events captured by a window pump while nobody could read stdin
     /// (the compaction LLM window), parked for `read_input` to dispatch on
     /// its next iteration — never dropped, never leaked into `$EDITOR`.
@@ -291,7 +287,6 @@ impl AppState {
                 context_tokens: 0,
                 control: ControlConfig::default(),
                 prefill: None,
-                term_guard: None,
                 parked_keys: VecDeque::new(),
             }),
         })
@@ -730,43 +725,32 @@ impl AppState {
         self.state.lock().parked_keys.pop_front()
     }
 
-    /// Is stdin owned by the interactive REPL? True iff the term guard was
-    /// published (interactive tty, non-quiet) — a window pump may read keys
-    /// only then: piped/batch stdin belongs to the script, and test states
-    /// have no guard at all.
+    /// Is stdin owned by the interactive REPL? True iff the config's manager
+    /// carries the mode guard (interactive tty, non-quiet — the same
+    /// published-at-setup fact the term-guard slot used to answer) — a
+    /// window pump may read keys only then: piped/batch stdin belongs to the
+    /// script, and test states have no guard at all.
     pub fn window_pump_active(&self) -> bool {
-        self.state.lock().term_guard.is_some()
-    }
-
-    /// Publish the REPL's term guard (set once at startup).
-    pub fn set_term_guard(&self, guard: Arc<crate::termio::TermGuard>) {
-        self.state.lock().term_guard = Some(guard);
-    }
-
-    /// Clone-out of the term guard (rule 3 — callers hold it across the
-    /// editor outside any lock; `edit_text` does exactly that).
-    pub fn term_guard(&self) -> Option<Arc<crate::termio::TermGuard>> {
-        self.state.lock().term_guard.clone()
+        let content = self.with_config(|c| c.content.clone());
+        // Bound: the lock guard must drop before `content` (a tail-expression
+        // temporary would outlive the borrow).
+        let is_tty = content.manager.lock().unwrap().is_tty();
+        is_tty
     }
 
     /// Run the external editor over `current` through the single wrapper
     /// (`crate::editor::run_editor`): reader gate, raw-mode turnover, DSR
-    /// re-anchor (doc/editor_cleanup.md §2). Requires an interactive term
-    /// guard — without one (quiet/pipe) there is no tty to hand over, so
-    /// this reports `Unsupported`.
+    /// re-anchor (doc/editor_cleanup.md §2). The turnover goes through the
+    /// config's manager — the front door for suspend/resume (4f-d) — which
+    /// reports `Unsupported` when no mode guard was installed (quiet/pipe:
+    /// no tty to hand over).
     pub fn edit_text(
         &self,
         current: &str,
         mode: crate::editor::EditorMode,
     ) -> std::io::Result<String> {
-        let guard = self.term_guard().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "editor requires an interactive terminal",
-            )
-        })?;
-        let output = self.with_config(|c| c.output.clone());
-        crate::editor::run_editor(&guard, output.as_ref(), current, mode)
+        let content = self.with_config(|c| c.content.clone());
+        crate::editor::run_editor(&content, current, mode)
     }
 
     // --- test constructor ---
@@ -862,7 +846,7 @@ mod tests {
     #[test]
     fn edit_text_requires_an_interactive_guard() {
         let app_state = AppState::for_test(test_settings());
-        // No term guard (quiet/pipe): there is no tty to hand to $EDITOR.
+        // No mode guard on the manager (quiet/pipe): no tty to hand to $EDITOR.
         let err = app_state
             .edit_text("draft", crate::editor::EditorMode::Edit)
             .unwrap_err();

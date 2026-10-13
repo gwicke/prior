@@ -23,7 +23,7 @@ use crate::params;
 use crate::repl::{History, InputAction, ModelFilter, PromptSession, Repl, ReplCtx};
 use crate::session::repo::JsonlSessionRepo;
 use crate::settings::SettingsStore;
-use crate::termio::{TermGuard, TermHandles, TermIO};
+use crate::termio::{TermHandles, TermIO};
 use crate::tools::set_sandbox;
 use crate::Result;
 
@@ -149,8 +149,8 @@ pub(crate) fn plan_rebuild(
 /// The state of a live interactive session, carried across REPL turns.
 ///
 /// Everything that must survive one input cycle is a field here: the applied
-/// config, the REPL handle and its reader guard, the carried prompt session,
-/// the cancel flags, the session repo, and the rebuild gate's fingerprint.
+/// config, the REPL handle, the carried prompt session, the cancel flags, the
+/// session repo, and the rebuild gate's fingerprint.
 /// [`run_interactive`] builds one of these and drives [`Interactive::run`].
 struct Interactive {
     config: AgentConfig,
@@ -162,7 +162,6 @@ struct Interactive {
     cancel: Arc<AtomicBool>,
     app_state: Arc<AppState>,
     last_attempted_target: Option<RebuildFingerprint>,
-    guard: Option<Arc<TermGuard>>,
     prompt_session: Option<PromptSession>,
     /// The terminal backend (step 4a): the closed `TermIO { Tty | Plain }`
     /// that owns the mode guard, the SIGCONT handler and — on Tty — the sole
@@ -249,12 +248,21 @@ impl Interactive {
         } else {
             TermIO::plain()
         };
-        // The mode guard: the reader's, this loop's and `$EDITOR`'s handle on
-        // raw mode, from `TermIO`'s canonical instance.
-        let guard = term_io.guard();
-        let mut repl = guard.clone().map(Repl::new);
-        if let Some(r) = repl.as_mut() {
-            let _ = r.start();
+        // The mode guard goes to its design home first: the manager is the
+        // front door for suspend/resume (§Render), so every former holder —
+        // this loop, the prompt, `$EDITOR`, the back-off pump — reaches raw
+        // mode through content's handle (4f-d). `None` (Plain) leaves the
+        // pass-throughs inert.
+        config
+            .content
+            .manager
+            .lock()
+            .unwrap()
+            .set_mode_guard(term_io.guard());
+        let repl = use_repl.then_some(Repl);
+        if repl.is_some() {
+            // Raw-mode entry (idempotent), where `Repl::start` used to do it.
+            config.content.manager.lock().unwrap().resume();
             // First screen: a one-line hint
             let content = &config.content;
             content.display_text("Welcome to picocode - type `/` for details.");
@@ -343,12 +351,9 @@ impl Interactive {
         // un-retried until the target changes — one error per distinct target,
         // not one per cycle while the user navigates back to the menu.
         let last_attempted_target: Option<RebuildFingerprint> = None;
-        // Publish the guard to the slot: the inline compact node's review
-        // closure suspends raw mode around `$EDITOR` with it (service handle,
-        // clone-out — never held behind the lock across the editor).
-        if let Some(g) = guard.clone() {
-            app_state.set_term_guard(g);
-        }
+        // (No slot to publish the guard to since 4f-d: the compact node's
+        // review closure gets at raw mode through `edit_text` → the manager
+        // installed above — the same path every `$EDITOR` takes.)
         // The persistent stdin reader (step 2 commit B): one thread, spawned
         // once by `TermIO::handles` (raw mode is already on), owning stdin
         // for the process lifetime. It forwards keys/paste on this channel;
@@ -363,10 +368,10 @@ impl Interactive {
         // and the reader takes over for the prompt. Without this ordering the
         // reader's first poll would swallow the terminal's cursor-position
         // report before `cursor_row` could read it.
-        let handles = if guard.is_some() {
+        let handles = if use_repl {
             crate::termio::PAUSE_GATE.store(true, Ordering::SeqCst);
             let handles = term_io.handles();
-            crate::repl::run_entry_dsr(config.output.as_ref());
+            crate::repl::run_entry_dsr(config.content.as_ref());
             crate::termio::PAUSE_GATE.store(false, Ordering::SeqCst);
             handles
         } else {
@@ -423,7 +428,6 @@ impl Interactive {
             cancel,
             app_state,
             last_attempted_target,
-            guard,
             prompt_session,
             term_io,
             handles,
@@ -825,22 +829,21 @@ impl Interactive {
                         session.as_deref(),
                         &turn,
                         &turn_params,
-                        // `zip`: the key branch exists only where there is both
-                        // a session to receive the key and a guard (interactive
-                        // mode). Piped input has neither, so it gets no key
-                        // branch — the persistent reader's queue is simply not
-                        // read there. `keys` is the one process-lifetime
-                        // channel the reader feeds.
+                        // The key branch exists only where there is a session
+                        // to receive it — built by the REPL arm alone, i.e.
+                        // interactive tty (the same fact the old `guard` zip
+                        // re-checked). Piped input gets no key branch: the
+                        // persistent reader's queue is simply not read there.
+                        // `keys` is the one process-lifetime channel the
+                        // reader feeds.
                         self.prompt_session
                             .as_mut()
-                            .zip(self.guard.as_deref())
-                            .map(|(sess, g)| crate::repl::InTurnInput {
+                            .map(|sess| crate::repl::InTurnInput {
                                 session: sess,
                                 keys: &mut self.handles.input,
                                 confirms: &mut self.confirm_bridge.requests,
                                 label: &self.prompt_str,
                                 history: &mut self.line_history,
-                                guard: g,
                             }),
                     )
                     .await;
@@ -885,9 +888,7 @@ impl Interactive {
                                 &mut self.handles.input,
                                 &mut self.line_history,
                                 &self.prompt_str,
-                                &self.guard,
                                 &self.config.content,
-                                self.config.output.as_ref(),
                             ),
                         )
                         .await;
@@ -963,9 +964,7 @@ impl Interactive {
                                 &mut self.handles.input,
                                 &mut self.line_history,
                                 &self.prompt_str,
-                                &self.guard,
                                 &self.config.content,
-                                self.config.output.as_ref(),
                             ),
                         )
                         .await;
@@ -1105,7 +1104,6 @@ impl Interactive {
                         &mut self.line_history,
                         &ctx,
                         &self.app_state,
-                        self.config.output.as_ref(),
                         self.config.content.as_ref(),
                         &mut self.handles.input,
                     )
@@ -1119,7 +1117,7 @@ impl Interactive {
                     // BEFORE the convergence step below, so control/target
                     // writes land the same cycle as an interactive `MenuDone`
                     // (doc/editor_cleanup.md §10.9).
-                    let input = self.config.output.get_user_input();
+                    let input = self.config.content.get_user_input();
                     match Repl::batch_slash(
                         &self.app_state,
                         &input,

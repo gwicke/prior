@@ -3,7 +3,6 @@ use crate::content::Content;
 use crate::session::repo::{ForkMode, SessionRepo};
 use crate::session::storage::SessionStorage;
 use crate::session::Session;
-use crate::Output;
 
 use rig_agent::agent::Agent;
 
@@ -168,10 +167,10 @@ impl TurnPersistence {
 
 pub struct CodeAgent {
     agent: Agent,
-    /// Frame + input (step 4 moves it to `RenderManager`).
-    output: Arc<dyn Output>,
     /// Content (step 3d): what the turn's `display_*` / `stream_*` /
-    /// `begin|end_response` calls go through.
+    /// `begin|end_response` calls go through. Since 4f-d it is also the
+    /// turn's whole frame/input seam — the `output` copy this struct used
+    /// to carry left with the dispatcher's last duty (`$EDITOR`).
     content: Arc<crate::content::Content>,
     tool_call_limit: usize,
     provider: String,
@@ -665,7 +664,6 @@ pub(crate) async fn start_fresh_session(app_state: &AppState, name: &str) {
 impl CodeAgent {
     pub fn new(
         agent: Agent,
-        output: Arc<dyn Output>,
         content: Arc<crate::content::Content>,
         context_limit: Option<u64>,
         tool_call_limit: usize,
@@ -682,7 +680,6 @@ impl CodeAgent {
     ) -> Self {
         Self {
             agent,
-            output,
             content,
             context_limit,
             tool_call_limit,

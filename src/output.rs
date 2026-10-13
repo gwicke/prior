@@ -18,7 +18,7 @@ use crate::render::{Element, Frame, RenderAt, Rendered};
 use crate::settings::ShowReasoning;
 use crate::settings::ShowReasoningHandle;
 use crate::termio::TermSize;
-use console::style;
+
 #[cfg(test)]
 use markdown_stream::{Parser, StreamParser};
 #[cfg(test)]
@@ -1025,15 +1025,10 @@ impl Output for ConsoleOutput {
     }
 
     fn get_user_input(&self) -> String {
-        use std::io;
-        // Through the counter like every other content write: it measures zero
-        // rows (the prompt does not move the cursor down) but it does close any
-        // blank line, so a block that follows does not inherit one.
-        self.content
-            .write_content(format!("{} ", style("❯").bold().blue()).as_bytes());
-        let mut input = String::new();
-        let _ = io::stdin().read_line(&mut input);
-        input.trim().to_string()
+        // The duty lives on `Content` since 4f-d (the prompt is a content
+        // write; the answer goes through the §4 tap when one is installed);
+        // this is the trait-facing forward.
+        self.content.get_user_input()
     }
 
     fn display_error(&self, error: &str) {

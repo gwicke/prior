@@ -347,9 +347,10 @@ pub enum TermIO {
 /// prompt loop, `$EDITOR`'s takeover), the reader's sending halves, and the
 /// handles handed out once.
 pub struct TtyIo {
-    /// The canonical mode guard; [`TermIO::guard`] hands out clones of this
-    /// `Arc` (transitional — the holders convert to the render manager's
-    /// suspend in step 4f, and this handle goes with them).
+    /// The canonical mode guard; [`TermIO::guard`] hands out the one clone
+    /// setup still needs — publishing it into the render manager's
+    /// suspend/resume front door (4f-d), which replaced the four direct
+    /// holders (`Repl`, the prompt loop, `$EDITOR`, the back-off pump).
     guard: Arc<TermGuard>,
     /// Sender half of [`TermHandles::input`], moved into the reader thread
     /// by [`TermIO::handles`].
@@ -489,9 +490,11 @@ impl TermIO {
         }
     }
 
-    /// The mode-guard handle (Tty) or `None` (Plain has no raw mode to
-    /// flip). Transitional: the holders (`Repl`, the prompt loop, `$EDITOR`,
-    /// the back-off pump) convert to the render manager's suspend in step 4f.
+    /// The mode-guard handle (Tty) or `None` (Plain has no raw mode to flip).
+    /// Setup's one call since 4f-d: the interactive driver publishes it into
+    /// `RenderManager::set_mode_guard` — the front door every former holder
+    /// reaches now — so no caller keeps an `Arc` of its own. Dies when
+    /// `TermIO` moves under `Draw` (4f-e) and the manager owns this instead.
     pub fn guard(&self) -> Option<Arc<TermGuard>> {
         match self {
             TermIO::Tty(t) => Some(t.guard.clone()),
@@ -654,14 +657,17 @@ pub(crate) fn spawn_stdin_reader(
 
 /// Owns terminal mode transitions — the folded former `repl::TermGuard`.
 /// [`TermIO::Tty`] holds the canonical instance and hands out `Arc` clones
-/// ([`TermIO::guard`]) to everything that must flip raw mode: the reader
-/// (resume / `Ctrl-C` / `Ctrl-Z`), the prompt loop, `$EDITOR`'s takeover, the
-/// back-off pump. [`start`](Self::start) enters raw mode and negotiates
-/// capabilities; [`stop`](Self::stop) (idempotent) restores cooked mode. Safe
-/// to call from `Drop`, a panic hook, or a signal handler.
+/// ([`TermIO::guard`]) to what must flip raw mode: the reader (resume /
+/// `Ctrl-C` / `Ctrl-Z`) and — since 4f-d — the render manager's
+/// suspend/resume front door, through which the prompt loop, `$EDITOR` and
+/// the back-off pump reach raw mode without holding a handle of their own.
+/// [`start`](Self::start) enters raw mode and negotiates capabilities;
+/// [`stop`](Self::stop) (idempotent) restores cooked mode. Safe to call from
+/// `Drop`, a panic hook, or a signal handler.
 ///
-/// Transitional: step 4f re-homes the holders on the render manager's
-/// suspend pass-through and this shared handle dies with them.
+/// Transitional: the manager's clone dies when `TermIO` moves under `Draw`
+/// (4f-e), and the design gives the whole lifecycle — suspend/resume,
+/// Ctrl-C/Ctrl-Z, DSR — to `TermIO` itself.
 pub struct TermGuard {
     active: AtomicBool,
     saved_paste: AtomicBool,

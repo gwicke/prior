@@ -1005,6 +1005,22 @@ impl Content {
         );
     }
 
+    /// One line of non-REPL input — the piped/batch `/`-driver's read (4f-d,
+    /// where the duty left `Output::get_user_input`'s call site). Like every
+    /// content verb it short-circuits through the tap when one is installed
+    /// (quiet's `QuietOutput` answers empty, a test's script answers its
+    /// script); without one it writes the `❯ ` prompt through the counter —
+    /// zero rows, but it closes any blank line — and reads the line.
+    pub(crate) fn get_user_input(&self) -> String {
+        if let Some(tap) = &self.tap {
+            return tap.get_user_input();
+        }
+        self.write_content(format!("{} ", style("❯").bold().blue()).as_bytes());
+        let mut input = String::new();
+        let _ = io::stdin().read_line(&mut input);
+        input.trim().to_string()
+    }
+
     pub(crate) fn begin_response(&self) {
         if let Some(tap) = &self.tap {
             tap.begin_response();
