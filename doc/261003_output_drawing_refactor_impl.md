@@ -351,18 +351,20 @@ most runway to expand into separate sub-commits.
 - **4f — Frame verbs re-home: agent, interactive, repl, confirm.** The biggest step; broken into
   sub-commits **4f-a … 4f-f**, each independently green (suite, fmt, clippy). Ownership moves
   before call-site repoints within each; the deep wiring (TermIO under Draw) closes it.
-  - **4f-a — the bar formats itself from raw data.** Per the design decision on `set_status`: the
-    bar learns to format itself — the push carries *raw data*, and the shaping is pulled into the
-    bar's own render. Concretely: an owned raw type in `agent/status.rs` (session name, first
-    message, and the `BarModel` fields — provider, model, thinking level, context tokens, context
-    window — today's `status_text` *inputs*); the status element holds
-    `Arc<Mutex<…raw…>>` + the streaming flag and runs the shaping (`status_text`: name fallback to
-    the opening-message preview, the field list, the drop order) *and* the fit (`status_bar`) inside
-    `render_at`. The raw-data store moves beside the streaming flag it already shares — onto
-    `Content` (`set_status` becomes a content verb); `Output::set_status`'s callers re-point and
-    the trait verb dies with the rest of the frame surface (or in 4f-b, whichever is last).
-    Byte-identical: same shaping rules, one home later in the pipeline — and a mid-turn figure
-    (context tokens) is now current at the next render without a re-shaping push.
+  - **4f-a — the bar formats itself from raw data.** Landed (`529f278`) — the commit message
+    records what moved: `BarStatus` (the owned raw push) in `agent/status.rs`, `status_text`
+    taking `&BarStatus`, the store on `Content` beside the streaming flag (`set_status` is a
+    content verb — a store, not a write, so the tap has nothing to intercept), `StatusItem`
+    running shaping *and* fit in `render_at`, and `Output::set_status` dead with its callers
+    re-pointed. Byte-identical; `BarModel` retired with the push-time shaping. Leftovers, each
+    claimed:
+    - The compose-side presence check (`status_row`) now shapes once at compose and once at
+      render — two cheap calls, deliberate: off is a shaped answer, and a second `is_off` on raw
+      emptiness would be a second definition of "nothing to say" to drift. A later cleanup could
+      shape once per compose and hand the shaped pair down; not worth it while the store is this
+      small.
+    - `StatusText` stays `pub` (it crosses the pub `agent::status::status_text` return); the
+      visibility pruning is step 5's.
   - **4f-b — the frame path leaves `&dyn Output`: compose head + `paint`/`settle`/`emit_commit`/
     confirm on the manager.** With the bar self-contained (4f-a), `compose_area`'s head no longer
     needs `ConsoleOutput`'s privates: the compose head moves out of `Output` into the paint path —
