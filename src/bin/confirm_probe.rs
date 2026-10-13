@@ -19,7 +19,8 @@
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, KeyModifiers};
 use picocode::confirm::{ConfirmBridge, ConfirmDecision};
 use picocode::draw::ApplyPolicy;
-use picocode::{ConsoleOutput, Output};
+use picocode::output::{term_height, term_width};
+use picocode::ConsoleOutput;
 
 #[tokio::main]
 async fn main() {
@@ -30,6 +31,10 @@ async fn main() {
     // Exercise the real raw-mode confirm path (mirrors the REPL's terminal).
     let _ = crossterm::terminal::enable_raw_mode();
     let out = ConsoleOutput::new(picocode::settings::default_show_reasoning_handle());
+    // The frame dims `Output::frame_size` used to answer (4f-c): the watched
+    // geometry, read fresh per paint — the same watch `ConsoleOutput`'s
+    // answer came from, so the probe composes exactly what it did before.
+    let dims = || (term_width(), term_height());
 
     let mut bridge = ConfirmBridge::new();
     let tool = msg
@@ -52,7 +57,7 @@ async fn main() {
         return;
     };
     let mut confirm = picocode::confirm::ConfirmPrompt::new(req, bridge.port.approvals().clone());
-    picocode::confirm::paint(&confirm, out.frame_size(), &out.hub());
+    picocode::confirm::paint(&confirm, dims(), &out.hub());
 
     // The dialog no longer takes the reader gate — that was the whole reason it
     // had to be a blocking loop. Sampled while it is up, so the test can assert
@@ -77,11 +82,11 @@ async fn main() {
                     if let Some(decided) = confirm.handle_key(KeyEvent::new(code, modifiers)) {
                         break decided;
                     }
-                    picocode::confirm::paint(&confirm, out.frame_size(), &out.hub());
+                    picocode::confirm::paint(&confirm, dims(), &out.hub());
                 }
             }
             Ok(Event::Resize(_, _)) => {
-                picocode::confirm::paint(&confirm, out.frame_size(), &out.hub());
+                picocode::confirm::paint(&confirm, dims(), &out.hub());
             }
             Ok(_) => {}
             Err(_) => break ConfirmDecision::Deny,
@@ -102,7 +107,7 @@ async fn main() {
             out.hub()
                 .lock()
                 .unwrap()
-                .render(Vec::new(), ApplyPolicy::Frame, out.frame_size());
+                .render(Vec::new(), ApplyPolicy::Frame, dims());
         },
         confirm.subject(),
         answered,

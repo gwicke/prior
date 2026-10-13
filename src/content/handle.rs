@@ -8,8 +8,11 @@
 //! pipeline and has owned the `Draw` sink since 4c. Since 4d every write
 //! this layer produces leaves as a `ContentWrite` handed to that hub
 //! (`with_content_writer` → `render_content`/`render_batch`) — the sink is
-//! never named here. The frame *verbs* (`frame_size`, `painted_size`,
-//! `cursor_row`, `draw_frame`) stay on `Output` until 4f re-homes them.
+//! never named here. Of the frame *verbs*, `frame_size` lives here since 4f-c
+//! (the watch this handle carries *is* the dims source), `painted_size` is the
+//! manager's (`RenderManager::painted_size`), `cursor_row` is the manager's
+//! with `Output` forwarding, and `draw_frame` — the test drivers' edge — stays
+//! on `Output` until step 5.
 
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
@@ -163,6 +166,17 @@ impl Content {
     pub(crate) fn set_reasoning_on_stderr(&self, on: bool) {
         self.reasoning_on_stderr
             .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The size frames are composed and applied for (ui_draw_v2 §9 #3) — the
+    /// watched geometry, floored like [`crate::output::term_width`] /
+    /// [`crate::output::term_height`] (`plan_apply` misbehaves under 20
+    /// columns; an uninitialized geometry must not get there). `frame_size`
+    /// left `Output` in 4f-c: this handle's receiver is the source, the same
+    /// channel `RenderManager::new` clones at construction, so a paint's dims
+    /// and the manager's own view of the geometry cannot disagree.
+    pub(crate) fn frame_size(&self) -> (usize, usize) {
+        (self.width(), self.height())
     }
 
     /// This instance's width: its subscribed watch, with the same 20-column

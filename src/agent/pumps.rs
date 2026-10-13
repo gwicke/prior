@@ -84,7 +84,7 @@ pub(crate) async fn dispatch_in_turn_event(
     let (Some(ev), Some(sess), Some(history)) = (ev, sess, history) else {
         return InTurnDispatch::Ignored;
     };
-    let dims = output.frame_size();
+    let dims = content.frame_size();
     match ev {
         InputEvent::Key(key) => {
             // The confirm is **modal**, and this is the top of the `Esc` ladder:
@@ -167,8 +167,9 @@ pub(crate) struct TurnPump<'a> {
     history: &'a mut crate::repl::History,
     label: &'a str,
     guard: &'a crate::termio::TermGuard,
-    /// The paints and settles go through content's manager (step 4f-b);
-    /// `output` stays for what has not re-homed yet (dims, `$EDITOR`).
+    /// The paints and settles go through content's manager (step 4f-b); the
+    /// frame dims read content's watch (4f-c). `output` stays for what has
+    /// not re-homed yet (`$EDITOR`).
     content: &'a crate::content::Content,
     output: &'a dyn Output,
 }
@@ -295,7 +296,7 @@ pub(crate) async fn cancellable_sleep_pumped(
                 }
             } => {
                 if let Some(p) = pump.as_mut() {
-                    let dims = p.output.frame_size();
+                    let dims = p.content.frame_size();
                     let _ = p
                         .session
                         .settle(p.content, p.label, &mut *p.history, dims)

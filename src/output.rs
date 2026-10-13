@@ -208,16 +208,12 @@ pub trait Output: Send + Sync {
             .unwrap_or(24)
     }
 
-    /// The size frames are composed and applied for (ui_draw_v2 §9 #3) — the
-    /// one shared source for callers that don't carry their own read (e.g. a
-    /// dialog's initial size). Callers that *do* hold a read (the REPL loop's
-    /// per-iteration size) pass it into [`Self::draw_frame`] instead.
-    /// Default: a fresh terminal query.
-    fn frame_size(&self) -> (usize, usize) {
-        crossterm::terminal::size()
-            .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
-            .unwrap_or((80, 24))
-    }
+    // The frame *size* verbs left with 4f-c: the watched size (the dims a
+    // frame is composed and applied for) is `Content::frame_size`'s — the
+    // content handle carries the same receiver the manager clones; the
+    // applied size (what resize detection compares against) is
+    // `RenderManager::painted_size`'s. Callers that hold their own read (the
+    // REPL loop's per-iteration size) still pass it into [`Self::draw_frame`].
 
     /// Draw a composed UI frame (ui_draw_v2 §5.1) with its top row at absolute
     /// `anchor` (1-based). `dims` is the (width, height) the frame was
@@ -234,23 +230,6 @@ pub trait Output: Send + Sync {
         dims: (usize, usize),
     ) -> (usize, usize) {
         (dims.0.max(1), dims.1.max(1))
-    }
-
-    /// The size the **last frame this output applied** took — the one number
-    /// resize detection compares the terminal against (ui_draw_v2 §9 #3).
-    ///
-    /// Before anything has been applied, a fresh terminal query: a caller that
-    /// has not painted yet should start from what is actually on screen, not
-    /// from a size nobody drew at.
-    ///
-    /// Distinct from [`frame_size`](Output::frame_size), which is the *current*
-    /// terminal size and never a memory — that is what a dialog wants when it
-    /// opens, this is what a painter wants when it is deciding whether its last
-    /// paint still describes the screen.
-    fn painted_size(&self) -> (usize, usize) {
-        crossterm::terminal::size()
-            .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
-            .unwrap_or((80, 24))
     }
 }
 
@@ -440,14 +419,15 @@ impl Output for LogOutput {
 /// The merged output — the agent's `Arc<dyn Output>` — whose content half is
 /// now the [`Content`] handle (step 3c): `content` owns the boundary, the
 /// width watch and the streaming renderers, and `Output`'s content methods
-/// forward through it. The frame methods stay here; the pipeline behind them
-/// is `RenderManager`'s (4b), reached through the content handle's hub.
+/// forward through it. The size verbs re-homed with 4f-c (frame dims to
+/// `Content::frame_size`, the applied size to `RenderManager::painted_size`);
+/// what remains here is `cursor_row`'s forward, the batch guard, and
+/// `draw_frame` — the test drivers' edge into the hub's pipeline (4b/4c).
 pub struct ConsoleOutput {
     /// The content owner (steps 3c–3d), shared by `Arc` with
     /// `AgentConfig.content`, so the config's frame handle and its content
     /// handle are one state. `Output`'s content methods forward through it;
-    /// the frame methods reach the drawing edge through its `manager`
-    /// (step 4c).
+    /// the drawing edge stays reachable through its `manager` (step 4c).
     pub(crate) content: Arc<Content>,
 }
 
@@ -655,17 +635,6 @@ impl ConsoleOutput {
     #[cfg(test)]
     pub(crate) fn with_size(show_reasoning: ShowReasoningHandle, size: TermSize) -> Self {
         Self::with_geometry(show_reasoning, crate::termio::fixed(size))
-    }
-
-    /// This instance's width: its subscribed watch, with the same 20-column
-    /// floor as the [`term_width`] free function.
-    fn term_width(&self) -> usize {
-        self.content.width()
-    }
-
-    /// This instance's height — symmetric to [`Self::term_width`].
-    fn term_height(&self) -> usize {
-        self.content.height()
     }
 }
 
@@ -951,14 +920,6 @@ impl Output for ConsoleOutput {
         // The verb's home is the hub since 4f-b (the query and the re-anchor
         // are both its); this is the trait-facing forward.
         self.content.manager.lock().unwrap().cursor_row()
-    }
-
-    fn frame_size(&self) -> (usize, usize) {
-        (self.term_width(), self.term_height())
-    }
-
-    fn painted_size(&self) -> (usize, usize) {
-        self.content.manager.lock().unwrap().draw().painted_size()
     }
 
     fn begin_batch(&self) -> BatchGuard<'_> {

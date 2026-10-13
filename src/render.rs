@@ -466,9 +466,11 @@ pub struct RenderManager {
     /// height on every call.
     frame_max_row_ratio: f64,
     /// The watched geometry — the handle `TermIO` hands out at setup (design
-    /// §3), cloned here so the manager owns it from the start. Nothing reads
-    /// it yet: `render` paints at the caller's `dims` (their belief, §9 #3),
-    /// and `frame_size`/`painted_size` re-home onto it in 4f.
+    /// §3), cloned here so the manager owns it from the start. `render`
+    /// paints at the caller's `dims` (their belief, §9 #3); the frame-size
+    /// reads went elsewhere in 4f-c — `Content::frame_size` carries the same
+    /// channel, and [`Self::painted_size`] reads through `draw`'s own clone —
+    /// so nothing reads this field itself yet.
     #[allow(dead_code)]
     size: SizeWatch,
 }
@@ -489,9 +491,13 @@ impl RenderManager {
         }
     }
 
-    /// The drawing edge, for the content path and the frame verbs that still
-    /// reach it directly (step 4c: `Content` and `ConsoleOutput` go through
-    /// the manager's lock to get here).
+    /// The drawing edge, for the test seams that read *past* this manager
+    /// (the writer swap, `cache.applied`). Production reaches the edge
+    /// through this manager's own verbs — `render`, `cursor_row`,
+    /// `painted_size`, `draw_frame` (content writes go through
+    /// `render_content`); the last production forwarder was
+    /// `Output::painted_size`, which 4f-c took. Test-only since.
+    #[cfg(test)]
     pub(crate) fn draw(&mut self) -> &mut Draw {
         &mut self.draw
     }
@@ -552,6 +558,19 @@ impl RenderManager {
     pub(crate) fn cursor_row(&mut self) -> usize {
         let row = crate::termio::query_cursor_row();
         self.draw.reanchor_to_cursor(row)
+    }
+
+    /// The size the **last frame applied through this hub** took — the one
+    /// number resize detection compares the terminal against (ui_draw_v2
+    /// §9 #3), read from the applied dims `render`/`draw_frame` record. Before
+    /// anything has been applied: the watched geometry (floored) — a caller
+    /// that has not painted yet starts from what the terminal is, not from a
+    /// size nobody drew at. `painted_size`'s home since 4f-c (what
+    /// `Output::painted_size` forwarded); distinct from the dims a paint is
+    /// *composed* for (`Content::frame_size`, the current size — what a
+    /// dialog wants when it opens): that is a belief, this is a memory.
+    pub(crate) fn painted_size(&self) -> (usize, usize) {
+        self.draw.painted_size()
     }
 
     /// Apply a frame that no composition produced *through this hub* —

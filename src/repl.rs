@@ -1462,15 +1462,16 @@ impl Repl {
         // value — and `PromptSession::handle_key` can be handed exactly the
         // fields it touches instead of a `&mut self` that would conflict with
         // these bindings.
-        // Terminal size at the last paint is `output.painted_size()`'s answer,
-        // read fresh each iteration rather than kept in a `Cell` here. Resizes
+        // Terminal size at the last paint is the hub's `painted_size()` answer
+        // (the manager's own since 4f-c), read fresh each iteration rather
+        // than kept in a `Cell` here. Resizes
         // are consumed without repainting (see the wait below), so a mismatch at
         // the top of the loop is the "repaint is due, and re-anchor first"
         // signal (plan §4.2); a *width* change additionally wipes + replays
         // first. The clear bound this pair used to provide is `plan_apply`'s
         // `screen_bottom` now (plan §4.3).
         //
-        // Owning it in the output rather than here also means a resize that
+        // Owning it in the hub rather than here also means a resize that
         // happens *during a turn* is caught when the next prompt opens, instead
         // of being absorbed by a fresh read at entry.
 
@@ -1509,7 +1510,8 @@ impl Repl {
                 let _ = self.guard.start();
                 let _ = output.cursor_row();
             }
-            // Resize detection against the output's `painted_size`. Resize events are
+            // Resize detection against the hub's `painted_size` (4f-c: the manager's
+            // own applied size, not an `Output` verb). Resize events are
             // consumed without repainting (see the wait below), so after a drag
             // this check first fires on the keystroke that triggers the
             // repaint: a size mismatch means "repaint is due, and re-anchor
@@ -1526,7 +1528,7 @@ impl Repl {
             let (cur_w_u16, cur_h_u16) = crossterm::terminal::size().unwrap_or((80, 24));
             let cur_h = cur_h_u16 as usize;
             let cur_w = cur_w_u16 as usize;
-            let (painted_w, painted_h) = output.painted_size();
+            let (painted_w, painted_h) = content.manager.lock().unwrap().painted_size();
             if cur_w != painted_w || cur_h != painted_h {
                 // Key-triggered repaint after a size change. A *width*
                 // change makes a reflowing terminal (wezterm) re-wrap the
