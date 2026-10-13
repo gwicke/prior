@@ -737,7 +737,7 @@ mod tests {
         // stdout is not a terminal, and without this it would be routed to
         // stderr by both sides and the test would prove nothing).
         let mut live = ConsoleOutput::with_size(reasoning.clone(), size);
-        live.reasoning_on_stderr = false;
+        live.content.reasoning_on_stderr = false;
         live.begin_capture();
         live.begin_response();
         for thinking in &turn.segments[0].thinking {
@@ -760,7 +760,7 @@ mod tests {
         // (bracketed) and then the response, so the live output should be the
         // *tail* of what replay paints — byte for byte, reasoning included.
         let mut replay = ConsoleOutput::with_size(reasoning, size);
-        replay.reasoning_on_stderr = false;
+        replay.content.reasoning_on_stderr = false;
         replay.begin_capture();
         render_turn(&replay, &turn);
         let replay_bytes = replay.end_capture();

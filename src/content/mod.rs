@@ -5,11 +5,11 @@
 //! (`doc/261003_output_drawing_refactor.md`).
 
 pub(crate) mod composition;
+pub(crate) mod handle;
 pub(crate) mod markdown;
 pub(crate) mod panel;
 pub(crate) mod preview;
 pub(crate) mod text;
 
-pub(crate) use composition::{
-    boundary_spacer, separator_line, ContentBoundary, ContentDisplayKind,
-};
+pub(crate) use composition::{boundary_spacer, separator_line, ContentDisplayKind};
+pub(crate) use handle::Content;

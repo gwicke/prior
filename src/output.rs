@@ -12,11 +12,11 @@ use crate::content::preview::{
 };
 use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno};
 use crate::content::text::wrap;
-use crate::content::{boundary_spacer, separator_line, ContentBoundary, ContentDisplayKind};
-use crate::draw::{plan_consume, ApplyPolicy, Draw};
+use crate::content::{boundary_spacer, separator_line, Content, ContentDisplayKind};
+use crate::draw::{plan_consume, ApplyPolicy};
 use crate::render::{allocate, live_budget, render, Element, Extent, Frame, RenderAt, Rendered};
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
-use crate::termio::{Caps, TermSize};
+use crate::termio::TermSize;
 use console::style;
 use markdown_stream::{Parser, StreamParser};
 use markdown_terminal::{Renderer, Theme};
@@ -599,78 +599,23 @@ impl Output for LogOutput {
     }
 }
 
+/// The merged output — the agent's `Arc<dyn Output>` — whose content half is
+/// now the [`Content`] handle (step 3c): `content` owns the boundary, the
+/// width watch, the streaming renderers, and the `Draw` sink, and `Output`'s
+/// content methods forward through it. The frame methods stay here, reaching
+/// `content.draw` until step 4 makes `RenderManager` the frame front door.
 pub struct ConsoleOutput {
-    /// The live screen: byte sink plus the bookkeeping of what is believed to
-    /// be on it. Writer before cache, always — see [`Draw`].
-    draw: Draw,
-    /// This instance's view of the size watch (step 2 commit A) — the same
-    /// channel `draw` holds, so the content path's width reads and the frame
-    /// path's geometry cannot disagree. In production a subscriber of the
-    /// process-wide channel; in tests, a private seeded one, which is what
-    /// makes the width per-instance state (no `#[serial]`).
-    size: watch::Receiver<TermSize>,
-    /// Per-stream capabilities, probed once (step 2 commit A): colour and
-    /// the reasoning routing below read this instead of calling
-    /// `is_terminal()` per site.
-    caps: Caps,
-    /// Whether the current response is being rendered live (TTY) or buffered
-    /// (non-TTY). Decided once per response in `begin_response`.
-    /// Where reasoning goes: `true` = stderr, so a consumer of
-    /// `picocode "q" | cat` can drop it (`2>/dev/null`) or merge it (`2>&1`)
-    /// without touching stdout. Decided once, here, because stdout does not
-    /// become a terminal mid-run — and because a per-call `is_terminal()`
-    /// scattered across the reasoning path is how the render path forked on
-    /// `live` in the first place (row_accounting_b3.md §4.1). `pub(crate)` so
-    /// the tests that pin the routing can ask for the other stream.
-    pub(crate) reasoning_on_stderr: bool,
-    /// Incremental GFM markdown parser for the current response (TTY only).
-    /// Fed the streamed deltas; emits events for *completed* blocks so the
-    /// renderer can print them once, avoiding whole-document re-renders.
-    parser: Mutex<StreamParser>,
-    /// Incremental terminal renderer (TTY only): prints each completed block
-    /// once as it closes, so code blocks stream line-by-line and paragraphs
-    /// appear on close — coarse-grained, with clean scrollback.
-    renderer: Mutex<Renderer>,
-    /// Incremental parser/renderer for *thinking* content (TTY only). Kept
-    /// separate from the answer parser/renderer so thinking and answer blocks
-    /// have independent state; thinking is rendered inline and dimmed as it
-    /// streams (Phase 5).
-    thinking_parser: Mutex<StreamParser>,
-    thinking_renderer: Mutex<Renderer>,
-    /// Live `show_reasoning` display mode. Read on every thinking event so a
-    /// `/set show_reasoning …` change applies immediately (no agent rebuild).
-    show_reasoning: ShowReasoningHandle,
-
-    /// The most recent tool call's `(name, args)`, captured in
-    /// `display_tool_call` and read back in `display_tool_result` so the result
-    /// can be rendered tool-aware (e.g. strip `read_file` line-number gutters
-    /// and pick a syntax-highlight language). The hook always fires a call
-    /// immediately before its result, so this is safe to read on the result.
-    last_tool: Mutex<Option<(String, Value)>>,
-    /// The status line's content (an all-empty `StatusText` is off). Content
-    /// rather than rendered bytes, because the width is this layer's to know:
-    /// see [`status_bar`].
-    ///
-    /// `Arc`'d so [`Element::status`] can hold its own handle: the row is
-    /// resolved when the frame is **drawn**, not when it is composed, so a
-    /// `set_status` or a dot flip landing between compose and draw still shows
-    /// up (ui_draw_v2 §4.5 P1/P2). Compose decides *whether* the row exists —
-    /// every compose happens after `read_input`'s `set_status`, so presence is
-    /// settled — and render decides what it says.
+    /// The content owner (step 3c). `Output`'s content methods forward
+    /// through it; the frame methods reach `content.draw` via a temporary
+    /// pass-through.
+    pub(crate) content: Content,
+    /// The status line's content — pure frame state, never content's (see the
+    /// transition contract). `Arc`'d so [`Element::status`] can hold its own
+    /// handle: the row resolves at draw time, not compose time.
     status_text: Arc<Mutex<StatusText>>,
-    /// Whether a turn is in flight, which is the bar dot's only state.
-    ///
-    /// Owned here rather than passed in because this layer is what *draws* it,
-    /// and the one caller that used to decide passed a hardcoded `true` — which
-    /// is how the idle bar and the streaming bar came to be two renderings of
-    /// one function. The flag flips in `begin_response`/`end_response`, so the
-    /// bar's state cannot disagree with whether a turn is actually running.
+    /// Whether a turn is in flight — the bar dot's only state, flipped in
+    /// `begin_response`/`end_response`.
     streaming: Arc<std::sync::atomic::AtomicBool>,
-    /// The content boundary/separator state (step 3a): the last declared kind,
-    /// its segment-closed flag, and the held blank rows. Owned by `content/` —
-    /// the content writers record into it and `display_committed_prompt` reads
-    /// it; `draw_frame` never touches it.
-    boundary: ContentBoundary,
 }
 
 /// Terminal width in columns, from the size watch (`crate::termio`, step 2
@@ -860,22 +805,10 @@ impl ConsoleOutput {
     /// watch, the caps probe) arrives here, so a test can substitute the
     /// watch via [`Self::with_size`] without forking the rest of the wiring.
     fn with_geometry(show_reasoning: ShowReasoningHandle, size: watch::Receiver<TermSize>) -> Self {
-        let caps = Caps::probe();
         Self {
-            draw: Draw::new(size.clone()),
-            size,
-            caps,
-            reasoning_on_stderr: !caps.primary,
-            parser: Mutex::new(StreamParser::new_gfm_stream()),
-            renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
-            thinking_parser: Mutex::new(StreamParser::new_gfm_stream()),
-            thinking_renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
-            show_reasoning,
-
-            last_tool: Mutex::new(None),
+            content: Content::new(size, show_reasoning),
             status_text: Arc::new(Mutex::new(StatusText::default())),
             streaming: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            boundary: ContentBoundary::new(),
         }
     }
 
@@ -890,12 +823,12 @@ impl ConsoleOutput {
     /// This instance's width: its subscribed watch, with the same 20-column
     /// floor as the [`term_width`] free function.
     fn term_width(&self) -> usize {
-        self.size.borrow().width.max(20)
+        self.content.width()
     }
 
     /// This instance's height — symmetric to [`Self::term_width`].
     fn term_height(&self) -> usize {
-        self.size.borrow().height.max(1)
+        self.content.height()
     }
 }
 
@@ -918,7 +851,7 @@ impl ConsoleOutput {
     fn reasoning_sink(&self) -> ReasoningSink {
         ReasoningSink {
             buf: Vec::new(),
-            to_stderr: self.reasoning_on_stderr,
+            to_stderr: self.content.reasoning_on_stderr,
         }
     }
 
@@ -1014,14 +947,14 @@ impl ConsoleOutput {
     where
         F: FnOnce(&mut dyn io::Write) -> T,
     {
-        let mut out = self.draw.writer.lock().unwrap();
+        let mut out = self.content.draw.writer.lock().unwrap();
         // The *caller* declares the kind — the choke point never guesses from
         // bytes — and the previous one is read first, because the whole
         // boundary rule is a statement about the pair. Recording before `f`
         // runs is deliberate: an emitter drawing several things inside this one
         // block then reads back its own kind, so its internal separators are
         // (kind, kind) and contribute nothing.
-        let (old, closed) = self.boundary.record(kind, closes_segment);
+        let (old, closed) = self.content.boundary.record(kind, closes_segment);
         // A write opens a new block when its kind differs from the last, or
         // when the last one said it closed its segment. Everything the opener
         // does — drawing the boundary row, stripping this block's leading
@@ -1035,7 +968,7 @@ impl ConsoleOutput {
         // separators it is not entitled to, and the backtrace below is how the
         // offender is found — a diagnostic, not a policy decision about what to
         // do with them, which stays "drop".
-        let held = self.boundary.take_held();
+        let held = self.content.boundary.take_held();
         // Two distinct findings, both about what the *previous* write left
         // behind, and both no more than a backtrace with which to find the
         // emitter:
@@ -1063,7 +996,7 @@ impl ConsoleOutput {
         //
         // Captures get the raw bytes — they are assertions against content,
         // not against a screen.
-        let capturing = self.draw.saved_writer.lock().unwrap().is_some();
+        let capturing = self.content.draw.saved_writer.lock().unwrap().is_some();
         let mut buf: Vec<u8> = Vec::new();
         let mut clear = LineClear {
             inner: &mut buf,
@@ -1160,7 +1093,7 @@ impl ConsoleOutput {
         // write that did write carries on, capped at one row: one separator is
         // all a gap ever is, and anything past it was already blamed above.
         let held_next = if wrote_any { carried.min(1) } else { held };
-        self.boundary.store_held(held_next);
+        self.content.boundary.store_held(held_next);
         if !wrote_content {
             // A write with no content in it changes no boundary: its new kind
             // never happened, so the predecessor still stands and the next
@@ -1179,7 +1112,8 @@ impl ConsoleOutput {
             //     This prevents an empty turn end (old=None, kind=ResponseText) from
             //     spuriously setting closed=true, which would inject blank lines
             //     before subsequent retry messages.
-            self.boundary
+            self.content
+                .boundary
                 .restore_empty(old, closed, kind, closes_segment);
         }
         let rows = counter.rows();
@@ -1201,7 +1135,7 @@ impl ConsoleOutput {
         // walk: each line clears the row it enters, and rows the content never
         // reaches are the reposition's `old_h` tail to clear in its own pass.
         let (walk, taken) = {
-            let mut cache = self.draw.cache.lock().unwrap();
+            let mut cache = self.content.draw.cache.lock().unwrap();
             match plan_consume(&mut cache) {
                 Some((walk, frame)) => (walk, Some(frame)),
                 // No live area: the cursor is wherever the last write left it,
@@ -1219,7 +1153,7 @@ impl ConsoleOutput {
         drop(out);
         // Zero rows means nothing moved, and a frame stays live.
         if rows > 0 {
-            self.draw.note_lines(rows);
+            self.content.draw.note_lines(rows);
         }
         // The area comes back below what was just written — re-rendered rather
         // than replayed, so its status row is whatever it is *now*: the turn's
@@ -1231,7 +1165,7 @@ impl ConsoleOutput {
         // Inside a batch the reposition waits: the frame stays consumed for
         // the whole burst and the guard's drop emits it once (ui_draw_v2 R5).
         let taken = {
-            let mut cache = self.draw.cache.lock().unwrap();
+            let mut cache = self.content.draw.cache.lock().unwrap();
             if taken.is_some() || cache.deferred.is_some() {
                 cache.consumed_rows += rows;
             }
@@ -1250,8 +1184,8 @@ impl ConsoleOutput {
             }
         };
         if let Some(taken) = taken {
-            let bytes = self.draw.reposition_area(width, taken);
-            let mut out = self.draw.writer.lock().unwrap();
+            let bytes = self.content.draw.reposition_area(width, taken);
+            let mut out = self.content.draw.writer.lock().unwrap();
             let _ = out.write_all(bytes.as_bytes());
             let _ = out.flush();
         }
@@ -1271,12 +1205,12 @@ impl ConsoleOutput {
     /// continuous faded stream. See `doc/reasoning_order_opus.md` §4.
     fn commit_thinking<W: io::Write>(&self, out: &mut W) {
         let events = {
-            let mut tparser = self.thinking_parser.lock().unwrap();
+            let mut tparser = self.content.thinking_parser.lock().unwrap();
             let events = tparser.flush();
             *tparser = StreamParser::new_gfm_stream();
             events
         };
-        let mut trenderer = self.thinking_renderer.lock().unwrap();
+        let mut trenderer = self.content.thinking_renderer.lock().unwrap();
         let _ = trenderer.feed(&events, out);
     }
 
@@ -1300,9 +1234,9 @@ impl ConsoleOutput {
     /// free: the parser keeps the document, the renderer starts a block.
     fn reset_renderer_gaps(&self) {
         let width = self.term_width();
-        let mut renderer = self.renderer.lock().unwrap();
-        *renderer = Renderer::new(answer_theme(self.caps.primary), width);
-        let mut trenderer = self.thinking_renderer.lock().unwrap();
+        let mut renderer = self.content.renderer.lock().unwrap();
+        *renderer = Renderer::new(answer_theme(self.content.caps.primary), width);
+        let mut trenderer = self.content.thinking_renderer.lock().unwrap();
         *trenderer = Renderer::new(Theme::dimmed(), width);
     }
 
@@ -1684,7 +1618,7 @@ impl ConsoleOutput {
     /// rendering the result alone.
     fn multi_file_pairs(&self, result: &str) -> Option<Vec<(String, Value, String)>> {
         let files = blockedit::parse_file_results(result)?;
-        let (name, args) = self.last_tool.lock().unwrap().clone()?;
+        let (name, args) = self.content.last_tool.lock().unwrap().clone()?;
         if !name.eq_ignore_ascii_case("edit") {
             return None;
         }
@@ -1723,7 +1657,7 @@ impl ConsoleOutput {
         // reads as a distinct block. The command itself is syntax-highlighted
         // through the same formatter the answer/result path uses (flushed per
         // block via a fresh fenced code render).
-        let color = self.caps.primary;
+        let color = self.content.caps.primary;
         let label_styled = highlight_code_fg(&label, command_lang(name), color, self.term_width());
         self.paint_panel(&label_styled, false);
         for line in &extra {
@@ -1835,7 +1769,7 @@ impl ConsoleOutput {
 
         // Which tool produced this result (set by `display_tool_call`). Drives
         // read/write-specific rendering and language guessing.
-        let tool = self.last_tool.lock().unwrap().clone();
+        let tool = self.content.last_tool.lock().unwrap().clone();
         let is_read = tool
             .as_ref()
             .map(|(n, _)| n.eq_ignore_ascii_case("read") || n.eq_ignore_ascii_case("read_file"))
@@ -1854,7 +1788,7 @@ impl ConsoleOutput {
                     v.get("lines").and_then(|x| x.as_u64()),
                 ) {
                     // Show the path as a header with line count
-                    let color = self.caps.primary;
+                    let color = self.content.caps.primary;
                     let lang = guess_lang(path);
                     let header = format!("write {} [{} lines]", path, total_lines);
                     let header_styled =
@@ -1894,7 +1828,7 @@ impl ConsoleOutput {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let color = self.caps.primary;
+        let color = self.content.caps.primary;
         // Error output is shown verbatim (red). Everything else is highlighted:
         // `read_file` output is colored by the file's guessed language, bash
         // command output gets token highlighting, and other tools' output is
@@ -1962,7 +1896,7 @@ impl Output for ConsoleOutput {
         // around the query so the reply cannot be swallowed, then this re-anchors
         // the draw cache with the answer.
         let row = crate::termio::query_cursor_row();
-        self.draw.reanchor_to_cursor(row)
+        self.content.draw.reanchor_to_cursor(row)
     }
 
     fn frame_size(&self) -> (usize, usize) {
@@ -1970,13 +1904,13 @@ impl Output for ConsoleOutput {
     }
 
     fn painted_size(&self) -> (usize, usize) {
-        self.draw.painted_size()
+        self.content.draw.painted_size()
     }
 
     fn begin_batch(&self) -> BatchGuard<'_> {
         // The mechanics (flag, debug assert) live on `Draw`; only the guard,
         // which has to name an `Output` for its drop, is this layer's.
-        if self.draw.begin_batch() {
+        if self.content.draw.begin_batch() {
             BatchGuard { out: Some(self) }
         } else {
             BatchGuard { out: None }
@@ -1984,7 +1918,7 @@ impl Output for ConsoleOutput {
     }
 
     fn end_batch(&self) {
-        self.draw.end_batch(self.term_width());
+        self.content.draw.end_batch(self.term_width());
     }
 
     /// Bracketed, and — where the previous content was also a committed
@@ -2010,7 +1944,7 @@ impl Output for ConsoleOutput {
     /// against model output reads as a turn while two adjacent prompts read as
     /// two commits sharing one rule.
     fn display_committed_prompt(&self, line: &str) {
-        let shares_rule = self.boundary.last_kind() == Some(ContentDisplayKind::Prompt);
+        let shares_rule = self.content.boundary.last_kind() == Some(ContentDisplayKind::Prompt);
         let rule = separator_line(self.term_width());
         let block = if shares_rule {
             format!("{line}\n{rule}")
@@ -2026,7 +1960,7 @@ impl Output for ConsoleOutput {
         policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
-        self.draw.draw_frame(frame, policy, dims)
+        self.content.draw.draw_frame(frame, policy, dims)
     }
 
     fn display_plain(&self, text: &str) {
@@ -2043,7 +1977,7 @@ impl Output for ConsoleOutput {
     }
 
     fn display_markdown(&self, text: &str) {
-        let color = self.caps.primary;
+        let color = self.content.caps.primary;
         let rendered = render_markdown(text, self.term_width(), color);
         let mut block = String::with_capacity(rendered.len() + 1);
         block.push_str(&rendered);
@@ -2087,19 +2021,19 @@ impl Output for ConsoleOutput {
         // incremental renderer, where the separator bugs live, went untested.
         // Colour still follows the terminal: that is a property of the bytes,
         // not of the render path.
-        let theme = answer_theme(self.caps.primary);
+        let theme = answer_theme(self.content.caps.primary);
         let current_width = self.term_width();
-        let mut parser = self.parser.lock().unwrap();
+        let mut parser = self.content.parser.lock().unwrap();
         *parser = StreamParser::new_gfm_stream();
-        let mut renderer = self.renderer.lock().unwrap();
+        let mut renderer = self.content.renderer.lock().unwrap();
         *renderer = Renderer::new(theme, current_width);
         // Reset the thinking parser/renderer for this response. Its dimming
         // needs no reset: the renderer fades each row as it emits it, so no
         // attribute outlives a block and there is no state to carry between
         // turns.
-        let mut tparser = self.thinking_parser.lock().unwrap();
+        let mut tparser = self.content.thinking_parser.lock().unwrap();
         *tparser = StreamParser::new_gfm_stream();
-        let mut trenderer = self.thinking_renderer.lock().unwrap();
+        let mut trenderer = self.content.thinking_renderer.lock().unwrap();
         *trenderer = Renderer::new(Theme::dimmed(), current_width);
         // No blank line written here: the row between the prompt and the
         // response is `boundary_spacer`'s, on the first `ResponseText` write —
@@ -2113,11 +2047,11 @@ impl Output for ConsoleOutput {
         // renderers reflow on the next feed.
         let current_width = self.term_width();
         {
-            let mut renderer = self.renderer.lock().unwrap();
+            let mut renderer = self.content.renderer.lock().unwrap();
             if renderer.width() != current_width {
                 renderer.set_width(current_width);
             }
-            let mut trenderer = self.thinking_renderer.lock().unwrap();
+            let mut trenderer = self.content.thinking_renderer.lock().unwrap();
             if trenderer.width() != current_width {
                 trenderer.set_width(current_width);
             }
@@ -2157,9 +2091,9 @@ impl Output for ConsoleOutput {
             Some(ContentDisplayKind::ResponseText),
             false,
             |mut out| {
-                let mut parser = self.parser.lock().unwrap();
+                let mut parser = self.content.parser.lock().unwrap();
                 let events = parser.write(delta.as_bytes());
-                let mut renderer = self.renderer.lock().unwrap();
+                let mut renderer = self.content.renderer.lock().unwrap();
                 let _ = renderer.feed(&events, &mut out);
             },
         );
@@ -2167,14 +2101,14 @@ impl Output for ConsoleOutput {
 
     fn stream_thinking(&self, delta: &str) {
         // Content mode => stream the reasoning text; otherwise suppress it.
-        if *self.show_reasoning.lock().unwrap() != ShowReasoning::Content {
+        if *self.content.show_reasoning.lock().unwrap() != ShowReasoning::Content {
             return;
         }
         // Sync terminal width (updated by in-flight reader on resize) so
         // renderers reflow on the next feed.
         let current_width = self.term_width();
         {
-            let mut trenderer = self.thinking_renderer.lock().unwrap();
+            let mut trenderer = self.content.thinking_renderer.lock().unwrap();
             if trenderer.width() != current_width {
                 trenderer.set_width(current_width);
             }
@@ -2185,9 +2119,9 @@ impl Output for ConsoleOutput {
         // into and taken out of, so this writer emits no escapes of its own and
         // the boundary after the reasoning has nothing to close.
         let mut sink = self.reasoning_sink();
-        let mut parser = self.thinking_parser.lock().unwrap();
+        let mut parser = self.content.thinking_parser.lock().unwrap();
         let events = parser.write(delta.as_bytes());
-        let mut renderer = self.thinking_renderer.lock().unwrap();
+        let mut renderer = self.content.thinking_renderer.lock().unwrap();
         let _ = renderer.feed(&events, &mut sink);
         sink.commit(self);
     }
@@ -2212,13 +2146,13 @@ impl Output for ConsoleOutput {
         // transition already emits one blank).
         let mut answer: Vec<u8> = Vec::new();
         {
-            let mut parser = self.parser.lock().unwrap();
+            let mut parser = self.content.parser.lock().unwrap();
             // `flush()` (not `write("\n\n")`) so a segment whose answer text
             // ends in a list/table is emitted now rather than stranded; then
             // start a fresh answer parser + renderer for the next segment.
             let events = parser.flush();
             *parser = StreamParser::new_gfm_stream();
-            let mut renderer = self.renderer.lock().unwrap();
+            let mut renderer = self.content.renderer.lock().unwrap();
             let _ = renderer.feed(&events, &mut answer);
             let theme = Theme {
                 clickable_links: true, // real TTY path
@@ -2250,17 +2184,17 @@ impl Output for ConsoleOutput {
         let mut answer: Vec<u8> = Vec::new();
         {
             // Finalize the answer document.
-            let mut parser = self.parser.lock().unwrap();
+            let mut parser = self.content.parser.lock().unwrap();
             let events = parser.flush();
-            let mut renderer = self.renderer.lock().unwrap();
+            let mut renderer = self.content.renderer.lock().unwrap();
             let _ = renderer.feed(&events, &mut answer);
         }
         let mut thinking: Vec<u8> = Vec::new();
         // Finalize thinking (it was rendered as it streamed, already faded).
         {
-            let mut parser = self.thinking_parser.lock().unwrap();
+            let mut parser = self.content.thinking_parser.lock().unwrap();
             let events = parser.flush();
-            let mut renderer = self.thinking_renderer.lock().unwrap();
+            let mut renderer = self.content.thinking_renderer.lock().unwrap();
             let _ = renderer.feed(&events, &mut thinking);
         }
         self.write_segment_tail(current_width, &answer, &thinking);
@@ -2271,7 +2205,7 @@ impl Output for ConsoleOutput {
         // tool-aware (strip `read_file` line-number gutters, pick a highlight
         // language). The hook always fires the call immediately before its
         // result, so this is safe to read back on the result.
-        *self.last_tool.lock().unwrap() = Some((name.to_string(), args.clone()));
+        *self.content.last_tool.lock().unwrap() = Some((name.to_string(), args.clone()));
         // A multi-file `edit` renders nothing here: its pair is not complete
         // until the result arrives, and splitting it into "all labels now, all
         // notes later" would produce two runs rather than one block per file.
@@ -2306,7 +2240,7 @@ impl Output for ConsoleOutput {
         // call half, and so the diff, is gone, but the report is still per
         // file and still needs its path to attribute a failure.
         if let Some(files) = blockedit::parse_file_results(result) {
-            let color = self.caps.primary;
+            let color = self.content.caps.primary;
             for fr in files {
                 let label = highlight_code_fg(
                     &format!("edit {}", fr.path),
@@ -2391,7 +2325,7 @@ impl Output for ConsoleOutput {
     }
 
     fn begin_capture(&self) {
-        self.draw.begin_capture();
+        self.content.draw.begin_capture();
     }
 
     /// The frame path's bar, from the same two facts the content path's is
@@ -2419,7 +2353,7 @@ impl Output for ConsoleOutput {
     /// output that has a screen has something to keep; everyone else drops it
     /// (the default), which is also why nothing here can be read by mistake.
     fn remember_compose(&self, stack: Vec<Element>, applied: (usize, usize)) {
-        self.draw.remember_compose(stack, applied);
+        self.content.draw.remember_compose(stack, applied);
     }
 
     /// Remember the status line to paint after each content block; see
@@ -2434,7 +2368,7 @@ impl Output for ConsoleOutput {
     }
 
     fn end_capture(&self) -> Vec<u8> {
-        self.draw.end_capture()
+        self.content.draw.end_capture()
     }
 }
 
@@ -2659,7 +2593,7 @@ mod tests {
         // Pinned rather than probed: the routing is not this suite's subject,
         // and a capture harness should capture everything the code might
         // write (the doc on this helper says why in full).
-        out.reasoning_on_stderr = false;
+        out.content.reasoning_on_stderr = false;
         (out, reasoning)
     }
 
@@ -2679,7 +2613,7 @@ mod tests {
 
     /// Tracked cursor row of `out` (0-based, as the screen reports it).
     fn tracked_row(out: &ConsoleOutput) -> usize {
-        out.draw.cache.lock().unwrap().tracked_row() - 1
+        out.content.draw.cache.lock().unwrap().tracked_row() - 1
     }
 
     /// Row the cursor ends on when `bytes` are replayed into a `width`x24
@@ -2890,7 +2824,7 @@ mod tests {
         // the pin is exactly the kind of thing a future edit drops as
         // "obviously already handled". The routing itself is the subject of
         // `reasoning_is_routed_by_the_output_layer`, which names both values.
-        out.reasoning_on_stderr = false;
+        out.content.reasoning_on_stderr = false;
         out.begin_capture();
         out.begin_response();
         for step in steps {
@@ -3060,7 +2994,7 @@ mod tests {
         // stderr instead, which is what makes `2>/dev/null` work for a consumer.
         let (mut out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.reasoning_on_stderr = true;
+        out.content.reasoning_on_stderr = true;
         out.begin_capture();
         out.begin_response();
         feed(&out, script[0], Chunking::Whole);
@@ -3074,7 +3008,7 @@ mod tests {
         // On the screen: the other side of the same decision.
         let (mut out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.reasoning_on_stderr = false;
+        out.content.reasoning_on_stderr = false;
         out.begin_capture();
         out.begin_response();
         feed(&out, script[0], Chunking::Whole);
@@ -3133,7 +3067,7 @@ mod tests {
     fn an_empty_segment_puts_no_blank_between_retries() {
         let (mut out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.reasoning_on_stderr = false;
+        out.content.reasoning_on_stderr = false;
         out.begin_capture();
         // Three failed attempts, each an empty turn: `begin_response` then a
         // stream that errors before a single delta reaches the parser.
@@ -3177,7 +3111,7 @@ mod tests {
     fn a_segment_that_streamed_still_closes_for_the_notice_after_it() {
         let (mut out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.reasoning_on_stderr = false;
+        out.content.reasoning_on_stderr = false;
         out.begin_capture();
         // The answer streams and is emitted as it arrives; the paragraph is
         // closed by its own trailing blank, so the flush below is genuinely
@@ -4014,7 +3948,7 @@ mod tests {
     fn content_choke_wraps_an_overwide_line_before_the_line_clear() {
         let (mut out, _reasoning) = capturing_output(60);
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
-        out.draw.writer = Mutex::new(Box::new(sink.clone()));
+        out.content.draw.writer = Mutex::new(Box::new(sink.clone()));
         let y = "y".repeat(120);
         out.with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
             w.write_all(y.as_bytes()).unwrap();
@@ -4036,7 +3970,7 @@ mod tests {
     fn wrapped_content_keeps_its_sgr_across_the_inserted_newline() {
         let (mut out, _reasoning) = capturing_output(60);
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
-        out.draw.writer = Mutex::new(Box::new(sink.clone()));
+        out.content.draw.writer = Mutex::new(Box::new(sink.clone()));
         let y = "y".repeat(120);
         let input = format!("\x1b[32m{y}\x1b[0m\n");
         out.with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
@@ -4533,7 +4467,7 @@ Invalid block: an edit block is missing its `@@@NEW` section\n\
 \n\
 Expected:\nsome/path:1234\n@@@OLD\nold text\n@@@NEW\nnew text\n@@@END\n\
 \n\
-Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock().unwrap().anchor()\n";
+Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.draw.lock().unwrap().anchor()\n";
         let out = ConsoleOutput::with_size(
             crate::settings::default_show_reasoning_handle(),
             TermSize {
@@ -4542,9 +4476,9 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
             },
         );
         out.display_tool_call("edit", &serde_json::json!({"path": "src/x.rs"}));
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
         out.display_tool_result(msg);
-        let bytes = out.draw.end_capture();
+        let bytes = out.content.draw.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         let columns: Vec<usize> = text
@@ -4592,9 +4526,9 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         ] {
             let err = crate::tools::EditArgs::from_wire(&raw).expect_err("must fail");
             let (out, _reasoning) = capturing_output(80);
-            out.draw.begin_capture();
+            out.content.draw.begin_capture();
             out.display_tool_result(&format!("failed to parse tool arguments: {err}"));
-            let bytes = out.draw.end_capture();
+            let bytes = out.content.draw.end_capture();
             let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
             assert!(!text.contains("@@ -"), "phantom diff for {raw}:\n{text}");
@@ -4625,13 +4559,13 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     #[test]
     fn a_single_edit_failure_renders_as_a_definition_list() {
         let (out, _reasoning) = capturing_output(80);
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
         out.display_tool_result(
             "missing required field 'path'\n\nExpected:\n\
              {\"path\": \"some/path.rs\", \"startLine\": 1234, \"oldText\": \"old text\", \
              \"newText\": \"new text\"}\n\nActual:\n{\"newText\":\"b\",\"oldText\":\"a\"}",
         );
-        let bytes = out.draw.end_capture();
+        let bytes = out.content.draw.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         assert!(!text.contains("|"), "a table was drawn:\n{text}");
@@ -4653,12 +4587,12 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     #[test]
     fn an_edit_call_still_renders_its_blocks_as_a_diff() {
         let (out, _reasoning) = capturing_output(80);
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
         out.display_tool_call(
             "edit",
             &serde_json::json!({"blocks": "src/x.rs:5\n@@@OLD\n    run();\n@@@NEW\n    walk();\n@@@END"}),
         );
-        let bytes = out.draw.end_capture();
+        let bytes = out.content.draw.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         assert!(text.contains("edit src/x.rs"), "no label:\n{text}");
@@ -4673,13 +4607,13 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     #[test]
     fn a_sed_preview_renders_without_a_call_context() {
         let (out, _reasoning) = capturing_output(80);
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
         out.display_tool_result(
             "sed preview: 1 block for src/x.rs (1 expression). Review the blocks below, \
              then pass them to the `edit` tool as its `blocks` argument.\n\
              src/x.rs:5\n@@@OLD\n    run();\n@@@NEW\n    walk();\n@@@END\n",
         );
-        let bytes = out.draw.end_capture();
+        let bytes = out.content.draw.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         assert!(
@@ -4695,7 +4629,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
     fn tmp_repro_separator_blanks() {
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response();
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
 
         // Case A: turn ends with a tool result (no trailing answer text).
         out.stream_text("Let me sleep.\n");
@@ -4704,23 +4638,23 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         out.display_tool_result("\"2. sleep 30 — done\"");
         out.end_response();
         out.display_separator();
-        let a = out.draw.end_capture();
+        let a = out.content.draw.end_capture();
         let a = strip_ansi(&String::from_utf8_lossy(&a));
         eprintln!("=== Case A (tool-result end) ===\n{:?}", a);
 
         // Case B: turn ends with plain text answer.
         out.begin_response();
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
         out.stream_text("All done.\n");
         out.end_response();
         out.display_separator();
-        let b = out.draw.end_capture();
+        let b = out.content.draw.end_capture();
         let b = strip_ansi(&String::from_utf8_lossy(&b));
         eprintln!("=== Case B (text end) ===\n{:?}", b);
 
         // Case C: turn ends with trailing thinking after a tool result.
         out.begin_response();
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
         out.stream_text("Let me sleep.\n");
         out.end_response_segment();
         out.display_tool_call("bash", &serde_json::json!({"command": "sleep 30"}));
@@ -4728,7 +4662,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         out.stream_thinking("wrapping up\n");
         out.end_response();
         out.display_separator();
-        let c = out.draw.end_capture();
+        let c = out.content.draw.end_capture();
         let c = strip_ansi(&String::from_utf8_lossy(&c));
         eprintln!("=== Case C (tool + trailing thinking) ===\n{:?}", c);
     }
@@ -4762,19 +4696,19 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
 
         // A: two single-file pairs, as a sequence of real calls would render.
         let (a, _) = capturing_output(40);
-        a.draw.begin_capture();
+        a.content.draw.begin_capture();
         for (i, single) in singles.iter().enumerate() {
             a.display_tool_call("edit", single);
             a.display_tool_result(notes[i]);
         }
-        let a = strip_ansi(&String::from_utf8_lossy(&a.draw.end_capture()));
+        let a = strip_ansi(&String::from_utf8_lossy(&a.content.draw.end_capture()));
 
         // B: one multi-file pair.
         let (b, _) = capturing_output(40);
-        b.draw.begin_capture();
+        b.content.draw.begin_capture();
         b.display_tool_call("edit", &multi_args);
         b.display_tool_result(&array);
-        let b = strip_ansi(&String::from_utf8_lossy(&b.draw.end_capture()));
+        let b = strip_ansi(&String::from_utf8_lossy(&b.content.draw.end_capture()));
 
         assert_eq!(
             a, b,
@@ -4807,12 +4741,12 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         // batch per file — a failure's short ui_view and a success's note — with
         // no aggregate line and no model_view diff leaking into scrollback.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
         out.display_tool_result(
             r#"[{"path":"src/a.rs","result":"Replaced 1 block(s) in ./a.rs"},
                 {"path":"src/b.rs","result":{"ui_view":"edit failed: nope","model_view":"SECRET DIFF"}}]"#,
         );
-        let d = strip_ansi(&String::from_utf8_lossy(&out.draw.end_capture()));
+        let d = strip_ansi(&String::from_utf8_lossy(&out.content.draw.end_capture()));
         assert!(d.contains("edit src/a.rs"), "{d}");
         assert!(d.contains("Replaced 1 block(s) in ./a.rs"), "{d}");
         assert!(d.contains("edit src/b.rs"), "{d}");
@@ -4827,9 +4761,9 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         // Another tool's list must keep its existing rendering; the multi-file
         // branch must not swallow it.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
         out.display_tool_result(r#"["alpha","beta"]"#);
-        let d = strip_ansi(&String::from_utf8_lossy(&out.draw.end_capture()));
+        let d = strip_ansi(&String::from_utf8_lossy(&out.content.draw.end_capture()));
         assert!(d.contains("alpha") && d.contains("beta"), "{d}");
     }
 
@@ -4841,7 +4775,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         // is separated from the tool-result line by a blank line.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response();
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
         out.stream_text("Let me edit.\n");
         out.end_response_segment();
         out.display_tool_call(
@@ -4853,7 +4787,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         out.end_response_segment();
         out.stream_text("Done.\n");
         out.end_response();
-        let d = out.draw.end_capture();
+        let d = out.content.draw.end_capture();
         let d = strip_ansi(&String::from_utf8_lossy(&d));
         let after = d.find("Replaced 1 block(s) in ./no_such.rs").unwrap()
             + "Replaced 1 block(s) in ./no_such.rs".len();
@@ -4871,7 +4805,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         // content preview (first 10 lines), matching read_file's rendering.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response();
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
 
         // Simulate a write tool call with structured result (as write_file returns)
         out.display_tool_call(
@@ -4882,7 +4816,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock
         out.display_tool_result(result);
 
         out.end_response();
-        let captured = out.draw.end_capture();
+        let captured = out.content.draw.end_capture();
         let output = strip_ansi(&String::from_utf8_lossy(&captured));
 
         // Should contain the path header with line count
@@ -4921,9 +4855,9 @@ mod ui_render_scope_tests {
 
     fn render(result: &str) -> String {
         let out = ConsoleOutput::new(default_show_reasoning_handle());
-        out.draw.begin_capture();
+        out.content.draw.begin_capture();
         out.display_tool_result(result);
-        let d = strip_ansi(&String::from_utf8_lossy(&out.draw.end_capture()));
+        let d = strip_ansi(&String::from_utf8_lossy(&out.content.draw.end_capture()));
         d
     }
 
