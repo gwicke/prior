@@ -22,6 +22,11 @@ and link a doc/ and/or commit hash
     - highlighting often char-wise - not helpful. require runs or tight clusters of matches?
 - [ ] tool errors: split the operator's view from the model's, then unredact — path_leak_risks.md
       (`edit` done; `read`/`write`/`glob`/`grep`/`list`/`sed` open)
+- [ ] Status bar context usage stale after compaction - check if fixed after drawing refactor.
+
+## Rendering / drawing
+
+- [ ] padded full-width diff lines from edit tool render wrap & cause rendering artifacts
 
 ## Token efficiency
 
@@ -32,9 +37,13 @@ and link a doc/ and/or commit hash
   - More aggressive truncation for long `read` / `bash` outputs
 - [ ] Strip reasoning content for older aborted / failed turns once a newer turn completes
       successfully with a final answer.
-- [x] Multi-file edits - Error: Provider rejected the request (HTTP 400); An assistant message with
-      'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
-      (insufficient tool messages following tool_calls message)
+- [ ] Multi-file edits - Error: Provider rejected the request (HTTP 400); An assistant message with
+  'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. (insufficient
+  tool messages following tool_calls message)
+      - 0ef960188195b9cf02c38ba011fc5662a82c2391 was not successful. Drop it, and instead implement
+      doc/261013_multi_file_edit_id_continuity.md.
+- [ ] More robust anchoring in crates/blockedit/src/diagnose.rs diagnose(). Currently uses longest
+      common sub-string.
 
 ## Cleanup
 
