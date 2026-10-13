@@ -272,12 +272,15 @@ most runway to expand into separate sub-commits.
     landed the manager's receiver half).
 - **4b — `RenderManager` shell: composition + apply leave the `Output` trait.** Landed (`38d9513`)
   — the commit message records what moved. Leftovers, each claimed:
-  - The call sites (repl, confirm, probe) keep their `&dyn Output` handles and reach the manager
+  - ~~The call sites (repl, confirm, probe) keep their `&dyn Output` handles and reach the manager
     through `draw_elements`' `ConsoleOutput` forward; the handle-level switch — repl/confirm
-    holding the manager — is what the 4f follow-up below already schedules (threading a manager
-    through `settle`/`paint`/the turn pumps now would be re-done when those params collapse).
-  - The compose head stays on `Output::compose_area` (the status row is console state) — **4h**,
-    when the bar becomes an installed element and the head moves into `render()`.
+    holding the manager — is what the 4f follow-up below already schedules.~~ Settled by **4f-b**
+    (`cb01977`): `paint_prompt`/`settle`/`paint`/`emit_commit`/`confirm::paint`/`confirm::resolve`
+    take content and/or the manager; `Output::draw_elements` is gone.
+  - ~~The compose head stays on `Output::compose_area` (the status row is console state) — **4h**,
+    when the bar becomes an installed element and the head moves into `render()`.~~ The head left
+    `Output` in **4f-b** (`repl::compose_area`, interim home); its final home inside `render()`
+    with the bar installed is still **4h**.
   - ~~The recipe field (`stack`) did not land: the recipe must leave `DrawCache` together with
     `reposition_area` (Elements cannot be cloned into two recipes), which is **4e** — the hub owns
     reposition there, and the recipe goes with it.~~ Settled by **4e** (`bce38e7`):
