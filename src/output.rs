@@ -13,7 +13,7 @@ use crate::content::Content;
 #[cfg(test)]
 use crate::content::ContentDisplayKind;
 use crate::draw::ApplyPolicy;
-use crate::render::{allocate, live_budget, render, Element, Extent, Frame, RenderAt, Rendered};
+use crate::render::{Element, Frame, RenderAt, Rendered};
 #[cfg(test)]
 use crate::settings::ShowReasoning;
 use crate::settings::ShowReasoningHandle;
@@ -350,14 +350,14 @@ pub trait Output: Send + Sync {
         (dims.0.max(1), dims.1.max(1))
     }
 
-    /// Compose, allocate, render and apply an area — **the one place the pure
-    /// pipeline runs** (ui_draw_v2 §5.1.1).
+    /// Compose and hand an area to the frame hub (ui_draw_v2 §5.1.1): the
+    /// pipeline — budget, render, apply, remember — is `RenderManager`'s as
+    /// of step 4b; this entry keeps its signature so the REPL/dialog call
+    /// sites stay put while the handles around them collapse (step 4f).
     ///
     /// Callers supply *content*: the pieces, **moved in**. Nothing comes back —
     /// no `Vec<Element>` crosses a call site, because no caller ever used one
-    /// except to hand it straight to the next statement. The composition is
-    /// recorded through [`remember_compose`](Output::remember_compose), which is
-    /// what lets §4.5's content path re-draw the area without recomposing it.
+    /// except to hand it straight to the next statement.
     ///
     /// The budget is derived from `dims`, never passed in — a caller that hands
     /// a budget is being asked to know something it shouldn't. `dims` itself
@@ -365,40 +365,20 @@ pub trait Output: Send + Sync {
     /// terminal, and resize detection compares that belief against what was
     /// painted.
     ///
-    /// A default impl because every output draws the same way: only the tail,
-    /// [`draw_frame`](Output::draw_frame), varies (test outputs paint nothing).
+    /// Default: drop the frame — non-console outputs carry no interactive UI,
+    /// so the raw-mode REPL never runs against them (the same contract
+    /// [`draw_frame`](Output::draw_frame)'s default states). `ConsoleOutput`
+    /// is the one that forwards: it composes the area (its status row is its
+    /// own fact) and hands the stack to the manager.
     fn draw_elements(
         &self,
-        input: Option<Element>,
-        overlay: Vec<Element>,
-        policy: ApplyPolicy,
+        _input: Option<Element>,
+        _overlay: Vec<Element>,
+        _policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
-        let (tw, th) = (dims.0.max(1), dims.1.max(1));
-        let stack = self.compose_area(input, overlay);
-        let extents: Vec<Extent> = stack.iter().map(Element::extent).collect();
-        // The page-scroll path needs the rows element's grant *before* the
-        // frame is rendered, and this is the only place `allocate` runs for a
-        // composition — so a caller that has to know re-runs it over the same
-        // extents rather than asking the painter to guess twice.
-        let heights = allocate(&extents, live_budget(th));
-        let frame = render(&stack, &heights, tw);
-        let applied = self.draw_frame(&frame, policy, dims);
-        // Moved, never copied: the recipe belongs to the composition that built
-        // it, and the cache is the only other place that reads it. The size is
-        // written under the same lock so the recipe and the geometry it was
-        // rendered at can never be read apart.
-        self.remember_compose(stack, applied);
-        applied
+        (dims.0.max(1), dims.1.max(1))
     }
-
-    /// Record what [`draw_elements`](Output::draw_elements) just built — the
-    /// composition, so §4.5's content path can re-draw it without recomposing,
-    /// and the size it was applied at, so [`painted_size`](Output::painted_size)
-    /// answers from the same place.
-    ///
-    /// Default no-op: an output with no screen has nothing to remember.
-    fn remember_compose(&self, _stack: Vec<Element>, _applied: (usize, usize)) {}
 
     /// The size the **last frame this output applied** took — the one number
     /// resize detection compares the terminal against (ui_draw_v2 §9 #3).
@@ -1151,6 +1131,26 @@ impl Output for ConsoleOutput {
         self.content.draw.draw_frame(frame, policy, dims)
     }
 
+    /// The frame path's entry (step 4b): compose the area — the status row is
+    /// this output's own fact (see [`Self::status_row`]), so the compose head
+    /// stays here — then hand the stack to the manager, which budgets,
+    /// renders, applies and remembers it, painting through the same `Draw`
+    /// this output has always drawn with.
+    fn draw_elements(
+        &self,
+        input: Option<Element>,
+        overlay: Vec<Element>,
+        policy: ApplyPolicy,
+        dims: (usize, usize),
+    ) -> (usize, usize) {
+        let stack = self.compose_area(input, overlay);
+        self.content
+            .manager
+            .lock()
+            .unwrap()
+            .render(&self.content.draw, stack, policy, dims)
+    }
+
     fn display_plain(&self, text: &str) {
         self.content.display_plain(text);
     }
@@ -1272,13 +1272,6 @@ impl Output for ConsoleOutput {
         ))
     }
 
-    /// Remember the composition so §4.5's content path can re-draw it. The only
-    /// output that has a screen has something to keep; everyone else drops it
-    /// (the default), which is also why nothing here can be read by mistake.
-    fn remember_compose(&self, stack: Vec<Element>, applied: (usize, usize)) {
-        self.content.draw.remember_compose(stack, applied);
-    }
-
     /// Remember the status line to paint after each content block; see
     /// [`ConsoleOutput::paint_status`] for the three conditions that decide
     /// whether it actually goes out.
@@ -1302,6 +1295,9 @@ mod tests {
     use super::*;
     // The test-local `strip_ansi` helper below needs the lead-byte table.
     use crate::ansi::utf8_len;
+    // The pure pipeline the manager's render now runs (and the composer tests
+    // re-run) — imported here since the production path left `output.rs`.
+    use crate::render::{allocate, live_budget, render, Extent};
 
     // --- Row accounting: the tracked cursor vs. the real one (phase B) ---
     //

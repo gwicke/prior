@@ -4,9 +4,10 @@
 //! and — as the content methods move onto it — formats content at the watched
 //! width and writes through the sink.
 //!
-//! Frame methods stay on `Output` for now; `ConsoleOutput` carries a temporary
-//! pass-through to `self.content.draw` for them until step 4 makes
-//! `RenderManager` the frame front door.
+//! It also holds the frame hub (step 4b): `RenderManager` runs the frame
+//! pipeline and paints through `draw` until 4c moves the sink under the
+//! manager's roof. The frame *verbs* (`frame_size`, `painted_size`,
+//! `cursor_row`, `draw_frame`) stay on `Output` until 4f re-homes them.
 
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
@@ -43,6 +44,12 @@ pub struct Content {
     /// The live screen: byte sink plus the bookkeeping of what is believed to
     /// be on it. Writer before cache, always — see [`Draw`].
     pub(crate) draw: Draw,
+    /// The frame hub (step 4b): where the frame pipeline lives now —
+    /// allocate → render → apply → remember, painting through `draw` until
+    /// 4c moves it under the manager's roof. `Arc<Mutex<…>>` is the design's
+    /// handle shape (§Render: UI and content both hold one); today the only
+    /// holder is this `Content`, reached by `ConsoleOutput` through it.
+    pub(crate) manager: Arc<Mutex<crate::render::RenderManager>>,
     /// This instance's view of the size watch (step 2) — the same channel
     /// `draw` holds, so the content path's width reads and the frame path's
     /// geometry cannot disagree. In production a subscriber of the process-wide
@@ -96,8 +103,16 @@ impl Content {
         show_reasoning: ShowReasoningHandle,
     ) -> Self {
         let caps = Caps::probe();
+        // The hub is born with its geometry and its budget ratio (step 4b):
+        // `configure` is the ratio's home, and this is the one wiring point.
+        let manager = Arc::new(Mutex::new(crate::render::RenderManager::new(size.clone())));
+        manager
+            .lock()
+            .unwrap()
+            .configure(crate::render::FRAME_MAX_ROW_RATIO);
         Self {
             draw: Draw::new(size.clone()),
+            manager,
             size,
             caps,
             reasoning_on_stderr: AtomicBool::new(!caps.primary),

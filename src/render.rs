@@ -1,6 +1,6 @@
-//! Pure frame composition for the unified draw pipeline (plan
-//! `doc/ui_draw_v2.md` §3). The pipeline is compose → allocate → render →
-//! apply; this module owns the first three, all pure:
+//! Frame composition and the frame hub (plan `doc/ui_draw_v2.md` §3, design
+//! `doc/261003_output_drawing_refactor.md` §Render layer). The pipeline is
+//! compose → allocate → render → apply; this module owns the pure phases:
 //!
 //! * compose builds a list of [`Element`]s (the REPL draws
 //!   `[Input, Divider, Overlay]`, dialogs `[Divider?, Overlay]`),
@@ -9,22 +9,48 @@
 //! * [`render`] produces a [`Frame`] — a flat byte buffer with per-row
 //!   extents and element spans.
 //!
-//! The `apply` phase is [`crate::draw`]. Nothing here touches a terminal. A
-//! frame's rows are self-contained: each carries the escapes needed to
-//! repaint itself in place (trailing `EL` or padding to `term_w`), so
-//! `apply` may rewrite any subset of rows unconditionally.
+//! [`RenderManager`] (step 4b) is the hub shell that runs those phases and
+//! applies through a [`Draw`] it is *given* — it does not own the drawing
+//! edge yet (4c moves `Draw` under this roof). The pure phases themselves
+//! stay pure and callable directly; the manager touches the terminal only
+//! through the `Draw` it is handed. A frame's rows are self-contained: each
+//! carries the escapes needed to repaint itself in place (trailing `EL` or
+//! padding to `term_w`), so `apply` may rewrite any subset of rows
+//! unconditionally.
 
 use std::ops::Range;
 
-use crate::draw::el_if_short;
+use crate::draw::{el_if_short, ApplyPolicy, Draw};
 use crate::slashdot_menu::table::display_width;
+use crate::termio::TermSize;
+use tokio::sync::watch;
 
-/// Live-region budget for a terminal of `term_h` rows: the frame may occupy
-/// at most this many rows; the rest of the screen is guaranteed scrollback
-/// (plan §2). Matches the pop-up cap used throughout v2.5 (`⌈2/3·term_h⌉`,
-/// at least 1).
+/// The size watch handle (design §3): what the manager reads its geometry
+/// from once the frame verbs re-home (step 4f). Today `render` paints at the
+/// caller's `dims` — their *belief* about the terminal, which resize
+/// detection compares against what was painted (ui_draw_v2 §9 #3).
+pub type SizeWatch = watch::Receiver<TermSize>;
+
+/// The fraction of the terminal height the frame area may occupy — the value
+/// [`RenderManager::configure`] is seeded and wired with (design §Render:
+/// the ratio is configuration, not a constant buried in the budget fn).
+///
+/// `f64`, not the design sketch's `f32`: the budget is a `ceil`, and `f32`'s
+/// rounding of 2/3 lands *above* the exact fraction (`24·(2/3 as f32) >
+/// 16`), which would turn the pinned `ceil(24·2/3) = 16` into 17.
+pub const FRAME_MAX_ROW_RATIO: f64 = 2.0 / 3.0;
+
+/// Live-region budget for a terminal of `term_h` rows at the default ratio:
+/// the frame may occupy at most this many rows; the rest of the screen is
+/// guaranteed scrollback (plan §2). Matches the pop-up cap used throughout
+/// v2.5 (`⌈2/3·term_h⌉`, at least 1).
 pub(crate) fn live_budget(term_h: usize) -> usize {
-    ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1)
+    live_budget_ratio(term_h, FRAME_MAX_ROW_RATIO)
+}
+
+/// The budget at an arbitrary ratio — [`RenderManager`]'s configured one.
+pub(crate) fn live_budget_ratio(term_h: usize, ratio: f64) -> usize {
+    ((term_h as f64 * ratio).ceil() as usize).max(1)
 }
 
 /// Height demand of one element, in screen rows (plan §3.2).
@@ -371,6 +397,88 @@ pub(crate) fn pad_row(row: &str, term_w: usize) -> String {
     }
 }
 
+// --- the frame hub (step 4b) -------------------------------------------------
+
+/// The frame hub's shell (design §Render layer): where a composition comes
+/// to be budgeted, rendered, applied and remembered. Step 4b moves the
+/// pipeline here — what was `Output::draw_elements`' default body — and
+/// leaves the rest of the design's shape to the steps that give it meaning:
+/// `Draw` ownership (4c), the `ContentWrite` hand-off and `render_batch`
+/// (4d), batching and the recipe field (4e, when reposition stops reading
+/// it from `DrawCache`), and the frame verbs off the watch (4f).
+pub struct RenderManager {
+    /// The fraction of the frame's terminal height the area may occupy —
+    /// [`configure`](Self::configure)'s, resolved against the render's
+    /// height on every call.
+    frame_max_row_ratio: f64,
+    /// The watched geometry — the handle `TermIO` hands out at setup (design
+    /// §3), cloned here so the manager owns it from the start. Nothing reads
+    /// it yet: `render` paints at the caller's `dims` (their belief, §9 #3),
+    /// and `frame_size`/`painted_size` re-home onto it in 4f.
+    #[allow(dead_code)]
+    size: SizeWatch,
+}
+
+impl RenderManager {
+    /// A fresh hub over the watched geometry. The budget ratio starts at
+    /// [`FRAME_MAX_ROW_RATIO`] — the value the pipeline hard-coded before
+    /// `configure` existed — so an unconfigured manager budgets exactly as
+    /// the old code did; [`Self::configure`] changes it.
+    pub fn new(size: SizeWatch) -> Self {
+        Self {
+            frame_max_row_ratio: FRAME_MAX_ROW_RATIO,
+            size,
+        }
+    }
+
+    /// Set the frame's max-height ratio (design §Render `configure`) — the
+    /// one knob the budget resolves from. The element half of the design's
+    /// signature (`frame_elements`) arrives with the element conversion (4h):
+    /// nothing installs long-lived chrome while elements are per-compose
+    /// boxes.
+    pub fn configure(&mut self, frame_max_row_ratio: f64) {
+        self.frame_max_row_ratio = frame_max_row_ratio;
+    }
+
+    /// The live-region budget at this manager's configured ratio.
+    fn budget(&self, term_h: usize) -> usize {
+        live_budget_ratio(term_h, self.frame_max_row_ratio)
+    }
+
+    /// Allocate → render → apply → remember: the pipeline that was
+    /// `Output::draw_elements`' default body (step 4b).
+    ///
+    /// The compose head is *not* here: the status row is the console side's
+    /// fact, so the caller composes (`Output::compose_area`) and hands the
+    /// stack in — the status row becomes an installed element in 4h and the
+    /// head moves in with it. `draw` is *given*, not owned: the manager does
+    /// not hold the drawing edge until 4c moves `Draw` under this roof.
+    pub(crate) fn render(
+        &self,
+        draw: &Draw,
+        stack: Vec<Element>,
+        policy: ApplyPolicy,
+        dims: (usize, usize),
+    ) -> (usize, usize) {
+        let (tw, th) = (dims.0.max(1), dims.1.max(1));
+        let extents: Vec<Extent> = stack.iter().map(Element::extent).collect();
+        // The page-scroll path needs the rows element's grant *before* the
+        // frame is rendered, and this is the only place `allocate` runs for a
+        // composition — so a caller that has to know re-runs it over the same
+        // extents rather than asking the painter to guess twice.
+        let heights = allocate(&extents, self.budget(th));
+        let frame = render(&stack, &heights, tw);
+        let applied = draw.draw_frame(&frame, policy, dims);
+        // Moved, never copied: the recipe belongs to the composition that built
+        // it, and `DrawCache` is where the content path reads it — until the
+        // hub takes reposition (4e). The size is written under the same lock
+        // so the recipe and the geometry it was rendered at can never be read
+        // apart.
+        draw.remember_compose(stack, applied);
+        applied
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +492,63 @@ mod tests {
         assert_eq!(live_budget(3), 2);
         assert_eq!(live_budget(1), 1);
         assert_eq!(live_budget(2), 2);
+    }
+
+    // ---- the manager (step 4b) ----
+
+    /// The manager's default budget *is* the old `live_budget` answer, and
+    /// `configure` is what moves it: same numbers, one knob (step 4b moved
+    /// the hard-coded 2/3 into `configure`).
+    #[test]
+    fn the_managers_default_budget_is_the_old_one_and_configure_moves_it() {
+        let size = crate::termio::fixed(TermSize {
+            width: 40,
+            height: 24,
+        });
+        let manager = RenderManager::new(size.clone());
+        assert_eq!(manager.budget(24), live_budget(24));
+        assert_eq!(manager.budget(1), 1);
+
+        let mut small = RenderManager::new(size);
+        small.configure(0.1);
+        assert_eq!(small.budget(24), 3);
+        assert_eq!(small.budget(1), 1, "never below one row");
+    }
+
+    /// `render` is the pipeline that left `Output::draw_elements`: it applies
+    /// through the `Draw` it is given and remembers the composition there
+    /// (recipe + applied size, where the content path reads it). Captured
+    /// through the draw's own capture swap — the manager writes nothing of
+    /// its own.
+    #[test]
+    fn manager_render_applies_through_the_given_draw_and_remembers() {
+        let size = crate::termio::fixed(TermSize {
+            width: 40,
+            height: 24,
+        });
+        let draw = Draw::new(size.clone());
+        let manager = RenderManager::new(size);
+
+        draw.begin_capture();
+        let stack = vec![
+            Element::lines(vec!["hello".to_string()]),
+            Element::divider(),
+        ];
+        let applied = manager.render(&draw, stack, ApplyPolicy::Frame, (40, 24));
+        let bytes = draw.end_capture();
+
+        assert_eq!(applied, (40, 24));
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("hello"),
+            "the frame's rows must reach the given Draw's writer"
+        );
+        let cache = draw.cache.lock().unwrap();
+        assert_eq!(cache.applied, Some((40, 24)), "applied size remembered");
+        assert_eq!(
+            cache.element_stack.len(),
+            2,
+            "the recipe is remembered where the content path reads it"
+        );
     }
 
     // ---- allocate ----
