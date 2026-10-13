@@ -13,6 +13,7 @@
 
 use super::Output;
 use crate::app_state::WindowKeySource;
+use crate::termio::InputEvent;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -70,11 +71,11 @@ pub(crate) enum InTurnDispatch {
 /// is a next iteration — which is why this still settles, and the screen stays
 /// true to the state the key left behind.
 pub(crate) async fn dispatch_in_turn_event(
-    ev: Option<crossterm::event::Event>,
+    ev: Option<InputEvent>,
     sess: Option<&mut crate::repl::PromptSession>,
     history: Option<&mut crate::repl::History>,
     label: &str,
-    guard: Option<&crate::repl::TermGuard>,
+    guard: Option<&crate::termio::TermGuard>,
     output: &dyn Output,
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
@@ -84,7 +85,7 @@ pub(crate) async fn dispatch_in_turn_event(
     };
     let dims = output.frame_size();
     match ev {
-        crossterm::event::Event::Key(key) => {
+        InputEvent::Key(key) => {
             // The confirm is **modal**, and this is the top of the `Esc` ladder:
             // dialog first, menu second, turn third. The root-`Esc` cancel below
             // is unconditional, so without this precedence one `Esc` would
@@ -141,7 +142,7 @@ pub(crate) async fn dispatch_in_turn_event(
             let _ = sess.settle(output, label, history, dims).await;
             InTurnDispatch::Handled
         }
-        crossterm::event::Event::Paste(text) => {
+        InputEvent::Paste(text) => {
             // A confirm has no text field, so a paste has nowhere to go; drop
             // it rather than pushing it into the prompt the dialog is layered
             // over, which would change the menu's meaning behind the modal.
@@ -160,11 +161,11 @@ pub(crate) async fn dispatch_in_turn_event(
 /// borrows so keys keep dispatching between attempts exactly as they do inside
 /// `prompt()`'s select — the back-off is part of the turn, not a hole in it.
 pub(crate) struct TurnPump<'a> {
-    keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
+    keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     session: &'a mut crate::repl::PromptSession,
     history: &'a mut crate::repl::History,
     label: &'a str,
-    guard: &'a crate::repl::TermGuard,
+    guard: &'a crate::termio::TermGuard,
     output: &'a dyn Output,
 }
 
@@ -174,11 +175,11 @@ impl<'a> TurnPump<'a> {
     /// it `zip`s the optional pieces and yields `None` where they are absent.
     #[cfg(test)]
     pub(crate) fn new(
-        keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
+        keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
         session: &'a mut crate::repl::PromptSession,
         history: &'a mut crate::repl::History,
         label: &'a str,
-        guard: &'a crate::repl::TermGuard,
+        guard: &'a crate::termio::TermGuard,
         output: &'a dyn Output,
     ) -> Self {
         Self {
@@ -199,10 +200,10 @@ impl<'a> TurnPump<'a> {
 /// deadline and cancel signal only.
 pub(crate) fn turn_backoff_pump<'a>(
     prompt_session: &'a mut Option<crate::repl::PromptSession>,
-    keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
+    keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     history: &'a mut crate::repl::History,
     label: &'a str,
-    guard: &'a Option<Arc<crate::repl::TermGuard>>,
+    guard: &'a Option<Arc<crate::termio::TermGuard>>,
     output: &'a dyn Output,
 ) -> Option<TurnPump<'a>> {
     match (prompt_session.as_mut(), history, guard.as_deref()) {
@@ -427,12 +428,12 @@ mod tests {
     ) -> (
         crate::repl::PromptSession,
         crate::repl::History,
-        crate::repl::TermGuard,
+        crate::termio::TermGuard,
     ) {
         (
             crate::repl::PromptSession::new(None, app_state),
             crate::repl::History::load(),
-            crate::repl::TermGuard::new(),
+            crate::termio::TermGuard::new(),
         )
     }
 
@@ -453,12 +454,10 @@ mod tests {
         let (mut session, mut history, guard) = backoff_pump_parts(&app_state);
         let output = null_output();
         let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(crossterm::event::Event::Key(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Esc,
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        ))
+        tx.send(InputEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        )))
         .unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -492,12 +491,10 @@ mod tests {
         let (mut session, mut history, guard) = backoff_pump_parts(&app_state);
         let output = null_output();
         let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(crossterm::event::Event::Key(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('x'),
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        ))
+        tx.send(InputEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        )))
         .unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -758,8 +755,16 @@ mod tests {
         assert!(app_state.poll_key().is_none(), "inactive must not read");
         app_state.park_key(char_event('a'));
         app_state.park_key(char_event('b'));
-        assert_eq!(app_state.take_parked_key(), Some(char_event('a')));
-        assert_eq!(app_state.take_parked_key(), Some(char_event('b')));
+        // The park converts to the input channel's vocabulary (step 4a) —
+        // that queue is what `read_input` drains, and it speaks `InputEvent`.
+        let expect = |c: char| {
+            Some(InputEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            )))
+        };
+        assert_eq!(app_state.take_parked_key(), expect('a'));
+        assert_eq!(app_state.take_parked_key(), expect('b'));
         assert_eq!(app_state.take_parked_key(), None);
     }
 }

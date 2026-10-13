@@ -23,34 +23,15 @@ use crate::render::{allocate, live_budget, window, Element, Extent, RenderAt, Re
 #[cfg(test)]
 use crate::render::{render, Frame};
 use crate::session::SessionTreeNode;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use crate::termio::{InputEvent, TermGuard, RESUMED_REANCHOR};
+use crossterm::event::{self, KeyCode, KeyModifiers};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
-
-/// Set by the `SIGCONT` handler on resume from `Ctrl-Z`. Read by the
-/// **persistent stdin reader** (step 2 commit B), which re-enters raw mode
-/// once it sees the flag. Kept separate from [`RESUMED_REANCHOR`] so the
-/// reader and the prompt loop never race to clear one another's work.
-pub(crate) static RESUMED: AtomicBool = AtomicBool::new(false);
-
-/// Also set by the `SIGCONT` handler, read by [`Repl::read_input`] alone:
-/// a resume means the shell may have repainted, so the prompt loop re-anchors
-/// the draw cache (DSR) on its next iteration. Split from [`RESUMED`] because
-/// with a single always-running reader both the reader (raw mode) and the loop
-/// (re-anchor) act on a resume, and a shared flag would let one clear it before
-/// the other saw it.
-pub(crate) static RESUMED_REANCHOR: AtomicBool = AtomicBool::new(false);
 
 /// The entry DSR at [`read_input`] has run once this process.
 ///
@@ -65,176 +46,6 @@ pub(crate) static RESUMED_REANCHOR: AtomicBool = AtomicBool::new(false);
 /// (ui_draw_261001).
 static ENTRY_DSR_DONE: AtomicBool = AtomicBool::new(false);
 
-/// `SIGCONT` handler: we just record that the process resumed.
-/// It must stay async-signal-safe (no I/O, no allocation), so the
-/// actual terminal re-entry is performed by the reader thread (a normal
-/// thread context) or by `read_input`'s loop, which poll these flags.
-/// Two flags because two different consumers act on one resume (see
-/// [`RESUMED`] / [`RESUMED_REANCHOR`]).
-extern "C" fn on_sigcont(_sig: i32) {
-    RESUMED.store(true, Ordering::SeqCst);
-    RESUMED_REANCHOR.store(true, Ordering::SeqCst);
-}
-
-/// Register the `SIGCONT` handler exactly once. Safe to call multiple
-/// times; `libc::signal` just replaces the handler. Required so that
-/// `Ctrl-Z` suspend/resume restores raw mode.
-pub(crate) fn register_sigcont() {
-    unsafe {
-        libc::signal(libc::SIGCONT, on_sigcont as *const () as usize);
-    }
-}
-
-/// Where the persistent stdin reader sends one terminal event.
-///
-/// Split out of [`spawn_stdin_reader`] because the *policy* is the part
-/// worth arguing about and the part worth testing: which keys may wait, and
-/// which may not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReaderRoute {
-    /// Deal with it here — process/terminal/abort state, or an event with
-    /// nobody to hand it to.
-    Inline,
-    /// Hand it to the prompt loop / turn's key branch on the channel.
-    Forward,
-}
-
-/// Route one terminal event as it arrives on stdin.
-///
-/// **Inline — must not wait:**
-/// - `Resize`: the streaming renderers read the size watch
-///   (`crate::termio`, step 2), and only this thread can update it while
-///   the main task is parked on the turn. Forwarding it too would make the
-///   turn consume the resize instead of the renderers reading it directly.
-/// - `Ctrl-C` / `Ctrl-Z`: process and terminal state (`exit`,
-///   `killpg(SIGTSTP)`), handled where they land, never queued.
-///
-/// **Forwarded:** every other key, plus `Paste`. These are content for the
-/// prompt; `read_input` already treats `Event::Paste` as a bulk insert, so
-/// the turn's key branch reads them the same way (U4.3). `Esc` is one of
-/// them, and that is a change:
-///
-/// `Esc` used to be Inline, and Inline meant *abort* — unconditionally, from
-/// here. Settled U4 makes it menu-first: the ladder runs while a menu is
-/// open, and it aborts only at root. This thread cannot make that call (it
-/// has no session to look at), so the decision moves to the one that can,
-/// and `Esc` rides the forwarded path with everything else. The cost is
-/// explicit: a root `Esc` is no longer guaranteed to land ahead of a paste
-/// backlog, where it was before. `Ctrl-C` still is, and it still never
-/// queues — that is what "immediately reachable" now rests on.
-///
-/// Everything else — mouse, focus — returns [`ReaderRoute::Inline`] and is
-/// ignored, exactly as it was before there was anywhere to forward to.
-pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
-    match ev {
-        Event::Resize(..) => ReaderRoute::Inline,
-        Event::Key(key) => match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ReaderRoute::Inline
-            }
-            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ReaderRoute::Inline
-            }
-            _ => ReaderRoute::Forward,
-        },
-        Event::Paste(..) => ReaderRoute::Forward,
-        _ => ReaderRoute::Inline,
-    }
-}
-
-/// What to do with each event is [`route_event`]'s call, not a pile of
-/// branches here. The reader handles three things inline and forwards the
-/// rest on `keys` (ui_draw_v2 §4.5 U4.2); until U4.2 nothing was
-/// forwarded and edit keys typed mid-request were simply dropped.
-///
-/// `keys` is **unbounded** on purpose: a bounded channel that filled would
-/// block this thread at precisely the moment it has to deliver `Ctrl-C`.
-///
-/// This is the **sole stdin owner** (step 2 commit B). It is spawned once,
-/// when the REPL starts, and runs for the process lifetime — it, and only
-/// it, calls `event::poll`/`event::read`. The prompt loop and every in-flight
-/// turn consume the events it forwards on `keys` instead of touching stdin,
-/// which is what removes the three-way race between the prompt's blocking
-/// reads, the turn's reader, and the DSR query (the last of which is answered
-/// by pausing this reader — see `ConsoleOutput::cursor_row`).
-///
-/// In raw mode `event::read` is blocking, so a background thread is what sees
-/// `Ctrl-C`/`Ctrl-Z` arriving while the main task is parked on a turn. `Esc`
-/// is forwarded, not handled here: U4.3 made it menu-first, a decision this
-/// thread cannot make without a session to look at; see [`route_event`].
-///
-/// `guard` is `Arc` and `stop()` is process-wide, so calling it from this
-/// thread is safe. The process-wide pause gate (`termio::PAUSE_GATE`) is raised
-/// by the main task whenever *it* owns stdin — `$EDITOR`'s takeover, a DSR
-/// query, or the compaction window — and while it is `true` this reader backs
-/// off (sleeps, does not read) so it cannot swallow the bytes the main task is
-/// waiting for; `termio::READER_PARKED` signals that it has genuinely parked.
-pub(crate) fn spawn_stdin_reader(guard: Arc<TermGuard>, keys: UnboundedSender<Event>) {
-    // A gate-raiser only waits for a park when a reader exists to park; set it
-    // before the thread starts so the entry-DSR's pause below sees it.
-    crate::termio::READER_RUNNING.store(true, Ordering::SeqCst);
-    let _ = thread::spawn(move || loop {
-        if RESUMED.swap(false, Ordering::SeqCst) {
-            let _ = guard.start();
-        }
-        // The main task owns stdin right now ($EDITOR, a DSR query, or the
-        // compaction window); back off so we don't consume the bytes it is
-        // waiting for. `READER_PARKED` tells a gate-raiser that we have
-        // left any in-flight poll and are genuinely not reading.
-        if crate::termio::PAUSE_GATE.load(Ordering::SeqCst) {
-            crate::termio::READER_PARKED.store(true, Ordering::SeqCst);
-            thread::sleep(Duration::from_millis(10));
-            continue;
-        }
-        crate::termio::READER_PARKED.store(false, Ordering::SeqCst);
-        if let Ok(true) = event::poll(Duration::from_millis(50)) {
-            match event::read() {
-                // U4.2: edit keys this thread used to drop now go to the
-                // prompt loop or the turn. `send` on an unbounded tokio mpsc
-                // never blocks, so this is safe from a plain OS thread — and
-                // being non-blocking is the whole reason the channel is
-                // unbounded (see `route_event`).
-                Ok(ev) if route_event(&ev) == ReaderRoute::Forward => {
-                    let _ = keys.send(ev);
-                }
-                Ok(Event::Resize(w, h)) => {
-                    // Publish the new geometry so renderers pick up the
-                    // change on their next streaming call.
-                    crate::termio::set_size(crate::termio::TermSize {
-                        width: w as usize,
-                        height: h as usize,
-                    });
-                }
-                Ok(Event::Key(key)) => {
-                    if let KeyCode::Char('c') = key.code {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            let _ = guard.stop();
-                            process::exit(1);
-                        }
-                    } else if let KeyCode::Char('z') = key.code {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            let _ = guard.stop();
-                            unsafe {
-                                libc::killpg(libc::getpgrp(), libc::SIGTSTP);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-}
-
-/// A fresh stdin-event channel: the sender half goes to the persistent reader
-/// ([`spawn_stdin_reader`]), the receiver half is consumed by the prompt loop
-/// and each turn. One channel for the process, so a key typed at the end of a
-/// turn lands in the next prompt rather than being dropped with a per-turn
-/// queue.
-pub(crate) fn stdin_channel() -> (UnboundedSender<Event>, UnboundedReceiver<Event>) {
-    unbounded_channel()
-}
-
 /// The entry DSR: anchor the draw cache to the real cursor once, at startup,
 /// **before the persistent reader starts consuming stdin** (step 2 commit B).
 /// Running it here — with the reader still paused — is what guarantees the
@@ -244,116 +55,6 @@ pub(crate) fn stdin_channel() -> (UnboundedSender<Event>, UnboundedReceiver<Even
 pub(crate) fn run_entry_dsr(output: &dyn Output) {
     if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
         let _ = output.cursor_row();
-    }
-}
-
-/// Owns terminal mode transitions. [`TermGuard::start`] enters raw mode and
-/// negotiates capabilities; [`TermGuard::stop`] (idempotent) restores cooked
-/// mode. Safe to call from `Drop`, a panic hook, or a signal handler.
-pub struct TermGuard {
-    active: AtomicBool,
-    saved_paste: AtomicBool,
-}
-
-impl Default for TermGuard {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TermGuard {
-    pub fn new() -> Self {
-        Self {
-            active: AtomicBool::new(false),
-            saved_paste: AtomicBool::new(false),
-        }
-    }
-
-    /// Enter raw mode and negotiate capabilities. Idempotent.
-    pub fn start(&self) -> io::Result<()> {
-        if self.active.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        self.saved_paste.store(false, Ordering::SeqCst);
-        enable_raw_mode()?;
-        // crossterm's `enable_raw_mode` calls `cfmakeraw`, which clears `OPOST`.
-        // With `OPOST` off the terminal does NOT translate `\n` -> `\r\n`, so
-        // every bare `\n` (help text, separators, agent responses) only moves
-        // down a row and leaves the cursor at the same column — producing the
-        // staggered "indentation" seen on a full screen. Re-enable output
-        // post-processing (specifically `ONLCR`) so line breaks return to
-        // column 0, while keeping raw *input* semantics (no canonical line
-        // editing, no echo). `disable_raw_mode` restores the original mode.
-        enable_output_processing();
-        Self::csi("?2004h")?; // bracketed paste on
-                              // Kitty keyboard protocol: disambiguate keys + report all keys as CSI u,
-                              // so Shift+Enter arrives as Enter+SHIFT (newline) and Alt+Letter as a
-                              // distinct Alt-modified char. Honored by wezterm/alacritty/kitty.
-        crossterm::execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
-            )
-        )?;
-        self.active.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Restore cooked mode. Idempotent; safe to call multiple times / from `Drop`.
-    pub fn stop(&self) -> io::Result<()> {
-        if !self.active.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        // Pop one level of Kitty keyboard enhancement (matches the single push).
-        let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        if self.saved_paste.load(Ordering::SeqCst) {
-            Self::csi("?2004h")?;
-        } else {
-            Self::csi("?2004l")?;
-        }
-        // The status line hides the cursor while a turn streams, and
-        // `draw_frame` shows it again when the prompt returns. If the turn is
-        // interrupted instead — a tool error, a confirm, a panic — nothing shows
-        // it again, and an invisible cursor follows the user into their shell.
-        // Unconditional and idempotent: showing a cursor that was never hidden
-        // costs nothing, and this is the last writer before the tty is the
-        // user's again.
-        io::stdout().write_all(crate::ansi::SHOW_CURSOR)?;
-        disable_raw_mode()?;
-        self.active.store(false, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn csi(seq: &str) -> io::Result<()> {
-        let mut s = String::from("\x1b[");
-        s.push_str(seq);
-        io::stdout().write_all(s.as_bytes())?;
-        io::stdout().flush()
-    }
-}
-
-/// Re-enable terminal output post-processing (specifically `OPOST`/`ONLCR`)
-/// on the stdout terminal. `crossterm::enable_raw_mode` runs `cfmakeraw`, which
-/// disables `OPOST`; without it a bare `\n` does not return the cursor to
-/// column 0, so agent responses and separators stagger. We operate on fd 1
-/// (stdout), which is the pty slave when interactive and a pipe otherwise
-/// (tcsetattr on a pipe harmlessly fails). Best-effort: errors are ignored.
-fn enable_output_processing() {
-    let fd = libc::STDOUT_FILENO;
-    unsafe {
-        let mut termios: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut termios) != 0 {
-            return;
-        }
-        termios.c_oflag |= libc::OPOST | libc::ONLCR;
-        let _ = libc::tcsetattr(fd, libc::TCSANOW, &termios);
-    }
-}
-
-impl Drop for TermGuard {
-    fn drop(&mut self) {
-        let _ = self.stop();
     }
 }
 
@@ -957,7 +658,7 @@ pub struct InTurnInput<'a> {
     /// The in-flight reader's channel. Unbounded because a bounded one that
     /// filled would block the reader at the moment it most needs to deliver
     /// `Ctrl-C` (see `route_event`).
-    pub keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    pub keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     /// Confirmation requests from gated tool calls, answered by the session's
     /// own dialog (doc/confirm_as_menu_261002.md). Borrowed per turn for the
     /// same reason `keys` is: a request must not outlive the pump that would
@@ -1567,29 +1268,19 @@ impl PromptSession {
     }
 }
 
-impl Default for Repl {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Repl {
-    pub fn new() -> Self {
-        Self {
-            guard: Arc::new(TermGuard::new()),
-        }
+    /// The interactive input-layer driver. The mode guard is *not* created
+    /// here: `TermIO::tty` owns the canonical instance and hands a clone to
+    /// this constructor (step 4a) — raw-mode entry stays [`start`](Self::start),
+    /// while the reader, the signal handler and the guard itself live with
+    /// `TermIO`.
+    pub fn new(guard: Arc<TermGuard>) -> Self {
+        Self { guard }
     }
 
     /// Enter raw mode (idempotent). Best-effort; `Drop` still restores.
     pub fn start(&self) -> io::Result<()> {
         self.guard.start()
-    }
-
-    /// Shared handle to the terminal-mode guard. Used by `run_interactive` to
-    /// drive suspend/resume (Ctrl-Z) and in-flight cancel from a background
-    /// reader thread while an LLM request is in flight.
-    pub(crate) fn guard(&self) -> Arc<TermGuard> {
-        self.guard.clone()
     }
 
     /// Read a multi-line input in raw mode, with the v2.5 slash-menu frame.
@@ -1632,7 +1323,7 @@ impl Repl {
         // The persistent reader's event queue (step 2 commit B). The reader is
         // the sole stdin owner; this loop consumes what it forwards rather
         // than calling `event::poll`/`event::read` itself.
-        keys: &mut UnboundedReceiver<Event>,
+        keys: &mut UnboundedReceiver<InputEvent>,
     ) -> Option<InputAction> {
         // Re-anchor the draw cache to the real cursor (DSR) before the first
         // paint (plan §4.2).
@@ -1818,7 +1509,7 @@ impl Repl {
             } else {
                 session.prose.poll_timeout()
             };
-            let ev: Option<Event> = loop {
+            let ev: Option<InputEvent> = loop {
                 // Keys a window pump parked while nobody could read stdin
                 // (the compaction LLM window — `WindowKeySource`) dispatch
                 // exactly as if they arrived just now: same Resize
@@ -1828,11 +1519,8 @@ impl Repl {
                 // waiting in the tty.
                 if let Some(parked) = app_state.take_parked_key() {
                     match parked {
-                        Event::Resize(w, h) => {
-                            crate::termio::set_size(crate::termio::TermSize {
-                                width: w as usize,
-                                height: h as usize,
-                            });
+                        InputEvent::Resize(size) => {
+                            crate::termio::set_size(size);
                             continue;
                         }
                         e => break Some(e),
@@ -1843,7 +1531,7 @@ impl Repl {
                 // sole sender and lives for the process, so a `None` here means
                 // it is gone — treated as a read error, as `event::read`'s `Err`
                 // was.
-                let e: Option<Event> = match prose_wait {
+                let e: Option<InputEvent> = match prose_wait {
                     Some(d) => match tokio::time::timeout(d, keys.recv()).await {
                         Ok(Some(ev)) => Some(ev),
                         Ok(None) => return None,
@@ -1854,12 +1542,10 @@ impl Repl {
                 match e {
                     // Defensive: the reader handles Resize inline and does not
                     // forward it, so this should not fire; if it does, publish
-                    // and keep waiting rather than treating it as a key.
-                    Some(Event::Resize(w, h)) => {
-                        crate::termio::set_size(crate::termio::TermSize {
-                            width: w as usize,
-                            height: h as usize,
-                        });
+                    // and keep waiting rather than treating it as a key. (The
+                    // parked path above is where Resize actually arrives.)
+                    Some(InputEvent::Resize(size)) => {
+                        crate::termio::set_size(size);
                         continue;
                     }
                     Some(e) => break Some(e),
@@ -1868,7 +1554,7 @@ impl Repl {
             };
             // --- Dispatch one key. ---
             match ev {
-                Some(Event::Key(key)) => {
+                Some(InputEvent::Key(key)) => {
                     // Ctrl-C: restore terminal, hard exit.
                     if let KeyCode::Char('c') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1934,10 +1620,10 @@ impl Repl {
                         }
                     }
                 }
-                Some(Event::Paste(text)) => {
+                Some(InputEvent::Paste(text)) => {
                     session.paste(&text);
                 }
-                Some(_) => {} // other events (mouse): ignored
+                Some(_) => {} // no other input variants today: ignored
                 None => {}    // prose wake with no key: re-eval below
             }
         }
@@ -3062,107 +2748,6 @@ fn history_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyEvent;
-
-    /// The in-flight reader's routing policy: which events may wait, and which
-    /// may not.
-    ///
-    /// Pinned as a *correctness* property rather than a preference — "an abort
-    /// cannot ride behind a paste backlog" (ui_draw_v2 §4.5) — and the
-    /// channel's unboundedness follows from it: a bounded one that filled would
-    /// block the reader at precisely the moment it has to deliver `Ctrl-C`.
-    ///
-    /// `Esc` used to be in this list and is deliberately gone from it now, for
-    /// the reason [`esc_is_forwarded_so_the_turn_can_decide`] pins.
-    #[test]
-    fn an_abort_never_queues_behind_content() {
-        let urgent = [
-            (
-                "Ctrl-C",
-                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            ),
-            (
-                "Ctrl-Z",
-                Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
-            ),
-            ("Resize", Event::Resize(120, 40)),
-        ];
-        for (what, ev) in urgent {
-            assert_eq!(
-                route_event(&ev),
-                ReaderRoute::Inline,
-                "{} must be handled inline, never queued",
-                what
-            );
-        }
-    }
-
-    /// `Esc` is forwarded, and that is the fix for the settled menu-first rule
-    /// (ui_draw_v2 §4.5, "abort only at root").
-    ///
-    /// It could not be decided where it used to be decided: routing `Esc`
-    /// Inline here meant routing it to *abort*, with no way to ask whether a
-    /// menu was open, because this function has no session to look at. Moving
-    /// it to the forwarded path is what lets the turn answer the question
-    /// correctly — step the ladder when a menu is up, stop the turn when there
-    /// is not. The trade is stated in [`route_event`]'s doc: a root `Esc` now
-    /// rides the queue like any other key.
-    #[test]
-    fn esc_is_forwarded_so_the_turn_can_decide() {
-        let ev = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(route_event(&ev), ReaderRoute::Forward);
-    }
-
-    /// Everything the prompt can hold is content, and content goes to the turn
-    /// instead of being dropped the way it was before U4.2.
-    #[test]
-    fn what_the_prompt_can_hold_is_forwarded() {
-        let content = [
-            (
-                "a character",
-                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
-            ),
-            (
-                "Enter",
-                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            ),
-            (
-                "Shift+Enter (a newline)",
-                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
-            ),
-            (
-                "Up",
-                Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-            ),
-            (
-                "Backspace",
-                Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
-            ),
-            ("a paste", Event::Paste("hello world".to_string())),
-        ];
-        for (what, ev) in content {
-            assert_eq!(
-                route_event(&ev),
-                ReaderRoute::Forward,
-                "{} is content for the prompt",
-                what
-            );
-        }
-    }
-
-    /// Events with nowhere to go keep their old fate instead of being
-    /// forwarded, so the channel carries no more than the prompt could ever
-    /// show.
-    #[test]
-    fn events_with_nowhere_to_go_stay_inline() {
-        let ev = Event::Mouse(crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Moved,
-            column: 3,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(route_event(&ev), ReaderRoute::Inline);
-    }
 
     /// A committed line is bracketed by rules: one above, one below, and the
     /// line between them.

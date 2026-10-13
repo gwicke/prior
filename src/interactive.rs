@@ -20,9 +20,10 @@ use crate::app_state::AppState;
 use crate::confirm::ConfirmBridge;
 use crate::model_catalog;
 use crate::params;
-use crate::repl::{History, InputAction, ModelFilter, PromptSession, Repl, ReplCtx, TermGuard};
+use crate::repl::{History, InputAction, ModelFilter, PromptSession, Repl, ReplCtx};
 use crate::session::repo::JsonlSessionRepo;
 use crate::settings::SettingsStore;
+use crate::termio::{TermGuard, TermHandles, TermIO};
 use crate::tools::set_sandbox;
 use crate::Result;
 
@@ -163,12 +164,20 @@ struct Interactive {
     last_attempted_target: Option<RebuildFingerprint>,
     guard: Option<Arc<TermGuard>>,
     prompt_session: Option<PromptSession>,
-    /// The persistent reader's event queue (step 2 commit B): the receiver
-    /// half of the one channel the sole stdin owner feeds. `read_input`
-    /// consumes it at the prompt; each turn borrows it as `InTurnInput::keys`.
-    /// Created once so a key typed at the end of a turn lands in the next
-    /// prompt instead of dying with a per-turn queue.
-    keys_rx: tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
+    /// The terminal backend (step 4a): the closed `TermIO { Tty | Plain }`
+    /// that owns the mode guard, the SIGCONT handler and — on Tty — the sole
+    /// stdin reader. Read here only for its lifetime: it parks in this field
+    /// until a later step of step 4 hands it to the render manager / `Draw`.
+    #[allow(dead_code)]
+    term_io: TermIO,
+    /// The handles `TermIO::handles()` handed out once, at setup (design doc
+    /// §3). `input` is the persistent reader's queue (step 2 commit B):
+    /// `read_input` consumes it at the prompt, each turn borrows it as
+    /// `InTurnInput::keys` — one channel for the process, so a key typed at
+    /// the end of a turn lands in the next prompt instead of dying with a
+    /// per-turn queue. `size`/`caret` wait for their consumer (the render
+    /// manager, step 4b).
+    handles: TermHandles,
 }
 
 /// Whether the input loop keeps going after an arm runs.
@@ -231,7 +240,19 @@ impl Interactive {
         if use_repl {
             config.confirm_port = Some(confirm_bridge.port.clone());
         }
-        let mut repl = if use_repl { Some(Repl::new()) } else { None };
+        // The terminal backend (step 4a): Tty folds the mode guard, registers
+        // the SIGCONT handler and owns the reader (spawned at `handles()`
+        // below, not here); Plain — piped stdin or `--quiet` — has neither.
+        // Same `use_repl` condition as the REPL itself: Tty iff there is one.
+        let mut term_io = if use_repl {
+            TermIO::tty()
+        } else {
+            TermIO::plain()
+        };
+        // The mode guard: the reader's, this loop's and `$EDITOR`'s handle on
+        // raw mode, from `TermIO`'s canonical instance.
+        let guard = term_io.guard();
+        let mut repl = guard.clone().map(Repl::new);
         if let Some(r) = repl.as_mut() {
             let _ = r.start();
             // First screen: a one-line hint
@@ -322,40 +343,38 @@ impl Interactive {
         // un-retried until the target changes — one error per distinct target,
         // not one per cycle while the user navigates back to the menu.
         let last_attempted_target: Option<RebuildFingerprint> = None;
-        // Guard handle for the reader thread (suspend/resume / hard-exit).
-        let guard = repl.as_ref().map(|r| r.guard());
-        // Publish to the slot: the inline compact node's review closure
-        // suspends raw mode around `$EDITOR` with it (service handle,
+        // Publish the guard to the slot: the inline compact node's review
+        // closure suspends raw mode around `$EDITOR` with it (service handle,
         // clone-out — never held behind the lock across the editor).
         if let Some(g) = guard.clone() {
             app_state.set_term_guard(g);
         }
-        if guard.is_some() {
-            crate::repl::register_sigcont();
-        }
         // The persistent stdin reader (step 2 commit B): one thread, spawned
-        // once here (raw mode is already on), owning stdin for the process
-        // lifetime. It forwards keys/paste on this channel; the prompt loop
-        // and every turn consume the receiver half. The reader backs off
-        // whenever the main task owns stdin — `$EDITOR`, a DSR query, or the
-        // compaction window — via the output's confirm gate, the same flag
-        // `editor::ReaderHold` raises.
+        // once by `TermIO::handles` (raw mode is already on), owning stdin
+        // for the process lifetime. It forwards keys/paste on this channel;
+        // the prompt loop and every turn consume the receiver half. The
+        // reader backs off whenever the main task owns stdin — `$EDITOR`, a
+        // DSR query, or the compaction window — via the output's confirm
+        // gate, the same flag `editor::ReaderHold` raises.
         //
-        // The gate is raised *before* the spawn so the reader starts parked
+        // The gate is raised *before* `handles()` so the reader starts parked
         // and cannot consume the entry DSR's reply: the draw cache is anchored
         // (`run_entry_dsr`) while nothing reads stdin, then the gate is lowered
         // and the reader takes over for the prompt. Without this ordering the
         // reader's first poll would swallow the terminal's cursor-position
         // report before `cursor_row` could read it.
-        let (keys_tx, keys_rx) = crate::repl::stdin_channel();
-        if let Some(g) = guard.clone() {
+        let handles = if guard.is_some() {
             crate::termio::PAUSE_GATE.store(true, Ordering::SeqCst);
-            crate::repl::spawn_stdin_reader(g, keys_tx);
+            let handles = term_io.handles();
             crate::repl::run_entry_dsr(config.output.as_ref());
             crate::termio::PAUSE_GATE.store(false, Ordering::SeqCst);
-        }
-        // (When there is no REPL — piped/quiet — `keys_tx` drops, closing the
-        // channel; nothing calls `recv` on it in that mode, so it never reads.)
+            handles
+        } else {
+            // Plain (piped/quiet): no reader, and `handles()`' input channel
+            // arrives closed — the shape piped mode had when it dropped the
+            // sender half, so nothing ever reads it in that mode.
+            term_io.handles()
+        };
         // Warm the model catalog cache in the background so the `/model`
         // overlay is populated within a few seconds *without* blocking the
         // first prompt. The overlay falls back to the cached/static list
@@ -406,7 +425,8 @@ impl Interactive {
             last_attempted_target,
             guard,
             prompt_session,
-            keys_rx,
+            term_io,
+            handles,
         }
     }
 
@@ -759,7 +779,8 @@ impl Interactive {
         // ends immediately, returning `Cancelled`.
         //
         // U4.2/U4.3: edit keys typed while the turn runs come from the **one
-        // process-lifetime channel** the persistent reader feeds (`self.keys_rx`,
+        // process-lifetime channel** the persistent reader feeds
+        // (`self.handles.input`,
         // step 2 commit B) — no per-turn reader, no per-turn queue. The
         // receiver is borrowed for the whole turn and handed into `prompt()` as
         // `InTurnInput::keys`; because the channel is never dropped between
@@ -815,7 +836,7 @@ impl Interactive {
                             .zip(self.guard.as_deref())
                             .map(|(sess, g)| crate::repl::InTurnInput {
                                 session: sess,
-                                keys: &mut self.keys_rx,
+                                keys: &mut self.handles.input,
                                 confirms: &mut self.confirm_bridge.requests,
                                 label: &self.prompt_str,
                                 history: &mut self.line_history,
@@ -861,7 +882,7 @@ impl Interactive {
                             ms,
                             turn_backoff_pump(
                                 &mut self.prompt_session,
-                                &mut self.keys_rx,
+                                &mut self.handles.input,
                                 &mut self.line_history,
                                 &self.prompt_str,
                                 &self.guard,
@@ -938,7 +959,7 @@ impl Interactive {
                             ms,
                             turn_backoff_pump(
                                 &mut self.prompt_session,
-                                &mut self.keys_rx,
+                                &mut self.handles.input,
                                 &mut self.line_history,
                                 &self.prompt_str,
                                 &self.guard,
@@ -1084,7 +1105,7 @@ impl Interactive {
                         &self.app_state,
                         self.config.output.as_ref(),
                         self.config.content.as_ref(),
-                        &mut self.keys_rx,
+                        &mut self.handles.input,
                     )
                     .await
                 }

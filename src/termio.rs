@@ -1,25 +1,40 @@
-//! Terminal geometry and capabilities — the first slice of `TermIO`
-//! (doc/ui_draw_v2.md, step 2, commit A).
+//! Terminal I/O — the `TermIO` layer (impl doc
+//! `doc/261003_output_drawing_refactor_impl.md`, step 4a).
 //!
-//! This commit lands the two pieces every other module needs *before* the
-//! terminal-owning enum itself: the size **watch** that replaces the
-//! `repl::TERMINAL_WIDTH` global and the scattered
-//! `crossterm::terminal::size()` queries, and the per-stream **caps** probe
-//! that replaces the scattered `is_terminal()` calls. The reader thread,
-//! raw mode, DSR, and the `TermIO { Tty | Plain }` enum arrive with the
-//! following commits.
+//! The closed `TermIO { Tty | Plain }` enum is the sole owner of the terminal:
+//! the **Tty** variant folds the former `repl::TermGuard` (raw-mode lifecycle)
+//! and owns the persistent stdin reader — the one thread that, for the process
+//! lifetime, calls `event::poll`/`event::read` — plus the SIGCONT handler that
+//! re-enters raw mode after a suspend. **Plain** (piped input, `--quiet`) has
+//! no reader and no raw mode; its channels are closed at construction, the
+//! shape piped mode had when it simply dropped the sender.
 //!
-//! Ownership note: the watch's sender is process-wide for now (a
+//! Setup hands out [`TermHandles`] exactly once (`TermIO::handles`): the
+//! `input` channel to the repl, and the `size` / `caret` channels to be
+//! distributed when their consumer exists (the render manager, step 4b).
+//!
+//! Ownership note: the size watch's sender is still process-wide (a
 //! `LazyLock`), because callers like `v25_listing_node` have no handle to
-//! thread through yet; step 4 moves the sender into the render manager and
-//! the global dies with it.
+//! thread through yet; it moves out of the global when the render manager
+//! takes a handle (impl doc, step 4 follow-ups).
+//!
+//! Not yet here (tracked in the impl doc): the production **writer** —
+//! `write` below exists and the test constructors use it, but `Draw` still
+//! owns the writer bytes flow through — DSR answered inside `TermIO` (4g),
+//! and caps probed at construction.
 
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::watch;
 
 /// Terminal geometry in logical units (columns / rows).
@@ -110,9 +125,85 @@ pub(crate) fn fixed(size: TermSize) -> watch::Receiver<TermSize> {
     watch::channel(size).1
 }
 
+/// One event on `TermIO`'s input channel — what the repl consumes
+/// (design doc §TermIO). The reader converts at the send edge
+/// ([`InputEvent::from_event`]); crossterm stays an input-side detail, below
+/// this channel and in the window pump that reads stdin directly while the
+/// reader is paused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputEvent {
+    /// A key press. Still a `crossterm` type "for now" (design doc §TermIO):
+    /// the prompt's dispatcher speaks it directly.
+    Key(KeyEvent),
+    /// Bracketed paste payload — a bulk insert for the prompt.
+    Paste(String),
+    /// A settled resize, as parked by the window pump. The reader itself
+    /// publishes resizes to the size watch inline and does not forward them
+    /// (see [`route_event`]); this variant exists for the parked path and for
+    /// the design's eventual "resize reaches the repl too" wiring.
+    Resize(TermSize),
+}
+
+impl InputEvent {
+    /// The send-edge conversion: `Key`/`Paste`/`Resize` map one-to-one;
+    /// anything the prompt could never show (mouse, focus) has nowhere to go
+    /// and returns `None` — dropped here, exactly as the reader's routing
+    /// drops it before the channel and the park drops it at drain time
+    /// (it was ignored there anyway).
+    pub fn from_event(ev: Event) -> Option<Self> {
+        match ev {
+            Event::Key(key) => Some(InputEvent::Key(key)),
+            Event::Paste(text) => Some(InputEvent::Paste(text)),
+            Event::Resize(w, h) => Some(InputEvent::Resize(TermSize {
+                width: w as usize,
+                height: h as usize,
+            })),
+            _ => None,
+        }
+    }
+}
+
+/// Caret invalidation pushed toward the render manager: SIGCONT / resume
+/// means the shell may have repainted, so the cached frame rows can no longer
+/// be trusted (design doc §9). The reader produces it; the render manager
+/// (step 4b) is the one consumer. Until then the channel is wired ahead of
+/// its consumer — the prompt loop's own `RESUMED_REANCHOR` flag still drives
+/// its DSR re-anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaretEvent {
+    Invalidated,
+}
+
+/// Acquired once at setup, then distributed (design doc §3): the reader's
+/// channel to the repl, plus the two channels whose consumer arrives with the
+/// render manager (4b) — `size` is `Clone` (frame dims + content format
+/// width), `caret` has the render manager as its only consumer. `TermIO` keeps
+/// the senders until `handles()` hands the receivers out, once.
+pub struct TermHandles {
+    /// Keys / paste / (parked) resize — one consumer: the repl.
+    pub input: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    /// The latest published geometry — `Clone`, for frame dims and format
+    /// width. Same channel as [`subscribe`]; this receiver is the setup-time
+    /// handle the design distributes.
+    pub size: watch::Receiver<TermSize>,
+    /// Caret invalidation (SIGCONT / resume) — the render manager only.
+    pub caret: tokio::sync::mpsc::UnboundedReceiver<CaretEvent>,
+}
+
+/// The stream token shared by Content → Render → Draw → TermIO (design doc
+/// §Render layer): content picks the stream, below it the only vocabulary is
+/// main / meta, so render and draw stay generic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    /// Primary output (stdout).
+    Main,
+    /// Meta output (stderr) — reasoning when it is routed there.
+    Meta,
+}
+
 /// Per-stream terminal capabilities, probed once per process.
 ///
-/// The future `TermIO` enum picks the *input / lifecycle* side
+/// `TermIO` picks the *input / lifecycle* side
 /// (`Tty`/`Plain`, from stdin); caps adjust output fidelity independently.
 /// `picocode "q" | cat` is the case that splits them: a tty stdin with a
 /// non-tty primary — frames dropped (and, later, output stripped) for the
@@ -137,6 +228,544 @@ impl Caps {
             primary: std::io::stdout().is_terminal(),
             meta: std::io::stderr().is_terminal(),
         }
+    }
+}
+
+// --- the TermIO type --------------------------------------------------------
+
+/// Where the persistent stdin reader sends one terminal event (moved from
+/// `repl.rs` with the reader). The *policy* is the part worth arguing about
+/// and the part worth testing: which keys may wait, and which may not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReaderRoute {
+    /// Deal with it here — process/terminal/abort state, or an event with
+    /// nobody to hand it to.
+    Inline,
+    /// Hand it to the prompt loop / turn's key branch on the channel.
+    Forward,
+}
+
+/// Route one terminal event as it arrives on stdin.
+///
+/// **Inline — must not wait:**
+/// - `Resize`: the streaming renderers read the size watch (this module), and
+///   only the reader can update it while the main task is parked on the turn.
+///   Forwarding it too would make the turn consume the resize instead of the
+///   renderers reading it directly. (The design doc has resize travel *both*
+///   the watch and the input channel; that forward lands with the read_input
+///   rework — impl doc, step 4 follow-ups.)
+/// - `Ctrl-C` / `Ctrl-Z`: process and terminal state (`exit`,
+///   `killpg(SIGTSTP)`), handled where they land, never queued.
+///
+/// **Forwarded:** every other key, plus `Paste`. These are content for the
+/// prompt; `read_input` already treats `Event::Paste` as a bulk insert, so
+/// the turn's key branch reads them the same way (U4.3). `Esc` is one of
+/// them, and that is a change:
+///
+/// `Esc` used to be Inline, and Inline meant *abort* — unconditionally, from
+/// here. Settled U4 makes it menu-first: the ladder runs while a menu is
+/// open, and it aborts only at root. This thread cannot make that call (it
+/// has no session to look at), so the decision moves to the one that can,
+/// and `Esc` rides the forwarded path with everything else. The cost is
+/// explicit: a root `Esc` is no longer guaranteed to land ahead of a paste
+/// backlog, where it was before. `Ctrl-C` still is, and it still never
+/// queues — that is what "immediately reachable" now rests on.
+///
+/// Everything else — mouse, focus — returns [`ReaderRoute::Inline`] and is
+/// ignored, exactly as it was before there was anywhere to forward to.
+pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
+    match ev {
+        Event::Resize(..) => ReaderRoute::Inline,
+        Event::Key(key) => match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ReaderRoute::Inline
+            }
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ReaderRoute::Inline
+            }
+            _ => ReaderRoute::Forward,
+        },
+        Event::Paste(..) => ReaderRoute::Forward,
+        _ => ReaderRoute::Inline,
+    }
+}
+
+/// Set by the `SIGCONT` handler on resume from `Ctrl-Z`. Read by the
+/// persistent stdin reader, which re-enters raw mode once it sees the flag.
+/// Kept separate from [`RESUMED_REANCHOR`] so the reader and the prompt loop
+/// never race to clear one another's work.
+pub(crate) static RESUMED: AtomicBool = AtomicBool::new(false);
+
+/// Set by the same handler, read by `Repl::read_input` alone: a resume means
+/// the shell may have repainted, so the prompt loop re-anchors the draw cache
+/// (DSR) on its next iteration. Lives here with [`RESUMED`] because the
+/// handler sets both and the reader consumes the first — one module owns the
+/// whole resume signal; the loop reads it downward (`crate::termio`).
+pub(crate) static RESUMED_REANCHOR: AtomicBool = AtomicBool::new(false);
+
+/// `SIGCONT` handler: record that the process resumed.
+/// It must stay async-signal-safe (no I/O, no allocation), so the actual
+/// terminal re-entry is performed by the reader thread (a normal thread
+/// context) or by `read_input`'s loop, which poll these flags.
+/// Two flags because two different consumers act on one resume (see
+/// [`RESUMED`] / [`RESUMED_REANCHOR`]).
+extern "C" fn on_sigcont(_sig: i32) {
+    RESUMED.store(true, Ordering::SeqCst);
+    RESUMED_REANCHOR.store(true, Ordering::SeqCst);
+}
+
+/// Register the `SIGCONT` handler exactly once. Safe to call multiple
+/// times; `libc::signal` just replaces the handler. Required so that
+/// `Ctrl-Z` suspend/resume restores raw mode. Called by [`TermIO::tty`] —
+/// raw mode is a Tty concern, so its resume signal is too.
+pub(crate) fn register_sigcont() {
+    unsafe {
+        libc::signal(libc::SIGCONT, on_sigcont as *const () as usize);
+    }
+}
+
+/// The closed terminal backend — "a closed type, not a trait: exactly two
+/// runtime behaviors, and TermIO is not an extension point" (design doc
+/// §TermIO). The variant picks the input / lifecycle side; caps adjust output
+/// fidelity separately (see [`Caps`]).
+///
+/// Wiring (design doc §3): build `TermIO`, call [`handles`](Self::handles)
+/// once, distribute — then the enum itself is handed to whoever owns drawing
+/// (today `Interactive`; the render manager / `Draw` takes it in a later step
+/// of step 4). No layer holds a reference into another.
+pub enum TermIO {
+    /// Interactive tty: raw mode, the sole stdin reader, the SIGCONT handler.
+    Tty(TtyIo),
+    /// Piped input or `--quiet`: line stdin, no raw mode, no reader, closed
+    /// input channel. `--quiet` is not a backend (design doc §TermIO): it
+    /// selects Plain, whose answer is printed from `run_once`'s return.
+    Plain(PlainIo),
+}
+
+/// The Tty half: the folded mode guard (the former `TermGuard` — raw-mode
+/// lifecycle, shared by every caller that must flip it: the reader, the
+/// prompt loop, `$EDITOR`'s takeover), the reader's sending halves, and the
+/// handles handed out once.
+pub struct TtyIo {
+    /// The canonical mode guard; [`TermIO::guard`] hands out clones of this
+    /// `Arc` (transitional — the holders convert to the render manager's
+    /// suspend in step 4f, and this handle goes with them).
+    guard: Arc<TermGuard>,
+    /// Sender half of [`TermHandles::input`], moved into the reader thread
+    /// by [`TermIO::handles`].
+    input_tx: Option<UnboundedSender<InputEvent>>,
+    /// Sender half of [`TermHandles::caret`] — held by the reader, which
+    /// pushes [`CaretEvent::Invalidated`] on resume.
+    caret_tx: UnboundedSender<CaretEvent>,
+    /// The receivers, taken exactly once by [`TermIO::handles`].
+    handles: Option<TermHandles>,
+}
+
+/// The Plain half: no reader, no raw mode. Its only behavior is where
+/// `write` lands — the real streams in production, or a test sinkhole /
+/// memory writer via [`TermIO::null`] / [`TermIO::recording`].
+pub struct PlainIo {
+    sink: Sink,
+    handles: Option<TermHandles>,
+}
+
+/// Where Plain's bytes go. The test constructors pick a non-stdio sink;
+/// production picks [`Sink::Stdio`].
+enum Sink {
+    /// stdout / stderr, per stream.
+    Stdio,
+    /// In-memory, per stream — [`TermIO::recording`] (test builds only;
+    /// nothing in production records).
+    #[cfg(test)]
+    Recording { main: Vec<u8>, meta: Vec<u8> },
+    /// Discard — [`TermIO::null`].
+    Null,
+}
+
+/// Fresh input + size + caret channels. The senders go to the reader (Tty)
+/// or are dropped outright (Plain and the test constructors: no reader will
+/// ever send).
+fn term_channels() -> (
+    TermHandles,
+    UnboundedSender<InputEvent>,
+    UnboundedSender<CaretEvent>,
+) {
+    let (input_tx, input_rx) = unbounded_channel();
+    let (caret_tx, caret_rx) = unbounded_channel();
+    let handles = TermHandles {
+        input: input_rx,
+        size: subscribe(),
+        caret: caret_rx,
+    };
+    (handles, input_tx, caret_tx)
+}
+
+impl TermIO {
+    /// The interactive-tty backend: register the resume handler, fold the
+    /// mode guard, build the channels. Does **not** start the reader —
+    /// [`handles`] does, so the caller can raise the pause gate first and the
+    /// entry DSR cannot be swallowed (the ordering `Interactive::new`
+    /// documents).
+    ///
+    /// [`handles`]: Self::handles
+    pub fn tty() -> Self {
+        register_sigcont();
+        let (handles, input_tx, caret_tx) = term_channels();
+        TermIO::Tty(TtyIo {
+            guard: Arc::new(TermGuard::new()),
+            input_tx: Some(input_tx),
+            caret_tx,
+            handles: Some(handles),
+        })
+    }
+
+    /// The non-interactive backend (piped stdin or `--quiet`): no reader, no
+    /// raw mode, closed channels — the shape piped mode had when it dropped
+    /// the sender half.
+    pub fn plain() -> Self {
+        let (handles, input_tx, caret_tx) = term_channels();
+        drop(input_tx);
+        drop(caret_tx);
+        TermIO::Plain(PlainIo {
+            sink: Sink::Stdio,
+            handles: Some(handles),
+        })
+    }
+
+    /// Memory writers, per stream (design doc §Testing): what byte-edge
+    /// assertions record through once `Draw` writes via `TermIO`. Stripped
+    /// bytes with frames dropped by caps are Draw's decision, above this.
+    #[cfg(test)]
+    pub fn recording() -> Self {
+        let (handles, input_tx, caret_tx) = term_channels();
+        drop(input_tx);
+        drop(caret_tx);
+        TermIO::Plain(PlainIo {
+            sink: Sink::Recording {
+                main: Vec::new(),
+                meta: Vec::new(),
+            },
+            handles: Some(handles),
+        })
+    }
+
+    /// The sinkhole backend: bytes in, nothing out.
+    pub fn null() -> Self {
+        let (handles, input_tx, caret_tx) = term_channels();
+        drop(input_tx);
+        drop(caret_tx);
+        TermIO::Plain(PlainIo {
+            sink: Sink::Null,
+            handles: Some(handles),
+        })
+    }
+
+    /// Acquire the channel handles — once, at setup (design doc §3). On Tty
+    /// this also **starts the sole stdin reader** (the reason it is not the
+    /// constructor: the caller raises the pause gate first, so the reader
+    /// starts parked and cannot swallow the entry DSR's reply).
+    ///
+    /// Panics on a second call: wiring happens once per process, and a
+    /// silently closed second set of handles would be harder to diagnose
+    /// than the mistake.
+    pub fn handles(&mut self) -> TermHandles {
+        match self {
+            TermIO::Tty(t) => {
+                let handles = t
+                    .handles
+                    .take()
+                    .expect("TermIO::handles() is called once at setup");
+                let input_tx = t
+                    .input_tx
+                    .take()
+                    .expect("TermIO::handles() is called once at setup");
+                spawn_stdin_reader(t.guard.clone(), input_tx, t.caret_tx.clone());
+                handles
+            }
+            TermIO::Plain(p) => p
+                .handles
+                .take()
+                .expect("TermIO::handles() is called once at setup"),
+        }
+    }
+
+    /// The mode-guard handle (Tty) or `None` (Plain has no raw mode to
+    /// flip). Transitional: the holders (`Repl`, the prompt loop, `$EDITOR`,
+    /// the back-off pump) convert to the render manager's suspend in step 4f.
+    pub fn guard(&self) -> Option<Arc<TermGuard>> {
+        match self {
+            TermIO::Tty(t) => Some(t.guard.clone()),
+            TermIO::Plain(_) => None,
+        }
+    }
+
+    /// Bytes to the stream's sink (design doc §TermIO `write`). Nothing in
+    /// production writes through here yet — `Draw` still owns the writer —
+    /// so today's callers are the byte-edge tests over [`recording`](Self::recording)
+    /// and [`null`](Self::null).
+    pub fn write(&mut self, s: Stream, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            TermIO::Tty(_) => write_stdio(s, bytes),
+            TermIO::Plain(p) => match &mut p.sink {
+                Sink::Stdio => write_stdio(s, bytes),
+                #[cfg(test)]
+                Sink::Recording { main, meta } => {
+                    match s {
+                        Stream::Main => main.extend_from_slice(bytes),
+                        Stream::Meta => meta.extend_from_slice(bytes),
+                    }
+                    Ok(())
+                }
+                Sink::Null => Ok(()),
+            },
+        }
+    }
+
+    /// What [`recording`](Self::recording) captured for `s` — empty for any
+    /// other backend (they store nothing).
+    #[cfg(test)]
+    pub fn recorded(&self, s: Stream) -> Vec<u8> {
+        match self {
+            TermIO::Tty(_) => Vec::new(),
+            TermIO::Plain(p) => match &p.sink {
+                Sink::Recording { main, meta } => match s {
+                    Stream::Main => main.clone(),
+                    Stream::Meta => meta.clone(),
+                },
+                _ => Vec::new(),
+            },
+        }
+    }
+}
+
+/// Production sink: the real streams, flushed per write (a frame must be on
+/// screen before the next one is planned; there is no batching layer below
+/// this yet).
+fn write_stdio(s: Stream, bytes: &[u8]) -> io::Result<()> {
+    match s {
+        Stream::Main => {
+            let mut out = io::stdout();
+            out.write_all(bytes)?;
+            out.flush()
+        }
+        Stream::Meta => {
+            let mut err = io::stderr();
+            err.write_all(bytes)?;
+            err.flush()
+        }
+    }
+}
+
+/// The sole stdin owner: the reader thread (moved from `repl.rs` with the
+/// `TermIO` type). What to do with each event is [`route_event`]'s call, not
+/// a pile of branches here. The reader handles three things inline and
+/// forwards the rest on `input` (ui_draw_v2 §4.5 U4.2); until U4.2 nothing
+/// was forwarded and edit keys typed mid-request were simply dropped.
+///
+/// `input` is **unbounded** on purpose: a bounded channel that filled would
+/// block this thread at precisely the moment it has to deliver `Ctrl-C`.
+///
+/// It is spawned once, when `TermIO::handles` runs on the Tty variant, and
+/// runs for the process lifetime — it, and only it, calls
+/// `event::poll`/`event::read`. The prompt loop and every in-flight turn
+/// consume the events it forwards instead of touching stdin, which is what
+/// removes the three-way race between the prompt's blocking reads, the turn's
+/// reader, and the DSR query (the last of which is answered by pausing this
+/// reader — see [`query_cursor_row`]).
+///
+/// In raw mode `event::read` is blocking, so a background thread is what sees
+/// `Ctrl-C`/`Ctrl-Z` arriving while the main task is parked on a turn. `Esc`
+/// is forwarded, not handled here: U4.3 made it menu-first, a decision this
+/// thread cannot make without a session to look at; see [`route_event`].
+///
+/// `guard` is `Arc` and `stop()` is process-wide, so calling it from this
+/// thread is safe. The process-wide pause gate ([`PAUSE_GATE`]) is raised
+/// by the main task whenever *it* owns stdin — `$EDITOR`'s takeover, a DSR
+/// query, or the compaction window — and while it is `true` this reader backs
+/// off (sleeps, does not read) so it cannot swallow the bytes the main task is
+/// waiting for; [`READER_PARKED`] signals that it has genuinely parked.
+pub(crate) fn spawn_stdin_reader(
+    guard: Arc<TermGuard>,
+    input: UnboundedSender<InputEvent>,
+    caret: UnboundedSender<CaretEvent>,
+) {
+    // A gate-raiser only waits for a park when a reader exists to park; set it
+    // before the thread starts so the entry-DSR's pause below sees it.
+    READER_RUNNING.store(true, Ordering::SeqCst);
+    let _ = thread::spawn(move || loop {
+        if RESUMED.swap(false, Ordering::SeqCst) {
+            let _ = guard.start();
+            // Resume invalidated the screen (design doc §9): push it toward
+            // the render manager. Today nothing consumes the channel yet —
+            // the prompt loop's own `RESUMED_REANCHOR` flag still runs its
+            // DSR — so the event waits in the queue for its consumer (4b).
+            let _ = caret.send(CaretEvent::Invalidated);
+        }
+        // The main task owns stdin right now ($EDITOR, a DSR query, or the
+        // compaction window); back off so we don't consume the bytes it is
+        // waiting for. `READER_PARKED` tells a gate-raiser that we have
+        // left any in-flight poll and are genuinely not reading.
+        if PAUSE_GATE.load(Ordering::SeqCst) {
+            READER_PARKED.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        READER_PARKED.store(false, Ordering::SeqCst);
+        if let Ok(true) = event::poll(Duration::from_millis(50)) {
+            match event::read() {
+                // U4.2: edit keys this thread used to drop now go to the
+                // prompt loop or the turn. `send` on an unbounded tokio mpsc
+                // never blocks, so this is safe from a plain OS thread — and
+                // being non-blocking is the whole reason the channel is
+                // unbounded (see `route_event`).
+                Ok(ev) if route_event(&ev) == ReaderRoute::Forward => {
+                    if let Some(ev) = InputEvent::from_event(ev) {
+                        let _ = input.send(ev);
+                    }
+                }
+                Ok(Event::Resize(w, h)) => {
+                    // Publish the new geometry so renderers pick up the
+                    // change on their next streaming call.
+                    set_size(TermSize {
+                        width: w as usize,
+                        height: h as usize,
+                    });
+                }
+                Ok(Event::Key(key)) => {
+                    if let KeyCode::Char('c') = key.code {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            let _ = guard.stop();
+                            std::process::exit(1);
+                        }
+                    } else if let KeyCode::Char('z') = key.code {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            let _ = guard.stop();
+                            unsafe {
+                                libc::killpg(libc::getpgrp(), libc::SIGTSTP);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+/// Owns terminal mode transitions — the folded former `repl::TermGuard`.
+/// [`TermIO::Tty`] holds the canonical instance and hands out `Arc` clones
+/// ([`TermIO::guard`]) to everything that must flip raw mode: the reader
+/// (resume / `Ctrl-C` / `Ctrl-Z`), the prompt loop, `$EDITOR`'s takeover, the
+/// back-off pump. [`start`](Self::start) enters raw mode and negotiates
+/// capabilities; [`stop`](Self::stop) (idempotent) restores cooked mode. Safe
+/// to call from `Drop`, a panic hook, or a signal handler.
+///
+/// Transitional: step 4f re-homes the holders on the render manager's
+/// suspend pass-through and this shared handle dies with them.
+pub struct TermGuard {
+    active: AtomicBool,
+    saved_paste: AtomicBool,
+}
+
+impl TermGuard {
+    pub fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            saved_paste: AtomicBool::new(false),
+        }
+    }
+
+    /// Enter raw mode and negotiate capabilities. Idempotent.
+    pub fn start(&self) -> io::Result<()> {
+        if self.active.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.saved_paste.store(false, Ordering::SeqCst);
+        enable_raw_mode()?;
+        // crossterm's `enable_raw_mode` calls `cfmakeraw`, which clears `OPOST`.
+        // With `OPOST` off the terminal does NOT translate `\n` -> `\r\n`, so
+        // every bare `\n` (help text, separators, agent responses) only moves
+        // down a row and leaves the cursor at the same column — producing the
+        // staggered "indentation" seen on a full screen. Re-enable output
+        // post-processing (specifically `ONLCR`) so line breaks return to
+        // column 0, while keeping raw *input* semantics (no canonical line
+        // editing, no echo). `disable_raw_mode` restores the original mode.
+        enable_output_processing();
+        Self::csi("?2004h")?; // bracketed paste on
+                              // Kitty keyboard protocol: disambiguate keys + report all keys as CSI u,
+                              // so Shift+Enter arrives as Enter+SHIFT (newline) and Alt+Letter as a
+                              // distinct Alt-modified char. Honored by wezterm/alacritty/kitty.
+        crossterm::execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            )
+        )?;
+        self.active.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Restore cooked mode. Idempotent; safe to call multiple times / from `Drop`.
+    pub fn stop(&self) -> io::Result<()> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        // Pop one level of Kitty keyboard enhancement (matches the single push).
+        let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        if self.saved_paste.load(Ordering::SeqCst) {
+            Self::csi("?2004h")?;
+        } else {
+            Self::csi("?2004l")?;
+        }
+        // The status line hides the cursor while a turn streams, and
+        // `draw_frame` shows it again when the prompt returns. If the turn is
+        // interrupted instead — a tool error, a confirm, a panic — nothing shows
+        // it again, and an invisible cursor follows the user into their shell.
+        // Unconditional and idempotent: showing a cursor that was never hidden
+        // costs nothing, and this is the last writer before the tty is the
+        // user's again.
+        io::stdout().write_all(crate::ansi::SHOW_CURSOR)?;
+        disable_raw_mode()?;
+        self.active.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn csi(seq: &str) -> io::Result<()> {
+        let mut s = String::from("\x1b[");
+        s.push_str(seq);
+        io::stdout().write_all(s.as_bytes())?;
+        io::stdout().flush()
+    }
+}
+
+impl Default for TermGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+/// Re-enable terminal output post-processing (specifically `OPOST`/`ONLCR`)
+/// on the stdout terminal. `crossterm::enable_raw_mode` runs `cfmakeraw`, which
+/// disables `OPOST`; without it a bare `\n` does not return the cursor to
+/// column 0, so agent responses and separators stagger. We operate on fd 1
+/// (stdout), which is the pty slave when interactive and a pipe otherwise
+/// (tcsetattr on a pipe harmlessly fails). Best-effort: errors are ignored.
+fn enable_output_processing() {
+    let fd = libc::STDOUT_FILENO;
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut termios) != 0 {
+            return;
+        }
+        termios.c_oflag |= libc::OPOST | libc::ONLCR;
+        let _ = libc::tcsetattr(fd, libc::TCSANOW, &termios);
     }
 }
 
@@ -314,5 +943,198 @@ mod tests {
             );
         }
         assert!(!reader_paused(), "dropped once, clear again");
+    }
+
+    // --- the routing policy, moved from `repl.rs` with the reader (4a) ------
+
+    /// The in-flight reader's routing policy: which events may wait, and which
+    /// may not.
+    ///
+    /// Pinned as a *correctness* property rather than a preference — "an abort
+    /// cannot ride behind a paste backlog" (ui_draw_v2 §4.5) — and the
+    /// channel's unboundedness follows from it: a bounded one that filled would
+    /// block the reader at precisely the moment it has to deliver `Ctrl-C`.
+    ///
+    /// `Esc` used to be in this list and is deliberately gone from it now, for
+    /// the reason [`esc_is_forwarded_so_the_turn_can_decide`] pins.
+    #[test]
+    fn an_abort_never_queues_behind_content() {
+        let urgent = [
+            (
+                "Ctrl-C",
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ),
+            (
+                "Ctrl-Z",
+                Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            ),
+            ("Resize", Event::Resize(120, 40)),
+        ];
+        for (what, ev) in urgent {
+            assert_eq!(
+                route_event(&ev),
+                ReaderRoute::Inline,
+                "{} must be handled inline, never queued",
+                what
+            );
+        }
+    }
+
+    /// `Esc` is forwarded, and that is the fix for the settled menu-first rule
+    /// (ui_draw_v2 §4.5, "abort only at root").
+    ///
+    /// It could not be decided where it used to be decided: routing `Esc`
+    /// Inline here meant routing it to *abort*, with no way to ask whether a
+    /// menu was open, because this function has no session to look at. Moving
+    /// it to the forwarded path is what lets the turn answer the question
+    /// correctly — step the ladder when a menu is up, stop the turn when there
+    /// is not. The trade is stated in [`route_event`]'s doc: a root `Esc` now
+    /// rides the queue like any other key.
+    #[test]
+    fn esc_is_forwarded_so_the_turn_can_decide() {
+        let ev = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(route_event(&ev), ReaderRoute::Forward);
+    }
+
+    /// Everything the prompt can hold is content, and content goes to the turn
+    /// instead of being dropped the way it was before U4.2.
+    #[test]
+    fn what_the_prompt_can_hold_is_forwarded() {
+        let content = [
+            (
+                "a character",
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            ),
+            (
+                "Enter",
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ),
+            (
+                "Shift+Enter (a newline)",
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            ),
+            (
+                "Up",
+                Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            ),
+            (
+                "Backspace",
+                Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            ),
+            ("a paste", Event::Paste("hello world".to_string())),
+        ];
+        for (what, ev) in content {
+            assert_eq!(
+                route_event(&ev),
+                ReaderRoute::Forward,
+                "{} is content for the prompt",
+                what
+            );
+        }
+    }
+
+    /// Events with nowhere to go keep their old fate instead of being
+    /// forwarded, so the channel carries no more than the prompt could ever
+    /// show.
+    #[test]
+    fn events_with_nowhere_to_go_stay_inline() {
+        let ev = Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(route_event(&ev), ReaderRoute::Inline);
+    }
+
+    // --- the TermIO type itself (4a) ----------------------------------------
+
+    /// The send-edge conversion: three variants map one-to-one, everything
+    /// else (mouse, focus, whatever a window pump might park) has nowhere to
+    /// go and is dropped — the fate it already had at the drain.
+    #[test]
+    fn from_event_maps_the_prompt_vocabulary_and_drops_the_rest() {
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            InputEvent::from_event(Event::Key(key)),
+            Some(InputEvent::Key(key))
+        );
+        assert_eq!(
+            InputEvent::from_event(Event::Paste("hi".into())),
+            Some(InputEvent::Paste("hi".into()))
+        );
+        assert_eq!(
+            InputEvent::from_event(Event::Resize(120, 40)),
+            Some(InputEvent::Resize(TermSize {
+                width: 120,
+                height: 40
+            }))
+        );
+        let mouse = Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 1,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(InputEvent::from_event(mouse), None);
+    }
+
+    /// Plain's channels arrive **closed** — no reader exists to feed them —
+    /// which is exactly the shape piped/quiet mode had when it dropped the
+    /// sender half of `stdin_channel`. `size` still serves the live watch.
+    #[test]
+    fn plain_handles_have_no_reader_and_closed_channels() {
+        let mut io = TermIO::plain();
+        let mut handles = io.handles();
+        assert!(
+            handles.input.try_recv().is_err(),
+            "no reader ever sends on Plain's input"
+        );
+        assert!(
+            handles.caret.try_recv().is_err(),
+            "no reader ever invalidates Plain's caret"
+        );
+        assert!(io.guard().is_none(), "Plain has no raw mode to flip");
+    }
+
+    /// Wiring happens once: a second `handles()` would hand out a second
+    /// receiver set nobody feeds, so the mistake is a panic, not silence.
+    #[test]
+    #[should_panic(expected = "called once at setup")]
+    fn handles_are_handed_out_once() {
+        let mut io = TermIO::plain();
+        let first = io.handles();
+        drop(first);
+        let _second = io.handles();
+    }
+
+    /// The Tty variant folds the mode guard: `guard()` hands out the shared
+    /// handle from its canonical instance, Plain has none. (No reader is
+    /// spawned — that is `handles()`' job, and a unit test must not start a
+    /// thread reading the harness's stdin.)
+    #[test]
+    fn the_mode_guard_lives_with_the_tty_variant() {
+        let io = TermIO::tty();
+        assert!(io.guard().is_some(), "Tty owns the guard");
+        let plain = TermIO::plain();
+        assert!(plain.guard().is_none());
+    }
+
+    /// `recording()` captures bytes per stream and `null()` discards them —
+    /// the two test constructors the byte-edge tests record through (design
+    /// doc §Testing). Production writes are `Draw`'s writer today; these pin
+    /// the `TermIO::write` surface that will carry them.
+    #[test]
+    fn recording_captures_per_stream_and_null_discards() {
+        let mut rec = TermIO::recording();
+        rec.write(Stream::Main, b"frame").unwrap();
+        rec.write(Stream::Meta, b"reason").unwrap();
+        rec.write(Stream::Main, b" more").unwrap();
+        assert_eq!(rec.recorded(Stream::Main), b"frame more");
+        assert_eq!(rec.recorded(Stream::Meta), b"reason");
+
+        let mut sink = TermIO::null();
+        sink.write(Stream::Main, b"gone").unwrap();
+        assert_eq!(sink.recorded(Stream::Main), b"");
     }
 }

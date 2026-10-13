@@ -186,11 +186,16 @@ pub struct State {
     /// REPL raw-mode guard — a service handle published once at startup;
     /// the compaction review closure clones it out to suspend raw mode
     /// around `$EDITOR` (same pattern as the Ctrl-E path).
-    pub(crate) term_guard: Option<Arc<crate::repl::TermGuard>>,
+    pub(crate) term_guard: Option<Arc<crate::termio::TermGuard>>,
     /// Key events captured by a window pump while nobody could read stdin
     /// (the compaction LLM window), parked for `read_input` to dispatch on
     /// its next iteration — never dropped, never leaked into `$EDITOR`.
-    pub(crate) parked_keys: VecDeque<crossterm::event::Event>,
+    /// Converted to [`InputEvent`] at the park edge (step 4a): the drain
+    /// speaks the input channel's vocabulary; events the prompt could never
+    /// show (mouse, focus) are dropped here, as the drain used to ignore them.
+    ///
+    /// [`InputEvent`]: crate::termio::InputEvent
+    pub(crate) parked_keys: VecDeque<crate::termio::InputEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -715,11 +720,13 @@ impl AppState {
     /// Resize handling, same dispatcher — and *after* any `$EDITOR` the
     /// window opened, instead of leaking into its stdin.
     pub fn park_key(&self, ev: crossterm::event::Event) {
-        self.state.lock().parked_keys.push_back(ev);
+        if let Some(ev) = crate::termio::InputEvent::from_event(ev) {
+            self.state.lock().parked_keys.push_back(ev);
+        }
     }
 
     /// Oldest parked key, if any — one per `read_input` iteration.
-    pub fn take_parked_key(&self) -> Option<crossterm::event::Event> {
+    pub fn take_parked_key(&self) -> Option<crate::termio::InputEvent> {
         self.state.lock().parked_keys.pop_front()
     }
 
@@ -732,13 +739,13 @@ impl AppState {
     }
 
     /// Publish the REPL's term guard (set once at startup).
-    pub fn set_term_guard(&self, guard: Arc<crate::repl::TermGuard>) {
+    pub fn set_term_guard(&self, guard: Arc<crate::termio::TermGuard>) {
         self.state.lock().term_guard = Some(guard);
     }
 
     /// Clone-out of the term guard (rule 3 — callers hold it across the
     /// editor outside any lock; `edit_text` does exactly that).
-    pub fn term_guard(&self) -> Option<Arc<crate::repl::TermGuard>> {
+    pub fn term_guard(&self) -> Option<Arc<crate::termio::TermGuard>> {
         self.state.lock().term_guard.clone()
     }
 

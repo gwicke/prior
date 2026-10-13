@@ -10,7 +10,7 @@
 //! read-back); everything outside this module must use [`run_editor`].
 
 use crate::output::Output;
-use crate::repl::TermGuard;
+use crate::termio::TermGuard;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
