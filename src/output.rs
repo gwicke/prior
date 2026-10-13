@@ -185,16 +185,6 @@ pub trait Output: Send + Sync {
     /// block while a turn runs — the session / model / context readout.
     ///
     /// Transient and *relative* (never `CUP`, so a viewport scrolled back into
-    /// the scrollback is never written into — the write lands below it,
-    /// invisible). It occupies the content's last row and the next content
-    /// write erases it, so the policy of when to paint it lives in the output
-    /// and the caller only supplies the text. Empty disables it. A live frame
-    /// (the prompt's input, a dialog) owns the last rows instead, so nothing is
-    /// painted then.
-    ///
-    /// Default no-op: outputs with no cursor to write at have no status line.
-    fn set_status(&self, _text: &StatusText) {}
-
     /// Is a turn running right now?
     ///
     /// The composer needs this to decide whether an empty input is a row (the
@@ -329,8 +319,8 @@ pub trait Output: Send + Sync {
     /// Default `None` — an output with no screen has no bar to show, which is
     /// also what every non-console output wants from [`Self::compose_area`]:
     /// the input and the overlay, and nothing standing in for a readout.
-    /// `ConsoleOutput` is the one that overrides it, and it is the one that
-    /// holds `status_text` and `streaming`.
+    /// `ConsoleOutput` is the one that overrides it, and it reaches the raw
+    /// store and the streaming flag through its content (step 4f-a).
     fn status_row(&self) -> Option<Element> {
         None
     }
@@ -595,10 +585,6 @@ pub struct ConsoleOutput {
     /// the frame methods reach the drawing edge through its `manager`
     /// (step 4c).
     pub(crate) content: Arc<Content>,
-    /// The status line's content — pure frame state, never content's (see the
-    /// transition contract). `Arc`'d so [`Element::status`] can hold its own
-    /// handle: the row resolves at draw time, not compose time.
-    status_text: Arc<Mutex<StatusText>>,
 }
 
 /// Terminal width in columns, from the size watch (`crate::termio`, step 2
@@ -790,7 +776,6 @@ impl ConsoleOutput {
     fn with_geometry(show_reasoning: ShowReasoningHandle, size: watch::Receiver<TermSize>) -> Self {
         Self {
             content: Arc::new(Content::new(size, show_reasoning)),
-            status_text: Arc::new(Mutex::new(StatusText::default())),
         }
     }
 
@@ -828,19 +813,21 @@ impl Default for ConsoleOutput {
 
 impl ConsoleOutput {}
 
-/// The status line's content, before it is fitted to a width: what names the
-/// session, and the model group as separate fields.
+/// The status line's content, after shaping and before the fit: what names the
+/// session, and the model group as separate fields. `agent::status::status_text`
+/// builds this from the raw [`crate::agent::status::BarStatus`]; `status_bar`
+/// below fits it to a width and styles it. Both run inside the bar's own
+/// render (step 4f-a).
 ///
-/// **Data, not drawing, and deliberately not the rendered bar.** `status_bar`
-/// below fits it to a width and styles it; nothing here needs to know how wide
-/// the terminal is, which is what lets the two halves live on opposite sides of
-/// the `agent` → `output` seam instead of the width being passed in from the
-/// layer that has no business knowing it.
+/// **Data, not drawing, and deliberately not the rendered bar.** Nothing here
+/// needs to know how wide the terminal is, which is what lets the two halves
+/// live on opposite sides of the `agent` → `output` seam instead of the width
+/// being passed in from the layer that has no business knowing it.
 ///
 /// The group's fields are kept separate — rather than pre-joined into one
 /// string — because a narrow terminal has to give up **whole** fields, from the
-/// right, and a joined string can only be cut mid-word. The push order is that
-/// drop order, so it is carried here rather than re-decided at the fit.
+/// right, and a joined string can only be cut mid-word. The shaping order is
+/// that drop order, so it is carried here rather than re-decided at the fit.
 #[derive(Default, Clone)]
 pub struct StatusText {
     /// The session name, or its opening message standing in for it.
@@ -857,9 +844,11 @@ impl StatusText {
     /// to say, and testing *it* would paint a blank bar where the status is
     /// supposed to be off.
     ///
-    /// One definition for both paths that need it: [`ConsoleOutput::paint_status`]
-    /// (content) and [`Output::status_row`] (frame). Two answers to "is there a
-    /// status?" is how the two bars end up disagreeing about their own existence.
+    /// One definition for every path that asks: the compose-side presence
+    /// check ([`Output::status_row`], which must not reserve a row for an
+    /// off bar) and the bar's own render ([`StatusItem`], which must not
+    /// draw one). Two answers to "is there a status?" is how the two end up
+    /// disagreeing about their own existence.
     pub(crate) fn is_off(&self) -> bool {
         self.name.is_empty() && self.group.is_empty()
     }
@@ -924,9 +913,10 @@ fn dot_cell(width: usize) -> (&'static str, &'static str, usize) {
 /// cell's share of the budget, the truncation and the padding are *one*
 /// decision, and the width is what makes it.
 ///
-/// Deliberately **one** function, called from two places: the area's status row
-/// and the transient bar are the same drawing, and two renderings of "fit the
-/// group, then style it" would be two places for them to drift apart.
+/// Deliberately **one** function: "fit the group, then style it" is one
+/// decision, and a second rendering of it would be a place for the two to
+/// drift apart. Its only production caller is the bar's own render (step
+/// 4f-a); the tests beside `agent::status` are the other readers.
 ///
 /// One pipe, and single spaces between the model fields. The labels went
 /// ("ctx 34% · 78k" → "34% 78k") because on a 120-column bar they were most of
@@ -938,26 +928,40 @@ fn dot_cell(width: usize) -> (&'static str, &'static str, usize) {
 /// so a long session name uses the whole gap and ends in an ellipsis instead of
 /// stopping short and leaving a hole. The model group is measured first, because
 /// it is the part with nothing to give.
-/// The area's status row, as an element that resolves **when it is drawn**.
+/// The area's status row, as an element that resolves **when it is drawn** —
+/// both halves of the drawing (step 4f-a, design §UI: the bar formats itself
+/// from raw data).
 ///
 /// `Element::lines` would bake `status_bar(...)`'s output into the element at
 /// compose time — and compose runs once per keystroke, while the two things
-/// the bar shows (`set_status`'s figures and the streaming dot) move at turn
+/// the bar shows (the raw store's figures and the streaming dot) move at turn
 /// start and end. Holding the handles instead makes every draw current,
-/// including §4.5 P1's re-emit of the area under a content write.
+/// including §4.5 P1's re-emit of the area under a content write. Since 4f-a
+/// the *shaping* runs here too, not at the push: the store carries facts
+/// (`agent::status::BarStatus`), and `status_text` + `status_bar` turn them
+/// into a row at the width being rendered for — neither half can be applied
+/// without the other, so neither left with the data.
 ///
 /// The element owns its data source rather than reaching back into `Output`,
 /// which is what keeps `render_at` a function of `(h, term_w)` plus state this
 /// element holds itself — constructible with no terminal and no output in
 /// sight, so §3.1's unit-testability is intact rather than traded away.
 struct StatusItem {
-    text: Arc<Mutex<StatusText>>,
+    /// The bar's **raw data** (step 4f-a, design §UI): the store is content's
+    /// (`Content::bar`), shared the same way the streaming flag is.
+    status: Arc<Mutex<crate::agent::status::BarStatus>>,
     streaming: Arc<AtomicBool>,
 }
 
 impl RenderAt for StatusItem {
     fn render_at(&self, _h: usize, term_w: usize) -> Rendered {
-        let text = self.text.lock().unwrap();
+        // The bar formats itself (step 4f-a): the held state is facts, and
+        // both halves of the drawing run here — the shaping (name fallback,
+        // field list, drop order) and the fit at the width being rendered
+        // for. Neither can be applied without the other, so neither left with
+        // the data.
+        let status = self.status.lock().unwrap();
+        let text = crate::agent::status::status_text(&status);
         // Off between compose and render → say nothing rather than render an
         // empty bar's furniture. The row was reserved by the allocator either
         // way, so nothing below it moves.
@@ -978,11 +982,14 @@ impl RenderAt for StatusItem {
 }
 
 impl Element {
-    /// The status row: `must == might == 1`, text resolved at render time.
+    /// The status row: `must == might == 1`, data resolved at render time.
     /// Presence is `status_row`'s decision; this is only ever built when there
     /// is something to say (see [`StatusItem`]).
-    pub(crate) fn status(text: Arc<Mutex<StatusText>>, streaming: Arc<AtomicBool>) -> Self {
-        Element::new(1, 1, StatusItem { text, streaming })
+    pub(crate) fn status(
+        status: Arc<Mutex<crate::agent::status::BarStatus>>,
+        streaming: Arc<AtomicBool>,
+    ) -> Self {
+        Element::new(1, 1, StatusItem { status, streaming })
     }
 }
 
@@ -1267,32 +1274,26 @@ impl Output for ConsoleOutput {
         self.content.begin_capture();
     }
 
-    /// The frame path's bar, from the same two facts the content path's is
-    /// (see [`Self::paint_status`]).
+    /// The frame path's bar, from the raw store content holds (step 4f-a) and
+    /// the streaming flag — the same two facts the row itself formats from.
     ///
     /// `streaming` is read here rather than passed in as `false` by whoever
     /// composes: whether a turn is running is a fact about this output, and a
     /// literal at a call site is a claim that can go stale — which is how the
     /// two bars could ever have rendered the same turn differently.
     ///
-    /// `None` when the status is off, for the same reason `paint_status`
-    /// returns early: there is no bar to show, and an off status must not
-    /// become an empty full-width row.
+    /// `None` when the status is off: there is no bar to show, and an off
+    /// status must not become an empty full-width row. Off is a shaped
+    /// answer — "nothing to say" is what the *shaping* decides — so the
+    /// presence check shapes too; the row formats itself again at render.
     fn status_row(&self) -> Option<Element> {
-        if self.status_text.lock().unwrap().is_off() {
+        if crate::agent::status::status_text(&self.content.bar.lock().unwrap()).is_off() {
             return None;
         }
         Some(Element::status(
-            self.status_text.clone(),
+            self.content.bar.clone(),
             self.content.streaming.clone(),
         ))
-    }
-
-    /// Remember the status line to paint after each content block; see
-    /// [`ConsoleOutput::paint_status`] for the three conditions that decide
-    /// whether it actually goes out.
-    fn set_status(&self, text: &StatusText) {
-        *self.status_text.lock().unwrap() = text.clone();
     }
 
     fn is_streaming(&self) -> bool {
@@ -1346,10 +1347,10 @@ mod tests {
     /// for is the painting (transience, the gap, the erase, the dim). The fitting —
     /// which field gives way to what, and the ellipsis — is a different contract and
     /// has its own tests beside `status_bar`.
-    fn bar_of(text: &str) -> StatusText {
-        StatusText {
-            name: text.to_string(),
-            group: Vec::new(),
+    fn bar_of(text: &str) -> crate::agent::status::BarStatus {
+        crate::agent::status::BarStatus {
+            session_name: Some(text.to_string()),
+            ..Default::default()
         }
     }
 
@@ -1365,7 +1366,7 @@ mod tests {
     #[test]
     fn the_dot_follows_the_response_lifecycle() {
         let (out, _reasoning) = capturing_output(60);
-        out.set_status(&bar_of("[bar]"));
+        out.content.set_status(bar_of("[bar]"));
         assert!(
             !out.content
                 .streaming
@@ -1419,7 +1420,7 @@ mod tests {
     #[test]
     fn compose_area_resolves_every_row_it_owns() {
         let (out, _reasoning) = capturing_output(60);
-        out.set_status(&bar_of("[bar]"));
+        out.content.set_status(bar_of("[bar]"));
         let input = || {
             Element::input(
                 crate::repl::LineEditor::new().layout(60, "> "),
@@ -1467,7 +1468,7 @@ mod tests {
     #[test]
     fn compose_area_reads_streaming_rather_than_being_told_it() {
         let (out, _reasoning) = capturing_output(60);
-        out.set_status(&bar_of("[bar]"));
+        out.content.set_status(bar_of("[bar]"));
         let idle = compose_rows(&out.compose_area(None, Vec::new()), 60);
         assert!(
             !idle[1].contains(DOT_STREAMING),
@@ -1501,15 +1502,12 @@ mod tests {
             out.compose_area(None, Vec::new()).is_empty(),
             "never set: there is no bar to show"
         );
-        out.set_status(&StatusText {
-            name: String::new(),
-            group: Vec::new(),
-        });
+        out.content.set_status(Default::default());
         assert!(
             out.compose_area(None, Vec::new()).is_empty(),
             "explicitly off: there is no bar to show"
         );
-        out.set_status(&bar_of("[bar]"));
+        out.content.set_status(bar_of("[bar]"));
         assert_eq!(
             out.compose_area(None, Vec::new()).len(),
             2,
@@ -3036,14 +3034,14 @@ mod tests {
         let dims = (60, 20);
 
         let (tail, _rt) = capturing_output(60);
-        tail.set_status(&bar_of("[bar]"));
+        tail.content.set_status(bar_of("[bar]"));
         let tail_sink = record_bytes(&tail);
         let (input, overlay) = pieces();
         let a = tail.draw_elements(input, overlay, ApplyPolicy::Frame, dims);
         let via_tail = tail_sink.0.lock().unwrap().clone();
 
         let (hand, _rh) = capturing_output(60);
-        hand.set_status(&bar_of("[bar]"));
+        hand.content.set_status(bar_of("[bar]"));
         // Feed `draw_frame` exactly what `draw_elements` composes — same
         // composer, same status, same dims — so the apply half is all that
         // differs.

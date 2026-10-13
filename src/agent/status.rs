@@ -1,12 +1,14 @@
 //! The two readouts the user sees without asking the model anything: the
 //! transient status line under each content block, and the `/stat` overlay.
 //!
-//! Both are pure. [`status_text`] takes a [`BarModel`] and returns a string;
-//! [`session_stats_lines`] takes the session's stored facts and returns lines.
-//! Neither reads a store or holds state — the caller resolves the context
-//! window ([`resolved_context_limit`]) and the session metadata and hands them
-//! over — which is what makes them testable without a terminal, and why
-//! `status_bar_tests` can assert on the rendered bar rather than on paint.
+//! Both are pure. [`status_text`] shapes a [`BarStatus`] push (raw facts) into
+//! the pair `output::status_bar` fits — both halves run inside the bar's own
+//! render (step 4f-a); [`session_stats_lines`] takes the session's stored
+//! facts and returns lines. Neither reads a store or holds state — the
+//! caller resolves the context window ([`resolved_context_limit`]) and the
+//! session metadata and hands them over — which is what makes them testable
+//! without a terminal, and why `status_bar_tests` can assert on the rendered
+//! bar rather than on paint.
 
 use super::SessionUsage;
 use crate::model_catalog;
@@ -47,56 +49,48 @@ pub struct SessionStatsInfo {
     pub user_message_count: usize,
 }
 
-/// The model half of the bar — everything to the right of the pipe.
+/// What the status bar shows, as **raw data** (step 4f-a; design §UI: "the
+/// bar's held state is raw data, formatted by the bar").
 ///
-/// A struct rather than four more positional arguments because those four are
-/// two strings, an `Option` and a number in a row: nothing at the call site says
-/// which `Option<&str>` is the thinking level and which is the first message, and
-/// getting that wrong compiles. The field names are the documentation.
-pub struct BarModel<'a> {
-    pub provider: &'a str,
-    pub model: &'a str,
+/// The bar's line is `● session | provider:model thinking 34% 78k` — the
+/// mid-turn readout (doc/row_accounting.md, zone 2) — carried here as *facts*,
+/// never as shaped text: the push stores this, and the bar element pulls it and
+/// runs both halves of the drawing in its own render — the shaping
+/// ([`status_text`]: name fallback to the opening-message preview, the field
+/// list, the drop order) and the fit (`output::status_bar`). A mid-turn figure
+/// (context tokens) is then current at the next paint without a re-shaping
+/// push, and neither half can be applied without the other.
+///
+/// A struct rather than five more positional arguments because those five are
+/// two strings, two `Option`s and a number in a row: nothing at the call site
+/// says which `Option<String>` is the thinking level and which the first
+/// message, and getting that wrong compiles. The field names are the
+/// documentation. Fields that are unknown are dropped rather than shown empty.
+#[derive(Default, Clone)]
+pub struct BarStatus {
+    /// The session name, when it has one. Wins over [`Self::first_message`]:
+    /// a name is a thing the user chose.
+    pub session_name: Option<String>,
+    /// The session's opening message — stands in for an unnamed session, so
+    /// the line still says *which* session this is, not just which model.
+    pub first_message: Option<String>,
+    pub provider: String,
+    pub model: String,
     /// The active thinking level, if any.
-    pub thinking: Option<&'a str>,
+    pub thinking: Option<String>,
     /// Context tokens in use. `0` means "not known yet" and drops the figure
     /// rather than showing a zero.
     pub context_tokens: u64,
-    /// The model's context window, already *resolved* (catalog overlaid with any
-    /// stored per-model override).
+    /// The model's context window, already *resolved* (catalog overlaid with
+    /// any stored per-model override).
     ///
     /// Supplied by the caller rather than looked up here: `status_text` is a
     /// pure function with no store to read, and the raw-catalog lookup it used
     /// to do divided the percentage by OpenRouter's number even when the user
-    /// had overridden it. `None` renders the bare token count, which is what an
-    /// unknown window always did.
+    /// had overridden it. `None` renders the bare token count, which is what
+    /// an unknown window always did.
     pub context_limit: Option<u64>,
 }
-
-/// The transient status line: `● session | provider:model thinking 34% 78k`.
-///
-/// The mid-turn readout (doc/row_accounting.md, zone 2). Built from the same
-/// pieces `session_stats_lines` uses — the caller for the resolved context
-/// window, its own token count for the usage — so the two cannot disagree about
-/// what the context figure means. That holds because a per-model
-/// `context_length` edit moves both: the prompt-side bar re-reads it every
-/// cycle, and `plan_rebuild` compares it so the mid-turn agent is rebuilt with
-/// the new one. Adding a term to that gate is what keeps the claim true. Fields that are unknown are dropped rather
-/// than shown empty.
-///
-/// **This is the data half.** A struct rather than a rendered string because the
-/// width is the drawing layer's to know: the group has to give way field by field
-/// to fit, the dot cell's width comes out of the same budget, and rendering here
-/// would mean the caller passed a width and then handed back bytes nobody
-/// downstream can re-fit. The halves are separable because there is nothing
-/// width-dependent in this one — `output::status_bar` is the other.
-///
-/// A struct rather than a rendered string because **the width is the drawing
-/// layer's to know**. The group has to give way field by field to fit, the dot
-/// cell's width comes out of the same budget, and rendering here would mean the
-/// caller passed a width and then handed back bytes nobody downstream can
-/// re-fit — which is what the streaming flag was for, and why it sat hardcoded
-/// `true` at the one call site that had it. The two halves are separable because
-/// there is nothing width-dependent in this one.
 ///
 /// The group's fields are pushed in the order they should be *dropped* from the
 /// right: the context figure first, because it changes every turn and a missing
@@ -124,48 +118,58 @@ pub fn resolved_context_limit(app_state: &crate::app_state::AppState) -> Option<
         .filter(|max| *max > 0)
 }
 
-pub fn status_text(
-    session_name: Option<&str>,
-    first_message: Option<&str>,
-    m: BarModel<'_>,
-) -> StatusText {
-    let BarModel {
-        provider,
-        model,
-        thinking,
-        context_tokens,
-        context_limit,
-    } = m;
+/// The shaping half of the bar's drawing: raw [`BarStatus`] to the shaped pair
+/// `output::status_bar` fits — the name (session name, else the opening
+/// message's preview) and the model group in drop order.
+///
+/// Run by the bar's own render (step 4f-a), which is why it takes the raw
+/// data by reference: nothing here is width-dependent, and the fit that is
+/// lives on the other side. Built from the same pieces `session_stats_lines`
+/// uses — the caller for the resolved context window, its own token count for
+/// the usage — so the two cannot disagree about what the context figure
+/// means. That holds because a per-model `context_length` edit moves both: the
+/// prompt-side bar re-reads it every cycle, and `plan_rebuild` compares it so
+/// the mid-turn agent is rebuilt with the new one.
+pub fn status_text(status: &BarStatus) -> StatusText {
     let mut fields: Vec<String> = Vec::new();
-    if !provider.is_empty() || !model.is_empty() {
-        fields.push(format!("{provider}:{model}"));
+    if !status.provider.is_empty() || !status.model.is_empty() {
+        fields.push(format!("{}:{}", status.provider, status.model));
     }
-    if let Some(level) = thinking.map(str::trim).filter(|l| !l.is_empty()) {
+    if let Some(level) = status
+        .thinking
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
         fields.push(level.to_string());
     }
-    if context_tokens > 0 {
+    if status.context_tokens > 0 {
         // The percentage needs the catalog's context window, and a model
         // missing from it is normal (a local endpoint, a new release). So the
         // count stands alone rather than the whole figure disappearing: no
         // window known means no percentage, not no context figure.
-        let window = context_limit.filter(|max| *max > 0);
+        let window = status.context_limit.filter(|max| *max > 0);
         fields.push(match window {
             Some(max) => {
-                let pct = (context_tokens as f64 / max as f64) * 100.0;
-                format!("{pct:.0}% {}", compact_tokens(context_tokens))
+                let pct = (status.context_tokens as f64 / max as f64) * 100.0;
+                format!("{pct:.0}% {}", compact_tokens(status.context_tokens))
             }
-            None => compact_tokens(context_tokens),
+            None => compact_tokens(status.context_tokens),
         });
     }
 
     // With no name to show, the session's opening message stands in: the line
     // should still say *which* session this is, not just which model.
-    let name = session_name
+    let name = status
+        .session_name
+        .as_deref()
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .map(str::to_string)
         .or_else(|| {
-            first_message
+            status
+                .first_message
+                .as_deref()
                 .map(str::trim)
                 .filter(|m| !m.is_empty())
                 .map(message_preview)
@@ -196,50 +200,55 @@ fn message_preview(msg: &str) -> String {
 
 #[cfg(test)]
 mod status_bar_tests {
-    use super::{message_preview, status_text, BarModel};
+    use super::{message_preview, status_text, BarStatus};
     // The separator the fit actually used, not a copy of the string: these tests
     // are about where the fit put it, so the constant has to be the real one.
     use crate::output::BAR_SEPARATOR as SEPARATOR;
 
-    /// The whole bar: the data half fitted and rendered.
+    /// The whole bar: the raw push shaped and fitted — exactly the two calls
+    /// the bar's own render makes (step 4f-a), spelled out here so the tests
+    /// can pass borrowed literals where the store carries owned data.
     ///
     /// Every test here is really about the *pair* — `status_text` builds the
     /// fields and `output::status_bar` fits them to a width — so they go through
     /// one seam-crossing helper rather than each spelling out the two calls. They
     /// live here rather than beside `status_bar` because most of them are as much
-    /// about `BarModel`'s data (which field is dropped first, what an unknown
+    /// about `BarStatus`'s data (which field is dropped first, what an unknown
     /// model does, what an unnamed session shows) as about the fitting.
     fn bar(
         session_name: Option<&str>,
         first_message: Option<&str>,
-        m: BarModel<'_>,
+        m: BarStatus,
         width: usize,
         streaming: bool,
     ) -> String {
-        crate::output::status_bar(
-            &status_text(session_name, first_message, m),
-            width,
-            streaming,
-        )
+        let status = BarStatus {
+            session_name: session_name.map(str::to_string),
+            first_message: first_message.map(str::to_string),
+            ..m
+        };
+        crate::output::status_bar(&status_text(&status), width, streaming)
     }
 
-    /// A [`BarModel`] for the tests. Positional on purpose: every test wants the
-    /// same four things, and the field names at each of the twenty-odd call sites
-    /// would be noise. The names are still checked, because the layout test is
-    /// about the order they render in.
-    fn model<'a>(
-        provider: &'a str,
-        model: &'a str,
-        thinking: Option<&'a str>,
+    /// A [`BarStatus`] for the tests, identity fields unset — the `bar` helper
+    /// takes those. Positional on purpose: every test wants the same five
+    /// things, and the field names at each of the twenty-odd call sites would
+    /// be noise. The names are still checked, because the layout test is about
+    /// the order they render in.
+    fn model(
+        provider: &str,
+        model: &str,
+        thinking: Option<&str>,
         context_tokens: u64,
         context_limit: Option<u64>,
-    ) -> BarModel<'a> {
-        BarModel {
-            provider,
-            model,
-            thinking,
+    ) -> BarStatus {
+        BarStatus {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            thinking: thinking.map(str::to_string),
             context_tokens,
             context_limit,
+            ..Default::default()
         }
     }
 

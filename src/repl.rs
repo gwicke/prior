@@ -1357,25 +1357,23 @@ impl Repl {
         // Repo handle: refresh in case the loop replaced its local Option
         // (clone-shared Arc cache — same listing state either way).
         app_state.set_repo(ctx.repo.clone());
-        // The prompt-side bar's **data**, pushed rather than rendered: this
-        // module no longer builds the row, `Output::compose_area` does, from
-        // whatever is stored here (ui_draw_v2 §5.1.1).
+        // The prompt-side bar's **raw data**, pushed rather than rendered:
+        // this module builds no row — the bar element formats whatever is
+        // stored here at its own render (step 4f-a, design §UI).
         //
         // Pushed once per cycle from the same `ctx` the overlays read, so the
         // prompt-side bar and the mid-turn one cannot name different sessions —
         // and pushed before the first paint, because the very first prompt runs
         // before any turn has set a status, and an unset one draws no bar at all.
-        output.set_status(&crate::agent::status::status_text(
-            ctx.session_name.as_deref(),
-            ctx.session_first_message.as_deref(),
-            crate::agent::status::BarModel {
-                provider: &ctx.provider,
-                model: &ctx.model,
-                thinking: ctx.reasoning_level.as_deref(),
-                context_tokens: ctx.context_tokens,
-                context_limit: ctx.context_limit,
-            },
-        ));
+        content.set_status(crate::agent::status::BarStatus {
+            session_name: ctx.session_name.clone(),
+            first_message: ctx.session_first_message.clone(),
+            provider: ctx.provider.clone(),
+            model: ctx.model.clone(),
+            thinking: ctx.reasoning_level.clone(),
+            context_tokens: ctx.context_tokens,
+            context_limit: ctx.context_limit,
+        });
         // The session's state, as the loop's own bindings. Destructuring a
         // `&mut PromptSession` reborrows each field *disjointly*, so the body
         // keeps addressing them as locals while they are, in fact, one movable
@@ -2865,17 +2863,12 @@ mod tests {
                 height: 24,
             },
         );
-        out.set_status(&crate::agent::status::status_text(
-            Some("sess"),
-            None,
-            crate::agent::status::BarModel {
-                provider: "llamacpp",
-                model: "test",
-                thinking: None,
-                context_tokens: 0,
-                context_limit: None,
-            },
-        ));
+        out.content.set_status(crate::agent::status::BarStatus {
+            session_name: Some("sess".to_string()),
+            provider: "llamacpp".to_string(),
+            model: "test".to_string(),
+            ..Default::default()
+        });
         (out, LineEditor::new())
     }
 

@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::agent::build::{request_additional_params, LoggingHook};
 use crate::agent::compaction::session_context_messages;
-use crate::agent::status::{first_user_text, status_text, BarModel};
+use crate::agent::status::{first_user_text, BarStatus};
 use crate::agent::CodeAgent;
 use crate::agent::{estimate_ctx_with, SessionUsage, TurnPersistence};
 use crate::session::Session;
@@ -184,26 +184,27 @@ impl CodeAgent {
             index.header.name.clone()
         });
         let reported_ctx = self.usage.lock().unwrap().last_input_tokens;
-        self.output.set_status(&status_text(
-            session_name.as_deref(),
-            first_message.as_deref(),
-            BarModel {
-                provider: &self.provider,
-                model: &self.model,
-                // The status bar's own field is upstream's `thinking`; the
-                // value it reads is now the renamed reasoning level.
-                thinking: self.live_params.reasoning_str().as_deref(),
-                context_limit: self.context_limit,
-                // Reported wins: it is the provider's own count of what it was
-                // sent. The estimate only stands in while there is none — turn
-                // one, where the alternative is no figure at all.
-                context_tokens: if reported_ctx > 0 {
-                    reported_ctx
-                } else {
-                    estimated_ctx
-                },
+        // Raw data, formatted by the bar at render (step 4f-a, design §UI):
+        // the push stores facts, so the figure refreshes with the next paint
+        // — no re-shaping push to keep in step.
+        self.content.set_status(BarStatus {
+            session_name,
+            first_message,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            // The status bar's own field is upstream's `thinking`; the
+            // value it reads is now the renamed reasoning level.
+            thinking: self.live_params.reasoning_str(),
+            context_limit: self.context_limit,
+            // Reported wins: it is the provider's own count of what it was
+            // sent. The estimate only stands in while there is none — turn
+            // one, where the alternative is no figure at all.
+            context_tokens: if reported_ctx > 0 {
+                reported_ctx
+            } else {
+                estimated_ctx
             },
-        ));
+        });
         self.content.begin_response();
         // U4.3: the turn's second pump, split out of `in_turn` into bindings the
         // two new futures below can borrow *disjointly* — one future per

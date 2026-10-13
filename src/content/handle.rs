@@ -89,6 +89,12 @@ pub struct Content {
     /// `begin_response`/`end_response`. Owned by content (the path that knows
     /// when a response starts/ends); the frame reads it via a shared handle.
     pub(crate) streaming: Arc<AtomicBool>,
+    /// The status bar's raw data (step 4f-a, design §UI): pushes store *facts*
+    /// ([`crate::agent::status::BarStatus`]), never formatted text — the bar
+    /// element pulls this and runs the shaping and the fit in its own render.
+    /// Beside `streaming`, which it is shared the same way (the element
+    /// clones the `Arc`).
+    pub(crate) bar: Arc<Mutex<crate::agent::status::BarStatus>>,
     /// The content seam (impl doc §4): when set, every content verb hands the
     /// call to this handle and returns without touching the sink — the
     /// `RecordingOutput` / `QuietOutput` patterns, covered without a live
@@ -127,6 +133,7 @@ impl Content {
             last_tool: Mutex::new(None),
             boundary: ContentBoundary::new(),
             streaming: Arc::new(AtomicBool::new(false)),
+            bar: Arc::new(Mutex::new(crate::agent::status::BarStatus::default())),
             tap: None,
         }
     }
@@ -529,6 +536,18 @@ impl Content {
         *renderer = Renderer::new(answer_theme(self.caps.primary), width);
         let mut trenderer = self.thinking_renderer.lock().unwrap();
         *trenderer = Renderer::new(Theme::dimmed(), width);
+    }
+
+    /// Store the status bar's raw data (step 4f-a). The push carries facts,
+    /// never shaped text: the bar element formats whatever stands here at its
+    /// next render — shaping and fit both — so a figure refreshed mid-turn is
+    /// current at the next paint without a re-shaping push.
+    ///
+    /// A store, not a write: nothing reaches the sink, so the tap seam has
+    /// nothing to intercept (the verbs that do reach the sink are the ones
+    /// that forward to it).
+    pub(crate) fn set_status(&self, status: crate::agent::status::BarStatus) {
+        *self.bar.lock().unwrap() = status;
     }
 
     /// Emit a segment's two flushes — the reasoning the thinking renderer
