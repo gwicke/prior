@@ -63,6 +63,7 @@ pub use rig_core::providers;
 
 pub use agent::build::{create_agent, load_agents_md, AgentConfig};
 pub use agent::CodeAgent;
+pub use content::Content;
 pub use interactive::run_interactive;
 pub use output::{Confirmation, ConsoleOutput, LogOutput, NoOutput, Output, QuietOutput};
 

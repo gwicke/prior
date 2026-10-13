@@ -24,6 +24,7 @@ use crate::content::markdown::{
 use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno};
 use crate::content::text::wrap;
 use crate::draw::{plan_consume, Draw};
+use crate::output::Output;
 use crate::row_count::RowCounter;
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
 use crate::termio::{Caps, TermSize};
@@ -75,6 +76,12 @@ pub struct Content {
     /// `begin_response`/`end_response`. Owned by content (the path that knows
     /// when a response starts/ends); the frame reads it via a shared handle.
     pub(crate) streaming: Arc<AtomicBool>,
+    /// The content seam (impl doc §4): when set, every content verb hands the
+    /// call to this handle and returns without touching the sink — the
+    /// `RecordingOutput` / `QuietOutput` patterns, covered without a live
+    /// render stack behind them. `None` in production, where `ConsoleOutput`
+    /// holds this `Content` by `Arc` and its own content methods forward here.
+    pub(crate) tap: Option<Arc<dyn Output>>,
 }
 
 impl Content {
@@ -99,7 +106,26 @@ impl Content {
             last_tool: Mutex::new(None),
             boundary: ContentBoundary::new(),
             streaming: Arc::new(AtomicBool::new(false)),
+            tap: None,
         }
+    }
+
+    /// A `Content` whose content verbs delegate to `tap` instead of rendering
+    /// (impl doc §4's test seam). `RecordingOutput` records the source strings
+    /// an assertion compares; `QuietOutput` discards them; neither needs a
+    /// render stack or a terminal behind it.
+    ///
+    /// The geometry is the process-wide size watch, not a private one: with
+    /// the verbs short-circuited there is no rendering to get wrong, and a
+    /// test that needs a pinned width renders through `ConsoleOutput::with_size`
+    /// as it always has.
+    pub fn with_tap(tap: Arc<dyn Output>) -> Self {
+        let mut content = Self::new(
+            crate::termio::subscribe(),
+            crate::settings::default_show_reasoning_handle(),
+        );
+        content.tap = Some(tap);
+        content
     }
 
     /// This instance's width: its subscribed watch, with the same 20-column
@@ -878,6 +904,10 @@ impl Content {
 
 impl Content {
     pub(crate) fn display_committed_prompt(&self, line: &str) {
+        if let Some(tap) = &self.tap {
+            tap.display_committed_prompt(line);
+            return;
+        }
         let shares_rule = self.boundary.last_kind() == Some(ContentDisplayKind::Prompt);
         let rule = separator_line(self.width());
         let block = if shares_rule {
@@ -889,6 +919,10 @@ impl Content {
     }
 
     pub(crate) fn display_plain(&self, text: &str) {
+        if let Some(tap) = &self.tap {
+            tap.display_plain(text);
+            return;
+        }
         // The count comes from the bytes: `writeln!` adds the newline, and a
         // caller-supplied line is padded or not as it likes. Then normalized —
         // a caller whose text already ends in a newline would otherwise emit a
@@ -902,6 +936,10 @@ impl Content {
     }
 
     pub(crate) fn display_markdown(&self, text: &str) {
+        if let Some(tap) = &self.tap {
+            tap.display_markdown(text);
+            return;
+        }
         let color = self.caps.primary;
         let rendered = render_markdown(text, self.width(), color);
         let mut block = String::with_capacity(rendered.len() + 1);
@@ -921,6 +959,10 @@ impl Content {
     }
 
     pub(crate) fn display_text(&self, text: &str) {
+        if let Some(tap) = &self.tap {
+            tap.display_text(text);
+            return;
+        }
         // The bytes, not the source, decide the height: the `⏺ ` prefix is two
         // columns the old `wrap(text).len()` count never saw, inline markdown
         // rewrites the text, and a message that exactly fills the width wraps
@@ -934,6 +976,10 @@ impl Content {
     }
 
     pub(crate) fn begin_response(&self) {
+        if let Some(tap) = &self.tap {
+            tap.begin_response();
+            return;
+        }
         // The bar's dot goes green for the turn. Set here rather than at the
         // call site that builds the text: this layer draws the bar, and a turn
         // starting is exactly when its state changes.
@@ -968,6 +1014,10 @@ impl Content {
     }
 
     pub(crate) fn stream_text(&self, delta: &str) {
+        if let Some(tap) = &self.tap {
+            tap.stream_text(delta);
+            return;
+        }
         // Sync terminal width (updated by in-flight reader on resize) so
         // renderers reflow on the next feed.
         let current_width = self.width();
@@ -1025,6 +1075,10 @@ impl Content {
     }
 
     pub(crate) fn stream_thinking(&self, delta: &str) {
+        if let Some(tap) = &self.tap {
+            tap.stream_thinking(delta);
+            return;
+        }
         // Content mode => stream the reasoning text; otherwise suppress it.
         if *self.show_reasoning.lock().unwrap() != ShowReasoning::Content {
             return;
@@ -1052,6 +1106,10 @@ impl Content {
     }
 
     pub(crate) fn end_response_segment(&self) {
+        if let Some(tap) = &self.tap {
+            tap.end_response_segment();
+            return;
+        }
         let current_width = self.width();
         // One counted block: the answer commit, the thinking commit, the
         // boundary blank and the dim reset. Inside the turn, so `Response`:
@@ -1094,6 +1152,10 @@ impl Content {
     }
 
     pub(crate) fn end_response(&self) {
+        if let Some(tap) = &self.tap {
+            tap.end_response();
+            return;
+        }
         // Before the flush, so the last bar of the turn is still the streaming
         // one; the bar painted after this is the idle one.
         self.streaming
@@ -1126,6 +1188,10 @@ impl Content {
     }
 
     pub(crate) fn display_tool_call(&self, name: &str, args: &Value) {
+        if let Some(tap) = &self.tap {
+            tap.display_tool_call(name, args);
+            return;
+        }
         // Remember the tool so `display_tool_result` can render the result
         // tool-aware (strip `read_file` line-number gutters, pick a highlight
         // language). The hook always fires the call immediately before its
@@ -1143,6 +1209,10 @@ impl Content {
     }
 
     pub(crate) fn display_tool_result(&self, result: &str) {
+        if let Some(tap) = &self.tap {
+            tap.display_tool_result(result);
+            return;
+        }
         // A multi-file result renders as N complete call-result pairs — label,
         // diff, note — one per file, through the very same renderers a
         // sequence of single-file calls uses. The call half is deferred to here
@@ -1178,6 +1248,10 @@ impl Content {
     }
 
     pub(crate) fn display_error(&self, error: &str) {
+        if let Some(tap) = &self.tap {
+            tap.display_error(error);
+            return;
+        }
         // Measured: a long error wraps, and the message carries a 2-column
         // prefix the row count has to include.
         let block = format!("{} Error: {}\n", style("⏺").red(), error);
@@ -1188,6 +1262,10 @@ impl Content {
     }
 
     pub(crate) fn display_system(&self, text: &str) {
+        if let Some(tap) = &self.tap {
+            tap.display_system(text);
+            return;
+        }
         let block = format!("{}\n", style(text).bold().dim());
         self.write_content_kinded(
             &at_line_start(block.as_bytes()),
@@ -1196,6 +1274,10 @@ impl Content {
     }
 
     pub(crate) fn display_separator(&self) {
+        if let Some(tap) = &self.tap {
+            tap.display_separator();
+            return;
+        }
         // `separator` writes through the row counter; noting again here would
         // count the same row twice.
         self.separator();
@@ -1209,9 +1291,33 @@ impl Content {
         limit: usize,
         persona: Option<&str>,
     ) {
+        if let Some(tap) = &self.tap {
+            tap.display_header(provider, model, yolo, limit, persona);
+            return;
+        }
         let block =
             content::text::header_block(provider, model, yolo, limit, persona, self.width());
         self.write_content(block.as_bytes());
+    }
+
+    /// Begin capturing everything content writes to the sink (§4: capture is
+    /// content's, tapped at the byte sink). With a tap set there is nothing
+    /// reaching the sink to capture, so the tap's own capture policy answers.
+    pub(crate) fn begin_capture(&self) {
+        if let Some(tap) = &self.tap {
+            tap.begin_capture();
+            return;
+        }
+        self.draw.begin_capture();
+    }
+
+    /// End a capture session and return what content wrote. See
+    /// [`Self::begin_capture`].
+    pub(crate) fn end_capture(&self) -> Vec<u8> {
+        if let Some(tap) = &self.tap {
+            return tap.end_capture();
+        }
+        self.draw.end_capture()
     }
 
     pub(crate) fn reasoning_sink(&self) -> ReasoningSink {
@@ -1260,5 +1366,48 @@ impl io::Write for ReasoningSink {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The content seam (impl doc §4): a tapped `Content` hands its verbs to
+    /// the seam and never reaches its own sink — the `RecordingOutput` pattern,
+    /// covered without a render stack behind it.
+    #[test]
+    fn tap_short_circuits_content_verbs_to_the_seam() {
+        let (out, lines) = crate::output::RecordingOutput::new();
+        let content = Content::with_tap(out);
+        content.display_text("hello");
+        content.display_separator();
+        content.begin_response();
+        content.stream_text("streamed");
+        content.end_response();
+        assert_eq!(
+            crate::output::RecordingOutput::joined(&lines),
+            "hello",
+            "the seam sees the source strings, unrendered"
+        );
+        assert!(
+            content.draw.cache.lock().unwrap().applied.is_none(),
+            "a tapped verb must not move the real screen"
+        );
+    }
+
+    /// Capture is content's (§4) and obeys the same seam: with a tap set there
+    /// is nothing reaching the sink to capture, so the tap's own policy
+    /// answers instead.
+    #[test]
+    fn tap_captures_through_the_seam() {
+        let (out, _lines) = crate::output::RecordingOutput::new();
+        let content = Content::with_tap(out);
+        content.begin_capture();
+        content.display_text("capped");
+        assert!(
+            content.end_capture().is_empty(),
+            "RecordingOutput captures nothing"
+        );
     }
 }

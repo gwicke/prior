@@ -12,4 +12,6 @@ pub(crate) mod preview;
 pub(crate) mod text;
 
 pub(crate) use composition::{boundary_spacer, separator_line, ContentDisplayKind};
-pub(crate) use handle::Content;
+// `pub`: `AgentConfig.content` (step 3d) is a public field, so the handle has
+// to be nameable from the binary too. Its state stays crate-private.
+pub use handle::Content;

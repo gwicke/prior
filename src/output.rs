@@ -1241,7 +1241,7 @@ impl Output for ConsoleOutput {
     }
 
     fn begin_capture(&self) {
-        self.content.draw.begin_capture();
+        self.content.begin_capture();
     }
 
     /// The frame path's bar, from the same two facts the content path's is
@@ -1286,7 +1286,7 @@ impl Output for ConsoleOutput {
     }
 
     fn end_capture(&self) -> Vec<u8> {
-        self.content.draw.end_capture()
+        self.content.end_capture()
     }
 }
 
