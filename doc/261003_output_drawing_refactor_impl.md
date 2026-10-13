@@ -383,16 +383,35 @@ most runway to expand into separate sub-commits.
     - `ConsoleOutput::hub()` (pub, beside the existing `content()`) and the now-pub
       `RenderManager::render` exist for out-of-crate drivers (the confirm probe). Both are
       transitional surface for **step 5**'s trait deletion to prune.
-    - The pumps thread content *beside* output (dims and `$EDITOR` still reach for it) — the
-      overlap ends with **4f-c** (dims) and **4f-d** (`$EDITOR`, guards).
-    - `Output::draw_frame` keeps only test drivers (the 4d-era byte-edge tests); it and the
+    - ~~The pumps thread content *beside* output (dims and `$EDITOR` still reach for it) — the
+      overlap ends with **4f-c** (dims) and **4f-d** (`$EDITOR`, guards).~~ The dims half closed
+      with **4f-c** (`fad8f76`); `$EDITOR` and the guards are what `output` still carries.
+    - ~~`Output::draw_frame` keeps only test drivers (the 4d-era byte-edge tests); it and the
       remaining frame verbs (`frame_size`, `painted_size`, `cursor_row`'s forward) go with
-      **4f-c**/**4f-d** and **step 5**.
-  - **4f-c — dims: `frame_size`/`painted_size` → the size watch.** The agent-side callers
-    (`pumps.rs`, `turn.rs`, interactive) read the watched size (frame dims) and the manager's
-    applied size (what a resize comparison needs) through the handles `AgentConfig` already
-    carries (`content.manager`, `content.size`). The two `Output` trait verbs and their
-    `ConsoleOutput` impls die.
+      **4f-c**/**4f-d** and **step 5**.~~ `frame_size`/`painted_size` went with **4f-c**;
+      `draw_frame` (test drivers) and `cursor_row`'s forward remain for **step 5**.
+  - **4f-c — dims: `frame_size`/`painted_size` → the size watch.** Landed (`fad8f76`) — the
+    commit message records what moved. `frame_size` → `Content::frame_size` (the receiver this
+    handle carries, same 20/1 floors, the same channel `RenderManager::new` clones — dims and the
+    manager's geometry view cannot disagree); `painted_size` → `RenderManager::painted_size` (the
+    applied dims `render`/`draw_frame` record). The two trait verbs, the two `ConsoleOutput`
+    impls, and `ConsoleOutput`'s private `term_width`/`term_height` (which only served its
+    `frame_size`) all die. Callers: turn pumps + turn read `content.frame_size()`; the REPL
+    loop-top resize check reads `content.manager.lock().painted_size()`; the confirm probe (an
+    out-of-crate driver) reads the `term_width`/`term_height` free fns — the same watch. No
+    `interactive.rs` site existed to move (the plan named it; grep agrees it never called the
+    verbs). Leftovers, each claimed:
+    - The REPL loop's live per-keystroke terminal query and its `set_size` publish stay: they are
+      the probe the watch refreshes from — **4f-e** moves them under `TermIO`'s roof (already
+      listed under 4f-d's "prompt-loop size probe" note).
+    - `RenderManager::draw()` went `#[cfg(test)]` — its last production caller was the
+      `Output::painted_size` forward this commit took; only the writer/cache test seams reach
+      past the manager now. Un-gate only if a later sub-commit finds a production seam that
+      genuinely reads *past* the manager's verbs (none should).
+    - The probe's `dims` closure is the out-of-crate driver's pattern for now; 4f-e's handle
+      hand-out may give drivers a subscribed receiver instead of the process-wide free fns.
+    - `Output::draw_frame` (test drivers) and `Output::cursor_row`'s default (non-console
+      outputs) stay for **4f-d**/**step 5**.
   - **4f-d — input collapses to one handle; the `TermGuard` holders convert.** `read_input` takes
     the handle set (content + manager + the key receiver) rather than `&dyn Output` + guard;
     `get_user_input`, `run_entry_dsr` (the caller side — the DSR *answer* moving inside TermIO is

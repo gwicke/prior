@@ -65,5 +65,6 @@ and link a doc/ and/or commit hash
     sub-commit plan 4a–4h recorded in the impl doc — 4a (`8cc955d`), 4b (`38d9513`), 4c
     (`33dc92c`), 4d (`98bcb85`), 4e (`bce38e7`) landed; 4f broken into 4f-a…4f-f — 4f-a
     (`529f278`, bar formats itself from raw data), 4f-b (`cb01977`, frame path leaves
-    `&dyn Output`) landed; 4f-c next (dims → the size watch)
+    `&dyn Output`), 4f-c (`fad8f76`, dims → the watch/manager, the size verbs leave the trait)
+    landed; 4f-d next (input collapses to one handle; `TermGuard` holders convert)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)
