@@ -216,9 +216,11 @@ pub trait Output: Send + Sync {
         limit: usize,
         persona: Option<&str>,
     );
-    /// Begin capturing rendered output into a byte buffer.  Returns `None`
-    /// for non-console implementations.  Must be paired with a subsequent
-    /// call to [`end_capture`] which returns the captured bytes.
+    /// Begin capturing what the content path hands to the hub, into a byte
+    /// buffer. `ConsoleOutput` taps the `ContentWrite` hand-off — content
+    /// bytes only, never frame bytes (step 4d, design §Content: an
+    /// assertion against content, not against a screen). Must be paired
+    /// with a subsequent call to [`end_capture`] which returns the bytes.
     fn begin_capture(&self) {}
     /// End a previous [`begin_capture`] and return the captured bytes.
     /// Returns an empty vec for non-console implementations.
@@ -1550,6 +1552,18 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Swap `out`'s byte sink for a recording one, returning the handle a
+    /// test reads the bytes back through. The byte-edge seam for tests
+    /// that need *frame* bytes: capture taps the content hand-off only
+    /// (step 4d, design §Content) — frame bytes can never be caught — so a
+    /// test asserting on what reached the terminal reads the writer, which
+    /// is the seam `TermIO::recording()` takes over wholesale in 4f.
+    fn record_bytes(out: &ConsoleOutput) -> Sink {
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        out.content.manager.lock().unwrap().draw().writer = Box::new(sink.clone());
+        sink
     }
 
     /// Tracked cursor row of `out` (0-based, as the screen reports it).
@@ -2895,8 +2909,7 @@ mod tests {
     #[test]
     fn content_choke_wraps_an_overwide_line_before_the_line_clear() {
         let (out, _reasoning) = capturing_output(60);
-        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
-        out.content.manager.lock().unwrap().draw().writer = Box::new(sink.clone());
+        let sink = record_bytes(&out);
         let y = "y".repeat(120);
         out.content
             .with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
@@ -2918,8 +2931,7 @@ mod tests {
     #[test]
     fn wrapped_content_keeps_its_sgr_across_the_inserted_newline() {
         let (out, _reasoning) = capturing_output(60);
-        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
-        out.content.manager.lock().unwrap().draw().writer = Box::new(sink.clone());
+        let sink = record_bytes(&out);
         let y = "y".repeat(120);
         let input = format!("\x1b[32m{y}\x1b[0m\n");
         out.content
@@ -2948,6 +2960,49 @@ mod tests {
         let mut expect = y.into_bytes();
         expect.push(b'\n');
         assert_eq!(cap, expect, "captured bytes are the raw content");
+    }
+
+    /// Capture taps the content hand-off, never the sink (step 4d, design
+    /// §Content): the block's bytes stop at the tap, while the frame — its
+    /// apply, the consume's walk, the reposition — keeps flowing to the
+    /// screen. The narrowing the writer swap retired, pinned: a capture
+    /// session with a *live frame* catches content only.
+    #[test]
+    fn capture_catches_content_but_never_frame_bytes() {
+        let (out, _reasoning) = capturing_output(40);
+        let sink = record_bytes(&out);
+        let frame = crate::repl::Repl::compose_frame(
+            &crate::repl::LineEditor::new(),
+            "",
+            None,
+            Vec::new(),
+            40,
+            10,
+        );
+        out.begin_capture();
+        out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
+        out.display_text("content only");
+        let cap = out.end_capture();
+        let cap = String::from_utf8_lossy(&cap).into_owned();
+        assert!(
+            cap.contains("content only"),
+            "the content block is what a capture catches: {cap:?}"
+        );
+        assert!(
+            !cap.contains("\x1b[?25"),
+            "frame bytes can never be caught (the apply's cursor show is \
+             screen-side only): {cap:?}"
+        );
+
+        let screen = String::from_utf8_lossy(&sink.0.lock().unwrap().clone()).into_owned();
+        assert!(
+            screen.contains("\x1b[?25h"),
+            "the frame apply reaches the screen: {screen:?}"
+        );
+        assert!(
+            !screen.contains("content only"),
+            "…and the content bytes do not — they stopped at the tap: {screen:?}"
+        );
     }
 
     /// `draw_elements` is the old hand-rolled path, not a new one: it must paint
@@ -2984,10 +3039,10 @@ mod tests {
 
         let (tail, _rt) = capturing_output(60);
         tail.set_status(&bar_of("[bar]"));
-        tail.begin_capture();
+        let tail_sink = record_bytes(&tail);
         let (input, overlay) = pieces();
         let a = tail.draw_elements(input, overlay, ApplyPolicy::Frame, dims);
-        let via_tail = tail.end_capture();
+        let via_tail = tail_sink.0.lock().unwrap().clone();
 
         let (hand, _rh) = capturing_output(60);
         hand.set_status(&bar_of("[bar]"));
@@ -2998,9 +3053,9 @@ mod tests {
         let extents: Vec<Extent> = stack.iter().map(Element::extent).collect();
         let heights = allocate(&extents, live_budget(dims.1));
         let frame = render(&stack, &heights, dims.0);
-        hand.begin_capture();
+        let hand_sink = record_bytes(&hand);
         let b = hand.draw_frame(&frame, ApplyPolicy::Frame, dims);
-        let via_hand = hand.end_capture();
+        let via_hand = hand_sink.0.lock().unwrap().clone();
 
         assert_eq!(a, b, "the same dims either way");
         assert_eq!(
@@ -3021,7 +3076,7 @@ mod tests {
     #[test]
     fn content_over_a_live_frame_reemits_it_below() {
         let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
+        let sink = record_bytes(&out);
         // A menu frame, as `/session` has open when a commit happens: the
         // input, a divider, and overlay rows — the table header is what the
         // report saw survive.
@@ -3045,7 +3100,7 @@ mod tests {
         );
         out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         out.display_text("Cannot start agent: Missing API key for provider.");
-        let bytes = out.end_capture();
+        let bytes = sink.0.lock().unwrap().clone();
 
         let mut p = vt100::Parser::new(24, 40, 1000);
         // The capture starts at the terminal's first row, but the frame apply is
@@ -3109,7 +3164,7 @@ mod tests {
     #[test]
     fn the_cursor_follows_the_frames_own_caret() {
         let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
+        let sink = record_bytes(&out);
         // Streaming with an empty buffer is R1's `input_hidden`: no input row,
         // and so no caret to place.
         out.begin_response();
@@ -3120,18 +3175,18 @@ mod tests {
             Vec::new(),
             (40, 24),
         );
-        let bytes = out.end_capture();
+        let bytes = sink.0.lock().unwrap().clone();
         assert!(
             String::from_utf8_lossy(&bytes).contains("\x1b[?25l"),
             "a frame with no caret hides the cursor"
         );
 
         let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
+        let sink = record_bytes(&out);
         let mut editor = crate::repl::LineEditor::new();
         editor.set("hi");
         crate::repl::paint_prompt(&out, "", &editor, Vec::new(), (40, 24));
-        let text = String::from_utf8_lossy(&out.end_capture()).into_owned();
+        let text = String::from_utf8_lossy(&sink.0.lock().unwrap().clone()).into_owned();
         assert!(
             text.contains("\x1b[?25h"),
             "a frame with a caret shows it: {text:?}"
@@ -3173,7 +3228,7 @@ mod tests {
     #[test]
     fn a_content_batch_emits_the_frame_once_at_the_end() {
         let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
+        let sink = record_bytes(&out);
         let overlay = crate::repl::test_overlay_parts(
             Some("MODEL            CTX    PRICE"),
             &[],
@@ -3196,7 +3251,7 @@ mod tests {
             out.display_text("second line");
             out.display_text("third line");
         } // the guard's drop owns the redraw
-        let bytes = out.end_capture();
+        let bytes = sink.0.lock().unwrap().clone();
 
         // Once for the frame's own apply, once for the batch's single
         // re-emit. Unbatched it is four — the apply plus one per write — and

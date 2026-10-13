@@ -716,8 +716,12 @@ fn erase_down(s: &mut String, h: usize) {
 /// encapsulated one layer up. Methods that write or advance therefore take
 /// `&mut self`.
 pub(crate) struct Draw {
-    /// Where the bytes go. Defaults to stdout; [`Self::begin_capture`] swaps
-    /// in a `Cursor<Vec<u8>>` and [`Self::end_capture`] swaps it back.
+    /// Where the bytes go. Defaults to stdout. Content bytes never name
+    /// it directly — they arrive through the manager's `ContentWrite`
+    /// hand-off (step 4d) — and the old writer-swap capture retired with
+    /// that split: a test that needs the byte edge swaps a recording sink
+    /// in here (`output.rs`'s `Sink`; `TermIO::recording()` takes the
+    /// seam wholesale in 4f).
     pub(crate) writer: Box<dyn Write + Send>,
     /// The size watch (step 2 commit A): the latest `TermSize`, without a
     /// per-call terminal query. The same channel the manager holds — a
@@ -727,8 +731,6 @@ pub(crate) struct Draw {
     /// last applied frame. (The content-path state moved to `content/` in
     /// step 3a of the output-drawing refactor.)
     pub(crate) cache: DrawCache,
-    /// The previous writer while a capture is active.
-    pub(crate) saved_writer: Option<Box<dyn Write + Send>>,
 }
 
 impl Draw {
@@ -737,7 +739,6 @@ impl Draw {
         Draw {
             writer: Box::new(io::stdout()),
             cache: DrawCache::new(term_h),
-            saved_writer: None,
             size,
         }
     }
@@ -930,27 +931,6 @@ impl Draw {
         // and are written together.
         self.cache.element_stack = stack;
         self.cache.applied = Some(applied);
-    }
-
-    /// Swap the writer for a `Cursor<Vec<u8>>` capture buffer; call
-    /// [`Draw::end_capture`] to restore the original writer and retrieve
-    /// the captured bytes.
-    pub(crate) fn begin_capture(&mut self) {
-        let old = std::mem::replace(&mut self.writer, Box::new(io::Cursor::new(Vec::new())));
-        self.saved_writer = Some(old);
-    }
-
-    /// End a capture session: restore the original writer and return the
-    /// captured bytes.
-    pub(crate) fn end_capture(&mut self) -> Vec<u8> {
-        let saved = self.saved_writer.take();
-        let old = saved.expect("end_capture without begin_capture");
-        let current = std::mem::replace(&mut self.writer, old);
-        // Safety: we know current is a Box<Cursor<Vec<u8>>> because
-        // begin_capture always creates one.
-        let raw = Box::into_raw(current);
-        let cursor = unsafe { Box::from_raw(raw as *mut io::Cursor<Vec<u8>>) };
-        cursor.into_inner()
     }
 }
 

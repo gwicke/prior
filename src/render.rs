@@ -15,10 +15,18 @@
 //! through its `Draw`. A frame's rows are self-contained: each carries the
 //! escapes needed to repaint itself in place (trailing `EL` or padding to
 //! `term_w`), so `apply` may rewrite any subset of rows unconditionally.
+//!
+//! Since 4d the manager is also content's only way onto the screen: the
+//! content path hands each formatted block over as a [`ContentWrite`]
+//! (`render_content` / `render_batch`), and nothing above the manager
+//! writes bytes of its own. What remains of the design's shape comes with
+//! the steps that give it meaning: batching and the recipe field (4e),
+//! the compose + content round trip of `render(Some(w))` with the frame
+//! verbs (4f), and the element stack (4h).
 
 use std::ops::Range;
 
-use crate::draw::{el_if_short, ApplyPolicy, Draw};
+use crate::draw::{el_if_short, plan_consume, ApplyPolicy, Draw};
 use crate::slashdot_menu::table::display_width;
 use crate::termio::TermSize;
 use tokio::sync::watch;
@@ -395,21 +403,49 @@ pub(crate) fn pad_row(row: &str, term_w: usize) -> String {
     }
 }
 
+/// A content write handed to the hub (design §Render): the bytes one block
+/// produced — complete, pre-wrapped, line-cleared screen rows, ending at a
+/// line boundary — plus the two facts the screen choreography needs to
+/// place them: the rows they occupy (measured from the bytes by content's
+/// `RowCounter`, not predicted from the source) and the width they were
+/// rendered at (the reposition re-renders at it).
+///
+/// Content-specific classification stops *above* this type: the only
+/// vocabulary the design sends down with a write is `Stream` (main/meta),
+/// and that token arrives with TermIO's meta sink — 4f. Every write is
+/// main-stream screen content today; the reasoning-to-stderr path never
+/// reaches the hub at all.
+pub(crate) struct ContentWrite {
+    /// The block's bytes as Content produced them.
+    pub(crate) bytes: Vec<u8>,
+    /// Screen rows the bytes occupy at the watched width (a measured
+    /// count: a long line wraps, which the byte length alone cannot say).
+    pub(crate) rows: usize,
+    /// The width the block was rendered for — the reposition's width.
+    pub(crate) width: usize,
+}
+
 // --- the frame hub (step 4b) -------------------------------------------------
 
 /// The frame hub (design §Render layer): where a composition comes to be
 /// budgeted, rendered, applied and remembered. Step 4b moved the pipeline
-/// here — what was `Output::draw_elements`' default body — and 4c moved the
-/// drawing edge (`Draw`) under this roof. What remains of the design's
-/// shape comes with the steps that give it meaning: the `ContentWrite`
-/// hand-off and `render_batch` (4d), batching and the recipe field (4e,
-/// when reposition stops reading it from `DrawCache`), and the frame verbs
-/// off the watch (4f).
+/// here — what was `Output::draw_elements`' default body — 4c moved the
+/// drawing edge (`Draw`) under this roof, and 4d made this the content
+/// path's only door onto the screen (the `ContentWrite` hand-off below).
+/// What remains of the design's shape comes with the steps that give it
+/// meaning: batching and the recipe field (4e, when reposition stops
+/// reading it from `DrawCache`), the frame verbs off the watch and the
+/// compose + content round trip (4f), and the element stack (4h).
 pub struct RenderManager {
     /// The drawing edge (step 4c): the byte sink and its live-screen
     /// bookkeeping, owned — the design's `Draw { … }` under this roof. Plain
     /// fields inside; this manager's `Mutex` is what serializes them.
     draw: Draw,
+    /// The capture tap (step 4d, design §Content): while open, each
+    /// [`ContentWrite`]'s bytes stop here instead of reaching the screen.
+    /// Content bytes only — frame bytes can never be caught, which is the
+    /// deliberate narrowing over the old writer swap.
+    captured: Option<Vec<u8>>,
     /// The fraction of the frame's terminal height the area may occupy —
     /// [`configure`](Self::configure)'s, resolved against the render's
     /// height on every call.
@@ -431,6 +467,7 @@ impl RenderManager {
     pub fn new(size: SizeWatch) -> Self {
         Self {
             draw: Draw::new(size.clone()),
+            captured: None,
             frame_max_row_ratio: FRAME_MAX_ROW_RATIO,
             size,
         }
@@ -487,12 +524,158 @@ impl RenderManager {
         self.draw.remember_compose(stack, applied);
         applied
     }
+
+    // --- the content hand-off (step 4d, design §Content/§Render) -----------
+
+    /// One content block on the streaming path — the hand-off the design
+    /// spells `render(Some(w))` (§Render) once this manager owns the
+    /// compose as well (4f/4h). Today the caller still composes
+    /// separately, so this is the content half alone: every streaming
+    /// write reaches the screen through here and never around it.
+    pub(crate) fn render_content(&mut self, content: ContentWrite) {
+        self.put_content(content);
+    }
+
+    /// One content block on the replay path (§Render): bulk writes, one
+    /// per call inside a batch, with the frame's re-emit deferred to a
+    /// final regular apply. Today the deferral is the same `batch_active`
+    /// flag the streaming path obeys inside [`Self::put_content`] — the
+    /// two verbs are one choreography under two names until the batching
+    /// guard moves here (4e) and the batch's deferral becomes its own
+    /// semantics rather than the shared flag's.
+    pub(crate) fn render_batch(&mut self, content: ContentWrite) {
+        self.put_content(content);
+    }
+
+    /// Is a content batch open — its writes defer the frame's re-emit to
+    /// the guard's drop? The read side of `Draw`'s flag, for the content
+    /// hand-off to pick its verb.
+    pub(crate) fn batching(&self) -> bool {
+        self.draw.cache.batch_active
+    }
+
+    /// True while a capture is open on the content hand-off (design
+    /// §Content: the tap reads each `ContentWrite` as handed over).
+    pub(crate) fn is_capturing(&self) -> bool {
+        self.captured.is_some()
+    }
+
+    /// Open a capture: from here each [`ContentWrite`]'s bytes stop at the
+    /// hub instead of reaching the screen. Content bytes only — frame
+    /// bytes (`draw_frame`, the reposition) can never be caught, which is
+    /// the deliberate narrowing over the old writer swap; byte-edge tests
+    /// read the writer, and `TermIO::recording()` takes that seam over
+    /// wholesale in 4f.
+    pub(crate) fn begin_capture(&mut self) {
+        self.captured = Some(Vec::new());
+    }
+
+    /// End the capture and return what the content path handed over.
+    pub(crate) fn end_capture(&mut self) -> Vec<u8> {
+        self.captured
+            .take()
+            .expect("end_capture without begin_capture")
+    }
+
+    /// The choreography every content write takes (moved from
+    /// `Content::with_content_writer` in 4d): consume the live frame, put
+    /// the block down at the fold, advance the tracked cursor by its
+    /// measured rows, and bring the frame back below — deferred while a
+    /// batch is open, whose guard's drop emits it once (ui_draw_v2 R5).
+    fn put_content(&mut self, content: ContentWrite) {
+        let ContentWrite { bytes, rows, width } = content;
+        let Self { draw, captured, .. } = self;
+        // **Consume, then write** (ui_draw_v2 §4.5 P1 / ui_draw_261001): the
+        // walk goes ahead of the bytes — cursor movement, straight to the
+        // writer, never through content's row counter — and the content
+        // follows, already carrying its per-line clears. No erase with the
+        // walk: each line clears the row it enters, and rows the content
+        // never reaches are the reposition's `old_h` tail to clear in its
+        // own pass.
+        let (walk, taken) = match plan_consume(&mut draw.cache) {
+            Some((walk, frame)) => (walk, Some(frame)),
+            // No live area: the cursor is wherever the last write left it,
+            // which is where the content belongs. Nothing to walk and no
+            // `CR` to emit — the column is the content path's own
+            // bookkeeping here, not something to reset.
+            None => (String::new(), None),
+        };
+        if !walk.is_empty() {
+            let _ = draw.writer.write_all(walk.as_bytes());
+        }
+        // The tap (design §Content): with a capture open the block's bytes
+        // stop here — exactly as Content produced them, content only. The
+        // choreography runs either way: the cursor advance and the consume
+        // are facts about the screen, and a capture does not pause it.
+        match captured.as_mut() {
+            Some(cap) => cap.extend_from_slice(&bytes),
+            None => {
+                let _ = draw.writer.write_all(&bytes);
+                let _ = draw.writer.flush();
+            }
+        }
+        // Zero rows means nothing moved, and a frame stays live.
+        if rows > 0 {
+            draw.note_lines(rows);
+        }
+        // The area comes back below what was just written — re-rendered
+        // rather than replayed, so its status row is whatever it is *now*:
+        // the turn's `set_status` and the dot's flip both happen after the
+        // REPL composed. The consume's rows ride along for the below-frame
+        // clear (`old_h - h_new - consumed_rows` in `paint_forward`),
+        // accumulated across a batch's writes and taken by whichever
+        // reposition follows.
+        //
+        // Inside a batch the reposition waits: the frame stays consumed for
+        // the whole burst and the guard's drop emits it once (ui_draw_v2 R5).
+        let taken = {
+            let cache = &mut draw.cache;
+            if taken.is_some() || cache.deferred.is_some() {
+                cache.consumed_rows += rows;
+            }
+            match taken {
+                Some(taken) if !cache.batch_active => Some(taken),
+                Some(taken) => {
+                    // Keep the *first* frame taken: it is `reposition_area`'s
+                    // fallback when no recipe recorded itself, and a later
+                    // write finds nothing to consume and so contributes none.
+                    if cache.deferred.is_none() {
+                        cache.deferred = Some(taken);
+                    }
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(taken) = taken {
+            let bytes = draw.reposition_area(width, taken);
+            let _ = draw.writer.write_all(bytes.as_bytes());
+            let _ = draw.writer.flush();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::repl::LineEditor;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    /// A recording byte sink for the writer seam: frame bytes are never
+    /// catchable at the content tap (4d), so a test that asserts on them
+    /// swaps the writer — the pattern `output.rs`'s `Sink` uses.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     // ---- live_budget ----
 
@@ -528,8 +711,10 @@ mod tests {
     /// `render` is the pipeline that left `Output::draw_elements`: it applies
     /// through the `Draw` it has owned since 4c and remembers the composition
     /// there (recipe + applied size, where the content path reads it).
-    /// Captured through the draw's own capture swap — the manager writes
-    /// nothing of its own.
+    /// Frame bytes read from a recording sink swapped into the writer —
+    /// the manager's own capture taps the *content* hand-off only (4d), so
+    /// a frame-byte assertion reads the byte edge, as `TermIO::recording()`
+    /// will take over wholesale in 4f.
     #[test]
     fn manager_render_paints_its_own_draw_and_remembers() {
         let size = crate::termio::fixed(TermSize {
@@ -538,13 +723,14 @@ mod tests {
         });
         let mut manager = RenderManager::new(size);
 
-        manager.draw.begin_capture();
+        let rec = SharedBuf::default();
+        manager.draw.writer = Box::new(rec.clone());
         let stack = vec![
             Element::lines(vec!["hello".to_string()]),
             Element::divider(),
         ];
         let applied = manager.render(stack, ApplyPolicy::Frame, (40, 24));
-        let bytes = manager.draw.end_capture();
+        let bytes = rec.0.lock().unwrap().clone();
 
         assert_eq!(applied, (40, 24));
         assert!(
