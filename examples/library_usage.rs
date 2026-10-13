@@ -4,13 +4,16 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Setup the output handler with NoOutput for silent execution
-    let output = Arc::new(NoOutput);
+    let output: Arc<dyn picocode::Output> = Arc::new(NoOutput);
+    // Content's verbs short-circuit through the same silent handle (step 3d).
+    let content = AgentConfig::content_for(&output);
 
     // 2. Create the agent
     let agent = create_agent(AgentConfig {
         provider: "anthropic".into(),
         model: "claude-3-5-sonnet-latest".into(),
         output,
+        content,
         yolo: true,         // Auto-confirm everything since there's no output
         confirm_port: None, // No REPL to ask, so nothing drives a confirm dialog
         context_limit: None,

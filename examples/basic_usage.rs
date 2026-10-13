@@ -7,6 +7,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = Arc::new(ConsoleOutput::new(
         picocode::settings::default_show_reasoning_handle(),
     ));
+    // The content handle shares the console's own `Content` (step 3d).
+    let content = output.content();
 
     // 2. Create the agent with a simple config struct
     // You no longer need to manually initialize Rig clients or builders.
@@ -14,6 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider: "anthropic".into(),
         model: "claude-3-5-sonnet-latest".into(),
         output,
+        content,
         yolo: false,
         confirm_port: None,
         context_limit: None,

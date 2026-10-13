@@ -167,7 +167,11 @@ impl TurnPersistence {
 
 pub struct CodeAgent {
     agent: Agent,
+    /// Frame + input (step 4 moves it to `RenderManager`).
     output: Arc<dyn Output>,
+    /// Content (step 3d): what the turn's `display_*` / `stream_*` /
+    /// `begin|end_response` calls go through.
+    content: Arc<crate::content::Content>,
     tool_call_limit: usize,
     provider: String,
     model: String,
@@ -661,6 +665,7 @@ impl CodeAgent {
     pub fn new(
         agent: Agent,
         output: Arc<dyn Output>,
+        content: Arc<crate::content::Content>,
         context_limit: Option<u64>,
         tool_call_limit: usize,
         provider: String,
@@ -677,6 +682,7 @@ impl CodeAgent {
         Self {
             agent,
             output,
+            content,
             context_limit,
             tool_call_limit,
             provider,

@@ -1144,10 +1144,13 @@ mod tests {
     /// Minimal `AgentConfig` for gate decisions — the plan only reads the
     /// model id, params, and persona, so the rest is filler.
     fn gate_cfg(provider: &str, model: &str, params: crate::params::ModelParams) -> AgentConfig {
+        let output: Arc<dyn crate::output::Output> = Arc::new(crate::output::NoOutput);
+        let content = AgentConfig::content_for(&output);
         AgentConfig {
             provider: provider.into(),
             model: model.into(),
-            output: Arc::new(crate::output::NoOutput),
+            output,
+            content,
             yolo: false,
             confirm_port: None,
             quiet: true,
@@ -1480,10 +1483,13 @@ mod tests {
         let sessions_tempdir = tempfile::tempdir().unwrap();
         let sessions_dir = sessions_tempdir.path().to_path_buf();
 
+        let output: Arc<dyn crate::output::Output> = Arc::new(out);
+        let content = AgentConfig::content_for(&output);
         let config = AgentConfig {
             provider: "openai".into(),
             model: "gpt-4o".into(),
-            output: Arc::new(out),
+            output,
+            content,
             yolo: true,
             confirm_port: None,
             quiet: true,
@@ -1591,10 +1597,13 @@ mod tests {
         };
 
         let sessions_tempdir = tempfile::tempdir().unwrap();
+        let output: Arc<dyn crate::output::Output> = Arc::new(out);
+        let content = AgentConfig::content_for(&output);
         let config = AgentConfig {
             provider: "openai".into(),
             model: "gpt-4o".into(),
-            output: Arc::new(out),
+            output,
+            content,
             yolo: true,
             confirm_port: None,
             quiet: true,

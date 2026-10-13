@@ -60,7 +60,17 @@ use crate::tools::{
 pub struct AgentConfig {
     pub provider: String,
     pub model: String,
+    /// The frame + input seam — `set_status` / `frame_size` / `paint` /
+    /// `confirm_default` and, in the REPL, `get_user_input`. Step 4 moves it to
+    /// `RenderManager`; the target `AgentConfig` (impl doc §4) drops it. Content
+    /// calls live on [`Self::content`] as of step 3d.
     pub output: Arc<dyn Output>,
+    /// The content handle (step 3d): every `display_*` / `stream_*` /
+    /// `begin|end_response` call goes here. In production it is the same
+    /// `Content` `ConsoleOutput` holds; in tests and `--quiet` it is a
+    /// `Content` whose verbs short-circuit through [`Self::output`] — see
+    /// [`Self::content_for`].
+    pub content: Arc<crate::content::Content>,
     pub yolo: bool,
     pub quiet: bool,
     /// The REPL's end of the confirm port, cloned into every guarded tool.
@@ -136,6 +146,18 @@ impl AgentConfig {
     /// Mirrors `ModelEntry::qualified()` for catalog entries.
     pub fn qualified_model_id(&self) -> String {
         format!("{}:{}", self.provider, self.model)
+    }
+
+    /// The `content` handle for a config whose frame+input handle is `output`.
+    ///
+    /// Content verbs short-circuit through that same handle, so
+    /// `RecordingOutput` still records the source strings an assertion
+    /// compares and `QuietOutput` / `NoOutput` still discard — the content
+    /// seam (impl doc §4) without a render stack behind it. `ConsoleOutput`
+    /// passes its own tap-less `Content`; that is the one case where content
+    /// renders for real.
+    pub fn content_for(output: &Arc<dyn Output>) -> Arc<crate::content::Content> {
+        Arc::new(crate::content::Content::with_tap(output.clone()))
     }
 }
 
@@ -309,6 +331,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
             CodeAgent::new(
                 rig_agent,
                 config.output,
+                config.content,
                 config.context_limit,
                 config.tool_call_limit,
                 config.provider,
@@ -539,7 +562,8 @@ pub fn load_agents_md() -> Option<String> {
 
 #[derive(Clone)]
 pub(crate) struct LoggingHook {
-    pub(crate) output: Arc<dyn Output>,
+    /// Content only: this hook's every verb is a `display_*` (step 3d).
+    pub(crate) content: Arc<crate::content::Content>,
     pub(crate) user_cancel: Arc<AtomicBool>,
     pub(crate) message_logger: Option<Arc<MessageLogger>>,
     pub(crate) reasoning_in_context: crate::settings::ReasoningInContextMode,
@@ -654,7 +678,7 @@ impl AgentHook for LoggingHook {
         if event.tool_name == "edit" {
             args_json = crate::edit_blocks::canonicalize_edit_value(&args_json);
         }
-        self.output.display_tool_call(event.tool_name, &args_json);
+        self.content.display_tool_call(event.tool_name, &args_json);
         ToolCallAction::Run
     }
 
@@ -683,7 +707,7 @@ impl AgentHook for LoggingHook {
         // the in-flight panel shows what the model tried. `display_error`
         // is the existing method; layer 1 Task 1 will add a dedicated
         // `display_tool_error` panel that we can swap in later.
-        self.output.display_error(&format!(
+        self.content.display_error(&format!(
             "Model called tool `{}` which is not available. Available tools: {:?}. \
              Asking the model to retry with a valid name.",
             event.tool_name, event.available_tools
@@ -703,7 +727,7 @@ impl AgentHook for LoggingHook {
         if self.user_cancel.load(Ordering::SeqCst) {
             return ToolResultAction::Stop("cancelled by user".into());
         }
-        self.output
+        self.content
             .display_tool_result(&event.raw_result.output().render());
         if let Some(text) = event.raw_result.output().as_text() {
             if let Some(cleaned) = model_facing_tool_text(event.tool_name, text) {
@@ -1198,10 +1222,12 @@ mod tests {
         ]]);
         let agent = AgentBuilder::new(model).build();
 
+        let no_output: Arc<dyn Output> = Arc::new(crate::NoOutput);
+        let hook_content = AgentConfig::content_for(&no_output);
         let mut stream = agent
             .stream_prompt("hi")
             .add_hook(LoggingHook {
-                output: Arc::new(crate::NoOutput),
+                content: hook_content,
                 user_cancel: Arc::new(AtomicBool::new(false)),
                 message_logger: Some(logger.clone()),
                 reasoning_in_context: crate::settings::ReasoningInContextMode::Never,

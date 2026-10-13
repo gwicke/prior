@@ -53,8 +53,11 @@ pub struct Content {
     pub(crate) caps: Caps,
     /// Where reasoning goes: `true` = stderr, so a consumer of
     /// `picocode "q" | cat` can drop it (`2>/dev/null`) or merge it (`2>&1`)
-    /// without touching stdout. Decided once, here.
-    pub(crate) reasoning_on_stderr: bool,
+    /// without touching stdout. Decided once, in [`Self::new`]. `AtomicBool`
+    /// rather than `bool` only because the handle is now shared behind an
+    /// `Arc` (step 3d) and a test pins it to the screen for a byte comparison —
+    /// see [`Self::set_reasoning_on_stderr`].
+    pub(crate) reasoning_on_stderr: AtomicBool,
     /// Incremental GFM markdown parser for the current response (TTY only).
     pub(crate) parser: Mutex<StreamParser>,
     /// Incremental terminal renderer (TTY only) for the answer.
@@ -97,7 +100,7 @@ impl Content {
             draw: Draw::new(size.clone()),
             size,
             caps,
-            reasoning_on_stderr: !caps.primary,
+            reasoning_on_stderr: AtomicBool::new(!caps.primary),
             parser: Mutex::new(StreamParser::new_gfm_stream()),
             renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
             thinking_parser: Mutex::new(StreamParser::new_gfm_stream()),
@@ -126,6 +129,15 @@ impl Content {
         );
         content.tap = Some(tap);
         content
+    }
+
+    /// Test knob: pin where reasoning goes, so a capture harness sees it on
+    /// the captured stream (a test's stdout is not a terminal, and the default
+    /// would route it to stderr). Production decides once in [`Self::new`].
+    #[cfg(test)]
+    pub(crate) fn set_reasoning_on_stderr(&self, on: bool) {
+        self.reasoning_on_stderr
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// This instance's width: its subscribed watch, with the same 20-column
@@ -1323,7 +1335,9 @@ impl Content {
     pub(crate) fn reasoning_sink(&self) -> ReasoningSink {
         ReasoningSink {
             buf: Vec::new(),
-            to_stderr: self.reasoning_on_stderr,
+            to_stderr: self
+                .reasoning_on_stderr
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }

@@ -278,10 +278,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let show_reasoning_handle: picocode::settings::ShowReasoningHandle =
         std::sync::Arc::new(std::sync::Mutex::new(show_reasoning));
     let reasoning_in_context = config.reasoning_in_context.unwrap_or_default();
-    let output: Arc<dyn picocode::Output> = if quiet {
-        Arc::new(picocode::QuietOutput::new())
+    let (output, content): (Arc<dyn picocode::Output>, Arc<picocode::Content>) = if quiet {
+        // Quiet: content's verbs short-circuit through the same handle (the §4
+        // content seam), so nothing reaches stdout and `display_error` still
+        // goes to stderr exactly as `QuietOutput` always did.
+        let out: Arc<dyn picocode::Output> = Arc::new(picocode::QuietOutput::new());
+        let content = Arc::new(picocode::Content::with_tap(out.clone()));
+        (out, content)
     } else {
-        Arc::new(ConsoleOutput::new(show_reasoning_handle.clone()))
+        // Production: share the `Content` this console already owns, so the
+        // config's frame handle and its content handle are one state — and
+        // content renders for real, because this `Content`'s tap is `None`.
+        let console = Arc::new(ConsoleOutput::new(show_reasoning_handle.clone()));
+        let content = console.content();
+        let out: Arc<dyn picocode::Output> = console;
+        (out, content)
     };
 
     let system_message_extension = picocode::load_agents_md();
@@ -310,6 +321,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         provider: provider.clone(),
         model,
         output,
+        content,
         yolo,
         quiet,
         // Installed by `run_interactive` before the agent is built, so every

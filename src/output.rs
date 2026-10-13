@@ -607,10 +607,11 @@ impl Output for LogOutput {
 /// content methods forward through it. The frame methods stay here, reaching
 /// `content.draw` until step 4 makes `RenderManager` the frame front door.
 pub struct ConsoleOutput {
-    /// The content owner (step 3c). `Output`'s content methods forward
-    /// through it; the frame methods reach `content.draw` via a temporary
-    /// pass-through.
-    pub(crate) content: Content,
+    /// The content owner (steps 3c–3d), shared by `Arc` with
+    /// `AgentConfig.content`, so the config's frame handle and its content
+    /// handle are one state. `Output`'s content methods forward through it;
+    /// the frame methods reach `content.draw` via a temporary pass-through.
+    pub(crate) content: Arc<Content>,
     /// The status line's content — pure frame state, never content's (see the
     /// transition contract). `Arc`'d so [`Element::status`] can hold its own
     /// handle: the row resolves at draw time, not compose time.
@@ -805,9 +806,15 @@ impl ConsoleOutput {
     /// watch via [`Self::with_size`] without forking the rest of the wiring.
     fn with_geometry(show_reasoning: ShowReasoningHandle, size: watch::Receiver<TermSize>) -> Self {
         Self {
-            content: Content::new(size, show_reasoning),
+            content: Arc::new(Content::new(size, show_reasoning)),
             status_text: Arc::new(Mutex::new(StatusText::default())),
         }
+    }
+
+    /// The content handle this console owns — what `AgentConfig.content` is
+    /// set to, so the config's two handles share one `Content`.
+    pub fn content(&self) -> Arc<Content> {
+        self.content.clone()
     }
 
     /// A `ConsoleOutput` on a privately seeded size watch — the test
@@ -1505,7 +1512,7 @@ mod tests {
 
     fn capturing_output(width: u16) -> (ConsoleOutput, crate::settings::ShowReasoningHandle) {
         let reasoning = crate::settings::default_show_reasoning_handle();
-        let mut out = ConsoleOutput::with_size(
+        let out = ConsoleOutput::with_size(
             reasoning.clone(),
             TermSize {
                 width: width as usize,
@@ -1515,7 +1522,7 @@ mod tests {
         // Pinned rather than probed: the routing is not this suite's subject,
         // and a capture harness should capture everything the code might
         // write (the doc on this helper says why in full).
-        out.content.reasoning_on_stderr = false;
+        out.content.set_reasoning_on_stderr(false);
         (out, reasoning)
     }
 
@@ -1738,7 +1745,7 @@ mod tests {
 
     /// Run a scripted response through the live render path; return the bytes.
     fn run_script(steps: &[Step], chunk: Chunking) -> Vec<u8> {
-        let (mut out, reasoning) = capturing_output(80);
+        let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
         // Reasoning on the captured stream. `capturing_output` already pins
         // this, so the line is redundant — kept because a replay test that
@@ -1746,7 +1753,7 @@ mod tests {
         // the pin is exactly the kind of thing a future edit drops as
         // "obviously already handled". The routing itself is the subject of
         // `reasoning_is_routed_by_the_output_layer`, which names both values.
-        out.content.reasoning_on_stderr = false;
+        out.content.set_reasoning_on_stderr(false);
         out.begin_capture();
         out.begin_response();
         for step in steps {
@@ -1914,9 +1921,9 @@ mod tests {
 
         // Diverted: reasoning leaves stdout — it shows up on the test runner's
         // stderr instead, which is what makes `2>/dev/null` work for a consumer.
-        let (mut out, reasoning) = capturing_output(80);
+        let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.content.reasoning_on_stderr = true;
+        out.content.set_reasoning_on_stderr(true);
         out.begin_capture();
         out.begin_response();
         feed(&out, script[0], Chunking::Whole);
@@ -1928,9 +1935,9 @@ mod tests {
         );
 
         // On the screen: the other side of the same decision.
-        let (mut out, reasoning) = capturing_output(80);
+        let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.content.reasoning_on_stderr = false;
+        out.content.set_reasoning_on_stderr(false);
         out.begin_capture();
         out.begin_response();
         feed(&out, script[0], Chunking::Whole);
@@ -1987,9 +1994,9 @@ mod tests {
     /// and the block *before* the first one.
     #[test]
     fn an_empty_segment_puts_no_blank_between_retries() {
-        let (mut out, reasoning) = capturing_output(80);
+        let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.content.reasoning_on_stderr = false;
+        out.content.set_reasoning_on_stderr(false);
         out.begin_capture();
         // Three failed attempts, each an empty turn: `begin_response` then a
         // stream that errors before a single delta reaches the parser.
@@ -2031,9 +2038,9 @@ mod tests {
     /// message that follows it.
     #[test]
     fn a_segment_that_streamed_still_closes_for_the_notice_after_it() {
-        let (mut out, reasoning) = capturing_output(80);
+        let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.content.reasoning_on_stderr = false;
+        out.content.set_reasoning_on_stderr(false);
         out.begin_capture();
         // The answer streams and is emitted as it arrives; the paragraph is
         // closed by its own trailing blank, so the flush below is genuinely
@@ -2868,9 +2875,9 @@ mod tests {
     /// whatever the frame below painted survived in the continuation.
     #[test]
     fn content_choke_wraps_an_overwide_line_before_the_line_clear() {
-        let (mut out, _reasoning) = capturing_output(60);
+        let (out, _reasoning) = capturing_output(60);
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
-        out.content.draw.writer = Mutex::new(Box::new(sink.clone()));
+        out.content.draw.set_writer(Box::new(sink.clone()));
         let y = "y".repeat(120);
         out.content
             .with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
@@ -2891,9 +2898,9 @@ mod tests {
     /// carries the green across the continuation row.
     #[test]
     fn wrapped_content_keeps_its_sgr_across_the_inserted_newline() {
-        let (mut out, _reasoning) = capturing_output(60);
+        let (out, _reasoning) = capturing_output(60);
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
-        out.content.draw.writer = Mutex::new(Box::new(sink.clone()));
+        out.content.draw.set_writer(Box::new(sink.clone()));
         let y = "y".repeat(120);
         let input = format!("\x1b[32m{y}\x1b[0m\n");
         out.content

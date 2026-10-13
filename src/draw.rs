@@ -960,6 +960,14 @@ impl Draw {
         cache.applied = Some(applied);
     }
 
+    /// Swap the sink wholesale — how the test harness captures what the content
+    /// path emits without a terminal. The writer sits behind its one lock, so a
+    /// `&self` swap is the whole operation.
+    #[cfg(test)]
+    pub(crate) fn set_writer(&self, writer: Box<dyn Write + Send>) {
+        *self.writer.lock().unwrap() = writer;
+    }
+
     /// Swap the writer for a `Cursor<Vec<u8>>` capture buffer; call
     /// [`Draw::end_capture`] to restore the original writer and retrieve
     /// the captured bytes.

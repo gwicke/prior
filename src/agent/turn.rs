@@ -143,7 +143,7 @@ impl CodeAgent {
         };
         let mut stream = request
             .add_hook(LoggingHook {
-                output: self.output.clone(),
+                content: self.content.clone(),
                 user_cancel: self.user_cancel.clone(),
                 message_logger: self.message_logger.clone(),
                 reasoning_in_context: self.reasoning_in_context,
@@ -204,7 +204,7 @@ impl CodeAgent {
                 },
             },
         ));
-        self.output.begin_response();
+        self.content.begin_response();
         // U4.3: the turn's second pump, split out of `in_turn` into bindings the
         // two new futures below can borrow *disjointly* — one future per
         // binding, so neither is borrowed twice at once. `tokio::select!`
@@ -266,19 +266,19 @@ impl CodeAgent {
                             StreamedAssistantContent::Text(text) => {
                                 let delta = text.text();
                                 output.push_str(delta);
-                                self.output.stream_text(delta);
+                                self.content.stream_text(delta);
                             }
                             StreamedAssistantContent::Reasoning { reasoning, .. } => {
                                 let t = reasoning_text(&reasoning);
                                 if !t.is_empty() {
                                     reasoning_buffer.push_str(&t); // Accumulate for partial persistence
-                                    self.output.stream_thinking(&t);
+                                    self.content.stream_thinking(&t);
                                 }
                             }
                             StreamedAssistantContent::ReasoningDelta { reasoning, .. }
                                 if !reasoning.is_empty() => {
                                     reasoning_buffer.push_str(&reasoning); // Accumulate for partial persistence
-                                    self.output.stream_thinking(&reasoning);
+                                    self.content.stream_thinking(&reasoning);
                                 }
                             _ => {}
                         },
@@ -319,7 +319,7 @@ impl CodeAgent {
                                 }
                             }
                             // Commit the text so far before the tool call / result line.
-                            self.output.end_response_segment();
+                            self.content.end_response_segment();
                         }
                         Some(Ok(MultiTurnStreamItem::FinalResponse(resp))) => {
                             final_history = resp.messages().map(|h| h.to_vec());
@@ -519,7 +519,7 @@ impl CodeAgent {
                                     }
                                 }
                             }
-                            self.output.end_response();
+                            self.content.end_response();
                             // A retryable error that interrupted the run AFTER
                             // progress: signal the REPL (via `LlmInterrupted`)
                             // so it resets the back-off and continues from the
@@ -654,7 +654,7 @@ impl CodeAgent {
                 }
             }
         }
-        self.output.end_response();
+        self.content.end_response();
 
         // Persist the turn into the session (or fallback to no persistence).
         if let Some(s) = session {
@@ -700,14 +700,14 @@ impl CodeAgent {
     }
 
     pub async fn run_once(&self, input: String) -> Result<String> {
-        self.output.display_header(
+        self.content.display_header(
             &self.provider,
             &self.model,
             self.yolo,
             self.tool_call_limit,
             self.persona_name.as_deref(),
         );
-        self.output.display_separator();
+        self.content.display_separator();
         // `prompt` now renders the response itself via the streaming Output
         // methods, so there is no separate `display_markdown` here.
         let turn = TurnPersistence::new();

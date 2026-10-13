@@ -777,10 +777,12 @@ impl AppState {
         settings: SettingsStore,
         output: Arc<dyn crate::output::Output>,
     ) -> Arc<AppState> {
+        let content = AgentConfig::content_for(&output);
         let config = AgentConfig {
             provider: "test".to_string(),
             model: "model".to_string(),
             output,
+            content,
             yolo: false,
             confirm_port: None,
             quiet: true,
