@@ -254,12 +254,16 @@ most runway to expand into separate sub-commits.
 
 - **4a — `TermIO { Tty | Plain }` as a closed type.** Landed (`8cc955d`) — the commit message
   records what moved. Leftovers, each claimed:
-  - The cloneable `Arc<TermGuard>` holders (`Repl`, the prompt loop, `$EDITOR` via app_state, the
+  - ~~The cloneable `Arc<TermGuard>` holders (`Repl`, the prompt loop, `$EDITOR` via app_state, the
     back-off pump) still name the guard directly; `TermIO::guard()` hands the handle out — **4f**
-    converts them to the manager/TermIO suspend and the handle dies.
+    converts them to the manager/TermIO suspend and the handle dies.~~ Settled by **4f-d**
+    (`348f7ed`): all four holders converted to the manager's `suspend`/`resume`, the direct Arc
+    clones died, and `TermIO::guard()`'s one remaining caller is setup's publish into the manager
+    (itself retired with the `Draw` move, **4f-e**).
   - Resize still travels the size watch only (`route_event` keeps it Inline, as step 2 decided);
     the design's "resize reaches the input channel too" forwards when `read_input` collapses to
-    one handle — **4f**.
+    one handle — **4f**. The collapse landed in 4f-d *without* the forward (see 4f-d's leftover);
+    the forward rides **4f-e**, with the sender moves it must not race.
   - `TermIO` parks in `Interactive` (read only for its lifetime) — the `Draw` move takes it, and
     the design has `Draw { term_io, cache }` — **4c** is its natural rider.
   - `TermIO::write` has no production caller (the `Draw` writer is still a plain field), caps are
@@ -385,7 +389,8 @@ most runway to expand into separate sub-commits.
       transitional surface for **step 5**'s trait deletion to prune.
     - ~~The pumps thread content *beside* output (dims and `$EDITOR` still reach for it) — the
       overlap ends with **4f-c** (dims) and **4f-d** (`$EDITOR`, guards).~~ The dims half closed
-      with **4f-c** (`fad8f76`); `$EDITOR` and the guards are what `output` still carries.
+      with **4f-c** (`fad8f76`), the `$EDITOR`/guard half with **4f-d** (`348f7ed`) — what `output`
+      carries now is only what step 5 deletes (the quiet tap, the tools' `confirm_default`).
     - ~~`Output::draw_frame` keeps only test drivers (the 4d-era byte-edge tests); it and the
       remaining frame verbs (`frame_size`, `painted_size`, `cursor_row`'s forward) go with
       **4f-c**/**4f-d** and **step 5**.~~ `frame_size`/`painted_size` went with **4f-c**;
@@ -411,16 +416,39 @@ most runway to expand into separate sub-commits.
     - The probe's `dims` closure is the out-of-crate driver's pattern for now; 4f-e's handle
       hand-out may give drivers a subscribed receiver instead of the process-wide free fns.
     - `Output::draw_frame` (test drivers) and `Output::cursor_row`'s default (non-console
-      outputs) stay for **4f-d**/**step 5**.
-  - **4f-d — input collapses to one handle; the `TermGuard` holders convert.** `read_input` takes
-    the handle set (content + manager + the key receiver) rather than `&dyn Output` + guard;
-    `get_user_input`, `run_entry_dsr` (the caller side — the DSR *answer* moving inside TermIO is
-    **4g**), `turn_backoff_pump`, and `app_state`'s `run_editor` re-home to manager/TermIO. The
-    four cloneable `Arc<TermGuard>` holders (Repl, the prompt loop, `$EDITOR`, the back-off pump)
-    convert to the manager/TermIO suspend and the direct guard handle dies (the **4a** leftover).
-    The prompt-loop size probe and the parked-resize drain keep writing the process-wide sender
-    until 4f-e moves it. `AgentConfig.output` is left without a duty the agent itself needs; it
-    stays as a field to step 5's trait deletion unless a holder turns up here.
+      outputs) stay for **step 5** — 4f-d took neither; cursor_row re-anchors go via the manager.
+  - **4f-d — input collapses to one handle; the `TermGuard` holders convert.** Landed (`348f7ed`)
+    — the commit message records what moved. The manager gained the design's front door
+    (`set_mode_guard`, `suspend`, `resume`, `is_tty` — §Render: content/UI never touch TermIO),
+    and setup's one publish (`Interactive` → `set_mode_guard`) replaced the four direct Arc
+    holders (`Repl` → a unit; `Interactive`'s field; `AppState`'s `term_guard` slot and its two
+    getters; `TurnPump`/`InTurnInput`/dispatch/back-off params). Per duty: `read_input` takes
+    `(content, keys)` — its DSR re-anchors go through `content.manager.cursor_row()`, its
+    Ctrl-C/Ctrl-Z through `suspend`/`resume`, raw entry is the manager's `resume` where
+    `Repl::start` was; `run_entry_dsr` takes content (caller side only — the DSR *answer* inside
+    TermIO is **4g**); `run_editor` takes content (order byte-identical: check → pause → stop →
+    edit → start → DSR; its locks are per-flip, never across the human edit) and now owns the
+    Unsupported check off `is_tty()`, so `edit_text` lost its caller-side guard check;
+    `turn_backoff_pump`/`dispatch`/`TurnPump`/`InTurnInput` drop guard *and* output — a prompt
+    session exists only where TermIO is Tty, so the old guard-presence zip changes nothing.
+    `CodeAgent`'s private `output` copy dies with dispatch's last use; `AgentConfig.output` stays
+    (the quiet tap, the tools' `confirm_default` copies out of `build_rig_agent`, step 5's
+    deletion). The prompt-loop size probe and the parked-resize drain keep writing the
+    process-wide sender until 4f-e moves it. Leftovers, each claimed:
+    - **`get_user_input` went to `Content`, not TermIO** (the plan said manager/TermIO): the
+      prompt is a content write and the answer goes through the §4 tap — which is what keeps
+      quiet's empty answer and the scripted `ScriptOutput` interactive test byte-identical; a
+      `TermIO` line read would bypass the tap and block on test stdin. `ConsoleOutput`'s impl is
+      a forward; the trait verb stays as the tap seam to step 5.
+    - The *reader-stop* half of `suspend()` is still each caller's `ReaderPauseGuard`; the
+      manager's pass-through stops raw mode only. Design's `TermIO::suspend()` (pause + raw off)
+      arrives when TermIO moves under `Draw` — **4f-e** — and retires `set_mode_guard` with it.
+    - **4a's resize note** rides 4f-e: `route_event` still handles Resize inline (`set_size`, no
+      forward to the input channel); moving the sender and the forward together with the
+      probe/drain relocation avoids a window where both paths publish. `read_input`'s defensive
+      `Resize` arms are already in place for when the forward starts.
+    - `run_editor` takes `&Content`, not the bare manager — content is the handle its callers
+      (`edit_text`, `open_editor`) already hold; widen only for a manager-only caller.
   - **4f-e — TermIO into Draw: the setup rework.** TermIO is constructed first (in `Interactive`);
     its handles are handed out (`input` → repl, `size` clones → content and the manager); caps are
     probed at TermIO construction and handed to `Content::new` (the `Caps::probe` site leaves
