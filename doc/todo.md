@@ -57,10 +57,10 @@ and link a doc/ and/or commit hash
 - [ ] output.rs drawing refactor — 261003_output_drawing_refactor.md (+ impl companion)
   - [x] Step 1: extract `render.rs` / `draw.rs` / `ansi.rs` mechanically; Output facade kept (§8.1)
   - [ ] Step 2: `TermIO` — reader, raw mode, DSR, size watch; un-`#[serial]` width tests (§8.2) —
-    moves landed (`74e987c`); the `TermGuard` → `TermIO` type fold rides with step 4 (4a)
+    moves landed (`74e987c`); the type fold landed in 4a (`8cc955d`); size-query fallbacks → 4g
   - [x] Step 3: split `content/`; `AgentConfig.content` + `Content` tap seam; content consumers on
     `&Content` (§8.3) — landed 3a–3d (`47122b4`…`cf7b6a8`); frame/input rides `AgentConfig.output`
     until step 4 (follow-ups recorded in the impl doc)
   - [ ] Step 4: fold in `RenderManager` + UI; elements → `Arc<Mutex<…>>`, shared editor (§8.4) —
-    sub-commit plan 4a–4h recorded in the impl doc
+    sub-commit plan 4a–4h recorded in the impl doc — 4a landed (`8cc955d`), 4b next
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)

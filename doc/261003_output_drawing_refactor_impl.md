@@ -218,12 +218,12 @@ done (`257e8e3`, `799cd12`, `177aa64`).
 
 The moves are landed (`74e987c`); the deferred remainder is below.
 
-> **Deferred to step 4** (the moves landed in `74e987c`): the `TermIO` **type** — the closed
-> `Tty`/`Plain` enum owning the reader and folding `TermGuard`, plus `TermHandles` and the
-> `recording()`/`null()` constructors — rides with step 4 (**4a**). So do the three
-> `Output` trait-default size queries (`cursor_row`/`frame_size`/`painted_size`) that still fall
-> back to a live `crossterm::terminal::size()` (non-console outputs only; `ConsoleOutput` already
-> reads the watch) — step 4 **4g**. The loop-top resize probe is deliberate, not a leftover.
+> **Deferred to step 4** (the moves landed in `74e987c`): the three `Output` trait-default size
+> queries (`cursor_row`/`frame_size`/`painted_size`) that still fall back to a live
+> `crossterm::terminal::size()` (non-console outputs only; `ConsoleOutput` already reads the
+> watch) — step 4 **4g**. The loop-top resize probe is deliberate, not a leftover. (The `TermIO`
+> **type** — the closed `Tty`/`Plain` enum owning the reader and folding `TermGuard`, plus
+> `TermHandles` and the `recording()`/`null()` constructors — landed in **4a**, `8cc955d`.)
 
 ### Step 3: Split `content/`
 
@@ -246,9 +246,21 @@ move element construction into `ui/`/repl.
 call-site repoints after; the design-led element conversion closes the step — last, where there is
 most runway to expand into separate sub-commits.
 
-- **4a — `TermIO { Tty | Plain }` as a closed type.** The step-2 deferral's first half: the enum
-  owning the reader and folding `TermGuard`, plus `TermHandles` and the `recording()`/`null()`
-  constructors. Mechanical `termio.rs` restructure + wiring; no behavior change.
+- **4a — `TermIO { Tty | Plain }` as a closed type.** Landed (`8cc955d`) — the commit message
+  records what moved. Leftovers, each claimed:
+  - The cloneable `Arc<TermGuard>` holders (`Repl`, the prompt loop, `$EDITOR` via app_state, the
+    back-off pump) still name the guard directly; `TermIO::guard()` hands the handle out — **4f**
+    converts them to the manager/TermIO suspend and the handle dies.
+  - Resize still travels the size watch only (`route_event` keeps it Inline, as step 2 decided);
+    the design's "resize reaches the input channel too" forwards when `read_input` collapses to
+    one handle — **4f**.
+  - `TermIO` parks in `Interactive` (read only for its lifetime) — the `Draw` move takes it, and
+    the design has `Draw { term_io, cache }` — **4c** is its natural rider.
+  - `TermIO::write` has no production caller (Draw still owns the production writer), caps are
+    still probed at `Content::new` rather than at `TermIO` construction, and the size watch's
+    sender is still the process-wide `LazyLock`. The writer + caps move rides with `Draw` (**4c**,
+    per the point above); the watch sender moves when the render manager takes the `size` handle
+    (**4b**).
 - **4b — `RenderManager` shell: composition + apply leave the `Output` trait.** New type in
   `render.rs` — `{ stack, size: SizeWatch }` with `configure` / `render()` / `render_batch`;
   `render()`'s body is today's `draw_elements` default (compose → allocate → render → apply →
@@ -278,10 +290,10 @@ most runway to expand into separate sub-commits.
   manager/TermIO; `read_input` collapses to one handle. `AgentConfig.output` survives this commit
   for input — dropping it is step 5.
 - **4g — Suspend/resume + DSR through the manager; dead size fallbacks die.**
-  `RenderManager::suspend()` becomes the front door (content/UI never touch TermIO), DSR is
-  answered inside TermIO, and the three `Output` trait-default size queries still falling back to a
-  live `crossterm::terminal::size()` go — non-console outputs read the watch. The loop-top resize
-  probe stays (deliberate, step-2 note).
+  `RenderManager::suspend()` becomes the front door (content/UI never touch TermIO), DSR is answered
+  inside TermIO, and the three `Output` trait-default size queries still falling back to a live
+  `crossterm::terminal::size()` go — non-console outputs read the watch. The loop-top resize probe
+  stays (deliberate, step-2 note).
 - **4h — Elements → `Arc<Mutex<…>>`; construction into `ui/`** (design-led, kept last for runway;
   expect it to split). `Element = Arc<Mutex<dyn RenderElement>>` with the shared editor held live
   across compositions; `Element::status` moves into `ui/`; `ui.rs` becomes a `ui/` module (menu
@@ -326,8 +338,8 @@ Follow-ups step 3 leaves here:
   remain only for `content_for` + the frame handle; with the tap re-shaped here content is covered
   and the frame is gone. `LogOutput` (§10) dies here regardless.
 - **Capture stays at the `ContentWrite` hand-off** — re-tapped early in **4d** (content bytes only,
-  never frames: the old writer-swap also caught `draw_frame` bytes). Nothing to migrate here;
-  verify it as the sinks die.
+  never frames: the old writer-swap also caught `draw_frame` bytes). Nothing to migrate here; verify
+  it as the sinks die.
 
 ## 9. Resolved open questions
 
