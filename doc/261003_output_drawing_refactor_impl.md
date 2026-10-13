@@ -256,12 +256,14 @@ most runway to expand into separate sub-commits.
     one handle — **4f**.
   - `TermIO` parks in `Interactive` (read only for its lifetime) — the `Draw` move takes it, and
     the design has `Draw { term_io, cache }` — **4c** is its natural rider.
-  - `TermIO::write` has no production caller (Draw still owns the production writer), caps are
+  - `TermIO::write` has no production caller (the `Draw` writer is still a plain field), caps are
     still probed at `Content::new` rather than at `TermIO` construction, and the size watch's
-    sender is still the process-wide `LazyLock`. The writer + caps move rides with `Draw` (**4c**,
-    per the point above); the watch sender moves with its producers — the prompt loop's probe and
-    the parked-resize drain — when `read_input` collapses (**4f**; 4b landed the manager's
-    receiver half).
+    sender is still the process-wide `LazyLock`. Re-scoped by **4c** (see below): the writer +
+    caps + `TermIO`-into-`Draw` move needs `TermIO` constructed *before* `Content`/the manager —
+    today it is built later, in `Interactive` — and the capture writer-swap gone (**4d**), so it
+    rides with the **4f** setup rework; the watch sender moves with its producers — the prompt
+    loop's probe and the parked-resize drain — when `read_input` collapses (**4f**; 4b landed the
+    manager's receiver half).
 - **4b — `RenderManager` shell: composition + apply leave the `Output` trait.** Landed (`38d9513`)
   — the commit message records what moved. Leftovers, each claimed:
   - The call sites (repl, confirm, probe) keep their `&dyn Output` handles and reach the manager
@@ -279,11 +281,19 @@ most runway to expand into separate sub-commits.
   - The size watch's *receiver* is the manager's; the *sender* is still the process-wide
     `LazyLock` — it moves with its producers (the prompt loop's probe, the parked-resize drain)
     when `read_input` collapses — **4f** (see the 4a note above).
-- **4c — `Draw` moves into `RenderManager`; `Content` gets the manager handle.**
-  `with_content_writer`, the capture writer-swap and the frame pass-through lock
-  `Arc<Mutex<RenderManager>>` instead of owning `draw: Draw`; `ConsoleOutput` shares the same Arc.
-  Kills the `content.draw` forwarders and frees `Content` for the `ContentWrite` split; tests can
-  lock the manager for `&mut`, so `Draw::set_writer` should fall here too.
+- **4c — `Draw` moves into `RenderManager`; `Content` gets the manager handle.** Landed
+  (`33dc92c`) — the commit message records what moved, including the bonus the stopgap note
+  implied: `Draw`'s own `writer`/`saved_writer`/`cache` mutexes are gone too (plain fields,
+  `&mut self` writers; the manager's lock is the one serialization). Leftovers, each claimed:
+  - The writer + caps + `TermIO`-into-`Draw` move (design §Draw: `Draw { term_io, cache }`,
+    caps cached from `TermIO::caps()`) is **not** in 4c: `TermIO` is constructed after
+    `Content`/the manager today (a setup rework — it rides with **4f**, where the handles start
+    flowing to the repl anyway), and the capture writer-swap has to be gone first — **4d**
+    retires it, else `TermIO` would need a capture mode of its own.
+  - `Content::draw()` accessor stays until `Content` stops touching the sink — **4d** ("every
+    write enters through `render()`" makes it dead).
+  - `Draw` and the manager each hold a receiver of the same size watch; the duplication dies with
+    `TermIO`'s move into `Draw` (**4f**, per the first point).
 - **4d — `ContentWrite` + the `render()` hand-off; capture taps early.** Split
   `with_content_writer`: emitters collect rows into `ContentWrite { lines, stream: Stream }` rather
   than `&mut dyn io::Write`, and `Content` hands it to `render(Some(w))` (streaming) or
