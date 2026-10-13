@@ -252,39 +252,86 @@ until the last step.
      `Content` would corrupt the matrix.
    - `ConfirmPort` / `confirm.rs` untouched; `Confirmation` (output.rs:25) stays put.
 
-   **Landed (3a, 3b, 3c — see commits `47122b4`, `aab6447`, `1b35b1c`, `322be81`, `61d7e18`):**
-   classification + separator matrix + boundary state in `content/composition.rs`; rendering in
-   `content/{markdown,panel,preview,text}.rs`; and the `Content` handle in `content/handle.rs`,
-   which owns the content state, the width watch, the streaming renderers, the byte sink (`Draw`),
-   the block write pipeline (`with_content_writer` + the panel emitters), and the content API
-   (`display_*`/`stream_*`/`begin|end_response`/header). `ConsoleOutput` is now the frame + forward
-   facade: its `Output` content methods forward through `self.content.…`, and the frame methods
-   reach `content.draw` via a temporary pass-through. What those leave behind:
+   **Landed (3a–3d — commits `47122b4` … `cf7b6a8`):** classification + separator matrix and
+   boundary state in `content/composition.rs`; rendering in
+   `content/{markdown,panel,preview,text}.rs`; the `Content` handle in `content/handle.rs`
+   (content state, width watch, streaming renderers, the `Draw` sink, the block write pipeline +
+   panel emitters, the content API); and step 3d, which made `Content` the handle every content
+   consumer reaches:
+
+   - **`AgentConfig { content: Arc<Content>, output: Arc<dyn Output> }` — a dual field**, the
+     transition the §4 sketch compresses into one. `AgentConfig::content_for(&output)` wires the
+     seam: content verbs short-circuit through `output`, so `RecordingOutput` / `QuietOutput` /
+     `NoOutput` keep capturing and discarding with no render stack behind them (§4's `tap`).
+     `ConsoleOutput.content` is now `Arc<Content>` shared with the config through
+     `ConsoleOutput::content()`, so the two handles are one state; `--quiet` gets a tapped
+     `Content`, production the console's own (tap `None`, renders for real).
+   - **Agent core repointed:** `CodeAgent` and `LoggingHook` carry `content` (the hook held
+     `output` and used it only for content), so `turn.rs` / `build.rs` display, stream and response
+     calls go through `self.content` while frame calls (`set_status`, `frame_size`,
+     `paint`/`settle`) stay on `self.output`. `interactive.rs`, `agent.rs`, `compaction`,
+     `v25_replay` and `v25_session` follow.
+   - **Content-only helpers take `&Content`,** params renamed `output` → `content`: `render_turn`,
+     `replay_units`, `replay_last_turns`, `handle_replay`, `replay_last_turn_silent`,
+     `retry_summarization`, `resume_session`, `Repl::batch_slash` + `batch_commit`. They brought
+     `Content::begin_batch` + `ContentBatchGuard` (batching suppresses `Draw`'s reposition, so it
+     is content's) and gave `read_input` a second, `content` param beside `output` for its resize
+     repaint.
+   - Test knobs a shared `Arc<Content>` cannot field-assign: `reasoning_on_stderr` is now an
+     `AtomicBool` with a `#[cfg(test)]` setter, and `Draw::set_writer(&self)` replaces the direct
+     writer swap.
+
+   **Step 3 is complete.** The transition contract's structural debts are step-4/5 by nature and
+   are collected there; they are named here so none is lost:
 
    - `with_content_writer`'s byte-production half (`WrapLines`/EL stack) lives in `Content` but is
-     still Draw-coupled; splitting it into `ContentWrite` handed to `render()` is step 4.
-   - `begin_capture`/`end_capture` still tap the sink (`content.draw.saved_writer`) — re-pointing
-     capture at the `ContentWrite` hand-off is step 4/5.
-   - The temporary frame pass-through (`ConsoleOutput` → `content.draw`) dissolves in step 4, when
-     `RenderManager` becomes the frame front door.
+     Draw-coupled; splitting it into `ContentWrite` handed to `render()` is step 4.
+   - `begin_capture`/`end_capture` tap the sink (`content.draw.saved_writer`), not the
+     `ContentWrite` hand-off — step 4/5.
    - The moved rendering's unit tests still live in `output.rs`'s test modules → relocate to
      `content/` when convenient.
 
-   **Remaining:**
-   - **3d — repoint writers; `AgentConfig.output` → `AgentConfig.content`.** Field rename + type:
-     `AgentConfig.content: Arc<Content>`; every `with_config(|c| c.output)` / `config.output` site
-     (main.rs:309, settings.rs ×3, app_state.rs, interactive.rs ×4, build.rs ×2, compaction ×2,
-     v25_replay, v25_session, agent.rs); interactive / repl / tools content calls → `content.*`;
-     test helpers `for_test_with_output` → content, `test_settings()` and the `AgentConfig` builders
-     follow. `ConfirmPort` unchanged. *Pin:* full suite + `/replay` + confirm tests.
-
-   *Open question for 3c/3d:* frame pass-through shape — `Content` method refs to its sink vs the
-   agent carrying `Content` + `Output` as two handles. (`RecordingOutput` keeps recording at the
-   sink until the `ContentWrite` tap exists — a transition note, not a question.)
+   *Resolved (was: frame pass-through shape):* the agent carries **two handles** — `Content` for
+   content, `output` for frame/input — rather than `Content` growing method refs to its sink. The
+   cost is the dual field and one dual-parameter helper (`read_input`), both listed under step 4.
 4. **Fold in `RenderManager` and UI.** `configure` / `render` / `render_batch`; convert elements to
    `Arc<Mutex<…>>` with the shared editor; move element construction into `ui/`/repl.
+
+   Follow-ups step 3 leaves here:
+
+   - **Re-point the frame helpers' content calls.** `settle` (`repl.rs:1329`, `:1351`),
+     `emit_commit` (`repl.rs:2266`) and `confirm::paint` (`confirm.rs:336`) take `&dyn Output` and
+     reach content through `ConsoleOutput`'s forwarders. Once each holds a `Content` (or a hub that
+     owns one) those forwarders go dead and `Output` shrinks to frame + input.
+   - **Collapse `read_input`'s two params.** It carries `output: &dyn Output` *and*
+     `content: &Content`; step 4 gives the frame/input half to RenderManager + the repl's `input`
+     channel, leaving one handle.
+   - **Re-home the agent's frame verbs.** `CodeAgent.output` survives only for `set_status`,
+     `frame_size` and `paint`/`settle`'s `&dyn Output`; `turn.rs`/`pumps.rs` re-point those at
+     RenderManager and the field goes. Same for `interactive.rs`'s `run_entry_dsr`,
+     `turn_backoff_pump`, `get_user_input`, and `app_state.rs:761`'s `run_editor`.
+   - **Decide where batching lives.** `Content::begin_batch`/`ContentBatchGuard` suppress `Draw`'s
+     reposition; if RenderManager owns reposition, the guard moves to the hub and `replay_units`
+     takes that instead of `Content`.
+   - **Re-shape the tap.** `Content::tap` is `Option<Arc<dyn Output>>`; once the trait is gone it
+     becomes a verb recorder (`FnMut` / sink) or folds into capture. `content_for` then reduces to
+     a quiet-vs-record switch, and `RecordingOutput`/`ScriptOutput` lose their content duties.
+   - **Revisit the interior-mutability stopgaps.** The `AtomicBool` routing flag and
+     `Draw::set_writer` exist only because `Content` is shared behind an `Arc`; both may fold into
+     the tap once the handle's shape settles.
 5. **Delete `output.rs`.** Remove the sinks, the dead taps (`LogOutput`),
    and the trait; prune `lib.rs` re-exports.
+
+   Follow-ups step 3 leaves here:
+
+   - **Drop `AgentConfig.output`,** reaching the §4 target `AgentConfig { content, confirm_port }`.
+     `AgentConfig::content_for` and `ConsoleOutput::content()` exist only for the dual field and go
+     with it, as does `ConsoleOutput` itself — ending the `Arc<Content>` sharing.
+   - **Retire the `Output`-shaped sinks.** `QuietOutput`/`NoOutput`/`RecordingOutput`/`ScriptOutput`
+     remain only for `content_for` + the frame handle; with the tap re-shaped (step 4) content is
+     covered and the frame is gone. `LogOutput` (§10) dies here regardless.
+   - **Capture narrows to the `ContentWrite` hand-off** — content bytes only, never frames (§4: the
+     writer swap also catches `draw_frame` bytes today).
 
 ## 9. Resolved open questions
 
