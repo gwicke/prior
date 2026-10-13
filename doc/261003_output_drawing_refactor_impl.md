@@ -278,14 +278,18 @@ most runway to expand into separate sub-commits.
     through `settle`/`paint`/the turn pumps now would be re-done when those params collapse).
   - The compose head stays on `Output::compose_area` (the status row is console state) — **4h**,
     when the bar becomes an installed element and the head moves into `render()`.
-  - The recipe field (`stack`) did not land: the recipe must leave `DrawCache` together with
+  - ~~The recipe field (`stack`) did not land: the recipe must leave `DrawCache` together with
     `reposition_area` (Elements cannot be cloned into two recipes), which is **4e** — the hub owns
-    reposition there, and the recipe goes with it.
+    reposition there, and the recipe goes with it.~~ Settled by **4e** (`bce38e7`):
+    `DrawCache.element_stack` is gone, `RenderManager::recipe` is the composition `render` applied,
+    `reposition_area` is the hub's (reading it at the hub's configured `budget()`, not the
+    hard-coded `live_budget` — a latent mismatch with `render`'s compose a configured ratio would
+    have exposed), and the direct-`draw_frame` clear is the hub-level `draw_frame` forward.
   - `render_batch`'s body landed with the `ContentWrite` hand-off (**4d**, `98bcb85`) — it
     delegates to the same `put_content` as `render_content`, the batch flag inside deferring the
-    reposition; the batching guard itself still moves in **4e**, and that is when the two verbs can
-    diverge. `configure`'s `frame_elements` half waits for **4h** with the rest of the long-lived
-    stack.
+    reposition; the batching guard itself moved in **4e** (`bce38e7`), which did *not* split the
+    verbs — that is the final-`render()` round trip (**4f/4h**). `configure`'s `frame_elements`
+    half waits for **4h** with the rest of the long-lived stack.
   - The size watch's *receiver* is the manager's; the *sender* is still the process-wide
     `LazyLock` — it moves with its producers (the prompt loop's probe, the parked-resize drain)
     when `read_input` collapses — **4f** (see the 4a note above).
@@ -301,7 +305,8 @@ most runway to expand into separate sub-commits.
   - ~~`Content::draw()` accessor stays until `Content` stops touching the sink — **4d** ("every
     write enters through `render()`" makes it dead).~~ Settled by **4d** (`98bcb85`): the content
     write path no longer names `Draw` at all; `RenderManager::draw()` survives as the frame verbs'
-    route (until **4f**) and the batch flag's (until **4e**).
+    route only (until **4f**) — its batch-flag half ended with **4e**, the mechanics being the
+    hub's own now.
   - `Draw` and the manager each hold a receiver of the same size watch; the duplication dies with
     `TermIO`'s move into `Draw` (**4f**, per the first point).
 - **4d — `ContentWrite` + the `render()` hand-off; capture taps early.** Landed (`98bcb85`) — the
@@ -314,10 +319,11 @@ most runway to expand into separate sub-commits.
     all; the token arrives with the meta sink — **4f**.
   - `Content` hands off through two verbs, `render_content` (streaming) and `render_batch`
     (replay, inside a batch), which are today one `put_content` choreography under two names — the
-    `batch_active` flag defers the reposition either way. They diverge when the batching guard
-    moves to the hub (**4e**); the end state's single `render(Some(w))` — compose and content in
-    one call, the frame applied below the block — waits for the frame verbs (**4f**) and the
-    installed stack (**4h**).
+    `batch_active` flag defers the reposition either way. **4e** moved the guard to the hub but did
+    *not* split them: the deferral is still the shared flag's, and the verbs diverge only when the
+    end state's single `render(Some(w))` — compose and content in one call, the frame applied below
+    the block — replaces the guard's `end_batch` reposition, which waits for the frame verbs
+    (**4f**) and the installed stack (**4h**).
   - Capture now taps the hand-off exactly as designed: content bytes only, the deliberate
     narrowing over the old writer swap (which also caught frame bytes), pinned by
     `capture_catches_content_but_never_frame_bytes`. Captures stay *raw* — the width guard and
@@ -329,9 +335,19 @@ most runway to expand into separate sub-commits.
     lock still spans build + hand-off (deliberate — the same serialization 4c established, and the
     boundary state is Content's under it). Formatting-only, unlocked, comes with the round trip
     (**4f/4h**) once non-reentrancy is proven for the build span.
-- **4e — Batching guard → the hub** (its own commit, deliberately). `Content::begin_batch` /
-  `ContentBatchGuard` move to `RenderManager`; `replay_units` and friends take the manager handle
-  beside `Content`. Settles "where batching lives": the hub owns reposition.
+- **4e — Batching guard → the hub** (its own commit, deliberately). Landed (`bce38e7`) — the commit
+  message records what moved. Settled "where batching lives": the hub owns reposition, the flag
+  and the deferred frame's re-emit; the recipe moved with it (the 4b note above). What it leaves
+  behind, for the steps below:
+  - The `Output`-layer `BatchGuard` stays: it names the `Output` whose drop ends the batch, for
+    the handle holders (repl, confirm, tests) still on `&dyn Output` — it dies with the trait in
+    **step 5**. `replay_units` opens its batch through `ContentBatchGuard::open(&content.manager)`
+    — the manager handle *beside* `Content` is the one Content's own layer holds down to (design
+    §Content); no signature threading was needed, and the tap path is harmless there (nothing
+    reaches the hub, so the flag raises and `end_batch` finds nothing deferred).
+  - The two hand-off verbs remain one body under two names (see the 4d note above): the guard
+    moving does not itself split the deferral — that is the final-`render()` round trip,
+    **4f/4h**.
 - **4f — Frame verbs re-home: agent, interactive, repl, confirm.** `CodeAgent.output`'s last verbs:
   `set_status` → a `StatusText` push the bar element reads on each `render()`,
   `frame_size`/`painted_size` → the size watch, `paint`/`settle` → the manager. `settle`,
@@ -363,9 +379,10 @@ Follow-ups step 3 leaves here — each claimed by a commit above unless noted:
   `frame_size` and `paint`/`settle`'s `&dyn Output`; `turn.rs`/`pumps.rs` re-point those at
   RenderManager and the field goes. Same for `interactive.rs`'s `run_entry_dsr`,
   `turn_backoff_pump`, `get_user_input`, and `app_state.rs:761`'s `run_editor`. → **4f**
-- **Decide where batching lives.** `Content::begin_batch`/`ContentBatchGuard` suppress `Draw`'s
+- ~~**Decide where batching lives.** `Content::begin_batch`/`ContentBatchGuard` suppress `Draw`'s
   reposition; if RenderManager owns reposition, the guard moves to the hub and `replay_units` takes
-  that instead of `Content`. → **4e** (answer: the hub owns reposition)
+  that instead of `Content`.~~ Answered and landed by **4e** (`bce38e7`): the hub owns reposition;
+  the guard moved there and `replay_units` opens it from the manager handle beside `Content`.
 - **Revisit the interior-mutability stopgaps.** The `AtomicBool` routing flag and `Draw::set_writer`
   exist only because `Content` is shared behind an `Arc`. `set_writer` should fall in **4c** (the
   manager's `Mutex` restores `&mut` access); the flag folds with the tap re-shape (step 5) — or
