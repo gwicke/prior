@@ -366,21 +366,25 @@ most runway to expand into separate sub-commits.
     - `StatusText` stays `pub` (it crosses the pub `agent::status::status_text` return); the
       visibility pruning is step 5's.
   - **4f-b — the frame path leaves `&dyn Output`: compose head + `paint`/`settle`/`emit_commit`/
-    confirm on the manager.** With the bar self-contained (4f-a), `compose_area`'s head no longer
-    needs `ConsoleOutput`'s privates: the compose head moves out of `Output` into the paint path —
-    a helper that builds `[status, input, …overlays]` from content's handles (status raw data,
-    streaming) plus the session's elements and calls `manager.render(stack, …)` directly. The
-   head's *final* home is `render()` itself, with the bar an installed element — that much is
-    **4h**; this sub-commit only moves it out of `Output`. What each function actually takes,
-    by what it consumes: `paint_prompt` and `Repl::paint` need content (the compose head reads the
-    bar's raw-data and streaming handles) + manager (the render); `Repl::settle` the same, plus its
-    error path's `display_text` (content) and `cursor_row` (manager); `emit_commit` content
-    (`display_committed_prompt`) plus the redraw closure it already takes.
-    `confirm::paint` needs **only the manager** — a bare overlay composition, no content anywhere;
-    `confirm::resolve` needs content for the decision line (`display_plain` is a content verb,
-    tap seam included) plus the redraw closure — the repaint-then-decide order is the invariant
-    the function exists to protect, so the line does not go back to the callers. Pumps/turn/probe
-    call sites re-point. `is_streaming` leaves the trait with them.
+    confirm on the manager.** Landed (`cb01977`) — the commit message records what moved. Per
+    function, by what it consumes: `paint_prompt`/`Repl::paint` content (compose head + streaming;
+    the manager comes through `content.manager` — one handle, the design's graph); `Repl::settle`
+    the same plus `display_text` (content) and `cursor_row` (now a `RenderManager` method — the
+    DSR query + re-anchor, with `Output::cursor_row` a trait forward); `emit_commit` content plus
+    its redraw closure; `confirm::paint` the manager only (a bare overlay through the shared
+    `area_body`); `confirm::resolve` content (the decision line, tap seam included) plus the
+    redraw closure. `Output` loses `compose_area`, `status_row`, `draw_elements` and `is_streaming`
+    — defaults and `ConsoleOutput` impls both. Leftovers, each claimed:
+    - The compose head's interim home is `repl::compose_area` (a free fn, content handles in); its
+      final home is `render()` with the bar an installed element — **4h**.
+    - `ConsoleOutput::hub()` (pub, beside the existing `content()`) and the now-pub
+      `RenderManager::render` exist for out-of-crate drivers (the confirm probe). Both are
+      transitional surface for **step 5**'s trait deletion to prune.
+    - The pumps thread content *beside* output (dims and `$EDITOR` still reach for it) — the
+      overlap ends with **4f-c** (dims) and **4f-d** (`$EDITOR`, guards).
+    - `Output::draw_frame` keeps only test drivers (the 4d-era byte-edge tests); it and the
+      remaining frame verbs (`frame_size`, `painted_size`, `cursor_row`'s forward) go with
+      **4f-c**/**4f-d** and **step 5**.
   - **4f-c — dims: `frame_size`/`painted_size` → the size watch.** The agent-side callers
     (`pumps.rs`, `turn.rs`, interactive) read the watched size (frame dims) and the manager's
     applied size (what a resize comparison needs) through the handles `AgentConfig` already
