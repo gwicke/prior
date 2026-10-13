@@ -8,18 +8,28 @@
 //! pass-through to `self.content.draw` for them until step 4 makes
 //! `RenderManager` the frame front door.
 
-use std::sync::Mutex;
+use std::io::{self, Write};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
+use console::style;
 use serde_json::Value;
 use tokio::sync::watch;
 
-use crate::draw::Draw;
+use crate::ansi::{at_line_start, EscState, HoldTrailing, LineClear, StripLeading, WrapLines};
+use crate::content;
+use crate::content::markdown::{answer_theme, command_lang, guess_lang, highlight_code_fg};
+use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno};
+use crate::content::text::wrap;
+use crate::draw::{plan_consume, Draw};
+use crate::row_count::RowCounter;
 use crate::settings::ShowReasoningHandle;
 use crate::termio::{Caps, TermSize};
-use markdown_stream::StreamParser;
+use markdown_stream::{Parser, StreamParser};
 use markdown_terminal::{Renderer, Theme};
 
 use super::composition::ContentBoundary;
+use super::{boundary_spacer, separator_line, ContentDisplayKind};
 
 /// The agent-facing content owner (step 3c).
 ///
@@ -59,6 +69,10 @@ pub struct Content {
     /// The content boundary/separator state (step 3a): the last declared kind,
     /// its segment-closed flag, and the held blank rows.
     pub(crate) boundary: ContentBoundary,
+    /// Whether a turn is in flight — the bar dot's only state, flipped in
+    /// `begin_response`/`end_response`. Owned by content (the path that knows
+    /// when a response starts/ends); the frame reads it via a shared handle.
+    pub(crate) streaming: Arc<AtomicBool>,
 }
 
 impl Content {
@@ -82,6 +96,7 @@ impl Content {
             show_reasoning,
             last_tool: Mutex::new(None),
             boundary: ContentBoundary::new(),
+            streaming: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -94,5 +109,767 @@ impl Content {
     /// This instance's height — symmetric to [`Self::width`].
     pub(crate) fn height(&self) -> usize {
         self.size.borrow().height.max(1)
+    }
+}
+
+impl Content {
+    /// Write content bytes, then advance the draw cache by the number of
+    /// terminal rows they occupy.
+    ///
+    /// The count is *measured from the bytes*, not predicted from the source:
+    /// a message is a prefix plus rendered markdown, a panel row is padded to
+    /// the full width, a long line wraps — none of which the caller knows
+    /// (doc/row_accounting.md §6, phase B). Everything content-related goes
+    /// through here or [`Self::with_content_writer`], so the count cannot be
+    /// forgotten; a writer that bypassed both is a bug the frame tests find.
+    pub(crate) fn write_content(&self, bytes: &[u8]) {
+        self.write_content_kinded(bytes, None);
+    }
+
+    /// [`Self::write_content`] that also says what was written, so
+    /// `with_content_writer` can record it as the transcript's last kind.
+    ///
+    /// Most content is not classified — a message, a tool result, streamed
+    /// text — and passes `None`, which simply clears the record. The point of
+    /// the parameter is that a *caller* declares its own kind; the choke point
+    /// never has to guess from the bytes.
+    pub(crate) fn write_content_kinded(&self, bytes: &[u8], kind: Option<ContentDisplayKind>) {
+        self.write_content_block(bytes, kind, false);
+    }
+
+    /// [`Self::write_content_kinded`] for the write that ends a segment — an
+    /// answer flush after which a tool panel, or the next segment's text,
+    /// arrives. The flag is what lets the next write to declare the *same* kind
+    /// still count as an opener: the two blocks are two, and only the writer
+    /// knows that.
+    pub(crate) fn write_content_closing_segment(
+        &self,
+        bytes: &[u8],
+        kind: Option<ContentDisplayKind>,
+    ) {
+        self.write_content_block(bytes, kind, true);
+    }
+
+    pub(crate) fn write_content_block(
+        &self,
+        bytes: &[u8],
+        kind: Option<ContentDisplayKind>,
+        closes: bool,
+    ) {
+        // No wrapping here: `with_content_writer`'s `WrapLines` is the one
+        // choke every writer passes — batch strings, streamed renderer
+        // output, everything — so a line can no longer reach the terminal
+        // wider than the terminal.
+        let width = self.width();
+        self.with_content_writer(width, kind, closes, |out| {
+            let _ = out.write_all(bytes);
+        });
+    }
+
+    /// Run `f` with `Draw`'s writer lock wrapped in a [`RowCounter`], then
+    /// advance the draw cache by the rows `f` wrote. For the writers that
+    /// produce their own bytes — the streaming markdown renderers, which want
+    /// a `Write` to feed.
+    ///
+    /// `f` gets a `&mut dyn io::Write`, which keeps the counter's type (and
+    /// its borrow of the lock) out of the signature. A caller handing it to
+    /// something generic over `W: Write` — `Renderer::feed`,
+    /// `commit_thinking` — passes `&mut out`, which is itself a `Write` and
+    /// satisfies the `Sized` bound that `&mut dyn Write` cannot.
+    ///
+    /// `width` is the width the content is being rendered for; pass the
+    /// renderer's own width so a line that wrapped at render time is counted
+    /// at that width.
+    ///
+    /// `kind` is what this write *is* (see [`ContentDisplayKind`]). It is
+    /// recorded as the transcript's last kind once the write has landed —
+    /// recorded last so a wrapper that makes several of these calls can leave
+    /// the kind it wants standing, rather than having its own first call clear
+    /// it. `None` clears the record: "unclassified" is the honest answer for
+    /// content that did not declare itself.
+    ///
+    /// `closes_segment` says this write is the last flush of its segment, so
+    /// the *next* write opens a new block even under this same kind — the
+    /// second dimension of the boundary rule alongside the pair of kinds. It is
+    /// the writer telling the choke point what it is doing; the stream is never
+    /// asked, because a row held back has not reached the stream and a question
+    /// about a row it cannot see is what the old boundary logic kept getting
+    /// wrong.
+    // `drop_non_drop`: the `drop()`s on `hold`/`counter`/`clear` below are
+    // deliberate borrow-shortening, not disposal — each of those wrappers holds
+    // a `&mut` into `buf` that has to be released at an exact point in the
+    // sequence, well before the end of the function. Clippy's advice (that the
+    // call "only extends its contained lifetimes") describes the opposite of
+    // the intent: `drop()` moves the value and ends the borrow, which is the
+    // only way to release it early. Scoped here rather than at crate level so
+    // an accidental `drop()` elsewhere is still reported.
+    #[allow(clippy::drop_non_drop)]
+    pub(crate) fn with_content_writer<T, F>(
+        &self,
+        width: usize,
+        kind: Option<ContentDisplayKind>,
+        closes_segment: bool,
+        f: F,
+    ) -> T
+    where
+        F: FnOnce(&mut dyn io::Write) -> T,
+    {
+        let mut out = self.draw.writer.lock().unwrap();
+        // The *caller* declares the kind — the choke point never guesses from
+        // bytes — and the previous one is read first, because the whole
+        // boundary rule is a statement about the pair. Recording before `f`
+        // runs is deliberate: an emitter drawing several things inside this one
+        // block then reads back its own kind, so its internal separators are
+        // (kind, kind) and contribute nothing.
+        let (old, closed) = self.boundary.record(kind, closes_segment);
+        // A write opens a new block when its kind differs from the last, or
+        // when the last one said it closed its segment. Everything the opener
+        // does — drawing the boundary row, stripping this block's leading
+        // blanks, refusing to release what the last block held — follows from
+        // that one answer.
+        let opener = old != kind || closed;
+        // Blank rows the previous write held past its line terminator. One is
+        // a paragraph gap the renderer left where no further content arrived,
+        // and at a boundary the row `boundary_spacer` draws is that same row:
+        // it is consumed, not stacked. More than one is an emitter asking for
+        // separators it is not entitled to, and the backtrace below is how the
+        // offender is found — a diagnostic, not a policy decision about what to
+        // do with them, which stays "drop".
+        let held = self.boundary.take_held();
+        // Two distinct findings, both about what the *previous* write left
+        // behind, and both no more than a backtrace with which to find the
+        // emitter:
+        //
+        // 1. Trailing separator lines at a kind or segment boundary — the block
+        //    that just ended had no further content to put them to work for.
+        //    They are dropped (the row at this boundary is the matrix's), but
+        //    the emitter that asked for them is named.
+        // 2. More than one blank separator line anywhere — one is the most that
+        //    can ever be legitimate as held interior spacing, so two means the
+        //    content emitted a gap no following row was ever going to explain.
+        debug_assert!(
+            !(opener && held > 0),
+            "content left trailing separator lines at a content boundary: \
+             {old:?} -> {kind:?} held {held} row(s)\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+
+        // Content goes to a buffer first, through the line-clear transform
+        // (a line clear with each line the write enters — overwrite, one pass,
+        // ui_draw_261001). Nothing reaches the stream until the write is known
+        // to *have* bytes, which defers the consume: a write that renders
+        // nothing (every empty delta) takes no frame and moves nothing, so the
+        // frame stays live and the next compose can still diff it.
+        //
+        // Captures get the raw bytes — they are assertions against content,
+        // not against a screen.
+        let capturing = self.draw.saved_writer.lock().unwrap().is_some();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut clear = LineClear {
+            inner: &mut buf,
+            pending: true,
+            enabled: !capturing,
+        };
+        // The counter sits *below* the line-clear (the codes are added to the
+        // stream after it counts) and *above* the buffer, so it counts the
+        // bytes as the terminal will receive them. The consume's walk, when
+        // there is one, still goes straight to the writer, ahead of all of
+        // this: it is cursor movement, not content, and never passes through
+        // the counter or the clear.
+        let mut counter = RowCounter::new(&mut clear, width);
+        // The width guard goes between the hold and the counter: held
+        // newlines reset its column, its inserted newline reaches the
+        // counter (counted as the row move it replaces) and the line-clear
+        // (armed for the continuation row). See `WrapLines`.
+        let mut wrap = WrapLines {
+            inner: &mut counter,
+            width: width.max(1),
+            enabled: !capturing,
+            col: 0,
+            partial: Vec::new(),
+            esc: EscState::None,
+        };
+        // The rows that belong *between* blocks — the matrix's boundary line,
+        // and whatever the previous block held back — are pending content, not
+        // something drawn on the way in. They go to the same mechanism that
+        // holds a block's own trailing newlines, so they materialise only if
+        // content follows to sit under them: a write with nothing in it (a
+        // segment flush with nothing left, a delta that rendered nothing) draws
+        // no row at all, and its rows ride on to the next write, which either
+        // releases them before its content or *is* the boundary that wanted one
+        // row in the first place.
+        //
+        // One boundary gets at most one row: an opener that wants a separator
+        // absorbs whatever was held rather than stacking on it, and a write
+        // that is not a boundary releases what was held as interior spacing.
+        let rows_due = if opener {
+            usize::from(boundary_spacer(old, closed, kind).is_some())
+        } else {
+            0
+        };
+        // Normalized to at most one: a boundary gets one row, and one piece of
+        // held interior spacing gets one row. Two held lines can only be
+        // content that over-emitted (blamed above), never something to draw.
+        let pending = rows_due.max(held).min(1);
+        let mut hold = HoldTrailing {
+            inner: &mut wrap,
+            pending: 0,
+            wrote_content: false,
+            wrote_any: false,
+        };
+        // Seeded as pending state rather than written through: a boundary row
+        // is not content, and a write that adds nothing of its own must still
+        // read as empty afterwards.
+        hold.pending = pending;
+        let r = if opener {
+            // Strip a block's leading blank lines: the boundary line above put
+            // exactly one row there, and content that opens with newlines
+            // would turn it into two. Stops at the first byte that is not a
+            // newline, so everything after it — interior paragraph gaps
+            // included — is untouched.
+            let mut strip = StripLeading {
+                inner: &mut hold,
+                armed: false,
+            };
+            f(&mut strip)
+        } else {
+            f(&mut hold)
+        };
+        // Did anything of substance cross? Empty and newline-only writes are
+        // both "no": the leading strip has already removed a block's own blank
+        // lines, so what is left is either content or nothing.
+        let wrote_any = hold.wrote_any;
+        let wrote_content = hold.wrote_content;
+        let carried = hold.finish();
+        drop(hold);
+        // Blame where the content is written, not where it lands: a block that
+        // ends in two or more blank lines is over, whatever comes next, and the
+        // backtrace here names the emitter rather than the innocent boundary
+        // that later meets its row.
+        debug_assert!(
+            !(wrote_content && carried > 1),
+            "content left more than one blank separator line: {old:?} -> \
+             {kind:?} carried {carried} row(s)\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        // What is stored for the next write. A write that wrote nothing at all
+        // restores what it found: the boundary row it seeded is re-derived from
+        // a boundary that still stands (its kind was rolled back too), so
+        // carrying it would only make it look like the *previous* block's
+        // trailing — and get that block blamed for a row it never emitted. Any
+        // write that did write carries on, capped at one row: one separator is
+        // all a gap ever is, and anything past it was already blamed above.
+        let held_next = if wrote_any { carried.min(1) } else { held };
+        self.boundary.store_held(held_next);
+        if !wrote_content {
+            // A write with no content in it changes no boundary: its new kind
+            // never happened, so the predecessor still stands and the next
+            // write still gets the row that boundary owed it.
+            //
+            // INVARIANT 1 (content write): wrote_content == true
+            //   - last_content_display_kind = kind (new kind stands)
+            //   - last_content_closes_segment = closes_segment (new closed stands)
+            //
+            // INVARIANT 2 (empty write): wrote_content == false
+            //   - last_content_display_kind = old (kind unchanged)
+            //   - last_content_closes_segment = closed || genuinely_closes
+            //     where genuinely_closes = closes_segment && old == kind && !closed
+            //     i.e. an empty write only propagates closed=true when it GENUINELY
+            //     closes an open segment of the SAME kind (old == kind && !closed).
+            //     This prevents an empty turn end (old=None, kind=ResponseText) from
+            //     spuriously setting closed=true, which would inject blank lines
+            //     before subsequent retry messages.
+            self.boundary
+                .restore_empty(old, closed, kind, closes_segment);
+        }
+        let rows = counter.rows();
+        let _ = counter.flush();
+        drop(counter);
+        drop(clear);
+        // Nothing reached the stream: no rows moved, nothing consumed, no
+        // reposition owed — and the frame stays *live*, so the next compose
+        // can still diff it. The kind/hold bookkeeping above already ran: an
+        // empty write is still a statement about the boundary.
+        if buf.is_empty() {
+            drop(out);
+            return r;
+        }
+        // **Consume, then write** (ui_draw_v2 §4.5 P1 / ui_draw_261001): the
+        // walk goes ahead of the bytes — cursor movement, straight to the
+        // writer, never through the counter (see above) — and the content
+        // follows, already carrying its per-line clears. No erase with the
+        // walk: each line clears the row it enters, and rows the content never
+        // reaches are the reposition's `old_h` tail to clear in its own pass.
+        let (walk, taken) = {
+            let mut cache = self.draw.cache.lock().unwrap();
+            match plan_consume(&mut cache) {
+                Some((walk, frame)) => (walk, Some(frame)),
+                // No live area: the cursor is wherever the last write left it,
+                // which is where the content belongs. Nothing to walk and no
+                // `CR` to emit — the column is the content path's own
+                // bookkeeping here, not something to reset.
+                None => (String::new(), None),
+            }
+        };
+        if !walk.is_empty() {
+            let _ = out.write_all(walk.as_bytes());
+        }
+        let _ = out.write_all(&buf);
+        let _ = out.flush();
+        drop(out);
+        // Zero rows means nothing moved, and a frame stays live.
+        if rows > 0 {
+            self.draw.note_lines(rows);
+        }
+        // The area comes back below what was just written — re-rendered rather
+        // than replayed, so its status row is whatever it is *now*: the turn's
+        // `set_status` and the dot's flip both happen after the REPL composed.
+        // The consume's rows ride along for the below-frame clear
+        // (`old_h - h_new - consumed_rows` in `paint_forward`), accumulated
+        // across a batch's writes and taken by whichever reposition follows.
+        //
+        // Inside a batch the reposition waits: the frame stays consumed for
+        // the whole burst and the guard's drop emits it once (ui_draw_v2 R5).
+        let taken = {
+            let mut cache = self.draw.cache.lock().unwrap();
+            if taken.is_some() || cache.deferred.is_some() {
+                cache.consumed_rows += rows;
+            }
+            match taken {
+                Some(taken) if !cache.batch_active => Some(taken),
+                Some(taken) => {
+                    // Keep the *first* frame taken: it is `reposition_area`'s
+                    // fallback when no recipe recorded itself, and a later
+                    // write finds nothing to consume and so contributes none.
+                    if cache.deferred.is_none() {
+                        cache.deferred = Some(taken);
+                    }
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(taken) = taken {
+            let bytes = self.draw.reposition_area(width, taken);
+            let mut out = self.draw.writer.lock().unwrap();
+            let _ = out.write_all(bytes.as_bytes());
+            let _ = out.flush();
+        }
+        r
+    }
+
+    /// Commit all buffered *thinking* to the (dimmed) thinking renderer and
+    /// start a fresh thinking parser.
+    ///
+    /// Uses `StreamParser::flush()` — **not** `write(b"\n\n")` — so
+    /// lookahead-dependent blocks (bullet/numbered lists, tables, fenced code)
+    /// are emitted *now*. A blank line cannot close a GFM list (the parser must
+    /// see a non-list line or EOF), so `write(b"\n\n")` left such reasoning
+    /// stranded in the parser until `end_response`'s `flush()` — which runs
+    /// *after* the answer parser, so the reasoning printed *below* the answer.
+    /// The thinking *renderer* is kept so post-tool thinking reads as one
+    /// continuous faded stream. See `doc/reasoning_order_opus.md` §4.
+    pub(crate) fn commit_thinking<W: io::Write>(&self, out: &mut W) {
+        let events = {
+            let mut tparser = self.thinking_parser.lock().unwrap();
+            let events = tparser.flush();
+            *tparser = StreamParser::new_gfm_stream();
+            events
+        };
+        let mut trenderer = self.thinking_renderer.lock().unwrap();
+        let _ = trenderer.feed(&events, out);
+    }
+
+    pub(crate) fn separator(&self) {
+        self.write_content(separator_line(self.width()).as_bytes());
+    }
+
+    /// Start the renderers fresh, so the next block either of them renders
+    /// carries no gap of its own.
+    ///
+    /// A long-lived `Renderer` remembers that it has written something
+    /// (`wrote_any`) and opens its next block with a blank line. Inside one
+    /// document that is right; at a boundary the *host* already separated it is
+    /// a second blank. `end_response_segment` has always reset the answer
+    /// renderer for this reason; the tool boundary needs it for the *thinking*
+    /// renderer, which is where the doubled blank came from — a turn with
+    /// reasoning before the tool left that renderer mid-document, and its next
+    /// block (the post-tool reasoning) arrived with a gap of its own.
+    ///
+    /// The renderers hold no state the parser does not, so replacing them is
+    /// free: the parser keeps the document, the renderer starts a block.
+    pub(crate) fn reset_renderer_gaps(&self) {
+        let width = self.width();
+        let mut renderer = self.renderer.lock().unwrap();
+        *renderer = Renderer::new(answer_theme(self.caps.primary), width);
+        let mut trenderer = self.thinking_renderer.lock().unwrap();
+        *trenderer = Renderer::new(Theme::dimmed(), width);
+    }
+
+    /// Emit a segment's two flushes — the reasoning the thinking renderer
+    /// still holds, and its answer — as the *two* blocks they are, each
+    /// normalized to a line boundary with no blank row behind it, and with
+    /// whichever is last declaring the segment closed.
+    ///
+    /// Reasoning first, always: it precedes the answer it was written for, so
+    /// the pair reads the way the model produced it, and the boundary between
+    /// them is stated as (reasoning, text) — `boundary_spacer`'s row, not a
+    /// newline smuggled inside a single mixed-kind block. A half with nothing
+    /// in it writes nothing at all; a segment with neither still writes its
+    /// closing declaration, empty, so the next write knows a new block starts.
+    ///
+    /// The closing flag on whichever block is *last* is what makes the next
+    /// write open a block: a tool panel arriving next already differs in kind,
+    /// but the next segment's text does not, and two text blocks with a fresh
+    /// parser and renderer between them are two blocks.
+    pub(crate) fn write_segment_tail(&self, width: usize, answer: &[u8], thinking: &[u8]) {
+        use ContentDisplayKind::{ResponseReasoning, ResponseText};
+        let answer = at_line_start(answer);
+        let thinking = at_line_start(thinking);
+        match (answer.is_empty(), thinking.is_empty()) {
+            (false, true) => {
+                self.with_content_writer(width, Some(ResponseText), true, |out| {
+                    let _ = out.write_all(&answer);
+                });
+            }
+            (true, false) => {
+                self.with_content_writer(width, Some(ResponseReasoning), true, |out| {
+                    let _ = out.write_all(&thinking);
+                });
+            }
+            (false, false) => {
+                self.with_content_writer(width, Some(ResponseReasoning), false, |out| {
+                    let _ = out.write_all(&thinking);
+                });
+                self.with_content_writer(width, Some(ResponseText), true, |out| {
+                    let _ = out.write_all(&answer);
+                });
+            }
+            (true, true) => {
+                self.with_content_writer(width, Some(ResponseText), true, |_out| {});
+            }
+        }
+    }
+
+    /// Close a tool block: declare its last chunk, and start the renderers
+    /// fresh for whatever comes next.
+    ///
+    /// No newline here — a tool block ends at a line boundary and no further.
+    /// The knowledge this carries is that the block *ended*, which no panel row
+    /// can express: every row of a tool block looks like every other, so two
+    /// blocks in a row would otherwise read as one. Declaring the last chunk is
+    /// what makes the next write open a block even under this same kind, and so
+    /// what puts `boundary_spacer`'s row between two tool panels.
+    pub(crate) fn end_tool_block(&self) {
+        self.write_content_closing_segment(b"", Some(ContentDisplayKind::ResponseTool));
+        self.reset_renderer_gaps();
+    }
+
+    /// Emit one dark-grey tool-panel row: [`content::panel::panel_row`] builds
+    /// the grey background around `content` (which already carries its own
+    /// foreground ANSI), and this writes it with the `ResponseTool` kind.
+    pub(crate) fn paint_panel(&self, content: &str, indent: bool) {
+        let row = content::panel::panel_row(content, indent, self.width());
+        // Hard-coded `ResponseTool`: a panel is a tool block, and tool blocks
+        // only ever occur between `begin_response` and `end_response`. Nothing
+        // here is ever drawn as anything else, so there is no caller to pass a
+        // kind down from — the one place that rule lets a utility decide.
+        // Call and result panels share the kind on purpose: the two halves of a
+        // pair are one block, and the row between them would be a second copy
+        // of the one `boundary_spacer` draws when the *tool* arrives.
+        self.write_content_kinded(
+            format!("{row}\n").as_bytes(),
+            Some(ContentDisplayKind::ResponseTool),
+        );
+    }
+
+    /// Emit a full-width panel for plain `text`: each wrapped+styled line (see
+    /// [`content::panel::tool_row_contents`]) becomes one [`Self::paint_panel`]
+    /// row.
+    pub(crate) fn tool_panel(&self, text: &str, is_error: bool, indent: bool) {
+        let contents = content::panel::tool_row_contents(text, is_error, indent, self.width());
+        for content in &contents {
+            self.paint_panel(content, indent);
+        }
+    }
+
+    /// Per-file call arguments for the multi-file `edit` recorded in `last_tool`
+    /// and the given result, paired by index, or `None` when this result is not
+    /// a multi-file pair.
+    ///
+    /// The pairing is by index because both halves are produced from the same
+    /// file list, in first-seen order, by `edit_files` — the same derivation the
+    /// persist and model-facing splits use. A length mismatch means the two
+    /// halves disagree, which is not something to guess at, so it degrades to
+    /// rendering the result alone.
+    pub(crate) fn multi_file_pairs(&self, result: &str) -> Option<Vec<(String, Value, String)>> {
+        let files = blockedit::parse_file_results(result)?;
+        let (name, args) = self.last_tool.lock().unwrap().clone()?;
+        if !name.eq_ignore_ascii_case("edit") {
+            return None;
+        }
+        let blobs = multi_file_blobs(&args)?;
+        (blobs.len() == files.len()).then(|| {
+            blobs
+                .into_iter()
+                .zip(files)
+                .map(|(blob, fr)| {
+                    let single = match &fr.result {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (name.clone(), blob, single)
+                })
+                .collect()
+        })
+    }
+
+    /// The call half of one tool call-result pair: boundary, label, and the
+    /// trailing diff/preview lines.
+    ///
+    /// Exactly one file's batch per invocation — a single-file call invokes this
+    /// once, and a multi-file call once per file — so the two cases cannot drift
+    /// apart in the view layer.
+    pub(crate) fn render_call_panel(&self, name: &str, args: &Value) {
+        // Purpose-built label (+ optional trailing lines such as an edit diff)
+        // from `get_preview`. One blank line above the panel, unless the stream
+        // already ends with one — which is what used to need a "was the last
+        // block a tool" flag: a text segment leaves the renderer's own trailing
+        // blank behind, a tool panel does not, and the stream knows which.
+        let (label, extra) = get_preview(name, args);
+        // Dark-grey panel box (no `⏺`, no tree line-art). The command label is
+        // the first line and is left flush; its output — the trailing
+        // diff/preview lines — is indented one column so the command's output
+        // reads as a distinct block. The command itself is syntax-highlighted
+        // through the same formatter the answer/result path uses (flushed per
+        // block via a fresh fenced code render).
+        let color = self.caps.primary;
+        let label_styled = highlight_code_fg(&label, command_lang(name), color, self.width());
+        self.paint_panel(&label_styled, false);
+        for line in &extra {
+            self.tool_panel(line, false, true);
+        }
+    }
+
+    /// The result half of one tool call-result pair: everything from the
+    /// structured-envelope check to `end_tool_block`.
+    ///
+    /// Expects the *single-file* result text — a bare success note or the
+    /// `{ui_view, model_view}` envelope — which is what one entry of a
+    /// multi-file result is, so a per-file batch reaches it unchanged.
+    pub(crate) fn render_result_panel(&self, result: &str) {
+        // Edit-tool failures are emitted as a structured JSON object with
+        // separate `ui_view` (short, no file text) and `model_view` (rich,
+        // with diff). The UI must render only the short view so we don't
+        // leak file content into scrollback; the full result string is
+        // still passed back to the model via the tool-result message.
+        if let Ok(v) = serde_json::from_str::<Value>(result) {
+            if let (Some(ui), Some(_model)) = (
+                v.get("ui_view").and_then(|x| x.as_str()),
+                v.get("model_view").and_then(|x| x.as_str()),
+            ) {
+                self.tool_panel(ui, true, true);
+                self.end_tool_block();
+                return;
+            }
+        }
+
+        // A `sed` preview result is a block blob behind a one-line banner.
+        // Render the blocks as a diff so the human reviewing the panel reads
+        // `-`/`+` lines rather than @@@ markers; the model still gets the
+        // verbatim blob in its tool message.
+        if let Some(lines) = sed_preview_body(result) {
+            // Not an error: a preview is a *proposal*, and colouring the whole
+            // body red (as the edit-failure path does) says the opposite. The
+            // `- `/`+ ` prefixes carry the red/green, matching an applied edit.
+            for line in &lines {
+                self.tool_panel(line, false, true);
+            }
+            self.end_tool_block();
+            return;
+        }
+
+        // Check for successful edit_file result and render a diff preview
+        // Success format: "Replaced N block(s) in <path>"
+
+        let unquoted = serde_json::from_str::<Value>(result)
+            .ok()
+            .and_then(|v| match v {
+                Value::String(s) => Some(s),
+                Value::Array(arr) => Some(
+                    arr.iter()
+                        .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .unwrap_or_else(|| result.to_string());
+
+        let mut cleaned = unquoted.as_str();
+        while cleaned.starts_with("Toolset error: ") || cleaned.starts_with("ToolCallError: ") {
+            if let Some(stripped) = cleaned.strip_prefix("Toolset error: ") {
+                cleaned = stripped;
+            } else if let Some(stripped) = cleaned.strip_prefix("ToolCallError: ") {
+                cleaned = stripped;
+            }
+        }
+        // Same treatment as the model: drop the redundant arg-error wrappers so
+        // the panel shows the problem, the expected block, and the offending
+        // structure — not a wall of prefixes. (Display is secondary to the model
+        // here, but the same text, so the same cleanup.)
+        cleaned = blockedit::strip_arg_error_prefixes(cleaned);
+
+        let is_error =
+            unquoted.starts_with("Toolset error") || unquoted.starts_with("ToolCallError");
+
+        // An `edit` argument error is one self-correcting message with a fixed
+        // `Expected:` / `Actual:` shape. Show it as two columns so the correct
+        // line and the line the model actually sent are on the same row, and so
+        // the block is half as tall (`Actual:` no longer falls below the fold).
+        // The *model* still receives the vertical form — see arg_error_view.
+        //
+        // Painted rather than `tool_panel`ed: these lines are already sized to
+        // the terminal and their columns align by construction, and
+        // `tool_panel` re-wraps through `wrap()`, which collapses the interior
+        // spaces that alignment depends on.
+        {
+            let width = self.width();
+            let avail = width.saturating_sub(1).max(1);
+            if let Some(table) = blockedit::arg_error_view::render_arg_error_table(cleaned, avail) {
+                for line in &table {
+                    self.paint_panel(&style(line.clone()).dim().to_string(), true);
+                }
+                self.end_tool_block();
+                return;
+            }
+        }
+
+        let lines: Vec<_> = cleaned.lines().collect();
+
+        if lines.is_empty() {
+            self.tool_panel("(empty)", false, true);
+            self.end_tool_block();
+            return;
+        }
+
+        // Which tool produced this result (set by `display_tool_call`). Drives
+        // read/write-specific rendering and language guessing.
+        let tool = self.last_tool.lock().unwrap().clone();
+        let is_read = tool
+            .as_ref()
+            .map(|(n, _)| n.eq_ignore_ascii_case("read") || n.eq_ignore_ascii_case("read_file"))
+            .unwrap_or(false);
+        let is_write = tool
+            .as_ref()
+            .map(|(n, _)| n.eq_ignore_ascii_case("write") || n.eq_ignore_ascii_case("write_file"))
+            .unwrap_or(false);
+
+        // Handle structured write result: {"path": "...", "content": "...", "lines": N, "bytes": N}
+        if is_write {
+            if let Ok(v) = serde_json::from_str::<Value>(result) {
+                if let (Some(path), Some(content), Some(total_lines)) = (
+                    v.get("path").and_then(|x| x.as_str()),
+                    v.get("content").and_then(|x| x.as_str()),
+                    v.get("lines").and_then(|x| x.as_u64()),
+                ) {
+                    // Show the path as a header with line count
+                    let color = self.caps.primary;
+                    let lang = guess_lang(path);
+                    let header = format!("write {} [{} lines]", path, total_lines);
+                    let header_styled = highlight_code_fg(&header, "bash", color, self.width());
+                    self.paint_panel(&header_styled, true);
+
+                    // Render the content with syntax highlighting (like read_file)
+                    let show_max = 10; // Limit preview to 10 lines (match read_file)
+                    let width = self.width();
+                    let inner = width.saturating_sub(1).max(1);
+                    let content_lines: Vec<_> = content.lines().collect();
+                    for (printed, line) in content_lines.iter().enumerate() {
+                        if printed >= show_max {
+                            break;
+                        }
+                        for wline in wrap(line, inner) {
+                            let styled = highlight_code_fg(&wline, lang, color, self.width());
+                            self.paint_panel(&styled, true);
+                        }
+                    }
+                    if content_lines.len() > show_max {
+                        self.tool_panel(
+                            &format!("... +{} lines", content_lines.len() - show_max),
+                            false,
+                            true,
+                        );
+                    }
+                    self.end_tool_block();
+                    return;
+                }
+            }
+        }
+
+        let read_path = tool
+            .as_ref()
+            .and_then(|(_, a)| a.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let color = self.caps.primary;
+        // Error output is shown verbatim (red). Everything else is highlighted:
+        // `read_file` output is colored by the file's guessed language, bash
+        // command output gets token highlighting, and other tools' output is
+        // colored uniformly (no meaningful grammar to tokenize).
+        let lang = if is_read {
+            guess_lang(read_path)
+        } else {
+            match tool.as_ref().map(|(n, _)| n.as_str()) {
+                Some("bash") => "bash",
+                _ => "text",
+            }
+        };
+
+        // Read results drop the `NNNN| ` line-number gutter and show up to 10
+        // lines; other results keep the previous 4-line default. Errors show
+        // everything.
+        let show_max = if is_error {
+            usize::MAX
+        } else if is_read {
+            10
+        } else {
+            8
+        };
+
+        let width = self.width();
+        let inner = width.saturating_sub(1).max(1);
+        for (printed, line) in lines.iter().enumerate() {
+            if printed >= show_max {
+                break;
+            }
+            // `read_file` renders `NNNN| content`; drop the gutter for display
+            // (the model still gets the numbers in the raw tool result).
+            let visible = if is_read {
+                strip_read_lineno(line)
+            } else {
+                line
+            };
+            for wline in wrap(visible, inner) {
+                if is_error {
+                    self.tool_panel(&wline, true, true);
+                } else {
+                    // Syntax-highlight through the result-path formatter, then
+                    // layer the grey tool panel on top (flushed per line).
+                    let styled = highlight_code_fg(&wline, lang, color, self.width());
+                    self.paint_panel(&styled, true);
+                }
+            }
+        }
+
+        if lines.len() > show_max && !is_error {
+            self.tool_panel(
+                &format!("... +{} lines", lines.len() - show_max),
+                false,
+                true,
+            );
+        }
+        self.end_tool_block();
     }
 }
