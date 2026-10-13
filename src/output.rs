@@ -1,27 +1,30 @@
-use crate::ansi::at_line_start;
 #[cfg(test)]
 use crate::ansi::strip_ansi;
-use crate::content;
 #[cfg(test)]
-use crate::content::markdown::guess_lang;
-use crate::content::markdown::{answer_theme, highlight_code_fg, render_markdown};
-use crate::content::preview::multi_file_blobs;
+use crate::content::markdown::{answer_theme, guess_lang, highlight_code_fg, render_markdown};
 #[cfg(test)]
 use crate::content::preview::{
-    edit_preview, get_preview, refined_diff_lines, sed_preview_body, short_banner,
-    strip_read_lineno, truncate, wrap_with_diff_markers, SED_PREVIEW_BANNER,
+    edit_preview, get_preview, multi_file_blobs, refined_diff_lines, sed_preview_body,
+    short_banner, strip_read_lineno, truncate, wrap_with_diff_markers, SED_PREVIEW_BANNER,
 };
 #[cfg(test)]
 use crate::content::text::wrap;
-use crate::content::{separator_line, Content, ContentDisplayKind};
+use crate::content::Content;
+#[cfg(test)]
+use crate::content::ContentDisplayKind;
 use crate::draw::ApplyPolicy;
 use crate::render::{allocate, live_budget, render, Element, Extent, Frame, RenderAt, Rendered};
-use crate::settings::{ShowReasoning, ShowReasoningHandle};
+#[cfg(test)]
+use crate::settings::ShowReasoning;
+use crate::settings::ShowReasoningHandle;
 use crate::termio::TermSize;
 use console::style;
+#[cfg(test)]
 use markdown_stream::{Parser, StreamParser};
+#[cfg(test)]
 use markdown_terminal::{Renderer, Theme};
 use serde_json::Value;
+#[cfg(test)]
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -833,23 +836,7 @@ impl Default for ConsoleOutput {
     }
 }
 
-impl ConsoleOutput {
-    /// A `Write` for one block of reasoning. The bytes are routed when the
-    /// block is committed: to the screen (and counted, like any other
-    /// content) when there is a terminal, to stderr when there is not, so a
-    /// consumer of `picocode "q" | cat` can drop reasoning
-    /// (`2>/dev/null`) or merge it (`2>&1`) without touching stdout.
-    ///
-    /// The decision is made once, here, rather than at every reasoning call
-    /// site — which is what let the render path fork on `live` in the first
-    /// place (row_accounting_b3.md §4.1).
-    fn reasoning_sink(&self) -> ReasoningSink {
-        ReasoningSink {
-            buf: Vec::new(),
-            to_stderr: self.content.reasoning_on_stderr,
-        }
-    }
-}
+impl ConsoleOutput {}
 
 /// The status line's content, before it is fitted to a width: what names the
 /// session, and the model group as separate fields.
@@ -1082,48 +1069,6 @@ pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> St
     )
 }
 
-/// Buffered reasoning bytes awaiting routing. See
-/// [`ConsoleOutput::reasoning_sink`].
-pub(crate) struct ReasoningSink {
-    buf: Vec<u8>,
-    to_stderr: bool,
-}
-
-impl ReasoningSink {
-    /// Route what has been written: stderr when there is no terminal, else the
-    /// screen through the same counter every other content write uses (so the
-    /// draw cache learns the height). Idempotent — the buffer is taken.
-    fn commit(&mut self, out: &ConsoleOutput) {
-        if self.buf.is_empty() {
-            return;
-        }
-        let bytes = std::mem::take(&mut self.buf);
-        if self.to_stderr {
-            let mut err = std::io::stderr();
-            let _ = err.write_all(&bytes);
-            let _ = err.flush();
-        } else {
-            // Reasoning sits inside `begin_response`…`end_response`, and is a
-            // kind of its own: it is the one kind whose blocks are dimmed, so
-            // the blank row above a following text block is the boundary's and
-            // not part of what the reasoning emitted.
-            out.content
-                .write_content_kinded(&bytes, Some(ContentDisplayKind::ResponseReasoning));
-        }
-    }
-}
-
-impl io::Write for ReasoningSink {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 impl ConsoleOutput {
     // --- Multi-file rendering primitives ----------------------------------
     //
@@ -1187,15 +1132,7 @@ impl Output for ConsoleOutput {
     /// against model output reads as a turn while two adjacent prompts read as
     /// two commits sharing one rule.
     fn display_committed_prompt(&self, line: &str) {
-        let shares_rule = self.content.boundary.last_kind() == Some(ContentDisplayKind::Prompt);
-        let rule = separator_line(self.term_width());
-        let block = if shares_rule {
-            format!("{line}\n{rule}")
-        } else {
-            format!("{rule}{line}\n{rule}")
-        };
-        self.content
-            .write_content_kinded(block.as_bytes(), Some(ContentDisplayKind::Prompt));
+        self.content.display_committed_prompt(line);
     }
 
     fn draw_frame(
@@ -1208,261 +1145,39 @@ impl Output for ConsoleOutput {
     }
 
     fn display_plain(&self, text: &str) {
-        // The count comes from the bytes: `writeln!` adds the newline, and a
-        // caller-supplied line is padded or not as it likes. Then normalized —
-        // a caller whose text already ends in a newline would otherwise emit a
-        // trailing blank row, which the contract forbids: synthetic content
-        // ends at a line boundary, never with a separator.
-        let block = format!("{}\n", text);
-        self.content.write_content_kinded(
-            &at_line_start(block.as_bytes()),
-            Some(ContentDisplayKind::SystemMessage),
-        );
+        self.content.display_plain(text);
     }
 
     fn display_markdown(&self, text: &str) {
-        let color = self.content.caps.primary;
-        let rendered = render_markdown(text, self.term_width(), color);
-        let mut block = String::with_capacity(rendered.len() + 1);
-        block.push_str(&rendered);
-        block.push('\n');
-        // Measured, not predicted: a long rendered line wraps, and `rendered`
-        // is a count of *logical* lines, not screen rows (§9 #6/#10).
-        // The blank above the block is not this method's business any more:
-        // `boundary_spacer` puts it there when the kind changes, which is the
-        // pair this block opens. The trailing one is ours to suppress: the
-        // renderer often ends with a blank of its own, and a synthetic block
-        // may not.
-        self.content.write_content_kinded(
-            &at_line_start(block.as_bytes()),
-            Some(ContentDisplayKind::SystemContent),
-        );
+        self.content.display_markdown(text);
     }
 
     fn display_text(&self, text: &str) {
-        // The bytes, not the source, decide the height: the `⏺ ` prefix is two
-        // columns the old `wrap(text).len()` count never saw, inline markdown
-        // rewrites the text, and a message that exactly fills the width wraps
-        // onto another row (§9 #6). Measuring the bytes removes the guess *and*
-        // the DSR that used to correct for it.
-        let block = content::text::system_message(text);
-        self.content.write_content_kinded(
-            &at_line_start(block.as_bytes()),
-            Some(ContentDisplayKind::SystemMessage),
-        );
+        self.content.display_text(text);
     }
 
     fn begin_response(&self) {
-        // The bar's dot goes green for the turn. Set here rather than at the
-        // call site that builds the text: this layer draws the bar, and a turn
-        // starting is exactly when its state changes.
-        self.content
-            .streaming
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        // One render path for every run (B3c). There used to be a second one
-        // for a non-tty stdout: buffer the whole response and render it as one
-        // markdown block at the end. Two paths meant every replay test — a
-        // test's stdout is never a terminal — exercised the *other* one, so the
-        // incremental renderer, where the separator bugs live, went untested.
-        // Colour still follows the terminal: that is a property of the bytes,
-        // not of the render path.
-        let theme = answer_theme(self.content.caps.primary);
-        let current_width = self.term_width();
-        let mut parser = self.content.parser.lock().unwrap();
-        *parser = StreamParser::new_gfm_stream();
-        let mut renderer = self.content.renderer.lock().unwrap();
-        *renderer = Renderer::new(theme, current_width);
-        // Reset the thinking parser/renderer for this response. Its dimming
-        // needs no reset: the renderer fades each row as it emits it, so no
-        // attribute outlives a block and there is no state to carry between
-        // turns.
-        let mut tparser = self.content.thinking_parser.lock().unwrap();
-        *tparser = StreamParser::new_gfm_stream();
-        let mut trenderer = self.content.thinking_renderer.lock().unwrap();
-        *trenderer = Renderer::new(Theme::dimmed(), current_width);
-        // No blank line written here: the row between the prompt and the
-        // response is `boundary_spacer`'s, on the first `ResponseText` write —
-        // `begin_response` writes nothing, so it has nothing to ask the stream
-        // about. Its leading blank lines are stripped by that same write,
-        // which is this half of "begin/end_response strip".
+        self.content.begin_response();
     }
 
     fn stream_text(&self, delta: &str) {
-        // Sync terminal width (updated by in-flight reader on resize) so
-        // renderers reflow on the next feed.
-        let current_width = self.term_width();
-        {
-            let mut renderer = self.content.renderer.lock().unwrap();
-            if renderer.width() != current_width {
-                renderer.set_width(current_width);
-            }
-            let mut trenderer = self.content.thinking_renderer.lock().unwrap();
-            if trenderer.width() != current_width {
-                trenderer.set_width(current_width);
-            }
-        }
-        // Coarse-grained live rendering: feed the delta to the incremental
-        // parser and emit only the *completed* blocks. Each block prints once
-        // (code lines line-by-line, paragraphs on close), so there is no whole
-        // document re-render, no in-place cursor gymnastics, and scrollback
-        // stays clean.
-        // One counted block: the boundary blank (if any) and the rendered
-        // blocks. The renderer produced the bytes, so the counter measures
-        // them rather than the delta text (§9 #10).
-        // Thinking just ended. Whatever the thinking renderer still holds is
-        // committed here, as its own counted block under its own kind, *before*
-        // the answer's block opens — so the pair recorded for the boundary is
-        // (reasoning, text) and the blank row between them is
-        // `boundary_spacer`'s, drawn when this block starts. Committed from
-        // inside the text block instead, the reasoning would be recorded under
-        // the text kind, the pair would read (text, text), and the row would
-        // have to be invented here by asking the stream what it ended with — a
-        // question the held-newline rule exists to stop asking.
-        //
-        // The signal is the flush itself, not a dim flag: dimming is a property
-        // of the rows the thinking renderer emits and ends with them, so there
-        // is nothing to turn off, and a flush that produces nothing opens no
-        // block and draws no row.
-        let mut thinking: Vec<u8> = Vec::new();
-        self.content.commit_thinking(&mut thinking);
-        if !thinking.is_empty() {
-            self.content.write_content_kinded(
-                &at_line_start(&thinking),
-                Some(ContentDisplayKind::ResponseReasoning),
-            );
-        }
-        self.content.with_content_writer(
-            current_width,
-            Some(ContentDisplayKind::ResponseText),
-            false,
-            |mut out| {
-                let mut parser = self.content.parser.lock().unwrap();
-                let events = parser.write(delta.as_bytes());
-                let mut renderer = self.content.renderer.lock().unwrap();
-                let _ = renderer.feed(&events, &mut out);
-            },
-        );
+        self.content.stream_text(delta);
     }
 
     fn stream_thinking(&self, delta: &str) {
-        // Content mode => stream the reasoning text; otherwise suppress it.
-        if *self.content.show_reasoning.lock().unwrap() != ShowReasoning::Content {
-            return;
-        }
-        // Sync terminal width (updated by in-flight reader on resize) so
-        // renderers reflow on the next feed.
-        let current_width = self.term_width();
-        {
-            let mut trenderer = self.content.thinking_renderer.lock().unwrap();
-            if trenderer.width() != current_width {
-                trenderer.set_width(current_width);
-            }
-        }
-        // Render thinking through its own incremental renderer with a faded
-        // theme, which brackets every row it emits in the faint attribute —
-        // fading is a property of a row, not a mode the stream has to be put
-        // into and taken out of, so this writer emits no escapes of its own and
-        // the boundary after the reasoning has nothing to close.
-        let mut sink = self.reasoning_sink();
-        let mut parser = self.content.thinking_parser.lock().unwrap();
-        let events = parser.write(delta.as_bytes());
-        let mut renderer = self.content.thinking_renderer.lock().unwrap();
-        let _ = renderer.feed(&events, &mut sink);
-        sink.commit(self);
+        self.content.stream_thinking(delta);
     }
 
     fn end_response_segment(&self) {
-        let current_width = self.term_width();
-        // One counted block: the answer commit, the thinking commit, the
-        // boundary blank and the dim reset. Inside the turn, so `Response`:
-        // the separators between a segment and the tool panel below are the
-        // response's own, not a content boundary.
-        // One counted block, accumulated and emitted at the end so the
-        // normalization below sees the whole segment: the answer commit, the
-        // thinking commit and the dim reset, ending at a line boundary with no
-        // blank row behind it. The row between this segment and the tool panel
-        // below is `boundary_spacer`'s, drawn when that panel arrives as
-        // (text, tool) — it is not this block's to end with.
-        // Commit any open answer paragraph so the tool call/result prints
-        // below, then start a *fresh* answer renderer for the next segment.
-        // This drops the renderer's `pending_gap`, which otherwise fires at
-        // the next answer segment's first block and would double the blank
-        // line at the thinking→answer boundary in multi-turn turns (the
-        // transition already emits one blank).
-        let mut answer: Vec<u8> = Vec::new();
-        {
-            let mut parser = self.content.parser.lock().unwrap();
-            // `flush()` (not `write("\n\n")`) so a segment whose answer text
-            // ends in a list/table is emitted now rather than stranded; then
-            // start a fresh answer parser + renderer for the next segment.
-            let events = parser.flush();
-            *parser = StreamParser::new_gfm_stream();
-            let mut renderer = self.content.renderer.lock().unwrap();
-            let _ = renderer.feed(&events, &mut answer);
-            let theme = Theme {
-                clickable_links: true, // real TTY path
-                ..Default::default()
-            };
-            *renderer = Renderer::new(theme, current_width);
-        }
-        // Commit thinking (the thinking renderer is kept — post-tool
-        // thinking continues as one continuous faded stream; only the
-        // parser is reset, inside `commit_thinking`).
-        let mut thinking: Vec<u8> = Vec::new();
-        self.content.commit_thinking(&mut thinking);
-        self.content
-            .write_segment_tail(current_width, &answer, &thinking);
+        self.content.end_response_segment();
     }
 
     fn end_response(&self) {
-        // Before the flush, so the last bar of the turn is still the streaming
-        // one; the bar painted after this is the idle one.
-        self.content
-            .streaming
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        let current_width = self.term_width();
-        // Streaming is over, so each remainder comes back as one buffer: strip
-        // it whole rather than carry a "might still be trailing" state across
-        // chunks `end_response` will never see again. Each half is then emitted
-        // as its own normalized block by `write_segment_tail`, which also
-        // declares the turn's last flush closed — the row *between* this
-        // response and whatever comes next is `boundary_spacer`'s, and writing
-        // one here would make two.
-        let mut answer: Vec<u8> = Vec::new();
-        {
-            // Finalize the answer document.
-            let mut parser = self.content.parser.lock().unwrap();
-            let events = parser.flush();
-            let mut renderer = self.content.renderer.lock().unwrap();
-            let _ = renderer.feed(&events, &mut answer);
-        }
-        let mut thinking: Vec<u8> = Vec::new();
-        // Finalize thinking (it was rendered as it streamed, already faded).
-        {
-            let mut parser = self.content.thinking_parser.lock().unwrap();
-            let events = parser.flush();
-            let mut renderer = self.content.thinking_renderer.lock().unwrap();
-            let _ = renderer.feed(&events, &mut thinking);
-        }
-        self.content
-            .write_segment_tail(current_width, &answer, &thinking);
+        self.content.end_response();
     }
 
     fn display_tool_call(&self, name: &str, args: &Value) {
-        // Remember the tool so `display_tool_result` can render the result
-        // tool-aware (strip `read_file` line-number gutters, pick a highlight
-        // language). The hook always fires the call immediately before its
-        // result, so this is safe to read back on the result.
-        *self.content.last_tool.lock().unwrap() = Some((name.to_string(), args.clone()));
-        // A multi-file `edit` renders nothing here: its pair is not complete
-        // until the result arrives, and splitting it into "all labels now, all
-        // notes later" would produce two runs rather than one block per file.
-        // `display_tool_result` renders the whole sequence of pairs then, which
-        // is what makes a multi-file batch byte-identical to N single-file ones.
-        if name.eq_ignore_ascii_case("edit") && multi_file_blobs(args).is_some() {
-            return;
-        }
-        self.content.render_call_panel(name, args);
+        self.content.display_tool_call(name, args);
     }
 
     /// A tool block ends without a blank line: the panel rows are the last
@@ -1471,42 +1186,7 @@ impl Output for ConsoleOutput {
     /// ends the block with it, which is the knowledge the `last_was_tool` flag
     /// used to carry, stated by the block that has it.
     fn display_tool_result(&self, result: &str) {
-        // A multi-file result renders as N complete call-result pairs — label,
-        // diff, note — one per file, through the very same renderers a
-        // sequence of single-file calls uses. The call half is deferred to here
-        // because it is not complete until the result exists: rendering the
-        // labels at the call event would give two contiguous runs instead of
-        // one block per file, and the block is the unit.
-        if let Some(pairs) = self.content.multi_file_pairs(result) {
-            for (name, args, single) in &pairs {
-                self.content.render_call_panel(name, args);
-                self.content.render_result_panel(single);
-            }
-            return;
-        }
-        // A result with no matching call context (replayed on its own): the
-        // call half, and so the diff, is gone, but the report is still per
-        // file and still needs its path to attribute a failure.
-        if let Some(files) = blockedit::parse_file_results(result) {
-            let color = self.content.caps.primary;
-            for fr in files {
-                let label = highlight_code_fg(
-                    &format!("edit {}", fr.path),
-                    "bash",
-                    color,
-                    self.term_width(),
-                );
-                self.content.paint_panel(&label, true);
-                let single = match &fr.result {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                self.content.render_result_panel(&single);
-            }
-            self.content.end_tool_block();
-            return;
-        }
-        self.content.render_result_panel(result);
+        self.content.display_tool_result(result);
     }
 
     fn get_user_input(&self) -> String {
@@ -1522,21 +1202,11 @@ impl Output for ConsoleOutput {
     }
 
     fn display_error(&self, error: &str) {
-        // Measured: a long error wraps, and the message carries a 2-column
-        // prefix the row count has to include.
-        let block = format!("{} Error: {}\n", style("⏺").red(), error);
-        self.content.write_content_kinded(
-            &at_line_start(block.as_bytes()),
-            Some(ContentDisplayKind::SystemMessage),
-        );
+        self.content.display_error(error);
     }
 
     fn display_system(&self, text: &str) {
-        let block = format!("{}\n", style(text).bold().dim());
-        self.content.write_content_kinded(
-            &at_line_start(block.as_bytes()),
-            Some(ContentDisplayKind::SystemContent),
-        );
+        self.content.display_system(text);
     }
 
     /// The **no-pump** confirm policy: nobody is driving keys, so there is no
@@ -1555,9 +1225,7 @@ impl Output for ConsoleOutput {
     }
 
     fn display_separator(&self) {
-        // `separator` writes through the row counter; noting again here would
-        // count the same row twice.
-        self.content.separator();
+        self.content.display_separator();
     }
 
     fn display_header(
@@ -1568,9 +1236,8 @@ impl Output for ConsoleOutput {
         limit: usize,
         persona: Option<&str>,
     ) {
-        let block =
-            content::text::header_block(provider, model, yolo, limit, persona, self.term_width());
-        self.content.write_content(block.as_bytes());
+        self.content
+            .display_header(provider, model, yolo, limit, persona);
     }
 
     fn begin_capture(&self) {
