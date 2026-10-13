@@ -59,6 +59,6 @@ and link a doc/ and/or commit hash
   - [ ] Step 2: `TermIO` — reader, raw mode, DSR, size watch; un-`#[serial]` width tests (§8.2) —
     moves landed (`74e987c`); the `TermGuard` → `TermIO` type fold rides with step 4
   - [ ] Step 3: split `content/`; `AgentConfig.output` → `.content`, `AppState.output` (§8.3) —
-    3a/3b landed (`47122b4`, `aab6447`); 3c/3d remain
+    3a/3b/3c landed (`47122b4`…`61d7e18`); 3d remains
   - [ ] Step 4: fold in `RenderManager` + UI; elements → `Arc<Mutex<…>>`, shared editor (§8.4)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)

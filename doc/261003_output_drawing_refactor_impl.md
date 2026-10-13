@@ -252,30 +252,25 @@ until the last step.
      `Content` would corrupt the matrix.
    - `ConfirmPort` / `confirm.rs` untouched; `Confirmation` (output.rs:25) stays put.
 
-   **Landed (3a, 3b — see commits `47122b4`, `aab6447`):** classification + separator matrix +
-   boundary state in `content/composition.rs`; rendering in
-   `content/{markdown,panel,preview,text}.rs`. What those leave behind:
+   **Landed (3a, 3b, 3c — see commits `47122b4`, `aab6447`, `1b35b1c`, `322be81`, `61d7e18`):**
+   classification + separator matrix + boundary state in `content/composition.rs`; rendering in
+   `content/{markdown,panel,preview,text}.rs`; and the `Content` handle in `content/handle.rs`,
+   which owns the content state, the width watch, the streaming renderers, the byte sink (`Draw`),
+   the block write pipeline (`with_content_writer` + the panel emitters), and the content API
+   (`display_*`/`stream_*`/`begin|end_response`/header). `ConsoleOutput` is now the frame + forward
+   facade: its `Output` content methods forward through `self.content.…`, and the frame methods
+   reach `content.draw` via a temporary pass-through. What those leave behind:
 
-   - `with_content_writer`'s **body** stays on `ConsoleOutput` — Draw-coupled
-     (`plan_consume`/`note_lines`/`reposition`); the `WrapLines`/EL stack is `ansi.rs`'s. Splitting
-     the byte-production half into content (handing `ContentWrite` to `render()`) is step 4.
-   - `render_call_panel`/`render_result_panel` and `paint_panel`/`tool_panel` still *emit*
-     row-by-row on `ConsoleOutput` (and call `end_tool_block`); they move behind `Content` in 3c.
-   - The stateful `stream_text`/thinking parsers stay on `ConsoleOutput` → 3c, where Content owns
-     them.
+   - `with_content_writer`'s byte-production half (`WrapLines`/EL stack) lives in `Content` but is
+     still Draw-coupled; splitting it into `ContentWrite` handed to `render()` is step 4.
+   - `begin_capture`/`end_capture` still tap the sink (`content.draw.saved_writer`) — re-pointing
+     capture at the `ContentWrite` hand-off is step 4/5.
+   - The temporary frame pass-through (`ConsoleOutput` → `content.draw`) dissolves in step 4, when
+     `RenderManager` becomes the frame front door.
    - The moved rendering's unit tests still live in `output.rs`'s test modules → relocate to
      `content/` when convenient.
 
    **Remaining:**
-
-   - **3c — the `Content` handle.**
-     `pub struct Content { boundary: ContentBoundary, width: SizeWatch, sink: Arc<dyn Output> }` —
-     owns 3a+3b, holds the cloned width watch, formats at the watched width per block, writes via
-     the sink. Exposes the content API (`display_*`, `stream_*`, `begin/end_response(_segment)`,
-     header, prompts, capture) plus the temporary frame pass-through. `Output::` content
-     methods on `ConsoleOutput` forward through the shared `Content`, so still-`Output` writers keep
-     sharing state until 3d. Full suite green (no behavior change).
-
    - **3d — repoint writers; `AgentConfig.output` → `AgentConfig.content`.** Field rename + type:
      `AgentConfig.content: Arc<Content>`; every `with_config(|c| c.output)` / `config.output` site
      (main.rs:309, settings.rs ×3, app_state.rs, interactive.rs ×4, build.rs ×2, compaction ×2,
