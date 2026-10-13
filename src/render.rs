@@ -9,14 +9,12 @@
 //! * [`render`] produces a [`Frame`] — a flat byte buffer with per-row
 //!   extents and element spans.
 //!
-//! [`RenderManager`] (step 4b) is the hub shell that runs those phases and
-//! applies through a [`Draw`] it is *given* — it does not own the drawing
-//! edge yet (4c moves `Draw` under this roof). The pure phases themselves
-//! stay pure and callable directly; the manager touches the terminal only
-//! through the `Draw` it is handed. A frame's rows are self-contained: each
-//! carries the escapes needed to repaint itself in place (trailing `EL` or
-//! padding to `term_w`), so `apply` may rewrite any subset of rows
-//! unconditionally.
+//! [`RenderManager`] (steps 4b/4c) is the hub that runs those phases and
+//! owns the [`Draw`] it applies through. The pure phases themselves stay
+//! pure and callable directly; the manager touches the terminal only
+//! through its `Draw`. A frame's rows are self-contained: each carries the
+//! escapes needed to repaint itself in place (trailing `EL` or padding to
+//! `term_w`), so `apply` may rewrite any subset of rows unconditionally.
 
 use std::ops::Range;
 
@@ -399,14 +397,19 @@ pub(crate) fn pad_row(row: &str, term_w: usize) -> String {
 
 // --- the frame hub (step 4b) -------------------------------------------------
 
-/// The frame hub's shell (design §Render layer): where a composition comes
-/// to be budgeted, rendered, applied and remembered. Step 4b moves the
-/// pipeline here — what was `Output::draw_elements`' default body — and
-/// leaves the rest of the design's shape to the steps that give it meaning:
-/// `Draw` ownership (4c), the `ContentWrite` hand-off and `render_batch`
-/// (4d), batching and the recipe field (4e, when reposition stops reading
-/// it from `DrawCache`), and the frame verbs off the watch (4f).
+/// The frame hub (design §Render layer): where a composition comes to be
+/// budgeted, rendered, applied and remembered. Step 4b moved the pipeline
+/// here — what was `Output::draw_elements`' default body — and 4c moved the
+/// drawing edge (`Draw`) under this roof. What remains of the design's
+/// shape comes with the steps that give it meaning: the `ContentWrite`
+/// hand-off and `render_batch` (4d), batching and the recipe field (4e,
+/// when reposition stops reading it from `DrawCache`), and the frame verbs
+/// off the watch (4f).
 pub struct RenderManager {
+    /// The drawing edge (step 4c): the byte sink and its live-screen
+    /// bookkeeping, owned — the design's `Draw { … }` under this roof. Plain
+    /// fields inside; this manager's `Mutex` is what serializes them.
+    draw: Draw,
     /// The fraction of the frame's terminal height the area may occupy —
     /// [`configure`](Self::configure)'s, resolved against the render's
     /// height on every call.
@@ -420,15 +423,24 @@ pub struct RenderManager {
 }
 
 impl RenderManager {
-    /// A fresh hub over the watched geometry. The budget ratio starts at
-    /// [`FRAME_MAX_ROW_RATIO`] — the value the pipeline hard-coded before
-    /// `configure` existed — so an unconfigured manager budgets exactly as
-    /// the old code did; [`Self::configure`] changes it.
+    /// A fresh hub over the watched geometry, with its own drawing edge. The
+    /// budget ratio starts at [`FRAME_MAX_ROW_RATIO`] — the value the
+    /// pipeline hard-coded before `configure` existed — so an unconfigured
+    /// manager budgets exactly as the old code did; [`Self::configure`]
+    /// changes it.
     pub fn new(size: SizeWatch) -> Self {
         Self {
+            draw: Draw::new(size.clone()),
             frame_max_row_ratio: FRAME_MAX_ROW_RATIO,
             size,
         }
+    }
+
+    /// The drawing edge, for the content path and the frame verbs that still
+    /// reach it directly (step 4c: `Content` and `ConsoleOutput` go through
+    /// the manager's lock to get here).
+    pub(crate) fn draw(&mut self) -> &mut Draw {
+        &mut self.draw
     }
 
     /// Set the frame's max-height ratio (design §Render `configure`) — the
@@ -446,16 +458,15 @@ impl RenderManager {
     }
 
     /// Allocate → render → apply → remember: the pipeline that was
-    /// `Output::draw_elements`' default body (step 4b).
+    /// `Output::draw_elements`' default body (step 4b), painting through the
+    /// [`Draw`] this manager has owned since 4c.
     ///
     /// The compose head is *not* here: the status row is the console side's
     /// fact, so the caller composes (`Output::compose_area`) and hands the
     /// stack in — the status row becomes an installed element in 4h and the
-    /// head moves in with it. `draw` is *given*, not owned: the manager does
-    /// not hold the drawing edge until 4c moves `Draw` under this roof.
+    /// head moves in with it.
     pub(crate) fn render(
-        &self,
-        draw: &Draw,
+        &mut self,
         stack: Vec<Element>,
         policy: ApplyPolicy,
         dims: (usize, usize),
@@ -468,13 +479,12 @@ impl RenderManager {
         // extents rather than asking the painter to guess twice.
         let heights = allocate(&extents, self.budget(th));
         let frame = render(&stack, &heights, tw);
-        let applied = draw.draw_frame(&frame, policy, dims);
+        let applied = self.draw.draw_frame(&frame, policy, dims);
         // Moved, never copied: the recipe belongs to the composition that built
         // it, and `DrawCache` is where the content path reads it — until the
-        // hub takes reposition (4e). The size is written under the same lock
-        // so the recipe and the geometry it was rendered at can never be read
-        // apart.
-        draw.remember_compose(stack, applied);
+        // hub takes reposition (4e). Written together, so the recipe and the
+        // geometry it was rendered at can never be read apart.
+        self.draw.remember_compose(stack, applied);
         applied
     }
 }
@@ -516,36 +526,38 @@ mod tests {
     }
 
     /// `render` is the pipeline that left `Output::draw_elements`: it applies
-    /// through the `Draw` it is given and remembers the composition there
-    /// (recipe + applied size, where the content path reads it). Captured
-    /// through the draw's own capture swap — the manager writes nothing of
-    /// its own.
+    /// through the `Draw` it has owned since 4c and remembers the composition
+    /// there (recipe + applied size, where the content path reads it).
+    /// Captured through the draw's own capture swap — the manager writes
+    /// nothing of its own.
     #[test]
-    fn manager_render_applies_through_the_given_draw_and_remembers() {
+    fn manager_render_paints_its_own_draw_and_remembers() {
         let size = crate::termio::fixed(TermSize {
             width: 40,
             height: 24,
         });
-        let draw = Draw::new(size.clone());
-        let manager = RenderManager::new(size);
+        let mut manager = RenderManager::new(size);
 
-        draw.begin_capture();
+        manager.draw.begin_capture();
         let stack = vec![
             Element::lines(vec!["hello".to_string()]),
             Element::divider(),
         ];
-        let applied = manager.render(&draw, stack, ApplyPolicy::Frame, (40, 24));
-        let bytes = draw.end_capture();
+        let applied = manager.render(stack, ApplyPolicy::Frame, (40, 24));
+        let bytes = manager.draw.end_capture();
 
         assert_eq!(applied, (40, 24));
         assert!(
             String::from_utf8_lossy(&bytes).contains("hello"),
-            "the frame's rows must reach the given Draw's writer"
+            "the frame's rows must reach the manager's Draw"
         );
-        let cache = draw.cache.lock().unwrap();
-        assert_eq!(cache.applied, Some((40, 24)), "applied size remembered");
         assert_eq!(
-            cache.element_stack.len(),
+            manager.draw.cache.applied,
+            Some((40, 24)),
+            "applied size remembered"
+        );
+        assert_eq!(
+            manager.draw.cache.element_stack.len(),
             2,
             "the recipe is remembered where the content path reads it"
         );

@@ -16,7 +16,6 @@
 //! [`crate::render`].
 
 use std::io::{self, Write};
-use std::sync::Mutex;
 
 use crate::ansi::{HIDE_CURSOR, SHOW_CURSOR};
 use crate::render::{allocate, live_budget, render, Element, Extent, Frame};
@@ -711,50 +710,42 @@ fn erase_down(s: &mut String, h: usize) {
 
 /// The live screen: the byte sink, and what is believed to be on it.
 ///
-/// Owns the writer and the [`DrawCache`] under one lock order — **writer,
-/// then cache** — so each byte emission and the bookkeeping advance that goes
-/// with it are one atomic step. The reverse is never taken: no path holds the
-/// cache while acquiring the writer.
-///
-/// Held by `ConsoleOutput`, whose content path still reaches into
-/// [`Self::writer`] and [`Self::cache`] directly; the encapsulation that
-/// replaces those reaches lands with step 4's render manager.
+/// Plain fields, no locks of its own (step 4c): `Draw` is reached only
+/// through `RenderManager`'s `Mutex`, which is what serializes byte emission
+/// with the bookkeeping advance — the old writer-then-cache lock order,
+/// encapsulated one layer up. Methods that write or advance therefore take
+/// `&mut self`.
 pub(crate) struct Draw {
     /// Where the bytes go. Defaults to stdout; [`Self::begin_capture`] swaps
     /// in a `Cursor<Vec<u8>>` and [`Self::end_capture`] swaps it back.
-    pub(crate) writer: Mutex<Box<dyn Write + Send>>,
+    pub(crate) writer: Box<dyn Write + Send>,
     /// The size watch (step 2 commit A): the latest `TermSize`, without a
-    /// per-call terminal query. Seeded by `ConsoleOutput` from the process
-    /// watch — or from a test's private one, which is what lets the width
-    /// tests run concurrently.
+    /// per-call terminal query. The same channel the manager holds — a
+    /// subscribed receiver, so a test's private watch pins both.
     pub(crate) size: watch::Receiver<TermSize>,
     /// Live-screen bookkeeping (plan §4.1): tracked cursor row, clear floor,
     /// last applied frame. (The content-path state moved to `content/` in
     /// step 3a of the output-drawing refactor.)
-    pub(crate) cache: Mutex<DrawCache>,
+    pub(crate) cache: DrawCache,
     /// The previous writer while a capture is active.
-    pub(crate) saved_writer: Mutex<Option<Box<dyn Write + Send>>>,
+    pub(crate) saved_writer: Option<Box<dyn Write + Send>>,
 }
 
 impl Draw {
     pub(crate) fn new(size: watch::Receiver<TermSize>) -> Self {
         let term_h = size.borrow().height;
         Draw {
-            writer: Mutex::new(Box::new(io::stdout())),
-            cache: Mutex::new(DrawCache::new(term_h)),
-            saved_writer: Mutex::new(None),
+            writer: Box::new(io::stdout()),
+            cache: DrawCache::new(term_h),
+            saved_writer: None,
             size,
         }
     }
 
     /// Apply `frame` at the cursor under `policy` (plan §4.3–4.4): plan the
     /// bytes, write them, return the dims actually applied.
-    ///
-    /// Locks the writer before the cache so the byte emission and the cache
-    /// advance are one atomic step, and never holds the cache while acquiring
-    /// the writer (the same order every other frame path takes).
     pub(crate) fn draw_frame(
-        &self,
+        &mut self,
         frame: &Frame,
         policy: ApplyPolicy,
         dims: (usize, usize),
@@ -763,31 +754,27 @@ impl Draw {
         // source for both phases of the frame (ui_draw_v2 §9 #3). Clamped
         // to what `plan_apply` stores as the live frame's `term_w`/`term_h`.
         let (tw, th) = (dims.0.max(1), dims.1.max(1));
-        let mut out = self.writer.lock().unwrap();
-        let bytes = {
-            let mut cache = self.cache.lock().unwrap();
-            // The recipe belongs to whatever composed *this* frame. Reaching
-            // `draw_frame` directly (a test, `ui::resolve`'s empty frame) means
-            // nothing composed an area, so the previous one is not what is on
-            // screen any more — and a content write must not re-emit it.
-            // `draw_elements` re-stores immediately after, so its own
-            // composition survives the clear.
-            cache.element_stack.clear();
-            plan_apply(&mut cache, frame, policy, tw, th)
-        };
-        let _ = out.write_all(bytes.as_bytes());
+        // The recipe belongs to whatever composed *this* frame. Reaching
+        // `draw_frame` directly (a test, `ui::resolve`'s empty frame) means
+        // nothing composed an area, so the previous one is not what is on
+        // screen any more — and a content write must not re-emit it.
+        // `RenderManager::render` re-stores immediately after, so its own
+        // composition survives the clear.
+        self.cache.element_stack.clear();
+        let bytes = plan_apply(&mut self.cache, frame, policy, tw, th);
+        let _ = self.writer.write_all(bytes.as_bytes());
         // The cursor follows the frame's own caret. A composed frame with one is
         // where the user types; a frame whose input is hidden mid-turn (R1) has
         // none to place, so hiding is the honest reading of the same fact rather
         // than a second piece of input state kept in step by hand. Either way
         // this is the cheapest place to be sure — `TermGuard` and the shell can
         // also leave it hidden.
-        let _ = out.write_all(if frame.caret.is_some() {
+        let _ = self.writer.write_all(if frame.caret.is_some() {
             SHOW_CURSOR
         } else {
             HIDE_CURSOR
         });
-        let _ = out.flush();
+        let _ = self.writer.flush();
         (tw, th)
     }
 
@@ -795,11 +782,11 @@ impl Draw {
     /// scrolls and keeps the cursor on the bottom row when content overflows,
     /// so we *clamp* to the height rather than wrapping (a modulo wrap would
     /// teleport the tracked row to the top of the screen after a long session).
-    pub(crate) fn note_lines(&self, n: usize) {
+    pub(crate) fn note_lines(&mut self, n: usize) {
         let h = self.size.borrow().height;
         // Advance the tracked cursor and drop the frame region — the write that
         // called us moved the cursor off the frame (plan §4.2).
-        self.cache.lock().unwrap().note_lines(n, h);
+        self.cache.note_lines(n, h);
     }
 
     /// The area's re-emit: re-render the stored recipe (§5.1.1) and walk it to
@@ -816,10 +803,10 @@ impl Draw {
     /// direct `draw_frame`). Falling back keeps the invariant that matters more
     /// than freshness, I5: an area that was consumed is always put back, so a
     /// half-consumed frame is never left stranded on screen.
-    pub(crate) fn reposition_area(&self, width: usize, taken: Frame) -> String {
+    pub(crate) fn reposition_area(&mut self, width: usize, taken: Frame) -> String {
         let tw = width.max(1);
         let th = self.size.borrow().height.max(1);
-        let mut cache = self.cache.lock().unwrap();
+        let cache = &mut self.cache;
         // The consumed frame's height is the `old_h` of the below-frame clear
         // (`old_h - h_new - consumed_rows`) — read before `taken` moves into
         // the fallback below.
@@ -848,7 +835,7 @@ impl Draw {
             cache.consumed_rows = 0;
             return String::new();
         }
-        plan_reposition(&mut cache, &frame, old_h, tw, th)
+        plan_reposition(cache, &frame, old_h, tw, th)
     }
 
     /// Sync the tracked row with the terminal's real cursor, write any
@@ -868,21 +855,17 @@ impl Draw {
     /// is live — every streamed block, and every commit — because the bytes
     /// are then just the cursor park. So it lives here, with the writer: every
     /// caller treats it as a side-effecting re-anchor, and none of them writes.
-    pub(crate) fn reanchor_to_cursor(&self, row: Option<usize>) -> usize {
-        // Writer before cache, as in `draw_frame`: one atomic step for the
-        // emission and the cache advance, and never the cache held while
-        // acquiring the writer.
-        let mut out = self.writer.lock().unwrap();
+    pub(crate) fn reanchor_to_cursor(&mut self, row: Option<usize>) -> usize {
         let (row, bytes) = {
-            let mut cache = self.cache.lock().unwrap();
             // Same floors the `output::term_width` free function applies: the
             // 20-column floor is load-bearing for `plan_apply` when the
             // geometry is still uninitialized.
             let size = *self.size.borrow();
-            cache.reanchor(row, size.width.max(20), size.height.max(1))
+            self.cache
+                .reanchor(row, size.width.max(20), size.height.max(1))
         };
-        let _ = out.write_all(bytes.as_bytes());
-        let _ = out.flush();
+        let _ = self.writer.write_all(bytes.as_bytes());
+        let _ = self.writer.flush();
         row
     }
 
@@ -892,7 +875,7 @@ impl Draw {
     /// apply, a fresh terminal query: a caller that has not painted yet should
     /// start from what is actually on screen, not from a size nobody drew at.
     pub(crate) fn painted_size(&self) -> (usize, usize) {
-        self.cache.lock().unwrap().applied.unwrap_or_else(|| {
+        self.cache.applied.unwrap_or_else(|| {
             let size = *self.size.borrow();
             (size.width.max(1), size.height.max(1))
         })
@@ -912,78 +895,57 @@ impl Draw {
     /// independent one. Loud where it is free (debug builds), and harmless
     /// where it is not (release keeps batching correctly) — rather than a
     /// missing redraw to chase at runtime.
-    pub(crate) fn begin_batch(&self) -> bool {
-        let mut cache = self.cache.lock().unwrap();
+    pub(crate) fn begin_batch(&mut self) -> bool {
         debug_assert!(
-            !cache.batch_active,
+            !self.cache.batch_active,
             "batches do not nest: this begin_batch is a no-op, because the \
              open batch above already covers everything written inside it"
         );
-        if cache.batch_active {
+        if self.cache.batch_active {
             return false;
         }
-        cache.batch_active = true;
+        self.cache.batch_active = true;
         true
     }
 
     /// End the open batch: emit the deferred frame once, at `width`
     /// (ui_draw_v2 R5).
-    pub(crate) fn end_batch(&self, width: usize) {
-        // Locks taken separately and never nested the other way round: every
-        // other frame path holds `writer` *then* `cache`, so acquiring `cache`
-        // with neither held here, and the writer only after the reposition is
-        // planned, keeps the two from ever being held inverted.
-        let taken = {
-            let mut cache = self.cache.lock().unwrap();
-            if !cache.batch_active {
-                return;
-            }
-            cache.batch_active = false;
-            cache.deferred.take()
-        };
-        let Some(taken) = taken else {
+    pub(crate) fn end_batch(&mut self, width: usize) {
+        if !self.cache.batch_active {
+            return;
+        }
+        self.cache.batch_active = false;
+        let Some(taken) = self.cache.deferred.take() else {
             return;
         };
         let bytes = self.reposition_area(width, taken);
-        let mut out = self.writer.lock().unwrap();
-        let _ = out.write_all(bytes.as_bytes());
-        let _ = out.flush();
+        let _ = self.writer.write_all(bytes.as_bytes());
+        let _ = self.writer.flush();
     }
 
     /// Remember the composition so §4.5's content path can re-draw it, and the
     /// size it was applied at.
-    pub(crate) fn remember_compose(&self, stack: Vec<Element>, applied: (usize, usize)) {
-        // One lock for both: the recipe and the geometry it was rendered at
-        // describe one paint and must not be read apart.
-        let mut cache = self.cache.lock().unwrap();
-        cache.element_stack = stack;
-        cache.applied = Some(applied);
-    }
-
-    /// Swap the sink wholesale — how the test harness captures what the content
-    /// path emits without a terminal. The writer sits behind its one lock, so a
-    /// `&self` swap is the whole operation.
-    #[cfg(test)]
-    pub(crate) fn set_writer(&self, writer: Box<dyn Write + Send>) {
-        *self.writer.lock().unwrap() = writer;
+    pub(crate) fn remember_compose(&mut self, stack: Vec<Element>, applied: (usize, usize)) {
+        // The recipe and the geometry it was rendered at describe one paint
+        // and are written together.
+        self.cache.element_stack = stack;
+        self.cache.applied = Some(applied);
     }
 
     /// Swap the writer for a `Cursor<Vec<u8>>` capture buffer; call
     /// [`Draw::end_capture`] to restore the original writer and retrieve
     /// the captured bytes.
-    pub(crate) fn begin_capture(&self) {
-        let mut writer = self.writer.lock().unwrap();
-        let old = std::mem::replace(&mut *writer, Box::new(io::Cursor::new(Vec::new())));
-        *self.saved_writer.lock().unwrap() = Some(old);
+    pub(crate) fn begin_capture(&mut self) {
+        let old = std::mem::replace(&mut self.writer, Box::new(io::Cursor::new(Vec::new())));
+        self.saved_writer = Some(old);
     }
 
     /// End a capture session: restore the original writer and return the
     /// captured bytes.
-    pub(crate) fn end_capture(&self) -> Vec<u8> {
-        let mut writer = self.writer.lock().unwrap();
-        let saved = self.saved_writer.lock().unwrap().take();
+    pub(crate) fn end_capture(&mut self) -> Vec<u8> {
+        let saved = self.saved_writer.take();
         let old = saved.expect("end_capture without begin_capture");
-        let current = std::mem::replace(&mut *writer, old);
+        let current = std::mem::replace(&mut self.writer, old);
         // Safety: we know current is a Box<Cursor<Vec<u8>>> because
         // begin_capture always creates one.
         let raw = Box::into_raw(current);

@@ -583,14 +583,15 @@ impl Output for LogOutput {
 
 /// The merged output — the agent's `Arc<dyn Output>` — whose content half is
 /// now the [`Content`] handle (step 3c): `content` owns the boundary, the
-/// width watch, the streaming renderers, and the `Draw` sink, and `Output`'s
-/// content methods forward through it. The frame methods stay here, reaching
-/// `content.draw` until step 4 makes `RenderManager` the frame front door.
+/// width watch and the streaming renderers, and `Output`'s content methods
+/// forward through it. The frame methods stay here; the pipeline behind them
+/// is `RenderManager`'s (4b), reached through the content handle's hub.
 pub struct ConsoleOutput {
     /// The content owner (steps 3c–3d), shared by `Arc` with
     /// `AgentConfig.content`, so the config's frame handle and its content
     /// handle are one state. `Output`'s content methods forward through it;
-    /// the frame methods reach `content.draw` via a temporary pass-through.
+    /// the frame methods reach the drawing edge through its `manager`
+    /// (step 4c).
     pub(crate) content: Arc<Content>,
     /// The status line's content — pure frame state, never content's (see the
     /// transition contract). `Arc`'d so [`Element::status`] can hold its own
@@ -1071,7 +1072,12 @@ impl Output for ConsoleOutput {
         // around the query so the reply cannot be swallowed, then this re-anchors
         // the draw cache with the answer.
         let row = crate::termio::query_cursor_row();
-        self.content.draw.reanchor_to_cursor(row)
+        self.content
+            .manager
+            .lock()
+            .unwrap()
+            .draw()
+            .reanchor_to_cursor(row)
     }
 
     fn frame_size(&self) -> (usize, usize) {
@@ -1079,13 +1085,13 @@ impl Output for ConsoleOutput {
     }
 
     fn painted_size(&self) -> (usize, usize) {
-        self.content.draw.painted_size()
+        self.content.manager.lock().unwrap().draw().painted_size()
     }
 
     fn begin_batch(&self) -> BatchGuard<'_> {
         // The mechanics (flag, debug assert) live on `Draw`; only the guard,
         // which has to name an `Output` for its drop, is this layer's.
-        if self.content.draw.begin_batch() {
+        if self.content.manager.lock().unwrap().draw().begin_batch() {
             BatchGuard { out: Some(self) }
         } else {
             BatchGuard { out: None }
@@ -1093,7 +1099,12 @@ impl Output for ConsoleOutput {
     }
 
     fn end_batch(&self) {
-        self.content.draw.end_batch(self.term_width());
+        self.content
+            .manager
+            .lock()
+            .unwrap()
+            .draw()
+            .end_batch(self.term_width());
     }
 
     /// Bracketed, and — where the previous content was also a committed
@@ -1128,14 +1139,19 @@ impl Output for ConsoleOutput {
         policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
-        self.content.draw.draw_frame(frame, policy, dims)
+        self.content
+            .manager
+            .lock()
+            .unwrap()
+            .draw()
+            .draw_frame(frame, policy, dims)
     }
 
     /// The frame path's entry (step 4b): compose the area — the status row is
     /// this output's own fact (see [`Self::status_row`]), so the compose head
     /// stays here — then hand the stack to the manager, which budgets,
-    /// renders, applies and remembers it, painting through the same `Draw`
-    /// this output has always drawn with.
+    /// renders, applies and remembers it through the `Draw` under its roof
+    /// (step 4c).
     fn draw_elements(
         &self,
         input: Option<Element>,
@@ -1148,7 +1164,7 @@ impl Output for ConsoleOutput {
             .manager
             .lock()
             .unwrap()
-            .render(&self.content.draw, stack, policy, dims)
+            .render(stack, policy, dims)
     }
 
     fn display_plain(&self, text: &str) {
@@ -1538,7 +1554,14 @@ mod tests {
 
     /// Tracked cursor row of `out` (0-based, as the screen reports it).
     fn tracked_row(out: &ConsoleOutput) -> usize {
-        out.content.draw.cache.lock().unwrap().tracked_row() - 1
+        out.content
+            .manager
+            .lock()
+            .unwrap()
+            .draw()
+            .cache
+            .tracked_row()
+            - 1
     }
 
     /// Row the cursor ends on when `bytes` are replayed into a `width`x24
@@ -2873,7 +2896,7 @@ mod tests {
     fn content_choke_wraps_an_overwide_line_before_the_line_clear() {
         let (out, _reasoning) = capturing_output(60);
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
-        out.content.draw.set_writer(Box::new(sink.clone()));
+        out.content.manager.lock().unwrap().draw().writer = Box::new(sink.clone());
         let y = "y".repeat(120);
         out.content
             .with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
@@ -2896,7 +2919,7 @@ mod tests {
     fn wrapped_content_keeps_its_sgr_across_the_inserted_newline() {
         let (out, _reasoning) = capturing_output(60);
         let sink = Sink(Arc::new(Mutex::new(Vec::new())));
-        out.content.draw.set_writer(Box::new(sink.clone()));
+        out.content.manager.lock().unwrap().draw().writer = Box::new(sink.clone());
         let y = "y".repeat(120);
         let input = format!("\x1b[32m{y}\x1b[0m\n");
         out.content
@@ -3404,9 +3427,9 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
             },
         );
         out.display_tool_call("edit", &serde_json::json!({"path": "src/x.rs"}));
-        out.content.draw.begin_capture();
+        out.begin_capture();
         out.display_tool_result(msg);
-        let bytes = out.content.draw.end_capture();
+        let bytes = out.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         let columns: Vec<usize> = text
@@ -3454,9 +3477,9 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         ] {
             let err = crate::tools::EditArgs::from_wire(&raw).expect_err("must fail");
             let (out, _reasoning) = capturing_output(80);
-            out.content.draw.begin_capture();
+            out.begin_capture();
             out.display_tool_result(&format!("failed to parse tool arguments: {err}"));
-            let bytes = out.content.draw.end_capture();
+            let bytes = out.end_capture();
             let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
             assert!(!text.contains("@@ -"), "phantom diff for {raw}:\n{text}");
@@ -3487,13 +3510,13 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     #[test]
     fn a_single_edit_failure_renders_as_a_definition_list() {
         let (out, _reasoning) = capturing_output(80);
-        out.content.draw.begin_capture();
+        out.begin_capture();
         out.display_tool_result(
             "missing required field 'path'\n\nExpected:\n\
              {\"path\": \"some/path.rs\", \"startLine\": 1234, \"oldText\": \"old text\", \
              \"newText\": \"new text\"}\n\nActual:\n{\"newText\":\"b\",\"oldText\":\"a\"}",
         );
-        let bytes = out.content.draw.end_capture();
+        let bytes = out.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         assert!(!text.contains("|"), "a table was drawn:\n{text}");
@@ -3515,12 +3538,12 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     #[test]
     fn an_edit_call_still_renders_its_blocks_as_a_diff() {
         let (out, _reasoning) = capturing_output(80);
-        out.content.draw.begin_capture();
+        out.begin_capture();
         out.display_tool_call(
             "edit",
             &serde_json::json!({"blocks": "src/x.rs:5\n@@@OLD\n    run();\n@@@NEW\n    walk();\n@@@END"}),
         );
-        let bytes = out.content.draw.end_capture();
+        let bytes = out.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         assert!(text.contains("edit src/x.rs"), "no label:\n{text}");
@@ -3535,13 +3558,13 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     #[test]
     fn a_sed_preview_renders_without_a_call_context() {
         let (out, _reasoning) = capturing_output(80);
-        out.content.draw.begin_capture();
+        out.begin_capture();
         out.display_tool_result(
             "sed preview: 1 block for src/x.rs (1 expression). Review the blocks below, \
              then pass them to the `edit` tool as its `blocks` argument.\n\
              src/x.rs:5\n@@@OLD\n    run();\n@@@NEW\n    walk();\n@@@END\n",
         );
-        let bytes = out.content.draw.end_capture();
+        let bytes = out.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         assert!(
@@ -3557,7 +3580,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     fn tmp_repro_separator_blanks() {
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response();
-        out.content.draw.begin_capture();
+        out.begin_capture();
 
         // Case A: turn ends with a tool result (no trailing answer text).
         out.stream_text("Let me sleep.\n");
@@ -3566,23 +3589,23 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         out.display_tool_result("\"2. sleep 30 — done\"");
         out.end_response();
         out.display_separator();
-        let a = out.content.draw.end_capture();
+        let a = out.end_capture();
         let a = strip_ansi(&String::from_utf8_lossy(&a));
         eprintln!("=== Case A (tool-result end) ===\n{:?}", a);
 
         // Case B: turn ends with plain text answer.
         out.begin_response();
-        out.content.draw.begin_capture();
+        out.begin_capture();
         out.stream_text("All done.\n");
         out.end_response();
         out.display_separator();
-        let b = out.content.draw.end_capture();
+        let b = out.end_capture();
         let b = strip_ansi(&String::from_utf8_lossy(&b));
         eprintln!("=== Case B (text end) ===\n{:?}", b);
 
         // Case C: turn ends with trailing thinking after a tool result.
         out.begin_response();
-        out.content.draw.begin_capture();
+        out.begin_capture();
         out.stream_text("Let me sleep.\n");
         out.end_response_segment();
         out.display_tool_call("bash", &serde_json::json!({"command": "sleep 30"}));
@@ -3590,7 +3613,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         out.stream_thinking("wrapping up\n");
         out.end_response();
         out.display_separator();
-        let c = out.content.draw.end_capture();
+        let c = out.end_capture();
         let c = strip_ansi(&String::from_utf8_lossy(&c));
         eprintln!("=== Case C (tool + trailing thinking) ===\n{:?}", c);
     }
@@ -3624,19 +3647,19 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
 
         // A: two single-file pairs, as a sequence of real calls would render.
         let (a, _) = capturing_output(40);
-        a.content.draw.begin_capture();
+        a.begin_capture();
         for (i, single) in singles.iter().enumerate() {
             a.display_tool_call("edit", single);
             a.display_tool_result(notes[i]);
         }
-        let a = strip_ansi(&String::from_utf8_lossy(&a.content.draw.end_capture()));
+        let a = strip_ansi(&String::from_utf8_lossy(&a.end_capture()));
 
         // B: one multi-file pair.
         let (b, _) = capturing_output(40);
-        b.content.draw.begin_capture();
+        b.begin_capture();
         b.display_tool_call("edit", &multi_args);
         b.display_tool_result(&array);
-        let b = strip_ansi(&String::from_utf8_lossy(&b.content.draw.end_capture()));
+        let b = strip_ansi(&String::from_utf8_lossy(&b.end_capture()));
 
         assert_eq!(
             a, b,
@@ -3669,12 +3692,12 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         // batch per file — a failure's short ui_view and a success's note — with
         // no aggregate line and no model_view diff leaking into scrollback.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
-        out.content.draw.begin_capture();
+        out.begin_capture();
         out.display_tool_result(
             r#"[{"path":"src/a.rs","result":"Replaced 1 block(s) in ./a.rs"},
                 {"path":"src/b.rs","result":{"ui_view":"edit failed: nope","model_view":"SECRET DIFF"}}]"#,
         );
-        let d = strip_ansi(&String::from_utf8_lossy(&out.content.draw.end_capture()));
+        let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture()));
         assert!(d.contains("edit src/a.rs"), "{d}");
         assert!(d.contains("Replaced 1 block(s) in ./a.rs"), "{d}");
         assert!(d.contains("edit src/b.rs"), "{d}");
@@ -3689,9 +3712,9 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         // Another tool's list must keep its existing rendering; the multi-file
         // branch must not swallow it.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
-        out.content.draw.begin_capture();
+        out.begin_capture();
         out.display_tool_result(r#"["alpha","beta"]"#);
-        let d = strip_ansi(&String::from_utf8_lossy(&out.content.draw.end_capture()));
+        let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture()));
         assert!(d.contains("alpha") && d.contains("beta"), "{d}");
     }
 
@@ -3703,7 +3726,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         // is separated from the tool-result line by a blank line.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response();
-        out.content.draw.begin_capture();
+        out.begin_capture();
         out.stream_text("Let me edit.\n");
         out.end_response_segment();
         out.display_tool_call(
@@ -3715,7 +3738,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         out.end_response_segment();
         out.stream_text("Done.\n");
         out.end_response();
-        let d = out.content.draw.end_capture();
+        let d = out.end_capture();
         let d = strip_ansi(&String::from_utf8_lossy(&d));
         let after = d.find("Replaced 1 block(s) in ./no_such.rs").unwrap()
             + "Replaced 1 block(s) in ./no_such.rs".len();
@@ -3733,7 +3756,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         // content preview (first 10 lines), matching read_file's rendering.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response();
-        out.content.draw.begin_capture();
+        out.begin_capture();
 
         // Simulate a write tool call with structured result (as write_file returns)
         out.display_tool_call(
@@ -3744,7 +3767,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         out.display_tool_result(result);
 
         out.end_response();
-        let captured = out.content.draw.end_capture();
+        let captured = out.end_capture();
         let output = strip_ansi(&String::from_utf8_lossy(&captured));
 
         // Should contain the path header with line count
@@ -3783,9 +3806,9 @@ mod ui_render_scope_tests {
 
     fn render(result: &str) -> String {
         let out = ConsoleOutput::new(default_show_reasoning_handle());
-        out.content.draw.begin_capture();
+        out.begin_capture();
         out.display_tool_result(result);
-        let d = strip_ansi(&String::from_utf8_lossy(&out.content.draw.end_capture()));
+        let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture()));
         d
     }
 

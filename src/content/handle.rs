@@ -1,13 +1,14 @@
 //! The `Content` handle (step 3c of the output-drawing refactor): the agent-
 //! facing owner of the transcript's content. It holds the content boundary
-//! state, the width watch, the streaming renderers, and the byte sink (`Draw`),
-//! and — as the content methods move onto it — formats content at the watched
-//! width and writes through the sink.
+//! state, the width watch and the streaming renderers, formats content at the
+//! watched width, and writes through the byte sink — which lives inside the
+//! frame hub it holds (steps 4b/4c).
 //!
-//! It also holds the frame hub (step 4b): `RenderManager` runs the frame
-//! pipeline and paints through `draw` until 4c moves the sink under the
-//! manager's roof. The frame *verbs* (`frame_size`, `painted_size`,
-//! `cursor_row`, `draw_frame`) stay on `Output` until 4f re-homes them.
+//! It also holds the frame hub (steps 4b/4c): `RenderManager` runs the frame
+//! pipeline and has owned the `Draw` sink since 4c — everything here that
+//! used to reach `self.draw` locks the manager first. The frame *verbs*
+//! (`frame_size`, `painted_size`, `cursor_row`, `draw_frame`) stay on
+//! `Output` until 4f re-homes them.
 
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
@@ -24,7 +25,7 @@ use crate::content::markdown::{
 };
 use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno};
 use crate::content::text::wrap;
-use crate::draw::{plan_consume, Draw};
+use crate::draw::plan_consume;
 use crate::output::Output;
 use crate::row_count::RowCounter;
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
@@ -41,14 +42,12 @@ use super::{boundary_spacer, separator_line, ContentDisplayKind};
 /// `ConsoleOutput` and reach them through `self.content.…`; they tighten to
 /// private once those methods move onto `Content` (3c-b).
 pub struct Content {
-    /// The live screen: byte sink plus the bookkeeping of what is believed to
-    /// be on it. Writer before cache, always — see [`Draw`].
-    pub(crate) draw: Draw,
-    /// The frame hub (step 4b): where the frame pipeline lives now —
-    /// allocate → render → apply → remember, painting through `draw` until
-    /// 4c moves it under the manager's roof. `Arc<Mutex<…>>` is the design's
-    /// handle shape (§Render: UI and content both hold one); today the only
-    /// holder is this `Content`, reached by `ConsoleOutput` through it.
+    /// The frame hub (steps 4b/4c): where the frame pipeline *and* the
+    /// drawing edge live — allocate → render → apply → remember, with the
+    /// `Draw` sink under the manager's roof since 4c. `Arc<Mutex<…>>` is the
+    /// design's handle shape (§Render: UI and content both hold one); today
+    /// the only holder is this `Content`, reached by `ConsoleOutput` through
+    /// it. Everything here that writes locks this first.
     pub(crate) manager: Arc<Mutex<crate::render::RenderManager>>,
     /// This instance's view of the size watch (step 2) — the same channel
     /// `draw` holds, so the content path's width reads and the frame path's
@@ -95,9 +94,10 @@ pub struct Content {
 }
 
 impl Content {
-    /// Build the content half from its per-process inputs: the `Draw` sink and
-    /// size watch are created together (they share the watch), the caps are
-    /// probed once, and the renderers start blank at a placeholder width.
+    /// Build the content half from its per-process inputs: the frame hub (and
+    /// through it the `Draw` sink) and the size watch are created together
+    /// (they share the watch), the caps are probed once, and the renderers
+    /// start blank at a placeholder width.
     pub(crate) fn new(
         size: watch::Receiver<TermSize>,
         show_reasoning: ShowReasoningHandle,
@@ -111,7 +111,6 @@ impl Content {
             .unwrap()
             .configure(crate::render::FRAME_MAX_ROW_RATIO);
         Self {
-            draw: Draw::new(size.clone()),
             manager,
             size,
             caps,
@@ -221,10 +220,10 @@ impl Content {
         });
     }
 
-    /// Run `f` with `Draw`'s writer lock wrapped in a [`RowCounter`], then
-    /// advance the draw cache by the rows `f` wrote. For the writers that
-    /// produce their own bytes — the streaming markdown renderers, which want
-    /// a `Write` to feed.
+    /// Run `f` with the hub's lock held around `Draw`'s writer, wrapped in a
+    /// [`RowCounter`], then advance the draw cache by the rows `f` wrote. For
+    /// the writers that produce their own bytes — the streaming markdown
+    /// renderers, which want a `Write` to feed.
     ///
     /// `f` gets a `&mut dyn io::Write`, which keeps the counter's type (and
     /// its borrow of the lock) out of the signature. A caller handing it to
@@ -269,7 +268,12 @@ impl Content {
     where
         F: FnOnce(&mut dyn io::Write) -> T,
     {
-        let mut out = self.draw.writer.lock().unwrap();
+        // The hub's lock is the sink's lock now (step 4c): one guard across
+        // the whole write, exactly the span the old writer lock covered —
+        // same non-reentrancy (a closure that called back into a content
+        // write would deadlock, as it always would have), one level up.
+        let mut mgr = self.manager.lock().unwrap();
+        let draw = mgr.draw();
         // The *caller* declares the kind — the choke point never guesses from
         // bytes — and the previous one is read first, because the whole
         // boundary rule is a statement about the pair. Recording before `f`
@@ -318,7 +322,7 @@ impl Content {
         //
         // Captures get the raw bytes — they are assertions against content,
         // not against a screen.
-        let capturing = self.draw.saved_writer.lock().unwrap().is_some();
+        let capturing = draw.saved_writer.is_some();
         let mut buf: Vec<u8> = Vec::new();
         let mut clear = LineClear {
             inner: &mut buf,
@@ -446,7 +450,6 @@ impl Content {
         // can still diff it. The kind/hold bookkeeping above already ran: an
         // empty write is still a statement about the boundary.
         if buf.is_empty() {
-            drop(out);
             return r;
         }
         // **Consume, then write** (ui_draw_v2 §4.5 P1 / ui_draw_261001): the
@@ -455,26 +458,22 @@ impl Content {
         // follows, already carrying its per-line clears. No erase with the
         // walk: each line clears the row it enters, and rows the content never
         // reaches are the reposition's `old_h` tail to clear in its own pass.
-        let (walk, taken) = {
-            let mut cache = self.draw.cache.lock().unwrap();
-            match plan_consume(&mut cache) {
-                Some((walk, frame)) => (walk, Some(frame)),
-                // No live area: the cursor is wherever the last write left it,
-                // which is where the content belongs. Nothing to walk and no
-                // `CR` to emit — the column is the content path's own
-                // bookkeeping here, not something to reset.
-                None => (String::new(), None),
-            }
+        let (walk, taken) = match plan_consume(&mut draw.cache) {
+            Some((walk, frame)) => (walk, Some(frame)),
+            // No live area: the cursor is wherever the last write left it,
+            // which is where the content belongs. Nothing to walk and no
+            // `CR` to emit — the column is the content path's own
+            // bookkeeping here, not something to reset.
+            None => (String::new(), None),
         };
         if !walk.is_empty() {
-            let _ = out.write_all(walk.as_bytes());
+            let _ = draw.writer.write_all(walk.as_bytes());
         }
-        let _ = out.write_all(&buf);
-        let _ = out.flush();
-        drop(out);
+        let _ = draw.writer.write_all(&buf);
+        let _ = draw.writer.flush();
         // Zero rows means nothing moved, and a frame stays live.
         if rows > 0 {
-            self.draw.note_lines(rows);
+            draw.note_lines(rows);
         }
         // The area comes back below what was just written — re-rendered rather
         // than replayed, so its status row is whatever it is *now*: the turn's
@@ -486,7 +485,7 @@ impl Content {
         // Inside a batch the reposition waits: the frame stays consumed for
         // the whole burst and the guard's drop emits it once (ui_draw_v2 R5).
         let taken = {
-            let mut cache = self.draw.cache.lock().unwrap();
+            let cache = &mut draw.cache;
             if taken.is_some() || cache.deferred.is_some() {
                 cache.consumed_rows += rows;
             }
@@ -505,10 +504,9 @@ impl Content {
             }
         };
         if let Some(taken) = taken {
-            let bytes = self.draw.reposition_area(width, taken);
-            let mut out = self.draw.writer.lock().unwrap();
-            let _ = out.write_all(bytes.as_bytes());
-            let _ = out.flush();
+            let bytes = draw.reposition_area(width, taken);
+            let _ = draw.writer.write_all(bytes.as_bytes());
+            let _ = draw.writer.flush();
         }
         r
     }
@@ -1338,14 +1336,20 @@ impl Content {
             return ContentBatchGuard { content: None };
         }
         ContentBatchGuard {
-            content: self.draw.begin_batch().then_some(self),
+            content: self
+                .manager
+                .lock()
+                .unwrap()
+                .draw()
+                .begin_batch()
+                .then_some(self),
         }
     }
 
     /// End the open batch: emit the deferred frame once, at this handle's
     /// watched width. Called by [`ContentBatchGuard`]'s drop.
     pub(crate) fn end_batch(&self) {
-        self.draw.end_batch(self.width());
+        self.manager.lock().unwrap().draw().end_batch(self.width());
     }
 
     /// Begin capturing everything content writes to the sink (§4: capture is
@@ -1356,7 +1360,7 @@ impl Content {
             tap.begin_capture();
             return;
         }
-        self.draw.begin_capture();
+        self.manager.lock().unwrap().draw().begin_capture();
     }
 
     /// End a capture session and return what content wrote. See
@@ -1365,7 +1369,7 @@ impl Content {
         if let Some(tap) = &self.tap {
             return tap.end_capture();
         }
-        self.draw.end_capture()
+        self.manager.lock().unwrap().draw().end_capture()
     }
 
     pub(crate) fn reasoning_sink(&self) -> ReasoningSink {
@@ -1458,7 +1462,14 @@ mod tests {
             "the seam sees the source strings, unrendered"
         );
         assert!(
-            content.draw.cache.lock().unwrap().applied.is_none(),
+            content
+                .manager
+                .lock()
+                .unwrap()
+                .draw()
+                .cache
+                .applied
+                .is_none(),
             "a tapped verb must not move the real screen"
         );
     }
