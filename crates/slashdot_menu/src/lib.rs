@@ -17,6 +17,7 @@ pub mod menu;
 
 // --- Engine modules ---
 pub mod cursor;
+pub mod elements;
 pub mod fields;
 pub mod filter;
 pub mod fuzzy;

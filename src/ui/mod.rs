@@ -567,6 +567,8 @@ mod tests {
             rows: Arc::new(vec![LogicalLine::new("m0"), LogicalLine::new("m1")]),
             selected: Some(1),
             active_rows: vec![],
+            view: None,
+            columns: Vec::new(),
         };
         let els = overlay_elements(&plan, 40, plan.selected);
         let asks: Vec<RowAsk> = els.iter().map(|e| e.ask(40)).collect();

@@ -16,3 +16,4 @@ slashdot_tui = { path = "../slashdot_tui" }
 
 [dev-dependencies]
 futures = "0.3"
+slashdot_tui = { path = "../slashdot_tui", features = ["test-helpers"] }

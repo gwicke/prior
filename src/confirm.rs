@@ -213,6 +213,8 @@ impl ConfirmPrompt {
                 rows,
                 selected: Some(DEFAULT_SEL),
                 active_rows: vec![],
+                view: None,
+                columns: Vec::new(),
             },
             sel: DEFAULT_SEL,
             subject: req.subject,

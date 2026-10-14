@@ -433,6 +433,8 @@ pub(crate) fn test_overlay_parts(
         rows: std::sync::Arc::new(rows.iter().map(|l| LogicalLine::new(*l)).collect()),
         selected: sel,
         active_rows: vec![],
+        view: None,
+        columns: Vec::new(),
     };
     crate::ui::overlay_elements(&plan, term_w, sel)
 }
@@ -5114,6 +5116,8 @@ mod confirm_tests {
                 rows: std::sync::Arc::new(vec![LogicalLine::new("menu-row")]),
                 selected: Some(0),
                 active_rows: vec![],
+                view: None,
+                columns: Vec::new(),
             },
         };
         let bridge = ConfirmBridge::new();
