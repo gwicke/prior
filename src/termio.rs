@@ -112,10 +112,11 @@ pub enum InputEvent {
     Key(KeyEvent),
     /// Bracketed paste payload — a bulk insert for the prompt.
     Paste(String),
-    /// A settled resize, as parked by the window pump. The reader itself
-    /// publishes resizes to the size watch inline and does not forward them
-    /// (see [`route_event`]); this variant exists for the parked path and for
-    /// the design's eventual "resize reaches the repl too" wiring.
+    /// A settled resize — on the channel since 4f-e-d: the reader forwards
+    /// what it also publishes to the size watch (both edges, design
+    /// §TermIO), and the window pump parks one for the same arms to drain.
+    /// Consumers republish idempotently and wait; nobody acts per event
+    /// (see [`route_event`]).
     Resize(TermSize),
 }
 
@@ -223,19 +224,24 @@ pub(crate) enum ReaderRoute {
 /// Route one terminal event as it arrives on stdin.
 ///
 /// **Inline — must not wait:**
-/// - `Resize`: the streaming renderers read the size watch (this module), and
-///   only the reader can update it while the main task is parked on the turn.
-///   Forwarding it too would make the turn consume the resize instead of the
-///   renderers reading it directly. (The design doc has resize travel *both*
-///   the watch and the input channel; that forward lands with the read_input
-///   rework — impl doc, step 4 follow-ups.)
 /// - `Ctrl-C` / `Ctrl-Z`: process and terminal state (`exit`,
 ///   `killpg(SIGTSTP)`), handled where they land, never queued.
 ///
-/// **Forwarded:** every other key, plus `Paste`. These are content for the
-/// prompt; `read_input` already treats `Event::Paste` as a bulk insert, so
-/// the turn's key branch reads them the same way (U4.3). `Esc` is one of
-/// them, and that is a change:
+/// **Forwarded:** every other key, plus `Paste` **and `Resize`** — resize
+/// travels *both* edges since 4f-e-d (design §TermIO: "resize → both the
+/// `size` watch and the `input` channel"; the reader publishes the watch as
+/// the event arrives, then forwards). The channel copy is the repl's, and
+/// the repl consumes it *without acting*: `read_input`'s arms republish
+/// idempotently and keep waiting, the turn's dispatch ignores it — so a
+/// drag's stream never forces a per-event repaint (that was the whole
+/// argument for keeping it inline; it survives as the watch half). The
+/// repaint stays where it was: the loop-top probe's once-per-keystroke
+/// compare, which runs the wipe + replay + re-anchor — a keystroke scrolls
+/// the cursor into view first, where a timer cannot.
+///
+/// The rest of `Paste`/keys: content for the prompt; `read_input` already
+/// treats `Event::Paste` as a bulk insert, so the turn's key branch reads
+/// them the same way (U4.3). `Esc` is one of them, and that is a change:
 ///
 /// `Esc` used to be Inline, and Inline meant *abort* — unconditionally, from
 /// here. Settled U4 makes it menu-first: the ladder runs while a menu is
@@ -250,7 +256,7 @@ pub(crate) enum ReaderRoute {
 /// ignored, exactly as it was before there was anywhere to forward to.
 pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
     match ev {
-        Event::Resize(..) => ReaderRoute::Inline,
+        Event::Resize(..) => ReaderRoute::Forward,
         Event::Key(key) => match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ReaderRoute::Inline
@@ -721,26 +727,19 @@ pub(crate) fn spawn_stdin_reader(
         }
         READER_PARKED.store(false, Ordering::SeqCst);
         if let Ok(true) = event::poll(Duration::from_millis(50)) {
-            match event::read() {
-                // U4.2: edit keys this thread used to drop now go to the
-                // prompt loop or the turn. `send` on an unbounded tokio mpsc
-                // never blocks, so this is safe from a plain OS thread — and
-                // being non-blocking is the whole reason the channel is
-                // unbounded (see `route_event`).
-                Ok(ev) if route_event(&ev) == ReaderRoute::Forward => {
-                    if let Some(ev) = InputEvent::from_event(ev) {
-                        let _ = input.send(ev);
-                    }
-                }
-                Ok(Event::Resize(w, h)) => {
-                    // Publish the new geometry on this instance's watch so
-                    // renderers pick up the change on their next streaming
-                    // call (the input-channel forward is 4f-e-d). Deduped
-                    // like every other publish: a storm of identical values
-                    // must not wake subscribers for nothing.
+            if let Ok(ev) = event::read() {
+                // Resize: *both* edges (4f-e-d, design §TermIO). The
+                // watch first — geometry readers (the streaming
+                // renderers, the loop-top compare) must see the new
+                // size by the time anyone reacts to the channel copy —
+                // then the forward. Deduped like every other publish:
+                // a storm of identical values must not wake subscribers
+                // for nothing, and the repl's republish of the same
+                // size is a no-op.
+                if let Event::Resize(w, h) = &ev {
                     let new = TermSize {
-                        width: w as usize,
-                        height: h as usize,
+                        width: *w as usize,
+                        height: *h as usize,
                     };
                     let _ = size.send_if_modified(|current| {
                         if *current == new {
@@ -751,7 +750,16 @@ pub(crate) fn spawn_stdin_reader(
                         }
                     });
                 }
-                Ok(Event::Key(key)) => {
+                // U4.2: edit keys this thread used to drop now go to the
+                // prompt loop or the turn. `send` on an unbounded tokio mpsc
+                // never blocks, so this is safe from a plain OS thread — and
+                // being non-blocking is the whole reason the channel is
+                // unbounded (see `route_event`).
+                if route_event(&ev) == ReaderRoute::Forward {
+                    if let Some(fwd) = InputEvent::from_event(ev) {
+                        let _ = input.send(fwd);
+                    }
+                } else if let Event::Key(key) = ev {
                     if let KeyCode::Char('c') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
                             let _ = guard.stop();
@@ -766,7 +774,8 @@ pub(crate) fn spawn_stdin_reader(
                         }
                     }
                 }
-                _ => {}
+                // Anything else Inline (mouse, focus): dropped, as
+                // before.
             }
         }
     });
@@ -1138,7 +1147,6 @@ mod tests {
                 "Ctrl-Z",
                 Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
             ),
-            ("Resize", Event::Resize(120, 40)),
         ];
         for (what, ev) in urgent {
             assert_eq!(
@@ -1148,6 +1156,22 @@ mod tests {
                 what
             );
         }
+    }
+
+    /// Resize travels *both* edges since 4f-e-d (design §TermIO): the watch
+    /// for the geometry readers, the input channel for the repl — which
+    /// consumes it without acting (the prompt's arms republish idempotently
+    /// and keep waiting, the turn's dispatch ignores it), so forwarding is
+    /// not the per-event repaint the Inline policy guarded against. That
+    /// guard survives as the watch half: only the reader publishes it while
+    /// the main task is parked.
+    #[test]
+    fn resize_travels_both_edges() {
+        assert_eq!(
+            route_event(&Event::Resize(120, 40)),
+            ReaderRoute::Forward,
+            "the channel copy is the repl's half of the split"
+        );
     }
 
     /// `Esc` is forwarded, and that is the fix for the settled menu-first rule

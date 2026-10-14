@@ -1586,12 +1586,13 @@ impl Repl {
             //
             // Events come from the **persistent reader** (`keys`), the sole
             // stdin owner — this loop no longer calls `event::poll`/`read`.
-            // Resize is handled *by the reader*, inline: it publishes the new
-            // geometry (`set_size`) and does not forward the event, so a drag's
-            // stream of resizes never reaches here to force a per-event repaint
-            // (which would strand frames while a reflowing terminal is still
-            // moving rows). The loop-top probe above notices the settled size
-            // and repaints once, re-anchoring via DSR. ---
+            // Resize reaches here on the channel since 4f-e-d (the reader
+            // publishes the watch *and* forwards), but never acts: the arms
+            // below republish idempotently and keep waiting, so a drag's
+            // stream cannot force a per-event repaint (which would strand
+            // frames while a reflowing terminal is still moving rows). The
+            // loop-top probe above notices the settled size and repaints
+            // once, re-anchoring via DSR. ---
             let prose_wait = if session.editor.chars().first() == Some(&'/') {
                 None
             } else {
@@ -1628,10 +1629,10 @@ impl Repl {
                     None => keys.recv().await,
                 };
                 match e {
-                    // Defensive: the reader handles Resize inline and does not
-                    // forward it, so this should not fire; if it does, publish
-                    // and keep waiting rather than treating it as a key. (The
-                    // parked path above is where Resize actually arrives.)
+                    // The reader's forwarded Resize (4f-e-d): republish —
+                    // idempotent, the reader already published it — and keep
+                    // waiting rather than treating it as a key. A drag never
+                    // repaints per event; the loop-top probe settles it.
                     Some(InputEvent::Resize(size)) => {
                         content.manager.lock().unwrap().set_size(size);
                         continue;
