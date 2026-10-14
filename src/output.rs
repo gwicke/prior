@@ -196,16 +196,10 @@ pub trait Output: Send + Sync {
         self.display_plain(line);
         self.display_separator();
     }
-    /// Current cursor row (1-based). The REPL uses it to position the input
-    /// line at the natural cursor rather than forcing it to the screen
-    /// bottom (which would leave a gap in the scrollback). The default
-    /// returns the terminal height (correct for non-console outputs, which
-    /// don't run the raw-mode REPL).
-    fn cursor_row(&self) -> usize {
-        crossterm::terminal::size()
-            .map(|(_, h)| h as usize)
-            .unwrap_or(24)
-    }
+    // `cursor_row` died in 4g-a: the re-anchor verbs' home is the manager
+    // (`RenderManager::cursor_row`, the DSR query + the cache sync) and every
+    // caller names it directly — a trait forward had no caller left, and its
+    // default was the last live `crossterm::terminal::size()` in this file.
 
     // The frame *size* verbs left with 4f-c: the watched size (the dims a
     // frame is composed and applied for) is `Content::frame_size`'s — the
@@ -420,8 +414,9 @@ impl Output for LogOutput {
 /// width watch and the streaming renderers, and `Output`'s content methods
 /// forward through it. The size verbs re-homed with 4f-c (frame dims to
 /// `Content::frame_size`, the applied size to `RenderManager::painted_size`);
-/// what remains here is `cursor_row`'s forward, the batch guard, and
-/// `draw_frame` — the test drivers' edge into the hub's pipeline (4b/4c).
+/// `cursor_row`'s forward died with the verb in 4g-a. What remains here is
+/// the batch guard and `draw_frame` — the test drivers' edge into the hub's
+/// pipeline (4b/4c).
 pub struct ConsoleOutput {
     /// The content owner (steps 3c–3d), shared by `Arc` with
     /// `AgentConfig.content`, so the config's frame handle and its content
@@ -908,12 +903,6 @@ impl ConsoleOutput {
 }
 
 impl Output for ConsoleOutput {
-    fn cursor_row(&self) -> usize {
-        // The verb's home is the hub since 4f-b (the query and the re-anchor
-        // are both its); this is the trait-facing forward.
-        self.content.manager.lock().unwrap().cursor_row()
-    }
-
     fn begin_batch(&self) -> BatchGuard<'_> {
         // The mechanics (flag, debug assert, the deferred reposition) live on
         // the hub (step 4e); only the guard, which has to name an `Output`
