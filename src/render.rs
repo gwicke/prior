@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::draw::{el_if_short, plan_consume, plan_reposition, ApplyPolicy, Draw};
 use crate::slashdot_menu::table::display_width;
-use crate::termio::{TermHandles, TermIO, TermSize};
+use crate::termio::{CaretEvent, TermHandles, TermIO, TermSize};
 use tokio::sync::watch;
 
 /// The size watch handle (design §3): what the manager reads its geometry
@@ -486,6 +486,11 @@ pub struct RenderManager {
     /// so nothing reads this field itself yet.
     #[allow(dead_code)]
     size: SizeWatch,
+    /// The reader's caret-invalidation queue — the receiver half is this
+    /// manager's alone since 4g-c (design §3: `caret` → "RenderManager
+    /// only"). `Interactive::new` hands it over from the one `handles()`
+    /// distribution; `None` until then (Plain never spawns a reader).
+    caret: Option<tokio::sync::mpsc::UnboundedReceiver<CaretEvent>>,
 }
 
 impl RenderManager {
@@ -501,6 +506,39 @@ impl RenderManager {
             recipe: Vec::new(),
             frame_max_row_ratio: FRAME_MAX_ROW_RATIO,
             size,
+            caret: None,
+        }
+    }
+
+    /// The caret channel, distributed once at setup (design §3): the
+    /// `TermHandles.caret` receiver `Interactive::new` took from the one
+    /// [`Self::handles`] hand-out moves in here — the manager is the event's
+    /// only consumer.
+    pub fn set_caret_receiver(&mut self, caret: tokio::sync::mpsc::UnboundedReceiver<CaretEvent>) {
+        self.caret = Some(caret);
+    }
+
+    /// Drain the caret channel; a pending invalidation (SIGCONT / resume —
+    /// the shell may have repainted, so the cached frame rows can no longer
+    /// be trusted, plan §4.2) re-anchors the live-screen cache via DSR.
+    /// Called at the prompt loop's top, where the reader-independent
+    /// `RESUMED_REANCHOR` flag check used to be (4g-c killed the flag): the
+    /// reader produces the event only after its own raw-mode re-entry, so
+    /// raw mode is back by the time the DSR runs — and since the same
+    /// reader thread sends the caret event *before* it forwards any later
+    /// key, the loop cannot wake on a post-resume key with the invalidation
+    /// still queued.
+    pub fn poll_caret(&mut self) {
+        let mut invalidated = false;
+        if let Some(caret) = &mut self.caret {
+            while let Ok(event) = caret.try_recv() {
+                if matches!(event, CaretEvent::Invalidated) {
+                    invalidated = true;
+                }
+            }
+        }
+        if invalidated {
+            let _ = self.cursor_row();
         }
     }
 

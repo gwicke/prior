@@ -24,7 +24,7 @@ use crate::render::{allocate, live_budget, window, Element, Extent, RenderAt, Re
 #[cfg(test)]
 use crate::render::{render, Frame};
 use crate::session::SessionTreeNode;
-use crate::termio::{InputEvent, RESUMED_REANCHOR};
+use crate::termio::InputEvent;
 use crossterm::event::{self, KeyCode, KeyModifiers};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -1509,16 +1509,13 @@ impl Repl {
         loop {
             // On resume from Ctrl-Z, re-anchor the draw cache (DSR): the shell
             // may have repainted while we were stopped, so the cached frame
-            // rows can no longer be trusted (plan §4.2). Raw-mode re-entry is
-            // the persistent reader's job (`RESUMED`); this flag is this
-            // loop's own resume signal, so the two never race. The manager's
-            // `resume()` here is a harmless idempotent belt-and-suspenders —
-            // the DSR below needs raw mode, and this keeps it correct
-            // regardless of whether the reader has re-entered yet.
-            if RESUMED_REANCHOR.swap(false, Ordering::SeqCst) {
-                content.manager.lock().unwrap().resume();
-                let _ = content.manager.lock().unwrap().cursor_row();
-            }
+            // rows can no longer be trusted (plan §4.2). Since 4g-c this is
+            // the caret channel's invalidation, drained through the manager
+            // (`poll_caret`) — the reader emits it only after its own
+            // raw-mode re-entry (`RESUMED`), so the DSR below finds raw mode
+            // back; the old loop-local `RESUMED_REANCHOR` flag and its
+            // belt-and-suspenders `resume()` are gone with it.
+            content.manager.lock().unwrap().poll_caret();
             // Resize detection against the hub's `painted_size` (4f-c: the manager's
             // own applied size, not an `Output` verb). Resize events are
             // consumed without repainting (see the wait below), so after a drag

@@ -23,7 +23,7 @@ use crate::params;
 use crate::repl::{History, InputAction, ModelFilter, PromptSession, Repl, ReplCtx};
 use crate::session::repo::JsonlSessionRepo;
 use crate::settings::SettingsStore;
-use crate::termio::TermHandles;
+use crate::termio::InputEvent;
 use crate::tools::set_sandbox;
 use crate::Result;
 
@@ -163,16 +163,15 @@ struct Interactive {
     app_state: Arc<AppState>,
     last_attempted_target: Option<RebuildFingerprint>,
     prompt_session: Option<PromptSession>,
-    /// The handles `TermIO::handles()` handed out once, at setup (design
-    /// doc §3) — taken through the manager, which has owned `TermIO` under
-    /// `Draw` since 4f-e-a (it is constructed in `main`, before `Content`).
-    /// `input` is the persistent reader's queue (step 2 commit B):
-    /// `read_input` consumes it at the prompt, each turn borrows it as
-    /// `InTurnInput::keys` — one channel for the process, so a key typed at
-    /// the end of a turn lands in the next prompt instead of dying with a
-    /// per-turn queue. `size`/`caret` are the spare receivers; content and
-    /// the manager took theirs at construction.
-    handles: TermHandles,
+    /// The persistent reader's input queue (step 2 commit B) — the one
+    /// receiver of the `TermIO::handles()` distribution this struct keeps
+    /// since 4g-c (design §3: distributed once at setup). `read_input`
+    /// consumes it at the prompt, each turn borrows it as `InTurnInput::keys`
+    /// — one channel for the process, so a key typed at the end of a turn
+    /// lands in the next prompt instead of dying with a per-turn queue.
+    /// `caret` went to the manager (the event's only consumer), `size` was
+    /// a spare — content and the manager took theirs at construction.
+    input: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
 }
 
 /// Whether the input loop keeps going after an arm runs.
@@ -363,6 +362,21 @@ impl Interactive {
             // sender half, so nothing ever reads it in that mode.
             config.content.manager.lock().unwrap().handles()
         };
+        // Distribute the hand-out (design §3): the caret half's only
+        // consumer is the render manager, which takes it here — the reader
+        // sends its `Invalidated` events from the first poll onward, so the
+        // receiver must be installed before the prompt loop runs.
+        let crate::termio::TermHandles {
+            input,
+            size: _size,
+            caret,
+        } = handles;
+        config
+            .content
+            .manager
+            .lock()
+            .unwrap()
+            .set_caret_receiver(caret);
         // Warm the model catalog cache in the background so the `/model`
         // overlay is populated within a few seconds *without* blocking the
         // first prompt. The overlay falls back to the cached/static list
@@ -412,7 +426,7 @@ impl Interactive {
             app_state,
             last_attempted_target,
             prompt_session,
-            handles,
+            input,
         }
     }
 
@@ -766,7 +780,7 @@ impl Interactive {
         //
         // U4.2/U4.3: edit keys typed while the turn runs come from the **one
         // process-lifetime channel** the persistent reader feeds
-        // (`self.handles.input`,
+        // (`self.input`,
         // step 2 commit B) — no per-turn reader, no per-turn queue. The
         // receiver is borrowed for the whole turn and handed into `prompt()` as
         // `InTurnInput::keys`; because the channel is never dropped between
@@ -822,7 +836,7 @@ impl Interactive {
                             .as_mut()
                             .map(|sess| crate::repl::InTurnInput {
                                 session: sess,
-                                keys: &mut self.handles.input,
+                                keys: &mut self.input,
                                 confirms: &mut self.confirm_bridge.requests,
                                 label: &self.prompt_str,
                                 history: &mut self.line_history,
@@ -867,7 +881,7 @@ impl Interactive {
                             ms,
                             turn_backoff_pump(
                                 &mut self.prompt_session,
-                                &mut self.handles.input,
+                                &mut self.input,
                                 &mut self.line_history,
                                 &self.prompt_str,
                                 &self.config.content,
@@ -943,7 +957,7 @@ impl Interactive {
                             ms,
                             turn_backoff_pump(
                                 &mut self.prompt_session,
-                                &mut self.handles.input,
+                                &mut self.input,
                                 &mut self.line_history,
                                 &self.prompt_str,
                                 &self.config.content,
@@ -1087,7 +1101,7 @@ impl Interactive {
                         &ctx,
                         &self.app_state,
                         self.config.content.as_ref(),
-                        &mut self.handles.input,
+                        &mut self.input,
                     )
                     .await
                 }

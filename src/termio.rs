@@ -141,22 +141,21 @@ impl InputEvent {
 
 /// Caret invalidation pushed toward the render manager: SIGCONT / resume
 /// means the shell may have repainted, so the cached frame rows can no longer
-/// be trusted (design doc §9). The reader produces it; the render manager
-/// (step 4b) is the one consumer. Until then the channel is wired ahead of
-/// its consumer — the prompt loop's own `RESUMED_REANCHOR` flag still drives
-/// its DSR re-anchor.
+/// be trusted (design doc §9). The reader produces it (after its own
+/// raw-mode re-entry); the render manager is the one consumer — it drains
+/// the channel in `poll_caret` and re-anchors via DSR (4g-c, design §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaretEvent {
     Invalidated,
 }
 
 /// Acquired once at setup, then distributed (design doc §3): the reader's
-/// channel to the repl, plus the two channels whose consumer arrives with the
-/// render manager — `caret` has the render manager as its only consumer (and
-/// is not read yet), `size` is a fresh receiver on the instance's watch
-/// (content and the manager usually already hold their own, taken at
-/// construction). `TermIO` keeps the senders until `handles()` hands the
-/// receivers out, once.
+/// channel to the repl, `caret` to the render manager — its only consumer,
+/// taking the receiver in `Interactive::new`'s hand-out (4g-c) — and `size`,
+/// a fresh receiver on the instance's watch (content and the manager usually
+/// already hold their own, taken at construction; the hand-out's third is a
+/// spare). `TermIO` keeps the senders until `handles()` hands the receivers
+/// out, once.
 pub struct TermHandles {
     /// Keys / paste / (parked) resize — one consumer: the repl.
     pub input: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
@@ -272,27 +271,18 @@ pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
 }
 
 /// Set by the `SIGCONT` handler on resume from `Ctrl-Z`. Read by the
-/// persistent stdin reader, which re-enters raw mode once it sees the flag.
-/// Kept separate from [`RESUMED_REANCHOR`] so the reader and the prompt loop
-/// never race to clear one another's work.
+/// persistent stdin reader, which re-enters raw mode once it sees the flag
+/// and then pushes the caret invalidation (a [`CaretEvent`]) toward the
+/// render manager — the whole resume signal is this one flag plus that
+/// event; the loop-local `RESUMED_REANCHOR` flag died in 4g-c.
 pub(crate) static RESUMED: AtomicBool = AtomicBool::new(false);
-
-/// Set by the same handler, read by `Repl::read_input` alone: a resume means
-/// the shell may have repainted, so the prompt loop re-anchors the draw cache
-/// (DSR) on its next iteration. Lives here with [`RESUMED`] because the
-/// handler sets both and the reader consumes the first — one module owns the
-/// whole resume signal; the loop reads it downward (`crate::termio`).
-pub(crate) static RESUMED_REANCHOR: AtomicBool = AtomicBool::new(false);
 
 /// `SIGCONT` handler: record that the process resumed.
 /// It must stay async-signal-safe (no I/O, no allocation), so the actual
-/// terminal re-entry is performed by the reader thread (a normal thread
-/// context) or by `read_input`'s loop, which poll these flags.
-/// Two flags because two different consumers act on one resume (see
-/// [`RESUMED`] / [`RESUMED_REANCHOR`]).
+/// terminal re-entry and the invalidation push are performed by the reader
+/// thread (a normal thread context), which polls [`RESUMED`].
 extern "C" fn on_sigcont(_sig: i32) {
     RESUMED.store(true, Ordering::SeqCst);
-    RESUMED_REANCHOR.store(true, Ordering::SeqCst);
 }
 
 /// Register the `SIGCONT` handler exactly once. Safe to call multiple
@@ -711,9 +701,12 @@ pub(crate) fn spawn_stdin_reader(
         if RESUMED.swap(false, Ordering::SeqCst) {
             let _ = guard.start();
             // Resume invalidated the screen (design doc §9): push it toward
-            // the render manager. Today nothing consumes the channel yet —
-            // the prompt loop's own `RESUMED_REANCHOR` flag still runs its
-            // DSR — so the event waits in the queue for its consumer (4b).
+            // the render manager, the channel's one consumer since 4g-c
+            // (it drains the event in `poll_caret` and re-anchors via DSR).
+            // Sent only after `guard.start()`, so the invalidation cannot
+            // reach the manager before raw mode is back — and before any
+            // later key this thread forwards, so the loop cannot wake on a
+            // post-resume key with the event still queued.
             let _ = caret.send(CaretEvent::Invalidated);
         }
         // The main task owns stdin right now ($EDITOR, a DSR query, or the
