@@ -219,10 +219,10 @@ done (`257e8e3`, `799cd12`, `177aa64`).
 
 The moves are landed (`74e987c`); the deferred remainder is below.
 
-> **Deferred to step 4** (the moves landed in `74e987c`): the three `Output` trait-default size
-> queries (`cursor_row`/`frame_size`/`painted_size`) that still fall back to a live
-> `crossterm::terminal::size()` (non-console outputs only; `ConsoleOutput` already reads the
-> watch) — step 4 **4g**. The loop-top resize probe is deliberate, not a leftover. (The `TermIO`
+> ~~**Deferred to step 4**: the three `Output` trait-default size queries (`cursor_row`/
+> `frame_size`/`painted_size`) that still fall back to a live `crossterm::terminal::size()`.~~
+> Landed: `frame_size`/`painted_size` with 4f-c, `cursor_row` in **4g** (`c21be0e`). The
+> loop-top resize probe is deliberate, not a leftover. (The `TermIO`
 > **type** — the closed `Tty`/`Plain` enum owning the reader and folding `TermGuard`, plus
 > `TermHandles` and the `recording()`/`null()` constructors — landed in **4a**, `8cc955d`.)
 
@@ -444,6 +444,8 @@ most runway to expand into separate sub-commits.
     Unsupported check off `is_tty()`, so `edit_text` lost its caller-side guard check;
     `turn_backoff_pump`/`dispatch`/`TurnPump`/`InTurnInput` drop guard *and* output — a prompt
     session exists only where TermIO is Tty, so the old guard-presence zip changes nothing.
+    (The DSR answer was inside TermIO all along — step 2 commit C; 4g put the entry window on
+    the same guard, `6961d0b`.)
     `CodeAgent`'s private `output` copy dies with dispatch's last use; `AgentConfig.output` stays
     (the quiet tap, the tools' `confirm_default` copies out of `build_rig_agent`, step 5's
     deletion). ~~The prompt-loop size probe and the parked-resize drain keep writing the
@@ -488,9 +490,9 @@ most runway to expand into separate sub-commits.
       into Draw" needed no install step — and `Interactive` reaches the hand-out through
       `manager.handles()`, never naming `TermIO`.
     Leftovers:
-    - `TermHandles.caret` still parks in `Interactive.handles`, unconsumed ("wired ahead of its
-      consumer" since 4b). Design §3 distributes it to the **RenderManager**; the consumer
-      arrives with the caret event answering inside TermIO — **4g**.
+    - ~~`TermHandles.caret` still parks in `Interactive.handles`, unconsumed.~~ Landed 4g
+      (`e7b17ad`): the manager takes the receiver at the hand-out and drains it in
+      `poll_caret`.
     - Design §Degradation's Draw-side degradation — non-tty primaries dropping frames wholesale,
       the stripped-by-caps byte edge — is implemented nowhere and claimed by no phasing step.
       Flagged for a slot (closest home: **step 5**, beside the sink dissolution) rather than
@@ -516,15 +518,29 @@ most runway to expand into separate sub-commits.
     out of 4f (**4h**, below).
   Out of 4f: the `render(Some(w))` compose + content round trip (waits for the installed stack,
   **4h**).
-- **4g — Suspend/resume + DSR through the manager; dead size fallbacks die.**
-  ~~`RenderManager::suspend()` becomes the front door (content/UI never touch TermIO)~~ — landed
-  4f-d (`set_mode_guard`) + 4f-e-c (`786009e`, the reader-stop). What remains here: DSR is
-  answered inside TermIO (the reader-stop pause is now the front door's to raise), the caret
-  handle distributes to the manager per design §3 (`TermHandles.caret` is parked in
-  `Interactive.handles` since 4f-e's hand-out), and the three `Output` trait-default size
-  queries still falling back to a live
-  `crossterm::terminal::size()` go — non-console outputs read the watch. The loop-top resize probe
-  stays (deliberate, step-2 note).
+- **4g — Suspend/resume + DSR through the manager; dead size fallbacks die.** Landed
+  (`c21be0e` verb, `6961d0b` guard, `e7b17ad` caret, `d4113ff` doc).
+  ~~`RenderManager::suspend()` becomes the front door~~ — landed 4f-d + 4f-e-c (`786009e`).
+  The remainder, all landed here:
+  - *Dead size fallbacks*: only `Output::cursor_row`'s trait default still reached for a live
+    `crossterm::terminal::size()` (the `frame_size`/`painted_size` halves of the old note died
+    with 4f-c). The verb had no trait-object caller left — every re-anchor names
+    `manager.cursor_row()` — so verb and forward died together; non-console outputs needed
+    nothing (the REPL never runs against them). The two survivors in `termio.rs` are the
+    deliberate watch seed (`TermSize::probe`) and the loop-top probe (`probe_size`).
+  - *DSR through the front door*: `query_cursor_row` has carried its own `ReaderPauseGuard`
+    since step 2 commit C (answered inside the terminal layer, design §TermIO). What was left
+    was the entry-DSR window in `Interactive::new` hand-raising the gate with raw `store()`s —
+    now `ReaderPauseGuard::raise()` (nesting-safe, lowers on drop; the reader starts inside
+    `handles()`, so the raise is instant and the reader starts parked, same ordering).
+  - *Caret handle to the manager* (design §3, "RenderManager only"): `Interactive::new` splits
+    the `TermHandles` hand-out — input stays with the repl, caret moves into the manager
+    (`set_caret_receiver`) — and the prompt loop's old `RESUMED_REANCHOR` flag check becomes
+    `RenderManager::poll_caret()`: drains the channel, re-anchors via DSR on a pending
+    `Invalidated`. The flag and its belt-and-suspenders `resume()` are gone; the reader's own
+    ordering makes them unnecessary (it emits the event only after `guard.start()` and before
+    forwarding any later key, same thread). Leftovers: none.
+  The loop-top resize probe stays (deliberate, step-2 note).
 - **4h — Elements → `Arc<Mutex<…>>`; construction into `ui/`** (design-led, kept last for runway;
   expect it to split). `Element = Arc<Mutex<dyn RenderElement>>` with the shared editor held live
   across compositions; `Element::status` moves into `ui/`; `ui.rs` becomes a `ui/` module (menu
@@ -580,6 +596,9 @@ Resolved from the earlier design discussion, with the end-state answers:
 - **Cursor re-anchor** — bottom-up: TermIO pushes `CaretEvent::Invalidated` (SIGCONT, resume) on the
   `caret` channel to `RenderManager`, which re-anchors lazily at its next `render()` (the DSR is
   answered inside TermIO). The repl neither asks for it nor issues one.
+  (As landed in 4g, `e7b17ad`: the lazy drain is `RenderManager::poll_caret()`, called at the
+  prompt loop's top — the old flag-check site — rather than inside `render()` itself; the repl
+  still neither touches the channel nor issues a DSR, it just pokes the manager's verb.)
 - **Resize propagation** — bottom-up via `TermIO`'s `size` watch (RenderManager + content) and the
   repl `input` channel. Ported to the *hook* side first: `RenderElement::height`/`render` are
   width-aware, so elements adapt to a width change without a repaint-per-event.

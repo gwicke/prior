@@ -57,7 +57,8 @@ and link a doc/ and/or commit hash
 - [ ] output.rs drawing refactor — 261003_output_drawing_refactor.md (+ impl companion)
   - [x] Step 1: extract `render.rs` / `draw.rs` / `ansi.rs` mechanically; Output facade kept (§8.1)
   - [ ] Step 2: `TermIO` — reader, raw mode, DSR, size watch; un-`#[serial]` width tests (§8.2) —
-    moves landed (`74e987c`); the type fold landed in 4a (`8cc955d`); size-query fallbacks → 4g
+    moves landed (`74e987c`); the type fold landed in 4a (`8cc955d`); the size-query
+    fallbacks landed in 4g (`c21be0e`)
   - [x] Step 3: split `content/`; `AgentConfig.content` + `Content` tap seam; content consumers on
     `&Content` (§8.3) — landed 3a–3d (`47122b4`…`cf7b6a8`); frame/input rides `AgentConfig.output`
     until step 4 (follow-ups recorded in the impl doc)
@@ -69,6 +70,9 @@ and link a doc/ and/or commit hash
     4f-d (`348f7ed`, input collapses to one handle; `TermGuard` holders convert),
     4f-e (`8733d09`+`c7ef4fe`+`786009e`+`2906fb1`, TermIO into Draw: setup rework, writer dies,
     reader-stop suspend, resize both edges),
-    4f-f (`cbeceed`+`044c7f9`, Stream + the meta sink; the formatting span unlocks);
-    4g next (DSR inside TermIO, the caret handle to the manager, dead size fallbacks)
+    4f-f (`cbeceed`+`044c7f9`, Stream + the meta sink; the formatting span unlocks),
+    4g (`c21be0e`+`6961d0b`+`e7b17ad`, cursor_row verb dies, entry-DSR on the front-door
+    guard, the caret channel reaches the manager);
+    4h next (elements → `Arc<Mutex<…>>`, construction into `ui/`, `render.rs` as the
+    RenderManager home)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)
