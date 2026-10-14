@@ -100,6 +100,13 @@ pub struct Content {
     /// `begin_response`/`end_response`. Owned by content (the path that knows
     /// when a response starts/ends); the frame reads it via a shared handle.
     pub(crate) streaming: Arc<AtomicBool>,
+    /// The formatting span's tripwire (4f-f-b): raised while a write builds
+    /// its `ContentWrite` outside the hub lock, cleared when the write ends
+    /// (`SpanGuard`). The proof that the unlocked span is safe — one writer
+    /// per content, `f` never re-entering — is recorded at
+    /// [`Self::with_content_writer`]; this keeps a violation loud, where the
+    /// held lock used to make it a self-deadlock. Debug-asserted only.
+    building: AtomicBool,
     /// The status bar's raw data (step 4f-a, design §UI): pushes store *facts*
     /// ([`crate::agent::status::BarStatus`]), never formatted text — the bar
     /// element pulls this and runs the shaping and the fit in its own render.
@@ -160,6 +167,7 @@ impl Content {
             last_tool: Mutex::new(None),
             boundary: ContentBoundary::new(),
             streaming: Arc::new(AtomicBool::new(false)),
+            building: AtomicBool::new(false),
             bar: Arc::new(Mutex::new(crate::agent::status::BarStatus::default())),
             tap: None,
         }
@@ -217,6 +225,17 @@ impl Content {
     /// `output::term_height`).
     pub fn height(&self) -> usize {
         self.size.borrow().height.max(1)
+    }
+}
+
+/// Clears [`Content::building`] when a formatting span ends — every exit,
+/// the empty-write return included. See `with_content_writer`'s span doc;
+/// the flag is a debug tripwire, not a lock.
+struct SpanGuard<'a>(&'a AtomicBool);
+
+impl Drop for SpanGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -284,7 +303,10 @@ impl Content {
     /// counter's type out of the signature. A caller handing it to
     /// something generic over `W: Write` — `Renderer::feed`,
     /// `commit_thinking` — passes `&mut out`, which is itself a `Write` and
-    /// satisfies the `Sized` bound that `&mut dyn Write` cannot.
+    /// satisfies the `Sized` bound that `&mut dyn Write` cannot. `f` is the
+    /// *build* and must stay inside `out`: a `write_all` or a
+    /// parser/renderer feed, never a content write and never the hub (the
+    /// span below runs unlocked since 4f-f-b; the tripwire asserts this).
     ///
     /// `width` is the width the content is being rendered for; pass the
     /// renderer's own width so a line that wrapped at render time is counted
@@ -323,11 +345,40 @@ impl Content {
     where
         F: FnOnce(&mut dyn io::Write) -> T,
     {
-        // The hub's lock is the sink's lock now (step 4c): one guard across
-        // the whole write, exactly the span the old writer lock covered —
-        // same non-reentrancy (a closure that called back into a content
-        // write would deadlock, as it always would have), one level up.
-        let mut mgr = self.manager.lock().unwrap();
+        // The formatting span runs **unlocked** (4f-f-b; design §Content:
+        // "formats … before each block — no hub round-trip"): boundary, chain
+        // and `f` touch content's own state or a private buffer, and the
+        // hand-off at the end takes the hub's lock for exactly the one round
+        // trip. What the removed lock guaranteed, the proof keeps:
+        //
+        //   1. *One writer.* Every content write runs inside the one REPL
+        //      task — the turn is inline in `prompt()`'s `select!` with no
+        //      spawn on the path (confirm.rs' module doc), and prompt-time
+        //      verbs (commit echo, menu messages, replay, compaction's
+        //      retry line) run between turns on that same task. No two
+        //      spans can overlap, `begin_capture`/`end_capture` included —
+        //      which is also why the capture read below can be its own
+        //      short lock and still stand for the whole span.
+        //   2. *`f` does not re-enter.* Every closure is a `write_all` or a
+        //      parser/renderer feed into `out` (enumerable at the doc).
+        //      The tripwire below is what keeps a future violation loud:
+        //      under the held lock it was a self-deadlock; unlocked it
+        //      would corrupt the boundary state silently.
+        //
+        // The tripwire is debug-only by design: release relies on 1 and 2,
+        // which are structural, and the suite runs where the tripwire
+        // lives.
+        debug_assert!(
+            !self
+                .building
+                .swap(true, std::sync::atomic::Ordering::Relaxed),
+            "content write re-entered (or a second writer started) while a \
+             formatting span was open: the build runs outside the hub lock \
+             since 4f-f-b, and only the single-writer + non-reentrancy \
+             proof keeps the boundary state correct\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        let _span = SpanGuard(&self.building);
         // The *caller* declares the kind — the choke point never guesses from
         // bytes — and the previous one is read first, because the whole
         // boundary rule is a statement about the pair. Recording before `f`
@@ -376,8 +427,11 @@ impl Content {
         //
         // Captures get the raw bytes — they are assertions against content,
         // not against a screen — tapped at the hand-off below, which is why
-        // the transforms step aside while one is open.
-        let capturing = mgr.is_capturing();
+        // the transforms step aside while one is open. Its own short lock
+        // (4f-f-b): capture toggles are same-task with writes (proof above),
+        // so this one read stands for the span — nothing can open or close a
+        // capture between here and the hand-off.
+        let capturing = self.manager.lock().unwrap().is_capturing();
         let mut buf: Vec<u8> = Vec::new();
         let mut clear = LineClear {
             inner: &mut buf,
@@ -529,10 +583,16 @@ impl Content {
         // R5) either way. The guard moved to the hub in 4e; the deferral
         // stays the shared flag's until the final `render()` round trip
         // (4f/4h) gives `render_batch` its own end.
-        if mgr.batching() {
-            mgr.render_batch(write);
-        } else {
-            mgr.render_content(write);
+        //
+        // The one hub round trip (4f-f-b): lock, route, release — the
+        // serialization the span used to carry whole is exactly this now.
+        {
+            let mut mgr = self.manager.lock().unwrap();
+            if mgr.batching() {
+                mgr.render_batch(write);
+            } else {
+                mgr.render_content(write);
+            }
         }
         r
     }
