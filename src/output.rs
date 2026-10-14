@@ -1320,12 +1320,13 @@ mod tests {
         Recording(out.content.clone())
     }
 
-    /// What a [`record_bytes`] swap captured on the main stream — read at
-    /// assert time through the same content handle, so a test keeps no lock
-    /// and no borrow into the manager.
+    /// What a [`record_bytes`] swap captured — read at assert time through
+    /// the same content handle, so a test keeps no lock and no borrow into
+    /// the manager.
     struct Recording(Arc<Content>);
 
     impl Recording {
+        /// The main stream — screen bytes, choreography included.
         fn bytes(&self) -> Vec<u8> {
             self.0
                 .manager
@@ -1334,6 +1335,17 @@ mod tests {
                 .draw()
                 .term_io
                 .recorded(crate::termio::Stream::Main)
+        }
+
+        /// The meta stream — the diverted-reasoning edge (4f-f).
+        fn meta(&self) -> Vec<u8> {
+            self.0
+                .manager
+                .lock()
+                .unwrap()
+                .draw()
+                .term_io
+                .recorded(crate::termio::Stream::Meta)
         }
     }
 
@@ -1723,8 +1735,11 @@ mod tests {
     fn reasoning_is_routed_by_the_output_layer() {
         let script = [Step::Think("Weighing the options.\n\n"), Step::ResponseEnd];
 
-        // Diverted: reasoning leaves stdout — it shows up on the test runner's
-        // stderr instead, which is what makes `2>/dev/null` work for a consumer.
+        // Diverted: reasoning leaves stdout — it rides the meta stream
+        // instead (stderr through the real backends, which is what makes
+        // `2>/dev/null` work for a consumer; this harness's sinkhole
+        // backend drops it, so the pin here is what the capture does *not*
+        // contain). The meta edge itself is `reasoning_to_meta_lands_on_…`.
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
         out.content.set_reasoning_on_stderr(true);
@@ -1750,6 +1765,39 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&tty).contains("Weighing the options"),
             "reasoning belongs on the screen when there is one"
+        );
+    }
+
+    /// The meta sink under the hub (4f-f): a diverted reasoning block rides
+    /// the stream token down to `TermIO` — recorded on the meta edge,
+    /// absent from main. Main's emptiness is the choreography pin: the
+    /// consume walk and reposition of `put_content`'s main route would put
+    /// bytes there, so none ran. The bytes themselves are the renderer's,
+    /// fed untransformed — the bypass `ReasoningSink` died with, now
+    /// routed by the token.
+    #[test]
+    fn reasoning_to_meta_lands_on_the_meta_edge() {
+        let (out, reasoning) = capturing_output(80);
+        *reasoning.lock().unwrap() = ShowReasoning::Content;
+        out.content.set_reasoning_on_stderr(true);
+        out.begin_response();
+        let recording = record_bytes(&out);
+        feed(
+            &out,
+            Step::Think("Weighing the options.\n\n"),
+            Chunking::Whole,
+        );
+
+        let meta = String::from_utf8_lossy(&recording.meta()).into_owned();
+        assert!(
+            meta.contains("Weighing the options"),
+            "the meta edge gets the rendered reasoning: {meta:?}"
+        );
+        let main = String::from_utf8_lossy(&recording.bytes()).into_owned();
+        assert!(
+            main.is_empty(),
+            "no screen choreography behind a meta write — main stays empty, \
+             got {main:?}"
         );
     }
 

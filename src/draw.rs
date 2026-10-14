@@ -743,6 +743,16 @@ impl Draw {
         let _ = self.term_io.write(crate::termio::Stream::Main, bytes);
     }
 
+    /// The meta sink's bytes (4f-f): `TermIO`'s `Stream::Meta`, no
+    /// bookkeeping — a stderr write does not move the screen's cursor, so
+    /// there is no consume, row count or cache note to keep for it, and
+    /// the byte edge records the two streams apart (design §TermIO: one
+    /// `write`, per-stream sinks). Reached only from `put_content`'s
+    /// meta branch, above content's hand-off.
+    pub(crate) fn write_meta(&mut self, bytes: &[u8]) {
+        let _ = self.term_io.write(crate::termio::Stream::Meta, bytes);
+    }
+
     // --- the TermIO pass-throughs (design §3: content / UI never name it) --
 
     /// The channel handles, once at setup — the render manager's forward, so

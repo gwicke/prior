@@ -406,25 +406,38 @@ pub(crate) fn pad_row(row: &str, term_w: usize) -> String {
 }
 
 /// A content write handed to the hub (design §Render): the bytes one block
-/// produced — complete, pre-wrapped, line-cleared screen rows, ending at a
-/// line boundary — plus the two facts the screen choreography needs to
-/// place them: the rows they occupy (measured from the bytes by content's
-/// `RowCounter`, not predicted from the source) and the width they were
-/// rendered at (the reposition re-renders at it).
+/// produced, plus the facts needed to place them — the rows they occupy
+/// (measured from the bytes by content's `RowCounter`, not predicted from
+/// the source), the width they were rendered at (the reposition
+/// re-renders at it), and the stream they ride. On the screen route
+/// (`Main`) the bytes are complete, pre-wrapped, line-cleared rows ending
+/// at a line boundary; on the `Meta` route they are raw (see
+/// [`Self::stream`]).
 ///
 /// Content-specific classification stops *above* this type: the only
 /// vocabulary the design sends down with a write is `Stream` (main/meta),
-/// and that token arrives with TermIO's meta sink — 4f. Every write is
-/// main-stream screen content today; the reasoning-to-stderr path never
-/// reaches the hub at all.
+/// which rides with every write since 4f-f. `Main` is every write through
+/// the boundary chain — screen content, choreography included. `Meta` is
+/// the reasoning hand-off when content routed reasoning to the meta sink
+/// at setup — straight to `TermIO`, no choreography, byte-identical to
+/// the stderr bypass this replaced.
 pub(crate) struct ContentWrite {
     /// The block's bytes as Content produced them.
     pub(crate) bytes: Vec<u8>,
     /// Screen rows the bytes occupy at the watched width (a measured
     /// count: a long line wraps, which the byte length alone cannot say).
+    /// Zero on the `Meta` route: stderr never moves the screen's cursor,
+    /// so the rows are not the route's to report.
     pub(crate) rows: usize,
     /// The width the block was rendered for — the reposition's width.
+    /// `Meta` carries the watched width too (honest wherever the payload
+    /// is read); the reposition never runs for it.
     pub(crate) width: usize,
+    /// Which stream these bytes ride — the stream decision is content's,
+    /// made once at setup; below this the hub routes on the token and
+    /// stays stream-generic (design §Render: `ContentWrite { lines,
+    /// stream }`).
+    pub(crate) stream: crate::termio::Stream,
 }
 
 // --- the frame hub (step 4b) -------------------------------------------------
@@ -789,13 +802,30 @@ impl RenderManager {
         plan_reposition(&mut self.draw.cache, &frame, old_h, tw, th)
     }
 
-    /// The choreography every content write takes (moved from
+    /// The choreography every `Main`-stream content write takes (moved from
     /// `Content::with_content_writer` in 4d): consume the live frame, put
     /// the block down at the fold, advance the tracked cursor by its
     /// measured rows, and bring the frame back below — deferred while a
     /// batch is open, whose guard's drop emits it once (ui_draw_v2 R5).
+    /// A `Meta` write takes the other route inside: `TermIO`'s meta sink,
+    /// no choreography (4f-f).
     fn put_content(&mut self, content: ContentWrite) {
-        let ContentWrite { bytes, rows, width } = content;
+        let ContentWrite {
+            bytes,
+            rows,
+            width,
+            stream,
+        } = content;
+        // The meta route (4f-f): the meta sink, no choreography — no
+        // consume, no cursor advance, no reposition, and no capture
+        // interception (a capture taps *screen* content; diverted reasoning
+        // was never in one — `reasoning_is_routed_by_the_output_layer`
+        // pins that). Byte-identical to the stderr bypass it replaced:
+        // the same renderer bytes, written and flushed on the meta stream.
+        if stream == crate::termio::Stream::Meta {
+            self.draw.write_meta(&bytes);
+            return;
+        }
         // **Consume, then write** (ui_draw_v2 §4.5 P1 / ui_draw_261001): the
         // walk goes ahead of the bytes — cursor movement, straight to the
         // writer, never through content's row counter — and the content

@@ -8,7 +8,10 @@
 //! pipeline and has owned the `Draw` sink since 4c. Since 4d every write
 //! this layer produces leaves as a `ContentWrite` handed to that hub
 //! (`with_content_writer` → `render_content`/`render_batch`) — the sink is
-//! never named here. Of the frame *verbs*, `frame_size` lives here since 4f-c
+//! never named here. Since 4f-f every hand-off also carries its stream:
+//! `Main` from the boundary chain, `Meta` from `commit_reasoning` when the
+//! setup decision diverts reasoning — the hub routes on the token.
+//! Of the frame *verbs*, `frame_size` lives here since 4f-c
 //! (the watch this handle carries *is* the dims source), `painted_size` is the
 //! manager's (`RenderManager::painted_size`), `cursor_row` is the manager's
 //! with `Output` forwarding, and `draw_frame` — the test drivers' edge — stays
@@ -66,12 +69,15 @@ pub struct Content {
     /// calling `is_terminal()` per site — the probe site left content with
     /// this step.
     pub(crate) caps: crate::termio::Caps,
-    /// Where reasoning goes: `true` = stderr, so a consumer of
-    /// `picocode "q" | cat` can drop it (`2>/dev/null`) or merge it (`2>&1`)
-    /// without touching stdout. Decided once, in [`Self::new`]. `AtomicBool`
-    /// rather than `bool` only because the handle is now shared behind an
-    /// `Arc` (step 3d) and a test pins it to the screen for a byte comparison —
-    /// see [`Self::set_reasoning_on_stderr`].
+    /// Where reasoning goes — the stream decision (4f-f): `true` picks
+    /// `Stream::Meta` (stderr, the real backends'), so a consumer of
+    /// `picocode "q" | cat` can drop it (`2>/dev/null`) or merge it
+    /// (`2>&1`) without touching stdout. Picked once, in [`Self::new`]
+    /// from the caps; [`Self::commit_reasoning`] hands the pick down as
+    /// the `ContentWrite`'s stream, and the hub routes on the token from
+    /// there. `AtomicBool` rather than `bool` only because the handle is
+    /// now shared behind an `Arc` (step 3d) and a test pins it to the
+    /// screen for a byte comparison — see [`Self::set_reasoning_on_stderr`].
     pub(crate) reasoning_on_stderr: AtomicBool,
     /// Incremental GFM markdown parser for the current response (TTY only).
     pub(crate) parser: Mutex<StreamParser>,
@@ -511,6 +517,10 @@ impl Content {
             bytes: buf,
             rows,
             width,
+            // The chain is the screen's path: every block it produced is
+            // main-stream content. The meta route hands off beside this
+            // one, raw — `commit_reasoning`.
+            stream: crate::termio::Stream::Main,
         };
         // One choreography, two design verbs (§Render): the replay path
         // writes inside a batch and hands off as `render_batch`, the
@@ -1165,13 +1175,49 @@ impl Content {
         // theme, which brackets every row it emits in the faint attribute —
         // fading is a property of a row, not a mode the stream has to be put
         // into and taken out of, so this writer emits no escapes of its own and
-        // the boundary after the reasoning has nothing to close.
-        let mut sink = self.reasoning_sink();
+        // the boundary after the reasoning has nothing to close. The rendered
+        // bytes are buffered like the sink's was; `commit_reasoning` lands
+        // them on the stream the setup decision picked (the parser/renderer
+        // locks are still held through the landing, as the sink's commit was).
+        let mut rendered: Vec<u8> = Vec::new();
         let mut parser = self.thinking_parser.lock().unwrap();
         let events = parser.write(delta.as_bytes());
         let mut renderer = self.thinking_renderer.lock().unwrap();
-        let _ = renderer.feed(&events, &mut sink);
-        sink.commit(self);
+        let _ = renderer.feed(&events, &mut rendered);
+        self.commit_reasoning(rendered);
+    }
+
+    /// Land a rendered reasoning block — the stream decision, made once at
+    /// setup (caps: `Meta` when the meta stream carries it), picks between
+    /// two routes. `Meta`: the bytes hand off raw as a `ContentWrite`
+    /// (4f-f — the meta sink under the hub, no boundary chain, no line
+    /// clear, no counter: byte-for-byte the stderr bypass the
+    /// `ReasoningSink` died with, and no choreography because stderr
+    /// never moves the screen's cursor). `Main`: the block runs the
+    /// chain like any other, under the reasoning kind, so the boundary
+    /// after it is drawn as its own.
+    ///
+    /// Empty means the delta rendered nothing: no write at all — even a
+    /// zero-byte hand-off would open a block on the main route.
+    fn commit_reasoning(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self
+            .reasoning_on_stderr
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let width = self.width();
+            let mut mgr = self.manager.lock().unwrap();
+            mgr.render_content(ContentWrite {
+                bytes,
+                rows: 0,
+                width,
+                stream: crate::termio::Stream::Meta,
+            });
+        } else {
+            self.write_content_kinded(&bytes, Some(ContentDisplayKind::ResponseReasoning));
+        }
     }
 
     pub(crate) fn end_response_segment(&self) {
@@ -1389,56 +1435,6 @@ impl Content {
             return tap.end_capture();
         }
         self.manager.lock().unwrap().end_capture()
-    }
-
-    pub(crate) fn reasoning_sink(&self) -> ReasoningSink {
-        ReasoningSink {
-            buf: Vec::new(),
-            to_stderr: self
-                .reasoning_on_stderr
-                .load(std::sync::atomic::Ordering::Relaxed),
-        }
-    }
-}
-
-/// Buffered reasoning bytes awaiting routing. See
-/// [`ConsoleOutput::reasoning_sink`].
-pub(crate) struct ReasoningSink {
-    buf: Vec<u8>,
-    to_stderr: bool,
-}
-
-impl ReasoningSink {
-    /// Route what has been written: stderr when there is no terminal, else the
-    /// screen through the same counter every other content write uses (so the
-    /// draw cache learns the height). Idempotent — the buffer is taken.
-    fn commit(&mut self, out: &Content) {
-        if self.buf.is_empty() {
-            return;
-        }
-        let bytes = std::mem::take(&mut self.buf);
-        if self.to_stderr {
-            let mut err = std::io::stderr();
-            let _ = err.write_all(&bytes);
-            let _ = err.flush();
-        } else {
-            // Reasoning sits inside `begin_response`…`end_response`, and is a
-            // kind of its own: it is the one kind whose blocks are dimmed, so
-            // the blank row above a following text block is the boundary's and
-            // not part of what the reasoning emitted.
-            out.write_content_kinded(&bytes, Some(ContentDisplayKind::ResponseReasoning));
-        }
-    }
-}
-
-impl io::Write for ReasoningSink {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 
