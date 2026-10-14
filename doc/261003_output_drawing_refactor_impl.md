@@ -545,15 +545,18 @@ most runway to expand into separate sub-commits.
 - **4h — The element stack: `slashdot_tui` crate; `Arc<Mutex<…>>` elements; pull-based rendering.**
   Design-led (design §RenderElement stack + the crate note under §End state layering), kept last for
   runway; split into eight commits, each independently green:
-  - **4h-a — crate extraction.** Create `crates/slashdot_tui` and move `ansi`, `termio`, `draw`,
-    `render` wholesale, plus the width utility: `slashdot_menu::table::display_width` moves into the
-    crate beside `ansi` (menu then imports it from `slashdot_tui`); `row_count.rs` stays picocode-side
-    (content's). The two outward edges of the {ansi, termio, draw, render} SCC are exactly these, so
-    the crate knows nothing of repl/content — the layering becomes compiler-enforced. The two
-    `crate::repl::LineEditor` test imports (`render.rs:973`, `draw.rs:885` apply_tests) rehome:
-    in-crate tests get in-crate dummy elements; the ones that genuinely pin manager+input behavior
-    move picocode-side. `lib.rs` re-exports (`pub use slashdot_tui::{…}`) keep `confirm_probe` and
-    examples source-compatible. Behavior-free.
+  - **4h-a — crate extraction.** Landed (`ba8d6be`). Create `crates/slashdot_tui` and move `ansi`,
+    `termio`, `draw`, `render` wholesale, plus the width utility: `slashdot_menu::table::display_width`
+    moves into the crate beside `ansi` (menu then imports it from `slashdot_tui`); `row_count.rs` stays
+    picocode-side (content's). The two outward edges of the {ansi, termio, draw, render} SCC are exactly
+    these, so the crate knows nothing of repl/content — the layering becomes compiler-enforced. The two
+    `crate::repl::LineEditor` test imports rehome: 6 render.rs + 3 draw.rs input-element pipeline tests
+    move to repl.rs `input_frame_tests` (the ones that pin manager+input behavior); `Element::status`/
+    `input`/`input_hidden` leave the inherent impl and become free fns; `Layout` (the input element's
+    data contract) moves beside `Element` in the tui crate. `lib.rs` re-exports
+    (`pub use slashdot_tui::{…}`) keep `confirm_probe` and examples source-compatible. The test-only
+    seams (`TermIO::recording`, `RenderManager::draw`, `tracked_row`, `fixed`) gate on a
+    `test-helpers` feature. Behavior-free.
   - **4h-b — `RowAsk`/`RowSpec` on the trait.** `RenderElement { height(&self, width) -> RowAsk;
     render(&self, height, width) -> Rendered }`; `RowAsk { min, max }`, `RowSpec::FixedNum(n)` /
     `RatioAndNum(r, n)`. The allocator resolves specs against the frame height
