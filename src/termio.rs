@@ -23,8 +23,8 @@
 //! repl, plus fresh `size` / `caret` receivers.
 //!
 //! Not yet here (tracked in the impl doc): DSR answered inside `TermIO`
-//! (4g). Production `write` exists; `Draw` still owns its own writer until
-//! 4f-e-b re-points every byte through here.
+//! (4g). Since 4f-e-b every production byte — frames, the re-anchor, the
+//! content choreography — leaves through [`Self::write`].
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
@@ -585,10 +585,10 @@ impl TermIO {
     // enum now, and [`Self::suspend`] / [`Self::resume`] / [`Self::is_tty`]
     // are the front door the manager forwards to.
 
-    /// Bytes to the stream's sink (design doc §TermIO `write`). Nothing in
-    /// production writes through here yet — `Draw` still owns the writer —
-    /// so today's callers are the byte-edge tests over [`recording`](Self::recording)
-    /// and [`null`](Self::null).
+    /// Bytes to the stream's sink (design doc §TermIO `write`). `Draw`'s
+    /// every byte comes through here since 4f-e-b (the writer field died);
+    /// the byte-edge tests read what [`recording`](Self::recording) holds at
+    /// the same edge, and [`null`](Self::null) discards.
     pub fn write(&mut self, s: Stream, bytes: &[u8]) -> io::Result<()> {
         match self {
             TermIO::Tty(_) => write_stdio(s, bytes),

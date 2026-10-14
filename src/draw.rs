@@ -1,21 +1,20 @@
 //! The apply phase of the unified draw pipeline (plan `doc/ui_draw_v2.md`
-//! §4): the live-screen cache, the escape planner, and the writer that emits
+//! §4): the live-screen cache, the escape planner, and the sink that emits
 //! what the planner returns.
 //!
 //! Planning is pure: [`plan_apply`] turns a [`Frame`] plus the [`DrawCache`]
 //! into the exact escape bytes and the post-apply cache state — bytes out,
 //! cache in/out — so the REPL, the dialogs and the vt100 tests all exercise
-//! the *same* sequence. [`Draw`] is the impure edge: it owns the writer and
-//! the locks, and is the only thing that writes. Newlines are emitted bare —
-//! the tty's OPOST/ONLCR maps them to CRLF (the same convention as the REPL's
-//! redraw) — so any harness that bypasses the tty must do that mapping.
+//! the *same* sequence. [`Draw`] is the impure edge: it owns the `TermIO`
+//! sink (4f-e-b), and is the only thing that writes. Newlines are emitted
+//! bare — the tty's OPOST/ONLCR maps them to CRLF (the same convention as
+//! the REPL's redraw) — so any harness that bypasses the tty must do that
+//! mapping.
 //!
 //! A frame's rows are self-contained: each carries the escapes needed to
 //! repaint itself in place (trailing `EL` or padding to `term_w`), so apply
 //! may rewrite any subset of rows unconditionally. Composition is
 //! [`crate::render`].
-
-use std::io::{self, Write};
 
 use crate::ansi::{HIDE_CURSOR, SHOW_CURSOR};
 use crate::render::Frame;
@@ -705,17 +704,13 @@ fn erase_down(s: &mut String, h: usize) {
 /// encapsulated one layer up. Methods that write or advance therefore take
 /// `&mut self`.
 pub(crate) struct Draw {
-    /// The terminal backend (4f-e): owned here, the design's
-    /// `Draw { term_io, cache }` — the whole reason the mode guard, the size
-    /// watch and the caps reached the layers above through the manager's
-    /// front door. Its `write` is not wired yet: until 4f-e-b the
-    /// transitional `writer` below still carries the bytes.
+    /// The terminal backend — the design's `Draw { term_io, cache }`, owned
+    /// here since 4f-e. Every byte leaves through [`Self::write_bytes`]:
+    /// the mode guard, the size watch, the caps *and* the sink all reach
+    /// the layers above through this one field. Content bytes never name it
+    /// directly — they arrive through the manager's `ContentWrite` hand-off
+    /// (step 4d).
     pub(crate) term_io: TermIO,
-    /// Transitional (4f-e-a): where the bytes go until 4f-e-b re-points
-    /// every write at `term_io.write(Stream::Main, …)` and this field dies.
-    /// Content bytes never name it directly — they arrive through the
-    /// manager's `ContentWrite` hand-off (step 4d).
-    pub(crate) writer: Box<dyn Write + Send>,
     /// The size watch (step 2 commit A): the latest `TermSize`, without a
     /// per-call terminal query. The same channel the manager holds — a
     /// subscribed receiver, so a test's private watch pins both.
@@ -731,10 +726,21 @@ impl Draw {
         let term_h = size.borrow().height;
         Draw {
             term_io,
-            writer: Box::new(io::stdout()),
             cache: DrawCache::new(term_h),
             size,
         }
+    }
+
+    /// The one choke point for byte emission (4f-e-b): the frame planner,
+    /// the re-anchor and the hub's content choreography all land here, and
+    /// this goes out `TermIO`'s main sink — written and flushed per call (a
+    /// frame must be on screen before the next one is planned; the sink
+    /// flushes itself, where the old `Box<dyn Write>` needed a separate
+    /// `flush`). A byte-edge test's recording constructor intercepts at the
+    /// same edge, which is what `TermIO::recording()` taking the seam
+    /// wholesale means.
+    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) {
+        let _ = self.term_io.write(crate::termio::Stream::Main, bytes);
     }
 
     // --- the TermIO pass-throughs (design §3: content / UI never name it) --
@@ -789,19 +795,18 @@ impl Draw {
         // to what `plan_apply` stores as the live frame's `term_w`/`term_h`.
         let (tw, th) = (dims.0.max(1), dims.1.max(1));
         let bytes = plan_apply(&mut self.cache, frame, policy, tw, th);
-        let _ = self.writer.write_all(bytes.as_bytes());
+        self.write_bytes(bytes.as_bytes());
         // The cursor follows the frame's own caret. A composed frame with one is
         // where the user types; a frame whose input is hidden mid-turn (R1) has
         // none to place, so hiding is the honest reading of the same fact rather
         // than a second piece of input state kept in step by hand. Either way
         // this is the cheapest place to be sure — `TermGuard` and the shell can
         // also leave it hidden.
-        let _ = self.writer.write_all(if frame.caret.is_some() {
+        self.write_bytes(if frame.caret.is_some() {
             SHOW_CURSOR
         } else {
             HIDE_CURSOR
         });
-        let _ = self.writer.flush();
         (tw, th)
     }
 
@@ -831,7 +836,7 @@ impl Draw {
     /// above the cursor from there. This is the one absolute address in a
     /// frame apply (row_accounting §6b), and it costs nothing when no frame
     /// is live — every streamed block, and every commit — because the bytes
-    /// are then just the cursor park. So it lives here, with the writer: every
+    /// are then just the cursor park. So it lives here, with the sink: every
     /// caller treats it as a side-effecting re-anchor, and none of them writes.
     pub(crate) fn reanchor_to_cursor(&mut self, row: Option<usize>) -> usize {
         let (row, bytes) = {
@@ -842,8 +847,7 @@ impl Draw {
             self.cache
                 .reanchor(row, size.width.max(20), size.height.max(1))
         };
-        let _ = self.writer.write_all(bytes.as_bytes());
-        let _ = self.writer.flush();
+        self.write_bytes(bytes.as_bytes());
         row
     }
 

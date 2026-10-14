@@ -26,8 +26,6 @@ use markdown_stream::{Parser, StreamParser};
 #[cfg(test)]
 use markdown_terminal::{Renderer, Theme};
 use serde_json::Value;
-#[cfg(test)]
-use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -1299,20 +1297,6 @@ mod tests {
         (out, reasoning)
     }
 
-    /// A cloneable byte sink: swapped into `ConsoleOutput::writer` so a test
-    /// can read what the content path emitted without a terminal.
-    #[derive(Clone)]
-    struct Sink(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for Sink {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().write(buf)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
     /// The compose head's home since 4f-b: the tests drive it through the
     /// content handle they already hold, the way `paint_prompt` does.
     fn compose_area(
@@ -1323,16 +1307,34 @@ mod tests {
         crate::repl::compose_area(&out.content, input, overlay)
     }
 
-    /// Swap `out`'s byte sink for a recording one, returning the handle a
-    /// test reads the bytes back through. The byte-edge seam for tests
-    /// that need *frame* bytes: capture taps the content hand-off only
-    /// (step 4d, design §Content) — frame bytes can never be caught — so a
-    /// test asserting on what reached the terminal reads the writer, which
-    /// is the seam `TermIO::recording()` takes over wholesale in 4f.
-    fn record_bytes(out: &ConsoleOutput) -> Sink {
-        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
-        out.content.manager.lock().unwrap().draw().writer = Box::new(sink.clone());
-        sink
+    /// Swap `out`'s byte edge for a recording `TermIO` and return the handle
+    /// a test reads the bytes back through (4f-e-b: `recording()` took the
+    /// seam wholesale — the writer field this used to swap is gone). The
+    /// byte-edge seam for tests that need *frame* bytes: capture taps the
+    /// content hand-off only (step 4d, design §Content) — frame bytes can
+    /// never be caught — so a test asserting on what reached the terminal
+    /// reads the sink, where "the sink" is now `TermIO`'s recording
+    /// backend under the manager's `Draw`.
+    fn record_bytes(out: &ConsoleOutput) -> Recording {
+        out.content.manager.lock().unwrap().draw().term_io = crate::termio::TermIO::recording();
+        Recording(out.content.clone())
+    }
+
+    /// What a [`record_bytes`] swap captured on the main stream — read at
+    /// assert time through the same content handle, so a test keeps no lock
+    /// and no borrow into the manager.
+    struct Recording(Arc<Content>);
+
+    impl Recording {
+        fn bytes(&self) -> Vec<u8> {
+            self.0
+                .manager
+                .lock()
+                .unwrap()
+                .draw()
+                .term_io
+                .recorded(crate::termio::Stream::Main)
+        }
     }
 
     /// Tracked cursor row of `out` (0-based, as the screen reports it).
@@ -2685,7 +2687,7 @@ mod tests {
                 w.write_all(y.as_bytes()).unwrap();
                 w.write_all(b"\n").unwrap();
             });
-        let bytes = sink.0.lock().unwrap().clone();
+        let bytes = sink.bytes();
         let text = String::from_utf8(bytes).expect("utf-8 content");
         let expect = format!("\x1b[K{}\n\x1b[K{}\n", &y[..60], &y[60..]);
         assert_eq!(
@@ -2707,7 +2709,7 @@ mod tests {
             .with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
                 w.write_all(input.as_bytes()).unwrap();
             });
-        let bytes = sink.0.lock().unwrap().clone();
+        let bytes = sink.bytes();
         let text = String::from_utf8(bytes).expect("utf-8 content");
         let expect = format!("\x1b[K\x1b[32m{}\n\x1b[K{}\x1b[0m\n", &y[..60], &y[60..]);
         assert_eq!(text, expect, "escape intact, wrap inside the color");
@@ -2763,7 +2765,7 @@ mod tests {
              screen-side only): {cap:?}"
         );
 
-        let screen = String::from_utf8_lossy(&sink.0.lock().unwrap().clone()).into_owned();
+        let screen = String::from_utf8_lossy(&sink.bytes()).into_owned();
         assert!(
             screen.contains("\x1b[?25h"),
             "the frame apply reaches the screen: {screen:?}"
@@ -2819,7 +2821,7 @@ mod tests {
                 .unwrap()
                 .render(stack, ApplyPolicy::Frame, dims)
         };
-        let via_tail = tail_sink.0.lock().unwrap().clone();
+        let via_tail = tail_sink.bytes();
 
         let (hand, _rh) = capturing_output(60);
         hand.content.set_status(bar_of("[bar]"));
@@ -2832,7 +2834,7 @@ mod tests {
         let frame = render(&stack, &heights, dims.0);
         let hand_sink = record_bytes(&hand);
         let b = hand.draw_frame(&frame, ApplyPolicy::Frame, dims);
-        let via_hand = hand_sink.0.lock().unwrap().clone();
+        let via_hand = hand_sink.bytes();
 
         assert_eq!(a, b, "the same dims either way");
         assert_eq!(
@@ -2877,7 +2879,7 @@ mod tests {
         );
         out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         out.display_text("Cannot start agent: Missing API key for provider.");
-        let bytes = sink.0.lock().unwrap().clone();
+        let bytes = sink.bytes();
 
         let mut p = vt100::Parser::new(24, 40, 1000);
         // The capture starts at the terminal's first row, but the frame apply is
@@ -2952,7 +2954,7 @@ mod tests {
             Vec::new(),
             (40, 24),
         );
-        let bytes = sink.0.lock().unwrap().clone();
+        let bytes = sink.bytes();
         assert!(
             String::from_utf8_lossy(&bytes).contains("\x1b[?25l"),
             "a frame with no caret hides the cursor"
@@ -2963,7 +2965,7 @@ mod tests {
         let mut editor = crate::repl::LineEditor::new();
         editor.set("hi");
         crate::repl::paint_prompt(&out.content, "", &editor, Vec::new(), (40, 24));
-        let text = String::from_utf8_lossy(&sink.0.lock().unwrap().clone()).into_owned();
+        let text = String::from_utf8_lossy(&sink.bytes()).into_owned();
         assert!(
             text.contains("\x1b[?25h"),
             "a frame with a caret shows it: {text:?}"
@@ -3028,7 +3030,7 @@ mod tests {
             out.display_text("second line");
             out.display_text("third line");
         } // the guard's drop owns the redraw
-        let bytes = sink.0.lock().unwrap().clone();
+        let bytes = sink.bytes();
 
         // Once for the frame's own apply, once for the batch's single
         // re-emit. Unbatched it is four — the apply plus one per write — and

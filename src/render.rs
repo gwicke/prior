@@ -539,11 +539,12 @@ impl RenderManager {
     }
 
     /// The drawing edge, for the test seams that read *past* this manager
-    /// (the writer swap, `cache.applied`). Production reaches the edge
-    /// through this manager's own verbs — `render`, `cursor_row`,
-    /// `painted_size`, `draw_frame` (content writes go through
-    /// `render_content`); the last production forwarder was
-    /// `Output::painted_size`, which 4f-c took. Test-only since.
+    /// (`cache.applied`, and `term_io.recorded` for the byte edge since
+    /// 4f-e-b). Production reaches the edge through this manager's own
+    /// verbs — `render`, `cursor_row`, `painted_size`, `draw_frame`
+    /// (content writes go through `render_content`); the last production
+    /// forwarder was `Output::painted_size`, which 4f-c took. Test-only
+    /// since.
     #[cfg(test)]
     pub(crate) fn draw(&mut self) -> &mut Draw {
         &mut self.draw
@@ -711,8 +712,7 @@ impl RenderManager {
             return;
         };
         let bytes = self.reposition_area(width, taken);
-        let _ = self.draw.writer.write_all(bytes.as_bytes());
-        let _ = self.draw.writer.flush();
+        self.draw.write_bytes(bytes.as_bytes());
     }
 
     /// True while a capture is open on the content hand-off (design
@@ -725,8 +725,7 @@ impl RenderManager {
     /// hub instead of reaching the screen. Content bytes only — frame
     /// bytes (`draw_frame`, the reposition) can never be caught, which is
     /// the deliberate narrowing over the old writer swap; byte-edge tests
-    /// read the writer, and `TermIO::recording()` takes that seam over
-    /// wholesale in 4f.
+    /// read `TermIO::recording()`, which took that seam wholesale (4f-e-b).
     pub(crate) fn begin_capture(&mut self) {
         self.captured = Some(Vec::new());
     }
@@ -812,7 +811,7 @@ impl RenderManager {
             None => (String::new(), None),
         };
         if !walk.is_empty() {
-            let _ = self.draw.writer.write_all(walk.as_bytes());
+            self.draw.write_bytes(walk.as_bytes());
         }
         // The tap (design §Content): with a capture open the block's bytes
         // stop here — exactly as Content produced them, content only. The
@@ -820,10 +819,7 @@ impl RenderManager {
         // are facts about the screen, and a capture does not pause it.
         match self.captured.as_mut() {
             Some(cap) => cap.extend_from_slice(&bytes),
-            None => {
-                let _ = self.draw.writer.write_all(&bytes);
-                let _ = self.draw.writer.flush();
-            }
+            None => self.draw.write_bytes(&bytes),
         }
         // Zero rows means nothing moved, and a frame stays live.
         if rows > 0 {
@@ -860,8 +856,7 @@ impl RenderManager {
         };
         if let Some(taken) = taken {
             let bytes = self.reposition_area(width, taken);
-            let _ = self.draw.writer.write_all(bytes.as_bytes());
-            let _ = self.draw.writer.flush();
+            self.draw.write_bytes(bytes.as_bytes());
         }
     }
 }
@@ -906,23 +901,6 @@ impl Drop for ContentBatchGuard<'_> {
 mod tests {
     use super::*;
     use crate::repl::LineEditor;
-    use std::io::{self, Write};
-    use std::sync::{Arc, Mutex};
-
-    /// A recording byte sink for the writer seam: frame bytes are never
-    /// catchable at the content tap (4d), so a test that asserts on them
-    /// swaps the writer — the pattern `output.rs`'s `Sink` uses.
-    #[derive(Clone, Default)]
-    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().write(buf)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
 
     // ---- live_budget ----
 
@@ -958,26 +936,24 @@ mod tests {
     /// `render` is the pipeline that left `Output::draw_elements`: it applies
     /// through the `Draw` it has owned since 4c and remembers the composition
     /// there (recipe + applied size, where the content path reads it).
-    /// Frame bytes read from a recording sink swapped into the writer —
-    /// the manager's own capture taps the *content* hand-off only (4d), so
-    /// a frame-byte assertion reads the byte edge, as `TermIO::recording()`
-    /// will take over wholesale in 4f.
+    /// Frame bytes read from a recording `TermIO` (4f-e-b: `recording()`
+    /// took the byte edge wholesale) — the manager's own capture taps the
+    /// *content* hand-off only (4d), so a frame-byte assertion reads the
+    /// byte edge.
     #[test]
     fn manager_render_paints_its_own_draw_and_remembers() {
         let size = crate::termio::fixed(TermSize {
             width: 40,
             height: 24,
         });
-        let mut manager = RenderManager::new(size, crate::termio::TermIO::null());
+        let mut manager = RenderManager::new(size, crate::termio::TermIO::recording());
 
-        let rec = SharedBuf::default();
-        manager.draw.writer = Box::new(rec.clone());
         let stack = vec![
             Element::lines(vec!["hello".to_string()]),
             Element::divider(),
         ];
         let applied = manager.render(stack, ApplyPolicy::Frame, (40, 24));
-        let bytes = rec.0.lock().unwrap().clone();
+        let bytes = manager.draw.term_io.recorded(crate::termio::Stream::Main);
 
         assert_eq!(applied, (40, 24));
         assert!(
