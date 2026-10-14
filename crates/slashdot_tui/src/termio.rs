@@ -95,8 +95,8 @@ impl TermSize {
 /// subscription, so a test's geometry is per-instance state and needs no
 /// test serialization. The sender is dropped — the value can never change,
 /// and a closed watch still serves `borrow()`.
-#[cfg(test)]
-pub(crate) fn fixed(size: TermSize) -> watch::Receiver<TermSize> {
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn fixed(size: TermSize) -> watch::Receiver<TermSize> {
     watch::channel(size).1
 }
 
@@ -212,7 +212,7 @@ impl Caps {
 /// `repl.rs` with the reader). The *policy* is the part worth arguing about
 /// and the part worth testing: which keys may wait, and which may not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReaderRoute {
+pub enum ReaderRoute {
     /// Deal with it here — process/terminal/abort state, or an event with
     /// nobody to hand it to.
     Inline,
@@ -253,7 +253,7 @@ pub(crate) enum ReaderRoute {
 ///
 /// Everything else — mouse, focus — returns [`ReaderRoute::Inline`] and is
 /// ignored, exactly as it was before there was anywhere to forward to.
-pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
+pub fn route_event(ev: &Event) -> ReaderRoute {
     match ev {
         Event::Resize(..) => ReaderRoute::Forward,
         Event::Key(key) => match key.code {
@@ -275,7 +275,7 @@ pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
 /// and then pushes the caret invalidation (a [`CaretEvent`]) toward the
 /// render manager — the whole resume signal is this one flag plus that
 /// event; the loop-local `RESUMED_REANCHOR` flag died in 4g-c.
-pub(crate) static RESUMED: AtomicBool = AtomicBool::new(false);
+pub static RESUMED: AtomicBool = AtomicBool::new(false);
 
 /// `SIGCONT` handler: record that the process resumed.
 /// It must stay async-signal-safe (no I/O, no allocation), so the actual
@@ -289,7 +289,7 @@ extern "C" fn on_sigcont(_sig: i32) {
 /// times; `libc::signal` just replaces the handler. Required so that
 /// `Ctrl-Z` suspend/resume restores raw mode. Called by [`TermIO::tty`] —
 /// raw mode is a Tty concern, so its resume signal is too.
-pub(crate) fn register_sigcont() {
+pub fn register_sigcont() {
     unsafe {
         libc::signal(libc::SIGCONT, on_sigcont as *const () as usize);
     }
@@ -369,7 +369,7 @@ enum Sink {
     Stdio,
     /// In-memory, per stream — [`TermIO::recording`] (test builds only;
     /// nothing in production records).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     Recording { main: Vec<u8>, meta: Vec<u8> },
     /// Discard — [`TermIO::null`].
     Null,
@@ -436,7 +436,7 @@ impl TermIO {
     /// Memory writers, per stream (design doc §Testing): what byte-edge
     /// assertions record through once `Draw` writes via `TermIO`. Stripped
     /// bytes with frames dropped by caps are Draw's decision, above this.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn recording() -> Self {
         let (handles, input_tx, caret_tx, size_tx) = term_channels();
         drop(input_tx);
@@ -612,7 +612,7 @@ impl TermIO {
             TermIO::Tty(_) => write_stdio(s, bytes),
             TermIO::Plain(p) => match &mut p.sink {
                 Sink::Stdio => write_stdio(s, bytes),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-helpers"))]
                 Sink::Recording { main, meta } => {
                     match s {
                         Stream::Main => main.extend_from_slice(bytes),
@@ -627,7 +627,7 @@ impl TermIO {
 
     /// What [`recording`](Self::recording) captured for `s` — empty for any
     /// other backend (they store nothing).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn recorded(&self, s: Stream) -> Vec<u8> {
         match self {
             TermIO::Tty(_) => Vec::new(),
@@ -688,7 +688,7 @@ fn write_stdio(s: Stream, bytes: &[u8]) -> io::Result<()> {
 /// query, or the compaction window — and while it is `true` this reader backs
 /// off (sleeps, does not read) so it cannot swallow the bytes the main task is
 /// waiting for; [`READER_PARKED`] signals that it has genuinely parked.
-pub(crate) fn spawn_stdin_reader(
+pub fn spawn_stdin_reader(
     guard: Arc<TermGuard>,
     input: UnboundedSender<InputEvent>,
     caret: UnboundedSender<CaretEvent>,
@@ -905,18 +905,18 @@ fn enable_output_processing() {
 
 /// Raised while the main task owns stdin; the persistent reader backs off
 /// (does not call `event::poll`/`read`) for as long as it is `true`.
-pub(crate) static PAUSE_GATE: AtomicBool = AtomicBool::new(false);
+pub static PAUSE_GATE: AtomicBool = AtomicBool::new(false);
 
 /// Set by the reader while it is backed off, cleared the moment it is about to
 /// read stdin again. A gate-raiser waits on this to know the reader has left
 /// any in-flight 50 ms poll — so the bytes it is about to read cannot be
 /// swallowed. See [`ReaderPauseGuard`].
-pub(crate) static READER_PARKED: AtomicBool = AtomicBool::new(false);
+pub static READER_PARKED: AtomicBool = AtomicBool::new(false);
 
 /// Set once the reader thread has started. A gate-raiser only waits on
 /// [`READER_PARKED`] when a reader exists to park — in a test harness with no
 /// reader there is nothing to wait for, and the wait would be a wasted timeout.
-pub(crate) static READER_RUNNING: AtomicBool = AtomicBool::new(false);
+pub static READER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Pauses the persistent reader for a window in which the main task owns stdin
 /// and reads it directly (step 2 commit C) — a DSR query, `$EDITOR`'s
@@ -925,13 +925,13 @@ pub(crate) static READER_RUNNING: AtomicBool = AtomicBool::new(false);
 ///
 /// Nesting-safe: if the gate is already up, this neither waits nor lowers — the
 /// outer holder owns the pause.
-pub(crate) struct ReaderPauseGuard {
+pub struct ReaderPauseGuard {
     /// Did *this* guard raise the gate? Only the raiser lowers it on drop.
     owned: bool,
 }
 
 impl ReaderPauseGuard {
-    pub(crate) fn raise() -> Self {
+    pub fn raise() -> Self {
         Self {
             owned: raise_pause_gate(),
         }
@@ -967,7 +967,7 @@ impl Drop for ReaderPauseGuard {
 /// The cursor row from a DSR query, answered with the reader paused so the
 /// reply cannot be swallowed (step 2 commit C). This is the *whole* of the
 /// terminal-I/O-layer DSR: pause dispatch, write the query, match the reply.
-pub(crate) fn query_cursor_row() -> Option<usize> {
+pub fn query_cursor_row() -> Option<usize> {
     let _pause = ReaderPauseGuard::raise();
     query_real_cursor_row()
 }

@@ -809,16 +809,18 @@ impl RenderAt for StatusItem {
     }
 }
 
-impl Element {
-    /// The status row: `must == might == 1`, data resolved at render time.
-    /// Presence is the compose's decision (`repl::compose_area`); this is
-    /// only ever built when there is something to say (see [`StatusItem`]).
-    pub(crate) fn status(
-        status: Arc<Mutex<crate::agent::status::BarStatus>>,
-        streaming: Arc<AtomicBool>,
-    ) -> Self {
-        Element::new(1, 1, StatusItem { status, streaming })
-    }
+/// The status row: `must == might == 1`, data resolved at render time.
+/// Presence is the compose's decision (`repl::compose_area`); this is
+/// only ever built when there is something to say (see [`StatusItem`]).
+///
+/// A free function, not `status`: inherent methods on `Element` would
+/// live in `slashdot_tui`, and this element is output's (it holds content's
+/// bar store). Same shape as `Element::new`, whose `render` impl lives there.
+pub(crate) fn status(
+    status: Arc<Mutex<crate::agent::status::BarStatus>>,
+    streaming: Arc<AtomicBool>,
+) -> Element {
+    Element::new(1, 1, StatusItem { status, streaming })
 }
 
 pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> String {
@@ -1068,6 +1070,7 @@ mod tests {
     // The pure pipeline the manager's render now runs (and the composer tests
     // re-run) — imported here since the production path left `output.rs`.
     use crate::render::{allocate, live_budget, render, Extent};
+    use crate::repl::input;
 
     // --- Row accounting: the tracked cursor vs. the real one (phase B) ---
     //
@@ -1175,7 +1178,7 @@ mod tests {
         let (out, _reasoning) = capturing_output(60);
         out.content.set_status(bar_of("[bar]"));
         let input = || {
-            Element::input(
+            input(
                 crate::repl::LineEditor::new().layout(60, "> "),
                 "> ".to_string(),
             )
@@ -2840,7 +2843,7 @@ mod tests {
         // pipeline*.
         let pieces = || {
             let layout = crate::repl::LineEditor::new().layout(60, "> ");
-            let input = Element::input(layout, "> ".to_string());
+            let input = input(layout, "> ".to_string());
             let overlay = crate::repl::test_overlay(&tall, 0, 60);
             (Some(input), overlay)
         };

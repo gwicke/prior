@@ -45,81 +45,79 @@ use std::sync::Arc;
 // `paint_detail` / `paint_header`; the rows stay unpainted and are windowed at
 // render time.
 
-impl Element {
-    /// The table's column-label line. **Elastic** (`must` 0), deliberately:
-    /// protecting it inverts the right priority when space runs out. Measured
-    /// against `allocate`, a budget of 3 with a protected header gives the
-    /// header its row and the menu *zero* rows — and given the choice, a row
-    /// beats a header. So the header yields; see `header_element_extent`.
-    fn table_header(section: PaintedSection) -> Self {
-        Element::new(0, section.height(), SectionItem { section })
-    }
+/// The table's column-label line. **Elastic** (`must` 0), deliberately:
+/// protecting it inverts the right priority when space runs out. Measured
+/// against `allocate`, a budget of 3 with a protected header gives the
+/// header its row and the menu *zero* rows — and given the choice, a row
+/// beats a header. So the header yields; see `header_element_extent`.
+fn table_header(section: PaintedSection) -> Element {
+    Element::new(0, section.height(), SectionItem { section })
+}
 
-    /// The node's `header()` output: context, above the table. Also elastic,
-    /// for the same reason — detail is the first thing to lose to a visible
-    /// row, and the last thing worth keeping when the rows have to be clipped.
-    ///
-    /// Within its allocation it keeps **whole logical lines**, dropping from
-    /// the bottom: a detail line too wide for the terminal was split when
-    /// painted, and it is kept or dropped whole rather than cut mid-line.
-    fn detail(section: PaintedSection) -> Self {
-        Element::new(0, section.height(), SectionItem { section })
-    }
+/// The node's `header()` output: context, above the table. Also elastic,
+/// for the same reason — detail is the first thing to lose to a visible
+/// row, and the last thing worth keeping when the rows have to be clipped.
+///
+/// Within its allocation it keeps **whole logical lines**, dropping from
+/// the bottom: a detail line too wide for the terminal was split when
+/// painted, and it is kept or dropped whole rather than cut mid-line.
+fn detail(section: PaintedSection) -> Element {
+    Element::new(0, section.height(), SectionItem { section })
+}
 
-    /// The scrollable rows, held **unpainted** and windowed at render time.
-    ///
-    /// `selected` is the cursor's *logical* row index — it is what this element
-    /// windows around, so there is no painted-index arithmetic anywhere: the
-    /// selection is identified exactly the way the engine identified it, and
-    /// nothing painted above it can move it.
-    ///
-    /// Holding the `Arc` rather than painted `String`s is what makes painting
-    /// O(window) rather than O(table): a 1000-row menu paints the ~14 rows
-    /// actually on screen instead of all 1000 (measured 2.5ms → 19µs). The rows
-    /// are already `Arc`-cached by the engine, so this shares the pointer and
-    /// repaints nothing a cursor move did not change.
-    /// The menu's row element: show something when there is anything to show.
-    ///
-    /// `#[cfg(test)]` because production reaches the rows through
-    /// [`overlay_elements_with`], which chooses the floor per host. The window
-    /// tests here want the bare element, not a composed overlay.
-    #[cfg(test)]
-    fn data_rows(rows: Arc<Vec<LogicalLine>>, selected: Option<usize>, active: Vec<usize>) -> Self {
-        Self::rows_pinned_to(rows, selected, active, 1)
-    }
+/// The scrollable rows, held **unpainted** and windowed at render time.
+///
+/// `selected` is the cursor's *logical* row index — it is what this element
+/// windows around, so there is no painted-index arithmetic anywhere: the
+/// selection is identified exactly the way the engine identified it, and
+/// nothing painted above it can move it.
+///
+/// Holding the `Arc` rather than painted `String`s is what makes painting
+/// O(window) rather than O(table): a 1000-row menu paints the ~14 rows
+/// actually on screen instead of all 1000 (measured 2.5ms → 19µs). The rows
+/// are already `Arc`-cached by the engine, so this shares the pointer and
+/// repaints nothing a cursor move did not change.
+/// The menu's row element: show something when there is anything to show.
+///
+/// `#[cfg(test)]` because production reaches the rows through
+/// [`overlay_elements_with`], which chooses the floor per host. The window
+/// tests here want the bare element, not a composed overlay.
+#[cfg(test)]
+fn data_rows(rows: Arc<Vec<LogicalLine>>, selected: Option<usize>, active: Vec<usize>) -> Element {
+    rows_pinned_to(rows, selected, active, 1)
+}
 
-    /// Rows that must survive a starved budget, with `min` as the floor.
-    ///
-    /// A menu asks for `1`; a confirmation asks for its option count, because
-    /// a dialog whose options have been squeezed away is not a consent prompt.
-    /// `allocate` serves every `must` before any `might`
-    /// (`render::allocate`), so this floor holds under pressure — with the
-    /// caveat that below the summed `must`s `fill` degrades to one row each in
-    /// element order, and this element is last.
-    fn rows_pinned_to(
-        rows: Arc<Vec<LogicalLine>>,
-        selected: Option<usize>,
-        active: Vec<usize>,
-        min: usize,
-    ) -> Self {
-        // `might` is the height *if every row were shown*, measured the way the
-        // engine wrote them ([`visual_height`]: embedded `\n` only). Painting
-        // can make a row taller — one too wide for the terminal is split — so
-        // this is a lower bound on the painted height, which is the safe
-        // direction: the allocator is never promised more rows than the element
-        // can actually produce. `render_at` re-measures and fits `h` anyway.
-        let might: usize = rows.iter().map(visual_height).sum();
-        let must = min.min(might);
-        Element::new(
-            must,
-            might,
-            RowsItem {
-                rows,
-                selected,
-                active,
-            },
-        )
-    }
+/// Rows that must survive a starved budget, with `min` as the floor.
+///
+/// A menu asks for `1`; a confirmation asks for its option count, because
+/// a dialog whose options have been squeezed away is not a consent prompt.
+/// `allocate` serves every `must` before any `might`
+/// (`render::allocate`), so this floor holds under pressure — with the
+/// caveat that below the summed `must`s `fill` degrades to one row each in
+/// element order, and this element is last.
+fn rows_pinned_to(
+    rows: Arc<Vec<LogicalLine>>,
+    selected: Option<usize>,
+    active: Vec<usize>,
+    min: usize,
+) -> Element {
+    // `might` is the height *if every row were shown*, measured the way the
+    // engine wrote them ([`visual_height`]: embedded `\n` only). Painting
+    // can make a row taller — one too wide for the terminal is split — so
+    // this is a lower bound on the painted height, which is the safe
+    // direction: the allocator is never promised more rows than the element
+    // can actually produce. `render_at` re-measures and fits `h` anyway.
+    let might: usize = rows.iter().map(visual_height).sum();
+    let must = min.min(might);
+    Element::new(
+        must,
+        might,
+        RowsItem {
+            rows,
+            selected,
+            active,
+        },
+    )
 }
 
 /// One elastic section: already-painted rows, clipped to the allocation.
@@ -265,16 +263,16 @@ pub(crate) fn overlay_elements_with(
     row_min: usize,
 ) -> Vec<Element> {
     let mut els = Vec::with_capacity(3);
-    let detail = paint_detail(&plan.detail, term_w);
-    if !detail.rows.is_empty() {
-        els.push(Element::detail(detail));
+    let detail_section = paint_detail(&plan.detail, term_w);
+    if !detail_section.rows.is_empty() {
+        els.push(detail(detail_section));
     }
-    let header = paint_header(plan.table_header.as_ref(), term_w);
-    if !header.rows.is_empty() {
-        els.push(Element::table_header(header));
+    let header_section = paint_header(plan.table_header.as_ref(), term_w);
+    if !header_section.rows.is_empty() {
+        els.push(table_header(header_section));
     }
     if !plan.rows.is_empty() {
-        els.push(Element::rows_pinned_to(
+        els.push(rows_pinned_to(
             Arc::clone(&plan.rows),
             selected.filter(|s| *s < plan.rows.len()),
             plan.active_rows.clone(),
@@ -295,7 +293,7 @@ mod tests {
     /// two agree by accident; only a list long enough to scroll shows the
     /// difference.
     ///
-    /// Driven through [`overlay_elements`] rather than `Element::data_rows`
+    /// Driven through [`overlay_elements`] rather than `data_rows`
     /// directly, so the composition path is covered too — a plan whose
     /// active rows are mis-wired on the way in would pass a test that
     /// skipped it.
@@ -386,9 +384,9 @@ mod tests {
     #[test]
     fn table_header_survives_a_scrolling_row_section() {
         let els = vec![
-            Element::detail(paint_detail(&[LogicalLine::new("pick one")], 60)),
-            Element::table_header(paint_header(Some(&LogicalLine::new("MODEL")), 60)),
-            Element::data_rows(
+            detail(paint_detail(&[LogicalLine::new("pick one")], 60)),
+            table_header(paint_header(Some(&LogicalLine::new("MODEL")), 60)),
+            data_rows(
                 Arc::new(
                     (0..30)
                         .map(|i| LogicalLine::new(format!("model-{i}")))
@@ -453,7 +451,7 @@ mod tests {
     #[test]
     fn section_rows_fill_the_width_inside_the_styled_span() {
         for (label, tw) in [("ab", 8usize), ("abcdefgh", 8), ("ab", 5)] {
-            let el = Element::table_header(paint_header(Some(&LogicalLine::new(label)), tw));
+            let el = table_header(paint_header(Some(&LogicalLine::new(label)), tw));
             // A label wider than the terminal is *split*, so the section can be
             // two rows; allocate what it actually wants.
             let h = el.extent().might;
@@ -482,7 +480,7 @@ mod tests {
                 .map(|i| LogicalLine::new(format!("item {i}")))
                 .collect(),
         );
-        let el = Element::data_rows(rows, Some(10), vec![]);
+        let el = data_rows(rows, Some(10), vec![]);
         let f = render(&[el], &[4], 20);
         assert_eq!(f.height(), 4);
         // `window_heights`' rule: walk back over at most half the budget, then
@@ -503,8 +501,8 @@ mod tests {
         );
         let els = |sel| {
             vec![
-                Element::table_header(paint_header(Some(&LogicalLine::new("HDR")), 20)),
-                Element::data_rows(Arc::clone(&rows), Some(sel), vec![]),
+                table_header(paint_header(Some(&LogicalLine::new("HDR")), 20)),
+                data_rows(Arc::clone(&rows), Some(sel), vec![]),
             ]
         };
         for sel in [0usize, 15, 29] {
@@ -532,7 +530,7 @@ mod tests {
             LogicalLine::new("short"),
             LogicalLine::new("tall\nrow\nof\nlines"),
         ]);
-        let el = Element::data_rows(rows, Some(1), vec![]);
+        let el = data_rows(rows, Some(1), vec![]);
         let f = render(&[el], &[2], 20);
         assert!(f.height() <= 2, "never more than h: {}", f.height());
         assert!(f.row(0).contains("tall"), "{:?}", f.row(0));

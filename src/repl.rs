@@ -20,6 +20,10 @@ use crate::content::Content;
 use crate::draw::{el_if_short, ApplyPolicy};
 use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
+use crate::output::status;
+/// The input element's data contract lives in `slashdot_tui` (beside
+/// [`Element`]); re-exported so `crate::repl::Layout` paths keep working.
+pub use crate::render::Layout;
 use crate::render::{allocate, live_budget, window, Element, Extent, RenderAt, Rendered};
 #[cfg(test)]
 use crate::render::{render, Frame};
@@ -337,41 +341,43 @@ enum V25Frame {
 /// its wrapped height (plan §3.4).
 const INPUT_CONTEXT_ROWS: usize = 3;
 
-impl Element {
-    /// Prompt + editor content. `layout` is the editor's visual layout
-    /// (prompt rendered on row 0); the caret lives at `layout.cursor_row` /
-    /// `layout.cursor_col` — derived, not stored.
-    ///
-    /// `must` is the caret's own row, which is why the input can never be
-    /// squeezed away entirely; wrapping grows `might`.
-    pub(crate) fn input(layout: Layout, prompt: String) -> Self {
-        let might = layout.row_count.max(1);
-        Element::new(1, might, InputItem { layout, prompt })
-    }
+/// Prompt + editor content. `layout` is the editor's visual layout
+/// (prompt rendered on row 0); the caret lives at `layout.cursor_row` /
+/// `layout.cursor_col` — derived, not stored.
+///
+/// `must` is the caret's own row, which is why the input can never be
+/// squeezed away entirely; wrapping grows `might`.
+///
+/// A free function, not `Element::input`: inherent methods on `Element` would
+/// live in `slashdot_tui`, and this element is repl's (it holds [`LineEditor`]'s
+/// layout). Same shape as `Element::new`, whose `render` impl lives here.
+pub(crate) fn input(layout: Layout, prompt: String) -> Element {
+    let might = layout.row_count.max(1);
+    Element::new(1, might, InputItem { layout, prompt })
+}
 
-    /// An input that occupies **no rows at all** — the mid-turn case.
-    ///
-    /// An input row with nothing in it reads as "type here", and while a turn is
-    /// running there is nothing to submit, so the row is a claim the screen
-    /// cannot back up. Between turns it is the opposite: it is what tells the
-    /// reader where input goes, so [`Self::input`] keeps it. The REPL is live
-    /// either way (OQ2) — the frame is composed and applied on every keystroke;
-    /// it simply has no row to draw until something is typed.
-    ///
-    /// `must == might == 0`, so the allocator serves it nothing and
-    /// `InputItem::render_at(0, _)` returns the empty `Rendered`. The choice is
-    /// made here rather than inferred inside the element, because "is a turn
-    /// running" is the output's fact (`streaming`), not the frame layer's.
-    pub(crate) fn input_hidden(layout: Layout, prompt: String) -> Self {
-        Element::new(0, 0, InputItem { layout, prompt })
-    }
+/// An input that occupies **no rows at all** — the mid-turn case.
+///
+/// An input row with nothing in it reads as "type here", and while a turn is
+/// running there is nothing to submit, so the row is a claim the screen
+/// cannot back up. Between turns it is the opposite: it is what tells the
+/// reader where input goes, so [`input`] keeps it. The REPL is live
+/// either way (OQ2) — the frame is composed and applied on every keystroke;
+/// it simply has no row to draw until something is typed.
+///
+/// `must == might == 0`, so the allocator serves it nothing and
+/// `InputItem::render_at(0, _)` returns the empty `Rendered`. The choice is
+/// made here rather than inferred inside the element, because "is a turn
+/// running" is the output's fact (`streaming`), not the frame layer's.
+pub(crate) fn input_hidden(layout: Layout, prompt: String) -> Element {
+    Element::new(0, 0, InputItem { layout, prompt })
 }
 
 /// The input element for one compose, and the R1 rule in one place.
 ///
 /// Mid-turn an empty input is **no row at all**; between turns it is the resting
 /// row that says where to type; anything typed is an ordinary input either way.
-/// [`Element::input_hidden`] has the reasoning.
+/// [`input_hidden`] has the reasoning.
 ///
 /// Shared by the REPL's redraw and the test harness rather than written twice —
 /// a copy would drift, and then the tests would pin a rule that production does
@@ -384,9 +390,9 @@ pub(crate) fn input_element(
 ) -> Element {
     let layout = editor.layout(term_w, prompt);
     if streaming && editor.text().is_empty() {
-        Element::input_hidden(layout, prompt.to_string())
+        input_hidden(layout, prompt.to_string())
     } else {
-        Element::input(layout, prompt.to_string())
+        input(layout, prompt.to_string())
     }
 }
 
@@ -505,7 +511,7 @@ pub(crate) fn area_body(input: Option<Element>, overlay: Vec<Element>) -> Vec<El
 /// Presence is decided here and the bar's render does not, because presence
 /// is the part that does not move under it: every compose happens after the
 /// cycle's `set_status`, so the flag cannot flip between compose and draw.
-/// What the row says is `Element::status`'s own business, resolved when it
+/// What the row says is `status`'s own business, resolved when it
 /// is rendered — and at the width it is rendered at. The head's *final* home
 /// is `render()` itself, with the bar an installed element (**4h**).
 pub(crate) fn compose_area(
@@ -523,10 +529,7 @@ pub(crate) fn compose_area(
         // the frame takes this row too, and it can never become a
         // permanent blank in the transcript.
         items.push(Element::lines(vec![String::new()]));
-        items.push(Element::status(
-            content.bar.clone(),
-            content.streaming.clone(),
-        ));
+        items.push(status(content.bar.clone(), content.streaming.clone()));
     }
     items.extend(area_body(input, overlay));
     items
@@ -1734,7 +1737,7 @@ impl Repl {
     ) -> Vec<Element> {
         let term_w = term_w.max(1);
         let layout = editor.layout(term_w, prompt);
-        let input = Element::input(layout, prompt.to_string());
+        let input = input(layout, prompt.to_string());
         let mut items: Vec<Element> = Vec::new();
         if let Some(bar) = status {
             items.push(Element::lines(vec![bar.to_string()]));
@@ -2614,18 +2617,6 @@ impl LineEditor {
             row_count,
         }
     }
-}
-
-/// Visual layout of a [`LineEditor`] buffer.
-pub struct Layout {
-    /// Content-only visual rows (the prompt is rendered separately on row 0).
-    pub rows: Vec<String>,
-    /// Visual row (0-based) the cursor is on.
-    pub cursor_row: usize,
-    /// Absolute column (0-based) the cursor is on, counting the prompt on row 0.
-    pub cursor_col: usize,
-    /// Total visual rows.
-    pub row_count: usize,
 }
 
 /// Word-boundary wrap of one logical line (no `'\n'`). Returns, for each
@@ -4703,6 +4694,141 @@ mod tests {
         }
     }
 
+    // The input element driven straight through the frame pipeline — no
+    // `compose_frame`, no overlay: just the [`input`] element handed to
+    // `plan_apply`, exactly as draw.rs's input-frame tests did before the crate
+    // split (4h-a). They moved here because they build the repl's own input
+    // element (`LineEditor` + [`input`]), which the drawing crate no longer
+    // knows about.
+    mod input_frame_tests {
+        use super::super::input;
+        use crate::draw::{plan_apply, ApplyPolicy, DrawCache};
+        use crate::render::render;
+        use crate::repl::LineEditor;
+        use vt100::Parser;
+
+        fn onlcr(s: &str) -> Vec<u8> {
+            s.replace('\n', "\r\n").into_bytes()
+        }
+
+        fn at(rows: usize, cols: usize, n: usize) -> Parser {
+            let mut p = Parser::new(rows as u16, cols as u16, 2000);
+            p.process(&onlcr(&"\n".repeat(n)));
+            p
+        }
+
+        fn feed(p: &mut Parser, chunk: &str) {
+            p.process(&onlcr(chunk));
+        }
+
+        fn row(p: &Parser, r: usize, cols: usize) -> String {
+            (0..cols)
+                .map(|c| {
+                    p.screen()
+                        .cell(r as u16, c as u16)
+                        .map(|cell| cell.contents())
+                        .unwrap_or(" ")
+                        .chars()
+                        .next()
+                        .unwrap_or(' ')
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        }
+
+        /// Put the tracked cursor on 1-based `row` — where a run of content
+        /// lines would have left it.
+        fn cursor_to(cache: &mut DrawCache, row: usize, th: usize) {
+            cache.note_lines(row.saturating_sub(1), th);
+        }
+
+        #[test]
+        fn a_frame_that_grows_below_the_caret_takes_the_caret_with_it() {
+            let mut e = LineEditor::new();
+            let input = |e: &LineEditor, rows: &[usize]| {
+                render(&[input(e.layout(20, "> "), "> ".to_string())], rows, 20)
+            };
+            let mut cache = DrawCache::new(24);
+            e.insert_str("abc");
+            cursor_to(&mut cache, 5, 24);
+            let s1 = plan_apply(&mut cache, &input(&e, &[1]), ApplyPolicy::Frame, 20, 24);
+            // Shift+Enter: a second row appears and the caret moves onto it. The
+            // apply needs no row from anyone — it follows the live frame.
+            e.insert_newline();
+            let s2 = plan_apply(&mut cache, &input(&e, &[2]), ApplyPolicy::Frame, 20, 24);
+            let mut p = at(24, 20, 4);
+            feed(&mut p, &s1);
+            feed(&mut p, &s2);
+            assert_eq!(row(&p, 4, 20), "> abc", "first row survives");
+            assert_eq!(
+                p.screen().cursor_position(),
+                (5, 0),
+                "the caret follows the caret onto the new row"
+            );
+            // The next keystroke lands on the new row, and the first keeps its text.
+            e.insert_str("d");
+            let s3 = plan_apply(&mut cache, &input(&e, &[2]), ApplyPolicy::Frame, 20, 24);
+            feed(&mut p, &s3);
+            assert_eq!(row(&p, 4, 20), "> abc");
+            assert_eq!(row(&p, 5, 20), "d");
+        }
+
+        #[test]
+        fn consume_walks_to_the_frame_top_at_column_zero_without_erasing() {
+            let mut cache = DrawCache::new(24);
+            let mut e = LineEditor::new();
+            e.insert_str("hi there");
+            let layout = e.layout(20, "> ");
+            let h = layout.row_count.max(1);
+            let f = render(&[input(layout, "> ".into())], &[h], 20);
+            cursor_to(&mut cache, 5, 24);
+            let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+            let mut p = at(24, 20, 4);
+            feed(&mut p, &s);
+            // The caret is on the input row, out at the prompt's width — not at
+            // column 0, which is the whole reason consume's walk needs its own
+            // `CR`. The exact column is the layout's business, so assert the
+            // property.
+            assert_eq!(cache.tracked_row(), 5, "the frame's caret row");
+            let before = (0..24).map(|r| row(&p, r, 20)).collect::<Vec<_>>();
+            assert_eq!(before[4], "> hi there");
+
+            let (walk, taken) = crate::draw::plan_consume(&mut cache).expect("a live frame");
+            assert_eq!(taken.height(), f.height(), "the same frame comes back");
+            // `EL` is `"\x1b[K"` (draw.rs, private): the fold carries no erase —
+            // the content write clears the rows it enters, the walk does not.
+            assert!(!walk.contains("\x1b[K"), "no erase in the fold: {walk:?}");
+            feed(&mut p, &walk);
+            assert_eq!(
+                p.screen().cursor_position(),
+                (4, 0),
+                "the fold, at column 0 — not the input's column"
+            );
+            let after = (0..24).map(|r| row(&p, r, 20)).collect::<Vec<_>>();
+            assert_eq!(
+                after, before,
+                "the frame still stands as painted — ownership changed, pixels did not"
+            );
+        }
+
+        #[test]
+        fn places_caret_for_input_frame() {
+            let mut cache = DrawCache::new(24);
+            let mut e = LineEditor::new();
+            e.insert_str("hi");
+            let layout = e.layout(20, "> ");
+            let f = render(&[input(layout, "> ".to_string())], &[1], 20);
+            cursor_to(&mut cache, 5, 24);
+            let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+            let mut p = at(24, 20, 4);
+            feed(&mut p, &s);
+            // "> hi" at 1-based row 5; caret after "hi" → col 4.
+            assert_eq!(p.screen().cursor_position(), (4, 4));
+            assert_eq!(cache.anchor(), 5);
+        }
+    }
+
     /// **R1: the input is a row between turns and no row at all mid-turn.**
     ///
     /// The contract has three cases, and the third is the one that keeps it from
@@ -4754,6 +4880,146 @@ mod tests {
         };
         assert_eq!(height(true), 0, "a hidden input paints no row at all");
         assert_eq!(height(false), 1, "a resting input paints its row");
+    }
+
+    // ---- the input element through the frame pipeline ----
+    //
+    // Relocated from `slashdot_tui`'s `render` tests with the crate split
+    // (4h-a): they build a [`LineEditor`] and the repl's [`input`] element, so
+    // they belong with the input's owner, not with the generic frame layer.
+    // They exercise the *real* pipeline (`render`, `allocate`, `live_budget`)
+    // rather than a stub, so the contract they pin is unchanged.
+
+    #[test]
+    fn render_input_row_prompt_and_caret() {
+        let mut e = LineEditor::new();
+        e.insert_str("hi");
+        let layout = e.layout(20, "> ");
+        let els = [input(layout, "> ".to_string())];
+        let f = render(&els, &[1], 20);
+        assert_eq!(f.height(), 1);
+        assert_eq!(f.row(0), "> hi\x1b[K");
+        // Prompt (2) + "hi" (2) = col 4; caret on the frame's only row.
+        assert_eq!(f.caret, Some((0, 4)));
+        assert_eq!(f.spans, vec![(0, 0..1)]);
+        assert_eq!(f.extents, vec![0..7]);
+    }
+
+    #[test]
+    fn render_windowed_input_keeps_caret_visible() {
+        // 6-row input squeezed into 3 rows with the caret on row 5:
+        // window keeps the caret with context above — rows 3..6.
+        let mut e = LineEditor::new();
+        e.insert_str("aa\nbb\ncc\ndd\nee\nff"); // caret ends at buffer end
+        let layout = e.layout(20, "> ");
+        assert_eq!(layout.row_count, 6);
+        assert_eq!(layout.cursor_row, 5);
+        let els = [input(layout, "> ".to_string())];
+        let f = render(&els, &[3], 20);
+        assert_eq!(f.height(), 3);
+        // Prompt row scrolled out: no "> " on the first visible row.
+        assert_eq!(f.row(0), "dd\x1b[K");
+        assert_eq!(f.row(2), "ff\x1b[K");
+        // Caret at frame row 2, content col 2 (no prompt on this row).
+        assert_eq!(f.caret, Some((2, 2)));
+    }
+
+    /// The sizing declaration is *data* now (§3.2.3), which means it can be wrong
+    /// without the allocator noticing: `allocate` reads the fields, not the impl.
+    ///
+    /// One assertion per kind, because this is the part the refactor moved from a
+    /// `match` into constructors — and mutation-checking `must: 1 → 0` on the
+    /// input sailed through the whole suite. A wrong `must`/`might` here shows up
+    /// much later as a frame squeezed wrong on a short terminal, so it is named
+    /// instead.
+    #[test]
+    fn each_kind_declares_the_floor_and_want_it_promised() {
+        let mut e = LineEditor::new();
+        e.insert_str("hi");
+        assert_eq!(
+            input(e.layout(20, "> "), "> ".into()).extent(),
+            Extent {
+                must: 1,
+                might: e.layout(20, "> ").row_count.max(1)
+            },
+            "the caret's own row is the floor: the input can never be squeezed away"
+        );
+        assert_eq!(
+            Element::divider().extent(),
+            Extent { must: 1, might: 1 },
+            "a rule is all-or-nothing"
+        );
+        assert_eq!(
+            Element::lines(vec!["a".to_string(), "b".to_string(), "c".to_string()]).extent(),
+            Extent { must: 3, might: 3 },
+            "fixed content is served whole in pass 1 — that is what `must` is for"
+        );
+    }
+
+    /// The caret is **frame-relative**, and there is exactly one thing that can
+    /// make that false: an input that is not the first element.
+    ///
+    /// Every caret test in this file puts the input at index 0, where
+    /// `first_row` is 0 — so deleting the offset from `render` passed all 850.
+    /// In production the input is *always* second, behind the status row, and
+    /// `compose_frame`'s tests pass `status: None`, so the offset has never
+    /// been exercised either. The refactor moved this arithmetic out of
+    /// `render`'s `Input` arm into `Rendered::caret`; pin it where it is, and
+    /// pin `spans` while there, since both come from the same `first_row`.
+    #[test]
+    fn the_input_caret_is_offset_by_its_element_first_row() {
+        let mut e = LineEditor::new();
+        e.insert_str("hi");
+        let layout = e.layout(20, "> ");
+        let els = [
+            Element::lines(vec!["bar".to_string()]),
+            input(layout, "> ".into()),
+        ];
+        let f = render(&els, &[1, 1], 20);
+        assert_eq!(f.height(), 2);
+        // Frame row 1, not 0 — the status row occupies row 0.
+        assert_eq!(
+            f.caret,
+            Some((1, 4)),
+            "prompt (2) + \"hi\" (2) = col 4, but on the input's own row"
+        );
+        assert_eq!(f.spans, vec![(0, 0..1), (1, 1..2)]);
+    }
+
+    #[test]
+    fn render_full_composition_extents_and_spans() {
+        // REPL composition: input + divider + overlay, allocated heights
+        // straight from `allocate`.
+        let mut e = LineEditor::new();
+        e.insert_str("ls -la");
+        let layout = e.layout(80, "> ");
+        let els = [
+            input(layout, "> ".to_string()),
+            Element::divider(),
+            Element::lines(vec!["one".to_string(), "two".to_string()]),
+        ];
+        let heights = allocate(
+            &els.iter().map(Element::extent).collect::<Vec<_>>(),
+            live_budget(24),
+        );
+        assert_eq!(heights, vec![1, 1, 2]); // all mights fit in 16
+        let f = render(&els, &heights, 80);
+
+        // Contiguous extents covering the buffer exactly.
+        let mut expect = 0;
+        for r in &f.extents {
+            assert_eq!(r.start, expect);
+            expect = r.end;
+        }
+        assert_eq!(expect, f.buf.len());
+        // Spans tile the frame in element order.
+        assert_eq!(f.spans, vec![(0, 0..1), (1, 1..2), (2, 2..4)]);
+        assert_eq!(f.height(), 4);
+        assert_eq!(f.row(0), "> ls -la\x1b[K");
+        assert!(f.row(1).starts_with("\x1b[2m"));
+        assert_eq!(f.row(3), "two\x1b[K", "`lines` ends a short row with EL");
+        // Caret follows the input element, prompt-inclusive column.
+        assert_eq!(f.caret, Some((0, 8)));
     }
 }
 

@@ -16,9 +16,8 @@
 //! may rewrite any subset of rows unconditionally. Composition is
 //! [`crate::render`].
 
-use crate::ansi::{HIDE_CURSOR, SHOW_CURSOR};
+use crate::ansi::{display_width, HIDE_CURSOR, SHOW_CURSOR};
 use crate::render::Frame;
-use crate::slashdot_menu::table::display_width;
 use crate::termio::{TermHandles, TermIO, TermSize};
 use tokio::sync::watch;
 
@@ -35,20 +34,20 @@ pub enum ApplyPolicy {
 }
 
 /// The last applied frame, while it is still intact on screen (plan §4.1).
-pub(crate) struct LiveFrame {
+pub struct LiveFrame {
     /// Absolute 1-based row of the frame's first row, post-scroll. The bottom
     /// is derived as `frame_top_row + frame.height() - 1`.
-    pub(crate) frame_top_row: usize,
+    pub frame_top_row: usize,
     /// Terminal size when the frame was applied (partial-apply predicate).
-    pub(crate) term_w: usize,
-    pub(crate) term_h: usize,
+    pub term_w: usize,
+    pub term_h: usize,
     /// The rows, for the partial-apply diff.
-    pub(crate) frame: Frame,
+    pub frame: Frame,
 }
 
 /// Live screen bookkeeping, owned by [`Draw`] (plan §4.1). Rows are
 /// absolute; bottom-relative quantities are recomputed on every apply.
-pub(crate) struct DrawCache {
+pub struct DrawCache {
     /// Absolute cursor position as we last left it: (1-based row, 0-based col).
     /// The row is authoritative; the col is best-effort (only an apply sets it,
     /// and only the row is ever consumed).
@@ -70,7 +69,7 @@ pub(crate) struct DrawCache {
     /// loop used to keep its own `Cell`): `read_input` and the turn's key
     /// branch both apply frames now, and two independent books of the same
     /// number are two ways for them to disagree about whether a repaint is due.
-    pub(crate) applied: Option<(usize, usize)>,
+    pub applied: Option<(usize, usize)>,
     /// True while a content batch is open (`Output::begin_batch`). While set a
     /// content write consumes the frame and does **not** put it back — one
     /// re-emit when the guard drops, instead of one per write (ui_draw_v2 R5).
@@ -87,13 +86,13 @@ pub(crate) struct DrawCache {
     /// the collapse is silent, `begin_batch` also `debug_assert`s, so it is
     /// loud in debug builds and merely correct in release. The worst a
     /// mistimed end does is redraw once too often.
-    pub(crate) batch_active: bool,
+    pub batch_active: bool,
     /// Content rows written since a consume — the `content_rows` term of the
     /// below-frame clear (`old_h - h_new - consumed`), accumulated across a
     /// batch's writes and taken by the next `paint_forward`. Only meaningful
     /// while a consume is outstanding (deferred or awaiting reposition);
     /// `paint_forward` zeroes it either way.
-    pub(crate) consumed_rows: usize,
+    pub consumed_rows: usize,
     /// The frame taken by a batch's *first* consume, held until the batch
     /// ends.
     ///
@@ -103,11 +102,11 @@ pub(crate) struct DrawCache {
     /// clears the hub's recipe. Without this stash a batch would consume
     /// that area and its final reposition would find an empty recipe and
     /// render nothing, so the area would never return.
-    pub(crate) deferred: Option<Frame>,
+    pub deferred: Option<Frame>,
 }
 
 impl DrawCache {
-    pub(crate) fn new(term_h: usize) -> Self {
+    pub fn new(term_h: usize) -> Self {
         DrawCache {
             caret: (1, 0),
             screen_bottom: term_h.max(1),
@@ -122,14 +121,14 @@ impl DrawCache {
     /// The tracked cursor row (1-based), for the host's row-accounting tests:
     /// they compare it against where a terminal emulator puts the cursor after
     /// replaying the same bytes (row_accounting §6 B2).
-    #[cfg(test)]
-    pub(crate) fn tracked_row(&self) -> usize {
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn tracked_row(&self) -> usize {
         self.caret.0
     }
 
     /// Where the next frame belongs (plan §5.1): the intact frame's top row if
     /// there is one, else the tracked cursor row.
-    pub(crate) fn anchor(&self) -> usize {
+    pub fn anchor(&self) -> usize {
         self.live
             .as_ref()
             .map(|l| l.frame_top_row)
@@ -139,7 +138,7 @@ impl DrawCache {
     /// Advance the tracked cursor by `n` lines, clamped to the screen, and
     /// invalidate the frame region: an ordinary content write moved the cursor,
     /// so the previous frame no longer describes the screen (plan §4.2).
-    pub(crate) fn note_lines(&mut self, n: usize, term_h: usize) {
+    pub fn note_lines(&mut self, n: usize, term_h: usize) {
         let h = term_h.max(1);
         self.caret.0 = (self.caret.0 + n).clamp(1, h);
         self.live = None;
@@ -167,7 +166,7 @@ impl DrawCache {
     /// offers no more guarantee than an answering one" → clear it); the
     /// guarantee comes from *when* DSR runs instead — exceptional events only,
     /// so between calls nothing external has run.
-    pub(crate) fn reanchor(
+    pub fn reanchor(
         &mut self,
         row: Option<usize>,
         term_w: usize,
@@ -289,7 +288,7 @@ impl DrawCache {
 /// bookkeeping only — the tracked cursor row that row accounting compares
 /// against a terminal, and the bounded clear below the block — and is never
 /// used for addressing.
-pub(crate) fn plan_apply(
+pub fn plan_apply(
     cache: &mut DrawCache,
     frame: &Frame,
     policy: ApplyPolicy,
@@ -560,7 +559,7 @@ fn plan_append(cache: &mut DrawCache, frame: &Frame, anchor: usize, th: usize) -
 /// **`CR` is part of the contract, not a detail.** `CUU` preserves the column,
 /// and the frame's caret is out at the *input's* column, so without an explicit
 /// `CR` the content would start a prompt-width to the right.
-pub(crate) fn plan_consume(cache: &mut DrawCache) -> Option<(String, Frame)> {
+pub fn plan_consume(cache: &mut DrawCache) -> Option<(String, Frame)> {
     let live = cache.live.take()?;
     let (caret_row, _) = frame_caret(&live.frame);
     let mut s = String::new();
@@ -584,7 +583,7 @@ pub(crate) fn plan_consume(cache: &mut DrawCache) -> Option<(String, Frame)> {
 /// the frame the consume took) plus the content rows since then decide how
 /// many of the old frame's rows nothing overwrote; `paint_forward` clears
 /// them in the same pass.
-pub(crate) fn plan_reposition(
+pub fn plan_reposition(
     cache: &mut DrawCache,
     frame: &Frame,
     old_h: usize,
@@ -632,7 +631,7 @@ const EL: &str = "\x1b[K";
 /// about any particular element, which is why it is shared instead of
 /// duplicated wherever rows are produced. Element impls live outside this
 /// module (`repl.rs`, `ui.rs`) and call it.
-pub(crate) fn el_if_short(content: &mut String, term_w: usize) {
+pub fn el_if_short(content: &mut String, term_w: usize) {
     if display_width(content) < term_w {
         content.push_str(EL);
     }
@@ -703,26 +702,26 @@ fn erase_down(s: &mut String, h: usize) {
 /// with the bookkeeping advance — the old writer-then-cache lock order,
 /// encapsulated one layer up. Methods that write or advance therefore take
 /// `&mut self`.
-pub(crate) struct Draw {
+pub struct Draw {
     /// The terminal backend — the design's `Draw { term_io, cache }`, owned
     /// here since 4f-e. Every byte leaves through [`Self::write_bytes`]:
     /// the mode guard, the size watch, the caps *and* the sink all reach
     /// the layers above through this one field. Content bytes never name it
     /// directly — they arrive through the manager's `ContentWrite` hand-off
     /// (step 4d).
-    pub(crate) term_io: TermIO,
+    pub term_io: TermIO,
     /// The size watch (step 2 commit A): the latest `TermSize`, without a
     /// per-call terminal query. The same channel the manager holds — a
     /// subscribed receiver, so a test's private watch pins both.
-    pub(crate) size: watch::Receiver<TermSize>,
+    pub size: watch::Receiver<TermSize>,
     /// Live-screen bookkeeping (plan §4.1): tracked cursor row, clear floor,
     /// last applied frame. (The content-path state moved to `content/` in
     /// step 3a of the output-drawing refactor.)
-    pub(crate) cache: DrawCache,
+    pub cache: DrawCache,
 }
 
 impl Draw {
-    pub(crate) fn new(size: watch::Receiver<TermSize>, term_io: TermIO) -> Self {
+    pub fn new(size: watch::Receiver<TermSize>, term_io: TermIO) -> Self {
         let term_h = size.borrow().height;
         Draw {
             term_io,
@@ -739,7 +738,7 @@ impl Draw {
     /// `flush`). A byte-edge test's recording constructor intercepts at the
     /// same edge, which is what `TermIO::recording()` taking the seam
     /// wholesale means.
-    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) {
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
         let _ = self.term_io.write(crate::termio::Stream::Main, bytes);
     }
 
@@ -749,7 +748,7 @@ impl Draw {
     /// the byte edge records the two streams apart (design §TermIO: one
     /// `write`, per-stream sinks). Reached only from `put_content`'s
     /// meta branch, above content's hand-off.
-    pub(crate) fn write_meta(&mut self, bytes: &[u8]) {
+    pub fn write_meta(&mut self, bytes: &[u8]) {
         let _ = self.term_io.write(crate::termio::Stream::Meta, bytes);
     }
 
@@ -758,43 +757,43 @@ impl Draw {
     /// The channel handles, once at setup — the render manager's forward, so
     /// the pause-gated entry-DSR window in `Interactive::new` stays the one
     /// place `handles()` runs.
-    pub(crate) fn handles(&mut self) -> TermHandles {
+    pub fn handles(&mut self) -> TermHandles {
         self.term_io.handles()
     }
 
     /// The full `TermIO::suspend` — reader parked, raw mode off (4f-e-c).
     /// Idempotent; a no-op on Plain.
-    pub(crate) fn suspend(&self) {
+    pub fn suspend(&self) {
         let _ = self.term_io.suspend();
     }
 
     /// Raw mode on — the reverse of [`Self::suspend`].
-    pub(crate) fn resume(&self) {
+    pub fn resume(&self) {
         let _ = self.term_io.resume();
     }
 
     /// Whether this terminal flips raw mode at all (TermIO's Tty, not Plain)
     /// — what `$EDITOR` and the window pump ask before expecting a mode
     /// turnover.
-    pub(crate) fn is_tty(&self) -> bool {
+    pub fn is_tty(&self) -> bool {
         self.term_io.is_tty()
     }
 
     /// Publish a settled size on the instance's watch (parked-key drains,
     /// defensive `Resize` arms).
-    pub(crate) fn set_size(&self, size: TermSize) {
+    pub fn set_size(&self, size: TermSize) {
         self.term_io.set_size(size);
     }
 
     /// Probe + publish the live terminal size (the prompt loop's loop-top
     /// refresh, since 4f-e-a under TermIO's roof).
-    pub(crate) fn probe_size(&self) -> TermSize {
+    pub fn probe_size(&self) -> TermSize {
         self.term_io.probe_size()
     }
 
     /// Apply `frame` at the cursor under `policy` (plan §4.3–4.4): plan the
     /// bytes, write them, return the dims actually applied.
-    pub(crate) fn draw_frame(
+    pub fn draw_frame(
         &mut self,
         frame: &Frame,
         policy: ApplyPolicy,
@@ -824,7 +823,7 @@ impl Draw {
     /// scrolls and keeps the cursor on the bottom row when content overflows,
     /// so we *clamp* to the height rather than wrapping (a modulo wrap would
     /// teleport the tracked row to the top of the screen after a long session).
-    pub(crate) fn note_lines(&mut self, n: usize) {
+    pub fn note_lines(&mut self, n: usize) {
         let h = self.size.borrow().height;
         // Advance the tracked cursor and drop the frame region — the write that
         // called us moved the cursor off the frame (plan §4.2).
@@ -848,7 +847,7 @@ impl Draw {
     /// is live — every streamed block, and every commit — because the bytes
     /// are then just the cursor park. So it lives here, with the sink: every
     /// caller treats it as a side-effecting re-anchor, and none of them writes.
-    pub(crate) fn reanchor_to_cursor(&mut self, row: Option<usize>) -> usize {
+    pub fn reanchor_to_cursor(&mut self, row: Option<usize>) -> usize {
         let (row, bytes) = {
             // Same floors the `output::term_width` free function applies: the
             // 20-column floor is load-bearing for `plan_apply` when the
@@ -866,7 +865,7 @@ impl Draw {
     /// happened while someone else (a turn) held the screen. Before the first
     /// apply, a fresh terminal query: a caller that has not painted yet should
     /// start from what is actually on screen, not from a size nobody drew at.
-    pub(crate) fn painted_size(&self) -> (usize, usize) {
+    pub fn painted_size(&self) -> (usize, usize) {
         self.cache.applied.unwrap_or_else(|| {
             let size = *self.size.borrow();
             (size.width.max(1), size.height.max(1))
@@ -882,7 +881,6 @@ mod apply_tests {
     //! together.
     use super::*;
     use crate::render::{render, Element};
-    use crate::repl::LineEditor;
     use vt100::Parser;
 
     /// The tty's OPOST/ONLCR: `plan_apply` emits bare `\n` (the line discipline
@@ -1266,42 +1264,6 @@ mod apply_tests {
     /// nothing in this module could, so it is pinned here in the three applies
     /// that actually happen: type, Shift+Enter, type again.
     #[test]
-    fn a_frame_that_grows_below_the_caret_takes_the_caret_with_it() {
-        let mut e = LineEditor::new();
-        let input = |e: &LineEditor, rows: &[usize]| {
-            render(
-                &[Element::input(e.layout(20, "> "), "> ".to_string())],
-                rows,
-                20,
-            )
-        };
-        let mut cache = DrawCache::new(24);
-        e.insert_str("abc");
-        cursor_to(&mut cache, 5, 24);
-        let s1 = plan_apply(&mut cache, &input(&e, &[1]), ApplyPolicy::Frame, 20, 24);
-        // Shift+Enter: a second row appears and the caret moves onto it. The
-        // apply needs no row from anyone — it follows the live frame.
-        e.insert_newline();
-        let s2 = plan_apply(&mut cache, &input(&e, &[2]), ApplyPolicy::Frame, 20, 24);
-        let mut p = at(24, 20, 4);
-        feed(&mut p, &s1);
-        feed(&mut p, &s2);
-        assert_eq!(screen(&p, 24, 20)[4], "> abc", "first row survives");
-        assert_eq!(
-            p.screen().cursor_position(),
-            (5, 0),
-            "the caret follows the caret onto the new row"
-        );
-        // The next keystroke lands on the new row, and the first keeps its text.
-        e.insert_str("d");
-        let s3 = plan_apply(&mut cache, &input(&e, &[2]), ApplyPolicy::Frame, 20, 24);
-        feed(&mut p, &s3);
-        let rows = screen(&p, 24, 20);
-        assert_eq!(rows[4], "> abc");
-        assert_eq!(rows[5], "d");
-    }
-
-    #[test]
     fn scrolls_frame_into_view() {
         let mut cache = DrawCache::new(10);
         let f = lines_frame(&["a", "b", "c"], 20);
@@ -1546,51 +1508,6 @@ mod apply_tests {
     /// is out at the input's column, and the content about to be written would
     /// start a prompt-width to the right. This makes it the plan's own
     /// postcondition rather than something inherited from a trailing `CR`.
-    #[test]
-    fn consume_walks_to_the_frame_top_at_column_zero_without_erasing() {
-        let mut cache = DrawCache::new(24);
-        let mut e = LineEditor::new();
-        e.insert_str("hi there");
-        let layout = e.layout(20, "> ");
-        let h = layout.row_count.max(1);
-        let f = render(&[Element::input(layout, "> ".into())], &[h], 20);
-        cursor_to(&mut cache, 5, 24);
-        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
-        let mut p = at(24, 20, 4);
-        feed(&mut p, &s);
-        // The caret is on the input row, out at the prompt's width.
-        // The caret is out in the input, not at column 0 — which is the whole
-        // reason the walk needs its own `CR`. The exact column is the layout's
-        // business (prompt marker + buffer), so assert the property.
-        assert_eq!(cache.caret.0, 5, "the frame's caret row: {:?}", cache.caret);
-        assert!(
-            cache.caret.1 > 1,
-            "and a column out in the input, which is why consume needs a `CR`: {:?}",
-            cache.caret
-        );
-        let before = screen(&p, 24, 20);
-        assert_eq!(before[4], "> hi there");
-
-        let (walk, taken) = plan_consume(&mut cache).expect("a live frame");
-        assert_eq!(taken.height(), f.height(), "the same frame comes back");
-        assert!(
-            !walk.contains(EL),
-            "no erase — the content write clears the rows it enters: {walk:?}"
-        );
-        feed(&mut p, &walk);
-        assert_eq!(
-            p.screen().cursor_position(),
-            (4, 0),
-            "the fold, at column 0 — not the input's column"
-        );
-        let after = screen(&p, 24, 20);
-        assert_eq!(
-            after, before,
-            "the frame still stands as painted — ownership changed, pixels did not"
-        );
-        assert!(cache.live.is_none(), "it is no longer intact");
-    }
-
     /// The whole of a turn today: no frame live, so there is nothing to consume
     /// and no walk to emit. This is why the clear `plan_consume` replaces was
     /// almost always a no-op, and it is the shape P1's wiring has to tolerate.
@@ -1641,22 +1558,6 @@ mod apply_tests {
         let mut p = at(24, 20, 23);
         feed(&mut p, &s);
         assert_eq!(screen(&p, 24, 20)[23], "x");
-    }
-
-    #[test]
-    fn places_caret_for_input_frame() {
-        let mut cache = DrawCache::new(24);
-        let mut e = LineEditor::new();
-        e.insert_str("hi");
-        let layout = e.layout(20, "> ");
-        let f = render(&[Element::input(layout, "> ".to_string())], &[1], 20);
-        cursor_to(&mut cache, 5, 24);
-        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
-        let mut p = at(24, 20, 4);
-        feed(&mut p, &s);
-        // "> hi" at 1-based row 5; caret after "hi" → col 4.
-        assert_eq!(p.screen().cursor_position(), (4, 4));
-        assert_eq!(cache.anchor(), 5);
     }
 
     #[test]

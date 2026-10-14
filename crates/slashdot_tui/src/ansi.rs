@@ -22,7 +22,7 @@ use unicode_width::UnicodeWidthChar;
 /// exactly one blank row — never two, and never a newline spent just closing a
 /// line that had no blank after it. The one line terminator the last line needs
 /// is put back, which is the "strip, then add by rule" of the normalization.
-pub(crate) fn at_line_start(bytes: &[u8]) -> Vec<u8> {
+pub fn at_line_start(bytes: &[u8]) -> Vec<u8> {
     let mut out = bytes.to_vec();
     while out.last() == Some(&b'\n') {
         out.pop();
@@ -37,7 +37,7 @@ pub(crate) fn at_line_start(bytes: &[u8]) -> Vec<u8> {
 /// passed through without counting as cells. `St` is the string-terminator
 /// tail (`ESC \`) of OSC/DCS families.
 #[derive(PartialEq, Clone, Copy)]
-pub(crate) enum EscState {
+pub enum EscState {
     None,
     /// The `ESC` itself has been seen; the next byte picks the family.
     Escape,
@@ -72,16 +72,16 @@ pub(crate) enum EscState {
 /// State is per write *call*: the content contract opens every call at line
 /// start (blocks are line-terminated, and the renderer flushes only complete
 /// lines — split-equivalence), so `col` seeds at 0.
-pub(crate) struct WrapLines<'a, W: io::Write + ?Sized> {
-    pub(crate) inner: &'a mut W,
-    pub(crate) width: usize,
-    pub(crate) enabled: bool,
+pub struct WrapLines<'a, W: io::Write + ?Sized> {
+    pub inner: &'a mut W,
+    pub width: usize,
+    pub enabled: bool,
     /// Display columns since the line's last newline.
-    pub(crate) col: usize,
+    pub col: usize,
     /// Bytes of a multi-byte char split across writes. Held, not emitted:
     /// the wrap decision must be made before the char's first byte.
-    pub(crate) partial: Vec<u8>,
-    pub(crate) esc: EscState,
+    pub partial: Vec<u8>,
+    pub esc: EscState,
 }
 
 /// Display width of a complete (valid UTF-8) byte sequence: one char's
@@ -219,11 +219,11 @@ impl<W: io::Write + ?Sized> io::Write for WrapLines<'_, W> {
 /// last written cell would eat it), so `pending` only arms at a line's start.
 /// A capture bypasses it (`enabled == false`) — captured bytes are assertions
 /// against content, not against a screen.
-pub(crate) struct LineClear<'a, W: io::Write + ?Sized> {
-    pub(crate) inner: &'a mut W,
+pub struct LineClear<'a, W: io::Write + ?Sized> {
+    pub inner: &'a mut W,
     /// True while the row the next byte would land on has not been cleared.
-    pub(crate) pending: bool,
-    pub(crate) enabled: bool,
+    pub pending: bool,
+    pub enabled: bool,
 }
 
 impl<W: io::Write + ?Sized> io::Write for LineClear<'_, W> {
@@ -264,10 +264,10 @@ impl<W: io::Write + ?Sized> io::Write for LineClear<'_, W> {
 /// Content that never starts (an all-newline chunk) is simply withheld, which
 /// is the whole point: the spacer already supplied the row it would have
 /// stacked on.
-pub(crate) struct StripLeading<'a, W: io::Write + ?Sized> {
-    pub(crate) inner: &'a mut W,
+pub struct StripLeading<'a, W: io::Write + ?Sized> {
+    pub inner: &'a mut W,
     /// Cleared once a non-newline byte has passed.
-    pub(crate) armed: bool,
+    pub armed: bool,
 }
 
 impl<W: io::Write + ?Sized> io::Write for StripLeading<'_, W> {
@@ -301,17 +301,17 @@ impl<W: io::Write + ?Sized> io::Write for StripLeading<'_, W> {
 /// One newline is never withheld: that is the line terminator closing the last
 /// line of content, not a blank row — without it the stream would sit
 /// mid-line.
-pub(crate) struct HoldTrailing<'a, W: io::Write + ?Sized> {
-    pub(crate) inner: &'a mut W,
+pub struct HoldTrailing<'a, W: io::Write + ?Sized> {
+    pub inner: &'a mut W,
     /// Newlines withheld since the last byte of content.
-    pub(crate) pending: usize,
+    pub pending: usize,
     /// Whether anything that is *not* a newline passed through — the
     /// difference between a write that still owes its line terminator and one
     /// that is nothing but separators.
-    pub(crate) wrote_content: bool,
+    pub wrote_content: bool,
     /// Whether any byte at all passed — the difference between a write with
     /// nothing in it and one whose only content was newlines.
-    pub(crate) wrote_any: bool,
+    pub wrote_any: bool,
 }
 
 impl<W: io::Write + ?Sized> HoldTrailing<'_, W> {
@@ -330,7 +330,7 @@ impl<W: io::Write + ?Sized> HoldTrailing<'_, W> {
     /// arrives to sit below them — so writing one here, on a stream that by
     /// convention already ends at a line boundary, would be inventing a blank
     /// row from a write that emitted no content at all.
-    pub(crate) fn finish(&mut self) -> usize {
+    pub fn finish(&mut self) -> usize {
         if self.pending > 0 && self.wrote_content {
             let _ = self.inner.write_all(b"\n");
             self.pending -= 1;
@@ -368,9 +368,37 @@ impl<W: io::Write + ?Sized> io::Write for HoldTrailing<'_, W> {
     }
 }
 
+/// Visible width of `s`, ignoring ANSI SGR escapes (so styled cells size
+/// correctly). Falls back to width 1 for control/ambiguous chars.
+///
+/// Moved here from `slashdot_menu::table` with the crate split (4h-a): the
+/// frame layers measure rows with it (`pad_row`, `el_if_short`) and the menu
+/// measures cells with it — one answer, below both.
+pub fn display_width(s: &str) -> usize {
+    let mut w = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip an escape sequence up to and including the final letter.
+            for e in chars.by_ref() {
+                if e.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        w += char_width(c);
+    }
+    w
+}
+
+fn char_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(1)
+}
+
 /// Remove ANSI/CSI escape sequences (e.g. `\x1b[1;36m`) so that
 /// downstream width/wrap math only counts *visible* characters.
-pub(crate) fn strip_ansi(s: &str) -> String {
+pub fn strip_ansi(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
@@ -424,7 +452,7 @@ pub(crate) fn strip_ansi(s: &str) -> String {
 }
 
 /// UTF-8 lead byte -> byte length (1..=4).
-pub(crate) fn utf8_len(b: u8) -> usize {
+pub fn utf8_len(b: u8) -> usize {
     if b < 0x80 {
         1
     } else if b >> 5 == 0b110 {
@@ -441,7 +469,7 @@ pub(crate) fn utf8_len(b: u8) -> usize {
 /// DECTCEM show — emitted when the applied frame has a caret, because that is
 /// where the user types. `TermGuard::stop` emits it unconditionally as the net
 /// for exiting with it hidden.
-pub(crate) const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+pub const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 
 /// DECTCEM hide — the other half of [`SHOW_CURSOR`], for a frame with **no
 /// caret**.
@@ -456,7 +484,7 @@ pub(crate) const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 /// the cursor *around a content write*, to stop it flickering over text
 /// arriving mid-render. This one describes the frame that was composed,
 /// decided once per apply.
-pub(crate) const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
+pub const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 
 #[cfg(test)]
 mod tests {
