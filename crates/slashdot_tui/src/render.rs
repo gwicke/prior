@@ -5,8 +5,9 @@
 //! * compose builds a list of [`Element`]s (the REPL draws
 //!   `[Input, Divider, Overlay]`, dialogs `[Divider?, Overlay]`),
 //! * [`allocate`] resolves each element's [`RowAsk`] against the frame
-//!   height, then distributes the live-region budget ([`live_budget`], at
-//!   most 2/3 of terminal rows) over the resolved floors and wants,
+//!   height, then distributes the live-region budget — the manager's own,
+//!   at most 2/3 of terminal rows by default — over the resolved floors
+//!   and wants,
 //! * [`render`] produces a [`Frame`] — a flat byte buffer with per-row
 //!   extents and element spans.
 //!
@@ -53,12 +54,22 @@ pub const FRAME_MAX_ROW_RATIO: f64 = 2.0 / 3.0;
 /// the frame may occupy at most this many rows; the rest of the screen is
 /// guaranteed scrollback (plan §2). Matches the pop-up cap used throughout
 /// v2.5 (`⌈2/3·term_h⌉`, at least 1).
+///
+/// The test twin's answer only (4h-b): production budgets through
+/// [`RenderManager::budget`], so that a ratio becomes a frame row count in
+/// exactly one place — [`live_budget_ratio`], the resolver itself, is
+/// private to this module for the same reason.
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn live_budget(term_h: usize) -> usize {
     live_budget_ratio(term_h, FRAME_MAX_ROW_RATIO)
 }
 
 /// The budget at an arbitrary ratio — [`RenderManager`]'s configured one.
-pub fn live_budget_ratio(term_h: usize, ratio: f64) -> usize {
+///
+/// Private since 4h-b: the manager is the only caller, which is what rules
+/// out two computations of the frame's row count — the configured ratio
+/// resolving one way here and another way in a caller that re-derived it.
+fn live_budget_ratio(term_h: usize, ratio: f64) -> usize {
     ((term_h as f64 * ratio).ceil() as usize).max(1)
 }
 
@@ -76,11 +87,14 @@ pub enum RowSpec {
     /// header/content split). No element asks for one today; the variant
     /// exists so one can without reopening the allocator.
     ///
-    /// `f64`, not the design sketch's `f32` — the same rounding hazard
-    /// [`FRAME_MAX_ROW_RATIO`] records: `2/3 as f32` rounds *above* the exact
-    /// fraction, so `ceil(24 × 2/3)` would resolve to 17 where the budget
-    /// answers 16.
-    RatioAndNum(f64, usize),
+    /// Approximate by design (4h-b): an in-frame ratio is a *preference about
+    /// a share*, resolved into integral rows either way, so the design
+    /// sketch's `f32` is precision enough — and there is nothing for it to
+    /// agree *with*: the frame's row count comes from the configured ratio
+    /// inside [`RenderManager::budget`] and nowhere else, while this resolves
+    /// an element's ask against the terminal height. One computation per
+    /// number, so no two of them can disagree.
+    RatioAndNum(f32, usize),
 }
 
 impl RowSpec {
@@ -91,7 +105,7 @@ impl RowSpec {
         match *self {
             RowSpec::FixedNum(rows) => rows,
             RowSpec::RatioAndNum(ratio, rows) => {
-                ((term_h as f64 * ratio).ceil() as usize).min(rows)
+                ((term_h as f32 * ratio).ceil() as usize).min(rows)
             }
         }
     }
@@ -724,8 +738,16 @@ impl RenderManager {
         self.frame_max_row_ratio = frame_max_row_ratio;
     }
 
-    /// The live-region budget at this manager's configured ratio.
-    fn budget(&self, term_h: usize) -> usize {
+    /// The live-region budget at this manager's configured ratio — the
+    /// frame's row count, resolved **here and nowhere else** (design §Render:
+    /// the manager "resolves `configure()`s frame max ratio into concrete
+    /// rows"). A caller that needs the number the next [`Self::render`] will
+    /// budget with — the page grant, which has to pre-compute the same
+    /// allocation — takes it from here rather than re-deriving the ratio, so
+    /// the grant and the paint cannot disagree. `pub` since 4h-b for exactly
+    /// those callers; [`live_budget_ratio`], the resolver, is this module's
+    /// alone.
+    pub fn budget(&self, term_h: usize) -> usize {
         live_budget_ratio(term_h, self.frame_max_row_ratio)
     }
 
@@ -1253,48 +1275,42 @@ mod tests {
     #[test]
     fn a_ratio_resolves_against_the_frame_height_and_caps_at_its_rows() {
         // A share of the *terminal*, not of the budget: `ceil(24 × 1/3) = 8`,
-        // capped at the ask's 4; the want's `ceil(24 × 2/3)` is far below its
-        // cap of 100.
+        // capped at the ask's 4; the want's half of the terminal is far below
+        // its cap of 100. (Exact on purpose: 1/2 is representable, so the
+        // assert does not depend on where an inexact ratio rounds — a ratio
+        // ask is approximate by design, not pinned to the bit.)
         let ask = RowAsk {
             min: RowSpec::RatioAndNum(1.0 / 3.0, 4),
-            max: RowSpec::RatioAndNum(2.0 / 3.0, 100),
+            max: RowSpec::RatioAndNum(0.5, 100),
         };
         assert_eq!(
             ask.resolve(24),
-            Extent { must: 4, might: 16 },
-            "floor capped at 4, want at ceil(16)"
+            Extent { must: 4, might: 12 },
+            "floor capped at 4, want at half the terminal"
         );
         // The same ask on a short terminal: the ratio lands below the cap.
-        assert_eq!(ask.resolve(6), Extent { must: 2, might: 4 });
+        assert_eq!(ask.resolve(6), Extent { must: 2, might: 3 });
     }
 
-    /// The `f64` pin: `2/3 as f32` rounds *above* the exact fraction, which
-    /// would resolve the want to 17 on the terminal the budget pins at 16 —
-    /// and a header/content split resolved one way while the budget resolved
-    /// the other is exactly the disagreement §6 exists to avoid.
-    #[test]
-    fn the_ratio_resolves_to_the_same_ceil_as_the_budget() {
-        let ask = RowAsk {
-            min: RowSpec::FixedNum(1),
-            max: RowSpec::RatioAndNum(FRAME_MAX_ROW_RATIO, 100),
-        };
-        assert_eq!(ask.resolve(24).might, live_budget(24));
-        assert_eq!(ask.resolve(24).might, 16);
-    }
-
+    /// Nothing resolves the frame's row count but the manager's own budget:
+    /// `live_budget_ratio` is private and `live_budget` is test-only, so a
+    /// production caller that wants the number has to ask
+    /// [`RenderManager::budget`] for it. The point is by-construction, not
+    /// by-agreement (4h-b): there is one computation of the frame row count
+    /// and one of an element's share, and no test has to keep them honest.
     #[test]
     fn a_ratio_ask_allocates_through_the_ordinary_split() {
         // A ratio want is just a resolved want: floors first, then the even
-        // split, with the ratio's 16 as the cap on this element's share.
+        // split, with the ratio's 12 as the cap on this element's share.
         let e = [
             RowAsk::fixed(1, 1),
             RowAsk {
                 min: RowSpec::FixedNum(1),
-                max: RowSpec::RatioAndNum(FRAME_MAX_ROW_RATIO, 100),
+                max: RowSpec::RatioAndNum(0.5, 100),
             },
         ];
-        // Σ might = 1 + 16 = 17 > budget 10; floors 2; pool 8 → the menu
-        // takes 8 of its 16.
+        // Σ might = 1 + 12 = 13 > budget 10; floors 2; pool 8 → the menu
+        // takes 8 of its 12.
         assert_eq!(allocate(&e, 24, 10), vec![1, 9]);
     }
 

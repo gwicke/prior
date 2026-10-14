@@ -128,7 +128,11 @@ pub(crate) async fn dispatch_in_turn_event(
                 return InTurnDispatch::CancelFired;
             }
             let opts_len = sess.opts_len();
-            match sess.handle_key(key, opts_len, label, history) {
+            // The frame's budget, from the one place a ratio resolves to a row
+            // count (4h-b): `dims` is the height the settle and paint below
+            // already commit to, so the grant and the frame cannot disagree.
+            let budget = content.manager.lock().unwrap().budget(dims.1);
+            match sess.handle_key(key, opts_len, budget, label, history) {
                 crate::repl::KeyOutcome::RunEditor => {
                     sess.open_editor(content);
                 }

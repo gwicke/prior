@@ -21,10 +21,12 @@ use crate::draw::{el_if_short, ApplyPolicy};
 use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
 use crate::output::status;
+#[cfg(test)]
+use crate::render::live_budget;
 /// The input element's data contract lives in `slashdot_tui` (beside
 /// [`Element`]); re-exported so `crate::repl::Layout` paths keep working.
 pub use crate::render::Layout;
-use crate::render::{allocate, live_budget, window, Element, RenderElement, Rendered, RowAsk};
+use crate::render::{allocate, window, Element, RenderElement, Rendered, RowAsk};
 #[cfg(test)]
 use crate::render::{render, Frame};
 use crate::session::SessionTreeNode;
@@ -445,7 +447,10 @@ pub(crate) fn test_overlay_parts(
 /// let a page move by more than one screen.
 ///
 /// This runs the same composition and the same `allocate` the frame will, so
-/// the two cannot differ. The status row is left out — it is one row, and a
+/// the two cannot differ — and the `budget` is the manager's own
+/// ([`RenderManager::budget`], 4h-b), the number the frame *will* be budgeted
+/// with, so the ratio resolves in exactly one place and the grant cannot
+/// disagree with the paint. The status row is left out — it is one row, and a
 /// menu is only open between turns, when there is nothing streaming to report.
 pub(crate) fn rows_grant(
     editor: &LineEditor,
@@ -453,11 +458,11 @@ pub(crate) fn rows_grant(
     overlay: Vec<Element>,
     term_w: usize,
     term_h: usize,
+    budget: usize,
 ) -> usize {
     let elements = Repl::compose_elements(editor, prompt, None, overlay, term_w);
     let asks: Vec<RowAsk> = elements.iter().map(|e| e.ask(term_w)).collect();
-    let term_h = term_h.max(1);
-    let heights = allocate(&asks, term_h, live_budget(term_h));
+    let heights = allocate(&asks, term_h.max(1), budget);
     // The rows element is the last of the overlay's sections by construction
     // (`overlay_elements` appends detail, header, then rows).
     heights.last().copied().unwrap_or(0)
@@ -1228,6 +1233,12 @@ impl PromptSession {
         // host-side cursor needs. Passed rather than recomputed so the
         // dispatch and the paint cannot disagree about how many rows there are.
         opts_len: usize,
+        // The live-region budget the frame will be composed under, from the
+        // one place a ratio resolves to rows (`RenderManager::budget`, 4h-b).
+        // Passed for the same reason `opts_len` is: the ratio is the
+        // manager's configuration, so a caller that re-derived it here would
+        // be a second computation of the same number.
+        budget: usize,
         prompt: &str,
         history: &mut History,
     ) -> KeyOutcome {
@@ -1319,6 +1330,7 @@ impl PromptSession {
                             overlay_elements(overlay, term_w),
                             term_w,
                             watched.height.max(1),
+                            budget,
                         );
                         let direction = if matches!(key.code, KeyCode::PageDown) {
                             1
@@ -1701,7 +1713,11 @@ impl Repl {
                     // would otherwise still be live while the argument reads
                     // the same session for its row count.
                     let opts_len = session.opts_len();
-                    match session.handle_key(key, opts_len, prompt, history) {
+                    // The frame's budget comes from the manager — the one
+                    // place a ratio resolves to a row count (4h-b) — at the
+                    // watched height the dispatch already keys off.
+                    let budget = content.manager.lock().unwrap().budget(content.height());
+                    match session.handle_key(key, opts_len, budget, prompt, history) {
                         KeyOutcome::Continue => {}
                         KeyOutcome::RunEditor => {
                             // The wrapper owns the whole turnover — reader

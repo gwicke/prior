@@ -557,13 +557,34 @@ most runway to expand into separate sub-commits.
     (`pub use slashdot_tui::{…}`) keep `confirm_probe` and examples source-compatible. The test-only
     seams (`TermIO::recording`, `RenderManager::draw`, `tracked_row`, `fixed`) gate on a
     `test-helpers` feature. Behavior-free.
-  - **4h-b — `RowAsk`/`RowSpec` on the trait.** `RenderElement { height(&self, width) -> RowAsk;
-    render(&self, height, width) -> Rendered }`; `RowAsk { min, max }`, `RowSpec::FixedNum(n)` /
-    `RatioAndNum(r, n)`. The allocator resolves specs against the frame height
-    (`FixedNum(n)` → n, `RatioAndNum(r, n)` → min(ceil(r × term_h), n)); budget = min(ratio × term_h,
-    Σ resolved max); floors first, then the split. Construction-time `must`/`might` fields die —
-    every element answers `height(width)` itself. All-`FixedNum` reproduces today's even-split
-    semantics; `allocate_*` stay as parity pins.
+  - **4h-b — `RowAsk`/`RowSpec` on the trait.** Landed (`ddf5522`). `RenderElement { height(&self,
+    width) -> RowAsk; render(&self, height, width) -> Rendered }`; `RowAsk { min, max }`,
+    `RowSpec::FixedNum(n)` / `RatioAndNum(r, n)`. The allocator resolves specs against the frame
+    height (`FixedNum(n)` → n, `RatioAndNum(r, n)` → min(ceil(r × term_h), n)); budget = min(ratio ×
+    term_h, Σ resolved max — the fit branch is that min); floors first, then the split.
+    Construction-time `must`/`might` fields die with `Element::extent()` — every element answers
+    `height(width)` itself. All-`FixedNum` reproduces today's even-split semantics; `allocate_*`
+    stay as parity pins (rewritten to ask in `RowAsk::fixed`; `term_h` is inert for a fixed ask).
+    `RatioAndNum` keeps the sketch's `f32` — no deviation: an in-frame ratio is a *preference about
+    a share*, resolved into integral rows either way, so precision is not the point. What the point
+    is came out of the review that started as an `f32`-vs-`f64` question: **one place computes each
+    number.** The frame's row count is `RenderManager::budget`'s alone, so `live_budget_ratio` went
+    private and `live_budget` is test-only — a production caller that needs the number the next
+    `render` budgets with asks the manager for it (`budget` went `pub` for that). The one such
+    caller today is the page grant: `rows_grant`/`handle_key` take the budget as a parameter
+    (alongside `opts_len`, which is passed for the same reason) instead of re-deriving the ratio, so
+    the grant cannot disagree with the paint. No test now pins a budget-vs-element ratio agreement
+    either — by construction rather than by agreement. Leftovers, each claimed:
+    - `InputItem`/`SectionItem`/`RowsItem` answer `height(width)` from a compose-width snapshot
+      (the `Layout` / `PaintedSection` / engine heights), so `width` is presently inert for them —
+      honest, since the ask is the one they can measure; computing at the render width is the
+      `Arc<Mutex<…>>` move (**4h-d** menu sections, **4h-f** the shared editor).
+    - `InputItem` carries the composer's `hidden` flag (a push fact, set where the mid-turn rule
+      decides). Design §RenderElement stack: turn presence rides `Content::streaming`, read at pull
+      time — that lands with the input element, **4h-f**.
+    - `Extent` survives as the *resolved* pair (plan §3.2's `must`/`might`) one step below the
+      element's `RowAsk` — the allocator's own vocabulary; no caller outside `allocate` reaches it
+      now.
   - **4h-c — the bar moves into `ui/`.** `ui.rs` → `ui/mod.rs` + `ui/bar.rs`: the bar element +
     `status_bar`/`dot_cell` come out of `output.rs` (`Element::status` and its `StatusItem` die
     there; the bar element holds the raw store handles as today). No `ui/menu.rs`: everything else
