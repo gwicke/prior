@@ -259,21 +259,27 @@ most runway to expand into separate sub-commits.
     converts them to the manager/TermIO suspend and the handle dies.~~ Settled by **4f-d**
     (`348f7ed`): all four holders converted to the manager's `suspend`/`resume`, the direct Arc
     clones died, and `TermIO::guard()`'s one remaining caller is setup's publish into the manager
-    (itself retired with the `Draw` move, **4f-e**).
-  - Resize still travels the size watch only (`route_event` keeps it Inline, as step 2 decided);
+    (retired with the `Draw` move — **4f-e** landed, `8733d09`).
+  - ~~Resize still travels the size watch only (`route_event` keeps it Inline, as step 2 decided);
     the design's "resize reaches the input channel too" forwards when `read_input` collapses to
     one handle — **4f**. The collapse landed in 4f-d *without* the forward (see 4f-d's leftover);
-    the forward rides **4f-e**, with the sender moves it must not race.
-  - `TermIO` parks in `Interactive` (read only for its lifetime) — the `Draw` move takes it, and
-    the design has `Draw { term_io, cache }` — **4c** is its natural rider.
-  - `TermIO::write` has no production caller (the `Draw` writer is still a plain field), caps are
+    the forward rides **4f-e**, with the sender moves it must not race.~~ Landed (`2906fb1`):
+    both edges; the sender had already moved with the probe/drain (`8733d09`), so no window had
+    two publishers.
+  - ~~`TermIO` parks in `Interactive` (read only for its lifetime) — the `Draw` move takes it, and
+    the design has `Draw { term_io, cache }` — **4c** is its natural rider.~~ Landed (`8733d09`):
+    constructed first in `main`, moved into `Draw` at `Content::new`; `Interactive`'s field died.
+  - ~~`TermIO::write` has no production caller (the `Draw` writer is still a plain field), caps are
     still probed at `Content::new` rather than at `TermIO` construction, and the size watch's
     sender is still the process-wide `LazyLock`. Re-scoped by **4c** (see below): the writer +
     caps + `TermIO`-into-`Draw` move needs `TermIO` constructed *before* `Content`/the manager —
     today it is built later, in `Interactive` — and the capture writer-swap gone (**4d** landed,
-    `98bcb85`), so it rides with the **4f** setup rework; the watch sender moves with its producers —
-    the prompt loop's probe and the parked-resize drain — when `read_input` collapses (**4f**; 4b
-    landed the manager's receiver half).
+    `98bcb85`), so it rides with the **4f** setup rework; the watch sender moves with its
+    producers — the prompt loop's probe and the parked-resize drain — when `read_input`
+    collapses (**4f**; 4b landed the manager's receiver half).~~ Landed (`8733d09`,
+    `c7ef4fe`): `TermIO` constructs before `Content` (in `main` — see 4f-e's recorded deviation),
+    production bytes flow through `TermIO::write`, caps probe at construction, the sender is
+    per-instance with probe + drain on the manager's handle.
 - **4b — `RenderManager` shell: composition + apply leave the `Output` trait.** Landed (`38d9513`)
   — the commit message records what moved. Leftovers, each claimed:
   - ~~The call sites (repl, confirm, probe) keep their `&dyn Output` handles and reach the manager
@@ -406,15 +412,18 @@ most runway to expand into separate sub-commits.
     out-of-crate driver) reads the `term_width`/`term_height` free fns — the same watch. No
     `interactive.rs` site existed to move (the plan named it; grep agrees it never called the
     verbs). Leftovers, each claimed:
-    - The REPL loop's live per-keystroke terminal query and its `set_size` publish stay: they are
-      the probe the watch refreshes from — **4f-e** moves them under `TermIO`'s roof (already
-      listed under 4f-d's "prompt-loop size probe" note).
+    - ~~The REPL loop's live per-keystroke terminal query and its `set_size` publish stay: they
+      are the probe the watch refreshes from — **4f-e** moves them under `TermIO`'s roof (already
+      listed under 4f-d's "prompt-loop size probe" note).~~ Landed (`8733d09`):
+      `RenderManager::probe_size()` is the loop-top refresh — one call, query + publish.
     - `RenderManager::draw()` went `#[cfg(test)]` — its last production caller was the
       `Output::painted_size` forward this commit took; only the writer/cache test seams reach
       past the manager now. Un-gate only if a later sub-commit finds a production seam that
       genuinely reads *past* the manager's verbs (none should).
-    - The probe's `dims` closure is the out-of-crate driver's pattern for now; 4f-e's handle
-      hand-out may give drivers a subscribed receiver instead of the process-wide free fns.
+    - ~~The probe's `dims` closure is the out-of-crate driver's pattern for now; 4f-e's handle
+      hand-out may give drivers a subscribed receiver instead of the process-wide free fns.~~
+      Landed (`8733d09`): the probe's `dims` reads `content.frame_size()` — a subscribed
+      receiver through a handle, which is why `Content::frame_size`/`width`/`height` went `pub`.
     - `Output::draw_frame` (test drivers) and `Output::cursor_row`'s default (non-console
       outputs) stay for **step 5** — 4f-d took neither; cursor_row re-anchors go via the manager.
   - **4f-d — input collapses to one handle; the `TermGuard` holders convert.** Landed (`348f7ed`)
@@ -433,30 +442,59 @@ most runway to expand into separate sub-commits.
     session exists only where TermIO is Tty, so the old guard-presence zip changes nothing.
     `CodeAgent`'s private `output` copy dies with dispatch's last use; `AgentConfig.output` stays
     (the quiet tap, the tools' `confirm_default` copies out of `build_rig_agent`, step 5's
-    deletion). The prompt-loop size probe and the parked-resize drain keep writing the
-    process-wide sender until 4f-e moves it. Leftovers, each claimed:
+    deletion). ~~The prompt-loop size probe and the parked-resize drain keep writing the
+    process-wide sender until 4f-e moves it.~~ Moved with the sender (`8733d09`).
+    Leftovers, each claimed:
     - **`get_user_input` went to `Content`, not TermIO** (the plan said manager/TermIO): the
       prompt is a content write and the answer goes through the §4 tap — which is what keeps
       quiet's empty answer and the scripted `ScriptOutput` interactive test byte-identical; a
       `TermIO` line read would bypass the tap and block on test stdin. `ConsoleOutput`'s impl is
       a forward; the trait verb stays as the tap seam to step 5.
-    - The *reader-stop* half of `suspend()` is still each caller's `ReaderPauseGuard`; the
+    - ~~The *reader-stop* half of `suspend()` is still each caller's `ReaderPauseGuard`; the
       manager's pass-through stops raw mode only. Design's `TermIO::suspend()` (pause + raw off)
-      arrives when TermIO moves under `Draw` — **4f-e** — and retires `set_mode_guard` with it.
-    - **4a's resize note** rides 4f-e: `route_event` still handles Resize inline (`set_size`, no
-      forward to the input channel); moving the sender and the forward together with the
+      arrives when TermIO moves under `Draw` — **4f-e** — and retires `set_mode_guard` with
+      it.~~ Landed (`786009e`, `set_mode_guard` with `8733d09`): `TermIO::suspend()` raises the
+      pause gate (ownership-latched — an outer holder survives a nested pair) before dropping
+      raw mode, and `run_editor`'s `ReaderPauseGuard` folded in.
+    - ~~**4a's resize note** rides 4f-e: `route_event` still handles Resize inline (`set_size`,
+      no forward to the input channel); moving the sender and the forward together with the
       probe/drain relocation avoids a window where both paths publish. `read_input`'s defensive
-      `Resize` arms are already in place for when the forward starts.
+      `Resize` arms are already in place for when the forward starts.~~ Landed (`2906fb1`):
+      the reader publishes the watch first, then forwards; the prompt arms republish
+      idempotently and wait, the turn's dispatch ignores — no window ever had two senders.
     - `run_editor` takes `&Content`, not the bare manager — content is the handle its callers
       (`edit_text`, `open_editor`) already hold; widen only for a manager-only caller.
-  - **4f-e — TermIO into Draw: the setup rework.** TermIO is constructed first (in `Interactive`);
-    its handles are handed out (`input` → repl, `size` clones → content and the manager); caps are
-    probed at TermIO construction and handed to `Content::new` (the `Caps::probe` site leaves
-    content); TermIO moves under Draw — `Draw { term_io, cache }`, the `writer` field dies (Draw
-    writes through the main sink), and the size watch's sender comes under TermIO's roof (the
-    process-wide `LazyLock` dies; 4f-d's probe and drain write through the handle; the few
-    free-function subscribers with no handle are settled here). `TermIO::recording()` takes the
-    byte-edge seam wholesale — the `record_bytes`/`Sink`/`SharedBuf` helpers re-point.
+  - **4f-e — TermIO into Draw: the setup rework.** Landed (`8733d09` wiring, `c7ef4fe` writer,
+    `786009e` reader-stop suspend, `2906fb1` resize forward) — the commit messages record what
+    moved. Everything the plan named is in: caps probed at construction and fed to `Content::new`
+    (the `Caps::probe` site left content — the four `TermIO::*` constructors are the only probes
+    now); `Draw { term_io, cache }`, `writer` field dead, every byte through
+    `TermIO::write(Stream::Main, …)` with `recording()` on the same edge (`record_bytes` re-pointed,
+    `Sink`/`SharedBuf` gone); the size sender per-instance under TermIO's roof (the `LazyLock` and
+    `set_size`/`size`/`subscribe` free fns dead), probe + drains through the manager's front door;
+    the free-function subscribers settled (see `8733d09`); `TermIO::suspend()` the design's whole
+    pause+raw-off; resize both edges. Two recorded deviations from the plan's wording:
+    - **Constructed in `main`, not `Interactive`** — forced: `Content::new` runs where
+      `AgentConfig` is built, so the backend must pre-exist it. `main` picks the variant (Tty iff
+      stdin is a terminal and `!quiet` — the condition `Interactive` derives `repl` from) and hands
+      it to `ConsoleOutput::new`; the *hand-out* (pause gate → `handles()` → input to the repl)
+      stays inside `Interactive::new`'s ordered entry-DSR window.
+    - `Content::new(term_io, …)` takes the backend by value: it derives the size receiver and caps
+      before moving `TermIO` down into `RenderManager` → `Draw`, so the plan's step-3 "move TermIO
+      into Draw" needed no install step — and `Interactive` reaches the hand-out through
+      `manager.handles()`, never naming `TermIO`.
+    Leftovers:
+    - `TermHandles.caret` still parks in `Interactive.handles`, unconsumed ("wired ahead of its
+      consumer" since 4b). Design §3 distributes it to the **RenderManager**; the consumer
+      arrives with the caret event answering inside TermIO — **4g**.
+    - Design §Degradation's Draw-side degradation — non-tty primaries dropping frames wholesale,
+      the stripped-by-caps byte edge — is implemented nowhere and claimed by no phasing step.
+      Flagged for a slot (closest home: **step 5**, beside the sink dissolution) rather than
+      slipped into this step.
+    - The loop-top probe now publishes *inside* the query (one call instead of query … replay …
+      `set_size`), so the never-applied `painted_size` shortcut reads the just-published watch
+      and a replay formats at fresh width — the watch being current at read time, which is what
+      publishing there means (`8733d09` records it).
   - **4f-f — `Stream` + the meta sink; the formatting span unlocks.** `ContentWrite` gains
     `stream: Stream`; the reasoning-to-stderr decision becomes a *stream* decision (content picks
     Meta once at setup) and `put_content` routes Main → the screen choreography, Meta → TermIO's
@@ -467,8 +505,12 @@ most runway to expand into separate sub-commits.
   Out of 4f: the `render(Some(w))` compose + content round trip (waits for the installed stack,
   **4h**).
 - **4g — Suspend/resume + DSR through the manager; dead size fallbacks die.**
-  `RenderManager::suspend()` becomes the front door (content/UI never touch TermIO), DSR is answered
-  inside TermIO, and the three `Output` trait-default size queries still falling back to a live
+  ~~`RenderManager::suspend()` becomes the front door (content/UI never touch TermIO)~~ — landed
+  4f-d (`set_mode_guard`) + 4f-e-c (`786009e`, the reader-stop). What remains here: DSR is
+  answered inside TermIO (the reader-stop pause is now the front door's to raise), the caret
+  handle distributes to the manager per design §3 (`TermHandles.caret` is parked in
+  `Interactive.handles` since 4f-e's hand-out), and the three `Output` trait-default size
+  queries still falling back to a live
   `crossterm::terminal::size()` go — non-console outputs read the watch. The loop-top resize probe
   stays (deliberate, step-2 note).
 - **4h — Elements → `Arc<Mutex<…>>`; construction into `ui/`** (design-led, kept last for runway;

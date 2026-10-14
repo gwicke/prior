@@ -11,11 +11,11 @@
 //! shape piped mode had when it simply dropped the sender.
 //!
 //! Constructed first at setup (4f-e, in `main`), before `Content`: it probes
-//! the caps once at construction ([`Self::caps`]) and owns the size watch —
+//! the caps once at construction ([`TermIO::caps`]) and owns the size watch —
 //! one channel per instance, no process-wide sender. Its receivers feed
 //! content (format width) and the render manager (frame dims) through
-//! [`Self::subscribe_size`]; those who publish ([`Self::set_size`],
-//! [`Self::probe_size`], the reader) write through the same instance, reached
+//! [`TermIO::subscribe_size`]; those who publish ([`TermIO::set_size`],
+//! [`TermIO::probe_size`], the reader) write through the same instance, reached
 //! via the render manager's front door once `Draw` owns it.
 //!
 //! Setup hands out [`TermHandles`] exactly once (`TermIO::handles`, called
@@ -24,7 +24,7 @@
 //!
 //! Not yet here (tracked in the impl doc): DSR answered inside `TermIO`
 //! (4g). Since 4f-e-b every production byte — frames, the re-anchor, the
-//! content choreography — leaves through [`Self::write`].
+//! content choreography — leaves through [`TermIO::write`].
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
@@ -782,18 +782,19 @@ pub(crate) fn spawn_stdin_reader(
 }
 
 /// Owns terminal mode transitions — the folded former `repl::TermGuard`.
-/// [`TermIO::Tty`] holds the canonical instance and hands out `Arc` clones
-/// ([`TermIO::guard`]) to what must flip raw mode: the reader (resume /
-/// `Ctrl-C` / `Ctrl-Z`) and — since 4f-d — the render manager's
-/// suspend/resume front door, through which the prompt loop, `$EDITOR` and
-/// the back-off pump reach raw mode without holding a handle of their own.
+/// [`TermIO::Tty`] holds the canonical instance and keeps the only `Arc`
+/// clones: its own and the reader's (resume / `Ctrl-C` / `Ctrl-Z`). The
+/// prompt loop, `$EDITOR` and the back-off pump flip raw mode through the
+/// render manager's suspend/resume front door, which reaches this enum
+/// under `Draw` since 4f-e — no holder outside `TermIO` names the guard
+/// (`TermIO::guard()` died with the `set_mode_guard` hand-off).
 /// [`start`](Self::start) enters raw mode and negotiates capabilities;
 /// [`stop`](Self::stop) (idempotent) restores cooked mode. Safe to call from
 /// `Drop`, a panic hook, or a signal handler.
 ///
-/// Transitional: the manager's clone dies when `TermIO` moves under `Draw`
-/// (4f-e), and the design gives the whole lifecycle — suspend/resume,
-/// Ctrl-C/Ctrl-Z, DSR — to `TermIO` itself.
+/// The design gives the whole lifecycle to `TermIO`: suspend/resume with
+/// the reader-stop is the enum's since 4f-e-c, Ctrl-C/Ctrl-Z are handled
+/// in the reader — DSR answered inside `TermIO` is 4g.
 pub struct TermGuard {
     active: AtomicBool,
     saved_paste: AtomicBool,
