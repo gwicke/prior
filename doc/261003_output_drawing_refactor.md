@@ -30,6 +30,10 @@ migration detail: `./261003_output_drawing_refactor_impl.md`.
          TermIO
 ```
 
+Render, Draw and TermIO (plus the width utilities and the `RenderElement` trait) live in their own
+crate, `slashdot_tui`. `slashdot_menu` and picocode's UI/content layers depend on it — the layering
+above is enforced by the dependency graph, not by convention.
+
 ## End state UI flow
 
 1) repl — control; consumes TermIO's input-event channel (keys/paste/resize); pulls data, assembles
@@ -71,7 +75,8 @@ the agent holds a `Content` handle (never the hub); confirmation keeps its own `
 
 Compose UI chrome into a RenderElement stack. Same level as Content.
 
-- source: ui/; files: ui.rs (menu chrome) · bar.rs (the bar)
+- source: ui/ (picocode); bar.rs (the bar) — menu chrome elements come from `slashdot_menu`
+  (below, RenderElement stack), which implements `RenderElement` for its views
 - Elements are long-lived and reused: the status bar and the input hold live state (the bar its
   status, the input the shared editor), joined by transient elements (menus, dialogs) as repl/ui
   state changes. Reuse is why `Element` is `Arc<Mutex<…>>`, not `Box`: the repl mutates the shared
@@ -155,7 +160,7 @@ impl RenderManager {
 }
 ```
 
-- source: render.rs (existing composition, moved from ui/frame.rs)
+- source: slashdot_tui (render.rs; existing composition, moved from ui/frame.rs)
 - Allocation: frame size = min(max ratio × term height, sum of element concrete max asks); floors
   first, then a **ratio-weighted** split — all-`FixedNum` (today) weights evenly, i.e. today's
   semantics, pinned by `allocate_*`.
@@ -190,7 +195,7 @@ impl Draw {
 }
 ```
 
-- files: draw.rs; ansi.rs (byte / width / escape transforms and the write wrappers)
+- files: slashdot_tui (draw.rs; ansi.rs — byte / width / escape transforms and the write wrappers)
 - `DrawCache` (`ui/frame.rs:415`) keeps the frame-side state only: `applied`, `consumed_rows`,
   `deferred`, `batch_active`, the tracked caret and the clear floor — not the recipe; RenderManager
   recomposes each render(). Its content-side fields
@@ -268,6 +273,37 @@ impl TermIO {
 - **Width is exposed because it cannot degrade late**: wrapping, table columns, panel and bar fit
   are decided at render time and destructive: a wrapped line cannot be unwrapped. ANSI is
   recoverable, geometry is not; height feeds only the frame budget.
+
+## RenderElement stack
+
+The manager's `stack` is configured **by the repl**, not assembled per paint and not curated by the
+manager: `configure` carries the whole membership, and presence, order and separators (blank
+companion row, divider above a menu) are rules the repl expresses by what it puts in. The manager
+budgets, calls `height`/`render` per element and merges the rows; it has no notion of bar, input or
+menu.
+
+- Elements are built **once, from raw data** — rows plus node config, never pre-painted rows — and
+  pull their state, resolve and format inside `render(h, w)` at the width being composed for. A
+  menu open constructs its elements; a keystroke moves the selection through shared handles in
+  place — no push, no rebuild; rows that actually change (filter, new plan) rebuild the affected
+  element and reconfigure the stack.
+- **One element per view section**: a listing's detail, table header and scrollable rows are three
+  entries in the stack, not a pre-composed sub-stack. Nothing below the repl stacks elements.
+- The **input element is always in the stack**; height carries its presence: `0` mid-turn with an
+  empty buffer (a mid-turn frame is an ordinary `render()` — the input simply contributes nothing),
+  the prompt row between turns even with no content, sized to the wrapped buffer whenever content is
+  present. Turn presence rides `Content::streaming` for now — a pushed fact, read at pull time.
+- **Dims never travel**: no frame-path verb takes dims; `render()` composes and paints at the watched
+  size, so a resize applies lazily at the next render. The repl's only dims use is to *initiate* a
+  content replay at its next size check.
+- `RowAsk`/`RowSpec` land with the stack, not later: `height(&self, width)` is what lets each element
+  answer in rows-at-this-width. All-`FixedNum` stays today's even-split semantics, pinned by
+  `allocate_*`.
+- `slashdot_menu` mints the elements for its views (detail, header, rows) and the repl appends them
+  to the stack. The rows element holds the view handle (`Arc<ViewRows>` — the crate's handle chain is
+  `Arc` throughout, so it is `Send + Sync`) and paints through its iterator inside `render(h, w)`:
+  filtered and unfiltered views resolve the same way, stale slots skip, and rows are never copied
+  into the element.
 
 ## Related
 

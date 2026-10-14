@@ -245,8 +245,9 @@ behind, for the steps below:
 
 ### Step 4: Fold in `RenderManager` and UI
 
-`configure` / `render` / `render_batch`; convert elements to `Arc<Mutex<…>>` with the shared editor;
-move element construction into `ui/`/repl.
+`configure` / `render` / `render_batch`; move Render/Draw/TermIO into the `slashdot_tui` crate,
+which exposes `RenderElement`; convert elements to `Arc<Mutex<…>>`; `slashdot_menu` mints its views'
+elements, `ui/`/repl the rest.
 
 **Commit plan (4a–4h; each independently green — suite, fmt, clippy).** Ownership moves first,
 call-site repoints after; the design-led element conversion closes the step — last, where there is
@@ -541,11 +542,78 @@ most runway to expand into separate sub-commits.
     ordering makes them unnecessary (it emits the event only after `guard.start()` and before
     forwarding any later key, same thread). Leftovers: none.
   The loop-top resize probe stays (deliberate, step-2 note).
-- **4h — Elements → `Arc<Mutex<…>>`; construction into `ui/`** (design-led, kept last for runway;
-  expect it to split). `Element = Arc<Mutex<dyn RenderElement>>` with the shared editor held live
-  across compositions; `Element::status` moves into `ui/`; `ui.rs` becomes a `ui/` module (menu
-  chrome + bar); element construction centralizes in `ui/` + repl; `render.rs` becomes the
-  RenderManager home.
+- **4h — The element stack: `slashdot_tui` crate; `Arc<Mutex<…>>` elements; pull-based rendering.**
+  Design-led (design §RenderElement stack + the crate note under §End state layering), kept last for
+  runway; split into eight commits, each independently green:
+  - **4h-a — crate extraction.** Create `crates/slashdot_tui` and move `ansi`, `termio`, `draw`,
+    `render` wholesale, plus the width utility: `slashdot_menu::table::display_width` moves into the
+    crate beside `ansi` (menu then imports it from `slashdot_tui`); `row_count.rs` stays picocode-side
+    (content's). The two outward edges of the {ansi, termio, draw, render} SCC are exactly these, so
+    the crate knows nothing of repl/content — the layering becomes compiler-enforced. The two
+    `crate::repl::LineEditor` test imports (`render.rs:973`, `draw.rs:885` apply_tests) rehome:
+    in-crate tests get in-crate dummy elements; the ones that genuinely pin manager+input behavior
+    move picocode-side. `lib.rs` re-exports (`pub use slashdot_tui::{…}`) keep `confirm_probe` and
+    examples source-compatible. Behavior-free.
+  - **4h-b — `RowAsk`/`RowSpec` on the trait.** `RenderElement { height(&self, width) -> RowAsk;
+    render(&self, height, width) -> Rendered }`; `RowAsk { min, max }`, `RowSpec::FixedNum(n)` /
+    `RatioAndNum(r, n)`. The allocator resolves specs against the frame height
+    (`FixedNum(n)` → n, `RatioAndNum(r, n)` → min(ceil(r × term_h), n)); budget = min(ratio × term_h,
+    Σ resolved max); floors first, then the split. Construction-time `must`/`might` fields die —
+    every element answers `height(width)` itself. All-`FixedNum` reproduces today's even-split
+    semantics; `allocate_*` stay as parity pins.
+  - **4h-c — the bar moves into `ui/`.** `ui.rs` → `ui/mod.rs` + `ui/bar.rs`: the bar element +
+    `status_bar`/`dot_cell` come out of `output.rs` (`Element::status` and its `StatusItem` die
+    there; the bar element holds the raw store handles as today). No `ui/menu.rs`: everything else
+    `ui.rs` holds is either already the menu crate's (the `paint_*`/`window_heights` imports) or
+    goes there with the element impls in **4h-d** (`window_keeps` rides along beside
+    `window_heights` — pure windowing, its only user is the rows element). `pad_row`/`el_if_short`
+    are `slashdot_tui`'s (`pub`) by then — row properties every element impl calls.
+  - **4h-d — menu views mint their own elements** (`slashdot_menu`):
+    1. `s/Rc/Arc/` on the handle chain — `ViewRows`, `DataResponse`, `CompletionRows`, the
+       `RowView::plan` signature; `Rc::ptr_eq` → `Arc::ptr_eq` (dirty-check semantics unchanged).
+       Pure widening: the async-trait `DataResult` returns become `Send`, never less.
+       `RefCell` sites stay `Rc` — node-internal (`node_impl.rs:426` active_ids, node_entry test
+       spies), never leave the thread.
+    2. `RenderElement` impls for a view's sections — detail, table header, rows, one element each.
+       The rows element holds the view handle (`Arc<ViewRows>`, auto `Send + Sync`) and paints
+       through `iter()` inside `render(h, w)` at the render width — the iterator logic (order-driven
+       resolution, stale-slot skips, active-flag lookup) runs *in* the element; rows are never
+       copied into it, and `RowView::plan`'s ptr_eq rebuild caching is untouched. Detail/header
+       hold raw config/data and format at render width.
+    3. The menu layering returns the element set for a view; the repl appends it to the configured
+       stack. Compose-width `PaintedSection` and `ui::overlay_elements*` die.
+  - **4h-e — selection behind shared state.** Menu open constructs the element set once; a keystroke
+    moves the selection through a shared handle in place (no push, no rebuild — the engine's plan
+    call still runs, but only the selection figures flow to the handle); rows that actually change
+    (filter, new plan) rebuild the affected element and reconfigure the stack.
+  - **4h-f — the input element.** `Repl::editor: LineEditor` → `Arc<Mutex<LineEditor>>`, shared
+    with the input element (label + streaming flag alongside); layout/wrap computes inside
+    `render(h, w)` at render width. Height rules: `0` mid-turn with an empty buffer; the prompt row
+    between turns even with no content; sized to the wrapped buffer whenever content is present, in
+    either case. Turn presence rides `Content::streaming` for now (pushed fact, read at pull time);
+    verify against the turn pumps' current pixels (the one open question from design discussion —
+    mid-turn repaint paths) and follow whatever preserves them.
+  - **4h-g — the flip.** `configure(frame_max_row_ratio, frame_elements)` regains the design's full
+    signature — the repl configures the whole stack (bar and transient menus by inclusion; blank
+    companion row and divider as ordinary elements; input always in, resolved by height).
+    `render(content: Option<ContentWrite>)` replaces `render(stack, policy, dims)`: dims come off
+    the watch inside the manager — no frame-path verb takes dims (`reposition` included), the repl
+    keeps dims only to initiate a content replay — and there is no return value.
+    `compose_area`/`area_body` shrink to stack configurators feeding `configure`;
+    `render_content`/`render_batch` fold toward the design's final round trip; `recipe` dies
+    (reposition re-composes from the configured stack — it is current by construction). The blank
+    row keeps its role (frame's row between content and bar) as an ordinary element in the
+    configured stack. Expect sub-splits.
+  - **4h-h — remaining callers + cleanup.** Confirm dialog: own selection state, elements via the
+    menu constructors with its `OPTIONS.len()` floor, in the repl-configured stack; the out-of-crate
+    probe keeps `draw_frame` through the re-exports. Anything left of `overlay_elements*`,
+    per-paint element construction, or dims params dies; docs updated (design doc already carries
+    the stack + crate sections).
+  Resolved during design (recorded here so they don't get re-litigated): RowAsk/RowSpec lands with
+  the stack (**4h-b**), not later; dims flow TermIO → Render exclusively (**4h-g**); the input
+  element is always in the stack with height carrying presence (**4h-f**); menu elements hold
+  `Arc<ViewRows>` directly after the crate's `Arc` swap (**4h-d**), preserving the no-copy row
+  iterator for filtered and unfiltered views alike.
 
 Follow-ups step 3 leaves here — each claimed by a commit above unless noted:
 
