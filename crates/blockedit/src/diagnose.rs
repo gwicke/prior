@@ -13,11 +13,17 @@
 //!     UI to avoid leaking large or secret-bearing regions of disk into
 //!     scrollback.
 //!
-//! Algorithm: longest-common-substring anchor + Myers diff over the
-//! windowed region. Cost is sub-millisecond for typical file sizes.
+//! Algorithm: two tiers. Tier 1 anchors on the longest common *byte*
+//! substring and gates on a Myers line diff over the windowed region — it
+//! catches typos and local drift. Tier 2, only when tier 1 fails, anchors on
+//! the longest common *token* run: whitespace is not a token, so
+//! indentation-only and wrap-only differences collapse to an identical
+//! stream and are reported as "matches except whitespace", with the file's
+//! own lines for a verbatim retry. Cost is sub-millisecond for typical file
+//! sizes.
 
 use serde::Serialize;
-use similar::{ChangeTag, TextDiff};
+use similar::{Change, ChangeTag, TextDiff};
 
 use crate::wire;
 
@@ -37,6 +43,16 @@ const CONTEXT_PAD: usize = 2;
 const MAX_CONTEXT_LINES: usize = 40;
 /// Cap on the echoed `oldText` when it is the only thing identifying a block.
 const MAX_ECHOED_OLD_LINES: usize = 20;
+/// Token-tier gate: minimum fraction of the query's tokens that must be
+/// recoverable (in order) from the candidate window. Lower than tier 1's
+/// effective strictness on purpose — this tier only runs after tier 1 failed,
+/// and a structurally-related pointer beats "no similar region in file".
+const MIN_TOKEN_RECALL: f64 = 0.6;
+/// Cap on the per-line indentation deltas listed in `model_view`.
+const MAX_INDENT_REPORTED: usize = 10;
+/// Columns a tab counts as when measuring indentation depth. Only matters
+/// for tab/space mixes, where any consistent ruler beats none.
+const INDENT_TABSTOP: usize = 4;
 
 /// Skew rule: for an anchor beyond the context tolerance, accept the nearest
 /// candidate only if it is at least this many times closer than the second
@@ -245,12 +261,26 @@ fn echo_old_text(old_text: &str) -> String {
 /// were usually the ones cut. A model can act on numbered lines; it cannot act
 /// on a diff of a region it has to re-derive.
 ///
+/// Two tiers, in order:
+///
+/// 1. [`diagnose_exact`] — the byte anchor + line gate above. Catches typos
+///    and local drift.
+/// 2. [`diagnose_token`] — a whitespace-tolerant fallback. Whitespace is not
+///    a token, so indentation-only and wrap-only differences collapse to an
+///    identical token stream; when that stream matches, the message says so
+///    and hands back the file's own lines to retry with.
+///
 /// Returns `None` if no region is similar enough to be worth showing.
 pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
     if query.is_empty() || file_text.is_empty() {
         return None;
     }
+    diagnose_exact(query, file_text).or_else(|| diagnose_token(query, file_text))
+}
 
+/// Tier 1 of [`diagnose`]: longest-common-substring byte anchor + Myers line
+/// gate over the windowed region.
+fn diagnose_exact(query: &str, file_text: &str) -> Option<EditFailure> {
     let search_text = file_text;
 
     // Stage 1: anchor via longest-common-substring. Its job is to seed the
@@ -297,6 +327,7 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
         .count();
     let line_ratio = (equal_lines as f64) / span_lines as f64;
     if anchor_ratio.max(line_ratio) < MIN_ANCHOR_RATIO {
+        // Tier 1 gives up; the whitespace-tolerant tier may still locate it.
         return None;
     }
 
@@ -333,21 +364,351 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
     let last = (span.1 + CONTEXT_PAD).min(total_lines(search_text));
     let last = last.max(first);
 
-    let body = elide_middle(
+    let header = format!("@@@OLD lines not found. Closest match at file lines {first}-{last}:");
+    let ui_view = format!("Closest match at file lines {first}-{last}.");
+    let indent = indent_mismatches(&changes, offset);
+
+    Some(render_located(
+        search_text,
+        first,
+        last,
+        &header,
+        &indent,
+        ui_view,
+        false,
+    ))
+}
+
+/// Tier 2 of [`diagnose`]: locate by tokens instead of bytes.
+///
+/// The byte anchor of tier 1 breaks wherever whitespace differs — a whole
+/// block re-indented, or the same text re-wrapped, shares no long byte run
+/// even though the content is identical. Tokens are maximal non-whitespace
+/// runs, so indent drift, wrap drift, and trailing blanks all vanish before
+/// matching: text that is the same modulo whitespace tokenizes to the same
+/// sequence, and the longest common token run then covers the query entirely.
+/// That case is reported as `whitespace_only`, with the file's own lines for
+/// a verbatim retry; otherwise this behaves like tier 1 with a token-recall
+/// gate.
+fn diagnose_token(query: &str, file_text: &str) -> Option<EditFailure> {
+    let q_toks = tokenize(query);
+    let f_toks = tokenize(file_text);
+    if q_toks.is_empty() || f_toks.is_empty() {
+        return None;
+    }
+
+    let (tok_start, tok_end) = find_token_anchor(file_text, query, &f_toks, &q_toks)?;
+    // The anchor covers every query token ⇒ the file span tokenizes to
+    // exactly the query's tokens: same content, different whitespace.
+    let whitespace_only = tok_end - tok_start == q_toks.len();
+
+    let anchor_start = f_toks[tok_start].0;
+    let anchor_end = f_toks[tok_end - 1].1;
+
+    // Same window rule as tier 1: line-aligned, sized to the query.
+    let win_start = line_start_at(file_text, anchor_start.saturating_sub(query.len()));
+    let win_end = line_end_at(file_text, (anchor_end + query.len()).min(file_text.len()));
+    let window = &file_text[win_start..win_end];
+    let offset = count_lines(&file_text[..win_start]) + 1;
+
+    // Gate: the fraction of the query's tokens recoverable from the window,
+    // in order. Whitespace-only drift scores 1.0 by construction; unrelated
+    // text scores near 0 even when it shares common words. This tier only
+    // runs after tier 1 failed, so a merely-related pointer is still worth
+    // more than "no similar region in file".
+    let w_toks = tokenize(window);
+    let recall = token_lcs_len(&q_toks, &w_toks, query, window) as f64 / q_toks.len() as f64;
+    if recall < MIN_TOKEN_RECALL {
+        return None;
+    }
+
+    // The line diff is still needed: it locates the divergent region for the
+    // non-whitespace case and pairs up differing lines for the indent report.
+    let diff = TextDiff::from_lines(query, window);
+    let changes: Vec<_> = diff.iter_all_changes().collect();
+    let indent = indent_mismatches(&changes, offset);
+
+    let total = total_lines(file_text);
+    let (first, last) = if whitespace_only {
+        // The anchor *is* the match. No context padding: these lines are the
+        // corrected @@@OLD, and padding would only dilute the claim.
+        let first = count_lines(prefix(file_text, anchor_start)) + 1;
+        let last = count_lines(prefix(file_text, anchor_end)) + 1;
+        (first, last.min(total).max(first))
+    } else {
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for change in &changes {
+            if matches!(change.tag(), ChangeTag::Equal) {
+                continue;
+            }
+            if let Some(i) = change.new_index() {
+                lo = lo.min(i);
+                hi = hi.max(i);
+            }
+        }
+        if lo == usize::MAX {
+            // Unreachable: no differing line means the strings are equal,
+            // which implies `whitespace_only`. Refuse rather than underflow.
+            return None;
+        }
+        let span_first = (offset + lo).max(1);
+        let span_last = (offset + hi + 1).min(total);
+        let first = span_first.saturating_sub(CONTEXT_PAD).max(1);
+        let last = (span_last + CONTEXT_PAD).min(total);
+        (first, last.max(first))
+    };
+
+    let (header, ui_view, verbatim) = if whitespace_only {
+        (
+            format!(
+                "@@@OLD lines not found. Your text matches the content spanning file lines \
+                 {first}-{last} exactly except for whitespace (indentation, wrapping, or \
+                 trailing blanks) — retry with those file lines verbatim as @@@OLD:"
+            ),
+            format!("Closest match at file lines {first}-{last} (whitespace-only differences)."),
+            true,
+        )
+    } else {
+        (
+            format!("@@@OLD lines not found. Closest match at file lines {first}-{last}:"),
+            format!("Closest match at file lines {first}-{last}."),
+            false,
+        )
+    };
+
+    Some(render_located(
+        file_text, first, last, &header, &indent, ui_view, verbatim,
+    ))
+}
+
+/// Assemble a located-region failure: header line, optional indentation
+/// report, optional verbatim-copy hint, then the `read`-format body.
+///
+/// `verbatim` marks the whitespace-only tier, whose whole point is that the
+/// rendered lines are the corrected `@@@OLD` — so if the region exceeds the
+/// render cap, the model is told to `read` the exact range instead of trying
+/// to reconstruct an elided one.
+fn render_located(
+    search_text: &str,
+    first: usize,
+    last: usize,
+    header: &str,
+    indent: &[(usize, i64)],
+    ui_view: String,
+    verbatim: bool,
+) -> EditFailure {
+    let mut model_view = String::from(header);
+    model_view.push('\n');
+    if let Some(note) = indent_note(indent) {
+        model_view.push_str(&note);
+        model_view.push('\n');
+    }
+    if verbatim && last - first + 1 > MAX_CONTEXT_LINES {
+        model_view.push_str(&format!(
+            "That span is larger than the render below; `read` lines {first}-{last} for the \
+             full text to copy.\n"
+        ));
+    }
+    model_view.push_str(&elide_middle(
         &render_numbered(search_text, first, last),
         MAX_CONTEXT_LINES,
-    );
-
-    let model_view = format!(
-        "@@@OLD lines not found. Closest match at file lines {}-{}:\n{}",
-        first, last, body,
-    );
-    let ui_view = format!("Closest match at file lines {first}-{last}.");
-
-    Some(EditFailure {
+    ));
+    EditFailure {
         ui_view,
         model_view,
-    })
+    }
+}
+
+/// Byte ranges `(start, end)` of every maximal run of non-whitespace in `s`.
+///
+/// The unit of [`diagnose_token`]: whitespace (indent, wrap, trailing blanks)
+/// never appears inside a token, so two texts that differ only in whitespace
+/// tokenize to the same sequence.
+fn tokenize(s: &str) -> Vec<(usize, usize)> {
+    let mut toks = Vec::new();
+    let mut open: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        if c.is_whitespace() {
+            if let Some(st) = open.take() {
+                toks.push((st, i));
+            }
+        } else if open.is_none() {
+            open = Some(i);
+        }
+    }
+    if let Some(st) = open {
+        toks.push((st, s.len()));
+    }
+    toks
+}
+
+/// Longest run of identical tokens shared by the file and the query, as a
+/// half-open `(start, end)` range of **file token indices** — the
+/// token-level twin of [`find_anchor`]. O(F·Q) over tokens, which is never
+/// more than the byte-level DP it backs up.
+fn find_token_anchor(
+    file_text: &str,
+    query: &str,
+    f_toks: &[(usize, usize)],
+    q_toks: &[(usize, usize)],
+) -> Option<(usize, usize)> {
+    if f_toks.is_empty() || q_toks.is_empty() {
+        return None;
+    }
+    let mut prev = vec![0u32; q_toks.len() + 1];
+    let mut best_len = 0usize;
+    let mut best_f_end = 0usize;
+    for i in 1..=f_toks.len() {
+        let mut curr = vec![0u32; q_toks.len() + 1];
+        let (fs, fe) = f_toks[i - 1];
+        for j in 1..=q_toks.len() {
+            let (qs, qe) = q_toks[j - 1];
+            if file_text[fs..fe] == query[qs..qe] {
+                curr[j] = prev[j - 1] + 1;
+                if curr[j] as usize > best_len {
+                    best_len = curr[j] as usize;
+                    best_f_end = i;
+                }
+            }
+        }
+        prev = curr;
+    }
+    if best_len == 0 {
+        None
+    } else {
+        Some((best_f_end - best_len, best_f_end))
+    }
+}
+
+/// Length of the longest common subsequence of the two token sequences —
+/// how much of the query's *content*, in order, the window carries.
+/// O(|Q|·|W|) with a rolling row.
+fn token_lcs_len(
+    q_toks: &[(usize, usize)],
+    w_toks: &[(usize, usize)],
+    query: &str,
+    window: &str,
+) -> usize {
+    if q_toks.is_empty() || w_toks.is_empty() {
+        return 0;
+    }
+    let mut prev = vec![0u32; w_toks.len() + 1];
+    for (qs, qe) in q_toks {
+        let mut curr = vec![0u32; w_toks.len() + 1];
+        let qt = &query[*qs..*qe];
+        for (k, (ws, we)) in w_toks.iter().enumerate() {
+            curr[k + 1] = if qt == &window[*ws..*we] {
+                prev[k] + 1
+            } else {
+                prev[k + 1].max(curr[k])
+            };
+        }
+        prev = curr;
+    }
+    prev[w_toks.len()] as usize
+}
+
+/// Split `s` into its leading space/tab run and the rest.
+fn split_indent(s: &str) -> (&str, &str) {
+    let rest = s.trim_start_matches([' ', '\t']);
+    (&s[..s.len() - rest.len()], rest)
+}
+
+/// Drop one trailing line terminator (`\n` or `\r\n`).
+fn strip_eol(s: &str) -> &str {
+    s.strip_suffix('\n')
+        .map_or(s, |t| t.strip_suffix('\r').unwrap_or(t))
+}
+
+/// Width of an indentation string in columns, expanding tabs to the next
+/// multiple of [`INDENT_TABSTOP`]. A heuristic — the dominant mismatch is
+/// spaces-vs-spaces, where the tabstop is irrelevant; for tab/space mixes it
+/// only has to be one consistent ruler.
+fn indent_cols(leading: &str) -> i64 {
+    let mut col: i64 = 0;
+    for c in leading.chars() {
+        if c == '\t' {
+            col = (col / INDENT_TABSTOP as i64 + 1) * INDENT_TABSTOP as i64;
+        } else {
+            col += 1;
+        }
+    }
+    col
+}
+
+/// Pair the lines a Myers pass reports as differing (deletes with inserts,
+/// positionally within each hunk) and keep the pairs that are identical
+/// apart from leading whitespace — the "you counted the spaces wrong" lines.
+///
+/// Returns `(file_line, file_indent − your_indent)` in columns, ascending.
+/// `offset` is the 1-based file line number of window line 0, so window line
+/// `i` is file line `offset + i`.
+fn indent_mismatches(changes: &[Change<&str>], offset: usize) -> Vec<(usize, i64)> {
+    let mut out = Vec::new();
+    let mut olds: Vec<(usize, &str)> = Vec::new();
+    let mut news: Vec<(usize, &str)> = Vec::new();
+    for c in changes {
+        match c.tag() {
+            ChangeTag::Equal => {
+                pair_indent(&olds, &news, offset, &mut out);
+                olds.clear();
+                news.clear();
+            }
+            ChangeTag::Delete => {
+                if let Some(i) = c.old_index() {
+                    olds.push((i, c.value()));
+                }
+            }
+            ChangeTag::Insert => {
+                if let Some(i) = c.new_index() {
+                    news.push((i, c.value()));
+                }
+            }
+        }
+    }
+    pair_indent(&olds, &news, offset, &mut out);
+    out
+}
+
+/// The zipped half of [`indent_mismatches`]: report pairs whose trimmed
+/// content is identical but whose indentation is not.
+fn pair_indent(
+    olds: &[(usize, &str)],
+    news: &[(usize, &str)],
+    offset: usize,
+    out: &mut Vec<(usize, i64)>,
+) {
+    for (&(_, old), &(new_i, new)) in olds.iter().zip(news.iter()) {
+        let (o_lead, o_rest) = split_indent(strip_eol(old));
+        let (n_lead, n_rest) = split_indent(strip_eol(new));
+        if o_lead != n_lead && o_rest.trim() == n_rest.trim() {
+            // Delta is file − yours: `+` = the file is deeper, `-` = yours
+            // is. A `+0` means same width, different characters (tab vs
+            // spaces) — still worth naming so the model looks at the line.
+            out.push((offset + new_i, indent_cols(n_lead) - indent_cols(o_lead)));
+        }
+    }
+}
+
+/// The per-line indentation report, capped at [`MAX_INDENT_REPORTED`]:
+/// `Indentation mismatches (file - yours, columns): 312:+1, 313:+2.`
+fn indent_note(mismatches: &[(usize, i64)]) -> Option<String> {
+    if mismatches.is_empty() {
+        return None;
+    }
+    let shown = mismatches.len().min(MAX_INDENT_REPORTED);
+    let mut list: Vec<String> = mismatches[..shown]
+        .iter()
+        .map(|&(l, d)| format!("{l}:{d:+}"))
+        .collect();
+    if mismatches.len() > shown {
+        list.push(format!("...and {} more", mismatches.len() - shown));
+    }
+    Some(format!(
+        "Indentation mismatches (file - yours, columns): {}.",
+        list.join(", ")
+    ))
 }
 
 /// Total lines in `text`, counting a final line with no trailing newline.
@@ -963,6 +1324,137 @@ mod tests {
         let f = diagnose(q, file);
         // Should produce a diagnosis (it's close enough).
         assert!(f.is_some());
+    }
+
+    #[test]
+    fn fully_reindented_block_is_diagnosed_as_whitespace_only() {
+        // Every line differs by indent, so no line is byte-equal: tier 1's
+        // anchor and line gate both fail. Tier 2 must still locate it, say
+        // the content matches, and report the per-line indent deltas.
+        let file = "fn main() {\n    let x = 1;\n    let y = 2;\n    let sum = x + y;\n}\n";
+        let q =
+            "fn main() {\n        let x = 1;\n        let y = 2;\n        let sum = x + y;\n}\n";
+        let f = diagnose(q, file).expect("re-indent must not read as 'no similar region'");
+        assert!(
+            f.model_view.contains("exactly except for whitespace"),
+            "{}",
+            f.model_view
+        );
+        // The file's own lines, with true numbers, for a verbatim retry.
+        assert!(
+            f.model_view.contains("   2|     let x = 1;"),
+            "{}",
+            f.model_view
+        );
+        // File has 4 columns, the query 8 → -4 on lines 2-4.
+        assert!(
+            f.model_view
+                .contains("Indentation mismatches (file - yours, columns): 2:-4, 3:-4, 4:-4."),
+            "{}",
+            f.model_view
+        );
+        // Line 1 (`fn main() {`) is byte-identical and part of the token run,
+        // so the match spans the whole block, lines 1-5.
+        assert!(
+            f.ui_view.contains("Closest match at file lines 1-5"),
+            "UI was: {}",
+            f.ui_view
+        );
+    }
+
+    #[test]
+    fn rewrapped_block_is_diagnosed_as_whitespace_only() {
+        let file = "alpha beta\ngamma delta\nepsilon zeta\n";
+        let q = "alpha beta gamma delta epsilon zeta\n";
+        let f = diagnose(q, file).expect("wrap-only difference must be diagnosed");
+        assert!(
+            f.model_view.contains("exactly except for whitespace"),
+            "{}",
+            f.model_view
+        );
+        // The difference is wrapping, not indent — no indent rows to list.
+        assert!(
+            !f.model_view.contains("Indentation mismatches"),
+            "{}",
+            f.model_view
+        );
+        assert!(
+            f.model_view.contains("   2| gamma delta"),
+            "{}",
+            f.model_view
+        );
+        assert!(f.ui_view.contains("file lines 1-3"));
+    }
+
+    #[test]
+    fn indent_mismatch_is_reported_with_file_line_and_delta() {
+        // Tier 1 still fires here (three equal lines), but the indent note
+        // must ride along with the closest-match report.
+        let file = "fn main() {\n    let x = 1;\n    let y = 2;\n    let z = 3;\n}\n";
+        let q = "fn main() {\n    let x = 1;\n  let y = 2;\n    let w = 3;\n}\n";
+        let f = diagnose(q, file).expect("should diagnose");
+        assert!(
+            f.model_view.contains("Closest match at file lines 1-5"),
+            "{}",
+            f.model_view
+        );
+        assert!(
+            f.model_view
+                .contains("Indentation mismatches (file - yours, columns): 3:+2."),
+            "{}",
+            f.model_view
+        );
+        // Line 4 differs in content, not indent — it must not be listed.
+        assert!(!f.model_view.contains("4:+"), "{}", f.model_view);
+        assert!(!f.model_view.contains("4:-"), "{}", f.model_view);
+    }
+
+    #[test]
+    fn whitespace_only_match_reports_true_file_line_numbers() {
+        let mut file = String::new();
+        for i in 1..=100 {
+            file.push_str(&format!("filler {i}\n"));
+        }
+        file.push_str("stmt one\n    stmt two\n    stmt three\n");
+        let q = "stmt one\n        stmt two\n        stmt three\n";
+        let f = diagnose(q, &file).expect("should diagnose");
+        assert!(
+            f.model_view.contains("file lines 101-103"),
+            "{}",
+            f.model_view
+        );
+        assert!(
+            f.model_view
+                .contains("Indentation mismatches (file - yours, columns): 102:-4, 103:-4."),
+            "{}",
+            f.model_view
+        );
+        // Every rendered row is the file's own content at its own line number.
+        for row in [101, 102, 103] {
+            let want = format!("{:4}| {}", row, file.lines().nth(row - 1).unwrap());
+            assert!(
+                f.model_view.contains(&want),
+                "missing {want:?} in:\n{}",
+                f.model_view
+            );
+        }
+    }
+
+    #[test]
+    fn token_tier_rejects_text_sharing_only_common_words() {
+        // Shares `let` and `=` with the file but nothing else: token recall
+        // is 2/4 = 0.5, below MIN_TOKEN_RECALL, and tier 1 already failed.
+        let file = "let alpha = compute(result);\n";
+        let q = "let beta = other(x);\n";
+        assert!(diagnose(q, file).is_none());
+    }
+
+    #[test]
+    fn tokenize_splits_on_whitespace_and_ranges_map_back() {
+        let s = "  let x\t= 1;\n";
+        let toks = tokenize(s);
+        let words: Vec<&str> = toks.iter().map(|&(a, b)| &s[a..b]).collect();
+        assert_eq!(words, ["let", "x", "=", "1;"]);
     }
 
     #[test]

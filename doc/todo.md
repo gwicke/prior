@@ -42,7 +42,7 @@ and link a doc/ and/or commit hash
   tool messages following tool_calls message)
       - 0ef960188195b9cf02c38ba011fc5662a82c2391 was not successful. Drop it, and instead implement
       doc/261013_multi_file_edit_id_continuity.md.
-- [ ] More robust anchoring in crates/blockedit/src/diagnose.rs diagnose(). Currently uses longest
+- [x] More robust anchoring in crates/blockedit/src/diagnose.rs diagnose(). Currently uses longest
       common sub-string.
 
 ## Cleanup
