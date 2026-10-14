@@ -509,8 +509,9 @@ impl RenderManager {
 
     /// Raw mode off — the front door (design §Render: "suspend() stops the
     /// reader and drops raw mode ($EDITOR, Ctrl-Z)"), pass-through to
-    /// `Draw`/`TermIO` — the only real implementation is `TermIO::suspend`.
-    /// Idempotent; a no-op on Plain. The reader-stop half is 4f-e-c's.
+    /// `Draw`/`TermIO` — the only real implementation is `TermIO::suspend`,
+    /// complete since 4f-e-c: the reader-stop rides with the raw-mode drop.
+    /// Idempotent; a no-op on Plain.
     pub fn suspend(&self) {
         self.draw.suspend();
     }

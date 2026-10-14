@@ -339,8 +339,8 @@ impl Interactive {
         // this channel; the prompt loop and every turn consume the receiver
         // half. The reader backs off whenever the main task owns stdin —
         // `$EDITOR`, a DSR query, or the compaction window — via the pause
-        // gate (`termio::PAUSE_GATE`), the same flag `editor::ReaderHold`
-        // raises.
+        // gate (`termio::PAUSE_GATE`), the one flag `ReaderPauseGuard` and
+        // `TermIO::suspend` raise.
         //
         // The gate is raised *before* `handles()` so the reader starts parked
         // and cannot consume the entry DSR's reply: the draw cache is anchored

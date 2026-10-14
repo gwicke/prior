@@ -752,8 +752,8 @@ impl Draw {
         self.term_io.handles()
     }
 
-    /// Raw mode off (4f-e-c adds the reader-stop half). Idempotent; a no-op
-    /// on Plain.
+    /// The full `TermIO::suspend` — reader parked, raw mode off (4f-e-c).
+    /// Idempotent; a no-op on Plain.
     pub(crate) fn suspend(&self) {
         let _ = self.term_io.suspend();
     }

@@ -30,15 +30,18 @@ pub enum EditorMode {
 /// Hand the terminal to an external editor and take it back — the only place
 /// that sequence exists (doc/editor_cleanup.md §2):
 ///
-/// 1. Pause the sole stdin owner (the persistent reader) for the whole window —
-///    the editor child's keystrokes *and* the DSR reply below arrive on stdin,
-///    so an unpaused reader would swallow them. Nesting-safe.
-/// 2. Drop raw mode, run `$EDITOR` on a tempfile (foreground child with
-///    inherited stdio), re-enter raw mode.
+/// 1. Suspend (§Render → `TermIO::suspend`): park the sole stdin owner —
+///    the editor child's keystrokes arrive on stdin, so an unpaused reader
+///    would swallow them — and drop raw mode. Nesting-safe inside TermIO
+///    (4f-e-c folded this window's pause in; an outer holder's pause — the
+///    compaction window — outlives it).
+/// 2. Run `$EDITOR` on a tempfile (foreground child with inherited stdio),
+///    then resume: raw mode back, reader released.
 /// 3. Re-anchor the draw cache (DSR): the editor was a foreign screen writer,
 ///    so the frame region can no longer be trusted (plan §4.2). Unconditional
-///    — even a failed launch may have touched the screen. The pause is still
-///    held across this query (the outer guard), so its reply is safe too.
+///    — even a failed launch may have touched the screen. The query carries
+///    its own pause ([`crate::termio::query_cursor_row`]), so its reply is
+///    safe even though the window's pause lifted with the resume.
 ///
 /// Blocking by design: while the editor owns the tty nothing else may write
 /// to it, so there is nothing for a concurrent task to do (§7 of the plan).
@@ -57,7 +60,6 @@ pub(crate) fn run_editor(content: &Content, current: &str, mode: EditorMode) -> 
             "editor requires an interactive terminal",
         ));
     }
-    let _pause = crate::termio::ReaderPauseGuard::raise();
     manager.lock().unwrap().suspend();
     let edited = edit_in_editor(current, mode);
     {

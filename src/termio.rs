@@ -329,6 +329,11 @@ pub struct TtyIo {
     /// `Draw`, which owns this enum since 4f-e (the `set_mode_guard` hand-off
     /// of 4f-d retired with it).
     guard: Arc<TermGuard>,
+    /// Did this instance's [`TermIO::suspend`] raise the pause gate? Only
+    /// that raise is released by the matching [`TermIO::resume`] — an outer
+    /// holder's pause (the compaction window) outlives a nested
+    /// suspend/resume pair (4f-e-c).
+    pause_owned: AtomicBool,
     /// The per-instance size watch's sending half: the reader publishes
     /// resizes here, and [`TermIO::set_size`] / [`TermIO::probe_size`] write
     /// through it. Receivers clone off it ([`TermIO::subscribe_size`]).
@@ -408,6 +413,7 @@ impl TermIO {
         let (handles, input_tx, caret_tx, size_tx) = term_channels();
         TermIO::Tty(TtyIo {
             guard: Arc::new(TermGuard::new()),
+            pause_owned: AtomicBool::new(false),
             size_tx,
             caps: Caps::probe(),
             input_tx: Some(input_tx),
@@ -472,22 +478,38 @@ impl TermIO {
         }
     }
 
-    /// Raw mode off — today exactly the guard's stop (the 4f-d pass-through
-    /// re-homed onto the enum); 4f-e-c adds the reader-stop half the design's
-    /// `suspend()` carries (`pause + raw off`). Idempotent; a no-op on Plain.
+    /// The design's `suspend()` (§TermIO: "stops the reader and drops raw
+    /// mode"), complete since 4f-e-c: park the sole stdin owner — raise the
+    /// pause gate, waiting out its last poll — then drop raw mode, the
+    /// order `$EDITOR`'s hand-off used to run by hand before folding into
+    /// here. Idempotent; a no-op on Plain. Nested against an outer holder
+    /// (the compaction window, a DSR query): only the raise *this* call
+    /// made is remembered to lower — [`Self::resume`] releases exactly that.
     pub fn suspend(&self) -> io::Result<()> {
         match self {
-            TermIO::Tty(t) => t.guard.stop(),
+            TermIO::Tty(t) => {
+                if raise_pause_gate() {
+                    t.pause_owned.store(true, Ordering::SeqCst);
+                }
+                t.guard.stop()
+            }
             TermIO::Plain(_) => Ok(()),
         }
     }
 
     /// Raw mode on — the reverse of [`Self::suspend`], and also the initial
-    /// entry at prompt-loop startup (the guard's idempotent `start`). A
-    /// no-op on Plain.
+    /// entry at prompt-loop startup (the guard's idempotent `start`). The
+    /// reader-stop lifts after raw mode is back, and only if this instance
+    /// raised it (see [`Self::suspend`]). A no-op on Plain.
     pub fn resume(&self) -> io::Result<()> {
         match self {
-            TermIO::Tty(t) => t.guard.start(),
+            TermIO::Tty(t) => {
+                let started = t.guard.start();
+                if t.pause_owned.swap(false, Ordering::SeqCst) {
+                    PAUSE_GATE.store(false, Ordering::SeqCst);
+                }
+                started
+            }
             TermIO::Plain(_) => Ok(()),
         }
     }
@@ -907,19 +929,28 @@ pub(crate) struct ReaderPauseGuard {
 
 impl ReaderPauseGuard {
     pub(crate) fn raise() -> Self {
-        let owned = !PAUSE_GATE.swap(true, Ordering::SeqCst);
-        if owned && READER_RUNNING.load(Ordering::SeqCst) {
-            // The reader polls on a 50 ms deadline; wait out at most one poll
-            // for it to leave the read path and set `READER_PARKED`.
-            let start = Instant::now();
-            while !READER_PARKED.load(Ordering::SeqCst)
-                && start.elapsed() < Duration::from_millis(100)
-            {
-                thread::sleep(Duration::from_millis(2));
-            }
+        Self {
+            owned: raise_pause_gate(),
         }
-        Self { owned }
     }
+}
+
+/// Raise the pause gate and wait the reader out; `true` when *this* call
+/// raised it — the raiser owns lowering it ([`ReaderPauseGuard`] drops its
+/// own, [`TermIO::suspend`] remembers its own across the editor window).
+/// Nesting-safe: a call on an already-up gate neither waits nor claims.
+fn raise_pause_gate() -> bool {
+    let owned = !PAUSE_GATE.swap(true, Ordering::SeqCst);
+    if owned && READER_RUNNING.load(Ordering::SeqCst) {
+        // The reader polls on a 50 ms deadline; wait out at most one poll
+        // for it to leave the read path and set `READER_PARKED`.
+        let start = Instant::now();
+        while !READER_PARKED.load(Ordering::SeqCst) && start.elapsed() < Duration::from_millis(100)
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    owned
 }
 
 impl Drop for ReaderPauseGuard {
@@ -1044,6 +1075,44 @@ mod tests {
             );
         }
         assert!(!reader_paused(), "dropped once, clear again");
+    }
+
+    /// The reader-stop half of `TermIO::suspend` (4f-e-c): suspend parks
+    /// the reader before dropping raw mode, a repeated suspend keeps its
+    /// claim, and the matching resume releases exactly that raise — an
+    /// outer holder's pause (the compaction window) outlives a nested
+    /// suspend/resume pair.
+    ///
+    /// Gated on a non-terminal stdin because `resume()` enters raw mode:
+    /// flipping the harness's real tty mid-suite (and spraying CSI at the
+    /// log) is what `a_pause_guard…`'s doc means by a unit test not touching
+    /// the terminal — the same escape hatch the bwrap regression uses.
+    #[test]
+    fn termio_suspend_parks_the_reader_and_resume_releases_only_its_own_pause() {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            return;
+        }
+        let io = TermIO::tty();
+        assert!(!reader_paused(), "gate starts clear");
+
+        io.suspend().unwrap();
+        assert!(reader_paused(), "suspend parks the reader");
+        io.suspend().unwrap();
+        let _ = io.resume(); // raw-mode flip may fail without a tty; the
+                             // gate release runs regardless
+        assert!(!reader_paused(), "resume lifts the pause suspend raised");
+
+        // An outer holder: its pause must survive a nested pair.
+        let outer = ReaderPauseGuard::raise();
+        io.suspend().unwrap();
+        let _ = io.resume();
+        assert!(
+            reader_paused(),
+            "an outer holder keeps the gate up across a nested suspend/resume"
+        );
+        drop(outer);
+        assert!(!reader_paused(), "the outer drop clears it");
     }
 
     // --- the routing policy, moved from `repl.rs` with the reader (4a) ------
