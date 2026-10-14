@@ -329,7 +329,7 @@ most runway to expand into separate sub-commits.
     output, so rows-as-`String` is not yet honest) with the measured row count and the rendered
     width alongside, and `Stream` is **absent on purpose** — there is no meta sink under the hub
     while `Draw` owns no `TermIO`, and today's reasoning-to-stderr path never reaches `Draw` at
-    all; the token arrives with the meta sink — **4f**.
+    all; the token arrives with the meta sink — ~~**4f**~~ Landed (`cbeceed`).
   - `Content` hands off through two verbs, `render_content` (streaming) and `render_batch`
     (replay, inside a batch), which are today one `put_content` choreography under two names — the
     `batch_active` flag defers the reposition either way. **4e** moved the guard to the hub but did
@@ -344,10 +344,14 @@ most runway to expand into separate sub-commits.
     compare what Content produced. Frame-byte capture tests moved to the writer seam
     (`output.rs`'s `record_bytes`, `render.rs`'s `SharedBuf`) — the seam `TermIO::recording()`
     takes wholesale in **4f**.
-  - The design's "formats … before each block — no hub round-trip" is not yet real: the manager
+  - ~~The design's "formats … before each block — no hub round-trip" is not yet real: the manager
     lock still spans build + hand-off (deliberate — the same serialization 4c established, and the
     boundary state is Content's under it). Formatting-only, unlocked, comes with the round trip
-    (**4f/4h**) once non-reentrancy is proven for the build span.
+    (**4f/4h**) once non-reentrancy is proven for the build span.~~ Landed (`044c7f9`): the
+    proof — one writer per content (the turn is inline in `prompt()`'s `select!`; prompt-time
+    verbs and capture toggles are the same task) and `f` non-reentrancy — is recorded at the
+    span, with a `Content.building` debug tripwire keeping a violation loud; the manager lock
+    now covers the hand-off alone.
 - **4e — Batching guard → the hub** (its own commit, deliberately). Landed (`bce38e7`) — the commit
   message records what moved. Settled "where batching lives": the hub owns reposition, the flag
   and the deferred frame's re-emit; the recipe moved with it (the 4b note above). What it leaves
@@ -495,13 +499,21 @@ most runway to expand into separate sub-commits.
       `set_size`), so the never-applied `painted_size` shortcut reads the just-published watch
       and a replay formats at fresh width — the watch being current at read time, which is what
       publishing there means (`8733d09` records it).
-  - **4f-f — `Stream` + the meta sink; the formatting span unlocks.** `ContentWrite` gains
-    `stream: Stream`; the reasoning-to-stderr decision becomes a *stream* decision (content picks
-    Meta once at setup) and `put_content` routes Main → the screen choreography, Meta → TermIO's
-    meta sink with no choreography (byte-identical to today's `ReasoningSink` stderr bypass, which
-    dies). With the sinks under the hub, `with_content_writer`'s formatting span unlocks — build
-    the `ContentWrite` before the lock, the design's "no hub round-trip" — pending the
-    non-reentrancy proof the 4d note recorded; the last rider, and droppable on its own.
+  - **4f-f — `Stream` + the meta sink; the formatting span unlocks.** Landed (`cbeceed` stream +
+    meta sink, `044c7f9` the span) — the commit messages record what moved. `ContentWrite` gained
+    `stream: Stream`; the reasoning decision is the hand-off's token now (content picks `Meta`
+    once at setup from the caps — `commit_reasoning`; `ReasoningSink` and `reasoning_sink()`
+    died). `put_content` routes Main → today's choreography and Meta → `Draw::write_meta` →
+    `TermIO::write(Stream::Meta)`: no consume, count, reposition, or capture interception —
+    byte-identical to the stderr bypass it replaced, recorded on the meta edge by
+    `reasoning_to_meta_lands_on_the_meta_edge` (main's emptiness is the choreography pin). The
+    formatting span then unlocked with the proof the 4d note was waiting for: one writer per
+    content (the turn runs inline in `prompt()`'s `select!` with no spawn on the path —
+    confirm.rs' module doc — and prompt-time verbs run between turns on that same task, capture
+    toggles included), plus enumerable `f` closures; a `Content.building` debug tripwire keeps a
+    future violation loud where the held lock used to self-deadlock, and the capture read is its
+    own short lock. Leftovers: none — the `render(Some(w))` compose + content round trip stays
+    out of 4f (**4h**, below).
   Out of 4f: the `render(Some(w))` compose + content round trip (waits for the installed stack,
   **4h**).
 - **4g — Suspend/resume + DSR through the manager; dead size fallbacks die.**
