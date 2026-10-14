@@ -73,6 +73,8 @@ and link a doc/ and/or commit hash
     4f-f (`cbeceed`+`044c7f9`, Stream + the meta sink; the formatting span unlocks),
     4g (`c21be0e`+`6961d0b`+`e7b17ad`, cursor_row verb dies, entry-DSR on the front-door
     guard, the caret channel reaches the manager);
-    4h next (elements → `Arc<Mutex<…>>`, construction into `ui/`, `render.rs` as the
-    RenderManager home)
+    4h-a (`ba8d6be`, `slashdot_tui` crate extraction), 4h-b (`ddf5522`+`8f80640`,
+    `height(width)` on the trait, one place computes the frame row count), 4h-c
+    (`280f654`+`2651b19`, the bar moves into `ui/`); 4h-d next (menu views mint their
+    own elements)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)

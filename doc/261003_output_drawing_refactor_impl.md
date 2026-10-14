@@ -585,13 +585,21 @@ most runway to expand into separate sub-commits.
     - `Extent` survives as the *resolved* pair (plan §3.2's `must`/`might`) one step below the
       element's `RowAsk` — the allocator's own vocabulary; no caller outside `allocate` reaches it
       now.
-  - **4h-c — the bar moves into `ui/`.** `ui.rs` → `ui/mod.rs` + `ui/bar.rs`: the bar element +
-    `status_bar`/`dot_cell` come out of `output.rs` (`Element::status` and its `StatusItem` die
-    there; the bar element holds the raw store handles as today). No `ui/menu.rs`: everything else
-    `ui.rs` holds is either already the menu crate's (the `paint_*`/`window_heights` imports) or
-    goes there with the element impls in **4h-d** (`window_keeps` rides along beside
-    `window_heights` — pure windowing, its only user is the rows element). `pad_row`/`el_if_short`
-    are `slashdot_tui`'s (`pub`) by then — row properties every element impl calls.
+  - **4h-c — the bar moves into `ui/`.** Landed (`280f654` + `2651b19`). `ui.rs` → `ui/mod.rs` +
+    `ui/bar.rs`: the bar element (`StatusItem`), its constructor, `status_bar` and `dot_cell` come
+    out of `output.rs` (`Element::status` and its `StatusItem` die there; the bar element holds the
+    raw store handles as today — `Arc<Mutex<BarStatus>>` + the streaming flag, both halves of the
+    drawing still resolved in its own render). `output.rs`'s render imports shrink to `Frame`.
+    One addition beyond the sketch: `StatusText` (the shaped pair `status_text` builds and
+    `status_bar` fits) moved to `agent/status.rs`, beside the shaping — with the fit in `ui/`,
+    leaving it in `output.rs` would have both `agent` and `ui` depending on `output` for a pure
+    data type; now `ui → agent::status` matches the existing `content → agent::status` direction.
+    `agent::status`'s tests assert against `ui::bar::{status_bar, BAR_SEPARATOR, DOT_STREAMING}`.
+    No `ui/menu.rs`: everything else `ui/mod.rs` holds is either already the menu crate's (the
+    `paint_*`/`window_heights` imports) or goes there with the element impls in **4h-d**
+    (`window_keeps` rides along beside `window_heights` — pure windowing, its only user is the
+    rows element). `pad_row`/`el_if_short` were already `slashdot_tui`'s (`pub`) — the sketch's
+    precondition, no change needed.
   - **4h-d — menu views mint their own elements** (`slashdot_menu`):
     1. `s/Rc/Arc/` on the handle chain — `ViewRows`, `DataResponse`, `CompletionRows`, the
        `RowView::plan` signature; `Rc::ptr_eq` → `Arc::ptr_eq` (dirty-check semantics unchanged).
