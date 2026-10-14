@@ -42,7 +42,7 @@ impl CodeAgent {
     ///
     /// **This future is `!Send`; the summarizers below are not.** Since U4.3
     /// the turn carries the REPL's prompt session in, and that session is
-    /// single-threaded by construction — `Rc` line windows, `Rc` menu views, a
+    /// single-threaded by construction — `Arc` line windows, `Arc` menu views, a
     /// sync `mpsc` completer — and it never leaves the task `run_interactive`
     /// runs on. Requiring `Send` would mean rewriting that chain to `Arc` for a
     /// property nothing uses: `main` awaits `run_interactive`, every test

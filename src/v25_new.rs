@@ -4,8 +4,6 @@
 //! (stamped from the target config — recorded judgment in the plan).
 use std::sync::Arc;
 
-use std::rc::Rc;
-
 use crate::app_state::AppState;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, SubmitResult,
@@ -18,7 +16,7 @@ pub struct NewNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for NewNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("new").desc("start a new session")],
             active_ids: Vec::new(),
         }))

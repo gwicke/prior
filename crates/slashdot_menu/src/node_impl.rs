@@ -125,15 +125,17 @@ pub struct DataError {
     pub message: String,
 }
 
-/// Result type for `data()`.
-pub type DataResult = Result<std::rc::Rc<DataResponse>, DataError>;
+/// Result type for `data()`. `Arc`, not `Rc`: a response rides the handle
+/// chain into the host's frame elements and crosses the completer's worker
+/// thread, so it must be `Send` (step 4h-d).
+pub type DataResult = Result<std::sync::Arc<DataResponse>, DataError>;
 
 use std::collections::HashMap;
 
 /// Completion payload (implicit-open auto-complete): candidate rows +
 /// optional dialog column labels for (id, description). Plain owned
 /// data — `Clone`/`Send`, so it can cross the prose-completion worker
-/// thread by value (the `Rc` is built on the receiving side).
+/// thread by value (the `Arc` is built on the receiving side).
 #[derive(Debug, Clone)]
 pub struct CompletionRows {
     pub rows: Vec<Row>,
@@ -237,7 +239,7 @@ pub trait SlashDotNode {
     /// Handled automatically for `StaticListingNode`, so higher levels of the hierarchy which have
     /// leaf nodes as children.
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(std::rc::Rc::new(DataResponse {
+        Ok(std::sync::Arc::new(DataResponse {
             rows: Vec::new(),
             active_ids: Vec::new(),
         }))
@@ -296,15 +298,15 @@ pub trait SlashDotNode {
     /// `("Value", "Description")` for leaves). Sort candidates with
     /// `fuzzy::rank_candidates` (prefix matches shortest-first, then
     /// fuzzy) before returning, so dialogs order predictably. Cache the
-    /// `Rc` until the response changes — the engine skips its view
-    /// re-derive on `Rc::ptr_eq`. Default: empty (the common case;
+    /// `Arc` until the response changes — the engine skips its view
+    /// re-derive on `Arc::ptr_eq`. Default: empty (the common case;
     /// every node is called on every passive frame).
     async fn complete_parameter(
         &mut self,
         _args: &PathArgs,
         _cursor_pos: usize,
-    ) -> Result<std::rc::Rc<CompletionRows>, DataError> {
-        Ok(std::rc::Rc::new(CompletionRows {
+    ) -> Result<std::sync::Arc<CompletionRows>, DataError> {
+        Ok(std::sync::Arc::new(CompletionRows {
             rows: Vec::new(),
             labels: None,
             match_indices: None,
@@ -471,7 +473,7 @@ impl SlashDotNode for StaticListingNode {
             .map(|r| Row::new(&r.id).desc(&r.desc))
             .collect();
         let active: Vec<String> = self.active_ids.borrow().iter().cloned().collect();
-        Ok(std::rc::Rc::new(DataResponse {
+        Ok(std::sync::Arc::new(DataResponse {
             rows,
             active_ids: active,
         }))

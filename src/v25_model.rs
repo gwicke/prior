@@ -1,12 +1,10 @@
 //! v2.5 `SlashDotNode` implementation for `/model`.
 //!
 //! Dynamic rows from the live catalog (cached, background-refreshed). The
-//! node caches its `Rc<DataResponse>` keyed by the catalog's generation
-//! counter — when the catalog hasn't refreshed, the engine's `Rc::ptr_eq`
+//! node caches its `Arc<DataResponse>` keyed by the catalog's generation
+//! counter — when the catalog hasn't refreshed, the engine's `Arc::ptr_eq`
 //! check skips the full re-derive (filter → fuzzy → sort → render).
 use std::sync::Arc;
-
-use std::rc::Rc;
 
 use crate::app_state::AppState;
 use crate::slashdot_menu::fields::ColumnDef;
@@ -34,10 +32,10 @@ pub struct ModelNode {
     /// moved under us, and writing it would store settings against a model
     /// the user is no longer looking at.
     pending_edit: std::cell::RefCell<Option<PendingEdit>>,
-    /// Last generated DataResponse, reused via `Rc::ptr_eq` when nothing the rows
+    /// Last generated DataResponse, reused via `Arc::ptr_eq` when nothing the rows
     /// derive from has changed. The three fields below *are* that condition —
     /// `data()` reuses only while all of them still hold.
-    cached_response: Option<Rc<DataResponse>>,
+    cached_response: Option<Arc<DataResponse>>,
     /// Catalog generation at build time: the entry set and its base order.
     cached_generation: u64,
     /// The active model id at build time. It is both hoisted to row 0 by
@@ -56,7 +54,7 @@ pub struct ModelNode {
     /// keeps it alive to compare against. Without this the rows outlived a
     /// Ctrl-E edit of a per-model record — the generation, the active model and
     /// the recency list are all unchanged by such an edit, so the memo missed
-    /// and, because `refresh_data` gates on `Rc::ptr_eq`, the view never
+    /// and, because `refresh_data` gates on `Arc::ptr_eq`, the view never
     /// refreshed either.
     cached_resolved: Option<Arc<Vec<crate::model_catalog::ModelEntry>>>,
 }
@@ -187,7 +185,7 @@ impl SlashDotNode for ModelNode {
         // *active* model and boosts recently-used ones, and `active_ids` is
         // what the `*` marker lands on. Keying on the generation alone served
         // a stale `active_ids` after a model switch — and because
-        // `refresh_data` gates on `Rc::ptr_eq`, the stale `Rc` also stopped
+        // `refresh_data` gates on `Arc::ptr_eq`, the stale `Arc` also stopped
         // `content.active_ids` and `slots_dirty` from refreshing, so the memo
         // in `ensure_rows` returned the stale view too. The marker then sat on
         // the *previous* active model, which `order_models` had hoisted to row
@@ -204,7 +202,7 @@ impl SlashDotNode for ModelNode {
                 && self.cached_recent == recent
                 && overlay_same
             {
-                return Ok(Rc::clone(cached));
+                return Ok(Arc::clone(cached));
             }
         }
 
@@ -237,8 +235,8 @@ impl SlashDotNode for ModelNode {
         };
 
         let rows: Vec<Row> = ordered.iter().map(model_row).collect();
-        let response = Rc::new(DataResponse { rows, active_ids });
-        self.cached_response = Some(Rc::clone(&response));
+        let response = Arc::new(DataResponse { rows, active_ids });
+        self.cached_response = Some(Arc::clone(&response));
         self.cached_generation = gen;
         self.cached_active = active_id;
         self.cached_recent = recent;
@@ -880,12 +878,12 @@ impl SlashDotNode for ModelActionNode {
     /// would make the picker unusable.
     async fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
         if drilled_model(path_args, self.above).is_none() {
-            return Ok(Rc::new(DataResponse {
+            return Ok(Arc::new(DataResponse {
                 rows: Vec::new(),
                 active_ids: Vec::new(),
             }));
         }
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new(self.action.id()).desc(self.action.desc())],
             active_ids: Vec::new(),
         }))
@@ -1018,12 +1016,12 @@ impl SlashDotNode for DefaultModelActivateNode {
     /// same action.
     async fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
         if drilled_model(path_args, 2).is_none() {
-            return Ok(Rc::new(DataResponse {
+            return Ok(Arc::new(DataResponse {
                 rows: Vec::new(),
                 active_ids: Vec::new(),
             }));
         }
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("activate").desc("make this the default model")],
             active_ids: Vec::new(),
         }))
@@ -1164,7 +1162,7 @@ mod tests {
         let r1 = futures::executor::block_on(node.data(1, &path_args)).unwrap();
         let r2 = futures::executor::block_on(node.data(1, &path_args)).unwrap();
         // Same generation → same Rc.
-        assert!(Rc::ptr_eq(&r1, &r2));
+        assert!(Arc::ptr_eq(&r1, &r2));
     }
 
     #[test]
@@ -1396,11 +1394,11 @@ mod tests {
     /// The `*` follows the active model **through a reused handle** — the case
     /// the cache key got wrong.
     ///
-    /// `data()` used to reuse its `Rc<DataResponse>` whenever the *catalog
+    /// `data()` used to reuse its `Arc<DataResponse>` whenever the *catalog
     /// generation* was unchanged, but the rows also depend on the active model
     /// (hoisted to row 0, and named in `active_ids`) and on recency. Switching
-    /// the model changed neither, so the stale `Rc` came back — and because
-    /// `refresh_data` gates on `Rc::ptr_eq`, that stale response also stopped
+    /// the model changed neither, so the stale `Arc` came back — and because
+    /// `refresh_data` gates on `Arc::ptr_eq`, that stale response also stopped
     /// `content.active_ids` and `slots_dirty` from refreshing, so `ensure_rows`
     /// returned a stale view as well. The marker stayed on the *previous*
     /// model, which row 0 still held, so it looked plausible rather than
@@ -2257,7 +2255,7 @@ mod tests {
     /// `data()` memoizes on the catalog generation, the active model and the
     /// recency list. A per-model record edit changes *none* of those, so the
     /// memo used to hit and hand back the pre-edit rows - and because
-    /// `refresh_data` gates on `Rc::ptr_eq`, a response that never changed never
+    /// `refresh_data` gates on `Arc::ptr_eq`, a response that never changed never
     /// refreshed the view either. Only visible through a *reused* node, which
     /// is why the sibling test (a fresh node each time) passed throughout.
     #[test]

@@ -11,7 +11,6 @@
 //! read-only (`EditorMode::View`) look at this level's `header()`. Rows in
 //! the view are a later addition, once specced.
 
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::app_state::AppState;
@@ -106,7 +105,7 @@ impl SlashDotNode for ListingNode {
         &mut self,
         args: &PathArgs,
         cursor_pos: usize,
-    ) -> Result<Rc<CompletionRows>, DataError> {
+    ) -> Result<Arc<CompletionRows>, DataError> {
         self.inner.complete_parameter(args, cursor_pos).await
     }
 

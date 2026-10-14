@@ -8,7 +8,6 @@
 //! the selected entry via the `tree_switch` control target.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::app_state::{AppState, CompactMode};
@@ -871,9 +870,9 @@ fn wrap_with_prefix(prefix: &str, text: &str, width: usize) -> Vec<String> {
 /// are shown.
 pub struct TreeListNode {
     pub app_state: Arc<AppState>,
-    /// Cached data response — reused via Rc::ptr_eq when the tree hasn't
+    /// Cached data response — reused via Arc::ptr_eq when the tree hasn't
     /// changed.
-    cached_data: Option<Rc<DataResponse>>,
+    cached_data: Option<Arc<DataResponse>>,
     /// The Arc we last built rows from (for freshness check).
     cached_tree_rc: Option<Arc<Vec<SessionTreeNode>>>,
     cached_leaf_id: Option<String>,
@@ -978,7 +977,7 @@ impl SlashDotNode for TreeListNode {
             .map(|l| vec![l])
             .unwrap_or_default();
 
-        let response = Rc::new(DataResponse { rows, active_ids });
+        let response = Arc::new(DataResponse { rows, active_ids });
 
         // Cache for next call.
         self.cached_data = Some(response.clone());
@@ -1009,7 +1008,7 @@ impl SlashDotNode for TreeListNode {
             return vec!["Select a tree entry, then choose an action.".to_string()];
         };
 
-        // Refresh the cache (cheap Rc::ptr_eq when unchanged) and render
+        // Refresh the cache (cheap Arc::ptr_eq when unchanged) and render
         // from the row — the same data the listing and fuzzy search use
         // (design: "header() → entry detail from the same cached row data").
         let Ok(resp) = self.data(0, path_args).await else {
@@ -1075,7 +1074,7 @@ pub struct TreeSwitchCursorNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeSwitchCursorNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("cursor").desc("move the session cursor to this entry")],
             active_ids: Vec::new(),
         }))
@@ -1127,7 +1126,7 @@ pub struct CompactNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for CompactNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("compact").desc("summarize conversation up to the current point")],
             active_ids: Vec::new(),
         }))
@@ -1187,7 +1186,7 @@ impl TreeCompactManualNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeCompactManualNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("manual").desc("user-editable file list")],
             active_ids: Vec::new(),
         }))
@@ -1267,7 +1266,7 @@ impl TreeCompactTextNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeCompactTextNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("text-only").desc("extracted conversation text")],
             active_ids: Vec::new(),
         }))
@@ -1350,7 +1349,7 @@ impl TreeCompactPromptNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeCompactPromptNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("prompt").desc("LLM-generated summary")],
             active_ids: Vec::new(),
         }))
@@ -1450,18 +1449,18 @@ impl SlashDotNode for TreeEditNode {
     async fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
         let target_id = extract_target_id(path_args);
         let Some(session) = self.app_state.session() else {
-            return Ok(Rc::new(DataResponse {
+            return Ok(Arc::new(DataResponse {
                 rows: Vec::new(),
                 active_ids: Vec::new(),
             }));
         };
         if !crate::agent::compaction::is_reaskable_entry(&session, &target_id).await {
-            return Ok(Rc::new(DataResponse {
+            return Ok(Arc::new(DataResponse {
                 rows: Vec::new(),
                 active_ids: Vec::new(),
             }));
         }
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("edit").desc("re-ask this prompt (pre-filled)")],
             active_ids: Vec::new(),
         }))
@@ -1529,7 +1528,7 @@ impl SlashDotNode for TreeSwitchSummarizeNode {
             CompactMode::TextOnly => ("text-only", "extracted text of the abandoned branch"),
             CompactMode::Prompt => ("prompt", "LLM-generated digest of the abandoned branch"),
         };
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new(row).desc(desc)],
             active_ids: Vec::new(),
         }))
@@ -2184,7 +2183,7 @@ mod tests {
         let r1 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
         let r2 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
         assert!(
-            Rc::ptr_eq(&r1, &r2),
+            Arc::ptr_eq(&r1, &r2),
             "same tree + same leaf should return same Rc"
         );
     }
@@ -2211,7 +2210,7 @@ mod tests {
         app_state.set_raw_tree(Arc::new(new_tree));
 
         let r2 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
-        assert!(!Rc::ptr_eq(&r1, &r2), "changed tree should return new Rc");
+        assert!(!Arc::ptr_eq(&r1, &r2), "changed tree should return new Rc");
         assert_eq!(r2.rows.len(), 2, "new tree has two entries");
     }
 
@@ -3811,7 +3810,7 @@ mod tests {
     }
 
     /// The raw `DataResponse` for a tree with the given leaf.
-    fn data_for(tree: Vec<SessionTreeNode>, leaf: Option<&str>) -> Rc<DataResponse> {
+    fn data_for(tree: Vec<SessionTreeNode>, leaf: Option<&str>) -> Arc<DataResponse> {
         let app_state = app_state_with_tree(tree);
         app_state.set_leaf_id(leaf.map(|s| s.to_string()));
         let mut node = TreeListNode::new(app_state);

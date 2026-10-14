@@ -3,7 +3,7 @@
 //! Not exposed to the host.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::fields::ColumnDef;
 use crate::fields::{row_field_value, FieldSpace, Row};
@@ -44,7 +44,7 @@ pub enum HostKey {
 // --- Handle to a row in a child's DataResponse ---
 
 /// A lightweight handle (child_idx, row_offset) into a child's
-/// `Rc<DataResponse>.rows` vec. Copy, 8 bytes. Created by `refresh_data`
+/// `Arc<DataResponse>.rows` vec. Copy, 8 bytes. Created by `refresh_data`
 /// and `ensure_view`; resolved via `RowRef::resolve`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RowRef {
@@ -57,7 +57,7 @@ impl RowRef {
     /// a stale/foreign handle (§3.6: degrade/skip, never unwrap).
     pub(crate) fn resolve<'a>(
         &self,
-        data: &'a [Option<Rc<crate::node_impl::DataResponse>>],
+        data: &'a [Option<Arc<crate::node_impl::DataResponse>>],
     ) -> Option<&'a crate::fields::Row> {
         let resp = data.get(self.child_idx as usize)?.as_ref()?;
         resp.rows.get(self.row_offset as usize)
@@ -69,16 +69,16 @@ impl RowRef {
 struct ContentCache {
     /// Per-child data responses (slots), parallel to self.children.
     /// On DataError, slot is None (stale rows kept).
-    data_rc: Vec<Option<Rc<crate::node_impl::DataResponse>>>,
+    data_rc: Vec<Option<Arc<crate::node_impl::DataResponse>>>,
     /// Rows marked active by any child (§5.2). HashSet for O(1) lookup.
     active_ids: HashSet<String>,
-    /// Row ID → child index. Rebuilt when any child's Rc changes.
+    /// Row ID → child index. Rebuilt when any child's Arc changes.
     row_index: HashMap<String, u16>,
     /// True when slots changed since the rows pipeline last ran.
     slots_dirty: bool,
     /// Rows-pipeline memo: key (`suffix.trim_end()`) + output.
     last_key: String,
-    view_rows: Option<Rc<ViewRows>>,
+    view_rows: Option<Arc<ViewRows>>,
 }
 
 impl Default for ContentCache {
@@ -158,12 +158,12 @@ pub(crate) struct NodeEntry {
     dialog_view: RowView,
     /// Completer-response → ViewRows wrap memo (ptr_eq passthrough for
     /// handler-cached responses).
-    completion_wrap: Option<(Rc<CompletionRows>, Rc<ViewRows>)>,
+    completion_wrap: Option<(Arc<CompletionRows>, Arc<ViewRows>)>,
     /// Confirm-arm rows → ViewRows, memoized on the descriptions they
     /// were minted from. The arms are fixed; only the text a
     /// `SubmitResult::Prepared` carried varies, so the rebuild is a
     /// two-string compare.
-    confirm_wrap: Option<(ConfirmLabels, Rc<ViewRows>)>,
+    confirm_wrap: Option<(ConfirmLabels, Arc<ViewRows>)>,
 }
 
 impl NodeEntry {
@@ -260,7 +260,7 @@ impl NodeEntry {
                     r
                 })
                 .collect();
-            Ok(std::rc::Rc::new(crate::node_impl::DataResponse {
+            Ok(std::sync::Arc::new(crate::node_impl::DataResponse {
                 rows: enriched_rows,
                 active_ids: response.active_ids.clone(),
             }))
@@ -666,10 +666,10 @@ impl NodeEntry {
     /// The arm rows as a `ViewRows`, memoized on the descriptions they
     /// were minted from — the arms and their text are fixed for the
     /// life of an arm, so this rebuilds only when a new `Prepared`
-    /// phrases them differently. Keeping one `Rc` across frames is what
+    /// phrases them differently. Keeping one `Arc` across frames is what
     /// lets the dialog cursor survive a re-render (`ptr_eq` skips the
     /// reconcile).
-    fn confirm_rows(&mut self) -> Rc<ViewRows> {
+    fn confirm_rows(&mut self) -> Arc<ViewRows> {
         let (accept, cancel) = self.epoch.confirm_labels.clone().unwrap_or_else(|| {
             (
                 CONFIRM_ACCEPT_LABEL.to_string(),
@@ -678,14 +678,14 @@ impl NodeEntry {
         });
         if let Some(((a, c), view)) = &self.confirm_wrap {
             if *a == accept && *c == cancel {
-                return Rc::clone(view);
+                return Arc::clone(view);
             }
         }
         let view = ViewRows::of(vec![
             Row::new(CONFIRM_ACCEPT).desc(accept.clone()),
             Row::new(CONFIRM_CANCEL).desc(cancel.clone()),
         ]);
-        self.confirm_wrap = Some(((accept, cancel), Rc::clone(&view)));
+        self.confirm_wrap = Some(((accept, cancel), Arc::clone(&view)));
         view
     }
 
@@ -828,7 +828,7 @@ impl NodeEntry {
 
     // --- Data refresh ---
 
-    /// Refresh data from children. Returns true if any child's Rc changed.
+    /// Refresh data from children. Returns true if any child's Arc changed.
     ///
     /// **IMPORTANT:** Always call `child.node_data()` — never access
     /// `child.inner.data()` directly. `node_data()` is the only sanctioned
@@ -841,7 +841,7 @@ impl NodeEntry {
         // node's section only) — hence two plain slices, not `&PathArgs`.
         let path_args = PathArgs::new(path.to_vec(), tail);
         let mut changed = false;
-        let mut new_data: Vec<Option<Rc<crate::node_impl::DataResponse>>> =
+        let mut new_data: Vec<Option<Arc<crate::node_impl::DataResponse>>> =
             Vec::with_capacity(self.children.len());
 
         for (i, child) in self.children.iter_mut().enumerate() {
@@ -849,7 +849,7 @@ impl NodeEntry {
             match child.node_data(epoch, &path_args).await {
                 Ok(response) => {
                     let same = match self.content.data_rc.get(i) {
-                        Some(Some(prev)) => Rc::ptr_eq(prev, &response),
+                        Some(Some(prev)) => Arc::ptr_eq(prev, &response),
                         _ => false,
                     };
                     if !same {
@@ -914,20 +914,20 @@ impl NodeEntry {
     // --- Rows pipeline (content side) + view plan ---
 
     /// Rows pipeline: memoized filter → fuzzy rank → sort over the flat
-    /// args, minting a **fresh** `Rc<ViewRows>` whenever it runs — fresh
+    /// args, minting a **fresh** `Arc<ViewRows>` whenever it runs — fresh
     /// even if content is equal (reconcile cadence must match today's
     /// derive cadence; `ptr_eq` is that signal). Key = `suffix.trim_end()`
     /// straight off `&PathArgs` — equivalent to today's
     /// `suffix[..tail.start].trim_end()` because the pipeline only runs
     /// at `handle_listing`-reachable frames where the tail is empty.
-    fn ensure_rows(&mut self, path_args: &PathArgs) -> Rc<ViewRows> {
+    fn ensure_rows(&mut self, path_args: &PathArgs) -> Arc<ViewRows> {
         let key = path_args.suffix.trim_end().to_string();
         // Traversal memory: §5.1 restore source — written exactly where
         // today's ensure_view wrote it (every pipeline touch).
         self.epoch.view_args = key.clone();
         if !self.content.slots_dirty && self.content.last_key == key {
             if let Some(rows) = &self.content.view_rows {
-                return Rc::clone(rows);
+                return Arc::clone(rows);
             }
         }
 
@@ -997,7 +997,7 @@ impl NodeEntry {
             self.sort_row_refs(&mut ranked, sort_field, sort_dir);
         }
 
-        let rows = Rc::new(ViewRows::new(
+        let rows = Arc::new(ViewRows::new(
             self.content.data_rc.clone(),
             ranked,
             self.content.active_ids.clone(),
@@ -1005,7 +1005,7 @@ impl NodeEntry {
         ));
         self.content.slots_dirty = false;
         self.content.last_key = key;
-        self.content.view_rows = Some(Rc::clone(&rows));
+        self.content.view_rows = Some(Arc::clone(&rows));
         rows
     }
 
@@ -1016,12 +1016,12 @@ impl NodeEntry {
     /// in by the caller for *this frame only* (completion `Err` /
     /// `SubmitResult::Error`) — never stored. Drill arms call this too
     /// and discard the returned plan (one `header()` + assembly on an
-    /// unchanged view — rows Rc reused).
+    /// unchanged view — rows Arc reused).
     async fn view_plan(
         &mut self,
         parsed: &ParsedSection,
         pin: Option<&str>,
-        rows: Rc<ViewRows>,
+        rows: Arc<ViewRows>,
         cursor_delta: Option<i32>,
         error: Option<&str>,
         render_ctx: &RenderContext,
@@ -1106,7 +1106,7 @@ impl NodeEntry {
             return Ok(None);
         }
         // Wrap the completer response — memoized on the response ptr so
-        // a handler-cached Rc passes through unchanged (no reconcile;
+        // a handler-cached Arc passes through unchanged (no reconcile;
         // dialog cursor survives).
         let wrap = self.wrap_completion(&rc);
         let (l1, l2) = rc.labels.clone().unwrap_or_else(|| {
@@ -1182,18 +1182,18 @@ impl NodeEntry {
 
     /// Mints the single-slot `ViewRows` for a completer response,
     /// memoized on the response ptr.
-    fn wrap_completion(&mut self, rc: &Rc<CompletionRows>) -> Rc<ViewRows> {
+    fn wrap_completion(&mut self, rc: &Arc<CompletionRows>) -> Arc<ViewRows> {
         if let Some((prev, view)) = &self.completion_wrap {
-            if Rc::ptr_eq(prev, rc) {
-                return Rc::clone(view);
+            if Arc::ptr_eq(prev, rc) {
+                return Arc::clone(view);
             }
         }
-        let resp = Rc::new(crate::node_impl::DataResponse {
+        let resp = Arc::new(crate::node_impl::DataResponse {
             rows: rc.rows.clone(),
             active_ids: Vec::new(),
         });
         let n = resp.rows.len();
-        let view = Rc::new(ViewRows::new(
+        let view = Arc::new(ViewRows::new(
             vec![Some(resp)],
             (0..n as u32)
                 .map(|i| RowRef {
@@ -1204,7 +1204,7 @@ impl NodeEntry {
             HashSet::new(),
             HashMap::new(),
         ));
-        self.completion_wrap = Some((Rc::clone(rc), Rc::clone(&view)));
+        self.completion_wrap = Some((Arc::clone(rc), Arc::clone(&view)));
         view
     }
 
@@ -1216,10 +1216,10 @@ impl NodeEntry {
         &self,
         parsed: &ParsedSection,
         cursor_pos: usize,
-    ) -> Result<Rc<CompletionRows>, DataError> {
+    ) -> Result<Arc<CompletionRows>, DataError> {
         let pa = &parsed.path_args;
         let empty = || {
-            Ok(Rc::new(CompletionRows {
+            Ok(Arc::new(CompletionRows {
                 rows: Vec::new(),
                 labels: None,
                 match_indices: None,
@@ -1303,7 +1303,7 @@ impl NodeEntry {
                     }
                     Some(map)
                 };
-                Ok(Rc::new(CompletionRows {
+                Ok(Arc::new(CompletionRows {
                     rows,
                     labels: None,
                     match_indices,
@@ -1406,10 +1406,10 @@ impl NodeEntry {
         rendered: Vec<Row>,
         match_by_rank: Vec<crate::fuzzy::MatchIndices>,
         word: &str,
-    ) -> Rc<CompletionRows> {
+    ) -> Arc<CompletionRows> {
         let all_exact = !rendered.is_empty() && rendered.iter().all(|r| r.id == word);
         if rendered.is_empty() || all_exact {
-            return Rc::new(CompletionRows {
+            return Arc::new(CompletionRows {
                 rows: Vec::new(),
                 labels: None,
                 match_indices: None,
@@ -1421,7 +1421,7 @@ impl NodeEntry {
                 indices.insert(idx, fm);
             }
         }
-        Rc::new(CompletionRows {
+        Arc::new(CompletionRows {
             rows: rendered,
             labels: None,
             match_indices: Some(indices),
@@ -1609,6 +1609,7 @@ mod tests {
         CONFIRM_ACCEPT, CONFIRM_ACCEPT_LABEL, CONFIRM_CANCEL, CONFIRM_CANCEL_LABEL,
     };
     use std::rc::Rc;
+    use std::sync::Arc;
 
     /// A trivial command node: returns a fixed set of rows.
     struct CmdNode {
@@ -1635,7 +1636,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for CmdNode {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: self.rows.clone(),
                 active_ids: self.active.clone(),
             }))
@@ -1658,7 +1659,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for LeafNode {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: vec![crate::fields::Row::new("leaf")],
                 active_ids: Vec::new(),
             }))
@@ -1679,7 +1680,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for DynamicNode {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: self.rows.clone(),
                 active_ids: Vec::new(),
             }))
@@ -1972,7 +1973,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for EditSpyNode {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: vec![crate::fields::Row::new("x").desc("ex")],
                 active_ids: Vec::new(),
             }))
@@ -2143,7 +2144,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for ConfirmLeaf {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: vec![Row::new(self.row).desc("an action")],
                 active_ids: Vec::new(),
             }))
@@ -2180,8 +2181,8 @@ mod tests {
             &mut self,
             _args: &PathArgs,
             _cursor_pos: usize,
-        ) -> Result<Rc<CompletionRows>, DataError> {
-            Ok(Rc::new(CompletionRows {
+        ) -> Result<Arc<CompletionRows>, DataError> {
+            Ok(Arc::new(CompletionRows {
                 rows: if self.completer {
                     vec![
                         Row::new("alpha").desc("first"),
@@ -2724,7 +2725,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for HeadedRoot {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: self.rows.clone(),
                 active_ids: Vec::new(),
             }))
@@ -3009,7 +3010,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for RecordingLeaf {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: vec![crate::fields::Row::new("action")],
                 active_ids: Vec::new(),
             }))
@@ -3215,7 +3216,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for RewriteLeaf {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: vec![crate::fields::Row::new("rename").desc("rename session")],
                 active_ids: Vec::new(),
             }))
@@ -3334,7 +3335,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for FieldedNode {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: vec![
                     Row::new("m1")
                         .desc("alpha model")
@@ -3755,7 +3756,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for PathLeaf {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: vec![Row::new("pathpick").desc("pick a path")],
                 active_ids: Vec::new(),
             }))
@@ -3765,11 +3766,11 @@ mod tests {
             &mut self,
             _args: &PathArgs,
             _cursor_pos: usize,
-        ) -> Result<Rc<CompletionRows>, DataError> {
+        ) -> Result<Arc<CompletionRows>, DataError> {
             if let Some(m) = &self.err {
                 return Err(DataError { message: m.clone() });
             }
-            Ok(Rc::new(CompletionRows {
+            Ok(Arc::new(CompletionRows {
                 rows: self.rows.clone(),
                 labels: None,
                 match_indices: None,
@@ -3862,7 +3863,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for ParamLeaf {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: vec![Row::new("param").desc("needs an arg")],
                 active_ids: Vec::new(),
             }))
@@ -4007,7 +4008,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl SlashDotNode for RankedFieldsNode {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows: vec![Row::new("run")
                     .field("price_input", Value::Num(1.0))
                     .field("reasoning", Value::Str("chain".into()))

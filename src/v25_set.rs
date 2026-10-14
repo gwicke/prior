@@ -8,8 +8,6 @@
 //! Leaf settings (int, freetext) return their value directly in `data()`.
 use std::sync::Arc;
 
-use std::rc::Rc;
-
 use crate::app_state::AppState;
 use crate::settings::{SettingKey, ValueKind, SETTINGS};
 use crate::slashdot_menu::fields::Row;
@@ -37,7 +35,7 @@ impl SlashDotNode for EnumSettingNode {
             .iter()
             .map(|(val, desc)| Row::new(*val).desc(*desc))
             .collect();
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows,
             active_ids: vec![current],
         }))
@@ -69,7 +67,7 @@ impl SlashDotNode for SettingLeafNode {
         let rows = vec![Row::new(meta.name)
             .desc(meta.description)
             .field("value", crate::slashdot_menu::value::Value::Str(val))];
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows,
             active_ids: Vec::new(),
         }))

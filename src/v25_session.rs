@@ -8,8 +8,6 @@
 //! coupled to `SessionListNode`.
 use std::sync::Arc;
 
-use std::rc::Rc;
-
 use crate::app_state::AppState;
 use crate::session::repo::SessionRepo;
 use crate::session::Session;
@@ -197,7 +195,7 @@ pub struct SessionListingNode;
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionListingNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("session").desc("list, rename, resume, fork, or delete sessions")],
             active_ids: Vec::new(),
         }))
@@ -323,7 +321,7 @@ impl SlashDotNode for SessionListNode {
             vec![current_id]
         };
 
-        Ok(Rc::new(DataResponse { rows, active_ids }))
+        Ok(Arc::new(DataResponse { rows, active_ids }))
     }
 
     fn columns(&self) -> Vec<ColumnDef> {
@@ -463,13 +461,13 @@ impl SlashDotNode for SessionResumeNode {
         // Guard: hidden for the current session.
         if let Some(sid) = drilled_session_id(path_args) {
             if sid == self.app_state.current_session_id() {
-                return Ok(Rc::new(DataResponse {
+                return Ok(Arc::new(DataResponse {
                     rows: Vec::new(),
                     active_ids: Vec::new(),
                 }));
             }
         }
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("resume").desc("continue the session")],
             active_ids: Vec::new(),
         }))
@@ -554,7 +552,7 @@ pub struct SessionForkNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionForkNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("fork").desc("branch from this point")],
             active_ids: Vec::new(),
         }))
@@ -608,7 +606,7 @@ pub struct SessionRenameNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionRenameNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("rename").desc("rename the session")],
             active_ids: Vec::new(),
         }))
@@ -697,7 +695,7 @@ pub struct SessionDeleteNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionDeleteNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![Row::new("delete").desc("delete from disk")],
             active_ids: Vec::new(),
         }))

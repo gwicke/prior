@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 // --- Cache generation counter ---
 // Bumped every time the catalog cache is refreshed. The v2.5 ModelNode uses
-// this to avoid rebuilding its `Rc<DataResponse>` when the underlying data
-// hasn't changed (enables the engine's `Rc::ptr_eq` freshness check).
+// this to avoid rebuilding its `Arc<DataResponse>` when the underlying data
+// hasn't changed (enables the engine's `Arc::ptr_eq` freshness check).
 
 static CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
 

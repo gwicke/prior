@@ -20,8 +20,8 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::path_complete::{completable, listing_stale, FileCompleter};
@@ -100,9 +100,9 @@ pub struct PromptCompletion {
     /// Dialog cursor + row-line cache (engine-owned, like slash).
     view: RowView,
     /// Word → rows → view: the wrap memo. Keeps the same
-    /// `Rc<ViewRows>` for an unchanged word, so `plan` skips the
+    /// `Arc<ViewRows>` for an unchanged word, so `plan` skips the
     /// cursor reconcile across passive frames.
-    last: Option<(String, Rc<CompletionRows>, Rc<ViewRows>)>,
+    last: Option<(String, Arc<CompletionRows>, Arc<ViewRows>)>,
     tx: Sender<String>,
     rx: Receiver<(String, CompletionRows)>,
     /// Word whose request is in flight (dedupe: never re-sent).
@@ -219,10 +219,10 @@ impl PromptCompletion {
                     }
                     if empty {
                         // Exact / nothing left to complete: no dialog.
-                        self.last = Some((w, Rc::new(rows), ViewRows::of(Vec::new())));
+                        self.last = Some((w, Arc::new(rows), ViewRows::of(Vec::new())));
                         self.view.reset();
                     } else {
-                        let rc = Rc::new(rows);
+                        let rc = Arc::new(rows);
                         let vrows = if let Some(ref match_indices) = rc.match_indices {
                             // Convert from row index to RowRef key
                             let mut map = HashMap::new();
@@ -293,7 +293,7 @@ impl PromptCompletion {
         let show = word.as_ref().and_then(|(r, w)| {
             self.last.as_ref().and_then(|(lw, rc, vrows)| {
                 (lw == w && !rc.rows.is_empty())
-                    .then(|| (r.clone(), rc.labels.clone(), Rc::clone(vrows)))
+                    .then(|| (r.clone(), rc.labels.clone(), Arc::clone(vrows)))
             })
         });
         match key {

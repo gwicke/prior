@@ -5,8 +5,6 @@
 //! point and breaks.
 use std::sync::Arc;
 
-use std::rc::Rc;
-
 use crate::app_state::AppState;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, SubmitResult,
@@ -19,7 +17,7 @@ pub struct QuitNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for QuitNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("quit").desc("quit the session")],
             active_ids: Vec::new(),
         }))

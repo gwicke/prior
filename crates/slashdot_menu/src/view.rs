@@ -2,13 +2,12 @@
 //! cut (doc/slashdot/arg_and_modifier_autocomplete.md).
 //!
 //! `ViewRows` is the single input: source rows + display order + active
-//! markers behind one Rc, minted by the content side (rows pipeline or
+//! markers behind one Arc, minted by the content side (rows pipeline or
 //! completer wrap). `RowView` owns the cursor and the row-line render
 //! cache and assembles `RenderPlan`s. The render side never sees how
 //! rows are stored: it mints `iter()`.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::fields::ColumnDef;
@@ -19,12 +18,12 @@ use crate::render::{LogicalLine, RenderPlan};
 use crate::table::{display_width, highlight_matches};
 
 /// The view's single input: source rows + display order + markers,
-/// bundled behind one Rc so "data OR query OR typed input changed"
+/// bundled behind one Arc so "data OR query OR typed input changed"
 /// collapses to one ptr_eq signal. Minted content-side only — fields
 /// private: storage (slots / RowRef / id set) is an implementation
 /// detail the render side never sees.
 pub struct ViewRows {
-    slots: Vec<Option<Rc<DataResponse>>>,
+    slots: Vec<Option<Arc<DataResponse>>>,
     order: Vec<RowRef>,
     active_ids: HashSet<String>,
     /// Per-row match indices for fuzzy highlighting: RowRef → (field_name → byte indices).
@@ -35,7 +34,7 @@ pub struct ViewRows {
 impl ViewRows {
     /// Content-side constructor (rows pipeline / completer wrap only).
     pub(crate) fn new(
-        slots: Vec<Option<Rc<DataResponse>>>,
+        slots: Vec<Option<Arc<DataResponse>>>,
         order: Vec<RowRef>,
         active_ids: HashSet<String>,
         match_indices: HashMap<RowRef, HashMap<String, Vec<usize>>>,
@@ -50,7 +49,7 @@ impl ViewRows {
 
     /// Content-side constructor without match indices (backward compatible).
     pub(crate) fn new_empty_match(
-        slots: Vec<Option<Rc<DataResponse>>>,
+        slots: Vec<Option<Arc<DataResponse>>>,
         order: Vec<RowRef>,
         active_ids: HashSet<String>,
     ) -> Self {
@@ -65,13 +64,13 @@ impl ViewRows {
     /// Completion source → view: one slot, identity order, no active
     /// markers. The public entry for a completer's `Vec<Row>` (host
     /// prose completion and the engine's `wrap_completion` shape).
-    pub fn of(rows: Vec<Row>) -> Rc<ViewRows> {
+    pub fn of(rows: Vec<Row>) -> Arc<ViewRows> {
         let n = rows.len();
-        let resp = Some(Rc::new(DataResponse {
+        let resp = Some(Arc::new(DataResponse {
             rows,
             active_ids: Vec::new(),
         }));
-        Rc::new(ViewRows::new_empty_match(
+        Arc::new(ViewRows::new_empty_match(
             vec![resp],
             (0..n as u32)
                 .map(|i| RowRef {
@@ -87,13 +86,13 @@ impl ViewRows {
     pub fn of_with_match_indices(
         rows: Vec<Row>,
         match_indices: HashMap<RowRef, HashMap<String, Vec<usize>>>,
-    ) -> Rc<ViewRows> {
+    ) -> Arc<ViewRows> {
         let n = rows.len();
-        let resp = Some(Rc::new(DataResponse {
+        let resp = Some(Arc::new(DataResponse {
             rows,
             active_ids: Vec::new(),
         }));
-        Rc::new(ViewRows::new(
+        Arc::new(ViewRows::new(
             vec![resp],
             (0..n as u32)
                 .map(|i| RowRef {
@@ -140,8 +139,10 @@ struct RenderCache {
     table_header: Option<LogicalLine>,
     /// `Arc` because this is the *plan's* rows, which a host holds in a frame
     /// element — and elements are `Send + Sync` (stashed in the draw cache
-    /// behind a `Mutex`). `ViewRows`' own slots stay `Rc`: they never leave
-    /// this thread.
+    /// behind a `Mutex`). `ViewRows`' slots are `Arc` for the same reason:
+    /// the whole handle chain is `Arc` (step 4h-d), so a view handle can
+    /// ride into an element without smuggling a non-`Send` `Rc` across the
+    /// boundary.
     rows: Arc<Vec<LogicalLine>>,
     active_rows: Vec<usize>,
 }
@@ -188,7 +189,7 @@ pub struct ViewPlan {
 
 pub struct RowView {
     /// Last view passed to plan; ptr-diff vs incoming = dirty.
-    last_view: Option<Rc<ViewRows>>,
+    last_view: Option<Arc<ViewRows>>,
     // --- cursor (per view; pub(crate) for cross-module tests) ---
     pub(crate) cursor_id: Option<String>,
     pub(crate) cursor_idx: usize,
@@ -222,17 +223,17 @@ impl RowView {
     /// is ptr/context driven and internal. `view` is taken by value
     /// (stored as `last_view`); the returned `cursor_row` covers
     /// drill/expand — callers need no second call.
-    pub fn plan(&mut self, view: Rc<ViewRows>, req: &ViewRequest<'_>) -> ViewPlan {
+    pub fn plan(&mut self, view: Arc<ViewRows>, req: &ViewRequest<'_>) -> ViewPlan {
         // 1. View changed → cursor reconcile (today's seed_or_keep).
         let changed = match &self.last_view {
-            Some(prev) => !Rc::ptr_eq(prev, &view),
+            Some(prev) => !Arc::ptr_eq(prev, &view),
             None => true,
         };
         if changed {
             self.reconcile(&view, req.seed_id);
         }
         // 2. Pin (§5.1 restore — applies even with no view change, which
-        //    is what keeps restore cheap: memo hit ⇒ same Rc ⇒ no
+        //    is what keeps restore cheap: memo hit ⇒ same Arc ⇒ no
         //    reconcile ⇒ pin alone moves the cursor).
         if let Some(id) = req.pin {
             self.cursor_id = Some(id.to_string());
@@ -254,7 +255,7 @@ impl RowView {
             self.rebuild_rows(&view, req.columns, req.render_ctx);
             self.last_render_ctx = req.render_ctx;
         }
-        self.last_view = Some(Rc::clone(&view));
+        self.last_view = Some(Arc::clone(&view));
         // 5. Assemble.
         let selected = if view.is_empty() {
             None
@@ -450,16 +451,16 @@ impl RowView {
 mod tests {
     use super::*;
 
-    fn resp(rows: Vec<Row>) -> Option<Rc<DataResponse>> {
-        Some(Rc::new(DataResponse {
+    fn resp(rows: Vec<Row>) -> Option<Arc<DataResponse>> {
+        Some(Arc::new(DataResponse {
             rows,
             active_ids: Vec::new(),
         }))
     }
 
-    fn view_of(rows: Vec<Row>) -> Rc<ViewRows> {
+    fn view_of(rows: Vec<Row>) -> Arc<ViewRows> {
         let n = rows.len();
-        Rc::new(ViewRows::new(
+        Arc::new(ViewRows::new(
             vec![resp(rows)],
             (0..n as u32)
                 .map(|i| crate::node_entry::RowRef {
@@ -479,7 +480,7 @@ mod tests {
         }
     }
 
-    fn rows3() -> Rc<ViewRows> {
+    fn rows3() -> Arc<ViewRows> {
         view_of(vec![Row::new("a"), Row::new("b"), Row::new("c")])
     }
 
@@ -495,7 +496,7 @@ mod tests {
     fn delta_moves_cursor() {
         let mut v = RowView::new();
         let view = rows3();
-        v.plan(Rc::clone(&view), &req());
+        v.plan(Arc::clone(&view), &req());
         let mut r = req();
         r.cursor_delta = Some(2);
         let out = v.plan(view, &r);
@@ -509,10 +510,10 @@ mod tests {
         let view = rows3();
         let mut r = req();
         r.cursor_delta = Some(1);
-        v.plan(Rc::clone(&view), &r);
-        // Same Rc handed again: cursor must survive even though a naive
+        v.plan(Arc::clone(&view), &r);
+        // Same Arc handed again: cursor must survive even though a naive
         // reconcile (!user_moved path is skipped — user_moved is true).
-        let out = v.plan(Rc::clone(&view), &req());
+        let out = v.plan(Arc::clone(&view), &req());
         assert_eq!(out.plan.selected, Some(1));
     }
 
@@ -540,20 +541,20 @@ mod tests {
     fn pin_forces_cursor_without_view_change() {
         let mut v = RowView::new();
         let view = rows3();
-        v.plan(Rc::clone(&view), &req());
+        v.plan(Arc::clone(&view), &req());
         let mut r = req();
         r.pin = Some("c");
-        let out = v.plan(view, &r); // identical Rc — pin still applies
+        let out = v.plan(view, &r); // identical Arc — pin still applies
         assert_eq!(out.plan.selected, Some(2));
     }
 
     #[test]
     fn active_rows_resolved_through_iterator() {
-        let slots = vec![Some(Rc::new(DataResponse {
+        let slots = vec![Some(Arc::new(DataResponse {
             rows: vec![Row::new("a"), Row::new("b")],
             active_ids: vec!["b".to_string()],
         }))];
-        let view = Rc::new(ViewRows::new(
+        let view = Arc::new(ViewRows::new(
             slots,
             vec![
                 crate::node_entry::RowRef {

@@ -2,7 +2,6 @@
 //!
 //! Leaf node: header() shows session stats; submit() closes the menu.
 
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::app_state::AppState;
@@ -17,7 +16,7 @@ pub struct StatNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for StatNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("stat")
                 .desc("session stats: context window, usage, cost, cache hit")],
             active_ids: Vec::new(),
