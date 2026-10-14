@@ -12,7 +12,6 @@
 
 use super::SessionUsage;
 use crate::model_catalog;
-use crate::output::StatusText;
 use rig_core::message::{Message, UserContent};
 
 /// Session-level metadata shown in the `/stat` overlay header.
@@ -118,8 +117,49 @@ pub fn resolved_context_limit(app_state: &crate::app_state::AppState) -> Option<
         .filter(|max| *max > 0)
 }
 
+/// The status line's content, after shaping and before the fit: what names the
+/// session, and the model group as separate fields. [`status_text`] below
+/// builds this from the raw [`BarStatus`]; the fit (`status_bar`) turns it
+/// into a row at a width. Both halves run inside the bar's own render (step
+/// 4f-a).
+///
+/// **Data, not drawing, and deliberately not the rendered bar.** Nothing here
+/// needs to know how wide the terminal is, which is what lets the two halves
+/// live on opposite sides of the `agent` → drawing-layer seam instead of the
+/// width being passed in from the layer that has no business knowing it.
+///
+/// The group's fields are kept separate — rather than pre-joined into one
+/// string — because a narrow terminal has to give up **whole** fields, from the
+/// right, and a joined string can only be cut mid-word. The shaping order is
+/// that drop order, so it is carried here rather than re-decided at the fit.
+#[derive(Default, Clone)]
+pub struct StatusText {
+    /// The session name, or its opening message standing in for it.
+    pub name: String,
+    /// The model group, in the order a narrow terminal should give it up.
+    pub group: Vec<String>,
+}
+
+impl StatusText {
+    /// Whether there is a bar to draw at all: both fields empty means off.
+    ///
+    /// Tested on the **stored content**, never on the rendered bar — a rendered
+    /// bar is a full-width row, so it is never empty even when there is nothing
+    /// to say, and testing *it* would paint a blank bar where the status is
+    /// supposed to be off.
+    ///
+    /// One definition for every path that asks: the compose-side presence
+    /// check (`repl::compose_area`, which must not reserve a row for an
+    /// off bar) and the bar's own render (the bar element, which must not
+    /// draw one). Two answers to "is there a status?" is how the two end up
+    /// disagreeing about their own existence.
+    pub(crate) fn is_off(&self) -> bool {
+        self.name.is_empty() && self.group.is_empty()
+    }
+}
+
 /// The shaping half of the bar's drawing: raw [`BarStatus`] to the shaped pair
-/// `output::status_bar` fits — the name (session name, else the opening
+/// `status_bar` fits — the name (session name, else the opening
 /// message's preview) and the model group in drop order.
 ///
 /// Run by the bar's own render (step 4f-a), which is why it takes the raw
