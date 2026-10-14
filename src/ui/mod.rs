@@ -9,6 +9,11 @@
 //! the dialog is session state owned by the REPL and composed by the very same
 //! [`overlay_elements`] the slash menu uses
 //! ([`doc/confirm_as_menu_261002.md`](../../doc/confirm_as_menu_261002.md)).
+//!
+//! [`bar`] is the status bar: the element and the fit that turns the shaped
+//! data into a row (step 4h-c).
+
+pub(crate) mod bar;
 
 use crate::render::{pad_row, Element, RenderElement, Rendered, RowAsk};
 use crate::slashdot_menu::render::{

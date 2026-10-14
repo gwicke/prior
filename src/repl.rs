@@ -20,7 +20,6 @@ use crate::content::Content;
 use crate::draw::{el_if_short, ApplyPolicy};
 use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
-use crate::output::status;
 #[cfg(test)]
 use crate::render::live_budget;
 /// The input element's data contract lives in `slashdot_tui` (beside
@@ -31,6 +30,7 @@ use crate::render::{allocate, window, Element, RenderElement, Rendered, RowAsk};
 use crate::render::{render, Frame};
 use crate::session::SessionTreeNode;
 use crate::termio::InputEvent;
+use crate::ui::bar::status;
 use crossterm::event::{self, KeyCode, KeyModifiers};
 use tokio::sync::mpsc::UnboundedReceiver;
 

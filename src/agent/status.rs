@@ -2,7 +2,7 @@
 //! transient status line under each content block, and the `/stat` overlay.
 //!
 //! Both are pure. [`status_text`] shapes a [`BarStatus`] push (raw facts) into
-//! the pair `output::status_bar` fits — both halves run inside the bar's own
+//! the pair `ui::bar::status_bar` fits — both halves run inside the bar's own
 //! render (step 4f-a); [`session_stats_lines`] takes the session's stored
 //! facts and returns lines. Neither reads a store or holds state — the
 //! caller resolves the context window ([`resolved_context_limit`]) and the
@@ -56,7 +56,7 @@ pub struct SessionStatsInfo {
 /// never as shaped text: the push stores this, and the bar element pulls it and
 /// runs both halves of the drawing in its own render — the shaping
 /// ([`status_text`]: name fallback to the opening-message preview, the field
-/// list, the drop order) and the fit (`output::status_bar`). A mid-turn figure
+/// list, the drop order) and the fit (`ui::bar::status_bar`). A mid-turn figure
 /// (context tokens) is then current at the next paint without a re-shaping
 /// push, and neither half can be applied without the other.
 ///
@@ -119,14 +119,14 @@ pub fn resolved_context_limit(app_state: &crate::app_state::AppState) -> Option<
 
 /// The status line's content, after shaping and before the fit: what names the
 /// session, and the model group as separate fields. [`status_text`] below
-/// builds this from the raw [`BarStatus`]; the fit (`status_bar`) turns it
-/// into a row at a width. Both halves run inside the bar's own render (step
-/// 4f-a).
+/// builds this from the raw [`BarStatus`]; the fit (`ui::bar::status_bar`)
+/// turns it into a row at a width. Both halves run inside the bar's own
+/// render (step 4f-a).
 ///
 /// **Data, not drawing, and deliberately not the rendered bar.** Nothing here
 /// needs to know how wide the terminal is, which is what lets the two halves
-/// live on opposite sides of the `agent` → drawing-layer seam instead of the
-/// width being passed in from the layer that has no business knowing it.
+/// live on opposite sides of the `agent` → `ui` seam instead of the width
+/// being passed in from the layer that has no business knowing it.
 ///
 /// The group's fields are kept separate — rather than pre-joined into one
 /// string — because a narrow terminal has to give up **whole** fields, from the
@@ -243,14 +243,14 @@ mod status_bar_tests {
     use super::{message_preview, status_text, BarStatus};
     // The separator the fit actually used, not a copy of the string: these tests
     // are about where the fit put it, so the constant has to be the real one.
-    use crate::output::BAR_SEPARATOR as SEPARATOR;
+    use crate::ui::bar::BAR_SEPARATOR as SEPARATOR;
 
     /// The whole bar: the raw push shaped and fitted — exactly the two calls
     /// the bar's own render makes (step 4f-a), spelled out here so the tests
     /// can pass borrowed literals where the store carries owned data.
     ///
     /// Every test here is really about the *pair* — `status_text` builds the
-    /// fields and `output::status_bar` fits them to a width — so they go through
+    /// fields and `ui::bar::status_bar` fits them to a width — so they go through
     /// one seam-crossing helper rather than each spelling out the two calls. They
     /// live here rather than beside `status_bar` because most of them are as much
     /// about `BarStatus`'s data (which field is dropped first, what an unknown
@@ -267,7 +267,7 @@ mod status_bar_tests {
             first_message: first_message.map(str::to_string),
             ..m
         };
-        crate::output::status_bar(&status_text(&status), width, streaming)
+        crate::ui::bar::status_bar(&status_text(&status), width, streaming)
     }
 
     /// A [`BarStatus`] for the tests, identity fields unset — the `bar` helper
