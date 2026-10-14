@@ -652,9 +652,10 @@ impl RenderManager {
 
     /// Re-anchor the live-screen cache to the real cursor (DSR): the query
     /// goes through `termio` — the sole stdin owner pauses around the reply
-    /// (step 2 commit C) — and the answer syncs the draw cache. The frame
-    /// verb's home since 4f-b (what `Output::cursor_row` forwarded); the
-    /// query itself moves inside `TermIO` in 4g.
+    /// (step 2 commit C), so it is answered *inside* the terminal layer as
+    /// the design's §TermIO asks — and the answer syncs the draw cache.
+    /// The frame verb's home since 4f-b; the `Output::cursor_row` forward
+    /// that used to reach it died with the verb in 4g-a.
     pub(crate) fn cursor_row(&mut self) -> usize {
         let row = crate::termio::query_cursor_row();
         self.draw.reanchor_to_cursor(row)
