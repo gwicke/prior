@@ -20,7 +20,7 @@ use std::io::{self, Write};
 use crate::ansi::{HIDE_CURSOR, SHOW_CURSOR};
 use crate::render::Frame;
 use crate::slashdot_menu::table::display_width;
-use crate::termio::TermSize;
+use crate::termio::{TermHandles, TermIO, TermSize};
 use tokio::sync::watch;
 
 /// How [`plan_apply`] treats a frame's screen region (plan §2).
@@ -705,12 +705,16 @@ fn erase_down(s: &mut String, h: usize) {
 /// encapsulated one layer up. Methods that write or advance therefore take
 /// `&mut self`.
 pub(crate) struct Draw {
-    /// Where the bytes go. Defaults to stdout. Content bytes never name
-    /// it directly — they arrive through the manager's `ContentWrite`
-    /// hand-off (step 4d) — and the old writer-swap capture retired with
-    /// that split: a test that needs the byte edge swaps a recording sink
-    /// in here (`output.rs`'s `Sink`; `TermIO::recording()` takes the
-    /// seam wholesale in 4f).
+    /// The terminal backend (4f-e): owned here, the design's
+    /// `Draw { term_io, cache }` — the whole reason the mode guard, the size
+    /// watch and the caps reached the layers above through the manager's
+    /// front door. Its `write` is not wired yet: until 4f-e-b the
+    /// transitional `writer` below still carries the bytes.
+    pub(crate) term_io: TermIO,
+    /// Transitional (4f-e-a): where the bytes go until 4f-e-b re-points
+    /// every write at `term_io.write(Stream::Main, …)` and this field dies.
+    /// Content bytes never name it directly — they arrive through the
+    /// manager's `ContentWrite` hand-off (step 4d).
     pub(crate) writer: Box<dyn Write + Send>,
     /// The size watch (step 2 commit A): the latest `TermSize`, without a
     /// per-call terminal query. The same channel the manager holds — a
@@ -723,13 +727,53 @@ pub(crate) struct Draw {
 }
 
 impl Draw {
-    pub(crate) fn new(size: watch::Receiver<TermSize>) -> Self {
+    pub(crate) fn new(size: watch::Receiver<TermSize>, term_io: TermIO) -> Self {
         let term_h = size.borrow().height;
         Draw {
+            term_io,
             writer: Box::new(io::stdout()),
             cache: DrawCache::new(term_h),
             size,
         }
+    }
+
+    // --- the TermIO pass-throughs (design §3: content / UI never name it) --
+
+    /// The channel handles, once at setup — the render manager's forward, so
+    /// the pause-gated entry-DSR window in `Interactive::new` stays the one
+    /// place `handles()` runs.
+    pub(crate) fn handles(&mut self) -> TermHandles {
+        self.term_io.handles()
+    }
+
+    /// Raw mode off (4f-e-c adds the reader-stop half). Idempotent; a no-op
+    /// on Plain.
+    pub(crate) fn suspend(&self) {
+        let _ = self.term_io.suspend();
+    }
+
+    /// Raw mode on — the reverse of [`Self::suspend`].
+    pub(crate) fn resume(&self) {
+        let _ = self.term_io.resume();
+    }
+
+    /// Whether this terminal flips raw mode at all (TermIO's Tty, not Plain)
+    /// — what `$EDITOR` and the window pump ask before expecting a mode
+    /// turnover.
+    pub(crate) fn is_tty(&self) -> bool {
+        self.term_io.is_tty()
+    }
+
+    /// Publish a settled size on the instance's watch (parked-key drains,
+    /// defensive `Resize` arms).
+    pub(crate) fn set_size(&self, size: TermSize) {
+        self.term_io.set_size(size);
+    }
+
+    /// Probe + publish the live terminal size (the prompt loop's loop-top
+    /// refresh, since 4f-e-a under TermIO's roof).
+    pub(crate) fn probe_size(&self) -> TermSize {
+        self.term_io.probe_size()
     }
 
     /// Apply `frame` at the cursor under `policy` (plan §4.3–4.4): plan the

@@ -19,7 +19,7 @@
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, KeyModifiers};
 use picocode::confirm::{ConfirmBridge, ConfirmDecision};
 use picocode::draw::ApplyPolicy;
-use picocode::output::{term_height, term_width};
+use picocode::termio::TermIO;
 use picocode::ConsoleOutput;
 
 #[tokio::main]
@@ -30,11 +30,20 @@ async fn main() {
 
     // Exercise the real raw-mode confirm path (mirrors the REPL's terminal).
     let _ = crossterm::terminal::enable_raw_mode();
-    let out = ConsoleOutput::new(picocode::settings::default_show_reasoning_handle());
-    // The frame dims `Output::frame_size` used to answer (4f-c): the watched
-    // geometry, read fresh per paint — the same watch `ConsoleOutput`'s
-    // answer came from, so the probe composes exactly what it did before.
-    let dims = || (term_width(), term_height());
+    // Plain is enough for an out-of-crate driver: caps probe the real
+    // streams either way, no reader is wanted (the probe reads stdin
+    // itself), and the frames apply through the hub's writer.
+    let out = ConsoleOutput::new(
+        TermIO::plain(),
+        picocode::settings::default_show_reasoning_handle(),
+    );
+    // The frame dims `Output::frame_size` used to answer (4f-c), now the
+    // content handle's `frame_size` (4f-e-a retired the free functions):
+    // the watched geometry, read fresh per paint — the same watch
+    // `ConsoleOutput`'s answer came from, so the probe composes exactly
+    // what it did before.
+    let content = out.content();
+    let dims = || content.frame_size();
 
     let mut bridge = ConfirmBridge::new();
     let tool = msg

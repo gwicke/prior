@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use picocode::termio::TermIO;
 use picocode::{config::Config, create_agent, AgentConfig, ConsoleOutput, SettingsStore};
 use std::sync::Arc;
 
@@ -281,15 +282,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (output, content): (Arc<dyn picocode::Output>, Arc<picocode::Content>) = if quiet {
         // Quiet: content's verbs short-circuit through the same handle (the §4
         // content seam), so nothing reaches stdout and `display_error` still
-        // goes to stderr exactly as `QuietOutput` always did.
+        // goes to stderr exactly as `QuietOutput` always did. `with_tap`
+        // builds its own Plain backend — the condition below is exactly what
+        // would have selected one.
         let out: Arc<dyn picocode::Output> = Arc::new(picocode::QuietOutput::new());
         let content = Arc::new(picocode::Content::with_tap(out.clone()));
         (out, content)
     } else {
+        // The terminal backend is constructed **first** (4f-e-a): it probes
+        // the caps, owns the size watch, and moves into `Content::new` →
+        // `Draw`. Tty iff the input is an interactive terminal — the same
+        // condition `Interactive::new` derives `repl` from (a Tty whose
+        // handles are never taken simply never starts the reader, which is
+        // the one-shot recipe/input path).
+        let term_io = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            TermIO::tty()
+        } else {
+            TermIO::plain()
+        };
         // Production: share the `Content` this console already owns, so the
         // config's frame handle and its content handle are one state — and
         // content renders for real, because this `Content`'s tap is `None`.
-        let console = Arc::new(ConsoleOutput::new(show_reasoning_handle.clone()));
+        let console = Arc::new(ConsoleOutput::new(term_io, show_reasoning_handle.clone()));
         let content = console.content();
         let out: Arc<dyn picocode::Output> = console;
         (out, content)

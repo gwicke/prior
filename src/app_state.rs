@@ -457,6 +457,15 @@ impl AppState {
         self.state.lock().config.clone()
     }
 
+    /// The content handle this state's config carries — the same `Arc` the
+    /// loop's applied config holds (clones share it). Setup paths that need
+    /// a geometry read but hold no content — the prompt session's cloned
+    /// size watch, the header context's width (4f-e-a) — go through here
+    /// instead of cloning the whole config.
+    pub(crate) fn content(&self) -> Arc<crate::content::Content> {
+        self.state.lock().config.content.clone()
+    }
+
     // --- settings (durable target; the one copy) ---
 
     /// Read access to the settings store.

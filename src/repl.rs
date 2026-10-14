@@ -710,6 +710,13 @@ pub struct PromptSession {
     /// against. Recomputed every iteration; held here so `handle_key` sees the
     /// same frame that was just painted.
     overlay: ActiveOverlay,
+    /// This session's view of the size watch — a clone of the content
+    /// handle's receiver (4f-e-a: the retired `termio::size()` /
+    /// `output::term_width()` free functions' replacement for the key paths,
+    /// which hold the session and not the content). Same channel, so a
+    /// resize published by the loop-top probe or the reader is what these
+    /// reads see.
+    size: tokio::sync::watch::Receiver<crate::termio::TermSize>,
     /// A gated tool call's confirmation, if one is on screen.
     ///
     /// Not an `ActiveOverlay` variant and not `None`-when-absent by design: a
@@ -774,7 +781,14 @@ impl PromptSession {
             epoch_active: false,
             overlay: ActiveOverlay::None,
             confirm: None,
+            size: app_state.content().size.clone(),
         }
+    }
+
+    /// The current width — the retired `output::term_width` answer (same
+    /// 20-column floor), off the session's cloned receiver.
+    fn term_width(&self) -> usize {
+        self.size.borrow().width.max(20)
     }
 
     /// Open a gated tool call's confirmation.
@@ -876,6 +890,10 @@ impl PromptSession {
     /// both pumps drive one session by reference, and neither may see it split
     /// apart.
     pub(crate) async fn eval(&mut self) -> EvalOutcome {
+        // The watched width for this eval — read before the destructure
+        // below borrows `self` apart (4f-e-a's replacement for the
+        // `output::term_width()` free function in `v25_eval`).
+        let width = self.term_width();
         let Self {
             editor,
             pending_key,
@@ -897,7 +915,7 @@ impl PromptSession {
             let cursor = editor.cursor;
             let result = {
                 let mut handle = Self::slash_handle(menu, epoch_active);
-                Repl::v25_eval(&mut handle, &buf_text, cursor, key).await
+                Repl::v25_eval(&mut handle, &buf_text, cursor, key, width).await
             };
             match result {
                 V25Frame::Continue(plan, prompt) => {
@@ -965,8 +983,10 @@ impl PromptSession {
             // Prose frames: one eval drives the word gate, the debounce, and
             // the dialog. Idle ⇒ no overlay (stateless dismissal: the next
             // frame re-derives from the buffer).
+            // Direct field read: `self` is destructured above, so a method
+            // call would borrow the whole session against the live bindings.
             let ctx = crate::slashdot_menu::RenderContext {
-                term_width: crate::output::term_width().max(1),
+                term_width: self.size.borrow().width.max(20),
             };
             match prose.eval(editor, key, ctx) {
                 crate::prompt_complete::Frame::Idle => ActiveOverlay::None,
@@ -1183,6 +1203,13 @@ impl PromptSession {
         prompt: &str,
         history: &mut History,
     ) -> KeyOutcome {
+        // The watched geometry for this dispatch — the retired
+        // `termio::size()` / `output::term_width()` free functions'
+        // replacement (4f-e-a): one read of this session's cloned receiver,
+        // taken before the destructure below borrows `self` apart. Raw
+        // values, so each use keeps exactly the floor it applied before.
+        let watched = *self.size.borrow();
+        let term_w = self.term_width();
         let Self {
             editor,
             sel,
@@ -1258,14 +1285,12 @@ impl PromptSession {
                         // composition and the same `allocate` the frame will
                         // run. Measured on the rows as the engine wrote them,
                         // which is the unit the rows element windows in.
-                        let cur_h = crate::termio::size().height;
-                        let term_w = crate::output::term_width().max(1);
                         let page = rows_grant(
                             &self.editor,
                             prompt,
                             overlay_elements(overlay, term_w),
                             term_w,
-                            cur_h.max(1),
+                            watched.height.max(1),
                         );
                         let direction = if matches!(key.code, KeyCode::PageDown) {
                             1
@@ -1280,7 +1305,7 @@ impl PromptSession {
                         }
                         return KeyOutcome::Continue;
                     }
-                    let page = crate::termio::size().height.saturating_sub(2).max(1);
+                    let page = watched.height.saturating_sub(2).max(1);
                     let max = opts_len.saturating_sub(1);
                     if matches!(key.code, KeyCode::PageDown) {
                         *sel = (*sel + page).min(max);
@@ -1312,7 +1337,7 @@ impl PromptSession {
                     // Prose dialog: Enter bypasses completion — submit the raw
                     // line (Shift+Enter inserts a newline). Tab is the only
                     // expansion key.
-                    if let Some(a) = Repl::edit_key(key, editor, history, prompt) {
+                    if let Some(a) = Repl::edit_key(key, editor, history, prompt, watched.width) {
                         return KeyOutcome::Action(a);
                     }
                     return KeyOutcome::Continue;
@@ -1331,7 +1356,7 @@ impl PromptSession {
                     // Editing keys pass through in both cases; dismissal is
                     // stateless — the next eval re-derives the dialog from
                     // the buffer.
-                    if let Some(a) = Repl::edit_key(key, editor, history, prompt) {
+                    if let Some(a) = Repl::edit_key(key, editor, history, prompt, watched.width) {
                         return KeyOutcome::Action(a);
                     }
                 }
@@ -1341,7 +1366,7 @@ impl PromptSession {
         // No overlay: normal editing (Tab with no dialog is inert — implicit
         // open means the dialog is already up whenever there is anything to
         // complete).
-        if let Some(a) = Repl::edit_key(key, editor, history, prompt) {
+        if let Some(a) = Repl::edit_key(key, editor, history, prompt, watched.width) {
             return KeyOutcome::Action(a);
         }
         KeyOutcome::Continue
@@ -1506,12 +1531,12 @@ impl Repl {
             // without any state here.
             // The one place that still queries the terminal live: a resize
             // that produced no event has to be caught somewhere, and this is
-            // the loop that runs per keystroke. The answer is *published*
-            // (`set_size`) so every reader below and around consumes the
-            // watch rather than a private query.
-            let (cur_w_u16, cur_h_u16) = crossterm::terminal::size().unwrap_or((80, 24));
-            let cur_h = cur_h_u16 as usize;
-            let cur_w = cur_w_u16 as usize;
+            // the loop that runs per keystroke. Since 4f-e-a the query
+            // lives under `TermIO`'s roof (`manager.probe_size()`) and its
+            // answer is *published* there too, so every reader below and
+            // around consumes the watch rather than a private query.
+            let cur = content.manager.lock().unwrap().probe_size();
+            let (cur_w, cur_h) = (cur.width, cur.height);
             let (painted_w, painted_h) = content.manager.lock().unwrap().painted_size();
             if cur_w != painted_w || cur_h != painted_h {
                 // Key-triggered repaint after a size change. A *width*
@@ -1535,12 +1560,9 @@ impl Repl {
                 }
                 let _ = content.manager.lock().unwrap().cursor_row();
             }
-            // Keep the watch in sync (covers size changes even without an
-            // explicit Resize event, e.g. on some terminals).
-            crate::termio::set_size(crate::termio::TermSize {
-                width: cur_w,
-                height: cur_h,
-            });
+            // (The watch is already in sync — `probe_size` published as it
+            // answered; the explicit `set_size` call this used to carry
+            // after the compare is gone with it.)
             // --- Eval → outcome → sync → paint, and end the read if that
             // produced an action. The whole sequence lives in `settle`
             // because the turn's `select!` branch runs it too (ui_draw_v2
@@ -1586,7 +1608,7 @@ impl Repl {
                 if let Some(parked) = app_state.take_parked_key() {
                     match parked {
                         InputEvent::Resize(size) => {
-                            crate::termio::set_size(size);
+                            content.manager.lock().unwrap().set_size(size);
                             continue;
                         }
                         e => break Some(e),
@@ -1611,7 +1633,7 @@ impl Repl {
                     // and keep waiting rather than treating it as a key. (The
                     // parked path above is where Resize actually arrives.)
                     Some(InputEvent::Resize(size)) => {
-                        crate::termio::set_size(size);
+                        content.manager.lock().unwrap().set_size(size);
                         continue;
                     }
                     Some(e) => break Some(e),
@@ -1768,6 +1790,9 @@ impl Repl {
         buf: &str,
         cursor_char: usize,
         key: crate::slashdot_menu::HostKey,
+        // The watched width (4f-e-a), read by the caller off its session —
+        // a parameter because this is a static helper with no session.
+        width: usize,
     ) -> V25Frame {
         use crate::slashdot_menu::node_impl::MenuResult;
         // Max rewrites before we call it a cycle. Normal chains are
@@ -1786,7 +1811,7 @@ impl Repl {
                 .unwrap_or(buf.len());
             let cursor = byte_in_buf.saturating_sub(buf.len() - line.len());
             match handle
-                .eval_prompt_with_cursor(&line, key, crate::output::term_width(), cursor)
+                .eval_prompt_with_cursor(&line, key, width, cursor)
                 .await
             {
                 MenuResult::ContinuePrompt(new_prompt) => {
@@ -1853,7 +1878,7 @@ impl Repl {
         }
         let mut menu = crate::v25_menu::build_menu(app_state);
         let mut handle = menu.get_handle();
-        let width = crate::output::term_width();
+        let width = content.width();
         let mut buf = input.to_string();
         // Prompt of the last Continue — the node an Enter acts on. `None`
         // means "derive passively before pressing".
@@ -2029,6 +2054,11 @@ impl Repl {
         editor: &mut LineEditor,
         history: &mut History,
         prompt: &str,
+        // The watched width (4f-e-a): `visual_up`/`visual_down` lay the
+        // buffer out against it. A parameter rather than a session read so
+        // the unit tests drive `edit_key` with no session at all — they pin
+        // 80, the seed every geometry had when the read was global.
+        width: usize,
     ) -> Option<InputAction> {
         match key.code {
             KeyCode::Enter => {
@@ -2106,7 +2136,7 @@ impl Repl {
                 None
             }
             KeyCode::Up => {
-                let w = crate::termio::size().width;
+                let w = width;
                 // Not on the first visual row: this is cursor movement inside a
                 // multi-line line, not recall.
                 if !editor.visual_up(w, prompt) {
@@ -2126,7 +2156,7 @@ impl Repl {
                 None
             }
             KeyCode::Down => {
-                let w = crate::termio::size().width;
+                let w = width;
                 if !editor.visual_down(w, prompt) {
                     // Forward-only: `Down` moves through a walk that `Up` began,
                     // and does nothing at all otherwise. With no walk in progress
@@ -3481,7 +3511,7 @@ mod tests {
     fn recalled_newest() -> (History, LineEditor) {
         let mut h = recall_hist();
         let mut ed = LineEditor::new();
-        Repl::edit_key(up_key(), &mut ed, &mut h, "");
+        Repl::edit_key(up_key(), &mut ed, &mut h, "", 80);
         assert_eq!(ed.text(), "third");
         (h, ed)
     }
@@ -3522,13 +3552,13 @@ mod tests {
         // over a draft, this is the test that has to be re-read.
         let mut h = recall_hist();
         let mut ed = LineEditor::new();
-        Repl::edit_key(up_key(), &mut ed, &mut h, "");
+        Repl::edit_key(up_key(), &mut ed, &mut h, "", 80);
         assert_eq!(
             ed.draft, "",
             "recall starts on an empty line, so nothing to stash"
         );
         ed.set_recalled("second");
-        Repl::edit_key(up_key(), &mut ed, &mut h, "");
+        Repl::edit_key(up_key(), &mut ed, &mut h, "", 80);
         assert_eq!(ed.draft, "");
     }
 
@@ -3543,7 +3573,7 @@ mod tests {
         let mut h = recall_hist();
         let mut editor = LineEditor::from_text("in progress");
         editor.end();
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(
             editor.text(),
             "in progress",
@@ -3563,7 +3593,7 @@ mod tests {
         // (the original reason Up-on-top exists) is preserved.
         let mut h = recall_hist();
         let mut editor = LineEditor::new();
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(
             editor.text(),
             "third",
@@ -3582,11 +3612,11 @@ mod tests {
         // `browsable = text.is_empty() || nav.is_some()`.
         let mut h = recall_hist();
         let mut editor = LineEditor::new();
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "third");
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "second");
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "third");
     }
 
@@ -3600,7 +3630,7 @@ mod tests {
         let (mut h, mut editor) = recalled_newest();
         editor.insert_str(" EDITED");
         assert_eq!(editor.text(), "third EDITED");
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(
             editor.text(),
             "third EDITED",
@@ -3616,7 +3646,7 @@ mod tests {
         let mut h = recall_hist();
         let mut editor = LineEditor::from_text("half-written thought");
         editor.end();
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "half-written thought");
     }
 
@@ -3628,18 +3658,19 @@ mod tests {
         // ends the walk, so the next Down does nothing.
         let mut h = recall_hist();
         let mut editor = LineEditor::new();
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "second");
         Repl::edit_key(
             event::KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
             &mut editor,
             &mut h,
             "",
+            80,
         );
         assert_eq!(editor.text(), "");
         assert!(editor.nav.is_none(), "clearing the line ends the walk");
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(
             editor.text(),
             "",
@@ -3653,7 +3684,7 @@ mod tests {
         // be overwritten by the next `Up` with nothing stashed to recover it.
         let (mut h, mut editor) = recalled_newest();
         editor.insert_str(" EDITED");
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "third EDITED");
     }
 
@@ -3666,7 +3697,7 @@ mod tests {
         // `replace_range` for the prose completion splice).
         let mut h = recall_hist();
         let mut editor = LineEditor::new();
-        Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert!(editor.nav.is_some());
         // Cursor moves are not content writes and must keep the walk alive —
         // this is what lets `Up`/`Down` move the caret inside a recalled
@@ -3688,7 +3719,7 @@ mod tests {
             ("set", 7),
         ] {
             let mut ed = LineEditor::new();
-            Repl::edit_key(up_key(), &mut ed, &mut h, "");
+            Repl::edit_key(up_key(), &mut ed, &mut h, "", 80);
             assert!(ed.nav.is_some(), "{what}: recall to start from");
             match f {
                 1 => ed.insert_str("x"),
@@ -3717,12 +3748,12 @@ mod tests {
         // editor that `read_input` clears on submit now carries the reset.
         let mut h = recall_hist();
         let mut editor = LineEditor::new();
-        Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         // Submit: the buffer is cleared and the line recorded (repl.rs:1707).
         editor.set("");
         h.add("third");
         assert!(editor.nav.is_none());
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "third", "recall starts at the newest entry");
     }
 
@@ -3744,12 +3775,12 @@ mod tests {
         );
         // …and the walk still works: `Up` steps one entry further back.
         h.add("/model");
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "second", "Up still walks the history");
         // `Down` likewise, and back to the newest entry rather than locking.
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "third");
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "/model", "Down reaches the newest entry");
     }
 
@@ -3773,7 +3804,7 @@ mod tests {
         h.add("older line");
         h.add("/model");
         let mut sess = PromptSession::new(None, &batch_state());
-        Repl::edit_key(up_key(), &mut sess.editor, &mut h, "");
+        Repl::edit_key(up_key(), &mut sess.editor, &mut h, "", 80);
         assert_eq!(sess.editor.text(), "/model");
         sess.pending_key = Some(crate::slashdot_menu::HostKey::Tab);
         let outcome = crate::agent::block_on_test(sess.eval());
@@ -3791,7 +3822,7 @@ mod tests {
             "the rewrite must not end the walk"
         );
         // …and history still answers.
-        let _ = Repl::edit_key(up_key(), &mut sess.editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut sess.editor, &mut h, "", 80);
         assert_eq!(sess.editor.text(), "older line", "Up still walks history");
     }
 

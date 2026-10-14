@@ -33,7 +33,7 @@ use crate::output::Output;
 use crate::render::ContentWrite;
 use crate::row_count::RowCounter;
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
-use crate::termio::{Caps, TermSize};
+use crate::termio::{TermIO, TermSize};
 use markdown_stream::{Parser, StreamParser};
 use markdown_terminal::{Renderer, Theme};
 
@@ -56,14 +56,16 @@ pub struct Content {
     /// — nothing here touches the sink. Everything that writes locks this
     /// first.
     pub(crate) manager: Arc<Mutex<crate::render::RenderManager>>,
-    /// This instance's view of the size watch (step 2) — the same channel
-    /// `draw` holds, so the content path's width reads and the frame path's
-    /// geometry cannot disagree. In production a subscriber of the process-wide
-    /// channel; in tests, a private seeded one.
+    /// This instance's view of the size watch — the same channel `draw`
+    /// holds (it came from the same `TermIO`, seeded at construction), so
+    /// the content path's width reads and the frame path's geometry cannot
+    /// disagree. In tests, a private seeded one.
     pub(crate) size: watch::Receiver<TermSize>,
-    /// Per-stream capabilities, probed once (step 2): colour and the reasoning
-    /// routing read this instead of calling `is_terminal()` per site.
-    pub(crate) caps: Caps,
+    /// Per-stream capabilities, probed once at `TermIO` construction
+    /// (4f-e-a): colour and the reasoning routing read this instead of
+    /// calling `is_terminal()` per site — the probe site left content with
+    /// this step.
+    pub(crate) caps: crate::termio::Caps,
     /// Where reasoning goes: `true` = stderr, so a consumer of
     /// `picocode "q" | cat` can drop it (`2>/dev/null`) or merge it (`2>&1`)
     /// without touching stdout. Decided once, in [`Self::new`]. `AtomicBool`
@@ -107,18 +109,34 @@ pub struct Content {
 }
 
 impl Content {
-    /// Build the content half from its per-process inputs: the frame hub (and
-    /// through it the `Draw` sink) and the size watch are created together
-    /// (they share the watch), the caps are probed once, and the renderers
-    /// start blank at a placeholder width.
-    pub(crate) fn new(
+    /// Build the content half from its per-process inputs: the terminal
+    /// backend (4f-e — constructed first at setup, so *it* seeds both facts
+    /// content used to gather itself: the caps it probed, and the size watch
+    /// it owns). The frame hub is built from the same watch and takes the
+    /// `TermIO` under `Draw` — one wiring point, one geometry source; the
+    /// renderers start blank at a placeholder width.
+    pub(crate) fn new(term_io: TermIO, show_reasoning: ShowReasoningHandle) -> Self {
+        let size = term_io.subscribe_size();
+        Self::new_from(term_io, size, show_reasoning)
+    }
+
+    /// [`Self::new`] with the geometry channel chosen by the caller — the
+    /// test seam behind `ConsoleOutput::with_size`, where a privately seeded
+    /// watch replaces the instance's own (the manager and `Draw` read the
+    /// seeded one; publishes to `term_io`'s watch go where they always did
+    /// relative to a pinned test: nowhere the test reads).
+    pub(crate) fn new_from(
+        term_io: TermIO,
         size: watch::Receiver<TermSize>,
         show_reasoning: ShowReasoningHandle,
     ) -> Self {
-        let caps = Caps::probe();
+        let caps = term_io.caps();
         // The hub is born with its geometry and its budget ratio (step 4b):
         // `configure` is the ratio's home, and this is the one wiring point.
-        let manager = Arc::new(Mutex::new(crate::render::RenderManager::new(size.clone())));
+        let manager = Arc::new(Mutex::new(crate::render::RenderManager::new(
+            size.clone(),
+            term_io,
+        )));
         manager
             .lock()
             .unwrap()
@@ -146,13 +164,15 @@ impl Content {
     /// an assertion compares; `QuietOutput` discards them; neither needs a
     /// render stack or a terminal behind it.
     ///
-    /// The geometry is the process-wide size watch, not a private one: with
-    /// the verbs short-circuited there is no rendering to get wrong, and a
-    /// test that needs a pinned width renders through `ConsoleOutput::with_size`
-    /// as it always has.
+    /// The geometry is this instance's own Plain backend, not a private
+    /// watch: with the verbs short-circuited there is no rendering to get
+    /// wrong, and a test that needs a pinned width renders through
+    /// `ConsoleOutput::with_size` as it always has. Plain is the backend a
+    /// tapped content deserves — no reader, no raw mode — and the `Draw`
+    /// underneath it (which no tapped verb reaches) still has a sink to own.
     pub fn with_tap(tap: Arc<dyn Output>) -> Self {
         let mut content = Self::new(
-            crate::termio::subscribe(),
+            TermIO::plain(),
             crate::settings::default_show_reasoning_handle(),
         );
         content.tap = Some(tap);
@@ -169,24 +189,27 @@ impl Content {
     }
 
     /// The size frames are composed and applied for (ui_draw_v2 §9 #3) — the
-    /// watched geometry, floored like [`crate::output::term_width`] /
-    /// [`crate::output::term_height`] (`plan_apply` misbehaves under 20
-    /// columns; an uninitialized geometry must not get there). `frame_size`
-    /// left `Output` in 4f-c: this handle's receiver is the source, the same
-    /// channel `RenderManager::new` clones at construction, so a paint's dims
-    /// and the manager's own view of the geometry cannot disagree.
-    pub(crate) fn frame_size(&self) -> (usize, usize) {
+    /// watched geometry, floored at 20 columns / 1 row (`plan_apply`
+    /// misbehaves under 20 columns; an uninitialized geometry must not get
+    /// there). `frame_size` left `Output` in 4f-c; since 4f-e-a it is also
+    /// the out-of-crate driver's answer (the confirm probe's `dims`, which
+    /// the retired `term_width`/`term_height` free functions used to
+    /// serve), hence `pub`. This handle's receiver is the source, the same
+    /// channel `RenderManager::new` clones at construction, so a paint's
+    /// dims and the manager's own view of the geometry cannot disagree.
+    pub fn frame_size(&self) -> (usize, usize) {
         (self.width(), self.height())
     }
 
-    /// This instance's width: its subscribed watch, with the same 20-column
-    /// floor as the [`crate::output::term_width`] free function.
-    pub(crate) fn width(&self) -> usize {
+    /// This instance's width — the retired `output::term_width` free
+    /// function's answer, now reached through a handle that has one.
+    pub fn width(&self) -> usize {
         self.size.borrow().width.max(20)
     }
 
-    /// This instance's height — symmetric to [`Self::width`].
-    pub(crate) fn height(&self) -> usize {
+    /// This instance's height — symmetric to [`Self::width`] (the retired
+    /// `output::term_height`).
+    pub fn height(&self) -> usize {
         self.size.borrow().height.max(1)
     }
 }

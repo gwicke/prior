@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::app_state::AppState;
 use crate::editor::EditorMode;
-use crate::output;
+
 use crate::slashdot_menu::fields::{ColumnDef, FieldSpec};
 use crate::slashdot_menu::node_impl::{
     CompletionRows, DataError, DataResult, PathArgs, RenderContext, SlashDotNode,
@@ -25,9 +25,14 @@ use crate::slashdot_menu::node_impl::{
 
 /// Render context for driving a node's own `header()` from `edit()` — the
 /// engine's `RenderContext` is not passed through `edit()`.
-pub(crate) fn header_ctx() -> RenderContext {
+///
+/// Width comes off the state's content handle (4f-e-a's replacement for the
+/// `output::term_width()` free function): a real geometry source, not a
+/// process-wide read, so a caller's width and the frames it paints share one
+/// watch.
+pub(crate) fn header_ctx(app_state: &AppState) -> RenderContext {
     RenderContext {
-        term_width: output::term_width(),
+        term_width: app_state.content().width(),
     }
 }
 
@@ -123,7 +128,7 @@ impl SlashDotNode for ListingNode {
     /// `StaticListingNode` has no override, and this host behavior is the
     /// point of the decorator.)
     async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let render_ctx = header_ctx();
+        let render_ctx = header_ctx(&self.app_state);
         let header = self.inner.header(path_args, &render_ctx).await;
         view_header(&self.app_state, &header)
     }

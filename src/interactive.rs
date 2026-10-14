@@ -23,7 +23,7 @@ use crate::params;
 use crate::repl::{History, InputAction, ModelFilter, PromptSession, Repl, ReplCtx};
 use crate::session::repo::JsonlSessionRepo;
 use crate::settings::SettingsStore;
-use crate::termio::{TermHandles, TermIO};
+use crate::termio::TermHandles;
 use crate::tools::set_sandbox;
 use crate::Result;
 
@@ -163,19 +163,15 @@ struct Interactive {
     app_state: Arc<AppState>,
     last_attempted_target: Option<RebuildFingerprint>,
     prompt_session: Option<PromptSession>,
-    /// The terminal backend (step 4a): the closed `TermIO { Tty | Plain }`
-    /// that owns the mode guard, the SIGCONT handler and — on Tty — the sole
-    /// stdin reader. Read here only for its lifetime: it parks in this field
-    /// until a later step of step 4 hands it to the render manager / `Draw`.
-    #[allow(dead_code)]
-    term_io: TermIO,
-    /// The handles `TermIO::handles()` handed out once, at setup (design doc
-    /// §3). `input` is the persistent reader's queue (step 2 commit B):
+    /// The handles `TermIO::handles()` handed out once, at setup (design
+    /// doc §3) — taken through the manager, which has owned `TermIO` under
+    /// `Draw` since 4f-e-a (it is constructed in `main`, before `Content`).
+    /// `input` is the persistent reader's queue (step 2 commit B):
     /// `read_input` consumes it at the prompt, each turn borrows it as
     /// `InTurnInput::keys` — one channel for the process, so a key typed at
     /// the end of a turn lands in the next prompt instead of dying with a
-    /// per-turn queue. `size`/`caret` wait for their consumer (the render
-    /// manager, step 4b).
+    /// per-turn queue. `size`/`caret` are the spare receivers; content and
+    /// the manager took theirs at construction.
     handles: TermHandles,
 }
 
@@ -239,26 +235,11 @@ impl Interactive {
         if use_repl {
             config.confirm_port = Some(confirm_bridge.port.clone());
         }
-        // The terminal backend (step 4a): Tty folds the mode guard, registers
-        // the SIGCONT handler and owns the reader (spawned at `handles()`
-        // below, not here); Plain — piped stdin or `--quiet` — has neither.
-        // Same `use_repl` condition as the REPL itself: Tty iff there is one.
-        let mut term_io = if use_repl {
-            TermIO::tty()
-        } else {
-            TermIO::plain()
-        };
-        // The mode guard goes to its design home first: the manager is the
-        // front door for suspend/resume (§Render), so every former holder —
-        // this loop, the prompt, `$EDITOR`, the back-off pump — reaches raw
-        // mode through content's handle (4f-d). `None` (Plain) leaves the
-        // pass-throughs inert.
-        config
-            .content
-            .manager
-            .lock()
-            .unwrap()
-            .set_mode_guard(term_io.guard());
+        // The terminal backend was constructed first, in `main` (4f-e-a):
+        // Tty iff `use_repl`, already seeded into `Content` (caps, size
+        // watch) and moved under `Draw` on the way in. Nothing here names
+        // `TermIO` — the manager's front door is the whole surface
+        // (`resume`/`suspend`/`is_tty`/`handles`/`probe_size`).
         let repl = use_repl.then_some(Repl);
         if repl.is_some() {
             // Raw-mode entry (idempotent), where `Repl::start` used to do it.
@@ -351,16 +332,15 @@ impl Interactive {
         // un-retried until the target changes — one error per distinct target,
         // not one per cycle while the user navigates back to the menu.
         let last_attempted_target: Option<RebuildFingerprint> = None;
-        // (No slot to publish the guard to since 4f-d: the compact node's
-        // review closure gets at raw mode through `edit_text` → the manager
-        // installed above — the same path every `$EDITOR` takes.)
         // The persistent stdin reader (step 2 commit B): one thread, spawned
-        // once by `TermIO::handles` (raw mode is already on), owning stdin
-        // for the process lifetime. It forwards keys/paste on this channel;
-        // the prompt loop and every turn consume the receiver half. The
-        // reader backs off whenever the main task owns stdin — `$EDITOR`, a
-        // DSR query, or the compaction window — via the output's confirm
-        // gate, the same flag `editor::ReaderHold` raises.
+        // once by `TermIO::handles` — reached through the manager, which has
+        // owned the backend since construction (raw mode is already on),
+        // owning stdin for the process lifetime. It forwards keys/paste on
+        // this channel; the prompt loop and every turn consume the receiver
+        // half. The reader backs off whenever the main task owns stdin —
+        // `$EDITOR`, a DSR query, or the compaction window — via the pause
+        // gate (`termio::PAUSE_GATE`), the same flag `editor::ReaderHold`
+        // raises.
         //
         // The gate is raised *before* `handles()` so the reader starts parked
         // and cannot consume the entry DSR's reply: the draw cache is anchored
@@ -370,7 +350,7 @@ impl Interactive {
         // report before `cursor_row` could read it.
         let handles = if use_repl {
             crate::termio::PAUSE_GATE.store(true, Ordering::SeqCst);
-            let handles = term_io.handles();
+            let handles = config.content.manager.lock().unwrap().handles();
             crate::repl::run_entry_dsr(config.content.as_ref());
             crate::termio::PAUSE_GATE.store(false, Ordering::SeqCst);
             handles
@@ -378,7 +358,7 @@ impl Interactive {
             // Plain (piped/quiet): no reader, and `handles()`' input channel
             // arrives closed — the shape piped mode had when it dropped the
             // sender half, so nothing ever reads it in that mode.
-            term_io.handles()
+            config.content.manager.lock().unwrap().handles()
         };
         // Warm the model catalog cache in the background so the `/model`
         // overlay is populated within a few seconds *without* blocking the
@@ -429,7 +409,6 @@ impl Interactive {
             app_state,
             last_attempted_target,
             prompt_session,
-            term_io,
             handles,
         }
     }

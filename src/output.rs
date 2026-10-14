@@ -17,6 +17,8 @@ use crate::render::{Element, Frame, RenderAt, Rendered};
 #[cfg(test)]
 use crate::settings::ShowReasoning;
 use crate::settings::ShowReasoningHandle;
+use crate::termio::TermIO;
+#[cfg(test)]
 use crate::termio::TermSize;
 
 #[cfg(test)]
@@ -28,7 +30,6 @@ use serde_json::Value;
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use tokio::sync::watch;
 
 #[derive(Debug, PartialEq)]
 pub enum Confirmation {
@@ -431,22 +432,11 @@ pub struct ConsoleOutput {
     pub(crate) content: Arc<Content>,
 }
 
-/// Terminal width in columns, from the size watch (`crate::termio`, step 2
-/// commit A). The 20-column floor is load-bearing: `plan_apply` misbehaves
-/// on a narrower geometry, and an uninitialized one must not get there.
-/// `ConsoleOutput`'s methods read their own subscribed receiver instead —
-/// this free function serves the callers with no output handle (the REPL
-/// loop, `v25_listing_node`).
-pub fn term_width() -> usize {
-    crate::termio::size().width.max(20)
-}
-
-/// Terminal height in rows. Symmetric to [`term_width`] — callers use it to
-/// budget vertical space for pop-up overlays (e.g. reserving room for menu
-/// items below a multi-line header).
-pub fn term_height() -> usize {
-    crate::termio::size().height.max(1)
-}
+// `term_width`/`term_height` (the free functions over the process-wide size
+// watch) died in 4f-e-a with that watch: every caller now reads a handle it
+// already holds — `Content::width`/`height`/`frame_size` (floors unchanged:
+// 20 columns, 1 row), reached through the content handle or, in the REPL
+// key paths, the prompt session's cloned receiver.
 
 #[cfg(test)]
 mod sed_preview_body_tests {
@@ -608,18 +598,13 @@ src/x.rs:9
 }
 
 impl ConsoleOutput {
-    /// The production constructor: subscribes to the process-wide size watch
-    /// and probes the caps once.
-    pub fn new(show_reasoning: ShowReasoningHandle) -> Self {
-        Self::with_geometry(show_reasoning, crate::termio::subscribe())
-    }
-
-    /// The one constructor — everything that is per-process state (the size
-    /// watch, the caps probe) arrives here, so a test can substitute the
-    /// watch via [`Self::with_size`] without forking the rest of the wiring.
-    fn with_geometry(show_reasoning: ShowReasoningHandle, size: watch::Receiver<TermSize>) -> Self {
+    /// The production constructor: the terminal backend (4f-e-a) moves in
+    /// and seeds everything per-process — the caps it probed, the size watch
+    /// content and the manager read, the `Draw` sink — so `TermIO` is
+    /// constructed first, in the caller (`main`).
+    pub fn new(term_io: TermIO, show_reasoning: ShowReasoningHandle) -> Self {
         Self {
-            content: Arc::new(Content::new(size, show_reasoning)),
+            content: Arc::new(Content::new(term_io, show_reasoning)),
         }
     }
 
@@ -632,15 +617,24 @@ impl ConsoleOutput {
     /// A `ConsoleOutput` on a privately seeded size watch — the test
     /// harness's answer to [`Self::new`]. The geometry becomes
     /// per-instance state, so tests that pin a width need no serialization.
+    /// The backend underneath is a sinkhole: these tests pin geometry, not
+    /// bytes, and the byte-edge tests record through `TermIO::recording()`.
     #[cfg(test)]
     pub(crate) fn with_size(show_reasoning: ShowReasoningHandle, size: TermSize) -> Self {
-        Self::with_geometry(show_reasoning, crate::termio::fixed(size))
+        let term_io = TermIO::null();
+        let size = crate::termio::fixed(size);
+        Self {
+            content: Arc::new(Content::new_from(term_io, size, show_reasoning)),
+        }
     }
 }
 
 impl Default for ConsoleOutput {
     fn default() -> Self {
-        Self::new(crate::settings::default_show_reasoning_handle())
+        Self::new(
+            TermIO::plain(),
+            crate::settings::default_show_reasoning_handle(),
+        )
     }
 }
 
@@ -3229,7 +3223,7 @@ mod tests {
         assert_eq!(guess_lang("a/b.py"), "python");
         assert_eq!(guess_lang("x.unknown"), "text");
         // highlighting: colored path keeps the source text and emits ANSI
-        let colored = highlight_code_fg("let x = 1;", "rust", true, term_width());
+        let colored = highlight_code_fg("let x = 1;", "rust", true, 80);
         // ANSI escapes break the literal substring, so strip them first
         let plain = strip_ansi(&colored);
         assert!(
@@ -3239,7 +3233,7 @@ mod tests {
         assert!(colored.contains('\x1b'), "color path must emit ANSI");
         // non-color path returns the line untouched
         assert_eq!(
-            highlight_code_fg("let x = 1;", "rust", false, term_width()),
+            highlight_code_fg("let x = 1;", "rust", false, 80),
             "let x = 1;"
         );
     }
@@ -3416,7 +3410,10 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
 
     #[test]
     fn tmp_repro_separator_blanks() {
-        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        let out = ConsoleOutput::new(
+            TermIO::plain(),
+            crate::settings::default_show_reasoning_handle(),
+        );
         out.begin_response();
         out.begin_capture();
 
@@ -3529,7 +3526,10 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         // The multi-file result is a bare array; it must render as one labelled
         // batch per file — a failure's short ui_view and a success's note — with
         // no aggregate line and no model_view diff leaking into scrollback.
-        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        let out = ConsoleOutput::new(
+            TermIO::plain(),
+            crate::settings::default_show_reasoning_handle(),
+        );
         out.begin_capture();
         out.display_tool_result(
             r#"[{"path":"src/a.rs","result":"Replaced 1 block(s) in ./a.rs"},
@@ -3549,7 +3549,10 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     fn an_array_of_plain_strings_is_not_a_multi_file_result() {
         // Another tool's list must keep its existing rendering; the multi-file
         // branch must not swallow it.
-        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        let out = ConsoleOutput::new(
+            TermIO::plain(),
+            crate::settings::default_show_reasoning_handle(),
+        );
         out.begin_capture();
         out.display_tool_result(r#"["alpha","beta"]"#);
         let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture()));
@@ -3562,7 +3565,10 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         // after a tool block when more text follows, so replay output matches
         // the live path (where each CompletionCall flushes) — the trailing text
         // is separated from the tool-result line by a blank line.
-        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        let out = ConsoleOutput::new(
+            TermIO::plain(),
+            crate::settings::default_show_reasoning_handle(),
+        );
         out.begin_response();
         out.begin_capture();
         out.stream_text("Let me edit.\n");
@@ -3592,7 +3598,10 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     fn write_tool_renders_content_like_read() {
         // Write tool result should render with path header and syntax-highlighted
         // content preview (first 10 lines), matching read_file's rendering.
-        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        let out = ConsoleOutput::new(
+            TermIO::plain(),
+            crate::settings::default_show_reasoning_handle(),
+        );
         out.begin_response();
         out.begin_capture();
 
@@ -3643,7 +3652,7 @@ mod ui_render_scope_tests {
     use crate::settings::default_show_reasoning_handle;
 
     fn render(result: &str) -> String {
-        let out = ConsoleOutput::new(default_show_reasoning_handle());
+        let out = ConsoleOutput::new(TermIO::plain(), default_show_reasoning_handle());
         out.begin_capture();
         out.display_tool_result(result);
         let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture()));

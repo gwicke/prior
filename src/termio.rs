@@ -1,5 +1,6 @@
 //! Terminal I/O — the `TermIO` layer (impl doc
-//! `doc/261003_output_drawing_refactor_impl.md`, step 4a).
+//! `doc/261003_output_drawing_refactor_impl.md`, step 4a; the setup rework,
+//! 4f-e).
 //!
 //! The closed `TermIO { Tty | Plain }` enum is the sole owner of the terminal:
 //! the **Tty** variant folds the former `repl::TermGuard` (raw-mode lifecycle)
@@ -9,19 +10,21 @@
 //! no reader and no raw mode; its channels are closed at construction, the
 //! shape piped mode had when it simply dropped the sender.
 //!
-//! Setup hands out [`TermHandles`] exactly once (`TermIO::handles`): the
-//! `input` channel to the repl, and the `size` / `caret` channels to be
-//! distributed when their consumer exists (the render manager, step 4b).
+//! Constructed first at setup (4f-e, in `main`), before `Content`: it probes
+//! the caps once at construction ([`Self::caps`]) and owns the size watch —
+//! one channel per instance, no process-wide sender. Its receivers feed
+//! content (format width) and the render manager (frame dims) through
+//! [`Self::subscribe_size`]; those who publish ([`Self::set_size`],
+//! [`Self::probe_size`], the reader) write through the same instance, reached
+//! via the render manager's front door once `Draw` owns it.
 //!
-//! Ownership note: the size watch's sender is still process-wide (a
-//! `LazyLock`), because callers like `v25_listing_node` have no handle to
-//! thread through yet; it moves out of the global when the render manager
-//! takes a handle (impl doc, step 4 follow-ups).
+//! Setup hands out [`TermHandles`] exactly once (`TermIO::handles`, called
+//! through the manager once `Draw` holds it): the `input` channel to the
+//! repl, plus fresh `size` / `caret` receivers.
 //!
-//! Not yet here (tracked in the impl doc): the production **writer** —
-//! `write` below exists and the test constructors use it, but `Draw` still
-//! owns the writer bytes flow through — DSR answered inside `TermIO` (4g),
-//! and caps probed at construction.
+//! Not yet here (tracked in the impl doc): DSR answered inside `TermIO`
+//! (4g). Production `write` exists; `Draw` still owns its own writer until
+//! 4f-e-b re-points every byte through here.
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
@@ -31,7 +34,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -82,42 +85,14 @@ impl TermSize {
     }
 }
 
-/// The process-wide size channel. Seeded once from a live query (or the
-/// default); thereafter written by the resize handlers — the in-flight
-/// reader on `Event::Resize`, the parked-key path, and the prompt loop's
-/// per-iteration probe (which catches a resize that produced no event) —
-/// and read by the renderers through a subscribed receiver.
-static SIZE: LazyLock<watch::Sender<TermSize>> =
-    LazyLock::new(|| watch::channel(TermSize::probe()).0);
+// The per-instance size watch lives on the variant structs below (one channel
+// per `TermIO`, seeded from [`TermSize::probe`] at construction); its sender
+// methods are [`TermIO::set_size`] / [`TermIO::subscribe_size`] /
+// [`TermIO::probe_size`]. The process-wide `LazyLock` channel these used to
+// wrap died in 4f-e.
 
-/// Publish a new terminal size. A no-op when the size did not change, so a
-/// steady-state resize storm does not wake subscribers for nothing.
-pub fn set_size(size: TermSize) {
-    SIZE.send_if_modified(|current| {
-        if *current == size {
-            false
-        } else {
-            *current = size;
-            true
-        }
-    });
-}
-
-/// The latest published size. Never blocks, never queries the terminal —
-/// every caller gets the same answer, which is the whole point of replacing
-/// the global.
-pub fn size() -> TermSize {
-    *SIZE.borrow()
-}
-
-/// A receiver on the process-wide channel — what `ConsoleOutput` and `Draw`
-/// hold so a resize reaches them without another query.
-pub fn subscribe() -> watch::Receiver<TermSize> {
-    SIZE.subscribe()
-}
-
-/// A private watch seeded at `size`: the test harness's stand-in for
-/// [`subscribe`], so a test's geometry is per-instance state and needs no
+/// A private watch seeded at `size`: the test harness's stand-in for a
+/// subscription, so a test's geometry is per-instance state and needs no
 /// test serialization. The sender is dropped — the value can never change,
 /// and a closed watch still serves `borrow()`.
 #[cfg(test)]
@@ -176,15 +151,15 @@ pub enum CaretEvent {
 
 /// Acquired once at setup, then distributed (design doc §3): the reader's
 /// channel to the repl, plus the two channels whose consumer arrives with the
-/// render manager (4b) — `size` is `Clone` (frame dims + content format
-/// width), `caret` has the render manager as its only consumer. `TermIO` keeps
-/// the senders until `handles()` hands the receivers out, once.
+/// render manager — `caret` has the render manager as its only consumer (and
+/// is not read yet), `size` is a fresh receiver on the instance's watch
+/// (content and the manager usually already hold their own, taken at
+/// construction). `TermIO` keeps the senders until `handles()` hands the
+/// receivers out, once.
 pub struct TermHandles {
     /// Keys / paste / (parked) resize — one consumer: the repl.
     pub input: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
-    /// The latest published geometry — `Clone`, for frame dims and format
-    /// width. Same channel as [`subscribe`]; this receiver is the setup-time
-    /// handle the design distributes.
+    /// The latest published geometry — a receiver on this instance's watch.
     pub size: watch::Receiver<TermSize>,
     /// Caret invalidation (SIGCONT / resume) — the render manager only.
     pub caret: tokio::sync::mpsc::UnboundedReceiver<CaretEvent>,
@@ -329,10 +304,11 @@ pub(crate) fn register_sigcont() {
 /// §TermIO). The variant picks the input / lifecycle side; caps adjust output
 /// fidelity separately (see [`Caps`]).
 ///
-/// Wiring (design doc §3): build `TermIO`, call [`handles`](Self::handles)
-/// once, distribute — then the enum itself is handed to whoever owns drawing
-/// (today `Interactive`; the render manager / `Draw` takes it in a later step
-/// of step 4). No layer holds a reference into another.
+/// Wiring (design doc §3): build `TermIO` first (4f-e, `main`), take its
+/// caps and a size-watch receiver for `Content::new`, move the enum itself
+/// under `Draw`, and call [`handles`](Self::handles) once through the render
+/// manager — the one hand-out, at the pause-gated entry-DSR window. No layer
+/// holds a reference into another.
 pub enum TermIO {
     /// Interactive tty: raw mode, the sole stdin reader, the SIGCONT handler.
     Tty(TtyIo),
@@ -347,11 +323,19 @@ pub enum TermIO {
 /// prompt loop, `$EDITOR`'s takeover), the reader's sending halves, and the
 /// handles handed out once.
 pub struct TtyIo {
-    /// The canonical mode guard; [`TermIO::guard`] hands out the one clone
-    /// setup still needs — publishing it into the render manager's
-    /// suspend/resume front door (4f-d), which replaced the four direct
-    /// holders (`Repl`, the prompt loop, `$EDITOR`, the back-off pump).
+    /// The canonical mode guard — raw-mode lifecycle, shared by every caller
+    /// that must flip it: the reader, the prompt loop, `$EDITOR`'s takeover.
+    /// The render manager's suspend/resume front door reaches it through
+    /// `Draw`, which owns this enum since 4f-e (the `set_mode_guard` hand-off
+    /// of 4f-d retired with it).
     guard: Arc<TermGuard>,
+    /// The per-instance size watch's sending half: the reader publishes
+    /// resizes here, and [`TermIO::set_size`] / [`TermIO::probe_size`] write
+    /// through it. Receivers clone off it ([`TermIO::subscribe_size`]).
+    size_tx: watch::Sender<TermSize>,
+    /// Probed once at construction ([`Caps::probe`]) — the caps `Content` is
+    /// seeded from, so the probe site lives here and not above.
+    caps: Caps,
     /// Sender half of [`TermHandles::input`], moved into the reader thread
     /// by [`TermIO::handles`].
     input_tx: Option<UnboundedSender<InputEvent>>,
@@ -367,6 +351,13 @@ pub struct TtyIo {
 /// memory writer via [`TermIO::null`] / [`TermIO::recording`].
 pub struct PlainIo {
     sink: Sink,
+    /// The per-instance size watch's sending half — same shape as Tty's;
+    /// Plain has no reader to publish from it, but the front door can still
+    /// probe (`--quiet` and piped runs answer from their own watch now, not
+    /// a process-wide one).
+    size_tx: watch::Sender<TermSize>,
+    /// Probed once at construction — see [`TtyIo::caps`].
+    caps: Caps,
     handles: Option<TermHandles>,
 }
 
@@ -383,22 +374,25 @@ enum Sink {
     Null,
 }
 
-/// Fresh input + size + caret channels. The senders go to the reader (Tty)
-/// or are dropped outright (Plain and the test constructors: no reader will
-/// ever send).
+/// Fresh input + size + caret channels for one instance. The input/caret
+/// senders go to the reader (Tty) or are dropped outright (Plain and the
+/// test constructors: no reader will ever send); the size watch's sender
+/// stays with the variant, seeded from a live probe.
 fn term_channels() -> (
     TermHandles,
     UnboundedSender<InputEvent>,
     UnboundedSender<CaretEvent>,
+    watch::Sender<TermSize>,
 ) {
     let (input_tx, input_rx) = unbounded_channel();
     let (caret_tx, caret_rx) = unbounded_channel();
+    let (size_tx, size_rx) = watch::channel(TermSize::probe());
     let handles = TermHandles {
         input: input_rx,
-        size: subscribe(),
+        size: size_rx,
         caret: caret_rx,
     };
-    (handles, input_tx, caret_tx)
+    (handles, input_tx, caret_tx, size_tx)
 }
 
 impl TermIO {
@@ -411,9 +405,11 @@ impl TermIO {
     /// [`handles`]: Self::handles
     pub fn tty() -> Self {
         register_sigcont();
-        let (handles, input_tx, caret_tx) = term_channels();
+        let (handles, input_tx, caret_tx, size_tx) = term_channels();
         TermIO::Tty(TtyIo {
             guard: Arc::new(TermGuard::new()),
+            size_tx,
+            caps: Caps::probe(),
             input_tx: Some(input_tx),
             caret_tx,
             handles: Some(handles),
@@ -424,11 +420,13 @@ impl TermIO {
     /// raw mode, closed channels — the shape piped mode had when it dropped
     /// the sender half.
     pub fn plain() -> Self {
-        let (handles, input_tx, caret_tx) = term_channels();
+        let (handles, input_tx, caret_tx, size_tx) = term_channels();
         drop(input_tx);
         drop(caret_tx);
         TermIO::Plain(PlainIo {
             sink: Sink::Stdio,
+            size_tx,
+            caps: Caps::probe(),
             handles: Some(handles),
         })
     }
@@ -438,7 +436,7 @@ impl TermIO {
     /// bytes with frames dropped by caps are Draw's decision, above this.
     #[cfg(test)]
     pub fn recording() -> Self {
-        let (handles, input_tx, caret_tx) = term_channels();
+        let (handles, input_tx, caret_tx, size_tx) = term_channels();
         drop(input_tx);
         drop(caret_tx);
         TermIO::Plain(PlainIo {
@@ -446,19 +444,106 @@ impl TermIO {
                 main: Vec::new(),
                 meta: Vec::new(),
             },
+            size_tx,
+            caps: Caps::probe(),
             handles: Some(handles),
         })
     }
 
     /// The sinkhole backend: bytes in, nothing out.
     pub fn null() -> Self {
-        let (handles, input_tx, caret_tx) = term_channels();
+        let (handles, input_tx, caret_tx, size_tx) = term_channels();
         drop(input_tx);
         drop(caret_tx);
         TermIO::Plain(PlainIo {
             sink: Sink::Null,
+            size_tx,
+            caps: Caps::probe(),
             handles: Some(handles),
         })
+    }
+
+    /// The caps probed at construction — what `Content::new` is seeded from
+    /// (design §Draw: the probe site lives here, not above).
+    pub fn caps(&self) -> Caps {
+        match self {
+            TermIO::Tty(t) => t.caps,
+            TermIO::Plain(p) => p.caps,
+        }
+    }
+
+    /// Raw mode off — today exactly the guard's stop (the 4f-d pass-through
+    /// re-homed onto the enum); 4f-e-c adds the reader-stop half the design's
+    /// `suspend()` carries (`pause + raw off`). Idempotent; a no-op on Plain.
+    pub fn suspend(&self) -> io::Result<()> {
+        match self {
+            TermIO::Tty(t) => t.guard.stop(),
+            TermIO::Plain(_) => Ok(()),
+        }
+    }
+
+    /// Raw mode on — the reverse of [`Self::suspend`], and also the initial
+    /// entry at prompt-loop startup (the guard's idempotent `start`). A
+    /// no-op on Plain.
+    pub fn resume(&self) -> io::Result<()> {
+        match self {
+            TermIO::Tty(t) => t.guard.start(),
+            TermIO::Plain(_) => Ok(()),
+        }
+    }
+
+    /// Whether this terminal flips raw mode at all (Tty, not Plain) — what
+    /// `$EDITOR` and the window pump ask before expecting a mode turnover.
+    /// The predicate the old `mode_guard: Option<…>` field's mere presence
+    /// answered (4f-d).
+    pub fn is_tty(&self) -> bool {
+        matches!(self, TermIO::Tty(_))
+    }
+
+    /// Publish a new terminal size on this instance's watch. A no-op when
+    /// the size did not change, so a steady-state resize storm does not wake
+    /// subscribers for nothing.
+    pub fn set_size(&self, size: TermSize) {
+        self.size_tx().send_if_modified(|current| {
+            if *current == size {
+                false
+            } else {
+                *current = size;
+                true
+            }
+        });
+    }
+
+    /// A receiver on this instance's watch — what content (format width) and
+    /// the render manager (frame dims) are seeded with at construction,
+    /// before the channel handles are distributed.
+    pub fn subscribe_size(&self) -> watch::Receiver<TermSize> {
+        self.size_tx().subscribe()
+    }
+
+    /// The size watch's sending half: the reader's clone (inline resizes)
+    /// and the front-door forwards.
+    fn size_tx(&self) -> &watch::Sender<TermSize> {
+        match self {
+            TermIO::Tty(t) => &t.size_tx,
+            TermIO::Plain(p) => &p.size_tx,
+        }
+    }
+
+    /// Probe the terminal for its current size and publish the answer — the
+    /// prompt loop's live query moved under this roof (4f-e): one live read
+    /// for a resize that produced no event, written to the watch every
+    /// reader consumes instead of only to the loop's local variables. Never
+    /// falls back to the watch: the point of the probe is to notice what the
+    /// watch has not.
+    pub fn probe_size(&self) -> TermSize {
+        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let size = TermSize {
+            width: w as usize,
+            height: h as usize,
+        };
+        self.set_size(size);
+        size
     }
 
     /// Acquire the channel handles — once, at setup (design doc §3). On Tty
@@ -480,7 +565,12 @@ impl TermIO {
                     .input_tx
                     .take()
                     .expect("TermIO::handles() is called once at setup");
-                spawn_stdin_reader(t.guard.clone(), input_tx, t.caret_tx.clone());
+                spawn_stdin_reader(
+                    t.guard.clone(),
+                    input_tx,
+                    t.caret_tx.clone(),
+                    t.size_tx.clone(),
+                );
                 handles
             }
             TermIO::Plain(p) => p
@@ -490,17 +580,10 @@ impl TermIO {
         }
     }
 
-    /// The mode-guard handle (Tty) or `None` (Plain has no raw mode to flip).
-    /// Setup's one call since 4f-d: the interactive driver publishes it into
-    /// `RenderManager::set_mode_guard` — the front door every former holder
-    /// reaches now — so no caller keeps an `Arc` of its own. Dies when
-    /// `TermIO` moves under `Draw` (4f-e) and the manager owns this instead.
-    pub fn guard(&self) -> Option<Arc<TermGuard>> {
-        match self {
-            TermIO::Tty(t) => Some(t.guard.clone()),
-            TermIO::Plain(_) => None,
-        }
-    }
+    // `guard()` — the 4f-d hand-off that published the `Arc` into
+    // `RenderManager::set_mode_guard` — died with this move: `Draw` owns the
+    // enum now, and [`Self::suspend`] / [`Self::resume`] / [`Self::is_tty`]
+    // are the front door the manager forwards to.
 
     /// Bytes to the stream's sink (design doc §TermIO `write`). Nothing in
     /// production writes through here yet — `Draw` still owns the writer —
@@ -591,6 +674,7 @@ pub(crate) fn spawn_stdin_reader(
     guard: Arc<TermGuard>,
     input: UnboundedSender<InputEvent>,
     caret: UnboundedSender<CaretEvent>,
+    size: watch::Sender<TermSize>,
 ) {
     // A gate-raiser only waits for a park when a reader exists to park; set it
     // before the thread starts so the entry-DSR's pause below sees it.
@@ -627,11 +711,22 @@ pub(crate) fn spawn_stdin_reader(
                     }
                 }
                 Ok(Event::Resize(w, h)) => {
-                    // Publish the new geometry so renderers pick up the
-                    // change on their next streaming call.
-                    set_size(TermSize {
+                    // Publish the new geometry on this instance's watch so
+                    // renderers pick up the change on their next streaming
+                    // call (the input-channel forward is 4f-e-d). Deduped
+                    // like every other publish: a storm of identical values
+                    // must not wake subscribers for nothing.
+                    let new = TermSize {
                         width: w as usize,
                         height: h as usize,
+                    };
+                    let _ = size.send_if_modified(|current| {
+                        if *current == new {
+                            false
+                        } else {
+                            *current = new;
+                            true
+                        }
                     });
                 }
                 Ok(Event::Key(key)) => {
@@ -1100,7 +1195,7 @@ mod tests {
             handles.caret.try_recv().is_err(),
             "no reader ever invalidates Plain's caret"
         );
-        assert!(io.guard().is_none(), "Plain has no raw mode to flip");
+        assert!(!io.is_tty(), "Plain has no raw mode to flip");
     }
 
     /// Wiring happens once: a second `handles()` would hand out a second
@@ -1121,9 +1216,9 @@ mod tests {
     #[test]
     fn the_mode_guard_lives_with_the_tty_variant() {
         let io = TermIO::tty();
-        assert!(io.guard().is_some(), "Tty owns the guard");
+        assert!(io.is_tty(), "Tty owns the guard");
         let plain = TermIO::plain();
-        assert!(plain.guard().is_none());
+        assert!(!plain.is_tty());
     }
 
     /// `recording()` captures bytes per stream and `null()` discards them —

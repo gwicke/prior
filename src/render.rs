@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::draw::{el_if_short, plan_consume, plan_reposition, ApplyPolicy, Draw};
 use crate::slashdot_menu::table::display_width;
-use crate::termio::{TermGuard, TermSize};
+use crate::termio::{TermHandles, TermIO, TermSize};
 use tokio::sync::watch;
 
 /// The size watch handle (design §3): what the manager reads its geometry
@@ -473,16 +473,6 @@ pub struct RenderManager {
     /// so nothing reads this field itself yet.
     #[allow(dead_code)]
     size: SizeWatch,
-    /// The mode guard (raw-mode lifecycle) — the design's front door so
-    /// content / UI never touch `TermIO` (§Render: "front door for
-    /// suspend/resume"). Installed once at setup (4f-d): the interactive
-    /// driver hands over `TermIO`'s canonical `Arc` via
-    /// [`Self::set_mode_guard`], replacing the four direct holders (`Repl`,
-    /// the prompt loop, `$EDITOR`, the back-off pump). `None` for Plain —
-    /// no raw mode to flip. 4f-e takes the whole `TermIO` under `Draw` and
-    /// this hand-off goes with it; the reader-stop half of `suspend` rides
-    /// in the same move.
-    mode_guard: Option<Arc<TermGuard>>,
 }
 
 impl RenderManager {
@@ -491,51 +481,61 @@ impl RenderManager {
     /// pipeline hard-coded before `configure` existed — so an unconfigured
     /// manager budgets exactly as the old code did; [`Self::configure`]
     /// changes it.
-    pub fn new(size: SizeWatch) -> Self {
+    pub fn new(size: SizeWatch, term_io: TermIO) -> Self {
         Self {
-            draw: Draw::new(size.clone()),
+            draw: Draw::new(size.clone(), term_io),
             captured: None,
             recipe: Vec::new(),
             frame_max_row_ratio: FRAME_MAX_ROW_RATIO,
             size,
-            mode_guard: None,
         }
     }
 
-    /// The setup hand-off (4f-d): where the interactive driver publishes the
-    /// mode guard its holders used to each carry an `Arc` of. `None` (Plain,
-    /// and every state built outside `Interactive`) leaves the pass-throughs
-    /// inert — the same answer the absent holders gave.
-    pub fn set_mode_guard(&mut self, guard: Option<Arc<TermGuard>>) {
-        self.mode_guard = guard;
+    /// The channel handles, once at setup (design §3 step 1–2): where the
+    /// entry-DSR window in `Interactive::new` takes the input receiver for
+    /// the repl. Reached through here so the setup never names `TermIO`,
+    /// which by then lives inside [`Self::draw`].
+    pub fn handles(&mut self) -> TermHandles {
+        self.draw.handles()
     }
 
     /// Whether this terminal flips raw mode at all (TermIO's Tty, not Plain)
     /// — what `$EDITOR` and the window pump ask before expecting a mode
-    /// turnover. The predicate the holders' mere presence used to answer.
+    /// turnover. The predicate the 4f-d `mode_guard: Option<…>` field
+    /// answered; since 4f-e the enum itself is the answer.
     pub fn is_tty(&self) -> bool {
-        self.mode_guard.is_some()
+        self.draw.is_tty()
     }
 
     /// Raw mode off — the front door (design §Render: "suspend() stops the
-    /// reader and drops raw mode ($EDITOR, Ctrl-Z)"). Today a pass-through
-    /// to the mode guard's stop; the reader-stop half rides with `TermIO`
-    /// under `Draw` (4f-e). Idempotent; a no-op on Plain.
+    /// reader and drops raw mode ($EDITOR, Ctrl-Z)"), pass-through to
+    /// `Draw`/`TermIO` — the only real implementation is `TermIO::suspend`.
+    /// Idempotent; a no-op on Plain. The reader-stop half is 4f-e-c's.
     pub fn suspend(&self) {
-        if let Some(g) = &self.mode_guard {
-            let _ = g.stop();
-        }
+        self.draw.suspend();
     }
 
     /// Raw mode on — the reverse of [`Self::suspend`], and also the initial
-    /// entry at prompt-loop startup (both are the guard's idempotent
-    /// `start`). The design makes resume implicit in the next render; until
-    /// the DSR answers inside `TermIO` (4g) callers re-enter explicitly.
-    /// A no-op on Plain.
+    /// entry at prompt-loop startup. The design makes resume implicit in
+    /// the next render; until the DSR answers inside `TermIO` (4g) callers
+    /// re-enter explicitly. A no-op on Plain.
     pub fn resume(&self) {
-        if let Some(g) = &self.mode_guard {
-            let _ = g.start();
-        }
+        self.draw.resume();
+    }
+
+    /// Publish a settled size on the geometry watch (parked-key drains and
+    /// the prompt loop's defensive `Resize` arms), through the `TermIO`
+    /// that owns the channel since 4f-e-a.
+    pub fn set_size(&self, size: TermSize) {
+        self.draw.set_size(size);
+    }
+
+    /// Probe the terminal for its live size and publish it — the prompt
+    /// loop's loop-top refresh, under `TermIO`'s roof since 4f-e-a. Returns
+    /// the probed size so the caller can compare it against
+    /// [`Self::painted_size`] without a second read.
+    pub fn probe_size(&self) -> TermSize {
+        self.draw.probe_size()
     }
 
     /// The drawing edge, for the test seams that read *past* this manager
@@ -945,11 +945,11 @@ mod tests {
             width: 40,
             height: 24,
         });
-        let manager = RenderManager::new(size.clone());
+        let manager = RenderManager::new(size.clone(), crate::termio::TermIO::null());
         assert_eq!(manager.budget(24), live_budget(24));
         assert_eq!(manager.budget(1), 1);
 
-        let mut small = RenderManager::new(size);
+        let mut small = RenderManager::new(size, crate::termio::TermIO::null());
         small.configure(0.1);
         assert_eq!(small.budget(24), 3);
         assert_eq!(small.budget(1), 1, "never below one row");
@@ -968,7 +968,7 @@ mod tests {
             width: 40,
             height: 24,
         });
-        let mut manager = RenderManager::new(size);
+        let mut manager = RenderManager::new(size, crate::termio::TermIO::null());
 
         let rec = SharedBuf::default();
         manager.draw.writer = Box::new(rec.clone());
