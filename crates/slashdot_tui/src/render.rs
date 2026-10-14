@@ -4,8 +4,9 @@
 //!
 //! * compose builds a list of [`Element`]s (the REPL draws
 //!   `[Input, Divider, Overlay]`, dialogs `[Divider?, Overlay]`),
-//! * [`allocate`] distributes the live-region budget ([`live_budget`], at
-//!   most 2/3 of terminal rows) over the elements' `(must, might)` extents,
+//! * [`allocate`] resolves each element's [`RowAsk`] against the frame
+//!   height, then distributes the live-region budget ([`live_budget`], at
+//!   most 2/3 of terminal rows) over the resolved floors and wants,
 //! * [`render`] produces a [`Frame`] — a flat byte buffer with per-row
 //!   extents and element spans.
 //!
@@ -61,7 +62,80 @@ pub fn live_budget_ratio(term_h: usize, ratio: f64) -> usize {
     ((term_h as f64 * ratio).ceil() as usize).max(1)
 }
 
-/// Height demand of one element, in screen rows (plan §3.2).
+/// One height bound, as a **spec** the allocator resolves against the frame
+/// height (design §Render, §6): a [`RowAsk`] is the element's demand, and only
+/// resolution turns it into rows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RowSpec {
+    /// Exactly this many rows — the common case, and every element's answer
+    /// today, which is what keeps the split the even one (§6: all-`FixedNum`
+    /// weights evenly, i.e. today's semantics, pinned by `allocate_*`).
+    FixedNum(usize),
+    /// A fraction of the frame's height, capped at `rows` (design §Render:
+    /// "Fraction of the frame area, capped at `rows`" — e.g. a future
+    /// header/content split). No element asks for one today; the variant
+    /// exists so one can without reopening the allocator.
+    ///
+    /// `f64`, not the design sketch's `f32` — the same rounding hazard
+    /// [`FRAME_MAX_ROW_RATIO`] records: `2/3 as f32` rounds *above* the exact
+    /// fraction, so `ceil(24 × 2/3)` would resolve to 17 where the budget
+    /// answers 16.
+    RatioAndNum(f64, usize),
+}
+
+impl RowSpec {
+    /// This bound in rows for a frame of `term_h`: a fixed spec is its own
+    /// answer; a ratio resolves against the *frame height* (a share of the
+    /// terminal, not of the budget) and caps at `rows`.
+    pub fn resolve(&self, term_h: usize) -> usize {
+        match *self {
+            RowSpec::FixedNum(rows) => rows,
+            RowSpec::RatioAndNum(ratio, rows) => {
+                ((term_h as f64 * ratio).ceil() as usize).min(rows)
+            }
+        }
+    }
+}
+
+/// Height demand of one element: a floor and a want, each a [`RowSpec`]
+/// (design §Render; plan §3.2's `must`/`might` generalized) — the floor is
+/// served before the split, the want caps the element's share of the surplus.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RowAsk {
+    /// Floor: rows the element keeps before anything else is served.
+    pub min: RowSpec,
+    /// Want: rows the element takes when space allows.
+    pub max: RowSpec,
+}
+
+impl RowAsk {
+    /// The common ask: both bounds fixed rows.
+    pub fn fixed(min: usize, max: usize) -> Self {
+        RowAsk {
+            min: RowSpec::FixedNum(min),
+            max: RowSpec::FixedNum(max),
+        }
+    }
+
+    /// Resolve against a frame of `term_h` rows: the [`Extent`] [`allocate`]
+    /// splits over.
+    pub fn resolve(&self, term_h: usize) -> Extent {
+        let extent = Extent {
+            must: self.min.resolve(term_h),
+            might: self.max.resolve(term_h),
+        };
+        debug_assert!(
+            extent.must <= extent.might,
+            "a floor above the want: {self:?} at term_h {term_h}"
+        );
+        extent
+    }
+}
+
+/// Height demand of one element, in screen rows, **resolved**: a [`RowAsk`]
+/// after [`RowAsk::resolve`] has given its specs a frame height to mean
+/// numbers (plan §3.2, whose `must`/`might` these are — the allocator's own
+/// vocabulary, one step short of the element's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Extent {
     /// Floor: rows the element keeps before anything else is served.
@@ -70,12 +144,14 @@ pub struct Extent {
     pub might: usize,
 }
 
-/// One drawable piece of a frame (plan §3.2).
+/// One drawable piece of a frame (plan §3.2, design §Render).
 ///
-/// The *sizing declaration* is data: `must` and `might` sit here so
-/// [`allocate`] can read every element's floor and want before any of them is
-/// rendered — which is what §3.1's two passes require. Only the rendering is
-/// polymorphic, and that is the whole point of the shape:
+/// The sizing declaration is the *trait's*, not this struct's: since 4h-b
+/// [`Element`] carries only the impl, and [`Self::ask`] reads the element's
+/// own floor and want — which is what §3.1's two passes require (every ask
+/// read before any of them is rendered), and what lets an element answer in
+/// rows-at-`width` instead of at whatever width it was constructed for. Only
+/// the rendering is polymorphic, and that is the whole point of the shape:
 ///
 /// - `render` cannot accumulate a `match` over element kinds, which is how
 ///   squeeze knowledge leaked into this module in the first place. The two
@@ -86,43 +162,47 @@ pub struct Extent {
 /// - each element holds whatever *it* needs to hold — an `Rc` of its rows, a
 ///   `Layout`, anything — and the frame layer neither knows nor copies it.
 pub struct Element {
-    /// Floor: rows the element keeps before anything else is served.
-    pub must: usize,
-    /// Want: rows the element takes when space allows.
-    pub might: usize,
-    /// The element's own squeeze policy, told what it got.
+    /// The element's own squeeze policy and painting, told what it got.
     ///
     /// `Box` rather than `Rc`: an element is owned by exactly one composition
     /// and is only ever moved between them, so the shared ownership would buy
     /// nothing. `Send + Sync` is not optional — `Output: Send + Sync` and
     /// `draw: Mutex<DrawCache>` put the composition behind both.
-    render: Box<dyn RenderAt + Send + Sync>,
+    render: Box<dyn RenderElement + Send + Sync>,
 }
 
-/// Height in, rows out (plan §3.2.3).
+/// Height in, rows out (plan §3.2.3, design §Render).
 ///
-/// `term_w` is a *parameter*, not a dependency, so §3.1's "no terminal
+/// `width` is a *parameter*, not a dependency, so §3.1's "no terminal
 /// dependency" holds: an impl can be unit-tested at any width with no terminal
-/// anywhere in sight.
-pub trait RenderAt {
-    /// Produce the rows for an allocation of exactly `h` screen rows of
-    /// `term_w`, and this element's caret if it has one.
+/// anywhere in sight. Every element answers its own height — the
+/// construction-time `must`/`might` fields [`Element`] carried died with 4h-b,
+/// because only the element knows what it wants *at this width*.
+pub trait RenderElement {
+    /// Min/max rows of this element at `width` (design §Render). Resolved
+    /// against the frame height by [`allocate`], never by the element: a spec
+    /// is a share of the terminal, and the frame's height is not the element's
+    /// to know.
+    fn height(&self, width: usize) -> RowAsk;
+
+    /// Produce the rows for an allocation of exactly `height` screen rows of
+    /// `width`, and this element's caret if it has one.
     ///
-    /// Must not return more than `h` rows. The frame builds its row ranges
-    /// from what comes back, so an over-tall impl desynchronises `spans`, the
-    /// caret and the allocator's own arithmetic — and unlike the old `match`,
-    /// nothing downstream can clamp it, because nothing downstream knows what
-    /// the rows mean.
-    fn render_at(&self, h: usize, term_w: usize) -> Rendered;
+    /// Must not return more than `height` rows. The frame builds its row
+    /// ranges from what comes back, so an over-tall impl desynchronises
+    /// `spans`, the caret and the allocator's own arithmetic — and unlike the
+    /// old `match`, nothing downstream can clamp it, because nothing
+    /// downstream knows what the rows mean.
+    fn render(&self, height: usize, width: usize) -> Rendered;
 }
 
 /// Visual layout of an editor buffer for one element render: the wrapped
 /// content-only rows (the prompt renders separately on row 0) plus the cursor.
 ///
 /// Lives beside [`Element`] because it *is* the input element's data
-/// contract — `InputItem` (repl) produces it, [`RenderAt`] consumes it — and
-/// both sides of that contract are above this crate, so neither can own the
-/// type without inverting the dependency.
+/// contract — `InputItem` (repl) produces it, [`RenderElement`] consumes it —
+/// and both sides of that contract are above this crate, so neither can own
+/// the type without inverting the dependency.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Layout {
     /// Content-only visual rows (the prompt is rendered separately on row 0).
@@ -149,13 +229,11 @@ pub struct Rendered {
 }
 
 impl Element {
-    /// An element with an explicit `(must, might)` and an impl of its own
-    /// rendering. Every constructor below is one line of it, so a new kind is a
-    /// `RenderAt` impl plus a constructor here — no `match` anywhere.
-    pub fn new(must: usize, might: usize, render: impl RenderAt + Send + Sync + 'static) -> Self {
+    /// An element with an impl of its own rendering *and* of its own height.
+    /// Every constructor below is one line of it, so a new kind is a
+    /// `RenderElement` impl plus a constructor here — no `match` anywhere.
+    pub fn new(render: impl RenderElement + Send + Sync + 'static) -> Self {
         Element {
-            must,
-            might,
             render: Box::new(render),
         }
     }
@@ -163,12 +241,12 @@ impl Element {
     /// Dim horizontal rule spanning the full terminal width. All-or-nothing:
     /// a one-row rule that does not fit is a rule nobody wanted.
     pub fn divider() -> Self {
-        Element::new(1, 1, DividerItem)
+        Element::new(DividerItem)
     }
 
-    /// Fixed text rows (commit lines, future status line). `must == might`, so
+    /// Fixed text rows (commit lines, future status line). `min == max`, so
     /// it is fully served by pass 1 and never competes for the surplus — that
-    /// is what `must` is for, and it is why a status row needs no protection
+    /// is what the floor is for, and it is why a status row needs no protection
     /// from whatever else the frame is showing.
     ///
     /// Keeps the **first `h` rows** because it has no focus: an element whose
@@ -181,16 +259,14 @@ impl Element {
     // convention for test-only users.
     #[allow(dead_code)]
     pub fn lines(rows: Vec<String>) -> Self {
-        let n = rows.len();
-        Element::new(n, n, LinesItem { rows })
+        Element::new(LinesItem { rows })
     }
 
-    /// The `(must, might)` this element contributes to [`allocate`].
-    pub fn extent(&self) -> Extent {
-        Extent {
-            must: self.must,
-            might: self.might,
-        }
+    /// The [`RowAsk`] this element contributes to [`allocate`] at `width` —
+    /// read from the element itself since 4h-b, which is what lets it answer
+    /// in rows-at-this-width rather than in whatever it was built from.
+    pub fn ask(&self, width: usize) -> RowAsk {
+        self.render.height(width)
     }
 }
 
@@ -208,8 +284,12 @@ impl Element {
 /// A horizontal rule: one row, or none.
 struct DividerItem;
 
-impl RenderAt for DividerItem {
-    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+impl RenderElement for DividerItem {
+    fn height(&self, _width: usize) -> RowAsk {
+        RowAsk::fixed(1, 1)
+    }
+
+    fn render(&self, h: usize, tw: usize) -> Rendered {
         if h == 0 {
             return Rendered::default();
         }
@@ -227,8 +307,12 @@ struct LinesItem {
     rows: Vec<String>,
 }
 
-impl RenderAt for LinesItem {
-    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+impl RenderElement for LinesItem {
+    fn height(&self, _width: usize) -> RowAsk {
+        RowAsk::fixed(self.rows.len(), self.rows.len())
+    }
+
+    fn render(&self, h: usize, tw: usize) -> Rendered {
         let mut rows = Vec::with_capacity(h.min(self.rows.len()));
         for row in self.rows.iter().take(h) {
             debug_assert!(!row.contains('\n'), "line rows are single screen rows");
@@ -240,11 +324,18 @@ impl RenderAt for LinesItem {
     }
 }
 
-/// Distribute `budget` rows over `extents`, honoring floors then splitting
-/// the surplus evenly among flexible elements (plan §3.2, OQ1–OQ2).
+/// Resolve `asks` against a frame of `term_h` rows, then distribute `budget`
+/// rows over them, honoring floors then splitting the surplus evenly among
+/// flexible elements (plan §3.2, OQ1–OQ2; design §6).
 ///
+/// * Resolution is the allocator's (§6): `FixedNum(n)` → `n`,
+///   `RatioAndNum(r, n)` → `min(ceil(r × term_h), n)`. The ratio is a share
+///   of the *terminal height*, so `term_h` is what it resolves against —
+///   `budget` is what the frame may spend, not what it is.
 /// * If every element fits (`Σ might ≤ budget`) each gets its `might` —
-///   the frame is as tall as its content, never padded to the budget.
+///   the frame is as tall as its content, never padded to the budget. That
+///   branch is also the design's `budget = min(ratio × term_h, Σ resolved
+///   max)`: the frame's height comes out as `min(budget, Σ max)` either way.
 /// * Otherwise every element first receives its `must`. If the floors
 ///   themselves exceed `budget`, they are scaled down by the same even
 ///   division, in element order (so the input's floor is served before a
@@ -252,10 +343,15 @@ impl RenderAt for LinesItem {
 /// * The remaining rows are split evenly across elements still below their
 ///   `might`; shares an element cannot use flow back and are re-split next
 ///   round (max-min fairness).
-pub fn allocate(extents: &[Extent], budget: usize) -> Vec<usize> {
-    if extents.is_empty() {
+///
+/// All-`FixedNum` — every element today — resolves to the same `(must,
+/// might)` pairs the pre-4h-b `Element` fields carried, so the split is the
+/// even one the `allocate_*` tests pin.
+pub fn allocate(asks: &[RowAsk], term_h: usize, budget: usize) -> Vec<usize> {
+    if asks.is_empty() {
         return Vec::new();
     }
+    let extents: Vec<Extent> = asks.iter().map(|a| a.resolve(term_h)).collect();
     let mights: Vec<usize> = extents.iter().map(|e| e.might).collect();
     if mights.iter().sum::<usize>() <= budget {
         return mights;
@@ -373,11 +469,11 @@ pub fn render(elements: &[Element], heights: &[usize], term_w: usize) -> Frame {
         //
         // Nothing downstream clamps the height. That is the trade this shape
         // makes: the old `match` could have corrected an over-tall element
-        // because it knew what every arm produced, and a `RenderAt` impl is
-        // free to be wrong — so `render_at`'s contract says fit `h`, and the
+        // because it knew what every arm produced, and a `RenderElement` impl
+        // is free to be wrong — so `render`'s contract says fit `h`, and the
         // module that could once enforce it no longer can. Worth it, because
         // enforcing it meant the module knowing what each element was.
-        let out = el.render.render_at(h, tw);
+        let out = el.render.render(h, tw);
         for row in &out.rows {
             push_row(&mut buf, &mut extents, row);
         }
@@ -463,9 +559,11 @@ pub struct ContentWrite {
 /// drawing edge (`Draw`) under this roof, 4d made this the content
 /// path's only door onto the screen (the `ContentWrite` hand-off below),
 /// and 4e moved batching and reposition here with the recipe they re-
-/// draw. What remains of the design's shape comes with the steps that
-/// give it meaning: the frame verbs off the watch and the compose +
-/// content round trip (4f), and the element stack (4h).
+/// draw. Since 4h-b the composition budgets each element's own [`RowAsk`] —
+/// resolved here against the frame height — rather than a construction-time
+/// `(must, might)` pair. What remains of the design's shape comes with the
+/// rest of 4h: the installed, long-lived element stack and the compose +
+/// content round trip.
 pub struct RenderManager {
     /// The drawing edge (step 4c): the byte sink and its live-screen
     /// bookkeeping, owned — the design's `Draw { … }` under this roof. Plain
@@ -648,12 +746,12 @@ impl RenderManager {
         dims: (usize, usize),
     ) -> (usize, usize) {
         let (tw, th) = (dims.0.max(1), dims.1.max(1));
-        let extents: Vec<Extent> = stack.iter().map(Element::extent).collect();
+        let asks: Vec<RowAsk> = stack.iter().map(|e| e.ask(tw)).collect();
         // The page-scroll path needs the rows element's grant *before* the
         // frame is rendered, and this is the only place `allocate` runs for a
         // composition — so a caller that has to know re-runs it over the same
-        // extents rather than asking the painter to guess twice.
-        let heights = allocate(&extents, self.budget(th));
+        // asks rather than asking the painter to guess twice.
+        let heights = allocate(&asks, th, self.budget(th));
         let frame = render(&stack, &heights, tw);
         let applied = self.draw.draw_frame(&frame, policy, dims);
         // Moved, never copied: the recipe belongs to the composition that
@@ -831,11 +929,11 @@ impl RenderManager {
             taken
         } else {
             let heights = {
-                let extents: Vec<Extent> = self.recipe.iter().map(Element::extent).collect();
+                let asks: Vec<RowAsk> = self.recipe.iter().map(|e| e.ask(tw)).collect();
                 // The hub's own budget (step 4e): the recipe re-renders at
                 // the same knob `render` composes under, so a configured
                 // ratio cannot make the two disagree.
-                allocate(&extents, self.budget(th))
+                allocate(&asks, th, self.budget(th))
             };
             render(&self.recipe, &heights, tw)
         };
@@ -1057,17 +1155,22 @@ mod tests {
     }
 
     // ---- allocate ----
+    //
+    // The parity pins (design §6): these asked in `Extent`s before 4h-b and
+    // ask in `RowAsk::fixed` now — all-`FixedNum` resolves to the same pairs
+    // the `Element` fields used to carry, so the split is byte-identical.
+    // `term_h` is inert for a fixed ask; it is what a ratio resolves against.
 
     #[test]
     fn allocate_full_fit_returns_mights_not_budget() {
         // OQ1: content smaller than the budget renders to its natural size;
         // the frame is never padded up to the budget.
         let e = [
-            Extent { must: 1, might: 3 },
-            Extent { must: 1, might: 1 },
-            Extent { must: 1, might: 5 },
+            RowAsk::fixed(1, 3),
+            RowAsk::fixed(1, 1),
+            RowAsk::fixed(1, 5),
         ];
-        assert_eq!(allocate(&e, 12), vec![3, 1, 5]);
+        assert_eq!(allocate(&e, 24, 12), vec![3, 1, 5]);
     }
 
     #[test]
@@ -1075,11 +1178,11 @@ mod tests {
         // OQ2: a 1-row input has min=max=1; the flexible overlay takes the
         // whole surplus.
         let e = [
-            Extent { must: 1, might: 1 },  // short input
-            Extent { must: 1, might: 1 },  // divider
-            Extent { must: 1, might: 20 }, // menu
+            RowAsk::fixed(1, 1),  // short input
+            RowAsk::fixed(1, 1),  // divider
+            RowAsk::fixed(1, 20), // menu
         ];
-        assert_eq!(allocate(&e, 8), vec![1, 1, 6]);
+        assert_eq!(allocate(&e, 24, 8), vec![1, 1, 6]);
     }
 
     #[test]
@@ -1087,21 +1190,21 @@ mod tests {
         // Two flexible elements: even split first (3/3), then the input
         // caps at its might and the overlay absorbs the leftover.
         let e = [
-            Extent { must: 1, might: 4 },
-            Extent { must: 1, might: 1 },
-            Extent { must: 1, might: 10 },
+            RowAsk::fixed(1, 4),
+            RowAsk::fixed(1, 1),
+            RowAsk::fixed(1, 10),
         ];
         // Σ might = 15 > 10; floors = 3; pool = 7.
         // Round 1: share 3 → input +3 (capped at 4), overlay +3 → pool 1.
         // Round 2: overlay +1.
-        assert_eq!(allocate(&e, 10), vec![4, 1, 5]);
+        assert_eq!(allocate(&e, 24, 10), vec![4, 1, 5]);
     }
 
     #[test]
     fn allocate_even_split_without_caps() {
-        let e = [Extent { must: 1, might: 6 }, Extent { must: 1, might: 6 }];
+        let e = [RowAsk::fixed(1, 6), RowAsk::fixed(1, 6)];
         // Σ might = 12 > 8; floors 2; pool 6 → 3/3.
-        assert_eq!(allocate(&e, 8), vec![4, 4]);
+        assert_eq!(allocate(&e, 24, 8), vec![4, 4]);
     }
 
     #[test]
@@ -1110,11 +1213,11 @@ mod tests {
         // budget: even division from zero caps each claimant at its floor,
         // so the small floors survive and the big one truncates.
         let e = [
-            Extent { must: 1, might: 1 },
-            Extent { must: 1, might: 1 },
-            Extent { must: 5, might: 5 },
+            RowAsk::fixed(1, 1),
+            RowAsk::fixed(1, 1),
+            RowAsk::fixed(5, 5),
         ];
-        assert_eq!(allocate(&e, 3), vec![1, 1, 1]);
+        assert_eq!(allocate(&e, 24, 3), vec![1, 1, 1]);
     }
 
     #[test]
@@ -1122,18 +1225,77 @@ mod tests {
         // Budget below the number of elements: one row each, element
         // order wins — input first, overlay last (plan §3.2).
         let e = [
-            Extent { must: 1, might: 1 },
-            Extent { must: 1, might: 1 },
-            Extent { must: 1, might: 40 },
+            RowAsk::fixed(1, 1),
+            RowAsk::fixed(1, 1),
+            RowAsk::fixed(1, 40),
         ];
-        assert_eq!(allocate(&e, 2), vec![1, 1, 0]);
-        assert_eq!(allocate(&e, 1), vec![1, 0, 0]);
-        assert_eq!(allocate(&e, 0), vec![0, 0, 0]);
+        assert_eq!(allocate(&e, 24, 2), vec![1, 1, 0]);
+        assert_eq!(allocate(&e, 24, 1), vec![1, 0, 0]);
+        assert_eq!(allocate(&e, 24, 0), vec![0, 0, 0]);
     }
 
     #[test]
-    fn allocate_empty_extents() {
-        assert!(allocate(&[], 10).is_empty());
+    fn allocate_empty_asks() {
+        assert!(allocate(&[], 24, 10).is_empty());
+    }
+
+    // ---- RowSpec resolution (design §6) ----
+
+    #[test]
+    fn a_fixed_spec_is_its_own_answer_at_any_height() {
+        assert_eq!(RowAsk::fixed(1, 5).resolve(1), Extent { must: 1, might: 5 });
+        assert_eq!(
+            RowAsk::fixed(1, 5).resolve(50),
+            Extent { must: 1, might: 5 }
+        );
+    }
+
+    #[test]
+    fn a_ratio_resolves_against_the_frame_height_and_caps_at_its_rows() {
+        // A share of the *terminal*, not of the budget: `ceil(24 × 1/3) = 8`,
+        // capped at the ask's 4; the want's `ceil(24 × 2/3)` is far below its
+        // cap of 100.
+        let ask = RowAsk {
+            min: RowSpec::RatioAndNum(1.0 / 3.0, 4),
+            max: RowSpec::RatioAndNum(2.0 / 3.0, 100),
+        };
+        assert_eq!(
+            ask.resolve(24),
+            Extent { must: 4, might: 16 },
+            "floor capped at 4, want at ceil(16)"
+        );
+        // The same ask on a short terminal: the ratio lands below the cap.
+        assert_eq!(ask.resolve(6), Extent { must: 2, might: 4 });
+    }
+
+    /// The `f64` pin: `2/3 as f32` rounds *above* the exact fraction, which
+    /// would resolve the want to 17 on the terminal the budget pins at 16 —
+    /// and a header/content split resolved one way while the budget resolved
+    /// the other is exactly the disagreement §6 exists to avoid.
+    #[test]
+    fn the_ratio_resolves_to_the_same_ceil_as_the_budget() {
+        let ask = RowAsk {
+            min: RowSpec::FixedNum(1),
+            max: RowSpec::RatioAndNum(FRAME_MAX_ROW_RATIO, 100),
+        };
+        assert_eq!(ask.resolve(24).might, live_budget(24));
+        assert_eq!(ask.resolve(24).might, 16);
+    }
+
+    #[test]
+    fn a_ratio_ask_allocates_through_the_ordinary_split() {
+        // A ratio want is just a resolved want: floors first, then the even
+        // split, with the ratio's 16 as the cap on this element's share.
+        let e = [
+            RowAsk::fixed(1, 1),
+            RowAsk {
+                min: RowSpec::FixedNum(1),
+                max: RowSpec::RatioAndNum(FRAME_MAX_ROW_RATIO, 100),
+            },
+        ];
+        // Σ might = 1 + 16 = 17 > budget 10; floors 2; pool 8 → the menu
+        // takes 8 of its 16.
+        assert_eq!(allocate(&e, 24, 10), vec![1, 9]);
     }
 
     // ---- window ----

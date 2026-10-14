@@ -106,7 +106,9 @@ pub struct Rendered { lines: Lines, caret: Option<(usize, usize)> } // caret: el
 pub enum RowSpec {
     FixedNum(rows: usize),
     // Fraction of the frame area, capped at `rows` (e.g. header vs content split).
-    RatioAndNum(ratio: f32, rows: usize),
+    // f64, not f32: the budget's ceil (FRAME_MAX_ROW_RATIO) rounds 2/3 as f32
+    // *above* the exact fraction, which would resolve 24·2/3 to 17 vs 16.
+    RatioAndNum(ratio: f64, rows: usize),
 }
 
 pub struct RowAsk { min: RowSpec, max: RowSpec }

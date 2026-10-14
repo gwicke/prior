@@ -24,7 +24,7 @@ use crate::output::status;
 /// The input element's data contract lives in `slashdot_tui` (beside
 /// [`Element`]); re-exported so `crate::repl::Layout` paths keep working.
 pub use crate::render::Layout;
-use crate::render::{allocate, live_budget, window, Element, Extent, RenderAt, Rendered};
+use crate::render::{allocate, live_budget, window, Element, RenderElement, Rendered, RowAsk};
 #[cfg(test)]
 use crate::render::{render, Frame};
 use crate::session::SessionTreeNode;
@@ -345,15 +345,18 @@ const INPUT_CONTEXT_ROWS: usize = 3;
 /// (prompt rendered on row 0); the caret lives at `layout.cursor_row` /
 /// `layout.cursor_col` — derived, not stored.
 ///
-/// `must` is the caret's own row, which is why the input can never be
-/// squeezed away entirely; wrapping grows `might`.
+/// `min` is the caret's own row, which is why the input can never be
+/// squeezed away entirely; wrapping grows `max`.
 ///
 /// A free function, not `Element::input`: inherent methods on `Element` would
 /// live in `slashdot_tui`, and this element is repl's (it holds [`LineEditor`]'s
-/// layout). Same shape as `Element::new`, whose `render` impl lives here.
+/// layout). Same shape as `Element::new`, whose `RenderElement` impl lives here.
 pub(crate) fn input(layout: Layout, prompt: String) -> Element {
-    let might = layout.row_count.max(1);
-    Element::new(1, might, InputItem { layout, prompt })
+    Element::new(InputItem {
+        layout,
+        prompt,
+        hidden: false,
+    })
 }
 
 /// An input that occupies **no rows at all** — the mid-turn case.
@@ -365,12 +368,16 @@ pub(crate) fn input(layout: Layout, prompt: String) -> Element {
 /// either way (OQ2) — the frame is composed and applied on every keystroke;
 /// it simply has no row to draw until something is typed.
 ///
-/// `must == might == 0`, so the allocator serves it nothing and
-/// `InputItem::render_at(0, _)` returns the empty `Rendered`. The choice is
+/// `min == max == 0`, so the allocator serves it nothing and
+/// `InputItem::render(0, _)` returns the empty `Rendered`. The choice is
 /// made here rather than inferred inside the element, because "is a turn
 /// running" is the output's fact (`streaming`), not the frame layer's.
 pub(crate) fn input_hidden(layout: Layout, prompt: String) -> Element {
-    Element::new(0, 0, InputItem { layout, prompt })
+    Element::new(InputItem {
+        layout,
+        prompt,
+        hidden: true,
+    })
 }
 
 /// The input element for one compose, and the R1 rule in one place.
@@ -448,8 +455,9 @@ pub(crate) fn rows_grant(
     term_h: usize,
 ) -> usize {
     let elements = Repl::compose_elements(editor, prompt, None, overlay, term_w);
-    let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
-    let heights = allocate(&extents, live_budget(term_h.max(1)));
+    let asks: Vec<RowAsk> = elements.iter().map(|e| e.ask(term_w)).collect();
+    let term_h = term_h.max(1);
+    let heights = allocate(&asks, term_h, live_budget(term_h));
     // The rows element is the last of the overlay's sections by construction
     // (`overlay_elements` appends detail, header, then rows).
     heights.last().copied().unwrap_or(0)
@@ -585,10 +593,27 @@ pub(crate) fn paint_prompt(
 struct InputItem {
     layout: Layout,
     prompt: String,
+    /// The mid-turn empty case (see [`input_hidden`]): a claim on no rows.
+    /// The ask is construction's because *the composer* knows whether a turn
+    /// is running — `streaming` is content's fact, and the element only ever
+    /// paints what it is handed.
+    hidden: bool,
 }
 
-impl RenderAt for InputItem {
-    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+impl RenderElement for InputItem {
+    fn height(&self, _width: usize) -> RowAsk {
+        if self.hidden {
+            RowAsk::fixed(0, 0)
+        } else {
+            // The floor is the caret's own row; wrapping grows the want to the
+            // wrapped buffer — at the layout the composer built for. Reading
+            // the width here (compute the layout inside `render`) is 4h-f's
+            // shared-editor move, when the layout stops being a snapshot.
+            RowAsk::fixed(1, self.layout.row_count.max(1))
+        }
+    }
+
+    fn render(&self, h: usize, tw: usize) -> Rendered {
         if h == 0 {
             return Rendered::default();
         }
@@ -1764,8 +1789,9 @@ impl Repl {
     ) -> Frame {
         let term_w = term_w.max(1);
         let elements = Self::compose_elements(editor, prompt, status, overlay, term_w);
-        let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
-        let heights = allocate(&extents, live_budget(term_h.max(1)));
+        let asks: Vec<RowAsk> = elements.iter().map(|e| e.ask(term_w)).collect();
+        let term_h = term_h.max(1);
+        let heights = allocate(&asks, term_h, live_budget(term_h));
         render(&elements, &heights, term_w)
     }
 
@@ -4836,46 +4862,46 @@ mod tests {
     /// its row, because that row is what tells the reader where to type.
     ///
     /// Asserted through [`input_element`] rather than through a composed frame,
-    /// because this is a property of the element's `(must, might)` and a test
+    /// because this is a property of the element's [`RowAsk`] and a test
     /// that replayed bytes to find it would pass just as well with the frame
     /// layer accidentally padding the gap back in.
     #[test]
     fn an_empty_input_is_a_row_between_turns_and_none_mid_turn() {
         let empty = LineEditor::new();
 
-        // Between turns: the resting row, `must == 1`.
+        // Between turns: the resting row, `min == 1`.
         let e = input_element(&empty, "> ", false, 60);
         assert_eq!(
-            (e.must, e.might),
-            (1, 1),
+            e.ask(60),
+            RowAsk::fixed(1, 1),
             "an idle REPL keeps its prompt row — it is where input goes"
         );
 
         // Mid-turn, still empty: nothing to submit, so no row and no claim.
         let e = input_element(&empty, "> ", true, 60);
         assert_eq!(
-            (e.must, e.might),
-            (0, 0),
+            e.ask(60),
+            RowAsk::fixed(0, 0),
             "an empty input mid-turn is not a row"
         );
 
-        // Mid-turn with something typed: an ordinary input again, and `must` is
+        // Mid-turn with something typed: an ordinary input again, and `min` is
         // the caret's row so it can never be squeezed away entirely.
         let mut typed = LineEditor::new();
         typed.set("hello");
         let e = input_element(&typed, "> ", true, 60);
         assert_eq!(
-            (e.must, e.might),
-            (1, 1),
+            e.ask(60),
+            RowAsk::fixed(1, 1),
             "typed input is drawn mid-turn: the row appears on the first keystroke"
         );
 
         // And through the real pipeline, a zero-row element really yields a zero-row
-        // frame — otherwise `must == might == 0` would only be a claim.
+        // frame — otherwise `min == max == 0` would only be a claim.
         use crate::render::{allocate, live_budget, render};
         let height = |streaming: bool| {
             let e = input_element(&empty, "> ", streaming, 60);
-            let heights = allocate(&[e.extent()], live_budget(24));
+            let heights = allocate(&[e.ask(60)], 24, live_budget(24));
             render(&[e], &heights, 60).height()
         };
         assert_eq!(height(true), 0, "a hidden input paints no row at all");
@@ -4924,35 +4950,37 @@ mod tests {
         assert_eq!(f.caret, Some((2, 2)));
     }
 
-    /// The sizing declaration is *data* now (§3.2.3), which means it can be wrong
-    /// without the allocator noticing: `allocate` reads the fields, not the impl.
+    /// The sizing declaration is the *trait's* now (§3.2.3, 4h-b), which means
+    /// it can be wrong without the allocator noticing: `allocate` reads the
+    /// ask the element answers, not the impl.
     ///
-    /// One assertion per kind, because this is the part the refactor moved from a
-    /// `match` into constructors — and mutation-checking `must: 1 → 0` on the
-    /// input sailed through the whole suite. A wrong `must`/`might` here shows up
-    /// much later as a frame squeezed wrong on a short terminal, so it is named
-    /// instead.
+    /// One assertion per kind, because this is the part the refactor moved from
+    /// a `match` into impls — and mutation-checking `must: 1 → 0` on the input
+    /// sailed through the whole suite. A wrong ask here shows up much later as
+    /// a frame squeezed wrong on a short terminal, so it is named instead.
     #[test]
     fn each_kind_declares_the_floor_and_want_it_promised() {
         let mut e = LineEditor::new();
         e.insert_str("hi");
         assert_eq!(
-            input(e.layout(20, "> "), "> ".into()).extent(),
-            Extent {
-                must: 1,
-                might: e.layout(20, "> ").row_count.max(1)
-            },
+            input(e.layout(20, "> "), "> ".into()).ask(20),
+            RowAsk::fixed(1, e.layout(20, "> ").row_count.max(1)),
             "the caret's own row is the floor: the input can never be squeezed away"
         );
         assert_eq!(
-            Element::divider().extent(),
-            Extent { must: 1, might: 1 },
+            input_hidden(e.layout(20, "> "), "> ".into()).ask(20),
+            RowAsk::fixed(0, 0),
+            "the mid-turn empty input claims no rows at all"
+        );
+        assert_eq!(
+            Element::divider().ask(20),
+            RowAsk::fixed(1, 1),
             "a rule is all-or-nothing"
         );
         assert_eq!(
-            Element::lines(vec!["a".to_string(), "b".to_string(), "c".to_string()]).extent(),
-            Extent { must: 3, might: 3 },
-            "fixed content is served whole in pass 1 — that is what `must` is for"
+            Element::lines(vec!["a".to_string(), "b".to_string(), "c".to_string()]).ask(20),
+            RowAsk::fixed(3, 3),
+            "fixed content is served whole in pass 1 — that is what the floor is for"
         );
     }
 
@@ -4999,10 +5027,11 @@ mod tests {
             Element::lines(vec!["one".to_string(), "two".to_string()]),
         ];
         let heights = allocate(
-            &els.iter().map(Element::extent).collect::<Vec<_>>(),
+            &els.iter().map(|el| el.ask(80)).collect::<Vec<_>>(),
+            24,
             live_budget(24),
         );
-        assert_eq!(heights, vec![1, 1, 2]); // all mights fit in 16
+        assert_eq!(heights, vec![1, 1, 2]); // all wants fit in 16
         let f = render(&els, &heights, 80);
 
         // Contiguous extents covering the buffer exactly.
@@ -5088,8 +5117,8 @@ mod confirm_tests {
         // "where on screen".
         let mut els = overlay_elements(&sess.overlay, 40);
         els.extend(sess.confirm.as_ref().unwrap().elements(40));
-        let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
-        let heights = crate::render::allocate(&extents, 40);
+        let asks: Vec<RowAsk> = els.iter().map(|e| e.ask(40)).collect();
+        let heights = crate::render::allocate(&asks, 24, 40);
         let frame = crate::render::render(&els, &heights, 40);
         let joined = (0..frame.height())
             .map(|i| frame.row(i).to_string())
@@ -5196,14 +5225,14 @@ mod confirm_tests {
         let els = prompt.elements(40);
         let rows_el = els.last().expect("the rows element");
         assert_eq!(
-            rows_el.extent().must,
+            rows_el.ask(40).resolve(24).must,
             3,
             "all three options are pinned, not just one row"
         );
         // Under a budget that cannot fit the header, the rows still get their
         // three: `allocate` serves every `must` before any `might`.
-        let all: Vec<_> = els.iter().map(Element::extent).collect();
-        let heights = crate::render::allocate(&all, 3);
+        let all: Vec<RowAsk> = els.iter().map(|e| e.ask(40)).collect();
+        let heights = crate::render::allocate(&all, 24, 3);
         assert_eq!(
             heights[heights.len() - 1],
             3,

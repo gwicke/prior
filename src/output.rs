@@ -13,7 +13,7 @@ use crate::content::Content;
 #[cfg(test)]
 use crate::content::ContentDisplayKind;
 use crate::draw::ApplyPolicy;
-use crate::render::{Element, Frame, RenderAt, Rendered};
+use crate::render::{Element, Frame, RenderElement, Rendered, RowAsk};
 #[cfg(test)]
 use crate::settings::ShowReasoning;
 use crate::settings::ShowReasoningHandle;
@@ -771,7 +771,7 @@ fn dot_cell(width: usize) -> (&'static str, &'static str, usize) {
 /// without the other, so neither left with the data.
 ///
 /// The element owns its data source rather than reaching back into `Output`,
-/// which is what keeps `render_at` a function of `(h, term_w)` plus state this
+/// which is what keeps `render` a function of `(h, term_w)` plus state this
 /// element holds itself — constructible with no terminal and no output in
 /// sight, so §3.1's unit-testability is intact rather than traded away.
 struct StatusItem {
@@ -781,8 +781,12 @@ struct StatusItem {
     streaming: Arc<AtomicBool>,
 }
 
-impl RenderAt for StatusItem {
-    fn render_at(&self, _h: usize, term_w: usize) -> Rendered {
+impl RenderElement for StatusItem {
+    fn height(&self, _width: usize) -> RowAsk {
+        RowAsk::fixed(1, 1)
+    }
+
+    fn render(&self, _h: usize, term_w: usize) -> Rendered {
         // The bar formats itself (step 4f-a): the held state is facts, and
         // both halves of the drawing run here — the shaping (name fallback,
         // field list, drop order) and the fit at the width being rendered
@@ -809,18 +813,19 @@ impl RenderAt for StatusItem {
     }
 }
 
-/// The status row: `must == might == 1`, data resolved at render time.
+/// The status row: `min == max == 1`, data resolved at render time.
 /// Presence is the compose's decision (`repl::compose_area`); this is
 /// only ever built when there is something to say (see [`StatusItem`]).
 ///
 /// A free function, not `status`: inherent methods on `Element` would
 /// live in `slashdot_tui`, and this element is output's (it holds content's
-/// bar store). Same shape as `Element::new`, whose `render` impl lives there.
+/// bar store). Same shape as `Element::new`, whose `RenderElement` impl lives
+/// there.
 pub(crate) fn status(
     status: Arc<Mutex<crate::agent::status::BarStatus>>,
     streaming: Arc<AtomicBool>,
 ) -> Element {
-    Element::new(1, 1, StatusItem { status, streaming })
+    Element::new(StatusItem { status, streaming })
 }
 
 pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> String {
@@ -1069,7 +1074,7 @@ mod tests {
     use crate::ansi::utf8_len;
     // The pure pipeline the manager's render now runs (and the composer tests
     // re-run) — imported here since the production path left `output.rs`.
-    use crate::render::{allocate, live_budget, render, Extent};
+    use crate::render::{allocate, live_budget, render, RowAsk};
     use crate::repl::input;
 
     // --- Row accounting: the tracked cursor vs. the real one (phase B) ---
@@ -1155,12 +1160,12 @@ mod tests {
 
     /// The rows a composed list would paint, without touching a terminal.
     ///
-    /// Extents alone cannot identify a row: the status and the divider are both
-    /// `must == might == 1`, so a test about *what* the composer produced has to
+    /// Asks alone cannot identify a row: the status and the divider both ask
+    /// `min == max == 1`, so a test about *what* the composer produced has to
     /// look at the bytes rather than the budgets.
     fn compose_rows(items: &[Element], term_w: usize) -> Vec<String> {
-        let extents: Vec<Extent> = items.iter().map(Element::extent).collect();
-        let heights = allocate(&extents, live_budget(24));
+        let asks: Vec<RowAsk> = items.iter().map(|e| e.ask(term_w)).collect();
+        let heights = allocate(&asks, 24, live_budget(24));
         let frame = render(items, &heights, term_w);
         frame
             .extents
@@ -2869,8 +2874,8 @@ mod tests {
         // composer, same status, same dims — so the apply half is all that
         // differs.
         let stack = compose_area(&hand, pieces().0, pieces().1);
-        let extents: Vec<Extent> = stack.iter().map(Element::extent).collect();
-        let heights = allocate(&extents, live_budget(dims.1));
+        let asks: Vec<RowAsk> = stack.iter().map(|e| e.ask(dims.0)).collect();
+        let heights = allocate(&asks, dims.1, live_budget(dims.1));
         let frame = render(&stack, &heights, dims.0);
         let hand_sink = record_bytes(&hand);
         let b = hand.draw_frame(&frame, ApplyPolicy::Frame, dims);

@@ -10,7 +10,7 @@
 //! [`overlay_elements`] the slash menu uses
 //! ([`doc/confirm_as_menu_261002.md`](../../doc/confirm_as_menu_261002.md)).
 
-use crate::render::{pad_row, Element, RenderAt, Rendered};
+use crate::render::{pad_row, Element, RenderElement, Rendered, RowAsk};
 use crate::slashdot_menu::render::{
     paint_detail, paint_header, paint_rows, visual_height, window_heights, LogicalLine,
     PaintedSection, RenderPlan,
@@ -22,7 +22,7 @@ use crate::draw::ApplyPolicy;
 // Only the element tests drive the pipeline themselves; naming these
 // unconditionally would trip `unused_imports` on a normal build.
 #[cfg(test)]
-use crate::render::{allocate, live_budget, render, Extent};
+use crate::render::{allocate, live_budget, render};
 use std::sync::Arc;
 
 // --- the overlay element ----------------------------------------------------
@@ -45,13 +45,13 @@ use std::sync::Arc;
 // `paint_detail` / `paint_header`; the rows stay unpainted and are windowed at
 // render time.
 
-/// The table's column-label line. **Elastic** (`must` 0), deliberately:
+/// The table's column-label line. **Elastic** (`min` 0), deliberately:
 /// protecting it inverts the right priority when space runs out. Measured
 /// against `allocate`, a budget of 3 with a protected header gives the
 /// header its row and the menu *zero* rows — and given the choice, a row
 /// beats a header. So the header yields; see `header_element_extent`.
 fn table_header(section: PaintedSection) -> Element {
-    Element::new(0, section.height(), SectionItem { section })
+    Element::new(SectionItem { section })
 }
 
 /// The node's `header()` output: context, above the table. Also elastic,
@@ -62,7 +62,7 @@ fn table_header(section: PaintedSection) -> Element {
 /// the bottom: a detail line too wide for the terminal was split when
 /// painted, and it is kept or dropped whole rather than cut mid-line.
 fn detail(section: PaintedSection) -> Element {
-    Element::new(0, section.height(), SectionItem { section })
+    Element::new(SectionItem { section })
 }
 
 /// The scrollable rows, held **unpainted** and windowed at render time.
@@ -87,7 +87,7 @@ fn data_rows(rows: Arc<Vec<LogicalLine>>, selected: Option<usize>, active: Vec<u
     rows_pinned_to(rows, selected, active, 1)
 }
 
-/// Rows that must survive a starved budget, with `min` as the floor.
+/// Rows that must survive a starved budget, with `floor` as the ask's `min`.
 ///
 /// A menu asks for `1`; a confirmation asks for its option count, because
 /// a dialog whose options have been squeezed away is not a consent prompt.
@@ -99,38 +99,34 @@ fn rows_pinned_to(
     rows: Arc<Vec<LogicalLine>>,
     selected: Option<usize>,
     active: Vec<usize>,
-    min: usize,
+    floor: usize,
 ) -> Element {
-    // `might` is the height *if every row were shown*, measured the way the
-    // engine wrote them ([`visual_height`]: embedded `\n` only). Painting
-    // can make a row taller — one too wide for the terminal is split — so
-    // this is a lower bound on the painted height, which is the safe
-    // direction: the allocator is never promised more rows than the element
-    // can actually produce. `render_at` re-measures and fits `h` anyway.
-    let might: usize = rows.iter().map(visual_height).sum();
-    let must = min.min(might);
-    Element::new(
-        must,
-        might,
-        RowsItem {
-            rows,
-            selected,
-            active,
-        },
-    )
+    Element::new(RowsItem {
+        rows,
+        selected,
+        active,
+        floor,
+    })
 }
 
 /// One elastic section: already-painted rows, clipped to the allocation.
 ///
 /// The shape both `detail` and `table_header` want, and deliberately *not*
-/// `render::Element::lines`: that one has `must == might`, which is what keeps
+/// `render::Element::lines`: that one has `min == max`, which is what keeps
 /// the status row from ever competing. These two must compete — they yield.
 struct SectionItem {
     section: PaintedSection,
 }
 
-impl RenderAt for SectionItem {
-    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+impl RenderElement for SectionItem {
+    fn height(&self, _width: usize) -> RowAsk {
+        // The section was painted at compose width, so its height is already
+        // measured; the paint-at-render-width move is 4h-d's (the menu crate
+        // mints its own elements), and the ask will read `width` then.
+        RowAsk::fixed(0, self.section.height())
+    }
+
+    fn render(&self, h: usize, tw: usize) -> Rendered {
         // Whole logical lines only: a line's painted sub-rows are kept or
         // dropped together, so the cut never lands inside one.
         let mut used = 0usize;
@@ -174,10 +170,25 @@ struct RowsItem {
     rows: Arc<Vec<LogicalLine>>,
     selected: Option<usize>,
     active: Vec<usize>,
+    /// The floor the host pinned ([`rows_pinned_to`]): a menu's `1`, a
+    /// dialog's option count.
+    floor: usize,
 }
 
-impl RenderAt for RowsItem {
-    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+impl RenderElement for RowsItem {
+    fn height(&self, _width: usize) -> RowAsk {
+        // The want is the height *if every row were shown*, measured the way
+        // the engine wrote them ([`visual_height`]: embedded `\n` only).
+        // Painting can make a row taller — one too wide for the terminal is
+        // split — so this is a lower bound on the painted height, which is
+        // the safe direction: the allocator is never promised more rows than
+        // the element can actually produce. `render` re-measures and fits `h`
+        // anyway. Width-independent until the paint moves inside (4h-d).
+        let max: usize = self.rows.iter().map(visual_height).sum();
+        RowAsk::fixed(self.floor.min(max), max)
+    }
+
+    fn render(&self, h: usize, tw: usize) -> Rendered {
         if h == 0 || self.rows.is_empty() {
             return Rendered::default();
         }
@@ -217,7 +228,7 @@ impl RenderAt for RowsItem {
             .filter(|f| *f < section.heights.len())
             .unwrap_or(0);
         let (win_start, win_count) = window_keeps(&section.heights, focus, h);
-        // `take(h)` is the contract: `render_at` fits its allocation, even when
+        // `take(h)` is the contract: `render` fits its allocation, even when
         // the selected row is taller than the whole thing — the marker is on
         // its first row, so the cursor is still visible.
         let rows = section
@@ -328,8 +339,8 @@ mod tests {
                 ..Default::default()
             };
             let els = overlay_elements(&plan, 20, Some(sel));
-            let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
-            let heights = allocate(&extents, live_budget(24));
+            let asks: Vec<RowAsk> = els.iter().map(|e| e.ask(20)).collect();
+            let heights = allocate(&asks, 24, live_budget(24));
             let f = render(&els, &heights, 20);
             (0..f.height())
                 .filter(|i| f.row(*i).contains('*'))
@@ -396,8 +407,8 @@ mod tests {
                 vec![],
             ),
         ];
-        let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
-        let heights = allocate(&extents, live_budget(24));
+        let asks: Vec<RowAsk> = els.iter().map(|e| e.ask(60)).collect();
+        let heights = allocate(&asks, 24, live_budget(24));
         let f = render(&els, &heights, 60);
 
         // The cursor is deep in the list, so the frame really did window.
@@ -420,29 +431,26 @@ mod tests {
     /// elastic precisely so that cannot happen.
     #[test]
     fn header_element_extent_yields_to_a_row_under_starvation() {
-        let extents = |h_must, h_might| {
+        let asks = |h_min, h_max| {
             vec![
-                Extent { must: 1, might: 1 }, // input
-                Extent { must: 1, might: 1 }, // divider
-                Extent { must: 0, might: 5 }, // detail
-                Extent {
-                    must: h_must,
-                    might: h_might,
-                },
-                Extent { must: 1, might: 20 }, // rows
+                RowAsk::fixed(1, 1), // input
+                RowAsk::fixed(1, 1), // divider
+                RowAsk::fixed(0, 5), // detail
+                RowAsk::fixed(h_min, h_max),
+                RowAsk::fixed(1, 20), // rows
             ]
         };
         // A protected header wins the tie-break and starves the rows.
-        let protected = allocate(&extents(1, 1), 3);
+        let protected = allocate(&asks(1, 1), 24, 3);
         assert_eq!(protected[4], 0, "a protected header wins the last row");
         // The elastic one does not.
-        let elastic = allocate(&extents(0, 1), 3);
+        let elastic = allocate(&asks(0, 1), 24, 3);
         assert_eq!(elastic[4], 1, "a row beats a header");
         assert_eq!(elastic[3], 0, "the header yielded");
         // And with room to spare both behave the same — this is only about
         // starvation, not about hiding the header in normal use.
         for h in [5usize, 8, 16] {
-            assert_eq!(allocate(&extents(0, 1), h)[3], 1, "budget {h}");
+            assert_eq!(allocate(&asks(0, 1), 24, h)[3], 1, "budget {h}");
         }
     }
 
@@ -453,8 +461,9 @@ mod tests {
         for (label, tw) in [("ab", 8usize), ("abcdefgh", 8), ("ab", 5)] {
             let el = table_header(paint_header(Some(&LogicalLine::new(label)), tw));
             // A label wider than the terminal is *split*, so the section can be
-            // two rows; allocate what it actually wants.
-            let h = el.extent().might;
+            // two rows; allocate what it actually wants. (`term_h` is inert:
+            // the ask is fixed.)
+            let h = el.ask(tw).resolve(24).might;
             let f = render(&[el], &[h], tw);
             assert_eq!(f.height(), h, "{label:?} at {tw}");
             for i in 0..f.height() {
@@ -507,8 +516,8 @@ mod tests {
         };
         for sel in [0usize, 15, 29] {
             let els = els(sel);
-            let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
-            let heights = allocate(&extents, live_budget(24));
+            let asks: Vec<RowAsk> = els.iter().map(|e| e.ask(20)).collect();
+            let heights = allocate(&asks, 24, live_budget(24));
             let f = render(&els, &heights, 20);
             assert!(
                 f.row(0).trim_end().contains("HDR"),
@@ -555,8 +564,8 @@ mod tests {
             active_rows: vec![],
         };
         let els = overlay_elements(&plan, 40, plan.selected);
-        let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
-        let heights = allocate(&extents, live_budget(24));
+        let asks: Vec<RowAsk> = els.iter().map(|e| e.ask(40)).collect();
+        let heights = allocate(&asks, 24, live_budget(24));
         let f = render(&els, &heights, 40);
         assert_eq!(f.height(), 4, "detail + header + 2 rows: {:?}", f.row(0));
         assert!(f.row(0).contains("pick one"), "{:?}", f.row(0));
@@ -575,8 +584,8 @@ mod tests {
         };
         let els = overlay_elements(&bare, 40, Some(0));
         assert_eq!(els.len(), 1, "only the rows element");
-        let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
-        let heights = allocate(&extents, live_budget(24));
+        let asks: Vec<RowAsk> = els.iter().map(|e| e.ask(40)).collect();
+        let heights = allocate(&asks, 24, live_budget(24));
         assert_eq!(render(&els, &heights, 40).height(), 1);
     }
 }
