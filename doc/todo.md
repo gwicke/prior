@@ -77,6 +77,10 @@ and link a doc/ and/or commit hash
     `height(width)` on the trait, one place computes the frame row count), 4h-c
     (`280f654`+`2651b19`, the bar moves into `ui/`), 4h-d
     (`a2ebeff`+`063d993`+`8daa008`, menu views mint their own elements: `Arc` handle
-    chain, `RenderElement` impls in `slashdot_menu`, the repl appends the element set);
-    4h-e next (selection behind shared state)
+    chain, `RenderElement` impls in `slashdot_menu`, the repl appends the element set),
+    4h-e (`14542025`+`744a8dfe`+`25730624`, selection figures live behind a shared
+    handle; a cursor move updates in place, changed rows re-mint), 4h-f
+    (`08ed747`+`be0e7b4`, the editor goes behind `Arc<Mutex<LineEditor>>` and the input
+    element pulls it; `Layout` comes home to repl); 4h-g next (the flip:
+    `configure` regains the full signature, dims come off the watch)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)

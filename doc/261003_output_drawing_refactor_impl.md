@@ -579,11 +579,12 @@ most runway to expand into separate sub-commits.
       (the `Layout` / `PaintedSection` / engine heights), so `width` is presently inert for them.~~
       The menu sections landed with **4h-d**: `SectionItem`/`RowsItem` are gone, the crate's
       detail/header/rows elements lay out at the render width inside `render(h, w)`, and their ask
-      reads `width`. Only `InputItem` still snapshots (a `Layout` at compose width) — **4h-f**'s
-      shared editor closes that half.
-    - `InputItem` carries the composer's `hidden` flag (a push fact, set where the mid-turn rule
-      decides). Design §RenderElement stack: turn presence rides `Content::streaming`, read at pull
-      time — that lands with the input element, **4h-f**.
+      reads `width`. `InputItem`'s snapshot closed with **4h-f** — the element holds the editor
+      handle and lays out inside `height`/`render` at the width it is asked at.
+    - ~~`InputItem` carries the composer's `hidden` flag (a push fact, set where the mid-turn rule
+      decides).~~ Design §RenderElement stack: turn presence rides `Content::streaming`, read at
+      pull time — landed with **4h-f**: the element holds the flag handle next to the editor and
+      the R1 rule lives inside its `height`.
     - `Extent` survives as the *resolved* pair (plan §3.2's `must`/`might`) one step below the
       element's `RowAsk` — the allocator's own vocabulary; no caller outside `allocate` reaches it
       now.
@@ -640,13 +641,29 @@ most runway to expand into separate sub-commits.
      need to name element identity).
    - Panel-shape rules, pinned by tests in the crate and in the repl: a detail section appearing
      or vanishing (an error line arriving on an unchanged view) is a rebuild, not a figure move.
-  - **4h-f — the input element.** `Repl::editor: LineEditor` → `Arc<Mutex<LineEditor>>`, shared
-    with the input element (label + streaming flag alongside); layout/wrap computes inside
-    `render(h, w)` at render width. Height rules: `0` mid-turn with an empty buffer; the prompt row
-    between turns even with no content; sized to the wrapped buffer whenever content is present, in
-    either case. Turn presence rides `Content::streaming` for now (pushed fact, read at pull time);
-    verify against the turn pumps' current pixels (the one open question from design discussion —
-    mid-turn repaint paths) and follow whatever preserves them.
+  - **4h-f — the input element.** *(landed — `08ed747` + `be0e7b4`)* `PromptSession::editor` is
+    `Arc<Mutex<LineEditor>>`, shared with the input element (label + streaming flag alongside);
+    layout/wrap computes inside `height`/`render` at render width. Height rules: `0` mid-turn with
+    an empty buffer; the prompt row between turns even with no content; sized to the wrapped buffer
+    whenever content is present, in either case. Turn presence rides `Content::streaming` — a
+    pushed fact, read at pull time inside the element.
+   - The mid-turn pixel check (the open question from design discussion): verified preserved. The
+     turn pumps' repaints all go through `paint_prompt` → the manager's one synchronous
+     compose→allocate→render, so the flag read at ask time is the same fact the old compose-time
+     push read — no await, no interleaving. The one place the pixels *improve* is the manager's
+     recipe re-render (resize reposition): it now re-lays-out the input at the new width instead
+     of replaying a stale compose-width snapshot; the recipe dies with **4h-g** anyway.
+   - `Layout` moved home from `slashdot_tui` — with the element pulling the editor, both sides of
+     the contract (`LineEditor::layout` produces, `InputItem` consumes) are repl's.
+   - `emit_commit` resets the buffer *before* the redraw rather than after (the closure paints
+     through the shared handle now; every caller passes `""`, so same pixels).
+   - Leftover: the engine re-mines its view handle per cursor eval today (`StaticListingNode::
+     data()` mints a fresh `DataResponse` per call → `slots_dirty` → fresh `ViewRows`), so
+     `ElementSet::update` rebuilds rather than moving figures in place on the production path —
+     pixels are right either way, but 4h-e's no-rebuild ideal needs child `data()` memoization
+     (same-`Arc` when unchanged) to reach it. Claimed by **4h-e**'s engine side, not this step; a
+     repl-level test asserting the carry was dropped with this step because it encoded the engine
+     memoization as fact before it is one.
   - **4h-g — the flip.** `configure(frame_max_row_ratio, frame_elements)` regains the design's full
     signature — the repl configures the whole stack (bar and transient menus by inclusion; blank
     companion row and divider as ordinary elements; input always in, resolved by height).
