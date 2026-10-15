@@ -585,7 +585,8 @@ impl CodeAgent {
                 } => {
                     if let Some(sess) = it_session.as_deref_mut() {
                         sess.open_confirm(req, self.confirm_approvals.clone());
-                        sess.paint(self.content.as_ref(), it_label);
+                        sess.sync_stack(self.content.as_ref(), it_label);
+                        crate::repl::paint_prompt(self.content.as_ref());
                     }
                 }
 

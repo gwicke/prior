@@ -1001,24 +1001,28 @@ mod tests {
         let _ = out.end_capture();
     }
 
-    /// A status with nothing to say draws no row. The check is the shaped
-    /// `is_off` — the same answer the bar's own render uses, so compose and
-    /// draw cannot disagree about whether the bar exists. (The old "an output
-    /// with no screen composes no status" arm went with the `Output`-side
-    /// composer in 4f-b: no screen is now *no `Content`*, and there is
-    /// nothing to compose from.)
+    /// The bar is **always present** (4h-g part 2): no `is_off` gate, so the
+    /// membership is the same shape whether or not the status has anything to
+    /// say. The gate was an artifact of the old push — it protected against a
+    /// stale/absent pushed row. With a live pull the bar always knows how to
+    /// render itself, so an empty status reserves its row and says nothing.
     #[test]
-    fn compose_area_drops_a_status_that_has_nothing_to_say() {
+    fn compose_area_keeps_the_bar_present_even_with_nothing_to_say() {
         let (out, _reasoning) = capturing_output(60);
-        assert!(
-            compose_area(&out, None, Vec::new()).is_empty(),
-            "never set: there is no bar to show"
+        // Never set: the bar is still there — gap, then the bar row.
+        assert_eq!(
+            compose_area(&out, None, Vec::new()).len(),
+            2,
+            "gap, then a bar — always"
         );
+        // Explicitly off: same membership, not a dropped row.
         out.content.set_status(Default::default());
-        assert!(
-            compose_area(&out, None, Vec::new()).is_empty(),
-            "explicitly off: there is no bar to show"
+        assert_eq!(
+            compose_area(&out, None, Vec::new()).len(),
+            2,
+            "an off status still reserves its row"
         );
+        // A real status: same two rows.
         out.content.set_status(bar_of("[bar]"));
         assert_eq!(
             compose_area(&out, None, Vec::new()).len(),
@@ -1053,14 +1057,28 @@ mod tests {
         e
     }
 
-    /// The compose head's home since 4f-b: the tests drive it through the
-    /// content handle they already hold, the way `paint_prompt` does.
+    /// The membership a REPL transition would install, built locally so the
+    /// tests can drive the pure pipeline without a live session (the test twin
+    /// the plan keeps: compose a stack, then `configure` + `render(None)`).
+    /// Mirrors `PromptSession::sync_stack`: gap, always-present bar, input, and
+    /// the divider-then-overlay tail when an overlay is open.
     fn compose_area(
         out: &ConsoleOutput,
         input: Option<Element>,
         overlay: Vec<Element>,
     ) -> Vec<Element> {
-        crate::repl::compose_area(&out.content, input, overlay)
+        let mut stack = Vec::new();
+        stack.push(Element::lines(vec![String::new()]));
+        stack.push(crate::ui::bar::status(
+            out.content.bar.clone(),
+            out.content.streaming.clone(),
+        ));
+        stack.extend(input);
+        if !overlay.is_empty() {
+            stack.push(Element::divider());
+            stack.extend(overlay);
+        }
+        stack
     }
 
     /// Swap `out`'s byte edge for a recording `TermIO` and return the handle
@@ -2622,12 +2640,13 @@ mod tests {
         let tail_sink = record_bytes(&tail);
         let (input, overlay) = pieces();
         let a = {
-            let stack = compose_area(&tail, input, overlay);
-            tail.content
-                .manager
-                .lock()
-                .unwrap()
-                .render(Some(stack), None)
+            let mut mgr = tail.content.manager.lock().unwrap();
+            mgr.configure(
+                crate::render::FRAME_MAX_ROW_RATIO,
+                compose_area(&tail, input, overlay),
+            );
+            mgr.render(None);
+            mgr.painted_size()
         };
         let via_tail = tail_sink.bytes();
 
@@ -2650,7 +2669,7 @@ mod tests {
         let b = hand.draw_frame(&frame, ApplyPolicy::Frame, dims);
         let via_hand = hand_sink.bytes();
 
-        assert_eq!(a, b, "the same dims either way");
+        assert_eq!(a, b, "the same painted dims either way");
         assert_eq!(
             via_tail, via_hand,
             "the tail is the old path, byte for byte — not a second behaviour"
@@ -2752,9 +2771,22 @@ mod tests {
         let (out, _reasoning) = capturing_output(40);
         let sink = record_bytes(&out);
         // Streaming with an empty buffer is R1's `input_hidden`: no input row,
-        // and so no caret to place.
+        // and so no caret to place. The element must pull the *streaming* flag,
+        // so mint it here rather than via `test_input` (which pins not-streaming).
         out.begin_response();
-        crate::repl::paint_prompt(&out.content, "", &shared_editor(|_| {}), Vec::new());
+        {
+            let hidden = crate::repl::input(
+                shared_editor(|_| {}),
+                "> ".to_string(),
+                out.content.streaming.clone(),
+            );
+            let mut mgr = out.content.manager.lock().unwrap();
+            mgr.configure(
+                crate::render::FRAME_MAX_ROW_RATIO,
+                compose_area(&out, Some(hidden), Vec::new()),
+            );
+        }
+        crate::repl::paint_prompt(&out.content);
         let bytes = sink.bytes();
         assert!(
             String::from_utf8_lossy(&bytes).contains("\x1b[?25l"),
@@ -2764,7 +2796,18 @@ mod tests {
         let (out, _reasoning) = capturing_output(40);
         let sink = record_bytes(&out);
         let editor = shared_editor(|e| e.set("hi"));
-        crate::repl::paint_prompt(&out.content, "", &editor, Vec::new());
+        {
+            let mut mgr = out.content.manager.lock().unwrap();
+            mgr.configure(
+                crate::render::FRAME_MAX_ROW_RATIO,
+                compose_area(
+                    &out,
+                    Some(crate::repl::test_input(&editor, "> ")),
+                    Vec::new(),
+                ),
+            );
+        }
+        crate::repl::paint_prompt(&out.content);
         let text = String::from_utf8_lossy(&sink.bytes()).into_owned();
         assert!(
             text.contains("\x1b[?25h"),

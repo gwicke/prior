@@ -312,10 +312,20 @@ pub fn paint(
     manager: &std::sync::Arc<std::sync::Mutex<crate::render::RenderManager>>,
 ) {
     // No compose head (step 4f-b): a probe's dialog is the whole area — the
-    // division below is the same `area_body` the session's own paint layers
-    // these elements under its bar and input with, so the two cannot drift.
-    let stack = crate::repl::area_body(None, confirm.elements());
-    manager.lock().unwrap().render(Some(stack), None);
+    // stack below is the same divider-then-elements the session's own paint
+    // layers under its bar and input, so the two cannot drift.
+    //
+    // A probe has no session to own membership, so it configures the manager
+    // directly (4h-g: `configure` is the membership verb) and then applies it.
+    let mut stack = Vec::new();
+    let elements = confirm.elements();
+    if !elements.is_empty() {
+        stack.push(crate::render::Element::divider());
+        stack.extend(elements);
+    }
+    let mut manager = manager.lock().unwrap();
+    manager.configure(crate::render::FRAME_MAX_ROW_RATIO, stack);
+    manager.render(None);
 }
 
 /// Resolve a confirmed dialog: **repaint without it, then record the decision**.

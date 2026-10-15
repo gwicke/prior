@@ -22,11 +22,14 @@
 //! content path hands each formatted block over as a [`ContentWrite`]
 //! (`render_content` / `render_batch`), and nothing above the manager
 //! writes bytes of its own; 4e made it batching's and reposition's home
-//! too (the guard, and the configured element stack reposition re-composes
-//! since 4h-g part 1). What remains of the design's shape comes with the
-//! steps that give it meaning: the compose + content round trip of
-//! `render(Some(w))` with the frame verbs (4f), and the rest of the element
-//! stack (4h-g).
+//! too (the guard, and the element stack reposition re-composes). 4h-g
+//! completed the design's shape: [`RenderManager::configure`] is the
+//! membership verb — the owner of what is on screen installs the element
+//! stack on each state transition — and [`RenderManager::render`] takes
+//! only the optional [`ContentWrite`], composing the *configured* stack for
+//! the UI half (`render(None)`) or running the write choreography for the
+//! content half (`render(Some(w))`). Nothing is handed in per paint:
+//! membership changes on transitions, never at paint.
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
@@ -555,12 +558,14 @@ pub struct ContentWrite {
 /// here — what was `Output::draw_elements`' default body — 4c moved the
 /// drawing edge (`Draw`) under this roof, 4d made this the content
 /// path's only door onto the screen (the `ContentWrite` hand-off below),
-/// and 4e moved batching and reposition here with the recipe they re-
-/// draw. Since 4h-b the composition budgets each element's own [`RowAsk`] —
-/// resolved here against the frame height — rather than a construction-time
-/// `(must, might)` pair. What remains of the design's shape comes with the
-/// rest of 4h: the installed, long-lived element stack and the compose +
-/// content round trip.
+/// and 4e moved batching and reposition here. Since 4h-b the composition
+/// budgets each element's own [`RowAsk`] — resolved here against the frame
+/// height — rather than a construction-time `(must, might)` pair. **4h-g
+/// completed the shape**: the element stack is the *configured* one
+/// ([`Self::configure`], membership changed by the repl on state
+/// transitions) and [`Self::render`] composes it with no stack handed in —
+/// paint renders whatever is configured, and the content write is the
+/// other half of the same verb.
 pub struct RenderManager {
     /// The drawing edge (step 4c): the byte sink and its live-screen
     /// bookkeeping, owned — the design's `Draw { … }` under this roof. Plain
@@ -571,20 +576,21 @@ pub struct RenderManager {
     /// Content bytes only — frame bytes can never be caught, which is the
     /// deliberate narrowing over the old writer swap.
     captured: Option<Vec<u8>>,
-    /// The configured long-lived element stack — bar, input, blank row — set
-    /// once by [`Self::configure`] (the repl owns membership, design §Render:
-    /// "the manager's `stack` is configured **by the repl**"). [`Self::render`]
-    /// composes it together with the per-paint overlay the caller hands in;
-    /// [`Self::reposition_area`] re-composes it when a content write brings the
-    /// area back, so the frame is current by construction (re-rendering the
-    /// configured elements is cheap and always reads the live state, where a
-    /// snapshot of the rendered rows would freeze whatever the status said at
-    /// the moment of compose).
+    /// The configured long-lived element stack — bar, input, blank row, plus
+    /// the overlay/confirm when one is open — installed by [`Self::configure`]
+    /// (the repl owns membership, design §Render: "the manager's `stack` is
+    /// configured **by the repl**"). [`Self::render`] composes exactly this,
+    /// and [`Self::reposition_area`] re-composes it when a content write
+    /// brings the area back, so the frame is current by construction
+    /// (re-rendering the configured elements is cheap and always reads the
+    /// live state, where a snapshot of the rendered rows would freeze
+    /// whatever the status said at the moment of compose).
     ///
-    /// The configured stack is never cleared by a direct [`Self::draw_frame`]
-    /// (the old "recipe" bookkeeping): it describes the frame the *next*
-    /// `render` will build, not the last composition a content write consumed,
-    /// so a raw apply leaves it intact.
+    /// Membership changes only on a state transition — the repl calls
+    /// [`Self::configure`] there (4h-g), never at paint. A direct
+    /// [`Self::draw_frame`] leaves it intact: it describes the frame the
+    /// *next* [`Self::render`] builds, not the last composition a content
+    /// write consumed.
     stack: Vec<Element>,
     /// The fraction of the frame's terminal height the area may occupy —
     /// [`configure`](Self::configure)'s, resolved against the render's
@@ -714,13 +720,18 @@ impl RenderManager {
         &mut self.draw
     }
 
-    /// Set the frame's max-height ratio (design §Render `configure`) — the
-    /// Set the frame's max-height ratio **and** install the long-lived element
-    /// stack (design §Render `configure(frame_max_row_ratio, frame_elements)`).
-    /// The ratio is the one knob the budget resolves from; the elements are
-    /// the bar/input/blank row the repl owns and hands over once — [`Self::render`]
-    /// composes them with the per-paint overlay, [`Self::reposition_area`]
-    /// re-composes them to bring the area back.
+    /// Set the frame's max-height ratio **and** install the element stack
+    /// (design §Render `configure(frame_max_row_ratio, frame_elements)`).
+    ///
+    /// The membership verb since 4h-g: the ratio is the one knob the budget
+    /// resolves from, and the elements are the frame's whole membership —
+    /// bar, input, blank row, plus the overlay/confirm when one is open. The
+    /// **repl** calls this on every state transition that changes what is on
+    /// screen (open/close/change an overlay, open/clear a confirm, submit
+    /// clear, commit); [`Self::render`] then composes exactly what is
+    /// configured, with nothing handed in per paint. `reposition_area`
+    /// re-composes the same stack to bring the area back after a content
+    /// write.
     pub fn configure(&mut self, frame_max_row_ratio: f64, frame_elements: Vec<Element>) {
         self.frame_max_row_ratio = frame_max_row_ratio;
         self.stack = frame_elements;
@@ -751,65 +762,42 @@ impl RenderManager {
     /// `Output::draw_elements`' default body (step 4b), painting through the
     /// [`Draw`] this manager has owned since 4c.
     ///
-    /// The compose head is *not* here: the caller composes the whole area
-    /// (`repl::compose_area`, whose head reads content's bar/streaming facts)
-    /// and hands the stack in — the status row becomes an installed element
-    /// in 4h and the head moves in with it.
-    /// `pub` as the hub's face verb (step 4f-b): out-of-crate drivers (the
-    /// confirm probe) apply frames through it directly.
+    /// No dims, no stack, no return (design §Render, complete since 4h-g):
+    /// both halves read the watched size and the configured [`Self::stack`],
+    /// so a resize applies lazily at the next `render` and a caller keys off
+    /// the resize event plus [`Self::painted_size`], never off a size this
+    /// verb returns. `ApplyPolicy::Frame` is the one policy the frame path
+    /// takes — `render` is the UI face verb, and no `render` caller has ever
+    /// passed `Append`.
     ///
-    /// Two halves, one verb (design §Render's final round trip, `render(content)`):
-    /// `stack` is the UI's compose+apply (the caller builds the element list
-    /// today; it moves to [`Self::configure`] with the final flip), `content`
-    /// is the content hand-off (choreographed against the live frame). The two
-    /// halves are still driven separately — never together — until **4h-g**
-    /// folds the stack into the configured one.
-    ///
-    /// No dims and no return (design §Render): the compose and the apply both
-    /// read the watched size, so a resize applies lazily at the next `render`
-    /// and a caller keys off the resize event plus [`Self::painted_size`],
-    /// never off a size this verb returns. `ApplyPolicy::Frame` is the one
-    /// policy the frame path takes — `render` is the UI face verb, and no
-    /// `render` caller has ever passed `Append`. A content-only call returns
-    /// the last painted size (the write does not compose a frame of its own).
-    pub fn render(
-        &mut self,
-        stack: Option<Vec<Element>>,
-        content: Option<ContentWrite>,
-    ) -> (usize, usize) {
-        // The two halves of the design's one round trip (§Render): the UI
-        // passes `stack = Some(…), content = None` (compose + apply the frame),
-        // the content paths pass `stack = None, content = Some(…)` (the write
-        // choreographed against the live frame). Until the final flip
-        // (**4h-g** remainder) the caller still composes the stack itself, so
-        // `stack` is `Some` from the UI and the content hand-off is `None` —
-        // the two never arrive together yet.
-        let applied = if let Some(stack) = stack {
+    /// Two halves, one verb (design §Render's round trip, `render(content)`):
+    /// a UI paint is `render(None)` — compose the configured stack and apply
+    /// it; a content write is `render(Some(w))` — the write choreographed
+    /// against the live frame, with no frame of its own composed (the write
+    /// consumes the live one and [`Self::reposition_area`] brings it back).
+    pub fn render(&mut self, content: Option<ContentWrite>) {
+        // The UI half (§Render): compose the *configured* stack — the
+        // membership the repl installed with `configure` — and apply it.
+        // Nothing is handed in: paint renders whatever is configured, which
+        // is what makes membership a transition concern rather than a
+        // per-paint one.
+        if !self.stack.is_empty() {
             let size = *self.size.borrow();
             let (tw, th) = (size.width.max(1), size.height.max(1));
-            let asks: Vec<RowAsk> = stack.iter().map(|e| e.ask(tw)).collect();
+            let asks: Vec<RowAsk> = self.stack.iter().map(|e| e.ask(tw)).collect();
             // The page-scroll path needs the rows element's grant *before* the
             // frame is rendered, and this is the only place `allocate` runs for
             // a composition — so a caller that has to know re-runs it over the
             // same asks rather than asking the painter to guess twice.
             let heights = allocate(&asks, th, self.budget(th));
-            let frame = render(&stack, &heights, tw);
+            let frame = render(&self.stack, &heights, tw);
             let applied = self.draw.draw_frame(&frame, ApplyPolicy::Frame, (tw, th));
-            // Not recorded: the configured `stack` (set by `configure`) is the
-            // reposition source now, so a per-paint compose leaves it untouched
-            // — and `draw_frame` below no longer clears it. Sub-split 2
-            // installs the real configured stack; until then it is empty and
-            // `reposition_area` falls back to `taken` exactly as the old
-            // empty-recipe path did.
             self.draw.cache.applied = Some(applied);
-            applied
-        } else {
-            self.painted_size()
-        };
+        }
+        // The content half: the write choreographed against the live frame.
         if let Some(content) = content {
             self.put_content(content);
         }
-        applied
     }
 
     /// Re-anchor the live-screen cache to the real cursor (DSR): the query
@@ -861,12 +849,10 @@ impl RenderManager {
     /// write takes is the shared `batch_active` flag's — it stays open across
     /// the burst and the guard's drop emits the re-emit once (ui_draw_v2 R5).
     ///
-    /// The compose half (`stack: Vec<Element>`) lands with the final flip
-    /// (**4h-g** remainder): until then the caller composes and hands the
-    /// stack to [`Self::render`] separately, so this is the content half
-    /// alone.
+    /// This is the content half of [`Self::render`] alone — the UI half is
+    /// `render(None)`, which composes the configured stack and applies it.
     pub fn render_content(&mut self, content: ContentWrite) {
-        self.render(None, Some(content));
+        self.render(Some(content));
     }
 
     /// One content block on the replay path (§Render): bulk writes, one per
@@ -877,7 +863,7 @@ impl RenderManager {
     /// the replay path reads as the design's `render_batch`, but the
     /// choreography it runs is the one round trip's.
     pub fn render_batch(&mut self, content: ContentWrite) {
-        self.render(None, Some(content));
+        self.render(Some(content));
     }
 
     /// Is a content batch open — its writes defer the frame's re-emit to
@@ -960,10 +946,10 @@ impl RenderManager {
     ///
     /// Re-render rather than replay `taken`: a `Frame` is a snapshot of the
     /// status as of the last compose, and the bar moves without the REPL
-    /// composing — `set_status` at turn start, the dot at
-    /// `begin_response`/`end_response`. The configured `stack` is the thing
-    /// that stays current (its elements pull live state at render), which is
-    /// why the hub re-composes it and not the rendered rows.
+    /// composing — the dot at `begin_response`/`end_response`, the usage
+    /// figure at every completion. The configured `stack` is the thing that
+    /// stays current (its elements pull live state at render), which is why
+    /// the hub re-composes it and not the rendered rows.
     ///
     /// `taken` is not a formality: it is the fallback when no stack was
     /// configured — a frame applied without a composition behind it (a test,
@@ -1190,13 +1176,17 @@ mod tests {
             Element::lines(vec!["hello".to_string()]),
             Element::divider(),
         ];
-        // The configured stack is the reposition source now, so configure it
-        // and let the compose pull the same elements (sub-split 4h-g part 1).
-        manager.configure(crate::render::FRAME_MAX_ROW_RATIO, stack.clone());
-        let applied = manager.render(stack, ApplyPolicy::Frame, (40, 24));
+        // The configured stack is what `render` composes (4h-g): install it,
+        // then apply with no stack handed in.
+        manager.configure(crate::render::FRAME_MAX_ROW_RATIO, stack);
+        manager.render(None);
         let bytes = manager.draw.term_io.recorded(crate::termio::Stream::Main);
 
-        assert_eq!(applied, (40, 24));
+        assert_eq!(
+            manager.painted_size(),
+            (40, 24),
+            "the applied dims are remembered"
+        );
         assert!(
             String::from_utf8_lossy(&bytes).contains("hello"),
             "the frame's rows must reach the manager's Draw"

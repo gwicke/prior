@@ -12,6 +12,7 @@
 //! the delay.
 
 use crate::app_state::WindowKeySource;
+use crate::repl::paint_prompt;
 use crate::termio::InputEvent;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -100,14 +101,18 @@ pub(crate) async fn dispatch_in_turn_event(
                         sess.clear_confirm();
                         crate::confirm::resolve(
                             content,
-                            || sess.paint(content, label),
+                            || {
+                                sess.sync_stack(content, label);
+                                paint_prompt(content);
+                            },
                             &subject,
                             decision,
                         );
                         InTurnDispatch::Handled
                     }
                     None => {
-                        sess.paint(content, label);
+                        sess.sync_stack(content, label);
+                        paint_prompt(content);
                         InTurnDispatch::Handled
                     }
                 };
