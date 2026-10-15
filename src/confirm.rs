@@ -229,8 +229,8 @@ impl ConfirmPrompt {
     /// The option rows are pinned to the full option count, so a starved
     /// budget cannot squeeze the choices away — a consent prompt you cannot read
     /// is not a consent prompt.
-    pub fn elements(&self, term_w: usize) -> Vec<crate::render::Element> {
-        crate::ui::overlay_elements_with(&self.plan, term_w, Some(self.sel), OPTIONS.len())
+    pub fn elements(&self) -> Vec<crate::render::Element> {
+        self.plan.elements(OPTIONS.len())
     }
 
     /// Feed one key. `Some(decision)` means the dialog is finished — the
@@ -316,7 +316,7 @@ pub fn paint(
     // No compose head (step 4f-b): a probe's dialog is the whole area — the
     // division below is the same `area_body` the session's own paint layers
     // these elements under its bar and input with, so the two cannot drift.
-    let stack = crate::repl::area_body(None, confirm.elements(tw));
+    let stack = crate::repl::area_body(None, confirm.elements());
     manager
         .lock()
         .unwrap()

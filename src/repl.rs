@@ -408,23 +408,24 @@ pub(crate) fn input_element(
 /// Overlay elements for a plain list of rows — for tests that care about the
 /// frame, not about a menu's sections. See [`test_overlay_parts`].
 #[cfg(test)]
-pub(crate) fn test_overlay(lines: &[&str], sel: usize, term_w: usize) -> Vec<Element> {
-    test_overlay_parts(None, &[], lines, Some(sel), term_w)
+pub(crate) fn test_overlay(lines: &[&str], sel: usize) -> Vec<Element> {
+    test_overlay_parts(None, &[], lines, Some(sel))
 }
 
 /// Overlay elements from a plan's three sections, for tests that want a header
 /// or detail as well as rows.
 ///
-/// Goes through a real [`RenderPlan`] and the real [`overlay_elements`], so a
-/// test that pastes in arbitrary strings is still exercising production's
-/// composition rather than a shortcut that can drift from it.
+/// Goes through a real [`RenderPlan`] and the real [`RenderPlan::elements`],
+/// so a test that pastes in arbitrary strings is still exercising production's
+/// composition rather than a shortcut that can drift from it. No width: the
+/// minted elements lay themselves out at the render width (step 4h-d), so a
+/// compose-time width has nothing to hand them.
 #[cfg(test)]
 pub(crate) fn test_overlay_parts(
     header: Option<&str>,
     detail: &[&str],
     rows: &[&str],
     sel: Option<usize>,
-    term_w: usize,
 ) -> Vec<Element> {
     use crate::slashdot_menu::render::{LogicalLine, RenderPlan};
     let plan = RenderPlan {
@@ -436,7 +437,7 @@ pub(crate) fn test_overlay_parts(
         view: None,
         columns: Vec::new(),
     };
-    crate::ui::overlay_elements(&plan, term_w, sel)
+    plan.elements(1)
 }
 
 /// The rows element's allocation in a prompt frame — the page size a PageUp or
@@ -476,12 +477,10 @@ pub(crate) fn rows_grant(
 /// frame allocates them, so there is no painted row list to hand on and no
 /// focus index to translate — the cursor's logical row index goes straight to
 /// the rows element, which is the only thing that scrolls.
-pub(crate) fn overlay_elements(overlay: &ActiveOverlay, term_w: usize) -> Vec<Element> {
+pub(crate) fn overlay_elements(overlay: &ActiveOverlay) -> Vec<Element> {
     match overlay {
         ActiveOverlay::None => Vec::new(),
-        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
-            crate::ui::overlay_elements(plan, term_w, plan.selected)
-        }
+        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => plan.elements(1),
     }
 }
 
@@ -1202,9 +1201,9 @@ impl PromptSession {
     /// doc/confirm_as_menu_261002.md): it is modal over the menu, and the
     /// prompt that drives that menu stays exactly where it was.
     pub(crate) fn paint(&self, content: &Content, prompt: &str, dims: (usize, usize)) {
-        let mut overlay = overlay_elements(&self.overlay, dims.0);
+        let mut overlay = overlay_elements(&self.overlay);
         if let Some(confirm) = &self.confirm {
-            overlay.extend(confirm.elements(dims.0));
+            overlay.extend(confirm.elements());
         }
         paint_prompt(content, prompt, &self.editor, overlay, dims);
     }
@@ -1329,7 +1328,7 @@ impl PromptSession {
                         let page = rows_grant(
                             &self.editor,
                             prompt,
-                            overlay_elements(overlay, term_w),
+                            overlay_elements(overlay),
                             term_w,
                             watched.height.max(1),
                             budget,
@@ -4398,7 +4397,7 @@ mod tests {
             overlay: &[&str],
             focus: usize,
         ) -> (usize, usize, Vec<String>, usize) {
-            let overlay = crate::repl::test_overlay(overlay, focus, width);
+            let overlay = crate::repl::test_overlay(overlay, focus);
             let frame = Repl::compose_frame(editor, prompt, None, overlay, width, term_rows);
             let mut cache = DrawCache::new(term_rows);
             // The tracked row is the block's position (A3.2): the apply reads it
@@ -5135,8 +5134,8 @@ mod confirm_tests {
         // Compose the whole stack the way `paint` does, then read the frame:
         // element order is the row order, so "where in the stack" is exactly
         // "where on screen".
-        let mut els = overlay_elements(&sess.overlay, 40);
-        els.extend(sess.confirm.as_ref().unwrap().elements(40));
+        let mut els = overlay_elements(&sess.overlay);
+        els.extend(sess.confirm.as_ref().unwrap().elements());
         let asks: Vec<RowAsk> = els.iter().map(|e| e.ask(40)).collect();
         let heights = crate::render::allocate(&asks, 24, 40);
         let frame = crate::render::render(&els, &heights, 40);
@@ -5242,7 +5241,7 @@ mod confirm_tests {
             },
             bridge.port.approvals().clone(),
         );
-        let els = prompt.elements(40);
+        let els = prompt.elements();
         let rows_el = els.last().expect("the rows element");
         assert_eq!(
             rows_el.ask(40).resolve(24).must,

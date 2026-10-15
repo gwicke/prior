@@ -1454,7 +1454,7 @@ mod tests {
         );
 
         // And the `*` is actually painted on that row.
-        let els = crate::ui::overlay_elements(&second, 80, second.selected);
+        let els = second.elements(1);
         let asks: Vec<crate::render::RowAsk> = els.iter().map(|e| e.ask(80)).collect();
         let heights = crate::render::allocate(&asks, 24, crate::render::live_budget(24));
         let f = crate::render::render(&els, &heights, 80);

@@ -939,7 +939,7 @@ mod tests {
         assert_eq!(rows.len(), 3, "gap, status, input: {rows:?}");
 
         // Both: the divider arrives *with* the overlay, not from the caller.
-        let overlay = crate::repl::test_overlay(&["row"], 0, 60);
+        let overlay = crate::repl::test_overlay(&["row"], 0);
         let rows = compose_rows(&compose_area(&out, Some(input()), overlay), 60);
         assert_eq!(
             rows.len(),
@@ -2588,7 +2588,7 @@ mod tests {
         let pieces = || {
             let layout = crate::repl::LineEditor::new().layout(60, "> ");
             let input = input(layout, "> ".to_string());
-            let overlay = crate::repl::test_overlay(&tall, 0, 60);
+            let overlay = crate::repl::test_overlay(&tall, 0);
             (Some(input), overlay)
         };
         let dims = (60, 20);
@@ -2651,7 +2651,6 @@ mod tests {
                 "  claude-opus    200k   3.00",
             ],
             Some(0),
-            40,
         );
         let frame = crate::repl::Repl::compose_frame(
             &crate::repl::LineEditor::new(),
@@ -2797,7 +2796,6 @@ mod tests {
             &[],
             &["  gpt-5          400k   1.00"],
             Some(0),
-            40,
         );
         let frame = crate::repl::Repl::compose_frame(
             &crate::repl::LineEditor::new(),
