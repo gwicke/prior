@@ -153,7 +153,10 @@ impl Content {
         manager
             .lock()
             .unwrap()
-            .configure(crate::render::FRAME_MAX_ROW_RATIO);
+            // The configured stack arrives in sub-split 4h-g part 2, where the
+            // repl installs bar/input/blank; for now the manager carries no
+            // long-lived elements and every compose is per-paint.
+            .configure(crate::render::FRAME_MAX_ROW_RATIO, Vec::new());
         Self {
             manager,
             size,

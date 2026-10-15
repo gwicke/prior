@@ -97,10 +97,10 @@ pub struct DrawCache {
     /// ends.
     ///
     /// Needed because the hub's `reposition_area` falls back to `taken` when
-    /// no recipe recorded itself — reachable in production by a direct
-    /// `draw_frame` (`ui::resolve`'s empty frame), which applies a frame and
-    /// clears the hub's recipe. Without this stash a batch would consume
-    /// that area and its final reposition would find an empty recipe and
+    /// no element stack is configured — reachable in production by a direct
+    /// `draw_frame` (`ui::resolve`'s empty frame), which applies a frame with
+    /// no composition behind it. Without this stash a batch would consume
+    /// that area and its final reposition would find no stack to re-render and
     /// render nothing, so the area would never return.
     pub deferred: Option<Frame>,
 }

@@ -22,10 +22,11 @@
 //! content path hands each formatted block over as a [`ContentWrite`]
 //! (`render_content` / `render_batch`), and nothing above the manager
 //! writes bytes of its own; 4e made it batching's and reposition's home
-//! too (the guard, the recipe). What remains of the design's shape comes
-//! with the steps that give it meaning: the compose + content round trip
-//! of `render(Some(w))` with the frame verbs (4f), and the element stack
-//! (4h).
+//! too (the guard, and the configured element stack reposition re-composes
+//! since 4h-g part 1). What remains of the design's shape comes with the
+//! steps that give it meaning: the compose + content round trip of
+//! `render(Some(w))` with the frame verbs (4f), and the rest of the element
+//! stack (4h-g).
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
@@ -573,19 +574,21 @@ pub struct RenderManager {
     /// Content bytes only — frame bytes can never be caught, which is the
     /// deliberate narrowing over the old writer swap.
     captured: Option<Vec<u8>>,
-    /// The last composition, kept as its **recipe** — the element list, not
-    /// the rendered rows it produced (ui_draw_v2 §5.1.1). [`Self::reposition_area`]
-    /// re-draws this instead of recomposing: re-rendering is cheap and always
-    /// current, where the rendered rows would be a snapshot of whatever the
-    /// status said at the moment of compose.
+    /// The configured long-lived element stack — bar, input, blank row — set
+    /// once by [`Self::configure`] (the repl owns membership, design §Render:
+    /// "the manager's `stack` is configured **by the repl**"). [`Self::render`]
+    /// composes it together with the per-paint overlay the caller hands in;
+    /// [`Self::reposition_area`] re-composes it when a content write brings the
+    /// area back, so the frame is current by construction (re-rendering the
+    /// configured elements is cheap and always reads the live state, where a
+    /// snapshot of the rendered rows would freeze whatever the status said at
+    /// the moment of compose).
     ///
-    /// The hub's since 4e (it moved out of `DrawCache` with reposition): the
-    /// recipe belongs to the composition `render` applied, so a direct
-    /// [`Self::draw_frame`] — one no composition produced — clears it, and a
-    /// later `render` overwrites it. Deliberately *not* retired by a
-    /// consume or note: those retire the frame's *position*, and the recipe
-    /// is exactly what survives it.
-    recipe: Vec<Element>,
+    /// The configured stack is never cleared by a direct [`Self::draw_frame`]
+    /// (the old "recipe" bookkeeping): it describes the frame the *next*
+    /// `render` will build, not the last composition a content write consumed,
+    /// so a raw apply leaves it intact.
+    stack: Vec<Element>,
     /// The fraction of the frame's terminal height the area may occupy —
     /// [`configure`](Self::configure)'s, resolved against the render's
     /// height on every call.
@@ -615,7 +618,7 @@ impl RenderManager {
         Self {
             draw: Draw::new(size.clone(), term_io),
             captured: None,
-            recipe: Vec::new(),
+            stack: Vec::new(),
             frame_max_row_ratio: FRAME_MAX_ROW_RATIO,
             size,
             caret: None,
@@ -715,12 +718,15 @@ impl RenderManager {
     }
 
     /// Set the frame's max-height ratio (design §Render `configure`) — the
-    /// one knob the budget resolves from. The element half of the design's
-    /// signature (`frame_elements`) arrives with the element conversion (4h):
-    /// nothing installs long-lived chrome while elements are per-compose
-    /// boxes.
-    pub fn configure(&mut self, frame_max_row_ratio: f64) {
+    /// Set the frame's max-height ratio **and** install the long-lived element
+    /// stack (design §Render `configure(frame_max_row_ratio, frame_elements)`).
+    /// The ratio is the one knob the budget resolves from; the elements are
+    /// the bar/input/blank row the repl owns and hands over once — [`Self::render`]
+    /// composes them with the per-paint overlay, [`Self::reposition_area`]
+    /// re-composes them to bring the area back.
+    pub fn configure(&mut self, frame_max_row_ratio: f64, frame_elements: Vec<Element>) {
         self.frame_max_row_ratio = frame_max_row_ratio;
+        self.stack = frame_elements;
     }
 
     /// The live-region budget at this manager's configured ratio — the
@@ -740,10 +746,10 @@ impl RenderManager {
     /// `Output::draw_elements`' default body (step 4b), painting through the
     /// [`Draw`] this manager has owned since 4c.
     ///
-    /// The compose head is *not* here: the status row is content's facts
-    /// (raw store + streaming flag), so the caller composes
-    /// (`repl::compose_area`) and hands the stack in — the status row
-    /// becomes an installed element in 4h and the head moves in with it.
+    /// The compose head is *not* here: the caller composes the whole area
+    /// (`repl::compose_area`, whose head reads content's bar/streaming facts)
+    /// and hands the stack in — the status row becomes an installed element
+    /// in 4h and the head moves in with it.
     /// `pub` as the hub's face verb (step 4f-b): out-of-crate drivers (the
     /// confirm probe) apply frames through it directly.
     pub fn render(
@@ -761,11 +767,11 @@ impl RenderManager {
         let heights = allocate(&asks, th, self.budget(th));
         let frame = render(&stack, &heights, tw);
         let applied = self.draw.draw_frame(&frame, policy, dims);
-        // Moved, never copied: the recipe belongs to the composition that
-        // built it, and the hub is where reposition reads it (step 4e).
-        // Written after the apply, so the recipe that described the *last*
-        // paint is never the one a concurrent content write re-renders.
-        self.recipe = stack;
+        // Not recorded: the configured `stack` (set by `configure`) is the
+        // reposition source now, so a per-paint compose leaves it untouched —
+        // and `draw_frame` below no longer clears it. Sub-split 2 installs the
+        // real configured stack; until then it is empty and `reposition_area`
+        // falls back to `taken` exactly as the old empty-recipe path did.
         self.draw.cache.applied = Some(applied);
         applied
     }
@@ -796,17 +802,16 @@ impl RenderManager {
 
     /// Apply a frame that no composition produced *through this hub* —
     /// `ui::resolve`'s empty frame, the direct `Output::draw_frame` paths,
-    /// tests. Whatever recipe recorded itself no longer describes the
-    /// screen, so it is cleared — the counterpart of [`Self::render`]
-    /// storing its own right after. (The clear moved here from
-    /// `Draw::draw_frame` with the recipe, step 4e.)
+    /// tests. Unlike the old recipe-clearing version, the configured `stack`
+    /// survives: it describes the frame the *next* [`Self::render`] builds,
+    /// not the last composition a content write consumed, so a raw apply
+    /// leaves it intact (sub-split 4h-g part 1).
     pub fn draw_frame(
         &mut self,
         frame: &Frame,
         policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
-        self.recipe.clear();
         self.draw.draw_frame(frame, policy, dims)
     }
 
@@ -917,14 +922,15 @@ impl RenderManager {
     /// Re-render rather than replay `taken`: a `Frame` is a snapshot of the
     /// status as of the last compose, and the bar moves without the REPL
     /// composing — `set_status` at turn start, the dot at
-    /// `begin_response`/`end_response`. The recipe is the thing that stays
-    /// current, which is why the hub keeps it and not the rendered rows.
+    /// `begin_response`/`end_response`. The configured `stack` is the thing
+    /// that stays current (its elements pull live state at render), which is
+    /// why the hub re-composes it and not the rendered rows.
     ///
-    /// `taken` is not a formality: it is the fallback when no recipe recorded
-    /// itself — a frame applied without a composition behind it (a test, or
-    /// a direct `draw_frame`). Falling back keeps the invariant that matters
-    /// more than freshness, I5: an area that was consumed is always put
-    /// back, so a half-consumed frame is never left stranded on screen.
+    /// `taken` is not a formality: it is the fallback when no stack was
+    /// configured — a frame applied without a composition behind it (a test,
+    /// or a direct `draw_frame`). Falling back keeps the invariant that
+    /// matters more than freshness, I5: an area that was consumed is always
+    /// put back, so a half-consumed frame is never left stranded on screen.
     pub fn reposition_area(&mut self, width: usize, taken: Frame) -> String {
         let tw = width.max(1);
         let th = self.draw.size.borrow().height.max(1);
@@ -932,17 +938,17 @@ impl RenderManager {
         // (`old_h - h_new - consumed_rows`) — read before `taken` moves into
         // the fallback below.
         let old_h = taken.height();
-        let frame = if self.recipe.is_empty() {
+        let frame = if self.stack.is_empty() {
             taken
         } else {
             let heights = {
-                let asks: Vec<RowAsk> = self.recipe.iter().map(|e| e.ask(tw)).collect();
-                // The hub's own budget (step 4e): the recipe re-renders at
+                let asks: Vec<RowAsk> = self.stack.iter().map(|e| e.ask(tw)).collect();
+                // The hub's own budget (step 4e): the stack re-renders at
                 // the same knob `render` composes under, so a configured
                 // ratio cannot make the two disagree.
                 allocate(&asks, th, self.budget(th))
             };
-            render(&self.recipe, &heights, tw)
+            render(&self.stack, &heights, tw)
         };
         // **A frame with no rows has nothing to put back.** `ui::resolve` clears
         // a dialog by applying `Frame::empty()`, and `plan_apply` records that
@@ -1117,7 +1123,7 @@ mod tests {
         assert_eq!(manager.budget(1), 1);
 
         let mut small = RenderManager::new(size, crate::termio::TermIO::null());
-        small.configure(0.1);
+        small.configure(0.1, Vec::new());
         assert_eq!(small.budget(24), 3);
         assert_eq!(small.budget(1), 1, "never below one row");
     }
@@ -1141,6 +1147,9 @@ mod tests {
             Element::lines(vec!["hello".to_string()]),
             Element::divider(),
         ];
+        // The configured stack is the reposition source now, so configure it
+        // and let the compose pull the same elements (sub-split 4h-g part 1).
+        manager.configure(crate::render::FRAME_MAX_ROW_RATIO, stack.clone());
         let applied = manager.render(stack, ApplyPolicy::Frame, (40, 24));
         let bytes = manager.draw.term_io.recorded(crate::termio::Stream::Main);
 
@@ -1155,9 +1164,9 @@ mod tests {
             "applied size remembered"
         );
         assert_eq!(
-            manager.recipe.len(),
+            manager.stack.len(),
             2,
-            "the recipe is remembered on the hub, where reposition reads it"
+            "the configured stack is kept on the hub, where reposition reads it"
         );
     }
 
