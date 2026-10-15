@@ -250,6 +250,7 @@ fn split_edit_call_and_result(args: &serde_json::Value, result: &str) -> Option<
     (per_file.len() == results.len()).then_some(SplitEditCall { per_file, results })
 }
 
+#[allow(dead_code)]
 /// The note shown in place of one multi-file call, so the model is not left
 /// wondering why it is looking at N calls it did not make.
 fn split_note(n: usize) -> String {
@@ -366,7 +367,8 @@ pub(crate) fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message
                     // The note rides with the results it explains, as leading
                     // text in the same user message — not a message of its own,
                     // which would perturb the turn structure.
-                    new_content.push(UserContent::Text(Text::new(split_note(n))));
+                    // gwicke: disabled to see if that avoids deepseek issues
+                    // new_content.push(UserContent::Text(Text::new(split_note(n))));
                     for (i, result) in split.results.iter().enumerate() {
                         new_content.push(UserContent::ToolResult(ToolResult {
                             call: crate::edit_blocks::split_id(&tr.call, i, n),
@@ -707,7 +709,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             if i == 0 {
                 assert_eq!(calls[i].id.to_string(), format!("t1"));
             } else {
-                assert_eq!(calls[i].id.to_string(), format!("t1~f{i}n3"));
+                assert_eq!(calls[i].id.to_string(), format!("t1_f{i}n3"));
             }
             // A synthesized call has no provider id or signature: Anthropic
             // keys tool_result on the id it issued, and N copies of one would
@@ -720,33 +722,33 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let results = results_of(&out[1]);
         assert_eq!(results.len(), 3, "{:?}", results);
         assert_eq!(results[0].0, "t1");
-        assert_eq!(results[1].0, "t1~f1n3");
-        assert_eq!(results[2].0, "t1~f2n3");
+        assert_eq!(results[1].0, "t1_f1n3");
+        assert_eq!(results[2].0, "t1_f2n3");
         assert!(results[0].1.contains("Replaced 1 block(s) in ./a.rs"));
         // A failing file keeps its full envelope: the model reads model_view.
         assert!(results[1].1.contains("long diff"), "{}", results[1].1);
         assert!(results[2].1.contains("./c.rs"));
     }
 
-    #[test]
-    fn a_split_explains_itself_in_one_note_carrying_no_aggregate() {
-        let out = split_multi_file_edit_calls(multi_file_history());
-        let Message::User { content } = &out[1] else {
-            panic!("expected a user message")
-        };
-        let notes: Vec<&Text> = content
-            .iter()
-            .filter_map(|c| match c {
-                UserContent::Text(t) => Some(t),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(notes.len(), 1, "exactly one note per split: {content:?}");
-        let n = notes[0].text.as_str();
-        assert!(n.contains('3'), "the note must name the file count: {n}");
-        // The note rides inside the results' message, not as its own.
-        assert_eq!(content[0], UserContent::Text(Text::new(n.to_string())));
-    }
+    // #[test]
+    // fn a_split_explains_itself_in_one_note_carrying_no_aggregate() {
+    //     let out = split_multi_file_edit_calls(multi_file_history());
+    //     let Message::User { content } = &out[1] else {
+    //         panic!("expected a user message")
+    //     };
+    //     let notes: Vec<&Text> = content
+    //         .iter()
+    //         .filter_map(|c| match c {
+    //             UserContent::Text(t) => Some(t),
+    //             _ => None,
+    //         })
+    //         .collect();
+    //     assert_eq!(notes.len(), 1, "exactly one note per split: {content:?}");
+    //     let n = notes[0].text.as_str();
+    //     assert!(n.contains('3'), "the note must name the file count: {n}");
+    //     // The note rides inside the results' message, not as its own.
+    //     assert_eq!(content[0], UserContent::Text(Text::new(n.to_string())));
+    // }
 
     #[test]
     fn splitting_twice_changes_nothing() {

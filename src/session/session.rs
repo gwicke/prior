@@ -44,7 +44,7 @@ use crate::session::types::*;
 /// `arguments.path` and so now yields every file because there is one call per
 /// file.
 ///
-/// Ids are derived (`{orig}~f{i}n{n}`), and derived by the *same* function the
+/// Ids are derived (`{orig}_f{i}n{n}`), and derived by the *same* function the
 /// model-facing transform uses, so the call half stored here pairs with the
 /// result half stored by [`split_edit_tool_results`] even though the two never
 /// see each other. `provider` and `signature` are cleared for the same reason
@@ -2717,7 +2717,7 @@ mod tests {
             if i == 0 {
                 assert_eq!(calls[i].id.to_string(), format!("t1"));
             } else {
-                assert_eq!(calls[i].id.to_string(), format!("t1~f{i}n2"));
+                assert_eq!(calls[i].id.to_string(), format!("t1_f{i}n2"));
             }
             assert!(calls[i].provider.is_none());
             assert!(calls[i].signature.is_none());

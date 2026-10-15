@@ -18,9 +18,7 @@ pub use blockedit::blob::*;
 /// (`session.rs`) each split their own half of the conversation, and both must
 /// independently arrive at the same id for the same file. Minting a random id
 /// on either side would pair a call with the wrong result, and re-deriving a
-/// fresh one would break correlation with an already-stored half. The `~` is
-/// not a character any provider issues, so a derived id cannot collide with a
-/// real one — which is what lets a synthetic call carry no `provider`.
+/// fresh one would break correlation with an already-stored half.
 pub fn split_id(
     orig: &rig_core::message::ToolCallId,
     i: usize,
@@ -32,7 +30,7 @@ pub fn split_id(
     if i == 0 {
         orig.clone()
     } else {
-        rig_core::message::ToolCallId::new(format!("{orig}~f{i}n{n}"))
+        rig_core::message::ToolCallId::new(format!("{orig}_f{i}n{n}"))
             .expect("a derived id is never empty")
     }
 }
