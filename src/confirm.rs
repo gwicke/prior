@@ -315,7 +315,7 @@ pub fn paint(
     // division below is the same `area_body` the session's own paint layers
     // these elements under its bar and input with, so the two cannot drift.
     let stack = crate::repl::area_body(None, confirm.elements());
-    manager.lock().unwrap().render(stack);
+    manager.lock().unwrap().render(Some(stack), None);
 }
 
 /// Resolve a confirmed dialog: **repaint without it, then record the decision**.

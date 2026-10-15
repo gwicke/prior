@@ -616,8 +616,10 @@ pub(crate) fn paint_prompt(
     // comes back, so no `Vec<Element>` crosses a call site (ui_draw_v2 §5.1.1).
     let stack = compose_area(content, Some(input), overlay);
     // No dims (design §Render): `render` composes and applies at the watched
-    // size, so the manager resolves the geometry this paint is for.
-    content.manager.lock().unwrap().render(stack);
+    // size, so the manager resolves the geometry this paint is for. The stack
+    // is the UI half of the round trip — `content` stays `None` here (the
+    // prompt has no block to write); the content path takes the other half.
+    content.manager.lock().unwrap().render(Some(stack), None);
 }
 
 /// Editor content: the prompt on row 0, the wrapped buffer below it.

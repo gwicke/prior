@@ -111,7 +111,7 @@ async fn main() {
         || {
             // The empty stack: with no compose head the area is nothing, and
             // applying it is the erase (dropping the element is the clear).
-            out.hub().lock().unwrap().render(Vec::new());
+            out.hub().lock().unwrap().render(Some(Vec::new()), None);
         },
         confirm.subject(),
         answered,

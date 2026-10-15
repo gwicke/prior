@@ -758,29 +758,57 @@ impl RenderManager {
     /// `pub` as the hub's face verb (step 4f-b): out-of-crate drivers (the
     /// confirm probe) apply frames through it directly.
     ///
+    /// Two halves, one verb (design §Render's final round trip, `render(content)`):
+    /// `stack` is the UI's compose+apply (the caller builds the element list
+    /// today; it moves to [`Self::configure`] with the final flip), `content`
+    /// is the content hand-off (choreographed against the live frame). The two
+    /// halves are still driven separately — never together — until **4h-g**
+    /// folds the stack into the configured one.
+    ///
     /// No dims and no return (design §Render): the compose and the apply both
     /// read the watched size, so a resize applies lazily at the next `render`
     /// and a caller keys off the resize event plus [`Self::painted_size`],
     /// never off a size this verb returns. `ApplyPolicy::Frame` is the one
     /// policy the frame path takes — `render` is the UI face verb, and no
-    /// `render` caller has ever passed `Append`.
-    pub fn render(&mut self, stack: Vec<Element>) -> (usize, usize) {
-        let size = *self.size.borrow();
-        let (tw, th) = (size.width.max(1), size.height.max(1));
-        let asks: Vec<RowAsk> = stack.iter().map(|e| e.ask(tw)).collect();
-        // The page-scroll path needs the rows element's grant *before* the
-        // frame is rendered, and this is the only place `allocate` runs for a
-        // composition — so a caller that has to know re-runs it over the same
-        // asks rather than asking the painter to guess twice.
-        let heights = allocate(&asks, th, self.budget(th));
-        let frame = render(&stack, &heights, tw);
-        let applied = self.draw.draw_frame(&frame, ApplyPolicy::Frame, (tw, th));
-        // Not recorded: the configured `stack` (set by `configure`) is the
-        // reposition source now, so a per-paint compose leaves it untouched —
-        // and `draw_frame` below no longer clears it. Sub-split 2 installs the
-        // real configured stack; until then it is empty and `reposition_area`
-        // falls back to `taken` exactly as the old empty-recipe path did.
-        self.draw.cache.applied = Some(applied);
+    /// `render` caller has ever passed `Append`. A content-only call returns
+    /// the last painted size (the write does not compose a frame of its own).
+    pub fn render(
+        &mut self,
+        stack: Option<Vec<Element>>,
+        content: Option<ContentWrite>,
+    ) -> (usize, usize) {
+        // The two halves of the design's one round trip (§Render): the UI
+        // passes `stack = Some(…), content = None` (compose + apply the frame),
+        // the content paths pass `stack = None, content = Some(…)` (the write
+        // choreographed against the live frame). Until the final flip
+        // (**4h-g** remainder) the caller still composes the stack itself, so
+        // `stack` is `Some` from the UI and the content hand-off is `None` —
+        // the two never arrive together yet.
+        let applied = if let Some(stack) = stack {
+            let size = *self.size.borrow();
+            let (tw, th) = (size.width.max(1), size.height.max(1));
+            let asks: Vec<RowAsk> = stack.iter().map(|e| e.ask(tw)).collect();
+            // The page-scroll path needs the rows element's grant *before* the
+            // frame is rendered, and this is the only place `allocate` runs for
+            // a composition — so a caller that has to know re-runs it over the
+            // same asks rather than asking the painter to guess twice.
+            let heights = allocate(&asks, th, self.budget(th));
+            let frame = render(&stack, &heights, tw);
+            let applied = self.draw.draw_frame(&frame, ApplyPolicy::Frame, (tw, th));
+            // Not recorded: the configured `stack` (set by `configure`) is the
+            // reposition source now, so a per-paint compose leaves it untouched
+            // — and `draw_frame` below no longer clears it. Sub-split 2
+            // installs the real configured stack; until then it is empty and
+            // `reposition_area` falls back to `taken` exactly as the old
+            // empty-recipe path did.
+            self.draw.cache.applied = Some(applied);
+            applied
+        } else {
+            self.painted_size()
+        };
+        if let Some(content) = content {
+            self.put_content(content);
+        }
         applied
     }
 
@@ -825,25 +853,31 @@ impl RenderManager {
 
     // --- the content hand-off (step 4d, design §Content/§Render) -----------
 
-    /// One content block on the streaming path — the hand-off the design
-    /// spells `render(Some(w))` (§Render) once this manager owns the
-    /// compose as well (4f/4h). Today the caller still composes
-    /// separately, so this is the content half alone: every streaming
-    /// write reaches the screen through here and never around it.
+    /// The content round trip — the design's `render(Some(w))` (§Render)
+    /// content half, now folded into one verb. Every content write (streaming
+    /// or replay) reaches the screen through here and never around it: the
+    /// write is choreographed against the live frame (consume → write →
+    /// reposition) inside [`Self::put_content`]. The batch deferral a replay
+    /// write takes is the shared `batch_active` flag's — it stays open across
+    /// the burst and the guard's drop emits the re-emit once (ui_draw_v2 R5).
+    ///
+    /// The compose half (`stack: Vec<Element>`) lands with the final flip
+    /// (**4h-g** remainder): until then the caller composes and hands the
+    /// stack to [`Self::render`] separately, so this is the content half
+    /// alone.
     pub fn render_content(&mut self, content: ContentWrite) {
-        self.put_content(content);
+        self.render(None, Some(content));
     }
 
-    /// One content block on the replay path (§Render): bulk writes, one
-    /// per call inside a batch, with the frame's re-emit deferred to a
-    /// final regular apply. The guard that opens such a batch is this
-    /// module's too ([`ContentBatchGuard`], step 4e); the deferral itself
-    /// is still the shared `batch_active` flag inside [`Self::put_content`]
-    /// — the two verbs remain one choreography under two names until the
-    /// design's final regular `render()` — compose + content in one call —
-    /// replaces the guard's `end_batch` reposition (4f/4h).
+    /// One content block on the replay path (§Render): bulk writes, one per
+    /// call inside a batch, with the frame's re-emit deferred to a final
+    /// regular apply. Same round trip as [`Self::render_content`] — a replay
+    /// write is a content write that happens to be inside an open batch, and
+    /// the deferral is the flag's, not the verb's. Kept as its own name so
+    /// the replay path reads as the design's `render_batch`, but the
+    /// choreography it runs is the one round trip's.
     pub fn render_batch(&mut self, content: ContentWrite) {
-        self.put_content(content);
+        self.render(None, Some(content));
     }
 
     /// Is a content batch open — its writes defer the frame's re-emit to

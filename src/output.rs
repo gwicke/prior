@@ -2623,7 +2623,11 @@ mod tests {
         let (input, overlay) = pieces();
         let a = {
             let stack = compose_area(&tail, input, overlay);
-            tail.content.manager.lock().unwrap().render(stack)
+            tail.content
+                .manager
+                .lock()
+                .unwrap()
+                .render(Some(stack), None)
         };
         let via_tail = tail_sink.bytes();
 
