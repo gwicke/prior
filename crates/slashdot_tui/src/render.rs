@@ -174,7 +174,8 @@ pub struct Extent {
 ///   `ui.rs` beside the dialog that holds it (§3.2.2). Only `DividerItem` and
 ///   `LinesItem`, which have no opinion to express, live here;
 /// - each element holds whatever *it* needs to hold — an `Rc` of its rows, a
-///   `Layout`, anything — and the frame layer neither knows nor copies it.
+///   shared editor handle, anything — and the frame layer neither knows nor
+///   copies it.
 #[derive(Clone)]
 pub struct Element {
     /// The element's own squeeze policy and painting, told what it got.
@@ -211,25 +212,6 @@ pub trait RenderElement {
     /// old `match`, nothing downstream can clamp it, because nothing
     /// downstream knows what the rows mean.
     fn render(&self, height: usize, width: usize) -> Rendered;
-}
-
-/// Visual layout of an editor buffer for one element render: the wrapped
-/// content-only rows (the prompt renders separately on row 0) plus the cursor.
-///
-/// Lives beside [`Element`] because it *is* the input element's data
-/// contract — `InputItem` (repl) produces it, [`RenderElement`] consumes it —
-/// and both sides of that contract are above this crate, so neither can own
-/// the type without inverting the dependency.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Layout {
-    /// Content-only visual rows (the prompt is rendered separately on row 0).
-    pub rows: Vec<String>,
-    /// Visual row (0-based) the cursor is on.
-    pub cursor_row: usize,
-    /// Absolute column (0-based) the cursor is on, counting the prompt on row 0.
-    pub cursor_col: usize,
-    /// Total visual rows.
-    pub row_count: usize,
 }
 
 /// What an element painted, and where its caret was.

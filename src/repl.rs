@@ -22,9 +22,6 @@ use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
 #[cfg(test)]
 use crate::render::live_budget;
-/// The input element's data contract lives in `slashdot_tui` (beside
-/// [`Element`]); re-exported so `crate::repl::Layout` paths keep working.
-pub use crate::render::Layout;
 use crate::render::{allocate, window, Element, RenderElement, Rendered, RowAsk};
 #[cfg(test)]
 use crate::render::{render, Frame};
@@ -383,67 +380,57 @@ enum V25Frame {
 /// its wrapped height (plan §3.4).
 const INPUT_CONTEXT_ROWS: usize = 3;
 
-/// Prompt + editor content. `layout` is the editor's visual layout
-/// (prompt rendered on row 0); the caret lives at `layout.cursor_row` /
+/// Prompt + editor content, and the R1 rule in one place.
+///
+/// The element holds the session's editor *handle* and content's streaming
+/// flag and resolves both inside `height`/`render` at the width being
+/// composed for — the layout is computed at the render width rather than
+/// snapshotted at compose (4h-f). The caret lives at `layout.cursor_row` /
 /// `layout.cursor_col` — derived, not stored.
 ///
-/// `min` is the caret's own row, which is why the input can never be
-/// squeezed away entirely; wrapping grows `max`.
+/// **R1: the input is `0` rows mid-turn with an empty buffer; the prompt row
+/// between turns even with no content; sized to the wrapped buffer whenever
+/// content is present, in either case.** An input row with nothing in it
+/// reads as "type here", and while a turn is running there is nothing to
+/// submit, so the row is a claim the screen cannot back up. Between turns it
+/// is the opposite: it is what tells the reader where input goes, so it
+/// stays. The REPL is live either way (OQ2) — the frame is composed and
+/// applied on every keystroke; it simply has no row to draw until something
+/// is typed. And `min` is the caret's own row, which is why a visible input
+/// can never be squeezed away entirely; wrapping grows `max`.
+///
+/// "Is a turn running" is the output's fact (`streaming`), not the frame
+/// layer's — the element does not own it, it pulls the handle content
+/// shares, the way the bar element pulls the bar store (4h-c). Read at pull
+/// time, the fact cannot go stale between compose and paint.
 ///
 /// A free function, not `Element::input`: inherent methods on `Element` would
-/// live in `slashdot_tui`, and this element is repl's (it holds [`LineEditor`]'s
-/// layout). Same shape as `Element::new`, whose `RenderElement` impl lives here.
-pub(crate) fn input(layout: Layout, prompt: String) -> Element {
-    Element::new(InputItem {
-        layout,
-        prompt,
-        hidden: false,
-    })
-}
-
-/// An input that occupies **no rows at all** — the mid-turn case.
-///
-/// An input row with nothing in it reads as "type here", and while a turn is
-/// running there is nothing to submit, so the row is a claim the screen
-/// cannot back up. Between turns it is the opposite: it is what tells the
-/// reader where input goes, so [`input`] keeps it. The REPL is live
-/// either way (OQ2) — the frame is composed and applied on every keystroke;
-/// it simply has no row to draw until something is typed.
-///
-/// `min == max == 0`, so the allocator serves it nothing and
-/// `InputItem::render(0, _)` returns the empty `Rendered`. The choice is
-/// made here rather than inferred inside the element, because "is a turn
-/// running" is the output's fact (`streaming`), not the frame layer's.
-pub(crate) fn input_hidden(layout: Layout, prompt: String) -> Element {
-    Element::new(InputItem {
-        layout,
-        prompt,
-        hidden: true,
-    })
-}
-
-/// The input element for one compose, and the R1 rule in one place.
-///
-/// Mid-turn an empty input is **no row at all**; between turns it is the resting
-/// row that says where to type; anything typed is an ordinary input either way.
-/// [`input_hidden`] has the reasoning.
-///
-/// Shared by the REPL's redraw and the test harness rather than written twice —
-/// a copy would drift, and then the tests would pin a rule that production does
-/// not follow.
-pub(crate) fn input_element(
-    editor: &Arc<Mutex<LineEditor>>,
-    prompt: &str,
-    streaming: bool,
-    term_w: usize,
+/// live in `slashdot_tui`, and this element is repl's (it holds
+/// [`LineEditor`]). Same shape as `Element::new`, whose `RenderElement` impl
+/// lives here.
+pub(crate) fn input(
+    editor: Arc<Mutex<LineEditor>>,
+    prompt: String,
+    streaming: Arc<AtomicBool>,
 ) -> Element {
-    let ed = editor.lock().unwrap();
-    let layout = ed.layout(term_w, prompt);
-    if streaming && ed.text().is_empty() {
-        input_hidden(layout, prompt.to_string())
-    } else {
-        input(layout, prompt.to_string())
-    }
+    Element::new(InputItem {
+        editor,
+        prompt,
+        streaming,
+    })
+}
+
+/// The resting (between-turns) input for tests: a not-streaming flag beside
+/// the caller's editor — R1's default, the prompt row that says where to
+/// type. Tests that pin the mid-turn rule mint [`input`] with their own
+/// flag.
+#[cfg(test)]
+pub(crate) fn test_input(editor: &Arc<Mutex<LineEditor>>, prompt: &str) -> Element {
+    input(
+        editor.clone(),
+        prompt.to_string(),
+        Arc::new(AtomicBool::new(false)),
+    )
 }
 
 /// Overlay elements for a plain list of rows — for tests that care about the
@@ -504,7 +491,7 @@ pub(crate) fn rows_grant(
     term_h: usize,
     budget: usize,
 ) -> usize {
-    let elements = Repl::compose_elements(editor, prompt, None, overlay, term_w);
+    let elements = Repl::compose_elements(editor, prompt, None, overlay);
     let asks: Vec<RowAsk> = elements.iter().map(|e| e.ask(term_w)).collect();
     let heights = allocate(&asks, term_h.max(1), budget);
     // The rows element is the last of the overlay's sections by construction
@@ -624,13 +611,9 @@ pub(crate) fn paint_prompt(
     // open. The status row is `compose_area`'s to resolve — it is made of
     // content's own facts and not something this module may reason about —
     // and so is the divider that separates the menu from the input above it
-    // (ui_draw_v2 §5.1.1).
-    let input = input_element(
-        editor,
-        label,
-        content.streaming.load(std::sync::atomic::Ordering::Relaxed),
-        dims.0,
-    );
+    // (ui_draw_v2 §5.1.1). Turn presence rides the flag handle, read at pull
+    // time inside the element (4h-f) — nothing is snapshotted here.
+    let input = input(editor.clone(), label.to_string(), content.streaming.clone());
     // Composition *and* division are the tail's now: pieces move in and nothing
     // comes back, so no `Vec<Element>` crosses a call site (ui_draw_v2 §5.1.1).
     let stack = compose_area(content, Some(input), overlay);
@@ -642,34 +625,42 @@ pub(crate) fn paint_prompt(
 }
 
 /// Editor content: the prompt on row 0, the wrapped buffer below it.
+///
+/// Holds the session's editor *handle* and content's streaming flag — the
+/// same pull-the-shared-store shape as the bar element (4h-c). The layout is
+/// computed inside `height`/`render` at the width being composed for, so a
+/// compose at one width and a render at another cannot disagree about the
+/// wrap (4h-f).
 struct InputItem {
-    layout: Layout,
+    editor: Arc<Mutex<LineEditor>>,
     prompt: String,
-    /// The mid-turn empty case (see [`input_hidden`]): a claim on no rows.
-    /// The ask is construction's because *the composer* knows whether a turn
-    /// is running — `streaming` is content's fact, and the element only ever
-    /// paints what it is handed.
-    hidden: bool,
+    /// The output's turn-presence fact, read at pull time (see [`input`]).
+    streaming: Arc<AtomicBool>,
 }
 
 impl RenderElement for InputItem {
-    fn height(&self, _width: usize) -> RowAsk {
-        if self.hidden {
-            RowAsk::fixed(0, 0)
-        } else {
-            // The floor is the caret's own row; wrapping grows the want to the
-            // wrapped buffer — at the layout the composer built for. Reading
-            // the width here (compute the layout inside `render`) is 4h-f's
-            // shared-editor move, when the layout stops being a snapshot.
-            RowAsk::fixed(1, self.layout.row_count.max(1))
+    fn height(&self, width: usize) -> RowAsk {
+        // R1 (the reasoning lives on [`input`]): mid-turn an empty input is
+        // no row at all — `min == max == 0`, so the allocator serves it
+        // nothing and `render(0, _)` returns the empty `Rendered`.
+        if self.streaming.load(Ordering::Relaxed) && self.editor.lock().unwrap().text().is_empty() {
+            return RowAsk::fixed(0, 0);
         }
+        // The floor is the caret's own row; wrapping grows the want to the
+        // wrapped buffer — laid out at *this* width, the one the allocator
+        // is resolving the frame at.
+        let layout = self.editor.lock().unwrap().layout(width, &self.prompt);
+        RowAsk::fixed(1, layout.row_count.max(1))
     }
 
     fn render(&self, h: usize, tw: usize) -> Rendered {
         if h == 0 {
             return Rendered::default();
         }
-        let layout = &self.layout;
+        // Computed here, at the render width — the same number `height`
+        // answered with for this compose (single-threaded prompt, nothing
+        // mutates the buffer between the two calls of one paint).
+        let layout = self.editor.lock().unwrap().layout(tw, &self.prompt);
         let n = layout.row_count.max(1);
         // Three rows above the caret: enough to see the argument you just
         // edited without losing the caret off the top. This constant is
@@ -1858,16 +1849,23 @@ impl Repl {
     /// is what makes a page one screen of rows by construction — a second
     /// composer here is how the page size and the painted height drifted apart
     /// in the first place.
+    ///
+    /// No width: the input element lays itself out at the width it is asked
+    /// at (4h-f), so there is nothing to snapshot here. The not-streaming
+    /// flag is safe in both callers' worlds — the tests are between turns,
+    /// and `rows_grant` only runs with an overlay up, which means a
+    /// non-empty buffer, which means the input is visible under either flag.
     pub(crate) fn compose_elements(
         editor: &Arc<Mutex<LineEditor>>,
         prompt: &str,
         status: Option<&str>,
         overlay: Vec<Element>,
-        term_w: usize,
     ) -> Vec<Element> {
-        let term_w = term_w.max(1);
-        let layout = editor.lock().unwrap().layout(term_w, prompt);
-        let input = input(layout, prompt.to_string());
+        let input = input(
+            editor.clone(),
+            prompt.to_string(),
+            Arc::new(AtomicBool::new(false)),
+        );
         let mut items: Vec<Element> = Vec::new();
         if let Some(bar) = status {
             items.push(Element::lines(vec![bar.to_string()]));
@@ -1893,7 +1891,7 @@ impl Repl {
         term_h: usize,
     ) -> Frame {
         let term_w = term_w.max(1);
-        let elements = Self::compose_elements(editor, prompt, status, overlay, term_w);
+        let elements = Self::compose_elements(editor, prompt, status, overlay);
         let asks: Vec<RowAsk> = elements.iter().map(|e| e.ask(term_w)).collect();
         let term_h = term_h.max(1);
         let heights = allocate(&asks, term_h, live_budget(term_h));
@@ -2309,6 +2307,25 @@ impl Repl {
             _ => None,
         }
     }
+}
+
+/// Visual layout of an editor buffer for one element render: the wrapped
+/// content-only rows (the prompt renders separately on row 0) plus the cursor.
+///
+/// The input element's data contract, and repl's alone: [`LineEditor::layout`]
+/// produces it and [`InputItem`] consumes it inside `render` (4h-f moved it
+/// home from `slashdot_tui` — with the element pulling the editor, no side of
+/// the contract is above this module any more).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Layout {
+    /// Content-only visual rows (the prompt is rendered separately on row 0).
+    pub rows: Vec<String>,
+    /// Visual row (0-based) the cursor is on.
+    pub cursor_row: usize,
+    /// Absolute column (0-based) the cursor is on, counting the prompt on row 0.
+    pub cursor_col: usize,
+    /// Total visual rows.
+    pub row_count: usize,
 }
 
 /// A flat character buffer + cursor for multi-line editing, plus the `Up`/`Down`
@@ -4859,7 +4876,7 @@ mod tests {
     // element (`LineEditor` + [`input`]), which the drawing crate no longer
     // knows about.
     mod input_frame_tests {
-        use super::super::input;
+        use super::super::test_input;
         use super::shared;
         use crate::draw::{plan_apply, ApplyPolicy, DrawCache};
         use crate::render::render;
@@ -4907,8 +4924,7 @@ mod tests {
         fn a_frame_that_grows_below_the_caret_takes_the_caret_with_it() {
             let e = shared(|e| e.insert_str("abc"));
             let input = |e: &Arc<Mutex<LineEditor>>, rows: &[usize]| {
-                let layout = e.lock().unwrap().layout(20, "> ");
-                render(&[input(layout, "> ".to_string())], rows, 20)
+                render(&[test_input(e, "> ")], rows, 20)
             };
             let mut cache = DrawCache::new(24);
             cursor_to(&mut cache, 5, 24);
@@ -4938,9 +4954,8 @@ mod tests {
         fn consume_walks_to_the_frame_top_at_column_zero_without_erasing() {
             let mut cache = DrawCache::new(24);
             let e = shared(|e| e.insert_str("hi there"));
-            let layout = e.lock().unwrap().layout(20, "> ");
-            let h = layout.row_count.max(1);
-            let f = render(&[input(layout, "> ".into())], &[h], 20);
+            let h = e.lock().unwrap().layout(20, "> ").row_count.max(1);
+            let f = render(&[test_input(&e, "> ")], &[h], 20);
             cursor_to(&mut cache, 5, 24);
             let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
             let mut p = at(24, 20, 4);
@@ -4974,10 +4989,8 @@ mod tests {
         #[test]
         fn places_caret_for_input_frame() {
             let mut cache = DrawCache::new(24);
-            let mut e = LineEditor::new();
-            e.insert_str("hi");
-            let layout = e.layout(20, "> ");
-            let f = render(&[input(layout, "> ".to_string())], &[1], 20);
+            let e = shared(|e| e.insert_str("hi"));
+            let f = render(&[test_input(&e, "> ")], &[1], 20);
             cursor_to(&mut cache, 5, 24);
             let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
             let mut p = at(24, 20, 4);
@@ -4994,16 +5007,20 @@ mod tests {
     /// being "never draw the input": between turns an empty buffer still shows
     /// its row, because that row is what tells the reader where to type.
     ///
-    /// Asserted through [`input_element`] rather than through a composed frame,
-    /// because this is a property of the element's [`RowAsk`] and a test
-    /// that replayed bytes to find it would pass just as well with the frame
-    /// layer accidentally padding the gap back in.
+    /// Asserted through the element's [`RowAsk`] rather than through a composed
+    /// frame, because this is a property of the element and a test that
+    /// replayed bytes to find it would pass just as well with the frame layer
+    /// accidentally padding the gap back in. Since 4h-f the element *pulls*
+    /// the flag and the buffer, so the test drives one element through all
+    /// three states by moving the shared state underneath it — a push-model
+    /// test could only mint three and hope.
     #[test]
     fn an_empty_input_is_a_row_between_turns_and_none_mid_turn() {
-        let empty = shared(|_| {});
+        let editor = shared(|_| {});
+        let streaming = Arc::new(AtomicBool::new(false));
+        let e = input(editor.clone(), "> ".to_string(), streaming.clone());
 
         // Between turns: the resting row, `min == 1`.
-        let e = input_element(&empty, "> ", false, 60);
         assert_eq!(
             e.ask(60),
             RowAsk::fixed(1, 1),
@@ -5011,7 +5028,8 @@ mod tests {
         );
 
         // Mid-turn, still empty: nothing to submit, so no row and no claim.
-        let e = input_element(&empty, "> ", true, 60);
+        // The *same element* answers — the flag moved under it.
+        streaming.store(true, Ordering::Relaxed);
         assert_eq!(
             e.ask(60),
             RowAsk::fixed(0, 0),
@@ -5020,8 +5038,7 @@ mod tests {
 
         // Mid-turn with something typed: an ordinary input again, and `min` is
         // the caret's row so it can never be squeezed away entirely.
-        let typed = shared(|e| e.set("hello"));
-        let e = input_element(&typed, "> ", true, 60);
+        editor.lock().unwrap().set("hello");
         assert_eq!(
             e.ask(60),
             RowAsk::fixed(1, 1),
@@ -5031,13 +5048,21 @@ mod tests {
         // And through the real pipeline, a zero-row element really yields a zero-row
         // frame — otherwise `min == max == 0` would only be a claim.
         use crate::render::{allocate, live_budget, render};
-        let height = |streaming: bool| {
-            let e = input_element(&empty, "> ", streaming, 60);
-            let heights = allocate(&[e.ask(60)], 24, live_budget(24));
-            render(&[e], &heights, 60).height()
-        };
-        assert_eq!(height(true), 0, "a hidden input paints no row at all");
-        assert_eq!(height(false), 1, "a resting input paints its row");
+        editor.lock().unwrap().set("");
+        let heights = allocate(&[e.ask(60)], 24, live_budget(24));
+        assert_eq!(
+            render(&[e], &heights, 60).height(),
+            0,
+            "a hidden input paints no row at all"
+        );
+        streaming.store(false, Ordering::Relaxed);
+        let e = input(editor.clone(), "> ".to_string(), streaming.clone());
+        let heights = allocate(&[e.ask(60)], 24, live_budget(24));
+        assert_eq!(
+            render(&[e], &heights, 60).height(),
+            1,
+            "a resting input paints its row"
+        );
     }
 
     // ---- the input element through the frame pipeline ----
@@ -5050,10 +5075,8 @@ mod tests {
 
     #[test]
     fn render_input_row_prompt_and_caret() {
-        let mut e = LineEditor::new();
-        e.insert_str("hi");
-        let layout = e.layout(20, "> ");
-        let els = [input(layout, "> ".to_string())];
+        let e = shared(|e| e.insert_str("hi"));
+        let els = [test_input(&e, "> ")];
         let f = render(&els, &[1], 20);
         assert_eq!(f.height(), 1);
         assert_eq!(f.row(0), "> hi\x1b[K");
@@ -5067,12 +5090,13 @@ mod tests {
     fn render_windowed_input_keeps_caret_visible() {
         // 6-row input squeezed into 3 rows with the caret on row 5:
         // window keeps the caret with context above — rows 3..6.
-        let mut e = LineEditor::new();
-        e.insert_str("aa\nbb\ncc\ndd\nee\nff"); // caret ends at buffer end
-        let layout = e.layout(20, "> ");
-        assert_eq!(layout.row_count, 6);
-        assert_eq!(layout.cursor_row, 5);
-        let els = [input(layout, "> ".to_string())];
+        let e = shared(|e| e.insert_str("aa\nbb\ncc\ndd\nee\nff")); // caret ends at buffer end
+        {
+            let layout = e.lock().unwrap().layout(20, "> ");
+            assert_eq!(layout.row_count, 6);
+            assert_eq!(layout.cursor_row, 5);
+        }
+        let els = [test_input(&e, "> ")];
         let f = render(&els, &[3], 20);
         assert_eq!(f.height(), 3);
         // Prompt row scrolled out: no "> " on the first visible row.
@@ -5092,17 +5116,17 @@ mod tests {
     /// a frame squeezed wrong on a short terminal, so it is named instead.
     #[test]
     fn each_kind_declares_the_floor_and_want_it_promised() {
-        let mut e = LineEditor::new();
-        e.insert_str("hi");
+        let e = shared(|e| e.insert_str("hi"));
         assert_eq!(
-            input(e.layout(20, "> "), "> ".into()).ask(20),
-            RowAsk::fixed(1, e.layout(20, "> ").row_count.max(1)),
+            test_input(&e, "> ").ask(20),
+            RowAsk::fixed(1, e.lock().unwrap().layout(20, "> ").row_count.max(1)),
             "the caret's own row is the floor: the input can never be squeezed away"
         );
+        let empty = shared(|_| {});
         assert_eq!(
-            input_hidden(e.layout(20, "> "), "> ".into()).ask(20),
+            input(empty.clone(), "> ".into(), Arc::new(AtomicBool::new(true))).ask(20),
             RowAsk::fixed(0, 0),
-            "the mid-turn empty input claims no rows at all"
+            "an empty mid-turn input claims no rows at all"
         );
         assert_eq!(
             Element::divider().ask(20),
@@ -5128,12 +5152,10 @@ mod tests {
     /// pin `spans` while there, since both come from the same `first_row`.
     #[test]
     fn the_input_caret_is_offset_by_its_element_first_row() {
-        let mut e = LineEditor::new();
-        e.insert_str("hi");
-        let layout = e.layout(20, "> ");
+        let e = shared(|e| e.insert_str("hi"));
         let els = [
             Element::lines(vec!["bar".to_string()]),
-            input(layout, "> ".into()),
+            test_input(&e, "> "),
         ];
         let f = render(&els, &[1, 1], 20);
         assert_eq!(f.height(), 2);
@@ -5150,11 +5172,9 @@ mod tests {
     fn render_full_composition_extents_and_spans() {
         // REPL composition: input + divider + overlay, allocated heights
         // straight from `allocate`.
-        let mut e = LineEditor::new();
-        e.insert_str("ls -la");
-        let layout = e.layout(80, "> ");
+        let e = shared(|e| e.insert_str("ls -la"));
         let els = [
-            input(layout, "> ".to_string()),
+            test_input(&e, "> "),
             Element::divider(),
             Element::lines(vec!["one".to_string(), "two".to_string()]),
         ];

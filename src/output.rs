@@ -814,7 +814,6 @@ mod tests {
     // The pure pipeline the manager's render now runs (and the composer tests
     // re-run) — imported here since the production path left `output.rs`.
     use crate::render::{allocate, live_budget, render, Element, RowAsk};
-    use crate::repl::input;
 
     // --- Row accounting: the tracked cursor vs. the real one (phase B) ---
     //
@@ -921,12 +920,7 @@ mod tests {
     fn compose_area_resolves_every_row_it_owns() {
         let (out, _reasoning) = capturing_output(60);
         out.content.set_status(bar_of("[bar]"));
-        let input = || {
-            input(
-                crate::repl::LineEditor::new().layout(60, "> "),
-                "> ".to_string(),
-            )
-        };
+        let input = || crate::repl::test_input(&shared_editor(|_| {}), "> ");
 
         // Nothing supplied: the gap and the status, and they come first.
         assert_eq!(
@@ -2590,8 +2584,7 @@ mod tests {
         // stack for each, and the only difference under test is *who runs the
         // pipeline*.
         let pieces = || {
-            let layout = crate::repl::LineEditor::new().layout(60, "> ");
-            let input = input(layout, "> ".to_string());
+            let input = crate::repl::test_input(&shared_editor(|_| {}), "> ");
             let overlay = crate::repl::test_overlay(&tall, 0);
             (Some(input), overlay)
         };
