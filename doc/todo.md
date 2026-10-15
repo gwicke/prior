@@ -75,6 +75,8 @@ and link a doc/ and/or commit hash
     guard, the caret channel reaches the manager);
     4h-a (`ba8d6be`, `slashdot_tui` crate extraction), 4h-b (`ddf5522`+`8f80640`,
     `height(width)` on the trait, one place computes the frame row count), 4h-c
-    (`280f654`+`2651b19`, the bar moves into `ui/`); 4h-d next (menu views mint their
-    own elements)
+    (`280f654`+`2651b19`, the bar moves into `ui/`), 4h-d
+    (`a2ebeff`+`063d993`+`8daa008`, menu views mint their own elements: `Arc` handle
+    chain, `RenderElement` impls in `slashdot_menu`, the repl appends the element set);
+    4h-e next (selection behind shared state)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)

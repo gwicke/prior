@@ -575,10 +575,12 @@ most runway to expand into separate sub-commits.
     (alongside `opts_len`, which is passed for the same reason) instead of re-deriving the ratio, so
     the grant cannot disagree with the paint. No test now pins a budget-vs-element ratio agreement
     either — by construction rather than by agreement. Leftovers, each claimed:
-    - `InputItem`/`SectionItem`/`RowsItem` answer `height(width)` from a compose-width snapshot
-      (the `Layout` / `PaintedSection` / engine heights), so `width` is presently inert for them —
-      honest, since the ask is the one they can measure; computing at the render width is the
-      `Arc<Mutex<…>>` move (**4h-d** menu sections, **4h-f** the shared editor).
+    - ~~`InputItem`/`SectionItem`/`RowsItem` answer `height(width)` from a compose-width snapshot
+      (the `Layout` / `PaintedSection` / engine heights), so `width` is presently inert for them.~~
+      The menu sections landed with **4h-d**: `SectionItem`/`RowsItem` are gone, the crate's
+      detail/header/rows elements lay out at the render width inside `render(h, w)`, and their ask
+      reads `width`. Only `InputItem` still snapshots (a `Layout` at compose width) — **4h-f**'s
+      shared editor closes that half.
     - `InputItem` carries the composer's `hidden` flag (a push fact, set where the mid-turn rule
       decides). Design §RenderElement stack: turn presence rides `Content::streaming`, read at pull
       time — that lands with the input element, **4h-f**.
@@ -595,25 +597,38 @@ most runway to expand into separate sub-commits.
     leaving it in `output.rs` would have both `agent` and `ui` depending on `output` for a pure
     data type; now `ui → agent::status` matches the existing `content → agent::status` direction.
     `agent::status`'s tests assert against `ui::bar::{status_bar, BAR_SEPARATOR, DOT_STREAMING}`.
-    No `ui/menu.rs`: everything else `ui/mod.rs` holds is either already the menu crate's (the
-    `paint_*`/`window_heights` imports) or goes there with the element impls in **4h-d**
-    (`window_keeps` rides along beside `window_heights` — pure windowing, its only user is the
-    rows element). `pad_row`/`el_if_short` were already `slashdot_tui`'s (`pub`) — the sketch's
-    precondition, no change needed.
-  - **4h-d — menu views mint their own elements** (`slashdot_menu`):
-    1. `s/Rc/Arc/` on the handle chain — `ViewRows`, `DataResponse`, `CompletionRows`, the
-       `RowView::plan` signature; `Rc::ptr_eq` → `Arc::ptr_eq` (dirty-check semantics unchanged).
-       Pure widening: the async-trait `DataResult` returns become `Send`, never less.
+   No `ui/menu.rs`: everything else `ui/mod.rs` holds went to the menu crate with the element impls
+   in **4h-d** (`window_keeps` rides along beside `window_heights` — pure windowing, its only user
+   is the rows element). `pad_row`/`el_if_short` were already `slashdot_tui`'s (`pub`) — the
+    sketch's precondition, no change needed. With **4h-d** landed, `ui/mod.rs` is only `bar`.
+  - **4h-d — menu views mint their own elements** (`slashdot_menu`). Landed
+    (`a2ebeff` + `063d993` + `8daa008`), in three commits:
+    1. `s/Rc/Arc/` on the handle chain (`a2ebeff`) — `ViewRows`, `DataResponse`, `CompletionRows`,
+       the `RowView::plan` signature; `Rc::ptr_eq` → `Arc::ptr_eq` (dirty-check semantics
+       unchanged). Pure widening: the async-trait `DataResult` returns become `Send`, never less.
        `RefCell` sites stay `Rc` — node-internal (`node_impl.rs:426` active_ids, node_entry test
        spies), never leave the thread.
-    2. `RenderElement` impls for a view's sections — detail, table header, rows, one element each.
-       The rows element holds the view handle (`Arc<ViewRows>`, auto `Send + Sync`) and paints
-       through `iter()` inside `render(h, w)` at the render width — the iterator logic (order-driven
-       resolution, stale-slot skips, active-flag lookup) runs *in* the element; rows are never
-       copied into it, and `RowView::plan`'s ptr_eq rebuild caching is untouched. Detail/header
-       hold raw config/data and format at render width.
+    2. `RenderElement` impls for a view's sections (`063d993`) — detail, table header, rows, one
+       element each, minted by `RenderPlan::elements(row_min)` (the plan grows `view`/`columns`
+       fields; a hand-built plan leaves `view: None` and gets the pre-laid-out-lines elements the
+       confirm dialog and tests still want). The rows element holds the view handle
+       (`Arc<ViewRows>`, auto `Send + Sync`) and paints through `iter()` inside `render(h, w)` at
+       the render width — the iterator logic (order-driven resolution, stale-slot skips,
+       active-flag lookup) runs *in* the element; rows are never copied into it, and
+       `RowView::plan`'s ptr_eq rebuild caching is untouched. `RowView::rebuild_rows`' body is
+       extracted verbatim as `assemble_table`, shared by the plan cache and the elements so the
+       paint cannot drift from the rows the page keys page over. Detail/header hold raw
+       config/data and format at render width. The layout is `TableLines`, shared by the header
+       and rows elements and keyed by width, so a cursor move repaints the window (O(window))
+       without re-laying-out the table (O(table)).
     3. The menu layering returns the element set for a view; the repl appends it to the configured
-       stack. Compose-width `PaintedSection` and `ui::overlay_elements*` die.
+       stack (`8daa008`). `repl::overlay_elements` drops its `term_w` and dispatches to
+       `plan.elements(1)`; the confirm dialog passes its `OPTIONS.len()` floor through
+       `plan.elements` (whose `selected` is the dialog cursor, kept in sync with `self.sel`). The
+       compose-width `PaintedSection` and `ui::overlay_elements*` die; `ui/mod.rs` is now only
+       `bar`.
+    `window_keeps` moved to `elements.rs` beside `window_heights`, and the overlay element tests
+    moved to the crate beside the elements that back them.
   - **4h-e — selection behind shared state.** Menu open constructs the element set once; a keystroke
     moves the selection through a shared handle in place (no push, no rebuild — the engine's plan
     call still runs, but only the selection figures flow to the handle); rows that actually change
@@ -636,16 +651,17 @@ most runway to expand into separate sub-commits.
     (reposition re-composes from the configured stack — it is current by construction). The blank
     row keeps its role (frame's row between content and bar) as an ordinary element in the
     configured stack. Expect sub-splits.
-  - **4h-h — remaining callers + cleanup.** Confirm dialog: own selection state, elements via the
-    menu constructors with its `OPTIONS.len()` floor, in the repl-configured stack; the out-of-crate
-    probe keeps `draw_frame` through the re-exports. Anything left of `overlay_elements*`,
-    per-paint element construction, or dims params dies; docs updated (design doc already carries
-    the stack + crate sections).
+  - **4h-h — remaining callers + cleanup.** Confirm dialog: own selection state and a place in the
+    repl-configured stack (its elements already come via the menu constructors with the
+    `OPTIONS.len()` floor — that half landed with **4h-d**, `8daa008`); the out-of-crate probe
+    keeps `draw_frame` through the re-exports. Anything left of per-paint element construction or
+    dims params dies; docs updated (design doc already carries the stack + crate sections).
+    `overlay_elements*` is already gone (**4h-d**).
   Resolved during design (recorded here so they don't get re-litigated): RowAsk/RowSpec lands with
   the stack (**4h-b**), not later; dims flow TermIO → Render exclusively (**4h-g**); the input
   element is always in the stack with height carrying presence (**4h-f**); menu elements hold
-  `Arc<ViewRows>` directly after the crate's `Arc` swap (**4h-d**), preserving the no-copy row
-  iterator for filtered and unfiltered views alike.
+  `Arc<ViewRows>` directly after the crate's `Arc` swap (**4h-d** — landed), preserving the
+  no-copy row iterator for filtered and unfiltered views alike.
 
 Follow-ups step 3 leaves here — each claimed by a commit above unless noted:
 
