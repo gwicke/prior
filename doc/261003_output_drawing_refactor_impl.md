@@ -655,15 +655,8 @@ most runway to expand into separate sub-commits.
      of replaying a stale compose-width snapshot; the recipe dies with **4h-g** anyway.
    - `Layout` moved home from `slashdot_tui` — with the element pulling the editor, both sides of
      the contract (`LineEditor::layout` produces, `InputItem` consumes) are repl's.
-   - `emit_commit` resets the buffer *before* the redraw rather than after (the closure paints
-     through the shared handle now; every caller passes `""`, so same pixels).
-   - Leftover: the engine re-mines its view handle per cursor eval today (`StaticListingNode::
-     data()` mints a fresh `DataResponse` per call → `slots_dirty` → fresh `ViewRows`), so
-     `ElementSet::update` rebuilds rather than moving figures in place on the production path —
-     pixels are right either way, but 4h-e's no-rebuild ideal needs child `data()` memoization
-     (same-`Arc` when unchanged) to reach it. Claimed by **4h-e**'s engine side, not this step; a
-     repl-level test asserting the carry was dropped with this step because it encoded the engine
-     memoization as fact before it is one.
+  - `emit_commit` resets the buffer *before* the redraw rather than after (the closure paints
+    through the shared handle now; every caller passes `""`, so same pixels).
   - **4h-g — the flip.** `configure(frame_max_row_ratio, frame_elements)` regains the design's full
     signature — the repl configures the whole stack (bar and transient menus by inclusion; blank
     companion row and divider as ordinary elements; input always in, resolved by height).
@@ -686,6 +679,19 @@ most runway to expand into separate sub-commits.
   element is always in the stack with height carrying presence (**4h-f**); menu elements hold
   `Arc<ViewRows>` directly after the crate's `Arc` swap (**4h-d** — landed), preserving the
   no-copy row iterator for filtered and unfiltered views alike.
+
+  Deferred beyond 4h — surfaced by **4h-f**, owned by no remaining sub-step:
+
+  - **Engine re-mines its view handle per cursor eval.** `StaticListingNode::data()` mints a fresh
+    `DataResponse` on every call, so `refresh_data` always reports change, `slots_dirty` stays
+    set, and `ensure_rows` hands back a fresh `ViewRows` each eval. `ElementSet::update`'s
+    `same_panel` then sees a new handle and rebuilds instead of moving figures in place — so
+    **4h-e**'s no-rebuild ideal holds in the crate's tests (where a plan carries a stable
+    `Arc<ViewRows>`) but not on the production path. Pixels are right either way; what is lost is
+    the flicker-free carry. Fixing it means memoizing the child `data()` response (return the same
+    `Arc` when unchanged), which is engine-side and cuts across nodes — not a rendering-step
+    concern. A repl-level test asserting the carry was dropped in **4h-f** because it encoded
+    this memoization as fact before it is one; it should return once the engine memoizes.
 
 Follow-ups step 3 leaves here — each claimed by a commit above unless noted:
 
