@@ -37,7 +37,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The entry DSR at [`read_input`] has run once this process.
@@ -254,29 +254,66 @@ pub fn session_meta_from(m: crate::session::types::SessionMetadata) -> SessionMe
 
 /// The input-region overlay currently shown: none, the v2.5 menu frame,
 /// or the prompt-line (prose) completion dialog. Both plan-carrying
-/// variants are pure display snapshots — key dispatch routes through the
-/// engine that produced the plan (slash handle / prose completer).
+/// variants are paint state — a panel's [`ElementSet`], whose plan the
+/// host's cursor math reads and whose elements paint. Key dispatch
+/// still routes through the engine that minted the plan (slash handle /
+/// prose completer); the set is updated from that engine's fresh plan
+/// every eval (see [`ActiveOverlay::menu`] / [`ActiveOverlay::path_complete`]).
 pub(crate) enum ActiveOverlay {
     None,
 
-    /// v2.5 engine overlay: carries a `RenderPlan` from the v2.5
-    /// `SlashDotHandle::eval_prompt`. All key dispatch goes through the
-    /// persistent handle — the overlay is purely a display snapshot.
+    /// v2.5 engine overlay: the element set of a panel the v2.5
+    /// `SlashDotHandle::eval_prompt` keeps open. All key dispatch goes
+    /// through the persistent handle — the set is display state.
     V25Menu {
-        /// The render plan from the v2.5 engine.
-        plan: crate::slashdot_menu::render::RenderPlan,
+        /// The panel's element set (its plan included).
+        set: crate::slashdot_menu::ElementSet,
     },
 
-    /// Prose completion dialog: a `RenderPlan` from
+    /// Prose completion dialog: the element set minted by
     /// `prompt_complete::PromptCompletion::eval`. Tab splices the
     /// cursor row's id through the prose layer; Enter/Esc bypass
     /// (submit the raw line / no-op — stateless dismissal).
     PathComplete {
-        plan: crate::slashdot_menu::render::RenderPlan,
+        set: crate::slashdot_menu::ElementSet,
     },
 }
 
 impl ActiveOverlay {
+    /// The v2.5 menu overlay for a fresh engine plan, taking the overlay
+    /// it replaces: the open panel's element set carries over when the
+    /// plan's rows are the ones it was minted from — a cursor keystroke,
+    /// where only the selection figures move, in place — and re-mints
+    /// for anything else (see [`ElementSet::update`]). Either way the
+    /// returned set paints `plan` and holds it.
+    fn menu(prev: ActiveOverlay, plan: crate::slashdot_menu::render::RenderPlan) -> ActiveOverlay {
+        let set = match prev {
+            ActiveOverlay::V25Menu { mut set } => {
+                set.update(&plan);
+                set
+            }
+            _ => plan.element_set(OVERLAY_ROW_MIN),
+        };
+        ActiveOverlay::V25Menu { set }
+    }
+
+    /// [`Self::menu`] for the prose completion dialog — same carry-or-
+    /// re-mint rule, keyed on the dialog's own variant so a kind change
+    /// (menu ⇄ dialog) always re-mints.
+    fn path_complete(
+        prev: ActiveOverlay,
+        plan: crate::slashdot_menu::render::RenderPlan,
+    ) -> ActiveOverlay {
+        let set = match prev {
+            ActiveOverlay::PathComplete { mut set } => {
+                set.update(&plan);
+                set
+            }
+            _ => plan.element_set(OVERLAY_ROW_MIN),
+        };
+        ActiveOverlay::PathComplete { set }
+    }
+
     /// Decompose an engine [`RenderPlan`] into the legacy `(opts, active)`
     /// contract for a verbatim plan-painted overlay: one logical option per
     /// candidate (visual lines joined with `\n`, marker-free text), plus the
@@ -294,7 +331,8 @@ impl ActiveOverlay {
     fn display_rows(&self) -> (Vec<String>, Option<usize>) {
         match self {
             ActiveOverlay::None => (vec![], None),
-            ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
+            ActiveOverlay::V25Menu { set } | ActiveOverlay::PathComplete { set } => {
+                let plan = set.plan();
                 if plan.rows.is_empty() {
                     return (vec!["(no results)".into()], None);
                 }
@@ -308,7 +346,9 @@ impl ActiveOverlay {
     fn cursor_row(&self) -> Option<usize> {
         match self {
             ActiveOverlay::None => None,
-            ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => plan.selected,
+            ActiveOverlay::V25Menu { set } | ActiveOverlay::PathComplete { set } => {
+                set.plan().selected
+            }
         }
     }
 
@@ -392,13 +432,14 @@ pub(crate) fn input_hidden(layout: Layout, prompt: String) -> Element {
 /// a copy would drift, and then the tests would pin a rule that production does
 /// not follow.
 pub(crate) fn input_element(
-    editor: &LineEditor,
+    editor: &Arc<Mutex<LineEditor>>,
     prompt: &str,
     streaming: bool,
     term_w: usize,
 ) -> Element {
-    let layout = editor.layout(term_w, prompt);
-    if streaming && editor.text().is_empty() {
+    let ed = editor.lock().unwrap();
+    let layout = ed.layout(term_w, prompt);
+    if streaming && ed.text().is_empty() {
         input_hidden(layout, prompt.to_string())
     } else {
         input(layout, prompt.to_string())
@@ -456,7 +497,7 @@ pub(crate) fn test_overlay_parts(
 /// disagree with the paint. The status row is left out — it is one row, and a
 /// menu is only open between turns, when there is nothing streaming to report.
 pub(crate) fn rows_grant(
-    editor: &LineEditor,
+    editor: &Arc<Mutex<LineEditor>>,
     prompt: &str,
     overlay: Vec<Element>,
     term_w: usize,
@@ -471,16 +512,21 @@ pub(crate) fn rows_grant(
     heights.last().copied().unwrap_or(0)
 }
 
+/// The floor an overlay's element set mints with: one row, if there is
+/// anything to show.
+const OVERLAY_ROW_MIN: usize = 1;
+
 /// The overlay's frame elements: no overlay ⇒ none.
 ///
-/// The overlay is *not* painted here. Its sections become elements and the
-/// frame allocates them, so there is no painted row list to hand on and no
-/// focus index to translate — the cursor's logical row index goes straight to
-/// the rows element, which is the only thing that scrolls.
+/// The overlay is *not* painted here. Its sections are elements the set
+/// already minted and the frame allocates them, so there is no painted
+/// row list to hand on and no focus index to translate — the cursor's
+/// logical row index goes straight to the rows element, which is the
+/// only thing that scrolls.
 pub(crate) fn overlay_elements(overlay: &ActiveOverlay) -> Vec<Element> {
     match overlay {
         ActiveOverlay::None => Vec::new(),
-        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => plan.elements(1),
+        ActiveOverlay::V25Menu { set } | ActiveOverlay::PathComplete { set } => set.elements(),
     }
 }
 
@@ -569,7 +615,7 @@ pub(crate) fn compose_area(
 pub(crate) fn paint_prompt(
     content: &Content,
     label: &str,
-    editor: &LineEditor,
+    editor: &Arc<Mutex<LineEditor>>,
     overlay: Vec<Element>,
     dims: (usize, usize),
 ) {
@@ -716,7 +762,13 @@ pub(crate) enum EvalOutcome {
 pub struct PromptSession {
     /// The input buffer, cursor, wrap layout, and the `Up`/`Down` history-recall
     /// position (which lives on the editor — see [`LineEditor::nav`]).
-    editor: LineEditor,
+    ///
+    /// Shared, not owned outright: the input *element* holds a clone of this
+    /// handle and pulls the buffer at paint time (4h-f), so the frame always
+    /// shows the live editor rather than a layout snapshotted at compose.
+    /// Locks are statement-scoped — no path holds one across a paint (the
+    /// element locks it again inside the manager's render).
+    editor: Arc<Mutex<LineEditor>>,
     /// Selected row of the current overlay.
     sel: usize,
     /// Overlay discriminant, for resetting `sel` when the overlay *kind*
@@ -806,7 +858,7 @@ impl PromptSession {
             editor.set(s);
         }
         Self {
-            editor,
+            editor: Arc::new(Mutex::new(editor)),
             sel: 0,
             last_disc: 0,
             prose: crate::prompt_complete::PromptCompletion::new(),
@@ -881,7 +933,7 @@ impl PromptSession {
     /// it had: the `/` prompt *is* the menu state, so the buffer that ends a
     /// turn is the buffer the next prompt opens with.
     pub(crate) fn apply_prefill(&mut self, text: &str) {
-        self.editor.set(text);
+        self.editor.lock().unwrap().set(text);
     }
 
     /// The handle to eval with, for the `/`-session the buffer is currently in.
@@ -940,13 +992,18 @@ impl PromptSession {
         let key = pending_key
             .take()
             .unwrap_or(crate::slashdot_menu::HostKey::None);
-        let buf_text = editor.text();
+        // The overlay being replaced: `menu`/`path_complete` carry its
+        // element set over when the panel underneath did not change, or
+        // re-mint. Taking it here also clears the slot, so an early
+        // `return` leaves no overlay behind.
+        let prev = std::mem::replace(overlay, ActiveOverlay::None);
+        let buf_text = editor.lock().unwrap().text();
         *overlay = if buf_text.starts_with('/') {
             // All `/` commands route through the v2.5 engine. The handle is
             // minted for the eval and dropped with it — it carries no state
             // beyond the borrowed root and the epoch, both of which live in
             // the session's menu (`slash_handle` decides which epoch).
-            let cursor = editor.cursor;
+            let cursor = editor.lock().unwrap().cursor;
             let result = {
                 let mut handle = Self::slash_handle(menu, epoch_active);
                 Repl::v25_eval(&mut handle, &buf_text, cursor, key, width).await
@@ -966,10 +1023,11 @@ impl PromptSession {
                     // in the recalled prompt with `Up`/`Down` refusing to
                     // browse. Derived writes keep them walking.
                     let new_buf = format!("/{}", prompt);
-                    if new_buf != editor.text() {
-                        editor.set_derived(&new_buf);
+                    let mut ed = editor.lock().unwrap();
+                    if new_buf != ed.text() {
+                        ed.set_derived(&new_buf);
                     }
-                    ActiveOverlay::V25Menu { plan }
+                    ActiveOverlay::menu(prev, plan)
                 }
                 V25Frame::DoneSuccess(msg, prompt)
                     if matches!(key, crate::slashdot_menu::HostKey::Enter) =>
@@ -998,14 +1056,14 @@ impl PromptSession {
                 // `/`-session are cleared here rather than by the caller,
                 // because they are state, not pixels.
                 V25Frame::DoneError(err, _) => {
-                    editor.set("");
+                    editor.lock().unwrap().set("");
                     *epoch_active = false;
-                    *overlay = ActiveOverlay::None;
+                    // `overlay` is already None — `prev` was taken above.
                     return EvalOutcome::Error { message: err };
                 }
                 // Esc at root — close the overlay.
                 V25Frame::DoneSuccess(_, _) => {
-                    editor.set("");
+                    editor.lock().unwrap().set("");
                     *epoch_active = false;
                     ActiveOverlay::None
                 }
@@ -1022,9 +1080,11 @@ impl PromptSession {
             let ctx = crate::slashdot_menu::RenderContext {
                 term_width: self.size.borrow().width.max(20),
             };
-            match prose.eval(editor, key, ctx) {
+            match prose.eval(&mut editor.lock().unwrap(), key, ctx) {
                 crate::prompt_complete::Frame::Idle => ActiveOverlay::None,
-                crate::prompt_complete::Frame::Dialog(plan) => ActiveOverlay::PathComplete { plan },
+                crate::prompt_complete::Frame::Dialog(plan) => {
+                    ActiveOverlay::path_complete(prev, plan)
+                }
             }
         };
         EvalOutcome::Frame
@@ -1112,8 +1172,12 @@ impl PromptSession {
     /// surfaces differently depending on which pump took the key is a failure
     /// the user sees one way out of two.
     pub(crate) fn open_editor(&mut self, content: &Content) {
-        match run_editor(content, &self.editor.text(), EditorMode::Edit) {
-            Ok(new_text) => self.editor.set(&new_text),
+        // The buffer text is taken and the guard dropped before the takeover:
+        // `$EDITOR` runs the whole raw-mode turnover and must not queue behind
+        // a lock the paint path also wants.
+        let current = self.editor.lock().unwrap().text();
+        match run_editor(content, &current, EditorMode::Edit) {
+            Ok(new_text) => self.editor.lock().unwrap().set(&new_text),
             Err(e) => {
                 let _ = io::stdout().write_all(format!("\r\neditor error: {}\r\n", e).as_bytes());
             }
@@ -1123,7 +1187,7 @@ impl PromptSession {
     /// Insert pasted text at the caret. Shared so "paste" is one operation
     /// rather than one each pump reaches for differently.
     pub(crate) fn paste(&mut self, text: &str) {
-        self.editor.insert_str(text);
+        self.editor.lock().unwrap().insert_str(text);
     }
 
     /// eval → outcome → sync → paint: the whole "make the session say
@@ -1148,9 +1212,12 @@ impl PromptSession {
     ) -> Option<InputAction> {
         // `emit_commit` wants a painter as a closure; the painter it wants is
         // the same one everything else uses, so this is an adapter over
-        // `paint_prompt` and not a second composition.
-        let redraw = |editor: &LineEditor, overlay: Vec<Element>, dims: (usize, usize)| {
-            paint_prompt(content, prompt, editor, overlay, dims);
+        // `paint_prompt` and not a second composition. It paints through the
+        // session's shared editor handle, so the closure holds a clone of it
+        // rather than borrowing the session — `eval` needs `&mut self` next.
+        let editor = self.editor.clone();
+        let redraw = move |overlay: Vec<Element>, dims: (usize, usize)| {
+            paint_prompt(content, prompt, &editor, overlay, dims);
         };
         // Bound before the `match` on purpose: a future in a match scrutinee
         // lives to the end of the `match`, and it would still hold the borrow
@@ -1159,7 +1226,7 @@ impl PromptSession {
         match eval {
             EvalOutcome::Frame => {}
             EvalOutcome::Commit { line, message } => {
-                Repl::emit_commit(content, &mut self.editor, &redraw, dims, &line, "", history);
+                Repl::emit_commit(content, &self.editor, &redraw, dims, &line, "", history);
                 if let Some(text) = message {
                     content.display_text(&text);
                 }
@@ -1182,7 +1249,10 @@ impl PromptSession {
                 // an error path — rare, and the cost of being wrong is a
                 // stranded input region — not because the accounting needs
                 // rescuing.
-                redraw(&LineEditor::new(), Vec::new(), dims);
+                // The eval emptied the buffer before answering `Error`, so
+                // painting through the shared handle paints the same empty
+                // input the throwaway editor used to.
+                redraw(Vec::new(), dims);
                 content.display_text(&message);
                 let _ = content.manager.lock().unwrap().cursor_row();
             }
@@ -1310,8 +1380,8 @@ impl PromptSession {
                     // through the engine that owns the cursor (slash handle /
                     // prose).
                     let plan = match overlay {
-                        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
-                            Some(plan)
+                        ActiveOverlay::V25Menu { set } | ActiveOverlay::PathComplete { set } => {
+                            Some(set.plan())
                         }
                         ActiveOverlay::None => None,
                     };
@@ -1378,7 +1448,13 @@ impl PromptSession {
                     // Prose dialog: Enter bypasses completion — submit the raw
                     // line (Shift+Enter inserts a newline). Tab is the only
                     // expansion key.
-                    if let Some(a) = Repl::edit_key(key, editor, history, prompt, watched.width) {
+                    if let Some(a) = Repl::edit_key(
+                        key,
+                        &mut editor.lock().unwrap(),
+                        history,
+                        prompt,
+                        watched.width,
+                    ) {
                         return KeyOutcome::Action(a);
                     }
                     return KeyOutcome::Continue;
@@ -1397,7 +1473,13 @@ impl PromptSession {
                     // Editing keys pass through in both cases; dismissal is
                     // stateless — the next eval re-derives the dialog from
                     // the buffer.
-                    if let Some(a) = Repl::edit_key(key, editor, history, prompt, watched.width) {
+                    if let Some(a) = Repl::edit_key(
+                        key,
+                        &mut editor.lock().unwrap(),
+                        history,
+                        prompt,
+                        watched.width,
+                    ) {
                         return KeyOutcome::Action(a);
                     }
                 }
@@ -1407,7 +1489,13 @@ impl PromptSession {
         // No overlay: normal editing (Tab with no dialog is inert — implicit
         // open means the dialog is already up whenever there is anything to
         // complete).
-        if let Some(a) = Repl::edit_key(key, editor, history, prompt, watched.width) {
+        if let Some(a) = Repl::edit_key(
+            key,
+            &mut editor.lock().unwrap(),
+            history,
+            prompt,
+            watched.width,
+        ) {
             return KeyOutcome::Action(a);
         }
         KeyOutcome::Continue
@@ -1631,7 +1719,7 @@ impl Repl {
             // frames while a reflowing terminal is still moving rows). The
             // loop-top probe above notices the settled size and repaints
             // once, re-anchoring via DSR. ---
-            let prose_wait = if session.editor.chars().first() == Some(&'/') {
+            let prose_wait = if session.editor.lock().unwrap().chars().first() == Some(&'/') {
                 None
             } else {
                 session.prose.poll_timeout()
@@ -1738,7 +1826,7 @@ impl Repl {
                                 // the first keystroke of the turn, or the next
                                 // prompt, put the old text back on screen. Clear
                                 // the real one and paint that.
-                                session.editor.set("");
+                                session.editor.lock().unwrap().set("");
                                 paint_prompt(
                                     content,
                                     prompt,
@@ -1771,14 +1859,14 @@ impl Repl {
     /// composer here is how the page size and the painted height drifted apart
     /// in the first place.
     pub(crate) fn compose_elements(
-        editor: &LineEditor,
+        editor: &Arc<Mutex<LineEditor>>,
         prompt: &str,
         status: Option<&str>,
         overlay: Vec<Element>,
         term_w: usize,
     ) -> Vec<Element> {
         let term_w = term_w.max(1);
-        let layout = editor.layout(term_w, prompt);
+        let layout = editor.lock().unwrap().layout(term_w, prompt);
         let input = input(layout, prompt.to_string());
         let mut items: Vec<Element> = Vec::new();
         if let Some(bar) = status {
@@ -1797,7 +1885,7 @@ impl Repl {
     /// pipeline that `ui.rs` used to have (ui_draw_v2 §5.1.1).
     #[cfg(test)]
     pub(crate) fn compose_frame(
-        editor: &LineEditor,
+        editor: &Arc<Mutex<LineEditor>>,
         prompt: &str,
         status: Option<&str>,
         overlay: Vec<Element>,
@@ -2055,9 +2143,9 @@ impl Repl {
     /// The status bar follows underneath without being asked for: the commit is
     /// written at the caret, which pushes the tracked row down, so the next
     /// frame apply draws the area below what was just written.
-    fn emit_commit<F: Fn(&LineEditor, Vec<Element>, (usize, usize))>(
+    fn emit_commit<F: Fn(Vec<Element>, (usize, usize))>(
         content: &Content,
-        editor: &mut LineEditor,
+        editor: &Arc<Mutex<LineEditor>>,
         redraw: &F,
         dims: (usize, usize),
         line: &str,
@@ -2072,9 +2160,14 @@ impl Repl {
         // No DSR here: the draw cache's tracked row is the steady-state
         // anchor, content writes advance it, and a foreign
         // screen writer ($EDITOR through `run_editor`) re-anchors on exit
-        // (plan §4.2). Clear the input region, then echo the line
-        // at the caret the frame apply left.
-        redraw(&LineEditor::new(), Vec::new(), dims);
+        // (plan §4.2). Reset the buffer, clear the input region by painting
+        // it, then echo the line at the caret the frame apply left. The
+        // reset leads rather than trails the paint since 4h-f: the closure
+        // paints through the shared handle, so what it shows *is* the
+        // editor — an empty one, which is what every caller's
+        // `next_input` (`""`) asks for.
+        editor.lock().unwrap().set(next_input);
+        redraw(Vec::new(), dims);
         // Bracketed by rules, the way a turn is — and, when a prompt follows
         // directly, sharing one with it rather than stacking two (ui_draw_v2
         // R4). A committed line is a real event in the transcript — `/thinking
@@ -2085,7 +2178,6 @@ impl Repl {
         // whatever was just written: content written at the caret pushes the
         // tracked row down, and the next apply clears from *there*.
         content.display_committed_prompt(line);
-        editor.set(next_input);
     }
 
     /// Apply a normal editing key to the line editor. Returns `Some(action)`
@@ -2875,6 +2967,13 @@ fn history_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A shared editor for a test — the `Arc<Mutex<LineEditor>>` handle the
+    /// input element and `compose_frame` want, seeded through a scoped lock.
+    fn shared(build: impl FnOnce(&mut LineEditor)) -> Arc<Mutex<LineEditor>> {
+        let e = Arc::new(Mutex::new(LineEditor::new()));
+        build(&mut e.lock().unwrap());
+        e
+    }
     use super::*;
     use crate::output::Output;
 
@@ -2903,7 +3002,7 @@ mod tests {
                 height: 24,
             },
         );
-        let mut editor = LineEditor::new();
+        let editor = Arc::new(Mutex::new(LineEditor::new()));
         // Built by hand rather than `History::load()`, which reads the real
         // history file — a test that depends on the machine's `~/.picocode`, and
         // `add` would then write to it.
@@ -2919,8 +3018,8 @@ mod tests {
         // own tests. Passing a real one here would only add a bar row to search.
         Repl::emit_commit(
             &out.content,
-            &mut editor,
-            &|_, _, _| {},
+            &editor,
+            &|_, _| {},
             (80, 24),
             line,
             "",
@@ -2947,7 +3046,7 @@ mod tests {
         // And the editor is re-seeded for the next prompt, so the committed text
         // is not left in the input row as if it were still being typed.
         assert_eq!(
-            editor.text(),
+            editor.lock().unwrap().text(),
             "",
             "the input row is cleared for the next prompt"
         );
@@ -2985,7 +3084,7 @@ mod tests {
 
     /// A `ConsoleOutput` carrying a status, plus the redraw `emit_commit`
     /// expects: compose the area and draw it, the way `read_input` does.
-    fn commit_harness() -> (crate::output::ConsoleOutput, LineEditor) {
+    fn commit_harness() -> (crate::output::ConsoleOutput, Arc<Mutex<LineEditor>>) {
         let reasoning = crate::settings::default_show_reasoning_handle();
         let out = crate::output::ConsoleOutput::with_size(
             reasoning,
@@ -3000,14 +3099,17 @@ mod tests {
             model: "test".to_string(),
             ..Default::default()
         });
-        (out, LineEditor::new())
+        (out, Arc::new(Mutex::new(LineEditor::new())))
     }
 
-    fn redraw_fn(
-        out: &crate::output::ConsoleOutput,
-    ) -> impl Fn(&LineEditor, Vec<Element>, (usize, usize)) + '_ {
-        move |editor: &LineEditor, overlay: Vec<Element>, dims: (usize, usize)| {
-            paint_prompt(&out.content, "> ", editor, overlay, dims);
+    fn redraw_fn<'o>(
+        out: &'o crate::output::ConsoleOutput,
+        editor: &Arc<Mutex<LineEditor>>,
+    ) -> impl Fn(Vec<Element>, (usize, usize)) + 'o {
+        // Cloned so the closure owns its handle: it borrows only `out`.
+        let editor = editor.clone();
+        move |overlay: Vec<Element>, dims: (usize, usize)| {
+            paint_prompt(&out.content, "> ", &editor, overlay, dims);
         }
     }
 
@@ -3021,12 +3123,12 @@ mod tests {
     /// of air, the next commit's opening rule lands below it.
     #[test]
     fn two_committed_prompts_render_without_a_blank_between_their_rules() {
-        let (out, mut editor) = commit_harness();
+        let (out, editor) = commit_harness();
         let mut history = History {
             entries: Vec::new(),
             file: None,
         };
-        let redraw = redraw_fn(&out);
+        let redraw = redraw_fn(&out, &editor);
 
         out.begin_capture();
         for line in [
@@ -3035,7 +3137,7 @@ mod tests {
         ] {
             Repl::emit_commit(
                 &out.content,
-                &mut editor,
+                &editor,
                 &redraw,
                 (40, 24),
                 line,
@@ -3081,19 +3183,19 @@ mod tests {
     /// row directly after it rather than be absorbed into the gap.
     #[test]
     fn a_committed_prompt_after_turn_content_keeps_its_upper_rule() {
-        let (out, mut editor) = commit_harness();
+        let (out, editor) = commit_harness();
         let mut history = History {
             entries: Vec::new(),
             file: None,
         };
-        let redraw = redraw_fn(&out);
+        let redraw = redraw_fn(&out, &editor);
 
         out.begin_capture();
         // Turn content the way a real turn leaves it: output ending in a blank.
         out.display_plain("git status output line\nmore output\n");
         Repl::emit_commit(
             &out.content,
-            &mut editor,
+            &editor,
             &redraw,
             (40, 24),
             "Great, nice work! Please commit your changes.",
@@ -3836,8 +3938,8 @@ mod tests {
         h.add("older line");
         h.add("/model");
         let mut sess = PromptSession::new(None, &batch_state());
-        Repl::edit_key(up_key(), &mut sess.editor, &mut h, "", 80);
-        assert_eq!(sess.editor.text(), "/model");
+        Repl::edit_key(up_key(), &mut sess.editor.lock().unwrap(), &mut h, "", 80);
+        assert_eq!(sess.editor.lock().unwrap().text(), "/model");
         sess.pending_key = Some(crate::slashdot_menu::HostKey::Tab);
         let outcome = crate::agent::block_on_test(sess.eval());
         assert!(
@@ -3848,14 +3950,22 @@ mod tests {
             matches!(sess.overlay, ActiveOverlay::V25Menu { .. }),
             "recalling a `/`-command re-opens its menu"
         );
-        assert_eq!(sess.editor.text(), "/model ", "the menu rewrote the prompt");
+        assert_eq!(
+            sess.editor.lock().unwrap().text(),
+            "/model ",
+            "the menu rewrote the prompt"
+        );
         assert!(
-            sess.editor.nav.is_some(),
+            sess.editor.lock().unwrap().nav.is_some(),
             "the rewrite must not end the walk"
         );
         // …and history still answers.
-        let _ = Repl::edit_key(up_key(), &mut sess.editor, &mut h, "", 80);
-        assert_eq!(sess.editor.text(), "older line", "Up still walks history");
+        let _ = Repl::edit_key(up_key(), &mut sess.editor.lock().unwrap(), &mut h, "", 80);
+        assert_eq!(
+            sess.editor.lock().unwrap().text(),
+            "older line",
+            "Up still walks history"
+        );
     }
 
     #[test]
@@ -4370,6 +4480,7 @@ mod tests {
     mod vt100_tests {
         use crate::draw::{plan_apply, ApplyPolicy, DrawCache};
         use crate::repl::{LineEditor, Repl};
+        use std::sync::{Arc, Mutex};
         use vt100::Parser;
 
         /// Simulate the tty's OPOST/ONLCR: `plan_apply` emits bare `\n` (the
@@ -4388,7 +4499,7 @@ mod tests {
         /// full path with the frame's top at `anchor`. Returns (cursor row,
         /// cursor col, screen rows, post-apply anchor).
         fn render_overlay_through_vt100(
-            editor: &LineEditor,
+            editor: &Arc<Mutex<LineEditor>>,
             width: usize,
             prompt: &str,
             term_rows: usize,
@@ -4437,7 +4548,7 @@ mod tests {
         /// Input-only variant (no overlay): the pre-existing entry point the
         /// cursor-positioning tests use.
         fn render_through_vt100(
-            editor: &LineEditor,
+            editor: &Arc<Mutex<LineEditor>>,
             width: usize,
             prompt: &str,
             term_rows: usize,
@@ -4457,11 +4568,14 @@ mod tests {
             (cr, cc, rows)
         }
 
+        use super::shared;
+
         #[test]
         fn vt100_cursor_at_start_of_single_line() {
-            let mut e = LineEditor::new();
-            e.insert_str("Hello");
-            e.cursor = 0;
+            let e = shared(|e| {
+                e.insert_str("Hello");
+                e.cursor = 0;
+            });
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             // anchor=10 is 1-indexed; vt100 uses 0-indexed rows, so row = 9
             assert_eq!((cr, cc), (9, 2), "cursor at start should be row 9 col 2");
@@ -4470,9 +4584,10 @@ mod tests {
 
         #[test]
         fn vt100_cursor_at_start_of_multi_line() {
-            let mut e = LineEditor::new();
-            e.insert_str("abc def ghi\njk lm");
-            e.cursor = 0;
+            let e = shared(|e| {
+                e.insert_str("abc def ghi\njk lm");
+                e.cursor = 0;
+            });
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             assert_eq!(
                 (cr, cc),
@@ -4484,9 +4599,10 @@ mod tests {
 
         #[test]
         fn vt100_cursor_at_mid_of_first_line() {
-            let mut e = LineEditor::new();
-            e.insert_str("abc def ghi\njk lm");
-            e.cursor = 4;
+            let e = shared(|e| {
+                e.insert_str("abc def ghi\njk lm");
+                e.cursor = 4;
+            });
             let (cr, cc, _) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             // cursor_col = pcols(2) + index(4) = 6
             assert_eq!((cr, cc), (9, 6), "cursor at pos 4 should be row 9 col 6");
@@ -4494,9 +4610,10 @@ mod tests {
 
         #[test]
         fn vt100_cursor_at_start_of_second_line() {
-            let mut e = LineEditor::new();
-            e.insert_str("abc def ghi\njk lm");
-            e.cursor = 12;
+            let e = shared(|e| {
+                e.insert_str("abc def ghi\njk lm");
+                e.cursor = 12;
+            });
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             // cursor on second visual row (row 10 0-indexed), col 0
             assert_eq!(
@@ -4509,15 +4626,16 @@ mod tests {
 
         #[test]
         fn vt100_user_exact_text_cursor_at_start() {
-            let mut e = LineEditor::new();
-            for c in "some text and more".chars() {
-                e.insert(c);
-            }
-            e.insert_newline();
-            for c in "and even more text in this line".chars() {
-                e.insert(c);
-            }
-            e.cursor = 0;
+            let e = shared(|e| {
+                for c in "some text and more".chars() {
+                    e.insert(c);
+                }
+                e.insert_newline();
+                for c in "and even more text in this line".chars() {
+                    e.insert(c);
+                }
+                e.cursor = 0;
+            });
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             // cursor_row=0 in layout → 0-indexed vt100 row = 9 + 0 = 9
             assert_eq!(
@@ -4544,11 +4662,10 @@ mod tests {
             let text = "some text and more\nand even more text in this line";
             let w = 80usize;
             let prompt = "> ";
-            let mut e = LineEditor::new();
-            e.insert_str(text);
+            let e = shared(|e| e.insert_str(text));
             for pos in 0..=text.len() {
-                e.cursor = pos;
-                let layout = e.layout(w, prompt);
+                e.lock().unwrap().cursor = pos;
+                let layout = e.lock().unwrap().layout(w, prompt);
                 let (cr, cc, _) = render_through_vt100(&e, w, prompt, 24, 80, 10);
                 // vt100 rows are 0-indexed; anchor=10 1-indexed = 9 0-indexed
                 let expected_row = 9 + layout.cursor_row;
@@ -4574,11 +4691,10 @@ mod tests {
             let widths = [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15];
             for text in &texts {
                 for w in &widths {
-                    let mut e = LineEditor::new();
-                    e.insert_str(text);
+                    let e = shared(|e| e.insert_str(text));
                     for pos in 0..=text.len() {
-                        e.cursor = pos;
-                        let layout = e.layout(*w, "> ");
+                        e.lock().unwrap().cursor = pos;
+                        let layout = e.lock().unwrap().layout(*w, "> ");
                         let (cr, cc, _) = render_through_vt100(&e, *w, "> ", 24, 80, 5);
                         // anchor=5 1-indexed = 4 0-indexed
                         assert_eq!(
@@ -4597,9 +4713,10 @@ mod tests {
 
         #[test]
         fn vt100_single_row_no_prompt() {
-            let mut e = LineEditor::new();
-            e.insert_str("Hello");
-            e.cursor = 0;
+            let e = shared(|e| {
+                e.insert_str("Hello");
+                e.cursor = 0;
+            });
             let (cr, cc, rows) = render_through_vt100(&e, 80, "", 24, 80, 5);
             // anchor=5 1-indexed = 4 0-indexed. No prompt, so col=0.
             assert_eq!(
@@ -4618,8 +4735,7 @@ mod tests {
             // fits both the screen and the budget, so nothing scrolls. The
             // overlay must appear directly below the input, the caret must
             // return to the input, and the live frame's anchor must not move.
-            let mut e = LineEditor::new();
-            e.insert_str("hi");
+            let e = shared(|e| e.insert_str("hi"));
             let overlay = ["one", "two", "three"];
             let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 10, &overlay, 0);
@@ -4650,8 +4766,7 @@ mod tests {
             // the cache, and the caret must land on the input row — this is
             // exactly the bug class the old hand-rolled test copy could not
             // catch.
-            let mut e = LineEditor::new();
-            e.insert_str("hi");
+            let e = shared(|e| e.insert_str("hi"));
             let overlay = ["one", "two", "three", "four", "five", "six"];
             let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 20, &overlay, 0);
@@ -4692,7 +4807,7 @@ mod tests {
             // windowed around the selection, so the frame fits at its anchor
             // (row 8 + 16 - 1 = 23 ≤ 24): no scroll, top 1/3 of the screen
             // stays scrollback.
-            let e = LineEditor::new();
+            let e = shared(|_| {});
             let overlay: Vec<String> = (0..100).map(|i| format!("item {i}")).collect();
             let overlay: Vec<&str> = overlay.iter().map(|s| s.as_str()).collect();
             let (cr, cc, rows, anchor) =
@@ -4745,9 +4860,11 @@ mod tests {
     // knows about.
     mod input_frame_tests {
         use super::super::input;
+        use super::shared;
         use crate::draw::{plan_apply, ApplyPolicy, DrawCache};
         use crate::render::render;
         use crate::repl::LineEditor;
+        use std::sync::{Arc, Mutex};
         use vt100::Parser;
 
         fn onlcr(s: &str) -> Vec<u8> {
@@ -4788,17 +4905,17 @@ mod tests {
 
         #[test]
         fn a_frame_that_grows_below_the_caret_takes_the_caret_with_it() {
-            let mut e = LineEditor::new();
-            let input = |e: &LineEditor, rows: &[usize]| {
-                render(&[input(e.layout(20, "> "), "> ".to_string())], rows, 20)
+            let e = shared(|e| e.insert_str("abc"));
+            let input = |e: &Arc<Mutex<LineEditor>>, rows: &[usize]| {
+                let layout = e.lock().unwrap().layout(20, "> ");
+                render(&[input(layout, "> ".to_string())], rows, 20)
             };
             let mut cache = DrawCache::new(24);
-            e.insert_str("abc");
             cursor_to(&mut cache, 5, 24);
             let s1 = plan_apply(&mut cache, &input(&e, &[1]), ApplyPolicy::Frame, 20, 24);
             // Shift+Enter: a second row appears and the caret moves onto it. The
             // apply needs no row from anyone — it follows the live frame.
-            e.insert_newline();
+            e.lock().unwrap().insert_newline();
             let s2 = plan_apply(&mut cache, &input(&e, &[2]), ApplyPolicy::Frame, 20, 24);
             let mut p = at(24, 20, 4);
             feed(&mut p, &s1);
@@ -4810,7 +4927,7 @@ mod tests {
                 "the caret follows the caret onto the new row"
             );
             // The next keystroke lands on the new row, and the first keeps its text.
-            e.insert_str("d");
+            e.lock().unwrap().insert_str("d");
             let s3 = plan_apply(&mut cache, &input(&e, &[2]), ApplyPolicy::Frame, 20, 24);
             feed(&mut p, &s3);
             assert_eq!(row(&p, 4, 20), "> abc");
@@ -4820,9 +4937,8 @@ mod tests {
         #[test]
         fn consume_walks_to_the_frame_top_at_column_zero_without_erasing() {
             let mut cache = DrawCache::new(24);
-            let mut e = LineEditor::new();
-            e.insert_str("hi there");
-            let layout = e.layout(20, "> ");
+            let e = shared(|e| e.insert_str("hi there"));
+            let layout = e.lock().unwrap().layout(20, "> ");
             let h = layout.row_count.max(1);
             let f = render(&[input(layout, "> ".into())], &[h], 20);
             cursor_to(&mut cache, 5, 24);
@@ -4884,7 +5000,7 @@ mod tests {
     /// layer accidentally padding the gap back in.
     #[test]
     fn an_empty_input_is_a_row_between_turns_and_none_mid_turn() {
-        let empty = LineEditor::new();
+        let empty = shared(|_| {});
 
         // Between turns: the resting row, `min == 1`.
         let e = input_element(&empty, "> ", false, 60);
@@ -4904,8 +5020,7 @@ mod tests {
 
         // Mid-turn with something typed: an ordinary input again, and `min` is
         // the caret's row so it can never be squeezed away entirely.
-        let mut typed = LineEditor::new();
-        typed.set("hello");
+        let typed = shared(|e| e.set("hello"));
         let e = input_element(&typed, "> ", true, 60);
         assert_eq!(
             e.ask(60),
@@ -5108,8 +5223,9 @@ mod confirm_tests {
     #[test]
     fn a_confirm_appends_below_an_open_menu() {
         let mut sess = session();
-        sess.overlay = ActiveOverlay::V25Menu {
-            plan: crate::slashdot_menu::render::RenderPlan {
+        sess.overlay = ActiveOverlay::menu(
+            ActiveOverlay::None,
+            crate::slashdot_menu::render::RenderPlan {
                 table_header: None,
                 detail: vec![LogicalLine::new("pick a model")],
                 rows: std::sync::Arc::new(vec![LogicalLine::new("menu-row")]),
@@ -5118,7 +5234,7 @@ mod confirm_tests {
                 view: None,
                 columns: Vec::new(),
             },
-        };
+        );
         let bridge = ConfirmBridge::new();
         let (reply, _rx) = tokio::sync::oneshot::channel();
         sess.open_confirm(

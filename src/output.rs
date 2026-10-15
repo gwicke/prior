@@ -1033,6 +1033,16 @@ mod tests {
         (out, reasoning)
     }
 
+    /// A shared editor for a test — the handle `compose_frame`/`paint_prompt`
+    /// take (4h-f), seeded through a scoped lock.
+    fn shared_editor(
+        build: impl FnOnce(&mut crate::repl::LineEditor),
+    ) -> Arc<Mutex<crate::repl::LineEditor>> {
+        let e = Arc::new(Mutex::new(crate::repl::LineEditor::new()));
+        build(&mut e.lock().unwrap());
+        e
+    }
+
     /// The compose head's home since 4f-b: the tests drive it through the
     /// content handle they already hold, the way `paint_prompt` does.
     fn compose_area(
@@ -2526,14 +2536,8 @@ mod tests {
     fn capture_catches_content_but_never_frame_bytes() {
         let (out, _reasoning) = capturing_output(40);
         let sink = record_bytes(&out);
-        let frame = crate::repl::Repl::compose_frame(
-            &crate::repl::LineEditor::new(),
-            "",
-            None,
-            Vec::new(),
-            40,
-            10,
-        );
+        let frame =
+            crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, Vec::new(), 40, 10);
         out.begin_capture();
         out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         out.display_text("content only");
@@ -2652,14 +2656,8 @@ mod tests {
             ],
             Some(0),
         );
-        let frame = crate::repl::Repl::compose_frame(
-            &crate::repl::LineEditor::new(),
-            "",
-            None,
-            overlay,
-            40,
-            10,
-        );
+        let frame =
+            crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, overlay, 40, 10);
         out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         out.display_text("Cannot start agent: Missing API key for provider.");
         let bytes = sink.bytes();
@@ -2733,7 +2731,7 @@ mod tests {
         crate::repl::paint_prompt(
             &out.content,
             "",
-            &crate::repl::LineEditor::new(),
+            &shared_editor(|_| {}),
             Vec::new(),
             (40, 24),
         );
@@ -2745,8 +2743,7 @@ mod tests {
 
         let (out, _reasoning) = capturing_output(40);
         let sink = record_bytes(&out);
-        let mut editor = crate::repl::LineEditor::new();
-        editor.set("hi");
+        let editor = shared_editor(|e| e.set("hi"));
         crate::repl::paint_prompt(&out.content, "", &editor, Vec::new(), (40, 24));
         let text = String::from_utf8_lossy(&sink.bytes()).into_owned();
         assert!(
@@ -2797,14 +2794,8 @@ mod tests {
             &["  gpt-5          400k   1.00"],
             Some(0),
         );
-        let frame = crate::repl::Repl::compose_frame(
-            &crate::repl::LineEditor::new(),
-            "",
-            None,
-            overlay,
-            40,
-            10,
-        );
+        let frame =
+            crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, overlay, 40, 10);
         out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         {
             let _batch = out.begin_batch();
