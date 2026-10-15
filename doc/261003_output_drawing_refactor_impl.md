@@ -629,10 +629,17 @@ most runway to expand into separate sub-commits.
        `bar`.
     `window_keeps` moved to `elements.rs` beside `window_heights`, and the overlay element tests
     moved to the crate beside the elements that back them.
-  - **4h-e — selection behind shared state.** Menu open constructs the element set once; a keystroke
-    moves the selection through a shared handle in place (no push, no rebuild — the engine's plan
-    call still runs, but only the selection figures flow to the handle); rows that actually change
-    (filter, new plan) rebuild the affected element and reconfigure the stack.
+  - **4h-e — selection behind shared state.** *(landed — `14542025`, `744a8dfe`, `25730624`)*
+    Menu open constructs the element set once; a keystroke moves the selection through a shared
+    handle in place (no push, no rebuild — the engine's plan call still runs, but only the
+    selection figures flow to the handle); rows that actually change (filter, new plan) rebuild
+    the affected element and reconfigure the stack. The set's plan is refreshed by the same
+    `update`, so host cursor math reads the freshest engine answer.
+   - "Reconfigure the stack" is per-paint today (`compose_area` re-runs per frame); it collapses
+     with **4h-g**. `Element::ptr_eq` exists under the test-helpers seam only (production has no
+     need to name element identity).
+   - Panel-shape rules, pinned by tests in the crate and in the repl: a detail section appearing
+     or vanishing (an error line arriving on an unchanged view) is a rebuild, not a figure move.
   - **4h-f — the input element.** `Repl::editor: LineEditor` → `Arc<Mutex<LineEditor>>`, shared
     with the input element (label + streaming flag alongside); layout/wrap computes inside
     `render(h, w)` at render width. Height rules: `0` mid-turn with an empty buffer; the prompt row
