@@ -540,10 +540,7 @@ pub struct ContentWrite {
     /// Zero on the `Meta` route: stderr never moves the screen's cursor,
     /// so the rows are not the route's to report.
     pub rows: usize,
-    /// The width the block was rendered for — the reposition's width.
-    /// `Meta` carries the watched width too (honest wherever the payload
-    /// is read); the reposition never runs for it.
-    pub width: usize,
+
     /// Which stream these bytes ride — the stream decision is content's,
     /// made once at setup; below this the hub routes on the token and
     /// stays stream-generic (design §Render: `ContentWrite { lines,
@@ -742,7 +739,15 @@ impl RenderManager {
         live_budget_ratio(term_h, self.frame_max_row_ratio)
     }
 
-    /// Allocate → render → apply → remember: the pipeline that was
+    /// The live-region budget at the **watched** height — the number the next
+    /// [`Self::render`] will budget with, no `term_h` to thread (design §Render:
+    /// the page grant "takes it from here rather than re-deriving"). For a
+    /// caller that wants the pre-paint row count without naming dims.
+    pub fn budget_now(&self) -> usize {
+        self.budget(self.size.borrow().height.max(1))
+    }
+
+    /// Allocate → render → apply: the pipeline that was
     /// `Output::draw_elements`' default body (step 4b), painting through the
     /// [`Draw`] this manager has owned since 4c.
     ///
@@ -752,13 +757,16 @@ impl RenderManager {
     /// in 4h and the head moves in with it.
     /// `pub` as the hub's face verb (step 4f-b): out-of-crate drivers (the
     /// confirm probe) apply frames through it directly.
-    pub fn render(
-        &mut self,
-        stack: Vec<Element>,
-        policy: ApplyPolicy,
-        dims: (usize, usize),
-    ) -> (usize, usize) {
-        let (tw, th) = (dims.0.max(1), dims.1.max(1));
+    ///
+    /// No dims and no return (design §Render): the compose and the apply both
+    /// read the watched size, so a resize applies lazily at the next `render`
+    /// and a caller keys off the resize event plus [`Self::painted_size`],
+    /// never off a size this verb returns. `ApplyPolicy::Frame` is the one
+    /// policy the frame path takes — `render` is the UI face verb, and no
+    /// `render` caller has ever passed `Append`.
+    pub fn render(&mut self, stack: Vec<Element>) -> (usize, usize) {
+        let size = *self.size.borrow();
+        let (tw, th) = (size.width.max(1), size.height.max(1));
         let asks: Vec<RowAsk> = stack.iter().map(|e| e.ask(tw)).collect();
         // The page-scroll path needs the rows element's grant *before* the
         // frame is rendered, and this is the only place `allocate` runs for a
@@ -766,7 +774,7 @@ impl RenderManager {
         // asks rather than asking the painter to guess twice.
         let heights = allocate(&asks, th, self.budget(th));
         let frame = render(&stack, &heights, tw);
-        let applied = self.draw.draw_frame(&frame, policy, dims);
+        let applied = self.draw.draw_frame(&frame, ApplyPolicy::Frame, (tw, th));
         // Not recorded: the configured `stack` (set by `configure`) is the
         // reposition source now, so a per-paint compose leaves it untouched —
         // and `draw_frame` below no longer clears it. Sub-split 2 installs the
@@ -877,11 +885,6 @@ impl RenderManager {
     /// watched width (ui_draw_v2 R5). Called by [`ContentBatchGuard`]'s
     /// drop; a no-op when no batch is open or nothing was deferred.
     pub fn end_batch(&mut self) {
-        // The width the deferred frame re-renders at is this manager's own
-        // watched geometry — the same channel `Content` formats at, with
-        // the same 20-column floor as `Content::width` and the
-        // `term_width` free function.
-        let width = self.size.borrow().width.max(20);
         if !self.draw.cache.batch_active {
             return;
         }
@@ -889,7 +892,9 @@ impl RenderManager {
         let Some(taken) = self.draw.cache.deferred.take() else {
             return;
         };
-        let bytes = self.reposition_area(width, taken);
+        // The deferred frame re-renders at the watched size — read inside
+        // `reposition_area`, the same channel `Content` formats at.
+        let bytes = self.reposition_area(taken);
         self.draw.write_bytes(bytes.as_bytes());
     }
 
@@ -915,9 +920,9 @@ impl RenderManager {
             .expect("end_capture without begin_capture")
     }
 
-    /// The area's re-emit: re-render the stored recipe (§5.1.1) and walk it
-    /// to where the content write left off. Moved here from `Draw` in 4e —
-    /// the hub owns reposition, and the recipe is the hub's.
+    /// The area's re-emit: re-render the configured stack (§5.1.1) and walk
+    /// it to where the content write left off. Moved here from `Draw` in 4e —
+    /// the hub owns reposition, and the configured stack is the hub's.
     ///
     /// Re-render rather than replay `taken`: a `Frame` is a snapshot of the
     /// status as of the last compose, and the bar moves without the REPL
@@ -931,9 +936,13 @@ impl RenderManager {
     /// or a direct `draw_frame`). Falling back keeps the invariant that
     /// matters more than freshness, I5: an area that was consumed is always
     /// put back, so a half-consumed frame is never left stranded on screen.
-    pub fn reposition_area(&mut self, width: usize, taken: Frame) -> String {
-        let tw = width.max(1);
-        let th = self.draw.size.borrow().height.max(1);
+    pub fn reposition_area(&mut self, taken: Frame) -> String {
+        // Dims never travel (design §Render): both come off the watched size
+        // — the same geometry `render` composes at, so a reposition after a
+        // resize re-lays-out at the settled width rather than the width the
+        // consumed frame was painted for.
+        let size = *self.size.borrow();
+        let (tw, th) = (size.width.max(1), size.height.max(1));
         // The consumed frame's height is the `old_h` of the below-frame clear
         // (`old_h - h_new - consumed_rows`) — read before `taken` moves into
         // the fallback below.
@@ -978,7 +987,6 @@ impl RenderManager {
         let ContentWrite {
             bytes,
             rows,
-            width,
             stream,
         } = content;
         // The meta route (4f-f): the meta sink, no choreography — no
@@ -1040,8 +1048,9 @@ impl RenderManager {
                 Some(taken) if !cache.batch_active => Some(taken),
                 Some(taken) => {
                     // Keep the *first* frame taken: it is `reposition_area`'s
-                    // fallback when no recipe recorded itself, and a later
-                    // write finds nothing to consume and so contributes none.
+                    // fallback when no configured stack re-composes, and a
+                    // later write finds nothing to consume and so contributes
+                    // none.
                     if cache.deferred.is_none() {
                         cache.deferred = Some(taken);
                     }
@@ -1051,7 +1060,7 @@ impl RenderManager {
             }
         };
         if let Some(taken) = taken {
-            let bytes = self.reposition_area(width, taken);
+            let bytes = self.reposition_area(taken);
             self.draw.write_bytes(bytes.as_bytes());
         }
     }

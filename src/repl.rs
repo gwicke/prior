@@ -17,7 +17,7 @@
 use crate::agent::SessionUsage;
 use crate::app_state::AppState;
 use crate::content::Content;
-use crate::draw::{el_if_short, ApplyPolicy};
+use crate::draw::el_if_short;
 use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
 #[cfg(test)]
@@ -604,9 +604,7 @@ pub(crate) fn paint_prompt(
     label: &str,
     editor: &Arc<Mutex<LineEditor>>,
     overlay: Vec<Element>,
-    dims: (usize, usize),
 ) {
-    let dims = (dims.0.max(1), dims.1.max(1));
     // The REPL supplies only what changes: the input, and the menu when one is
     // open. The status row is `compose_area`'s to resolve — it is made of
     // content's own facts and not something this module may reason about —
@@ -617,11 +615,9 @@ pub(crate) fn paint_prompt(
     // Composition *and* division are the tail's now: pieces move in and nothing
     // comes back, so no `Vec<Element>` crosses a call site (ui_draw_v2 §5.1.1).
     let stack = compose_area(content, Some(input), overlay);
-    content
-        .manager
-        .lock()
-        .unwrap()
-        .render(stack, ApplyPolicy::Frame, dims);
+    // No dims (design §Render): `render` composes and applies at the watched
+    // size, so the manager resolves the geometry this paint is for.
+    content.manager.lock().unwrap().render(stack);
 }
 
 /// Editor content: the prompt on row 0, the wrapped buffer below it.
@@ -1199,7 +1195,6 @@ impl PromptSession {
         content: &Content,
         prompt: &str,
         history: &mut History,
-        dims: (usize, usize),
     ) -> Option<InputAction> {
         // `emit_commit` wants a painter as a closure; the painter it wants is
         // the same one everything else uses, so this is an adapter over
@@ -1207,8 +1202,8 @@ impl PromptSession {
         // session's shared editor handle, so the closure holds a clone of it
         // rather than borrowing the session — `eval` needs `&mut self` next.
         let editor = self.editor.clone();
-        let redraw = move |overlay: Vec<Element>, dims: (usize, usize)| {
-            paint_prompt(content, prompt, &editor, overlay, dims);
+        let redraw = move |overlay: Vec<Element>| {
+            paint_prompt(content, prompt, &editor, overlay);
         };
         // Bound before the `match` on purpose: a future in a match scrutinee
         // lives to the end of the `match`, and it would still hold the borrow
@@ -1217,7 +1212,7 @@ impl PromptSession {
         match eval {
             EvalOutcome::Frame => {}
             EvalOutcome::Commit { line, message } => {
-                Repl::emit_commit(content, &self.editor, &redraw, dims, &line, "", history);
+                Repl::emit_commit(content, &self.editor, &redraw, &line, "", history);
                 if let Some(text) = message {
                     content.display_text(&text);
                 }
@@ -1243,13 +1238,13 @@ impl PromptSession {
                 // The eval emptied the buffer before answering `Error`, so
                 // painting through the shared handle paints the same empty
                 // input the throwaway editor used to.
-                redraw(Vec::new(), dims);
+                redraw(Vec::new());
                 content.display_text(&message);
                 let _ = content.manager.lock().unwrap().cursor_row();
             }
         }
         self.sync_selection();
-        self.paint(content, prompt, dims);
+        self.paint(content, prompt);
         None
     }
 
@@ -1261,12 +1256,12 @@ impl PromptSession {
     /// A confirm *appends* rather than replaces (§3 of
     /// doc/confirm_as_menu_261002.md): it is modal over the menu, and the
     /// prompt that drives that menu stays exactly where it was.
-    pub(crate) fn paint(&self, content: &Content, prompt: &str, dims: (usize, usize)) {
+    pub(crate) fn paint(&self, content: &Content, prompt: &str) {
         let mut overlay = overlay_elements(&self.overlay);
         if let Some(confirm) = &self.confirm {
             overlay.extend(confirm.elements());
         }
-        paint_prompt(content, prompt, &self.editor, overlay, dims);
+        paint_prompt(content, prompt, &self.editor, overlay);
     }
 
     /// Apply one key to the session.
@@ -1688,10 +1683,7 @@ impl Repl {
             // Everything after it here is the *other* half of the iteration —
             // waiting for a key — which is exactly what the turn has instead
             // of a wait.
-            if let Some(action) = session
-                .settle(content, prompt, history, (cur_w, cur_h))
-                .await
-            {
+            if let Some(action) = session.settle(content, prompt, history).await {
                 return Some(action);
             }
 
@@ -1818,13 +1810,7 @@ impl Repl {
                                 // prompt, put the old text back on screen. Clear
                                 // the real one and paint that.
                                 session.editor.lock().unwrap().set("");
-                                paint_prompt(
-                                    content,
-                                    prompt,
-                                    &session.editor,
-                                    Vec::new(),
-                                    (cur_w, cur_h),
-                                );
+                                paint_prompt(content, prompt, &session.editor, Vec::new());
                             }
                             return Some(a);
                         }
@@ -2141,11 +2127,10 @@ impl Repl {
     /// The status bar follows underneath without being asked for: the commit is
     /// written at the caret, which pushes the tracked row down, so the next
     /// frame apply draws the area below what was just written.
-    fn emit_commit<F: Fn(Vec<Element>, (usize, usize))>(
+    fn emit_commit<F: Fn(Vec<Element>)>(
         content: &Content,
         editor: &Arc<Mutex<LineEditor>>,
         redraw: &F,
-        dims: (usize, usize),
         line: &str,
         next_input: &str,
         history: &mut History,
@@ -2165,7 +2150,7 @@ impl Repl {
         // editor — an empty one, which is what every caller's
         // `next_input` (`""`) asks for.
         editor.lock().unwrap().set(next_input);
-        redraw(Vec::new(), dims);
+        redraw(Vec::new());
         // Bracketed by rules, the way a turn is — and, when a prompt follows
         // directly, sharing one with it rather than stacking two (ui_draw_v2
         // R4). A committed line is a real event in the transcript — `/thinking
@@ -3033,15 +3018,7 @@ mod tests {
         // The redraw closure is a no-op: this test is about what `emit_commit`
         // writes, and the real closure's frame apply is covered by the REPL's
         // own tests. Passing a real one here would only add a bar row to search.
-        Repl::emit_commit(
-            &out.content,
-            &editor,
-            &|_, _| {},
-            (80, 24),
-            line,
-            "",
-            &mut history,
-        );
+        Repl::emit_commit(&out.content, &editor, &|_| {}, line, "", &mut history);
         let bytes = out.end_capture();
         let text = String::from_utf8_lossy(&bytes);
 
@@ -3122,11 +3099,11 @@ mod tests {
     fn redraw_fn<'o>(
         out: &'o crate::output::ConsoleOutput,
         editor: &Arc<Mutex<LineEditor>>,
-    ) -> impl Fn(Vec<Element>, (usize, usize)) + 'o {
+    ) -> impl Fn(Vec<Element>) + 'o {
         // Cloned so the closure owns its handle: it borrows only `out`.
         let editor = editor.clone();
-        move |overlay: Vec<Element>, dims: (usize, usize)| {
-            paint_prompt(&out.content, "> ", &editor, overlay, dims);
+        move |overlay: Vec<Element>| {
+            paint_prompt(&out.content, "> ", &editor, overlay);
         }
     }
 
@@ -3152,15 +3129,7 @@ mod tests {
             "/model xiaomimimo:mimo-v2.6-flash activate",
             "/reasoning high",
         ] {
-            Repl::emit_commit(
-                &out.content,
-                &editor,
-                &redraw,
-                (40, 24),
-                line,
-                "",
-                &mut history,
-            );
+            Repl::emit_commit(&out.content, &editor, &redraw, line, "", &mut history);
         }
         let rows = screen_rows(&out.end_capture());
 
@@ -3214,7 +3183,6 @@ mod tests {
             &out.content,
             &editor,
             &redraw,
-            (40, 24),
             "Great, nice work! Please commit your changes.",
             "",
             &mut history,

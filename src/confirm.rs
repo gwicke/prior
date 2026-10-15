@@ -309,18 +309,13 @@ pub fn decision_line(subject: &str, decision: ConfirmDecision) -> String {
 /// ends in.
 pub fn paint(
     confirm: &ConfirmPrompt,
-    dims: (usize, usize),
     manager: &std::sync::Arc<std::sync::Mutex<crate::render::RenderManager>>,
 ) {
-    let (tw, th) = (dims.0.max(1), dims.1.max(1));
     // No compose head (step 4f-b): a probe's dialog is the whole area — the
     // division below is the same `area_body` the session's own paint layers
     // these elements under its bar and input with, so the two cannot drift.
     let stack = crate::repl::area_body(None, confirm.elements());
-    manager
-        .lock()
-        .unwrap()
-        .render(stack, crate::draw::ApplyPolicy::Frame, (tw, th));
+    manager.lock().unwrap().render(stack);
 }
 
 /// Resolve a confirmed dialog: **repaint without it, then record the decision**.

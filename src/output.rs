@@ -613,11 +613,27 @@ impl ConsoleOutput {
     /// bytes, and the byte-edge tests record through `TermIO::recording()`.
     #[cfg(test)]
     pub(crate) fn with_size(show_reasoning: ShowReasoningHandle, size: TermSize) -> Self {
+        Self::with_size_at(show_reasoning, size).0
+    }
+
+    /// [`Self::with_size`] that also hands back the private size watch's
+    /// sending half. The watch `render()` composes at is per-instance state
+    /// (the manager reads it directly), and `fixed()` drops its sender, so a
+    /// test that needs the geometry *under test* to differ from the width it
+    /// seeded — both paths composing at one watched size, not a width the
+    /// harness hardcoded — keeps this to move it. `set_size` cannot: that
+    /// publishes to `term_io`'s watch, which the private one replaced.
+    #[cfg(test)]
+    pub(crate) fn with_size_at(
+        show_reasoning: ShowReasoningHandle,
+        size: TermSize,
+    ) -> (Self, tokio::sync::watch::Sender<TermSize>) {
         let term_io = TermIO::null();
-        let size = crate::termio::fixed(size);
-        Self {
-            content: Arc::new(Content::new_from(term_io, size, show_reasoning)),
-        }
+        let (size_tx, size_rx) = tokio::sync::watch::channel(size);
+        let out = Self {
+            content: Arc::new(Content::new_from(term_io, size_rx, show_reasoning)),
+        };
+        (out, size_tx)
     }
 }
 
@@ -2588,23 +2604,36 @@ mod tests {
             let overlay = crate::repl::test_overlay(&tall, 0);
             (Some(input), overlay)
         };
+        // `render()` composes at the watched size (the manager reads its own
+        // private watch), so that is the geometry under test — seeded here on
+        // both outputs so the two paths cannot disagree about it. `dims` below
+        // is the *hand* path's apply, which still takes dims explicitly.
         let dims = (60, 20);
 
-        let (tail, _rt) = capturing_output(60);
+        let reasoning = crate::settings::default_show_reasoning_handle();
+        let (tail, _tail_tx) = ConsoleOutput::with_size_at(
+            reasoning.clone(),
+            TermSize {
+                width: dims.0,
+                height: dims.1,
+            },
+        );
         tail.content.set_status(bar_of("[bar]"));
         let tail_sink = record_bytes(&tail);
         let (input, overlay) = pieces();
         let a = {
             let stack = compose_area(&tail, input, overlay);
-            tail.content
-                .manager
-                .lock()
-                .unwrap()
-                .render(stack, ApplyPolicy::Frame, dims)
+            tail.content.manager.lock().unwrap().render(stack)
         };
         let via_tail = tail_sink.bytes();
 
-        let (hand, _rh) = capturing_output(60);
+        let (hand, _hand_tx) = ConsoleOutput::with_size_at(
+            reasoning,
+            TermSize {
+                width: dims.0,
+                height: dims.1,
+            },
+        );
         hand.content.set_status(bar_of("[bar]"));
         // Feed `draw_frame` exactly what the paint path composes — same
         // composer, same status, same dims — so the apply half is all that
@@ -2721,13 +2750,7 @@ mod tests {
         // Streaming with an empty buffer is R1's `input_hidden`: no input row,
         // and so no caret to place.
         out.begin_response();
-        crate::repl::paint_prompt(
-            &out.content,
-            "",
-            &shared_editor(|_| {}),
-            Vec::new(),
-            (40, 24),
-        );
+        crate::repl::paint_prompt(&out.content, "", &shared_editor(|_| {}), Vec::new());
         let bytes = sink.bytes();
         assert!(
             String::from_utf8_lossy(&bytes).contains("\x1b[?25l"),
@@ -2737,7 +2760,7 @@ mod tests {
         let (out, _reasoning) = capturing_output(40);
         let sink = record_bytes(&out);
         let editor = shared_editor(|e| e.set("hi"));
-        crate::repl::paint_prompt(&out.content, "", &editor, Vec::new(), (40, 24));
+        crate::repl::paint_prompt(&out.content, "", &editor, Vec::new());
         let text = String::from_utf8_lossy(&sink.bytes()).into_owned();
         assert!(
             text.contains("\x1b[?25h"),

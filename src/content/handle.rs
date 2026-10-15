@@ -573,7 +573,6 @@ impl Content {
         let write = ContentWrite {
             bytes: buf,
             rows,
-            width,
             // The chain is the screen's path: every block it produced is
             // main-stream content. The meta route hands off beside this
             // one, raw — `commit_reasoning`.
@@ -1270,12 +1269,10 @@ impl Content {
             .reasoning_on_stderr
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            let width = self.width();
             let mut mgr = self.manager.lock().unwrap();
             mgr.render_content(ContentWrite {
                 bytes,
                 rows: 0,
-                width,
                 stream: crate::termio::Stream::Meta,
             });
         } else {

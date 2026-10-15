@@ -42,8 +42,6 @@ async fn main() {
     // the watched geometry, read fresh per paint — the same watch
     // `ConsoleOutput`'s answer came from, so the probe composes exactly
     // what it did before.
-    let content = out.content();
-    let dims = || content.frame_size();
 
     let mut bridge = ConfirmBridge::new();
     let tool = msg
@@ -66,7 +64,7 @@ async fn main() {
         return;
     };
     let mut confirm = picocode::confirm::ConfirmPrompt::new(req, bridge.port.approvals().clone());
-    picocode::confirm::paint(&confirm, dims(), &out.hub());
+    picocode::confirm::paint(&confirm, &out.hub());
 
     // The dialog no longer takes the reader gate — that was the whole reason it
     // had to be a blocking loop. Sampled while it is up, so the test can assert
@@ -91,11 +89,11 @@ async fn main() {
                     if let Some(decided) = confirm.handle_key(KeyEvent::new(code, modifiers)) {
                         break decided;
                     }
-                    picocode::confirm::paint(&confirm, dims(), &out.hub());
+                    picocode::confirm::paint(&confirm, &out.hub());
                 }
             }
             Ok(Event::Resize(_, _)) => {
-                picocode::confirm::paint(&confirm, dims(), &out.hub());
+                picocode::confirm::paint(&confirm, &out.hub());
             }
             Ok(_) => {}
             Err(_) => break ConfirmDecision::Deny,
@@ -113,10 +111,7 @@ async fn main() {
         || {
             // The empty stack: with no compose head the area is nothing, and
             // applying it is the erase (dropping the element is the clear).
-            out.hub()
-                .lock()
-                .unwrap()
-                .render(Vec::new(), ApplyPolicy::Frame, dims());
+            out.hub().lock().unwrap().render(Vec::new());
         },
         confirm.subject(),
         answered,

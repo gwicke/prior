@@ -239,14 +239,7 @@ impl CodeAgent {
         // by the submit, so its `eval` is a passive derive with nothing to
         // dispatch and the action it returns is empty by construction.
         if let (Some(sess), Some(hist)) = (it_session.as_deref_mut(), it_history.as_deref_mut()) {
-            let _ = sess
-                .settle(
-                    self.content.as_ref(),
-                    it_label,
-                    hist,
-                    self.content.frame_size(),
-                )
-                .await;
+            let _ = sess.settle(self.content.as_ref(), it_label, hist).await;
         }
         loop {
             // Prose's wake-up for this iteration, resolved *before* the select
@@ -592,7 +585,7 @@ impl CodeAgent {
                 } => {
                     if let Some(sess) = it_session.as_deref_mut() {
                         sess.open_confirm(req, self.confirm_approvals.clone());
-                        sess.paint(self.content.as_ref(), it_label, self.content.frame_size());
+                        sess.paint(self.content.as_ref(), it_label);
                     }
                 }
 
@@ -644,9 +637,8 @@ impl CodeAgent {
                     if let (Some(sess), Some(history)) =
                         (it_session.as_deref_mut(), it_history.as_deref_mut())
                     {
-                        let dims = self.content.frame_size();
                         let _ = sess
-                            .settle(self.content.as_ref(), it_label, history, dims)
+                            .settle(self.content.as_ref(), it_label, history)
                             .await;
                     }
                 }

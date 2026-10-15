@@ -84,7 +84,6 @@ pub(crate) async fn dispatch_in_turn_event(
     let (Some(ev), Some(sess), Some(history)) = (ev, sess, history) else {
         return InTurnDispatch::Ignored;
     };
-    let dims = content.frame_size();
     match ev {
         InputEvent::Key(key) => {
             // The confirm is **modal**, and this is the top of the `Esc` ladder:
@@ -101,14 +100,14 @@ pub(crate) async fn dispatch_in_turn_event(
                         sess.clear_confirm();
                         crate::confirm::resolve(
                             content,
-                            || sess.paint(content, label, dims),
+                            || sess.paint(content, label),
                             &subject,
                             decision,
                         );
                         InTurnDispatch::Handled
                     }
                     None => {
-                        sess.paint(content, label, dims);
+                        sess.paint(content, label);
                         InTurnDispatch::Handled
                     }
                 };
@@ -129,9 +128,10 @@ pub(crate) async fn dispatch_in_turn_event(
             }
             let opts_len = sess.opts_len();
             // The frame's budget, from the one place a ratio resolves to a row
-            // count (4h-b): `dims` is the height the settle and paint below
-            // already commit to, so the grant and the frame cannot disagree.
-            let budget = content.manager.lock().unwrap().budget(dims.1);
+            // count (4h-b): `budget_now` reads the watched height — the same
+            // geometry the settle and paint below compose at — so the grant
+            // and the frame cannot disagree.
+            let budget = content.manager.lock().unwrap().budget_now();
             match sess.handle_key(key, opts_len, budget, label, history) {
                 crate::repl::KeyOutcome::RunEditor => {
                     sess.open_editor(content);
@@ -142,7 +142,7 @@ pub(crate) async fn dispatch_in_turn_event(
             // as it does at the prompt. Its `MenuDone` is dropped: applying a
             // command needs the convergence machinery that runs *after*
             // `prompt()` returns, which is still post-turn only (U4.3+).
-            let _ = sess.settle(content, label, history, dims).await;
+            let _ = sess.settle(content, label, history).await;
             InTurnDispatch::Handled
         }
         InputEvent::Paste(text) => {
@@ -153,7 +153,7 @@ pub(crate) async fn dispatch_in_turn_event(
                 return InTurnDispatch::Ignored;
             }
             sess.paste(&text);
-            let _ = sess.settle(content, label, history, dims).await;
+            let _ = sess.settle(content, label, history).await;
             InTurnDispatch::Handled
         }
         _ => InTurnDispatch::Ignored,
@@ -289,10 +289,9 @@ pub(crate) async fn cancellable_sleep_pumped(
                 }
             } => {
                 if let Some(p) = pump.as_mut() {
-                    let dims = p.content.frame_size();
                     let _ = p
                         .session
-                        .settle(p.content, p.label, &mut *p.history, dims)
+                        .settle(p.content, p.label, &mut *p.history)
                         .await;
                 }
             }
