@@ -32,6 +32,7 @@ pub mod view;
 pub mod wrap;
 
 // Re-export public types for convenience.
+pub use elements::{ElementSet, Update};
 pub use fields::ColumnDef;
 pub use menu::{SlashDotHandle, SlashDotMenu, SlashDotMenuNode};
 pub use node_entry::{HostKey, RowRef};

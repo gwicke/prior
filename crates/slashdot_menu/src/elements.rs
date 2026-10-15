@@ -11,9 +11,14 @@
 //! hand-built plan (the confirm dialog, tests) mints elements over its
 //! pre-laid-out rows instead; both paths paint the same chrome.
 //!
-//! This module is the destination `ui::overlay_elements*` moves into (step
-//! 4h-d): nothing here sees a painted row before the width is known, so
-//! there is no compose-width `PaintedSection` snapshot on either path.
+//! Nothing here sees a painted row before the width is known, so there is
+//! no compose-width `PaintedSection` snapshot on either path.
+//!
+//! Since 4h-e a host that keeps a menu open mints an [`ElementSet`] — the
+//! elements plus the [`Selection`] figures a keystroke moves — and a cursor
+//! move updates the figures **in place** through the shared handle, without
+//! re-minting (design §RenderElement stack: "a menu open constructs its
+//! elements; a keystroke moves the selection through shared handles").
 //!
 //! [`window_keeps`] rides beside [`window_heights`]: pure windowing, and
 //! its only user is the rows element below.
@@ -91,6 +96,19 @@ pub(crate) fn window_keeps(heights: &[usize], focus: usize, budget: usize) -> (u
     }
 }
 
+// --- the shared selection ---------------------------------------------------
+
+/// The figures a keystroke moves in place: the cursor's row and the detail
+/// lines above the table (the node's `header()` output tracks the focused
+/// row, so it moves with the cursor too). Shared between the host, which
+/// writes it on each engine plan, and the elements, which read it inside
+/// `render` — a selection move is a write, not a rebuild (step 4h-e).
+#[derive(Default)]
+struct Selection {
+    selected: Option<usize>,
+    detail: Vec<LogicalLine>,
+}
+
 // --- the three section elements ----------------------------------------------
 
 /// The node's `header()` output: context, above the table. Elastic (`min` 0),
@@ -102,21 +120,25 @@ pub(crate) fn window_keeps(heights: &[usize], focus: usize, budget: usize) -> (u
 /// the bottom: a detail line too wide for the terminal was split when
 /// painted, and it is kept or dropped whole rather than cut mid-line.
 struct DetailItem {
-    detail: Vec<LogicalLine>,
+    selection: Arc<Mutex<Selection>>,
 }
 
 impl RenderElement for DetailItem {
     fn height(&self, width: usize) -> RowAsk {
         // Painted at this width to measure: a line wider than the terminal
         // splits, and the ask is the rows it actually occupies here.
-        RowAsk::fixed(0, paint_detail(&self.detail, width).height())
+        let sel = self.selection.lock().unwrap();
+        RowAsk::fixed(0, paint_detail(&sel.detail, width).height())
     }
 
     fn render(&self, h: usize, w: usize) -> Rendered {
         if h == 0 {
             return Rendered::default();
         }
-        let section = paint_detail(&self.detail, w);
+        let section = {
+            let sel = self.selection.lock().unwrap();
+            paint_detail(&sel.detail, w)
+        };
         // Whole logical lines only: a line's painted sub-rows are kept or
         // dropped together, so the cut never lands inside one.
         let mut used = 0usize;
@@ -201,10 +223,10 @@ enum RowsSource {
 
 /// The scrollable rows, held **unpainted** and windowed at render time.
 ///
-/// `selected` is the cursor's *logical* row index — it is what this element
-/// windows around, so there is no painted-index arithmetic anywhere: the
-/// selection is identified exactly the way the engine identified it, and
-/// nothing painted above it can move it.
+/// The cursor's *logical* row index (in the shared [`Selection`]) is what
+/// this element windows around, so there is no painted-index arithmetic
+/// anywhere: the selection is identified exactly the way the engine
+/// identified it, and nothing painted above it can move it.
 ///
 /// Holding unpainted rows is what makes painting O(window) rather than
 /// O(table): a 1000-row menu paints the ~14 rows actually on screen instead
@@ -213,7 +235,7 @@ enum RowsSource {
 /// repaints the window without re-laying-out the table.
 struct RowsItem {
     source: RowsSource,
-    selected: Option<usize>,
+    selection: Arc<Mutex<Selection>>,
     /// The floor the host pinned: a menu's `1`, a dialog's option count —
     /// `allocate` serves every `must` before any `might`, so this holds
     /// under pressure (with the caveat that below the summed `must`s
@@ -254,6 +276,9 @@ impl RenderElement for RowsItem {
         if h == 0 {
             return Rendered::default();
         }
+        // Copied out of the shared handle first: the figure is `Copy`, and
+        // taking it here means the selection lock is never held together /// with the table layout's below.
+        let selected = self.selection.lock().unwrap().selected;
         match &self.source {
             RowsSource::View { lines, view } => {
                 let mut guard = lines.lock().unwrap();
@@ -261,7 +286,7 @@ impl RenderElement for RowsItem {
                 if lines.is_empty() {
                     return Rendered::default();
                 }
-                let selected = self.selected.filter(|s| *s < lines.len());
+                let selected = selected.filter(|s| *s < lines.len());
                 // Window on the heights the layout wrote — painting cannot
                 // make a row taller (the layout width *is* the painter's
                 // content width), so this window is the painted window.
@@ -303,7 +328,7 @@ impl RenderElement for RowsItem {
                 if lines.is_empty() {
                     return Rendered::default();
                 }
-                let selected = self.selected.filter(|s| *s < lines.len());
+                let selected = selected.filter(|s| *s < lines.len());
                 // Window on the heights the engine wrote (embedded `\n`),
                 // paint only that window, then re-window on the *painted*
                 // heights: a pre-laid-out row can be wider than this width
@@ -355,6 +380,110 @@ impl RenderElement for RowsItem {
 
 // --- the mint ----------------------------------------------------------------
 
+/// What an [`ElementSet`] was minted over — the identity
+/// [`ElementSet::update`] compares a fresh plan against. An engine plan's
+/// identity is its view handle (a filter or a drill mints a new one; a
+/// cursor move hands back the same); a hand-built plan's is its rows
+/// pointer, plus the figures baked beside them.
+enum Origin {
+    View(Arc<ViewRows>),
+    Lines {
+        rows: Arc<Vec<LogicalLine>>,
+        active: Vec<usize>,
+        header: Option<LogicalLine>,
+    },
+}
+
+/// What [`ElementSet::update`] did with a fresh plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Update {
+    /// The rows underneath were the ones the set was minted from: only /// the selection figures moved, through the shared handle — the *same* /// elements paint the new cursor.
+    Moved,
+    /// The rows changed (filter, new plan): the set re-minted itself /// from the plan.
+    Rebuilt,
+}
+
+/// One open panel's element set: the frame elements, minted once, plus the
+/// shared [`Selection`] their `render`s read.
+///
+/// Constructed by [`RenderPlan::element_set`] when a host keeps the panel
+/// open across keystrokes. The active (`*`) flags are *not* in the shared
+/// state: a view-backed rows element resolves them through the view's
+/// iterator at paint time, and a host-built (pre-laid-out rows) set is
+/// one-shot — [`RenderPlan::elements`] drops the state.
+pub struct ElementSet {
+    elements: Vec<Element>,
+    selection: Arc<Mutex<Selection>>,
+    /// The plan this set paints: the mint's original, refreshed by every /// [`Self::update`]. The host's cursor math (bounds, paging) reads /// it here, so dispatch and paint cannot disagree.
+    plan: RenderPlan,
+    /// The rows element was minted over this — the identity `update`
+    /// compares.
+    origin: Origin,
+    /// Whether a detail element was minted: the set's shape is fixed at
+    /// mint, so a plan that grows or drops its detail section is a
+    /// rebuild, not a figure move.
+    had_detail: bool,
+    /// The floor a rebuild mints with (see [`RenderPlan::element_set`]).
+    row_min: usize,
+}
+
+impl ElementSet {
+    /// The elements to append to the frame stack — clones of the minted
+    /// set (shared boxes), so the set outlives any one composition.
+    pub fn elements(&self) -> Vec<Element> {
+        self.elements.clone()
+    }
+
+    /// The engine's plan behind this set — what host cursor math reads.
+    pub fn plan(&self) -> &RenderPlan {
+        &self.plan
+    }
+
+    /// A fresh plan for this panel: the selection figures flow to the
+    /// shared handle in place when the rows underneath are the ones this
+    /// set was minted from — a cursor keystroke, no rebuild; rows that
+    /// actually changed (filter, new plan) re-mint the set.
+    ///
+    /// A width change is *not* a rebuild: the elements lay themselves out /// at the render width (4h-d), so the same elements re-wrap for the /// new width — only the host's laid-out snapshot ([`RenderPlan::rows`]) /// is refreshed here for cursor math.
+    pub fn update(&mut self, plan: &RenderPlan) -> Update {
+        if self.same_panel(plan) {
+            let mut sel = self.selection.lock().unwrap();
+            sel.selected = plan.selected;
+            sel.detail = plan.detail.clone();
+            drop(sel);
+            self.plan = plan.clone();
+            Update::Moved
+        } else {
+            *self = plan.element_set(self.row_min);
+            Update::Rebuilt
+        }
+    }
+
+    /// Same panel underneath: the same rows identity (see [`Origin`]), and /// the same *sections* — the detail element is minted only when the /// plan has detail lines, so a section appearing or vanishing is a /// rebuild too, not a figure move.
+    fn same_panel(&self, plan: &RenderPlan) -> bool {
+        let same_sections = self.had_detail == !plan.detail.is_empty();
+        same_sections
+            && match (&self.origin, &plan.view) {
+                // Engine plans: the same view handle means the same rows, /// the same `*` flags and the same columns — the elements /// re-lay-out from it at the render width.
+                (Origin::View(v), Some(pv)) => Arc::ptr_eq(v, pv),
+                // Hand-built plans: the same laid-out rows *and* the /// figures baked beside them.
+                (
+                    Origin::Lines {
+                        rows,
+                        active,
+                        header,
+                    },
+                    None,
+                ) => {
+                    Arc::ptr_eq(rows, &plan.rows)
+                        && *active == plan.active_rows
+                        && *header == plan.table_header
+                }
+                _ => false,
+            }
+    }
+}
+
 impl RenderPlan {
     /// The frame elements for this panel, in paint order: the node's
     /// detail, the table header, the scrollable rows.
@@ -371,13 +500,25 @@ impl RenderPlan {
     /// because `allocate` will happily starve a dialog down to nothing and
     /// a consent prompt with no visible options is not one.
     pub fn elements(&self, row_min: usize) -> Vec<Element> {
+        self.element_set(row_min).elements
+    }
+
+    /// The element set for an open panel: the elements [`Self::elements`]
+    /// returns, plus the shared selection handle a keystroke moves in
+    /// place (step 4h-e).
+    pub fn element_set(&self, row_min: usize) -> ElementSet {
+        let selection = Arc::new(Mutex::new(Selection {
+            selected: self.selected,
+            detail: self.detail.clone(),
+        }));
         let mut els = Vec::with_capacity(3);
-        if !self.detail.is_empty() {
+        let had_detail = !self.detail.is_empty();
+        if had_detail {
             els.push(Element::new(DetailItem {
-                detail: self.detail.clone(),
+                selection: Arc::clone(&selection),
             }));
         }
-        match &self.view {
+        let origin = match &self.view {
             Some(view) => {
                 let lines = Arc::new(Mutex::new(TableLines::new(
                     Arc::clone(view),
@@ -394,13 +535,15 @@ impl RenderPlan {
                             lines,
                             view: Arc::clone(view),
                         },
-                        selected: self.selected,
+                        selection: Arc::clone(&selection),
                         floor: row_min,
                     }));
                 }
+                Origin::View(Arc::clone(view))
             }
             None => {
-                if let Some(th) = &self.table_header {
+                let header = self.table_header.clone();
+                if let Some(th) = &header {
                     els.push(Element::new(HeaderItem {
                         source: HeaderSource::Line(Some(th.clone())),
                     }));
@@ -411,13 +554,25 @@ impl RenderPlan {
                             lines: Arc::clone(&self.rows),
                             active: self.active_rows.clone(),
                         },
-                        selected: self.selected,
+                        selection: Arc::clone(&selection),
                         floor: row_min,
                     }));
                 }
+                Origin::Lines {
+                    rows: Arc::clone(&self.rows),
+                    active: self.active_rows.clone(),
+                    header,
+                }
             }
+        };
+        ElementSet {
+            elements: els,
+            selection,
+            plan: self.clone(),
+            origin,
+            had_detail,
+            row_min,
         }
-        els
     }
 }
 
@@ -800,5 +955,151 @@ mod tests {
         // At a wide enough width there is no wrap: 2 rows.
         let ext = els.last().unwrap().ask(200).resolve(24);
         assert_eq!(ext.might, 2, "unwrapped: one row per logical row");
+    }
+
+    // --- ElementSet::update (step 4h-e) ------------------------------------
+
+    /// A cursor keystroke moves the selection figures through the shared /// handle: the *same* elements (clones taken before the move) paint /// the new cursor and the new detail — no rebuild.
+    #[test]
+    fn a_cursor_move_updates_the_set_in_place() {
+        let view = view_rows(vec![Row::new("a"), Row::new("b"), Row::new("c")], vec![]);
+        // Mint with detail already present: the *sections* are fixed at /// mint, so a later plan must keep the same shape to move in place.
+        let open = RenderPlan {
+            selected: Some(0),
+            detail: vec![LogicalLine::new("focused row: a")],
+            view: Some(view.clone()),
+            ..Default::default()
+        };
+        let mut set = open.element_set(1);
+        // The elements every paint clones out — captured *before* the move.
+        let els = set.elements();
+        let asks = asks_of(&els, 40);
+        let heights = allocate(&asks, 24, live_budget(24));
+        let f = render(&els, &heights, 40);
+        let marked = (0..f.height())
+            .find(|i| f.row(*i).contains('>'))
+            .expect("a cursor row painted");
+        assert!(
+            plain(f.row(marked)).ends_with('a'),
+            "before the move: {:?}",
+            f.row(marked)
+        );
+
+        // The engine's next plan: same view, cursor moved, detail refreshed.
+        let moved = RenderPlan {
+            selected: Some(2),
+            detail: vec![LogicalLine::new("focused row: c")],
+            view: Some(view),
+            ..Default::default()
+        };
+        assert_eq!(set.update(&moved), Update::Moved);
+        assert_eq!(set.plan().selected, Some(2), "host math sees the move");
+
+        // The elements captured before the move paint the *new* selection — /// they share the handle, nothing was rebuilt.
+        let f = render(&els, &heights, 40);
+        let marked = (0..f.height())
+            .find(|i| f.row(*i).contains('>'))
+            .expect("a cursor row painted");
+        assert!(
+            plain(f.row(marked)).ends_with('c'),
+            "after the move: {:?}",
+            f.row(marked)
+        );
+        assert!(
+            f.row(0).contains("focused row: c"),
+            "detail flowed to the handle: {:?}",
+            f.row(0)
+        );
+    }
+
+    /// Rows that actually changed (a filter's new view) rebuild the set: /// the fresh plan's rows are painted, and the old element clones keep /// their old rows — the handle was not silently re-pointed.
+    #[test]
+    fn rows_that_change_rebuild_the_set() {
+        let view = view_rows(vec![Row::new("a"), Row::new("b")], vec![]);
+        let mut set = view_plan(view, Some(0)).element_set(1);
+        let stale = set.elements(); // clones of the pre-filter elements
+
+        let filtered = view_rows(vec![Row::new("b")], vec![]);
+        let plan = view_plan(filtered, Some(0));
+        assert_eq!(set.update(&plan), Update::Rebuilt);
+
+        let fresh = set.elements();
+        let painted = |els: &[Element]| {
+            let asks = asks_of(els, 40);
+            let heights = allocate(&asks, 24, live_budget(24));
+            let f = render(els, &heights, 40);
+            (0..f.height()).map(|i| plain(f.row(i))).collect::<Vec<_>>()
+        };
+        // The fresh set shows only the filtered rows… (painted rows carry /// their marker, so match on content.)
+        let rows = painted(&fresh);
+        assert!(
+            !rows.iter().any(|r| r.contains("a")),
+            "the filter dropped a: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.contains('b')), "kept b: {rows:?}");
+        // …and the stale clones are detached, still showing the old panel: /// proof the rebuild minted new elements rather than re-pointing /// the old ones.
+        let rows = painted(&stale);
+        assert!(
+            rows.iter().any(|r| r.contains('a')),
+            "old clones keep old rows: {rows:?}"
+        );
+    }
+
+    /// A detail section *appearing* is a rebuild, not a figure move: the /// set was minted without a DetailItem, so an [ERROR] line arriving /// on an unchanged view needs an element to show it.
+    #[test]
+    fn a_detail_section_appearing_rebuilds_the_set() {
+        let view = view_rows(vec![Row::new("a")], vec![]);
+        let no_detail = RenderPlan {
+            selected: Some(0),
+            detail: Vec::new(),
+            view: Some(view.clone()),
+            ..Default::default()
+        };
+        let mut set = no_detail.element_set(1);
+        let with_error = RenderPlan {
+            selected: Some(0),
+            detail: vec![LogicalLine::new("[ERROR]: boom")],
+            view: Some(view),
+            ..Default::default()
+        };
+        assert_eq!(set.update(&with_error), Update::Rebuilt);
+
+        let fresh = set.elements();
+        let asks = asks_of(&fresh, 40);
+        let heights = allocate(&asks, 24, live_budget(24));
+        let f = render(&fresh, &heights, 40);
+        assert!(
+            f.row(0).contains("[ERROR]: boom"),
+            "the rebuilt set paints the error: {:?}",
+            f.row(0)
+        );
+    }
+
+    /// A hand-built (pre-laid-out rows) set moves its selection in place /// too — the lines path shares the handle exactly as the view path /// does.
+    #[test]
+    fn a_hand_built_set_moves_its_selection_in_place() {
+        let rows: Vec<String> = (0..5).map(|i| format!("item {i}")).collect();
+        let rowrefs: Vec<&str> = rows.iter().map(|s| s.as_str()).collect();
+        let plan = lines_plan(None, &[], &rowrefs, Some(0));
+        let mut set = plan.element_set(1);
+        let els = set.elements();
+
+        let moved = RenderPlan {
+            selected: Some(3),
+            ..plan.clone()
+        };
+        assert_eq!(set.update(&moved), Update::Moved);
+
+        let asks = asks_of(&els, 40);
+        let heights = allocate(&asks, 24, live_budget(24));
+        let f = render(&els, &heights, 40);
+        let marked = (0..f.height())
+            .find(|i| f.row(*i).contains('>'))
+            .expect("a cursor row painted");
+        assert!(
+            plain(f.row(marked)).ends_with("item 3"),
+            "the pre-move clones paint the new cursor: {:?}",
+            f.row(marked)
+        );
     }
 }
