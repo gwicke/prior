@@ -175,14 +175,17 @@ pub struct Extent {
 ///   `LinesItem`, which have no opinion to express, live here;
 /// - each element holds whatever *it* needs to hold — an `Rc` of its rows, a
 ///   `Layout`, anything — and the frame layer neither knows nor copies it.
+#[derive(Clone)]
 pub struct Element {
     /// The element's own squeeze policy and painting, told what it got.
     ///
-    /// `Box` rather than `Rc`: an element is owned by exactly one composition
-    /// and is only ever moved between them, so the shared ownership would buy
-    /// nothing. `Send + Sync` is not optional — `Output: Send + Sync` and
-    /// `draw: Mutex<DrawCache>` put the composition behind both.
-    render: Box<dyn RenderElement + Send + Sync>,
+    /// `Arc`, not `Box`: since 4h-e an element set is minted once by the
+    /// panel that owns it (an open menu) and *cloned into* every
+    /// composition — the paint moves a copy, the set stays live and is
+    /// updated in place. The shared ownership is the point. `Send + Sync`
+    /// is not optional — `Output: Send + Sync` and `draw: Mutex<DrawCache>`
+    /// put the composition behind both.
+    render: Arc<dyn RenderElement + Send + Sync>,
 }
 
 /// Height in, rows out (plan §3.2.3, design §Render).
@@ -248,7 +251,7 @@ impl Element {
     /// `RenderElement` impl plus a constructor here — no `match` anywhere.
     pub fn new(render: impl RenderElement + Send + Sync + 'static) -> Self {
         Element {
-            render: Box::new(render),
+            render: Arc::new(render),
         }
     }
 
