@@ -83,6 +83,8 @@ and link a doc/ and/or commit hash
     (`08ed747`+`be0e7b4`, the editor goes behind `Arc<Mutex<LineEditor>>` and the input
     element pulls it; `Layout` comes home to repl), 4h-g (`ac92095`+`72a3ac7`+`fb3a793`,
     the flip: `render` composes from the configured stack, membership reconfigured on
-    transitions; the bar is always present and pulls usage live); 4h-h next (confirm dialog
-    selection state + its place in the configured stack, out-of-crate callers, cleanup)
+    transitions; the bar is always present and pulls usage live); 4h-h (`243890e`, confirm dialog
+    selection state + its place in the configured stack, out-of-crate callers, cleanup);
+    4h-g4 next (the bar pulls every fact live: identity + model fields off `AppState`, one shared
+    estimate fallback read by the bar and `/stat`)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)

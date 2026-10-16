@@ -83,13 +83,21 @@ Compose UI chrome into a RenderElement stack. Same level as Content.
   editor / overlay cursor in place and the next render() paints it.
 - The bar is **always present** — no on/off gate (the old `is_off`/`set_status` gate was an
   artifact of push, guarding a stale/absent pushed row; with pull the bar always renders itself).
-  Its held state is **raw data, formatted by the bar**: session name, first message, the model
-  fields (provider/model/thinking/context). It is a **live pull, not a snapshot** — render() reads
-  the agent's shared `usage` mutex (`Arc<Mutex<SessionUsage>>`) for the context figure, so a value
-  the agent updates mid-turn (context tokens after each tool-call round) is current at the very
-  next render. render() runs the shaping (name fallback, field list, drop order) and the fit there
-  — pushes store facts, never formatted text. `/stat` reads the same shared usage live, so it is
-  current mid-turn too (impl doc 4h-g part 2).
+  The bar **holds stores, not a snapshot**, and formats them at render (name fallback, field list,
+  drop order, fit). Its facts come from three live sources read at render:
+  - the model fields (provider/model/thinking/context_limit) off `AppState` — the same sync
+    accessors `/stat` uses, so a mid-turn `/reasoning` or `/model` commit (which lands on
+    `AppState` immediately) shows at the very next paint;
+  - identity (session name / first message) off `AppState`, written by the loop's cycle build;
+  - the context figure off the agent's shared `usage` mutex (`Arc<Mutex<SessionUsage>>`) — the
+    provider's last-reported input tokens, so the agent's per-tool-call-round update is current at
+    the next render.
+
+  **The context figure has one fallback, shared by the bar and `/stat`:** the estimate. It lives in
+  the usage store as `estimated_input_tokens`, and the figure read is
+  `last_input_tokens if > 0 else estimated_input_tokens` — the estimate stands only until the first
+  completion reports. `/stat` calls the same read, so it is current mid-turn and needs no
+  `AppState` context snapshot (impl doc 4h-g / 4h-g4).
 - Confirmations are repl dialogs (session state). Batch / one-shot runs have no dialog: gated tools
   there require yolo mode (the sandbox is mandatory).
 
