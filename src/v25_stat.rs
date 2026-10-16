@@ -41,14 +41,19 @@ impl SlashDotNode for StatNode {
 
         // Read live off the agent's usage store (4h-g part 2) rather than the
         // loop's per-cycle snapshot, so a `/stat` opened mid-turn reports the
-        // most recent completion — the same source the status bar pulls. No
-        // agent yet means no completions, so the default store is the honest
-        // answer.
+        // most recent completion — the same source the status bar pulls (both
+        // reach it through content's handle). No agent yet means no completions,
+        // so the default store is the honest answer.
         let usage = self
             .app_state
+            .content()
             .usage_handle()
             .map(|u| *u.lock().unwrap())
             .unwrap_or_default();
+        // The estimate line's figure, off the same one read the bar uses
+        // (4h-g4 part 3): the provider's count when one has reported, else the
+        // recorded estimate.
+        let context_figure = usage.context_figure();
 
         let session_info = {
             let session_id = self.app_state.current_session_id();
@@ -78,7 +83,7 @@ impl SlashDotNode for StatNode {
             &model,
             usage,
             session_info,
-            self.app_state.context_tokens(),
+            context_figure,
             self.app_state
                 .with_settings(|s| s.model_settings(&format!("{provider}:{model}")).cloned())
                 .as_ref(),
@@ -307,7 +312,16 @@ mod tests {
     fn stat_header_shows_estimated_context_tokens() {
         let app_state = test_app_state();
         app_state.set_model("openai:gpt-4o");
-        app_state.update_cycle_view(String::new(), 42_000, Arc::new(Vec::new()), None);
+        // The estimate now lives on the usage store (4h-g4 part 3), read off
+        // the same handle the bar pulls; seed it as an estimate, not a report.
+        app_state
+            .content()
+            .set_usage(Some(Arc::new(std::sync::Mutex::new(
+                crate::agent::SessionUsage {
+                    estimated_input_tokens: 42_000,
+                    ..Default::default()
+                },
+            ))));
         let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = futures::executor::block_on(handle.eval_prompt("stat ", HostKey::None, 80));

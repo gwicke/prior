@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::agent::{CodeAgent, SessionUsage};
+use crate::agent::CodeAgent;
 use crate::session::repo::JsonlSessionRepo;
 use crate::session::{Session, SessionTreeNode};
 use crate::settings::{SettingKey, SettingsStore};
@@ -172,8 +172,15 @@ pub struct State {
     /// Session entry tree snapshot (source of truth for `/tree`).
     pub(crate) raw_tree: Arc<Vec<SessionTreeNode>>,
     pub(crate) leaf_id: Option<String>,
-    /// Estimated tokens of the next-turn context (`/stat`).
-    pub(crate) context_tokens: u64,
+    /// The session's user-assigned name, or `None` when unnamed — the status
+    /// bar's leading label (4h-g4 part 2). Written once per cycle by the loop
+    /// off the session index; the bar reads it at render rather than a
+    /// per-turn push.
+    pub(crate) session_name: Option<String>,
+    /// The session's opening user message — the bar's label when the session
+    /// has no name. Written per cycle off the branch, and filled in by the
+    /// submit path on the first prompt (before the message is persisted).
+    pub(crate) session_first_message: Option<String>,
     /// Declarative control targets (see [`ControlConfig`]).
     pub(crate) control: ControlConfig,
     /// One-shot prompt prefill (resume's `/model …` model decision, the
@@ -281,7 +288,8 @@ impl AppState {
                 recent_models: Vec::new(),
                 raw_tree: Arc::new(Vec::new()),
                 leaf_id: None,
-                context_tokens: 0,
+                session_name: None,
+                session_first_message: None,
                 control: ControlConfig::default(),
                 prefill: None,
                 parked_keys: VecDeque::new(),
@@ -613,15 +621,42 @@ impl AppState {
     pub fn update_cycle_view(
         &self,
         current_id: String,
-        context_tokens: u64,
+        session_name: Option<String>,
+        session_first_message: Option<String>,
         tree: Arc<Vec<SessionTreeNode>>,
         leaf_id: Option<String>,
     ) {
         let mut st = self.state.lock();
         st.session.current_id = current_id;
-        st.context_tokens = context_tokens;
+        st.session_name = session_name;
+        st.session_first_message = session_first_message;
         st.raw_tree = tree;
         st.leaf_id = leaf_id;
+    }
+
+    /// The status bar's leading label (4h-g4 part 2): the session name, else
+    /// its opening message. Both come off the per-cycle write
+    /// ([`Self::update_cycle_view`]) except on the first prompt, where the
+    /// branch is still empty and [`Self::set_first_message_if_unset`] fills the
+    /// message in at submit.
+    pub fn bar_identity(&self) -> (Option<String>, Option<String>) {
+        let st = self.state.lock();
+        (st.session_name.clone(), st.session_first_message.clone())
+    }
+
+    /// Fill the bar's message label when the cycle view has none (4h-g4 part
+    /// 2): on the very first prompt the branch is not yet persisted, so the
+    /// loop's cycle write leaves it empty. The submit path knows the text it
+    /// is about to send, so it stands in — the `first_user_text(prior).or(input)`
+    /// fallback the turn used to carry, relocated to where the input is.
+    pub fn set_first_message_if_unset(&self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let mut st = self.state.lock();
+        if st.session_first_message.is_none() {
+            st.session_first_message = Some(text.to_string());
+        }
     }
 
     pub fn raw_tree(&self) -> Arc<Vec<SessionTreeNode>> {
@@ -641,22 +676,6 @@ impl AppState {
     /// Single-field leaf write (same caveat as [`set_raw_tree`]).
     pub fn set_leaf_id(&self, leaf_id: Option<String>) {
         self.state.lock().leaf_id = leaf_id;
-    }
-
-    pub fn context_tokens(&self) -> u64 {
-        self.state.lock().context_tokens
-    }
-
-    /// The running agent's live usage handle (4h-g part 2), or `None` while no
-    /// agent is up. Cloned out so the content bar reads the turn's in-place
-    /// writes at every paint rather than a snapshot taken at turn start.
-    pub fn usage_handle(&self) -> Option<Arc<std::sync::Mutex<SessionUsage>>> {
-        self.state
-            .lock()
-            .session
-            .agent
-            .as_ref()
-            .map(|a| a.usage_handle())
     }
 
     // --- recent models (loop is the sole writer) ---
@@ -904,12 +923,13 @@ mod tests {
         let app_state = AppState::for_test(test_settings());
         app_state.update_cycle_view(
             "sess-1".into(),
-            42_000,
+            Some("work".into()),
+            None,
             Arc::new(vec![]),
             Some("leaf-1".into()),
         );
         assert_eq!(app_state.current_session_id(), "sess-1");
-        assert_eq!(app_state.context_tokens(), 42_000);
+        assert_eq!(app_state.bar_identity(), (Some("work".to_string()), None));
         assert_eq!(app_state.leaf_id().as_deref(), Some("leaf-1"));
     }
 

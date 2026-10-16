@@ -677,57 +677,19 @@ most runway to expand into separate sub-commits.
    the input element's label is not constant across a session's life, so it is threaded at the one
    moment membership is built rather than stored. The design doc should either add it or say why
    the label is not part of the membership it describes.
-  - The `estimated_ctx` → `usage.last_input_tokens` seeding (turn start, and the prompt cycle) is
-    superseded by **4h-g4**: the estimate gets a home of its own and the fallback moves into the
-    read (below).
-  - `AppState.session_usage` and `update_cycle_view`'s usage copy are gone (part 2's cleanup ran).
-    The earlier note that `context_tokens` stays for `/tree` was wrong — `/stat` is its only reader;
-    **4h-g4** removes it.
-
-  - **4h-g4 — the bar pulls every fact; the estimate fallback is shared.** *(planned)* **4h-g** left
-    two kinds of fact on the push. The model fields (provider/model/thinking/context_limit) and the
-    identity (session name / first message) still arrive via `set_status`, stamped at turn start and
-    once per cycle — so a mid-turn `/reasoning` or `/model` commit (which lands on `AppState` in
-    `settle`, pumps.rs:147) never reaches the bar; the running turn keeps its `live_params` and the
-    bar shows the old level until the turn ends. And the context figure has no fallback of its own:
-    the estimate is *seeded into* `usage.last_input_tokens` at two sites (turn.rs, repl.rs), a write
-    that impersonates a provider report. Both are one defect — the bar holds a snapshot where it
-    should hold stores.
-
-    **The model (settled here):** the bar holds three stores and assembles its `BarStatus` **value**
-    at render. (1) `AppState` — provider/model/thinking/context_limit through the existing sync
-    accessors, and identity through two new cycle-written fields. (2) the shared `usage` mutex —
-    the context figure, plus a new `estimated_input_tokens` fallback. (3) `Content.streaming`,
-    unchanged. `Content.bar`, `set_status`, and both pushes die; `BarStatus` survives only as a
-    render-time value, so the shaping tests keep working.
-
-    - **Part 1 — the model fields go live.** The bar element takes the `AppState` handle
-      (`PromptSession` already receives `&Arc<AppState>` in `new`; store it, and hand it to
-      `ui::bar::status` in `sync_stack`). Render reads provider/model (`AppState::model`/`params`),
-      thinking (`AppState::reasoning`), and `context_limit` (`resolved_context_limit`). Kills the
-      model fields in the turn-start push and in the cycle push. A mid-turn `/reasoning` or `/model`
-      commit now shows at the next paint — the staleness the **4h-g** live context pull did *not*
-      cover.
-    - **Part 2 — identity moves to `AppState`.** `update_cycle_view` carries `session_name` +
-      `first_message` (the loop computes both at cycle build, interactive.rs:1046). The turn-start
-      push's turn-1 gap (branch empty at cycle time, input not yet persisted) is closed by the loop's
-      submit path setting `first_message` to the submitted input when it is still unset — the
-      `first_user_text(prior).or(input)` fallback, relocated from turn.rs. The bar reads both from
-      `AppState`.
-    - **Part 3 — one estimate home, one fallback read.** `SessionUsage` gains
-      `estimated_input_tokens`. The two seed sites become honest estimate *writes* (an estimate is
-      recorded as an estimate; nothing impersonates a provider report). Both readers call one
-      helper — `context_figure(usage) = last_input_tokens if > 0 else estimated_input_tokens`.
-      `/stat` calls it too, so its `context_tokens` parameter (today `AppState::context_tokens`)
-      goes, and with it `AppState.context_tokens` and `update_cycle_view`'s copy.
-
-    **Gates:** the mid-turn context test (`799665f`) stays green; a mid-turn `/reasoning <level>`
-    commit changes the bar bytes at the next paint with no push; the bar shows the estimate before
-    the first completion and the provider figure after, with no seed write.
-
+  - **4h-g4 — the bar pulls every fact; the estimate fallback is shared.** *(landed)* `Content.bar`,
+    `set_status`, both pushes and `AppState.context_tokens` are gone. The bar element now holds the
+    `AppState` handle (model fields + identity, read live) beside the usage store and the streaming
+    flag, and assembles its `BarStatus` value at render (`agent::status::bar_status`, no longer a
+    store). `SessionUsage.estimated_input_tokens` is the estimate's home; the loop and the turn
+    write it as an estimate, and `SessionUsage::context_figure` (one read) is what the bar and
+    `/stat` call — `/stat` reaches it through content's usage handle. `CodeAgent.context_limit` fell
+    out dead with the turn-start push (the bar reads `AppState`'s resolved window). Git is the
+    record of what moved.
     - Follow-up: a mid-turn `/session rename` still lags one phase — `session_name` is a
       cycle-written snapshot, not a name handle. Closing it means the rename node writing `AppState`,
       which the design's "reconfigure on transitions" model does not yet require.
+
   - **4h-h — remaining callers + cleanup.** *(landed)* The confirm dialog owns its selection state
    (`ConfirmPrompt::sel`) and takes its place in the repl-configured stack (`sync_stack` extends the
    overlay with `confirm.elements()`); the out-of-crate probe reached the flipped `render` in

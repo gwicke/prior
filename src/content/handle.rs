@@ -107,18 +107,12 @@ pub struct Content {
     /// [`Self::with_content_writer`]; this keeps a violation loud, where the
     /// held lock used to make it a self-deadlock. Debug-asserted only.
     building: AtomicBool,
-    /// The status bar's raw data (step 4f-a, design §UI): pushes store *facts*
-    /// ([`crate::agent::status::BarStatus`]), never formatted text — the bar
-    /// element pulls this and runs the shaping and the fit in its own render.
-    /// Beside `streaming`, which it is shared the same way (the element
-    /// clones the `Arc`).
-    pub(crate) bar: Arc<Mutex<crate::agent::status::BarStatus>>,
     /// The running agent's token-usage store, shared with the turn that writes
-    /// it in place (4h-g part 2). The one fact the bar reads *live* at render
-    /// — `context_tokens` — comes from here, so a mid-turn completion's count
-    /// lands on the next paint with no push to keep in step. `None` until the
-    /// agent is built (and again briefly across a rebuild); the bar then shows
-    /// no context figure rather than a stale one.
+    /// it in place (4h-g part 2). The bar's context figure and `/stat`'s read
+    /// *live* here, so a mid-turn completion's count lands on the next paint
+    /// with no push to keep in step. `None` until the agent is built (and again
+    /// briefly across a rebuild); the bar then shows no context figure rather
+    /// than a stale one.
     ///
     /// `Mutex`, not a bare `Option`, because it is written after construction
     /// through a shared handle ([`Self::set_usage`]) while the bar's element
@@ -147,9 +141,7 @@ impl Content {
     /// Point the bar at a running agent's live usage store (4h-g part 2), so
     /// its context figure is read at render rather than snapshotted at turn
     /// start. Call on the transitions that change who is answering: agent
-    /// build/rebuild. The `BarStatus` identity fields keep coming from the
-    /// pushes ([`Self::set_status`]) — they come off the async session index,
-    /// which nothing here can block on.
+    /// build/rebuild.
     pub(crate) fn set_usage(&self, usage: Option<Arc<Mutex<crate::agent::SessionUsage>>>) {
         *self.usage.lock().unwrap() = usage;
     }
@@ -204,7 +196,6 @@ impl Content {
             boundary: ContentBoundary::new(),
             streaming: Arc::new(AtomicBool::new(false)),
             building: AtomicBool::new(false),
-            bar: Arc::new(Mutex::new(crate::agent::status::BarStatus::default())),
             usage: Mutex::new(None),
             tap: None,
         }
@@ -679,23 +670,6 @@ impl Content {
         *renderer = Renderer::new(answer_theme(self.caps.primary), width);
         let mut trenderer = self.thinking_renderer.lock().unwrap();
         *trenderer = Renderer::new(Theme::dimmed(), width);
-    }
-
-    /// Store the status bar's raw data (step 4f-a). The push carries facts,
-    /// never shaped text: the bar element formats whatever stands here at its
-    /// next render — shaping and fit both — so a figure refreshed mid-turn is
-    /// current at the next paint without a re-shaping push.
-    ///
-    /// One fact is no longer pushed (4h-g part 2): `context_tokens` comes off
-    /// the live usage store ([`Self::set_usage`]) at render, so this carries
-    /// the identity fields and the window, which come off the async session
-    /// index and the applied config.
-    ///
-    /// A store, not a write: nothing reaches the sink, so the tap seam has
-    /// nothing to intercept (the verbs that do reach the sink are the ones
-    /// that forward to it).
-    pub(crate) fn set_status(&self, status: crate::agent::status::BarStatus) {
-        *self.bar.lock().unwrap() = status;
     }
 
     /// Emit a segment's two flushes — the reasoning the thinking renderer

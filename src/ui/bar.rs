@@ -9,13 +9,14 @@
 //! both halves of the *drawing* (the shaping's fit and the dot) run in the
 //! element's own render, below.
 //!
-//! One fact is **live** (4h-g part 2): the context figure comes off the agent's
-//! shared usage store, written in place by the turn, so a mid-turn completion's
-//! count is current on the next paint with no push to keep in step. The rest
-//! are pushed once per cycle (and once at turn start) — they come off the async
-//! session index, which a render must not block on.
+//! Every fact is **live** (4h-g4): the model/thinking and the session identity
+//! come off `AppState`'s sync accessors at render, and the context figure off
+//! the agent's shared usage store, written in place by the turn. So a mid-turn
+//! `/reasoning` or `/model` commit, or a completion's count, is current on the
+//! next paint with no push to keep in step.
 
-use crate::agent::status::{status_text, BarStatus, StatusText};
+use crate::agent::status::{bar_status, status_text, StatusText};
+use crate::app_state::AppState;
 use crate::render::{Element, RenderElement, Rendered, RowAsk};
 use crate::row_count::{display_width_ansi, truncate_to_width};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,42 +172,44 @@ pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> St
 /// from raw data).
 ///
 /// `Element::lines` would bake `status_bar(...)`'s output into the element at
-/// compose time — and compose runs once per keystroke, while the two things
-/// the bar shows (the raw store's figures and the streaming dot) move at turn
-/// start and end. Holding the handles instead makes every draw current,
-/// including §4.5 P1's re-emit of the area under a content write. Since 4f-a
-/// the *shaping* runs here too, not at the push: the store carries facts
-/// (`agent::status::BarStatus`), and `status_text` + `status_bar` turn them
+/// compose time — and compose runs once per keystroke, while the things the
+/// bar shows (the config in force, the session identity, the context figure,
+/// the streaming dot) move at turn start and end, and mid-turn. Holding the
+/// stores instead makes every draw current, including §4.5 P1's re-emit of the
+/// area under a content write. The *shaping* runs here too, not at a push:
+/// `bar_status` assembles facts, and `status_text` + `status_bar` turn them
 /// into a row at the width being rendered for — neither half can be applied
 /// without the other, so neither left with the data.
 ///
-/// The element owns its data source rather than reaching back into the output
-/// that pushed it, which is what keeps `render` a function of `(h, term_w)`
+/// The element owns its data sources rather than reaching back into an output
+/// that pushed to it, which is what keeps `render` a function of `(h, term_w)`
 /// plus state this element holds itself — constructible with no terminal and
 /// no output in sight, so §3.1's unit-testability is intact rather than traded
 /// away.
 struct StatusItem {
-    /// The bar's **raw data** (step 4f-a, design §UI): the store is content's
-    /// (`Content::bar`), shared the same way the streaming flag is.
-    status: Arc<Mutex<BarStatus>>,
-    /// The running agent's usage store (4h-g part 2): the *live* source for
-    /// the context figure. Shared with the turn that writes it in place, so a
-    /// mid-turn completion's count is current at the next render. `None` before
-    /// the first agent is built.
+    /// The **stores** the bar reads at render (4h-g4): the model in force, the
+    /// thinking level, the context window and the session identity, all off
+    /// `AppState`'s sync accessors. Read here, not pushed, so a mid-turn
+    /// config commit (which lands on `AppState`) shows at the next paint.
+    app_state: Arc<AppState>,
+    /// The running agent's usage store: the *live* source for the context
+    /// figure. Shared with the turn that writes it in place, so a mid-turn
+    /// completion's count is current at the next render. `None` before the
+    /// first agent is built.
     usage: Option<Arc<Mutex<crate::agent::SessionUsage>>>,
     streaming: Arc<AtomicBool>,
 }
 
 impl StatusItem {
-    /// The context figure, live: the usage store's `last_input_tokens` — the
-    /// provider's own count of what it last sent, so it is the truth the moment
-    /// a completion reports it. `0` means "not known yet", which drops the
+    /// The context figure, live: `SessionUsage::context_figure` — the
+    /// provider's own count of what it last sent once one has reported, else
+    /// the loop's/turn's estimate. `0` means "not known yet", which drops the
     /// figure: that is the whole window before the first agent is built and
-    /// turn one, before any completion has reported.
+    /// before any estimate has been recorded.
     fn context_tokens(&self) -> u64 {
         self.usage
             .as_ref()
-            .and_then(|u| u.lock().ok().map(|g| g.last_input_tokens))
+            .and_then(|u| u.lock().ok().map(|g| g.context_figure()))
             .unwrap_or(0)
     }
 }
@@ -222,11 +225,11 @@ impl RenderElement for StatusItem {
         // field list, drop order) and the fit at the width being rendered
         // for. Neither can be applied without the other, so neither left with
         // the data.
-        // One fact is live (4h-g part 2): the context figure comes off the
-        // usage store at render, so a mid-turn completion lands without a push.
-        // The identity fields stay as the last push left them — they come off
-        // the async session index, which a render must not block on.
-        let status = self.status.lock().unwrap();
+        // Every fact is live (4h-g4): the raw data is assembled from the
+        // stores now — the model/thinking/window and identity off `AppState`,
+        // the context figure off the usage store — so a mid-turn config commit
+        // or completion lands without a push.
+        let status = bar_status(&self.app_state);
         let text = status_text(&status, self.context_tokens());
         // The bar is always present (4h-g part 2): no `is_off` gate. With a
         // live pull the bar always knows how to render itself, so an empty
@@ -244,16 +247,16 @@ impl RenderElement for StatusItem {
 /// The status row: `min == max == 1`, data resolved at render time.
 ///
 /// A free function rather than an inherent method on `Element`: those would
-/// live in `slashdot_tui`, and this element is the UI layer's (it holds
-/// content's bar store). Same shape as `Element::new`, whose `RenderElement`
-/// impl lives there.
+/// live in `slashdot_tui`, and this element is the UI layer's (it reads
+/// `AppState` and content's usage store). Same shape as `Element::new`, whose
+/// `RenderElement` impl lives there.
 pub(crate) fn status(
-    status: Arc<Mutex<BarStatus>>,
+    app_state: Arc<AppState>,
     usage: Option<Arc<Mutex<crate::agent::SessionUsage>>>,
     streaming: Arc<AtomicBool>,
 ) -> Element {
     Element::new(StatusItem {
-        status,
+        app_state,
         usage,
         streaming,
     })

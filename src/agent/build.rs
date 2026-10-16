@@ -331,7 +331,6 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
             CodeAgent::new(
                 rig_agent,
                 config.content,
-                config.context_limit,
                 config.tool_call_limit,
                 config.provider,
                 model,

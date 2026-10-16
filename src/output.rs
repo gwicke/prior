@@ -825,6 +825,7 @@ impl Output for ConsoleOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_state::AppState;
     // The test-local `strip_ansi` helper below needs the lead-byte table.
     use crate::ansi::utf8_len;
     // The pure pipeline the manager's render now runs (and the composer tests
@@ -854,19 +855,39 @@ mod tests {
     /// harness should capture everything the code might write, so this pins the
     /// answer to the question every test in this file is asking.
     ///
-    /// The one test whose subject *is* the routing names both values itself.
-    /// A `BarStatus` whose bar carries exactly `text`: the name, and no model
-    /// group — so `status_bar` renders it verbatim between the dot and the padding.
+    /// An `AppState` whose bar carries exactly `name` as the session label, for
+    /// the marker the painting tests look for on screen. The bar reads its
+    /// facts off `AppState` now (4h-g4), so the tests hand it one rather than
+    /// pushing a status; the model is a fixed unknown so no window shows and
+    /// the name renders verbatim between the dot and the padding.
     ///
-    /// The tests below use the bar as a *marker* to find on screen; what they are
-    /// for is the painting (transience, the gap, the erase, the dim). The fitting —
-    /// which field gives way to what, and the ellipsis — is a different contract and
-    /// has its own tests beside `status_bar`.
-    fn bar_of(text: &str) -> crate::agent::status::BarStatus {
-        crate::agent::status::BarStatus {
-            session_name: Some(text.to_string()),
-            ..Default::default()
-        }
+    /// What these tests are for is the painting (transience, the gap, the
+    /// erase, the dim). The fitting — which field gives way to what, and the
+    /// ellipsis — is a different contract and has its own tests beside
+    /// `status_bar`.
+    fn bar_app(name: &str) -> Arc<AppState> {
+        let app = crate::app_state::AppState::for_test(crate::settings::SettingsStore {
+            default_model: String::new(),
+            security_mode: String::new(),
+            tool_call_limit: 0,
+            default_persona: None,
+            default_reasoning_level: None,
+            show_reasoning: String::new(),
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
+            session_resume_replay_turns: 0,
+            llm_compact_prompt: String::new(),
+            models: Default::default(),
+            path: None,
+        });
+        app.set_model("llamacpp:test");
+        app.update_cycle_view(
+            String::new(),
+            Some(name.to_string()),
+            None,
+            Arc::new(Vec::new()),
+            None,
+        );
+        app
     }
 
     /// The dot's colour is the bar's only state, and it is **derived** from the
@@ -881,7 +902,6 @@ mod tests {
     #[test]
     fn the_dot_follows_the_response_lifecycle() {
         let (out, _reasoning) = capturing_output(60);
-        out.content.set_status(bar_of("[bar]"));
         assert!(
             !out.content
                 .streaming
@@ -935,7 +955,6 @@ mod tests {
     #[test]
     fn compose_area_resolves_every_row_it_owns() {
         let (out, _reasoning) = capturing_output(60);
-        out.content.set_status(bar_of("[bar]"));
         let input = || crate::repl::test_input(&shared_editor(|_| {}), "> ");
 
         // Nothing supplied: the gap and the status, and they come first.
@@ -978,7 +997,6 @@ mod tests {
     #[test]
     fn compose_area_reads_streaming_rather_than_being_told_it() {
         let (out, _reasoning) = capturing_output(60);
-        out.content.set_status(bar_of("[bar]"));
         let idle = compose_rows(&compose_area(&out, None, Vec::new()), 60);
         assert!(
             !idle[1].contains(crate::ui::bar::DOT_STREAMING),
@@ -1009,25 +1027,13 @@ mod tests {
     #[test]
     fn compose_area_keeps_the_bar_present_even_with_nothing_to_say() {
         let (out, _reasoning) = capturing_output(60);
-        // Never set: the bar is still there — gap, then the bar row.
+        // The bar is always present (4h-g): gap, then the bar row — whether or
+        // not the stores have anything to say. There is no "off" state to
+        // test; an unnamed, window-less session still reserves its row.
         assert_eq!(
             compose_area(&out, None, Vec::new()).len(),
             2,
             "gap, then a bar — always"
-        );
-        // Explicitly off: same membership, not a dropped row.
-        out.content.set_status(Default::default());
-        assert_eq!(
-            compose_area(&out, None, Vec::new()).len(),
-            2,
-            "an off status still reserves its row"
-        );
-        // A real status: same two rows.
-        out.content.set_status(bar_of("[bar]"));
-        assert_eq!(
-            compose_area(&out, None, Vec::new()).len(),
-            2,
-            "gap, then a bar"
         );
     }
 
@@ -1037,33 +1043,41 @@ mod tests {
     /// what the old `set_status` snapshot could not do (it was frozen at turn
     /// start until the next push). A push-based bar would fail this: the store
     /// moves, the pushed facts do not, and the figure follows the store.
+    ///
+    /// Since 4h-g4 the figure goes through `context_figure`, so an estimate
+    /// stands in before any completion reports — set it and the bar shows it
+    /// just the same, then the provider's count wins.
     #[test]
     fn the_bar_pulls_the_context_figure_live_rather_than_a_pushed_snapshot() {
         let (out, _reasoning) = capturing_output(60);
-        // The one pushed fact the figure is formatted beside: a window, so the
-        // figure renders as a percentage of it.
-        out.content.set_status(crate::agent::status::BarStatus {
-            context_limit: Some(200_000),
-            ..Default::default()
-        });
         // A fresh store, as the agent's constructor installs it.
         let usage = std::sync::Arc::new(Mutex::new(crate::agent::SessionUsage::default()));
         out.content.set_usage(Some(usage.clone()));
 
         let before = compose_rows(&compose_area(&out, None, Vec::new()), 60);
         assert!(
-            !before[1].contains("50%"),
-            "no completion has reported, so no context figure: {:?}",
+            !before[1].contains("100k"),
+            "nothing recorded, so no context figure: {:?}",
             before[1]
         );
 
+        // An estimate stands in before any completion reports.
+        usage.lock().unwrap().estimated_input_tokens = 42_000;
+        let estimated = compose_rows(&compose_area(&out, None, Vec::new()), 60);
+        assert!(
+            estimated[1].contains("42k"),
+            "the estimate stands in: {:?}",
+            estimated[1]
+        );
+
         // A completion reports, mid-turn, writing the store in place — the one
-        // thing the turn already does (agent/turn.rs, per completion).
+        // thing the turn already does (agent/turn.rs, per completion). It wins
+        // over the estimate.
         usage.lock().unwrap().last_input_tokens = 100_000;
         let after = compose_rows(&compose_area(&out, None, Vec::new()), 60);
         assert!(
-            after[1].contains("50%"),
-            "the figure moved with the store, no push involved: {:?}",
+            after[1].contains("100k"),
+            "the provider's report wins over the estimate, no push involved: {:?}",
             after[1]
         );
     }
@@ -1082,6 +1096,97 @@ mod tests {
         // write (the doc on this helper says why in full).
         out.content.set_reasoning_on_stderr(false);
         (out, reasoning)
+    }
+
+    /// The bar holds **stores**, not a snapshot (4h-g4 part 1): a mid-turn
+    /// `/reasoning` commit lands on `AppState` (`settle`), and the bar — which
+    /// reads the level off `AppState` at render — shows the new level at the
+    /// next paint with no push. This is the staleness the 4h-g live context
+    /// pull did not cover: a push-based bar would keep the old level until the
+    /// turn ended (the running turn keeps its `live_params`).
+    #[test]
+    fn the_bar_follows_a_mid_turn_reasoning_commit_with_no_push() {
+        let (out, _reasoning) = capturing_output(60);
+        let app = bar_app("[bar]");
+        let stack = || {
+            vec![
+                Element::lines(vec![String::new()]),
+                crate::ui::bar::status(
+                    app.clone(),
+                    out.content.usage_handle(),
+                    out.content.streaming.clone(),
+                ),
+            ]
+        };
+        let before = compose_rows(&stack(), 60);
+        assert!(
+            !before[1].contains("high"),
+            "no level yet, so the bar shows none: {:?}",
+            before[1]
+        );
+        // The commit lands on the target config, exactly where `settle` writes
+        // it; the running turn would still be on its old `live_params`.
+        app.set_reasoning(Some(crate::params::ReasoningLevel::High));
+        let after = compose_rows(&stack(), 60);
+        assert!(
+            after[1].contains("high"),
+            "the bar reads the live level, no push involved: {:?}",
+            after[1]
+        );
+    }
+
+    /// The bar's label comes off `AppState` (4h-g4 part 2): the opening message
+    /// stands in for an unnamed session, and the submit path's
+    /// `set_first_message_if_unset` fills it before the branch has it.
+    #[test]
+    fn the_bar_reads_the_session_identity_off_app_state() {
+        let (out, _reasoning) = capturing_output(60);
+        let app = crate::app_state::AppState::for_test(crate::settings::SettingsStore {
+            default_model: String::new(),
+            security_mode: String::new(),
+            tool_call_limit: 0,
+            default_persona: None,
+            default_reasoning_level: None,
+            show_reasoning: String::new(),
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
+            session_resume_replay_turns: 0,
+            llm_compact_prompt: String::new(),
+            models: Default::default(),
+            path: None,
+        });
+        app.set_model("llamacpp:test");
+        let stack = || {
+            vec![
+                Element::lines(vec![String::new()]),
+                crate::ui::bar::status(
+                    app.clone(),
+                    out.content.usage_handle(),
+                    out.content.streaming.clone(),
+                ),
+            ]
+        };
+        let empty = compose_rows(&stack(), 60);
+        assert!(
+            !empty[1].contains("fix the bug"),
+            "no identity yet: {:?}",
+            empty[1]
+        );
+        // The first prompt: the submit path records the text as the stand-in.
+        app.set_first_message_if_unset("fix the bug");
+        let shown = compose_rows(&stack(), 60);
+        assert!(
+            shown[1].contains("fix the bug"),
+            "the message labels the session: {:?}",
+            shown[1]
+        );
+        // A second submit must not overwrite it.
+        app.set_first_message_if_unset("something else");
+        let still = compose_rows(&stack(), 60);
+        assert!(
+            still[1].contains("fix the bug") && !still[1].contains("something else"),
+            "the first message sticks: {:?}",
+            still[1]
+        );
     }
 
     /// A shared editor for a test — the handle `compose_frame`/`paint_prompt`
@@ -1107,7 +1212,7 @@ mod tests {
         let mut stack = Vec::new();
         stack.push(Element::lines(vec![String::new()]));
         stack.push(crate::ui::bar::status(
-            out.content.bar.clone(),
+            bar_app("[bar]"),
             out.content.usage_handle(),
             out.content.streaming.clone(),
         ));
@@ -2674,7 +2779,6 @@ mod tests {
                 height: dims.1,
             },
         );
-        tail.content.set_status(bar_of("[bar]"));
         let tail_sink = record_bytes(&tail);
         let (input, overlay) = pieces();
         let a = {
@@ -2695,7 +2799,6 @@ mod tests {
                 height: dims.1,
             },
         );
-        hand.content.set_status(bar_of("[bar]"));
         // Feed `draw_frame` exactly what the paint path composes — same
         // composer, same status, same dims — so the apply half is all that
         // differs.

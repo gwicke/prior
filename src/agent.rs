@@ -41,6 +41,12 @@ pub struct SessionUsage {
     /// Input ("prompt") tokens of the most recent completion request — the
     /// size of the context that would be re-sent on the next turn.
     pub last_input_tokens: u64,
+    /// The **estimated** input size, recorded by the loop and the turn before
+    /// any completion has reported (4h-g4 part 3). An estimate is kept as an
+    /// estimate: it never impersonates a provider report in
+    /// [`Self::last_input_tokens`]. [`Self::context_figure`] is the one read
+    /// that falls back to it.
+    pub estimated_input_tokens: u64,
     /// Output ("completion") tokens of the most recent completion request.
     pub last_output_tokens: u64,
     /// Cache-read tokens of the most recent completion request.
@@ -57,6 +63,21 @@ pub struct SessionUsage {
     pub session_cache_creation_input_tokens: u64,
     /// Cumulative reasoning tokens across the session.
     pub session_reasoning_tokens: u64,
+}
+
+impl SessionUsage {
+    /// The context figure the bar and `/stat` show: the provider's own count of
+    /// what it last sent when one has reported, else the loop's/turn's
+    /// estimate (4h-g4 part 3). One read, so the two surfaces cannot disagree
+    /// about which number stands — and so the estimate never has to pretend to
+    /// be a provider report to be seen.
+    pub fn context_figure(&self) -> u64 {
+        if self.last_input_tokens > 0 {
+            self.last_input_tokens
+        } else {
+            self.estimated_input_tokens
+        }
+    }
 }
 
 /// Per-turn persistence state threaded across `prompt()` retries inside one
@@ -182,9 +203,6 @@ pub struct CodeAgent {
     /// The live params this agent was built with: the default for a turn with
     /// no per-turn override, and the status bar's reasoning level.
     live_params: crate::params::ModelParams,
-    /// The resolved context window, so the per-turn status bar divides by the
-    /// number in force rather than looking one up per paint.
-    context_limit: Option<u64>,
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
@@ -671,7 +689,6 @@ impl CodeAgent {
     pub fn new(
         agent: Agent,
         content: Arc<crate::content::Content>,
-        context_limit: Option<u64>,
         tool_call_limit: usize,
         provider: String,
         model: String,
@@ -687,7 +704,6 @@ impl CodeAgent {
         Self {
             agent,
             content,
-            context_limit,
             tool_call_limit,
             provider,
             model,

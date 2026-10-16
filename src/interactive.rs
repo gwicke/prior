@@ -668,6 +668,12 @@ impl Interactive {
         // `/stat` is handled by the REPL overlay (typing it opens the
         // stats panel); it is never submitted here, so there's nothing
         // to do for that keyword.
+        // The bar's label for an unnamed session on the very first prompt: the
+        // cycle view is written before this message is persisted, so the branch
+        // is still empty then. Record the text being sent as the stand-in (the
+        // `first_user_text(prior).or(input)` fallback, relocated here from the
+        // turn — 4h-g4 part 2); the next cycle's branch write supersedes it.
+        self.app_state.set_first_message_if_unset(&input);
         // Reprint the submitted prompt via the `Output` impl so the
         // session (and cursor tracking) stays correct; `read_input`
         // cleared the input line on submit. Bracketed — a rule above
@@ -1047,8 +1053,6 @@ impl Interactive {
                         branch_messages.first().map(|(_, preview)| preview.clone());
 
                     let ctx = ReplCtx {
-                        provider: self.config.provider.clone(),
-                        model: self.config.model.clone(),
                         recent: self.app_state.recent_models(),
                         persona: self.config.persona_name.clone(),
                         repo: self.repo.clone(),
@@ -1058,17 +1062,11 @@ impl Interactive {
                         leaf_id,
                         context_tokens,
                         model_filter: ModelFilter::default_for_coding(),
-                        // P1's accessor (the level now lives in `ModelParams`)
-                        // plus upstream's two new status-bar fields.
-                        reasoning_level: self.config.params.reasoning_str(),
-                        // The resolved context window, so the prompt-side bar's
-                        // percentage uses the same denominator as the mid-turn one.
-                        context_limit: resolved_context_limit(&self.app_state),
-                        // The prompt-side bar names the session the same way the
-                        // mid-turn one does: off the session index, with the opening
-                        // message as the fallback when it has no name. Read here, at
-                        // the top of the cycle, so both bars are looking at one
-                        // snapshot rather than at whatever the index holds later.
+                        // The bar names the session off `AppState`, which this
+                        // cycle writes below: the name off the session index,
+                        // with the opening message as the fallback. The model,
+                        // thinking level and context window are read straight
+                        // off `AppState` by the bar at render.
                         session_name,
                         session_first_message,
                     };

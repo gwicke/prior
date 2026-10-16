@@ -77,10 +77,10 @@ Compose UI chrome into a RenderElement stack. Same level as Content.
 
 - source: ui/ (picocode); bar.rs (the bar) — menu chrome elements come from `slashdot_menu`
   (below, RenderElement stack), which implements `RenderElement` for its views
-- Elements are long-lived and reused: the status bar and the input hold live state (the bar its
-  status, the input the shared editor), joined by transient elements (menus, dialogs) as repl/ui
-  state changes. Reuse is why `Element` is `Arc<Mutex<…>>`, not `Box`: the repl mutates the shared
-  editor / overlay cursor in place and the next render() paints it.
+- Elements are long-lived and reused: the status bar and the input hold live state (the bar the
+  stores it reads, the input the shared editor), joined by transient elements (menus, dialogs) as
+  repl/ui state changes. Reuse is why `Element` is `Arc<Mutex<…>>`, not `Box`: the repl mutates the
+  shared editor / overlay cursor in place and the next render() paints it.
 - The bar is **always present** — no on/off gate (the old `is_off`/`set_status` gate was an
   artifact of push, guarding a stale/absent pushed row; with pull the bar always renders itself).
   The bar **holds stores, not a snapshot**, and formats them at render (name fallback, field list,
@@ -97,7 +97,7 @@ Compose UI chrome into a RenderElement stack. Same level as Content.
   the usage store as `estimated_input_tokens`, and the figure read is
   `last_input_tokens if > 0 else estimated_input_tokens` — the estimate stands only until the first
   completion reports. `/stat` calls the same read, so it is current mid-turn and needs no
-  `AppState` context snapshot (impl doc 4h-g / 4h-g4).
+  `AppState` context snapshot.
 - Confirmations are repl dialogs (session state). Batch / one-shot runs have no dialog: gated tools
   there require yolo mode (the sandbox is mandatory).
 

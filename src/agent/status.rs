@@ -12,7 +12,6 @@
 
 use super::SessionUsage;
 use crate::model_catalog;
-use rig_core::message::{Message, UserContent};
 
 /// Session-level metadata shown in the `/stat` overlay header.
 ///
@@ -48,18 +47,20 @@ pub struct SessionStatsInfo {
     pub user_message_count: usize,
 }
 
-/// What the status bar shows, as **raw data** (step 4f-a; design §UI: "the
-/// bar's held state is raw data, formatted by the bar").
+/// What the status bar shows, as **raw data**, assembled at render (4h-g4
+/// part 1; design §UI: "the bar's held state is raw data, formatted by the
+/// bar").
 ///
 /// The bar's line is `● session | provider:model thinking 34% 78k` — the
 /// mid-turn readout (doc/row_accounting.md, zone 2) — carried here as *facts*,
-/// never as shaped text. These are the facts that come off a *push* — the
-/// session's identity off the index, the model/thinking off the config in
-/// force. The context figure is deliberately absent (4h-g part 2): it is the
-/// one fact that moves mid-turn, so the bar reads it off the agent's shared
-/// usage store at render and [`status_text`] takes it as an argument. The
-/// shaping (name fallback to the opening-message preview, the field list, the
-/// drop order) is `status_text`'s; the fit is `ui::bar::status_bar`'s.
+/// never as shaped text. [`bar_status`] builds this value at render from the
+/// stores that hold each fact (the model/thinking off `AppState`, the identity
+/// off the per-cycle view); nothing is pushed, so a mid-turn config commit
+/// shows at the next paint. The context figure is deliberately absent: it is
+/// read off the agent's shared usage store at render and [`status_text`] takes
+/// it as an argument. The shaping (name fallback to the opening-message
+/// preview, the field list, the drop order) is `status_text`'s; the fit is
+/// `ui::bar::status_bar`'s.
 ///
 /// A struct rather than four more positional arguments because those four are
 /// two strings and two `Option`s in a row: nothing at the call site says which
@@ -108,6 +109,28 @@ pub fn resolved_context_limit(app_state: &crate::app_state::AppState) -> Option<
         })
         .and_then(|e| e.context_length)
         .filter(|max| *max > 0)
+}
+
+/// Assemble the bar's raw data from the **stores** (4h-g4 part 1): the model
+/// in force, the thinking level, the resolved context window, and the session
+/// identity — all read live off `AppState`'s sync accessors at render. The
+/// bar element calls this each paint, so a mid-turn `/reasoning` or `/model`
+/// commit (which lands on `AppState`) shows at the next paint with no push.
+pub fn bar_status(app_state: &crate::app_state::AppState) -> BarStatus {
+    let qualified = app_state.model();
+    let (provider, model) = match qualified.split_once(':') {
+        Some((p, m)) => (p.to_string(), m.to_string()),
+        None => (String::new(), qualified),
+    };
+    let (session_name, first_message) = app_state.bar_identity();
+    BarStatus {
+        session_name,
+        first_message,
+        provider,
+        model,
+        thinking: app_state.reasoning(),
+        context_limit: resolved_context_limit(app_state),
+    }
 }
 
 /// The status line's content, after shaping and before the fit: what names the
@@ -744,19 +767,6 @@ mod status_bar_tests {
         let p = message_preview("\x1b[2J\x1b[31mred\x1b[0m");
         assert_eq!(p, "red");
         assert!(!p.contains('\u{1b}'), "{p:?}");
-    }
-}
-
-/// The first user message in a built context, as the status line's stand-in
-/// label for an unnamed session. `None` when the context is empty (the session's
-/// first turn) or opens with something that carries no text.
-pub(crate) fn first_user_text(prior: &[Message]) -> Option<&str> {
-    let Message::User { content } = prior.first()? else {
-        return None;
-    };
-    match content.first()? {
-        UserContent::Text(t) if !t.text.trim().is_empty() => Some(t.text.as_str()),
-        _ => None,
     }
 }
 

@@ -94,8 +94,6 @@ pub enum InputAction {
 /// session output after an inline overlay is dismissed. Rebuilt each loop
 /// iteration from the live `AgentConfig`.
 pub struct ReplCtx {
-    pub provider: String,
-    pub model: String,
     pub recent: Vec<String>,
     /// Currently active runtime persona name (None => none), for marking the
     /// active entry in the `/persona` overlay.
@@ -115,18 +113,15 @@ pub struct ReplCtx {
     pub leaf_id: Option<String>,
     /// Estimated tokens of the current (compaction-scoped) context. Shown in
     /// the `/tree compact` sub-menu header; the compact handler writes the
-    /// same estimate as `tokensBefore` (same `estimate_context_tokens` call).
+    /// same estimate as `tokensBefore` (same `estimate_context_tokens` call),
+    /// and the loop records it as the live usage store's
+    /// `estimated_input_tokens` (4h-g4 part 3).
     pub context_tokens: u64,
-    /// The resolved context window for the prompt-side bar's percentage.
-    pub context_limit: Option<u64>,
     /// Current model filter/sort state for the `/model` overlay.
     pub model_filter: ModelFilter,
-    /// Currently-active reasoning level (for the `*` marker in `/reasoning`).
-    pub reasoning_level: Option<String>,
-    /// The session's name, for the prompt-side status bar. `None` when unnamed,
-    /// in which case the bar falls back to the session's opening message — the
-    /// mid-turn bar reads the same two fields off the session index, and the two
-    /// bars must not be able to disagree about which session they are naming.
+    /// The session's name, written to `AppState` (`update_cycle_view`) — the
+    /// source the status bar reads at render. `None` when unnamed, in which
+    /// case the bar falls back to the session's opening message.
     pub session_name: Option<String>,
     /// The session's opening user message, for the same fallback.
     pub session_first_message: Option<String>,
@@ -701,6 +696,11 @@ pub struct PromptSession {
     /// resize published by the loop-top probe or the reader is what these
     /// reads see.
     size: tokio::sync::watch::Receiver<crate::termio::TermSize>,
+    /// The injected state handle (4h-g4 part 1): the bar element reads the
+    /// model in force, the thinking level and the context window off it at
+    /// render, so a mid-turn `/reasoning` or `/model` commit shows at the next
+    /// paint. Cloned into `sync_stack`'s bar element.
+    app_state: Arc<AppState>,
     /// A gated tool call's confirmation, if one is on screen.
     ///
     /// Not an `ActiveOverlay` variant and not `None`-when-absent by design: a
@@ -766,6 +766,7 @@ impl PromptSession {
             overlay: ActiveOverlay::None,
             confirm: None,
             size: app_state.content().size.clone(),
+            app_state: app_state.clone(),
         }
     }
 
@@ -1191,7 +1192,7 @@ impl PromptSession {
         // was an artifact of the old push.
         stack.push(Element::lines(vec![String::new()]));
         stack.push(crate::ui::bar::status(
-            content.bar.clone(),
+            self.app_state.clone(),
             content.usage_handle(),
             content.streaming.clone(),
         ));
@@ -1502,42 +1503,23 @@ impl Repl {
         // copies, no sync flags.
         app_state.update_cycle_view(
             ctx.current_session_id.clone(),
-            ctx.context_tokens,
+            ctx.session_name.clone(),
+            ctx.session_first_message.clone(),
             ctx.tree.clone(),
             ctx.leaf_id.clone(),
         );
         // Repo handle: refresh in case the loop replaced its local Option
         // (clone-shared Arc cache — same listing state either way).
         app_state.set_repo(ctx.repo.clone());
-        // The context figure is read *live* by the bar (4h-g part 2), off the
-        // agent's usage store — so this cycle's estimate is a **seed** for the
-        // store, not a push into the status. Seeding only while the store reads
-        // empty is what keeps the two sources honest: before any completion has
-        // reported (the very first prompt, which runs before any turn has set a
-        // status) the estimate is all there is; after one has, the provider's
-        // own count is the truth and this must not overwrite it.
+        // The context figure is read *live* by the bar and `/stat` (4h-g part
+        // 2) off the agent's usage store — so this cycle's estimate is recorded
+        // as an **estimate** (4h-g4 part 3), not a push into the status and not
+        // a report. Before any completion has reported the estimate is what
+        // `context_figure` falls back to; after one has, the provider's own
+        // count wins and this write is simply unused.
         if let Some(usage) = content.usage_handle() {
-            let mut usage = usage.lock().unwrap();
-            if usage.last_input_tokens == 0 {
-                usage.last_input_tokens = ctx.context_tokens;
-            }
+            usage.lock().unwrap().estimated_input_tokens = ctx.context_tokens;
         }
-        // The prompt-side bar's **raw data**, pushed rather than rendered:
-        // this module builds no row — the bar element formats whatever is
-        // stored here at its own render (step 4f-a, design §UI).
-        //
-        // Pushed once per cycle from the same `ctx` the overlays read, so the
-        // prompt-side bar and the mid-turn one cannot name different sessions —
-        // and pushed before the first paint, because the very first prompt runs
-        // before any turn has set a status, and an unset one draws no bar at all.
-        content.set_status(crate::agent::status::BarStatus {
-            session_name: ctx.session_name.clone(),
-            first_message: ctx.session_first_message.clone(),
-            provider: ctx.provider.clone(),
-            model: ctx.model.clone(),
-            thinking: ctx.reasoning_level.clone(),
-            context_limit: ctx.context_limit,
-        });
         // The session's state, as the loop's own bindings. Destructuring a
         // `&mut PromptSession` reborrows each field *disjointly*, so the body
         // keeps addressing them as locals while they are, in fact, one movable
@@ -3056,12 +3038,6 @@ mod tests {
                 height: 24,
             },
         );
-        out.content.set_status(crate::agent::status::BarStatus {
-            session_name: Some("sess".to_string()),
-            provider: "llamacpp".to_string(),
-            model: "test".to_string(),
-            ..Default::default()
-        });
         (out, Arc::new(Mutex::new(LineEditor::new())))
     }
 

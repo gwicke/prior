@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::agent::build::{request_additional_params, LoggingHook};
 use crate::agent::compaction::session_context_messages;
-use crate::agent::status::{first_user_text, BarStatus};
+
 use crate::agent::CodeAgent;
 use crate::agent::{estimate_ctx_with, TurnPersistence};
 use crate::session::Session;
@@ -98,22 +98,19 @@ impl CodeAgent {
             },
             None => Vec::new(),
         };
-        // The stand-in label for a session with no name: its opening user
-        // message. `prior` holds everything before this turn, so from the second
-        // turn onward that *is* the first message; on the first turn it is empty
-        // and this turn's own prompt is. Captured here, before `prior` moves
-        // into the agent.
-        let first_message: Option<String> = first_user_text(&prior)
-            .or_else(|| (!input.trim().is_empty()).then_some(input))
-            .map(str::to_string);
-        // The same shape, for the ctx figure: the first turn has no reported
-        // usage at all (the first completion call is still in flight), so the
-        // status line would have no context number for exactly the turn a new
-        // session is most likely to be watched. The estimate `/tree compact`
-        // already uses is computable from the messages in hand — `prior` plus
-        // this turn's prompt — so use it, and let the provider's own count
-        // replace it from the second turn on.
+        // The first turn has no reported usage at all (the first completion
+        // call is still in flight), so the status line would have no context
+        // number for exactly the turn a new session is most likely to be
+        // watched. The estimate `/tree compact` already uses is computable from
+        // the messages in hand — `prior` plus this turn's prompt — so record it
+        // as an *estimate* (4h-g4 part 3); the provider's own count replaces it
+        // through `context_figure` from the second turn on, with nothing
+        // impersonating a report.
         let estimated_ctx = estimate_ctx_with(&prior, input);
+        {
+            let mut usage = self.usage.lock().unwrap();
+            usage.estimated_input_tokens = estimated_ctx;
+        }
 
         // `stream_prompt(...).await` yields the item stream (rig 0.40's
         // `IntoFuture` returns the stream itself, not a collected response).
@@ -177,35 +174,6 @@ impl CodeAgent {
         // is not in it: the agent carries none (it went with the hold-back in
         // B3b) and it only changes on an explicit commit, so it belongs to the
         // prompt-side carrier.
-        let session_name = session.and_then(|s| {
-            let index = s.index.try_lock().ok()?;
-            index.header.name.clone()
-        });
-        // Seed the context figure *into* the live store rather than pushing it
-        // into the status (4h-g part 2): the bar reads `last_input_tokens` at
-        // render, so the estimate is the seed that stands in until the first
-        // completion reports — a real count replaces it mid-turn, unprompted.
-        // Seeding before any completion has reported is what makes this safe:
-        // once one has, the report is the truth and the seed is overwritten.
-        {
-            let mut usage = self.usage.lock().unwrap();
-            if usage.last_input_tokens == 0 {
-                usage.last_input_tokens = estimated_ctx;
-            }
-        }
-        // Raw data, formatted by the bar at render (step 4f-a, design §UI):
-        // the push stores facts, so the figure refreshes with the next paint
-        // — no re-shaping push to keep in step.
-        self.content.set_status(BarStatus {
-            session_name,
-            first_message,
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            // The status bar's own field is upstream's `thinking`; the
-            // value it reads is now the renamed reasoning level.
-            thinking: self.live_params.reasoning_str(),
-            context_limit: self.context_limit,
-        });
         self.content.begin_response();
         // U4.3: the turn's second pump, split out of `in_turn` into bindings the
         // two new futures below can borrow *disjointly* — one future per

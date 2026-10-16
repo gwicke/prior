@@ -62,7 +62,7 @@ and link a doc/ and/or commit hash
   - [x] Step 3: split `content/`; `AgentConfig.content` + `Content` tap seam; content consumers on
     `&Content` (§8.3) — landed 3a–3d (`47122b4`…`cf7b6a8`); frame/input rides `AgentConfig.output`
     until step 4 (follow-ups recorded in the impl doc)
-  - [ ] Step 4: fold in `RenderManager` + UI; elements → `Arc<Mutex<…>>`, shared editor (§8.4) —
+  - [x] Step 4: fold in `RenderManager` + UI; elements → `Arc<Mutex<…>>`, shared editor (§8.4) —
     sub-commit plan 4a–4h recorded in the impl doc — 4a (`8cc955d`), 4b (`38d9513`), 4c
     (`33dc92c`), 4d (`98bcb85`), 4e (`bce38e7`) landed; 4f landed whole — 4f-a
     (`529f278`, bar formats itself from raw data), 4f-b (`cb01977`, frame path leaves
@@ -85,6 +85,6 @@ and link a doc/ and/or commit hash
     the flip: `render` composes from the configured stack, membership reconfigured on
     transitions; the bar is always present and pulls usage live); 4h-h (`243890e`, confirm dialog
     selection state + its place in the configured stack, out-of-crate callers, cleanup);
-    4h-g4 next (the bar pulls every fact live: identity + model fields off `AppState`, one shared
+    4h-g4 (the bar pulls every fact live: identity + model fields off `AppState`, one shared
     estimate fallback read by the bar and `/stat`)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)
