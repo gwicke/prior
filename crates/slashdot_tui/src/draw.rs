@@ -737,17 +737,15 @@ impl Draw {
     /// same edge, which is what `TermIO::recording()` taking the seam
     /// wholesale means.
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        let _ = self.term_io.write(crate::termio::Stream::Main, bytes);
+        let _ = self.term_io.write(crate::termio::Stream::Content, bytes);
     }
 
-    /// The meta sink's bytes: `TermIO`'s `Stream::Meta`, no
-    /// bookkeeping — a stderr write does not move the screen's cursor, so
-    /// there is no consume, row count or cache note to keep for it, and
-    /// the byte edge records the two streams apart (design §TermIO: one
-    /// `write`, per-stream sinks). Reached only from [`Self::draw`]'s
-    /// meta branch, above content's hand-off.
-    pub fn write_meta(&mut self, bytes: &[u8]) {
-        let _ = self.term_io.write(crate::termio::Stream::Meta, bytes);
+    /// Content bytes of kind `s`, routed by `TermIO` to the sink the kind and
+    /// the caps pick (design §TermIO): `Content` to the primary, the diverting
+    /// kinds to the primary when it is a terminal else meta. The one
+    /// kind-carrying write; the frame-side bytes go through [`Self::write_bytes`].
+    pub fn write_kind(&mut self, s: crate::termio::Stream, bytes: &[u8]) {
+        let _ = self.term_io.write(s, bytes);
     }
 
     // --- the frame + content merge (design §Draw) ---------------------
@@ -762,17 +760,16 @@ impl Draw {
     /// it is passed rather than recomputed here so a capture-emptied write —
     /// bytes gone, screen still to be choreographed — keeps its advance.
     ///
-    /// A `Meta` write goes straight to the meta sink, with no
-    /// choreography: stderr never moves the screen's cursor.
+    /// The write's bytes carry their kind and are routed by `TermIO`; nothing
+    /// here forks on the sink (design §Draw: Draw always merges, and a diverting
+    /// write that lands on meta is one whose primary is not a terminal — frames
+    /// are dropped and the screen cache is already fiction, so the merge is
+    /// inert and its frame-side bytes never leave).
     pub fn draw(&mut self, frame: &Frame, content: Option<(&ContentWrite, usize)>) {
         let Some((w, rows)) = content else {
             self.apply(frame);
             return;
         };
-        if w.stream == crate::termio::Stream::Meta {
-            self.write_meta(&w.bytes);
-            return;
-        }
         let th = self.size.borrow().height.max(1);
         // Consume, then write (ui_draw_v2 §4.5 P1): the walk goes ahead of the
         // bytes, and the block follows carrying its own per-line clears.
@@ -787,7 +784,7 @@ impl Draw {
         // manager's call (it hands an empty write instead), so Draw stays
         // capture-agnostic — and a write the tap emptied still advances the
         // cursor by the row count the manager passed.
-        self.write_bytes(&w.bytes);
+        self.write_kind(w.stream, &w.bytes);
         if rows > 0 {
             self.cache.note_lines(rows, th);
         }

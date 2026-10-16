@@ -56,6 +56,18 @@ The shape:
   no `Caps::kind_sink` surfaces above TermIO; the mapping is TermIO's alone, and Draw always merges
   (its cache advances against dropped bytes, the fiction 5f accepts).
 
+Commits:
+
+1. **Kind vocabulary + TermIO routing.** Rename `Stream::{Main, Meta}` → `{Content, Reasoning,
+   Error}`; TermIO maps kind → sink from caps; `repair` loses the stream gate; `Draw::draw` loses
+   the meta special-case and writes content with its kind. Content's raw reasoning route carries
+   `Reasoning`. `Frame` still not a target — the `paints_frames` gates stay for this commit.
+2. **`Frame` target.** `TermIO::write_frame` (drops on a real non-terminal primary); route Draw's
+   frame-side writes through it and remove the `paints_frames` gate from Draw.
+3. **Recording doubles become real backends; `TermGuard` routes through the edge.** The 5f `degrade`
+   flag goes, `recording()`/`recording_degraded()` become one caps-parameterised real backend,
+   `Content` is built over it; the guard's CSI goes through the write edge, gated on `caps.primary`.
+
 Open before landing:
 
 - **Recording doubles model real backends.** They should replicate what a tty or a plain backend

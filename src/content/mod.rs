@@ -1,6 +1,6 @@
 //! The content layer: classification, the separator matrix, and content
 //! rendering. None of it crosses
-//! below — the only vocabulary going down is `Stream` (main / meta), so
+//! below — the only vocabulary going down is `Stream` (the write's kind), so
 //! `render` / `draw` stay generic
 //! (`doc/261003_output_drawing_refactor.md`).
 

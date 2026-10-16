@@ -61,15 +61,17 @@ pub struct Content {
     /// and the reasoning routing read this instead of calling `is_terminal()`
     /// per site.
     pub(crate) caps: crate::termio::Caps,
-    /// Where reasoning goes — the stream decision: `true` picks
-    /// `Stream::Meta` (stderr, the real backends'), so a consumer of
-    /// `picocode "q" | cat` can drop it (`2>/dev/null`) or merge it
-    /// (`2>&1`) without touching stdout. Picked once, in [`Self::new`]
-    /// from the caps; [`Self::commit_reasoning`] hands the pick down as
-    /// the `ContentWrite`'s stream, and the hub routes on the token from
-    /// there. `AtomicBool` rather than `bool` only because the handle is
-    /// shared behind an `Arc` and a test pins it to the screen for a byte
-    /// comparison — see [`Self::set_reasoning_on_stderr`].
+    /// Which *route* reasoning takes — `true` hands the rendered bytes off raw
+    /// (no boundary chain, no choreography), `false` runs them through the
+    /// chain like any on-screen block. The pick is content's (it decides
+    /// whether reasoning is on screen); the *sink* is `TermIO`'s alone — a raw
+    /// reasoning write carries `Stream::Reasoning` and lands on stderr (the
+    /// real backends') when the primary is not a terminal, so a consumer of
+    /// `picocode "q" | cat` can drop it (`2>/dev/null`) or merge it (`2>&1`)
+    /// without touching stdout. Picked once, in [`Self::new`] from the caps;
+    /// `AtomicBool` rather than `bool` only because the handle is shared behind
+    /// an `Arc` and a test pins it to the screen for a byte comparison — see
+    /// [`Self::set_reasoning_on_stderr`].
     pub(crate) reasoning_on_stderr: AtomicBool,
     /// Incremental GFM markdown parser for the current response (TTY only).
     pub(crate) parser: Mutex<StreamParser>,
@@ -377,12 +379,24 @@ impl Content {
         kind: Option<ContentDisplayKind>,
         closes: bool,
     ) {
+        self.write_content_block_as(bytes, kind, closes, crate::termio::Stream::Content);
+    }
+
+    /// [`Self::write_content_block`] with an explicit write kind — the error
+    /// path's `Stream::Error`.
+    pub(crate) fn write_content_block_as(
+        &self,
+        bytes: &[u8],
+        kind: Option<ContentDisplayKind>,
+        closes: bool,
+        stream: crate::termio::Stream,
+    ) {
         // No wrapping here: `with_content_writer`'s `WrapLines` is the one
         // choke every writer passes — batch strings, streamed renderer
         // output, everything — so a line can no longer reach the terminal
         // wider than the terminal.
         let width = self.width();
-        self.with_content_writer(width, kind, closes, |out| {
+        self.with_content_writer_stream(width, kind, closes, stream, |out| {
             let _ = out.write_all(bytes);
         });
     }
@@ -428,12 +442,35 @@ impl Content {
     // the intent: `drop()` moves the value and ends the borrow, which is the
     // only way to release it early. Scoped here rather than at crate level so
     // an accidental `drop()` elsewhere is still reported.
-    #[allow(clippy::drop_non_drop)]
     pub(crate) fn with_content_writer<T, F>(
         &self,
         width: usize,
         kind: Option<ContentDisplayKind>,
         closes_segment: bool,
+        f: F,
+    ) -> T
+    where
+        F: FnOnce(&mut dyn io::Write) -> T,
+    {
+        self.with_content_writer_stream(
+            width,
+            kind,
+            closes_segment,
+            crate::termio::Stream::Content,
+            f,
+        )
+    }
+
+    /// [`Self::with_content_writer`] with an explicit write **kind** (design
+    /// §TermIO): the block's `ContentWrite` carries it and `TermIO` routes it
+    /// to the sink. Only the error path asks for anything but `Content`.
+    #[allow(clippy::drop_non_drop)]
+    pub(crate) fn with_content_writer_stream<T, F>(
+        &self,
+        width: usize,
+        kind: Option<ContentDisplayKind>,
+        closes_segment: bool,
+        stream: crate::termio::Stream,
         f: F,
     ) -> T
     where
@@ -674,10 +711,10 @@ impl Content {
         // brings the frame back below.
         let write = ContentWrite {
             bytes: buf,
-            // The chain is the screen's path: every block it produced is
-            // main-stream content. The meta route hands off beside this
-            // one, raw — `commit_reasoning`.
-            stream: crate::termio::Stream::Main,
+            // The kind the caller declared: `Content` for the chain (the
+            // screen's path), `Error` for the error path. The diverting route
+            // hands off beside this one, raw — `commit_reasoning`.
+            stream,
         };
         // One choreography, two design verbs (§Render): the replay path
         // writes inside a batch and hands off as `render_batch`, the
@@ -1316,18 +1353,17 @@ impl Content {
         self.commit_reasoning(rendered);
     }
 
-    /// Land a rendered reasoning block — the stream decision, made once at
-    /// setup (caps: `Meta` when the meta stream carries it), picks between
-    /// two routes. `Meta`: the bytes hand off raw as a `ContentWrite`
-    /// (the meta sink under the hub, no boundary chain, no line clear, no
-    /// counter: byte-for-byte the stderr bypass it replaced, and no
-    /// choreography because stderr
-    /// never moves the screen's cursor). `Main`: the block runs the
-    /// chain like any other, under the reasoning kind, so the boundary
-    /// after it is drawn as its own.
+    /// Land a rendered reasoning block — the route decision, made once at
+    /// setup (cap `reasoning_on_stderr`: `true` when the primary is not a
+    /// terminal), picks between two routes. Raw: the bytes hand off as a
+    /// `ContentWrite` of kind `Reasoning`, no boundary chain, no line clear, no
+    /// counter — byte-for-byte the stderr bypass it replaced, and no
+    /// choreography because it lands on stderr, which never moves the screen's
+    /// cursor. Chained: the block runs the chain like any other block, so the
+    /// boundary after it is drawn as its own.
     ///
     /// Empty means the delta rendered nothing: no write at all — even a
-    /// zero-byte hand-off would open a block on the main route.
+    /// zero-byte hand-off would open a block on the chained route.
     fn commit_reasoning(&self, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
@@ -1344,7 +1380,7 @@ impl Content {
             let mut mgr = self.manager.lock().unwrap();
             mgr.render_content(ContentWrite {
                 bytes,
-                stream: crate::termio::Stream::Meta,
+                stream: crate::termio::Stream::Reasoning,
             });
         } else {
             self.write_content_kinded(&bytes, Some(ContentDisplayKind::ResponseReasoning));
@@ -1488,9 +1524,11 @@ impl Content {
         // Measured: a long error wraps, and the message carries a 2-column
         // prefix the row count has to include.
         let block = format!("{} Error: {}\n", style("⏺").red(), error);
-        self.write_content_kinded(
+        self.write_content_block_as(
             &at_line_start(block.as_bytes()),
             Some(ContentDisplayKind::SystemMessage),
+            false,
+            crate::termio::Stream::Error,
         );
     }
 
@@ -1946,8 +1984,22 @@ mod tests {
     /// asserting on what reached the terminal reads `TermIO`'s recording
     /// backend under the manager's `Draw`.
     fn record_bytes(out: &Content) -> Recording {
+        record_bytes_with(
+            out,
+            crate::termio::Caps {
+                primary: true,
+                meta: true,
+            },
+        )
+    }
+
+    /// [`record_bytes`] with pinned caps — the encoding double for a real
+    /// backend whose primary is (or is not) a terminal, so the kind → sink
+    /// routing is exercised. A non-terminal primary sends the diverting kinds
+    /// to the meta bucket.
+    fn record_bytes_with(out: &Content, caps: crate::termio::Caps) -> Recording {
         let hub = out.manager.clone();
-        hub.lock().unwrap().draw().term_io = crate::termio::TermIO::recording();
+        hub.lock().unwrap().draw().term_io = crate::termio::TermIO::recording_with(caps);
         Recording(hub)
     }
 
@@ -1956,24 +2008,25 @@ mod tests {
     struct Recording(Arc<Mutex<crate::render::RenderManager>>);
 
     impl Recording {
-        /// The main stream — screen bytes, choreography included.
+        /// The primary stream — screen bytes, choreography included.
         fn bytes(&self) -> Vec<u8> {
             self.0
                 .lock()
                 .unwrap()
                 .draw()
                 .term_io
-                .recorded(crate::termio::Stream::Main)
+                .recorded(crate::termio::Stream::Content)
         }
 
-        /// The meta stream — the diverted-reasoning edge.
+        /// The meta sink — the diverted-reasoning edge (the recording double's
+        /// pinned caps are a non-terminal primary, so `Reasoning` routes here).
         fn meta(&self) -> Vec<u8> {
             self.0
                 .lock()
                 .unwrap()
                 .draw()
                 .term_io
-                .recorded(crate::termio::Stream::Meta)
+                .recorded(crate::termio::Stream::Reasoning)
         }
     }
 
@@ -2402,7 +2455,14 @@ mod tests {
         *reasoning.lock().unwrap() = ShowReasoning::Content;
         out.set_reasoning_on_stderr(true);
         out.begin_response();
-        let recording = record_bytes(&out);
+        // A piped primary: the reasoning kind diverts to the meta bucket.
+        let recording = record_bytes_with(
+            &out,
+            crate::termio::Caps {
+                primary: false,
+                meta: true,
+            },
+        );
         feed(
             &out,
             Step::Think("Weighing the options.\n\n"),

@@ -163,15 +163,29 @@ pub struct TermHandles {
     pub caret: tokio::sync::mpsc::UnboundedReceiver<CaretEvent>,
 }
 
-/// The stream token shared by Content → Render → Draw → TermIO (design doc
-/// §Render layer): content picks the stream, below it the only vocabulary is
-/// main / meta, so render and draw stay generic.
+/// The **kind** of an output write, shared by Content → Render → Draw → TermIO
+/// (design doc §Render layer). Content says *what* a write is; the sink — the
+/// primary stream or meta (stderr) — is TermIO's decision from caps (design
+/// §TermIO), so nothing above TermIO forks on a sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
-    /// Primary output (stdout).
-    Main,
-    /// Meta output (stderr) — reasoning when it is routed there.
-    Meta,
+    /// Primary content: screen content and its choreography. Always the
+    /// primary stream, terminal or not (a piped consumer still sees it).
+    Content,
+    /// Reasoning — the primary stream when it is a terminal, else meta.
+    Reasoning,
+    /// Error / system text — routed like [`Stream::Reasoning`], named apart so
+    /// the two can diverge later.
+    Error,
+}
+
+impl Stream {
+    /// Whether this kind's bytes land on the meta (stderr) sink under `caps`:
+    /// only the diverting kinds, and only when the primary is not a terminal.
+    /// Content always rides the primary, so a pipe still receives it.
+    fn targets_meta(self, caps: Caps) -> bool {
+        !matches!(self, Stream::Content) && !caps.primary
+    }
 }
 
 /// Per-stream terminal capabilities, probed once per process.
@@ -444,6 +458,20 @@ impl TermIO {
     /// [`Self::recording_degraded`]).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn recording() -> Self {
+        // A screen double: both streams are "terminals", so the diverting kinds
+        // ride the primary and the primary bucket holds the whole screen.
+        Self::recording_with(Caps {
+            primary: true,
+            meta: true,
+        })
+    }
+
+    /// A non-degrading recording double with `caps` pinned, so its bucket
+    /// routing is deterministic whatever the runner's streams are. `degrade` is
+    /// false: the double observes the *composed* bytes, not a real stream's
+    /// degraded form (that is [`Self::recording_degraded`]).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn recording_with(caps: Caps) -> Self {
         let (handles, input_tx, caret_tx, size_tx) = term_channels();
         drop(input_tx);
         drop(caret_tx);
@@ -453,7 +481,7 @@ impl TermIO {
                 meta: Vec::new(),
             },
             size_tx,
-            caps: Caps::probe(),
+            caps,
             degrade: false,
             handles: Some(handles),
         })
@@ -629,10 +657,12 @@ impl TermIO {
     // `Draw` owns the enum; [`Self::suspend`] / [`Self::resume`] /
     // [`Self::is_tty`] are the front door the manager forwards to.
 
-    /// Bytes to the stream's sink (design doc §TermIO `write`). Every byte
+    /// Bytes of kind `s` to their sink (design doc §TermIO `write`). Every byte
     /// `Draw` writes comes through here; the byte-edge tests read what
     /// [`recording`](Self::recording) holds at the same edge, and
-    /// [`null`](Self::null) discards.
+    /// [`null`](Self::null) discards. The kind → sink map is here alone
+    /// ([`Stream::targets_meta`]): `Content` to the primary, `Reasoning` /
+    /// `Error` to the primary when it is a terminal else meta.
     ///
     /// **The degradation edge** (design §TermIO): on a *real* stream that is
     /// not a terminal, every CSI / OSC-8 escape is stripped — zero-width, so
@@ -648,15 +678,20 @@ impl TermIO {
         } else {
             bytes
         };
+        let meta = s.targets_meta(self.caps());
         match self {
-            TermIO::Tty(_) => write_stdio(s, bytes),
+            TermIO::Tty(_) => write_stdio(meta, bytes),
             TermIO::Plain(p) => match &mut p.sink {
-                Sink::Stdio => write_stdio(s, bytes),
+                Sink::Stdio => write_stdio(meta, bytes),
                 #[cfg(any(test, feature = "test-helpers"))]
-                Sink::Recording { main, meta } => {
-                    match s {
-                        Stream::Main => main.extend_from_slice(bytes),
-                        Stream::Meta => meta.extend_from_slice(bytes),
+                Sink::Recording {
+                    main,
+                    meta: meta_buf,
+                } => {
+                    if meta {
+                        meta_buf.extend_from_slice(bytes);
+                    } else {
+                        main.extend_from_slice(bytes);
                     }
                     Ok(())
                 }
@@ -691,9 +726,10 @@ impl TermIO {
     /// degradation decision.
     fn stream_is_terminal(&self, s: Stream) -> bool {
         let caps = self.caps();
-        match s {
-            Stream::Main => caps.primary,
-            Stream::Meta => caps.meta,
+        if s.targets_meta(caps) {
+            caps.meta
+        } else {
+            caps.primary
         }
     }
 
@@ -704,10 +740,13 @@ impl TermIO {
         match self {
             TermIO::Tty(_) => Vec::new(),
             TermIO::Plain(p) => match &p.sink {
-                Sink::Recording { main, meta } => match s {
-                    Stream::Main => main.clone(),
-                    Stream::Meta => meta.clone(),
-                },
+                Sink::Recording { main, meta } => {
+                    if s.targets_meta(self.caps()) {
+                        meta.clone()
+                    } else {
+                        main.clone()
+                    }
+                }
                 _ => Vec::new(),
             },
         }
@@ -717,18 +756,15 @@ impl TermIO {
 /// Production sink: the real streams, flushed per write (a frame must be on
 /// screen before the next one is planned; there is no batching layer below
 /// this yet).
-fn write_stdio(s: Stream, bytes: &[u8]) -> io::Result<()> {
-    match s {
-        Stream::Main => {
-            let mut out = io::stdout();
-            out.write_all(bytes)?;
-            out.flush()
-        }
-        Stream::Meta => {
-            let mut err = io::stderr();
-            err.write_all(bytes)?;
-            err.flush()
-        }
+fn write_stdio(meta: bool, bytes: &[u8]) -> io::Result<()> {
+    if meta {
+        let mut err = io::stderr();
+        err.write_all(bytes)?;
+        err.flush()
+    } else {
+        let mut out = io::stdout();
+        out.write_all(bytes)?;
+        out.flush()
     }
 }
 
@@ -1378,43 +1414,52 @@ mod tests {
         assert!(!plain.is_tty());
     }
 
-    /// `recording()` captures bytes per stream and `null()` discards them —
-    /// the two test constructors the byte-edge tests record through (design
-    /// doc §Testing). Production writes are `Draw`'s writer today; these pin
-    /// the `TermIO::write` surface that will carry them.
+    /// A recording double captures bytes per sink and `null()` discards them —
+    /// the two test constructors the byte-edge tests record through (design doc
+    /// §Testing). Under a non-terminal primary the diverting kinds land in the
+    /// meta bucket, so the kind → sink map is visible across the two buckets.
     #[test]
-    fn recording_captures_per_stream_and_null_discards() {
-        let mut rec = TermIO::recording();
-        rec.write(Stream::Main, b"frame").unwrap();
-        rec.write(Stream::Meta, b"reason").unwrap();
-        rec.write(Stream::Main, b" more").unwrap();
-        assert_eq!(rec.recorded(Stream::Main), b"frame more");
-        assert_eq!(rec.recorded(Stream::Meta), b"reason");
+    fn recording_captures_per_sink_and_null_discards() {
+        let mut rec = TermIO::recording_with(Caps {
+            primary: false,
+            meta: true,
+        });
+        rec.write(Stream::Content, b"frame").unwrap();
+        rec.write(Stream::Reasoning, b"reason").unwrap();
+        rec.write(Stream::Content, b" more").unwrap();
+        assert_eq!(rec.recorded(Stream::Content), b"frame more");
+        assert_eq!(rec.recorded(Stream::Reasoning), b"reason");
+
+        // A screen double (tty caps) keeps everything on the primary.
+        let mut screen = TermIO::recording();
+        screen.write(Stream::Reasoning, b"on screen").unwrap();
+        assert_eq!(screen.recorded(Stream::Content), b"on screen");
 
         let mut sink = TermIO::null();
-        sink.write(Stream::Main, b"gone").unwrap();
-        assert_eq!(sink.recorded(Stream::Main), b"");
+        sink.write(Stream::Content, b"gone").unwrap();
+        assert_eq!(sink.recorded(Stream::Content), b"");
     }
 
     /// The degradation edge (design §TermIO): a *real* non-terminal stream is
-    /// stripped per stream from caps — `Main` when stdout is a pipe, `Meta`
-    /// when stderr is, each independently.
+    /// stripped per target — the primary when stdout is a pipe, meta when
+    /// stderr is, each independently. Content rides the primary; Reasoning
+    /// diverts to meta (the primary is not a terminal).
     #[test]
     fn the_edge_strips_a_non_terminal_stream_and_keeps_a_terminal_one() {
         let mut io = TermIO::recording_degraded(Caps {
             primary: false,
             meta: true,
         });
-        io.write(Stream::Main, b"\x1b[32mgreen\x1b[0m\x1b[K\n")
+        io.write(Stream::Content, b"\x1b[32mgreen\x1b[0m\x1b[K\n")
             .unwrap();
-        io.write(Stream::Meta, b"\x1b[2mdim\x1b[0m\n").unwrap();
+        io.write(Stream::Reasoning, b"\x1b[2mdim\x1b[0m\n").unwrap();
         assert_eq!(
-            io.recorded(Stream::Main),
+            io.recorded(Stream::Content),
             b"green\n",
             "a non-terminal primary is stripped"
         );
         assert_eq!(
-            io.recorded(Stream::Meta),
+            io.recorded(Stream::Reasoning),
             b"\x1b[2mdim\x1b[0m\n",
             "a terminal meta stream is left as composed"
         );
@@ -1425,9 +1470,10 @@ mod tests {
     #[test]
     fn the_recording_and_null_doubles_do_not_degrade() {
         let mut rec = TermIO::recording();
-        rec.write(Stream::Main, b"\x1b[32mgreen\x1b[0m\n").unwrap();
+        rec.write(Stream::Content, b"\x1b[32mgreen\x1b[0m\n")
+            .unwrap();
         assert_eq!(
-            rec.recorded(Stream::Main),
+            rec.recorded(Stream::Content),
             b"\x1b[32mgreen\x1b[0m\n",
             "raw bytes at the observation edge"
         );

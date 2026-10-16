@@ -522,9 +522,10 @@ pub fn pad_row(row: &str, term_w: usize) -> String {
 }
 
 /// A content write handed to the hub (design §Render): the bytes one block
-/// produced, plus the stream they ride. On the screen route (`Main`) the
-/// bytes are complete, pre-wrapped, line-cleared rows ending at a line
-/// boundary; on the `Meta` route they are raw (see [`Self::stream`]).
+/// produced, plus the **kind** of write it is. On the chain route (`Content`)
+/// the bytes are complete, pre-wrapped, line-cleared rows ending at a line
+/// boundary; on the diverting route (`Reasoning` / `Error`, raw — see
+/// [`Self::stream`]) they are as rendered.
 ///
 /// The payload is the bytes alone — the `\n` split **is** the row structure,
 /// so a separate count would be a second source of truth that can disagree.
@@ -534,29 +535,33 @@ pub fn pad_row(row: &str, term_w: usize) -> String {
 /// (see [`RenderManager::render`]).
 ///
 /// Content-specific classification stops *above* this type: the only
-/// vocabulary the design sends down with a write is `Stream` (main/meta),
-/// which rides with every write. `Main` is every write through
-/// the boundary chain — screen content, choreography included. `Meta` is
-/// the reasoning hand-off when content routed reasoning to the meta sink
-/// at setup — straight to `TermIO`, no choreography, byte-identical to
-/// the stderr bypass this replaced.
+/// vocabulary the design sends down with a write is `Stream` (the kind), which
+/// rides with every write. `Content` is every write through the boundary chain
+/// — screen content, choreography included. `Reasoning` is the hand-off that
+/// skips the chain (straight to `TermIO`, no choreography, byte-identical to
+/// the stderr bypass this replaced) when reasoning is diverted.
 pub struct ContentWrite {
     /// The block's bytes as Content produced them.
     pub bytes: Vec<u8>,
 
-    /// Which stream these bytes ride — the stream decision is content's,
-    /// made once at setup; below this the hub routes on the token and
-    /// stays stream-generic (design §Render: `ContentWrite { lines,
-    /// stream }`).
+    /// The kind of write — content's statement of *what* it is, not where it
+    /// goes; the sink is `TermIO`'s decision from caps (design §TermIO).
+    /// Below this the hub routes on the token and stays sink-generic (design
+    /// §Render: `ContentWrite { lines, stream }`).
     pub stream: crate::termio::Stream,
 }
 
-/// Repair a `Main` write's bytes at the watched `term_w`: force the line
+/// Repair a write's bytes at the watched `term_w`: force the line
 /// terminator, then re-wrap every row that exceeds `term_w`, entering each
 /// continuation with `\n\x1b[K`. Returns the repaired bytes and Render's row
 /// count — the newline count of the result, so Render's number cannot disagree
-/// with what it writes. `Meta` is skipped (the caller checks the stream):
-/// stderr never moves the screen's cursor, so nothing is repaired.
+/// with what it writes.
+///
+/// The net applies to **every kind** (design §Render layer): a diverting write
+/// lands on meta only when the primary is not a terminal — exactly when frames
+/// are dropped and the screen cache is already fiction — so no screen sees the
+/// bytes and the row count only matters where every write is a screen write.
+/// Render needs the width, never the sink, which is `TermIO`'s alone.
 ///
 /// This is the overwrite rule's last guard (ui_draw_261001): Draw clears per
 /// *terminal line* (an `EL` on each row's entry), so the only thing that
@@ -565,10 +570,7 @@ pub struct ContentWrite {
 /// status-bar remnant in the right margin). With no row past `term_w`, no write
 /// can cross onto an uncleared row; the per-row entry `EL` covers the rest, and
 /// no padding is needed.
-fn repair_main(w: &mut ContentWrite, term_w: usize) -> usize {
-    if w.stream != crate::termio::Stream::Main {
-        return 0;
-    }
+fn repair(w: &mut ContentWrite, term_w: usize) -> usize {
     let term_w = term_w.max(1);
     if w.bytes.is_empty() {
         return 0;
@@ -822,7 +824,7 @@ impl RenderManager {
             Some(mut w) => {
                 // Render owns the final guarantee: repair the bytes against the
                 // watched width, then read the row count back off them.
-                let rows = repair_main(&mut w, self.size.borrow().width);
+                let rows = repair(&mut w, self.size.borrow().width);
                 self.draw.draw(&frame, Some((&w, rows)));
             }
         }
@@ -1055,7 +1057,10 @@ mod tests {
         // then apply with no stack handed in.
         manager.configure(crate::render::FRAME_MAX_ROW_RATIO, stack);
         manager.render(None);
-        let bytes = manager.draw.term_io.recorded(crate::termio::Stream::Main);
+        let bytes = manager
+            .draw
+            .term_io
+            .recorded(crate::termio::Stream::Content);
 
         assert_eq!(
             manager.painted_size(),
@@ -1105,7 +1110,7 @@ mod tests {
             manager
                 .draw
                 .term_io
-                .recorded(crate::termio::Stream::Main)
+                .recorded(crate::termio::Stream::Content)
                 .is_empty(),
             "a frame must not reach a piped primary"
         );
@@ -1117,10 +1122,13 @@ mod tests {
         // Content still flows — stripped at the edge, text only.
         manager.render_content(crate::render::ContentWrite {
             bytes: b"\x1b[32mgreen\x1b[0m\x1b[K\n".to_vec(),
-            stream: crate::termio::Stream::Main,
+            stream: crate::termio::Stream::Content,
         });
         assert_eq!(
-            manager.draw.term_io.recorded(crate::termio::Stream::Main),
+            manager
+                .draw
+                .term_io
+                .recorded(crate::termio::Stream::Content),
             b"green\n",
             "content survives as stripped text"
         );
@@ -1337,12 +1345,12 @@ mod tests {
         assert_eq!(pad_row("abcde", 4), "abcde"); // never truncates
     }
 
-    // ---- repair_main (Render width enforcement) ----
+    // ---- repair (Render width enforcement) ----
 
     fn main_write(bytes: &[u8]) -> ContentWrite {
         ContentWrite {
             bytes: bytes.to_vec(),
-            stream: crate::termio::Stream::Main,
+            stream: crate::termio::Stream::Content,
         }
     }
 
@@ -1352,18 +1360,18 @@ mod tests {
     #[test]
     fn repair_forces_the_terminator_and_counts_rows() {
         let mut w = main_write(b"ab");
-        assert_eq!(repair_main(&mut w, 40), 1);
+        assert_eq!(repair(&mut w, 40), 1);
         assert_eq!(w.bytes, b"ab\n", "a `\\n`-less tail is terminated");
 
         let mut w = main_write(b"a\nb\n");
-        assert_eq!(repair_main(&mut w, 40), 2);
+        assert_eq!(repair(&mut w, 40), 2);
         assert_eq!(w.bytes, b"a\nb\n", "a terminated block is unchanged");
 
         let mut w = main_write(b"\n");
-        assert_eq!(repair_main(&mut w, 40), 1, "a blank row is still a row");
+        assert_eq!(repair(&mut w, 40), 1, "a blank row is still a row");
 
         let mut w = main_write(b"");
-        assert_eq!(repair_main(&mut w, 40), 0);
+        assert_eq!(repair(&mut w, 40), 0);
         assert!(w.bytes.is_empty());
     }
 
@@ -1373,24 +1381,28 @@ mod tests {
     #[test]
     fn repair_rewraps_an_over_wide_row_and_re_arms_the_clear() {
         let mut w = main_write(b"\x1b[Kabcdef\n");
-        assert_eq!(repair_main(&mut w, 3), 2);
+        assert_eq!(repair(&mut w, 3), 2);
         assert_eq!(w.bytes, b"\x1b[Kabc\n\x1b[Kdef\n");
 
         // Fits: no invented break.
         let mut w = main_write(b"\x1b[Kabc\n");
-        assert_eq!(repair_main(&mut w, 3), 1);
+        assert_eq!(repair(&mut w, 3), 1);
         assert_eq!(w.bytes, b"\x1b[Kabc\n");
     }
 
-    /// `Meta` is raw: stderr never moves the screen's cursor, so a meta write is
-    /// neither terminated nor wrapped, and contributes no rows.
+    /// The net is kind-blind (design §Render layer): a diverting kind is
+    /// repaired like any other, because when it lands on meta no screen sees it
+    /// — the row count only matters where every write is a screen write.
     #[test]
-    fn repair_leaves_the_meta_route_raw() {
+    fn repair_is_kind_blind() {
         let mut w = ContentWrite {
             bytes: b"raw tail".to_vec(),
-            stream: crate::termio::Stream::Meta,
+            stream: crate::termio::Stream::Reasoning,
         };
-        assert_eq!(repair_main(&mut w, 3), 0);
-        assert_eq!(w.bytes, b"raw tail");
+        assert_eq!(repair(&mut w, 40), 1);
+        assert_eq!(
+            w.bytes, b"raw tail\n",
+            "the terminator is forced regardless"
+        );
     }
 }
