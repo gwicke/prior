@@ -100,10 +100,10 @@ and link a doc/ and/or commit hash
   - [ ] follow-up: track the line-terminator / width repairs back into content — Render's enforcement
     is a net, not the plan (impl doc)
   - [ ] `tests/confirm_raw_mode.rs` confirm-dialog paint test (refactor fallout)
-  - [~] step 6 — output kinds + backend-owned routing. 6a: kind vocabulary (`Stream { Content,
-    Reasoning, Error }`) + TermIO kind → sink, kind-blind `repair`, Draw writes content with its kind
-    (`68c78eb`). Remaining: `Frame` as a `Draw → TermIO` target, `TermGuard` through the edge, the
-    recording doubles converge; impl doc
+  - [x] Step 6: output kinds + backend-owned routing — 6a kind vocabulary (`Stream { Content,
+    Reasoning, Error }`) + TermIO kind → sink (`68c78eb`); 6b `Frame` as a `TermIO::write_frame`
+    target, the `paints_frames` gate leaves Draw (`812cc11`); 6c the mode guard's escapes gate on the
+    primary + the recording doubles converge (`dc50205`)
   - [x] Step 5: delete `output.rs` (§8.5) — 5a/5b/5c (drawing verbs retire; the confirm half retires,
     no-port path denies; capture moves to Content and a capturing write never reaches render()); 5d
     (5d-i quiet + input source; 5d-ii the tap seam and `ConsoleOutput` go; `AgentConfig.output`

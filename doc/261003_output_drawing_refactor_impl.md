@@ -17,36 +17,9 @@ what remains and the decisions worth keeping. Do not refer to this document from
   padded row fills the last cell with no byte beyond it, so on a terminal whose deferred wrap wants
   a following byte it is the edge to confirm end-to-end. `pad_row` fills to `term_w` for the same
   reason.
-
-### Next — step 6: output kinds, backend-owned routing
-
-The kind vocabulary (`Stream { Content, Reasoning, Error }`) and TermIO-owned routing landed (git
-log); `repair` is kind-blind and Draw no longer forks on the sink. What remains is the `Frame`
-target and its consequences.
-
-Remaining (rough commit order; git log records what landed):
-
-- **`Frame` target.** `Frame` is a Draw → TermIO distinction, not a `Stream` variant:
-  `TermIO::write_frame` (or a two-variant `TermTarget { Content(Stream), Frame }`). Draw's
-  frame-side writes — `plan_consume`'s walk, `apply`/`draw_frame`/`reposition`, the caret show/hide,
-  the re-anchor — carry it; the content write keeps its kind, and the consume never rewrites content
-  bytes, so the drop leaves them intact. This also lets the 5f `paints_frames` gate leave `Draw`:
-  TermIO drops `Frame`.
-- **`TermGuard` routes through the edge.** It is a TermIO concern already (`TtyIo` owns it), but the
-  fix keys on the **target** cap, not the backend kind — an interactive stdin can have a piped
-  primary (`picocode > out.txt`), which is exactly the leak. Route the guard's CSI (bracketed paste,
-  kitty keyboard, cursor) through the write edge, gated on `caps.primary`.
-- **Recording doubles converge on one real backend.** `recording`/`recording_with`/`recording_degraded`
-  are three constructors around the 5f `degrade` flag: a screen double, a caps-pinned non-degrading
-  double, and a caps-pinned degrading one. Collapse to one real backend taking caps; the byte-edge
-  suite pins screen caps and the degradation tests pipe caps. `Content`'s caps must match for colour
-  and routing, so build it over the recording backend rather than swapping the sink after
-  construction.
 - **Non-tty width (CLI)** is independent geometry — the `term_w` hard requirement exists only so a
-  wrapped row cannot defeat the per-row entry `EL`, and a pipe has no screen. Accepted: keep the
-  80 fallback (`TermSize::default` via `probe`'s `Err` arm) for now; make it configurable later if
-  wanted.
-- **`--quiet` is unaffected** by all of this — it drops the hub hand-off entirely; keep it that way.
+  wrapped row cannot defeat the per-row entry `EL`, and a pipe has no screen. Accepted for now: the
+  80 fallback (`TermSize::default` via `probe`'s `Err` arm); make it configurable later if wanted.
 
 ### Follow-up — track the repairs back into content
 

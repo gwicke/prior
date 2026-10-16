@@ -61,7 +61,8 @@ the agent holds a `Content` handle (never the hub); confirmation keeps its own `
 - source: content/*; files: text.rs, markdown.rs, panel.rs, preview.rs, composition.rs
 - Owns all content classification: kinds (`ContentDisplayKind`), boundary / separator bookkeeping
   (today's separator matrix, `last_content_*`, `held_blank`). None crosses below: the only
-  vocabulary going down is `Stream` (main / meta).
+  vocabulary going down is `Stream`, the write's kind (`Content` / `Reasoning` / `Error`) — the sink
+  is TermIO's.
 - Holds a cloned width-watch handle (from TermIO at setup) and formats at the current watched width
   before each block — no hub round-trip — then hands a `ContentWrite { bytes, stream }` to
   `render()`. `bytes` are complete, pre-wrapped, line-cleared screen rows ending at a line boundary;
@@ -150,15 +151,19 @@ pub trait RenderElement {
 // Elements are reused across compositions (UI layer) — shared and dynamic.
 type Element = Arc<Mutex<dyn RenderElement + Send + Sync>>;
 
-/// A content write handed to render(): the block's bytes + the stream. The
+/// A content write handed to render(): the block's bytes + its kind. The
 /// `\n` split is the row structure; Render repairs the bytes (terminator,
 /// width) and reads the row count back off them. All content-specific
 /// classification stays above this interface; below it the only vocabulary
-/// is main / meta, so Render and Draw stay generic.
+/// is the kind, so Render and Draw stay sink-generic.
 pub struct ContentWrite { bytes: Vec<u8>, stream: Stream }
 
-/// The stream token shared by Content → Render → Draw → TermIO.
-pub enum Stream { Main, Meta }
+/// The kind of an output write, shared by Content → Render → Draw → TermIO.
+/// Content says *what* a write is; TermIO maps the kind to a sink from caps:
+/// Content → primary; Reasoning/Error → primary when it is a terminal, else
+/// meta. Frame bytes are a separate TermIO target (`write_frame`), dropped on
+/// a real non-terminal primary.
+pub enum Stream { Content, Reasoning, Error }
 
 pub struct RenderManager {
     stack: Vec<Element>,
@@ -234,10 +239,11 @@ impl Draw {
   boundary bookkeeping is content's, not the screen's. Writer + cache become this layer's fields,
   so the lock order is encapsulated once.
 - Caps are cached here per stream from `TermIO::caps()` at construction — collapses the 7
-  `is_terminal()` sites (1950…3779 in output.rs) into two decisions (primary, meta).
-- Streams: `ContentWrite.stream` picks the sink — main → primary, meta → meta. The stream decision
-  (e.g. reasoning → meta when meta carries it to stderr — caps, decided once at setup) is Content's.
-  Frames target TTY primary only — no UI-on-stderr case.
+  `is_terminal()` sites (1950…3779 in output.rs) into one `Caps { primary, meta }`.
+- Kinds: `ContentWrite.stream` is the write's *kind*; `TermIO` owns the kind → sink map from caps
+  (Content → primary; Reasoning/Error → primary when it is a terminal, else meta). Content decides
+  only the *route* (through the boundary chain, or the raw reasoned hand-off). Frame bytes are a
+  separate TermIO target (`write_frame`) and target the TTY primary only — no UI-on-stderr case.
 - `output.rs` dissolves: content verbs enter through render(), drawing verbs are Draw's, interactive
   verbs are repl dialogs / TermIO's. The five no-op drawing stubs and their dummy `(w, h)` returns
   disappear with the verbs.
@@ -270,9 +276,12 @@ pub enum TermIO {
 
 impl TermIO {
     fn handles(&mut self) -> TermHandles;
-    // Per-stream caps: primary (stdout) and meta (stderr) can disagree.
-    fn caps(&self, s: Stream) -> Caps;
+    // Primary (stdout) and meta (stderr) can disagree.
+    fn caps(&self) -> Caps;
+    // Kind → sink from caps; the strip is per *target*.
     fn write(&mut self, s: Stream, bytes: &[u8]) -> io::Result<()>;
+    // Frame bytes: the primary, dropped on a real non-terminal primary.
+    fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()>;
     fn size(&self) -> TermSize;
     fn suspend(&mut self) -> io::Result<()>;
     fn resume(&mut self) -> io::Result<()>;
@@ -294,15 +303,19 @@ impl TermIO {
   `reader_paused` entirely (including `$EDITOR`'s hand-off); all five `Output::cursor_row()`
   re-anchor sites (repl ×4, editor ×1) dissolve into it.
 - `suspend()` stops the reader and drops raw mode ($EDITOR, Ctrl-Z); `resume()` reverses it. Upper
-  layers reach it only through the RenderManager / Draw pass-throughs.
-- Two variants only. Constructors over Plain, not variants: `recording()` (memory writers,
-  `#[cfg(test)]`) and `null()` (sinkhole). `--quiet` is not a backend: it selects Plain, whose answer
-  is printed from `run_once`'s return (main.rs:366).
-- Degradation: layers above always emit ANSI + OSC-8; a `StripAnsi` writer wrapper (per stream from
-  caps) strips CSI/OSC-8 at the very edge — zero-width, so geometry is untouched. Non-tty primaries
-  additionally drop frames wholesale at Draw. Both are a property of a **real** stream: the
-  `recording()`/`null()` doubles observe the *composed* bytes (no strip, frames kept), and a
-  `recording_degraded(caps)` double stands in for a real stream so the degradation is testable.
+  layers reach it only through the RenderManager / Draw pass-throughs. The mode guard's own escapes
+  (bracketed paste, kitty keyboard, cursor) are primary-stream writes: emitted only when the primary
+  is a terminal, so a redirected primary (`picocode > out.txt`) does not collect them. Raw mode
+  itself is unconditional — a stdin concern.
+- Two variants only. Constructors over Plain, not variants: `recording_with(caps)` (a real backend
+  with pinned caps; `recording()` is the screen-caps shorthand) and `null()` (sinkhole). `--quiet`
+  is not a backend: it selects Plain, whose answer is printed from `run_once`'s return (main.rs:366).
+- Degradation: layers above always emit ANSI + OSC-8; a `StripAnsi` wrapper (per *target* stream from
+  caps) strips CSI/OSC-8 at the very edge — zero-width, so geometry is untouched. A real non-terminal
+  primary additionally drops frames wholesale, now at `TermIO::write_frame`, and the mode guard's
+  escapes (bracketed paste, kitty keyboard, cursor) gate on the same primary cap. A recording double's
+  **caps** decide whether it degrades: screen caps keep the byte edge composed, pipe caps exercise the
+  degradation; `null` is the one non-degrading sinkhole.
 - **Width is exposed because it cannot degrade late**: wrapping, table columns, panel and bar fit
   are decided at render time and destructive: a wrapped line cannot be unwrapped. ANSI is
   recoverable, geometry is not; height feeds only the frame budget.
