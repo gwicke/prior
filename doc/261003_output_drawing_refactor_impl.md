@@ -38,6 +38,14 @@ unreliable, **not** a second half of the width requirement. Add it only if such 
 
 Decisions not obvious from the code or the design.
 
+- **Terminal teardown is owned by `run_interactive`'s exit, not `TermGuard`'s `Drop`.** The drop
+  backstop is unreachable at process exit: the persistent stdin reader holds an `Arc` clone for the
+  process lifetime, and `main` returning kills the thread without unwinding it. The prompt loop's
+  exit therefore calls the front door (`suspend`) explicitly; the panic hook reaches the same guard
+  through `termio::emergency_stop` (a process-global registered by `TermIO::tty`), and
+  `main`'s `process::exit` path calls it too since exit skips destructors. Ctrl-C never needed this:
+  the reader stops the guard inline before exiting. `tests/quit_restores_cooked_mode.rs` pins it on
+  a real pty.
 - **Width enforcement and padding solve different problems.** Clearing is per *terminal line*, so
   the only thing that defeats it is a row wide enough to wrap — that is the leak, and width
   enforcement (never exceed `term_w`) is the fix. Padding to `term_w` is redundant while the entry
