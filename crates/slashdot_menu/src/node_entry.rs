@@ -4152,6 +4152,41 @@ mod tests {
         );
     }
 
+    /// 4i-b: on the engine path — a real listing node whose `data()` mints a
+    /// fresh `DataResponse` every call — a cursor move yields a *stable*
+    /// `ViewRows` handle: `plan.view` is the same `Arc` across evals, so
+    /// `ElementSet::update` sees `same_panel` and moves figures instead of
+    /// rebuilding. 4h-e's crate tests reached this only with a hand-built
+    /// plan; `refresh_data`'s content-equality fallback is what makes it hold
+    /// here.
+    #[test]
+    fn cursor_move_keeps_the_engine_view_handle() {
+        let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b")]);
+        let plan_of = |r: MenuResult| match r {
+            MenuResult::Continue(p, _) => p,
+            other => panic!("expected Continue, got {:?}", other),
+        };
+        let first = plan_of(futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        )));
+        let moved = plan_of(futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::MoveCursor(1),
+            Vec::new(),
+            "",
+            &rctx(),
+        )));
+        let (a, b) = (first.view.as_ref().unwrap(), moved.view.as_ref().unwrap());
+        assert!(
+            Arc::ptr_eq(a, b),
+            "the view handle is carried across a cursor move"
+        );
+    }
+
     #[test]
     fn same_content_compares_rows_and_active_ids_as_a_set() {
         let base = DataResponse {
