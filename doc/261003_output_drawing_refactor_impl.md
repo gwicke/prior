@@ -703,35 +703,22 @@ most runway to expand into separate sub-commits.
    no-copy row iterator for filtered and unfiltered views alike.
 
   - **4i — the engine memoizes `data()` responses; the carry holds on the production path.**
-  *(planned — lands before step 5; surfaced by **4h-f**, promoted from the deferred list.)*
-  **4h-e**'s no-rebuild ideal holds only in the crate's tests, where a hand-built plan carries a
-  stable `Arc<ViewRows>`; on the real menu path every cursor eval rebuilds the element set.
-  Measured: `refresh_data` (`node_entry.rs:851`) gates "changed" on `Arc::ptr_eq(prev, &response)`,
-  so a node minting a fresh `DataResponse` per call always reports change → `slots_dirty` (`:908`)
-  → `ensure_rows` (`:923`) mints a fresh `Arc<ViewRows>` → `RenderPlan.view` is new →
-  `ElementSet::update`/`same_panel` (`elements.rs:463`) sees a new handle → `Update::Rebuilt`.
-  Only `ModelNode` (`v25_model.rs:194`) memoizes; `StaticListingNode` (`node_impl.rs:469`) and the
-  other v25 nodes mint per call, and a parent's `changed` ORs every child, so one such child
-  rebuilds the whole level — at the root that is nearly every node. Pixels are right either way;
-  what is lost is the flicker-free carry.
-
-  **Approach: one engine-side content-equality fallback, not per-node memoization.** In
-  `refresh_data`, when `ptr_eq` fails, compare content and reuse the stored `Arc` when equal —
-  `changed` stays false, and the reused `Arc` is written into this slot so a sibling's change
-  cannot churn it. `DataResponse` gains `same_content`: `rows` compared directly (order is the
-  display order), `active_ids` as a *set* (`StaticListingNode` drains a `HashSet`; consumers only
-  insert into sets). Central by choice: it covers every node and the `value_forwarding` enrichment
-  (`node_entry.rs:263`) forever, and a new node cannot silently regress the carry. `ptr_eq` stays
-  the fast path, so large memoizing lists (`/model`) pay nothing; only small non-memoizing nodes
-  do an O(rows) compare, and genuinely dynamic lists (`/session`, `/tree`, `/sandbox`)
-  compare-unequal as they should.
-
-  Sub-commits:
-  - **4i-a** — `same_content` + the `refresh_data` fallback; crate test: equal-but-fresh responses
-    leave `slots_dirty` clear and reuse the handle across evals.
-  - **4i-b** — restore the repl-level carry assertion dropped in **4h-f**: a production `/`-menu
-    cursor move yields `Update::Moved` through the real `StaticListingNode`-backed tree (not a
-    hand-built plan).
+    *(landed — `237d9ab` 4i-a, `48e5e96` 4i-b, `bff9c63` 4i-c; surfaced by **4h-f**.)*
+    The engine half is `DataResponse::same_content` + the `refresh_data` content-equality fallback:
+    when `ptr_eq` fails, equal content contributes no change and the *stored* `Arc` is reused
+    (4i-a), so the carry holds without per-node memoization. 4i-b pins it through the real engine —
+    a listing node that mints per call keeps the same `plan.view` `Arc` across a cursor move (it
+    fails without the fallback).
+    The audit of large-row producers (4i-c) found only `/session` unmemoized; `ModelNode` and
+    `TreeListNode` already key on a data identity. `SessionListNode` now memoizes on a monotonic,
+    *mtime-driven* repo listing generation plus the current session id; the repo's 2s time-based
+    debounce is gone (validation is per-file mtime). `/tree`/`/sandbox` inherit the fallback and
+    compare unequal only when their content actually changes — neither needs a node-level memo.
+    Leftovers, none blocking step 5:
+    - `list_sessions_overlay` now stats the session files on every eval call (no time window). That
+      is the deliberate trade the audit made — mtime checks over a clock. If a cwd ever holds enough
+      sessions for the per-call stat to matter, the top-level dir enumeration could be pinned to
+      `base_dir`'s own mtime; not needed today.
 
 Follow-ups step 3 leaves here — each claimed by a commit above unless noted:
 

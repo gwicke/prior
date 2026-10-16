@@ -87,8 +87,8 @@ and link a doc/ and/or commit hash
     selection state + its place in the configured stack, out-of-crate callers, cleanup);
     4h-g4 (the bar pulls every fact live: identity + model fields off `AppState`, one shared
     estimate fallback read by the bar and `/stat`)
-  - [ ] 4i: engine memoizes child `data()` responses so the no-rebuild carry holds on the
-    production menu path (today only the crate's hand-built plans do) — `same_content` fallback in
-    `refresh_data` (4i-a) + restored repl carry test (4i-b); detail in the impl doc. Lands before
-    Step 5.
+  - [x] 4i: engine memoizes child `data()` responses so the no-rebuild carry holds on the
+    production menu path — `same_content` fallback in `refresh_data` (4i-a, `237d9ab`), engine-path
+    carry test (4i-b, `48e5e96`), and the large-row producer audit + `/session` memo on an
+    mtime-driven listing generation (4i-c, `bff9c63`); detail in the impl doc.
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)
