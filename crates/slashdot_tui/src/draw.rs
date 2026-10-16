@@ -17,7 +17,7 @@
 //! [`crate::render`].
 
 use crate::ansi::{display_width, HIDE_CURSOR, SHOW_CURSOR};
-use crate::render::Frame;
+use crate::render::{ContentWrite, Frame};
 use crate::termio::{TermHandles, TermIO, TermSize};
 use tokio::sync::watch;
 
@@ -96,7 +96,7 @@ pub struct DrawCache {
     /// The frame taken by a batch's *first* consume, held until the batch
     /// ends.
     ///
-    /// Needed because the hub's `reposition_area` falls back to `taken` when
+    /// Needed because [`Draw::reposition`] falls back to `taken` when
     /// no element stack is configured — reachable in production by a direct
     /// `draw_frame` (`ui::resolve`'s empty frame), which applies a frame with
     /// no composition behind it. Without this stash a batch would consume
@@ -744,10 +744,105 @@ impl Draw {
     /// bookkeeping — a stderr write does not move the screen's cursor, so
     /// there is no consume, row count or cache note to keep for it, and
     /// the byte edge records the two streams apart (design §TermIO: one
-    /// `write`, per-stream sinks). Reached only from `put_content`'s
+    /// `write`, per-stream sinks). Reached only from [`Self::draw`]'s
     /// meta branch, above content's hand-off.
     pub fn write_meta(&mut self, bytes: &[u8]) {
         let _ = self.term_io.write(crate::termio::Stream::Meta, bytes);
+    }
+
+    // --- the frame + content merge (design §Draw) ---------------------
+
+    /// The one verb the hub calls (design §Draw): apply `frame` alone for a UI
+    /// paint (`content == None`), or append `content` to scrollback —
+    /// consuming the live frame's rows — then put `frame` back below it.
+    ///
+    /// The manager composes `frame` first and hands it down; Draw does the
+    /// writing. A `Meta` write goes straight to the meta sink, with no
+    /// choreography: stderr never moves the screen's cursor.
+    pub fn draw(&mut self, frame: &Frame, content: Option<&ContentWrite>) {
+        let Some(w) = content else {
+            self.apply(frame);
+            return;
+        };
+        if w.stream == crate::termio::Stream::Meta {
+            self.write_meta(&w.bytes);
+            return;
+        }
+        let th = self.size.borrow().height.max(1);
+        // Consume, then write (ui_draw_v2 §4.5 P1): the walk goes ahead of the
+        // bytes, and the block follows carrying its own per-line clears.
+        let (walk, taken) = match plan_consume(&mut self.cache) {
+            Some((walk, frame)) => (walk, Some(frame)),
+            None => (String::new(), None),
+        };
+        if !walk.is_empty() {
+            self.write_bytes(walk.as_bytes());
+        }
+        // The write's bytes as handed down by the manager. A capture is the
+        // manager's call (it hands an empty write instead), so Draw stays
+        // capture-agnostic — and a write the tap emptied still advances the
+        // cursor by its row count below.
+        self.write_bytes(&w.bytes);
+        let rows = w.rows;
+        if rows > 0 {
+            self.cache.note_lines(rows, th);
+        }
+        // The area comes back below what was just written, deferred while a
+        // batch is open (ui_draw_v2 R5). The consume's rows ride along for the
+        // below-frame clear (`old_h - h_new - consumed_rows`).
+        if taken.is_some() || self.cache.deferred.is_some() {
+            self.cache.consumed_rows += rows;
+        }
+        let Some(taken) = taken else {
+            return;
+        };
+        if self.cache.batch_active {
+            // Keep the *first* frame taken: it is the fallback when no stack
+            // re-composes, and a later write finds nothing to consume.
+            if self.cache.deferred.is_none() {
+                self.cache.deferred = Some(taken);
+            }
+            return;
+        }
+        // `frame` is the manager's fresh composition; a raw `draw_frame` with
+        // no composition behind it leaves it empty, and the consumed frame is
+        // then the honest thing to put back.
+        let frame = if frame.height() == 0 { &taken } else { frame };
+        self.reposition(frame, taken.height());
+    }
+
+    /// Apply `frame` as a UI paint (plan §4.3–4.4): plan the bytes, write them,
+    /// follow the frame's caret, and remember the size that was applied.
+    fn apply(&mut self, frame: &Frame) {
+        let (tw, th) = self.watched_dims();
+        let applied = self.draw_frame(frame, ApplyPolicy::Frame, (tw, th));
+        self.cache.applied = Some(applied);
+    }
+
+    /// Paint a frame **below the cursor** — a reposition: the content write left
+    /// the cursor on the seam, and the block paints forward from there. `old_h`
+    /// is the height of the frame the consume took, so `paint_forward` clears
+    /// the rows nothing overwrote.
+    ///
+    /// A frame with no rows has nothing to put back: `ui::resolve` clears a
+    /// dialog by applying `Frame::empty()`, and a content write right after it
+    /// consumes a zero-height area. Returning early — and clearing the
+    /// accumulator, so a stale count cannot misplace the next reposition's
+    /// below-frame clear — is the honest answer.
+    pub fn reposition(&mut self, frame: &Frame, old_h: usize) {
+        if frame.height() == 0 {
+            self.cache.consumed_rows = 0;
+            return;
+        }
+        let (tw, th) = self.watched_dims();
+        let bytes = plan_reposition(&mut self.cache, frame, old_h, tw, th);
+        self.write_bytes(bytes.as_bytes());
+    }
+
+    /// The watched geometry, floored the way every frame path floors it.
+    fn watched_dims(&self) -> (usize, usize) {
+        let s = *self.size.borrow();
+        (s.width.max(1), s.height.max(1))
     }
 
     // --- the TermIO pass-throughs (design §3: content / UI never name it) --

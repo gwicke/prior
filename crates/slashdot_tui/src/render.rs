@@ -21,21 +21,20 @@
 //! The manager is also content's only way onto the screen: the
 //! content path hands each formatted block over as a [`ContentWrite`]
 //! (`render_content` / `render_batch`), and nothing above the manager
-//! writes bytes of its own. It is batching's and reposition's home
-//! (the guard, and the element stack reposition re-composes), with the
-//! design's shape complete: [`RenderManager::configure`] is the
-//! membership verb — the owner of what is on screen installs the element
-//! stack on each state transition — and [`RenderManager::render`] takes
-//! only the optional [`ContentWrite`], composing the *configured* stack for
-//! the UI half (`render(None)`) or running the write choreography for the
-//! content half (`render(Some(w))`). Nothing is handed in per paint:
+//! writes bytes of its own. It is batching's home (the guard, which defers
+//! [`Draw`]'s reposition), with the design's shape complete:
+//! [`RenderManager::configure`] is the membership verb — the owner of what
+//! is on screen installs the element stack on each state transition — and
+//! [`RenderManager::render`] prepares the frame from the *configured* stack
+//! and hands it down with the optional [`ContentWrite`] to [`Draw::draw`],
+//! which merges them (design §Draw). Nothing is handed in per paint:
 //! membership changes on transitions, never at paint.
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::ansi::display_width;
-use crate::draw::{el_if_short, plan_consume, plan_reposition, ApplyPolicy, Draw};
+use crate::draw::{el_if_short, ApplyPolicy, Draw};
 use crate::termio::{CaretEvent, TermHandles, TermIO, TermSize};
 use tokio::sync::watch;
 
@@ -572,16 +571,17 @@ pub struct RenderManager {
     /// bookkeeping, owned — the design's `Draw { … }` under this roof. Plain
     /// fields inside; this manager's `Mutex` is what serializes them.
     draw: Draw,
-    /// The capture tap (design §Content): while open, each
-    /// [`ContentWrite`]'s bytes stop here instead of reaching the screen.
-    /// Content bytes only — frame bytes can never be caught, which is the
-    /// deliberate narrowing over the old writer swap.
+    /// The capture tap (design §Content): while open, each `Main` write's
+    /// bytes are recorded here at the content-emit boundary — before any
+    /// width enforcement — and handed on empty, so the screen keeps the
+    /// content out. Content bytes only; frame bytes can never be caught, which
+    /// is the deliberate narrowing over the old writer swap.
     captured: Option<Vec<u8>>,
     /// The configured long-lived element stack — bar, input, blank row, plus
     /// the overlay/confirm when one is open — installed by [`Self::configure`]
     /// (the repl owns membership, design §Render: "the manager's `stack` is
     /// configured **by the repl**"). [`Self::render`] composes exactly this,
-    /// and [`Self::reposition_area`] re-composes it when a content write
+    /// and [`Draw::reposition`] re-composes it when a content write
     /// brings the area back, so the frame is current by construction
     /// (re-rendering the configured elements is cheap and always reads the
     /// live state, where a snapshot of the rendered rows would freeze
@@ -722,7 +722,7 @@ impl RenderManager {
     /// **repl** calls this on every state transition that changes what is on
     /// screen (open/close/change an overlay, open/clear a confirm, submit
     /// clear, commit); [`Self::render`] then composes exactly what is
-    /// configured, with nothing handed in per paint. `reposition_area`
+    /// configured, with nothing handed in per paint. [`Draw::reposition`]
     /// re-composes the same stack to bring the area back after a content
     /// write.
     pub fn configure(&mut self, frame_max_row_ratio: f32, frame_elements: Vec<Element>) {
@@ -751,44 +751,68 @@ impl RenderManager {
         self.budget(self.size.borrow().height.max(1))
     }
 
-    /// Allocate → render → apply, painting through the manager's [`Draw`].
+    /// Compose, then merge with the content — the design's round trip
+    /// (§Render, §Draw): a UI paint is `render(None)`; a content write is
+    /// `render(Some(w))`. The manager prepares the frame — the *configured*
+    /// stack read at the watched size — and hands frame + content to
+    /// [`Draw::draw`], which does the writing.
     ///
-    /// No dims, no stack, no return (design §Render):
-    /// both halves read the watched size and the configured [`Self::stack`],
-    /// so a resize applies lazily at the next `render` and a caller keys off
-    /// the resize event plus [`Self::painted_size`], never off a size this
-    /// verb returns. `ApplyPolicy::Frame` is the one policy the frame path
-    /// takes — `render` is the UI face verb, and no `render` caller has ever
-    /// passed `Append`.
-    ///
-    /// Two halves, one verb (design §Render's round trip, `render(content)`):
-    /// a UI paint is `render(None)` — compose the configured stack and apply
-    /// it; a content write is `render(Some(w))` — the write choreographed
-    /// against the live frame, with no frame of its own composed (the write
-    /// consumes the live one and [`Self::reposition_area`] brings it back).
+    /// No dims, no stack, no return: both halves read the watched size and the
+    /// configured [`Self::stack`], so a resize applies lazily at the next
+    /// `render` and a caller keys off the resize event plus
+    /// [`Self::painted_size`], never off a size this verb returns.
     pub fn render(&mut self, content: Option<ContentWrite>) {
-        // The UI half (§Render): compose the *configured* stack — the
-        // membership the repl installed with `configure` — and apply it.
-        // Nothing is handed in: paint renders whatever is configured, which
-        // is what makes membership a transition concern rather than a
-        // per-paint one.
-        if !self.stack.is_empty() {
-            let size = *self.size.borrow();
-            let (tw, th) = (size.width.max(1), size.height.max(1));
-            let asks: Vec<RowAsk> = self.stack.iter().map(|e| e.ask(tw)).collect();
-            // The page-scroll path needs the rows element's grant *before* the
-            // frame is rendered, and this is the only place `allocate` runs for
-            // a composition — so a caller that has to know re-runs it over the
-            // same asks rather than asking the painter to guess twice.
-            let heights = allocate(&asks, th, self.budget(th));
-            let frame = render(&self.stack, &heights, tw);
-            let applied = self.draw.draw_frame(&frame, ApplyPolicy::Frame, (tw, th));
-            self.draw.cache.applied = Some(applied);
+        // Nothing configured and nothing to write: no frame to compose, no
+        // area to paint. (A content write with an empty stack still runs: it
+        // has bytes to place.)
+        if self.stack.is_empty() && content.is_none() {
+            return;
         }
-        // The content half: the write choreographed against the live frame.
-        if let Some(content) = content {
-            self.put_content(content);
+        let frame = self.compose();
+        match content {
+            None => self.draw.draw(&frame, None),
+            Some(mut w) => {
+                // The tap first — at the content-emit boundary, so what is
+                // recorded is what Content produced, before enforcement. The
+                // write is handed on empty, but its row count stands, so the
+                // cursor advance and the choreography run either way.
+                let swallow = self.capture_tap(&w);
+                if swallow {
+                    w.bytes.clear();
+                }
+                self.draw.draw(&frame, Some(&w));
+            }
         }
+    }
+
+    /// Record a `Main` write's bytes at the content-emit boundary (design
+    /// §Content) — before any width enforcement — returning whether the screen
+    /// must keep them out. The `Meta` route is never captured: diverted
+    /// reasoning was never on the screen's path.
+    fn capture_tap(&mut self, w: &ContentWrite) -> bool {
+        if w.stream != crate::termio::Stream::Main {
+            return false;
+        }
+        match self.captured.as_mut() {
+            Some(cap) => {
+                cap.extend_from_slice(&w.bytes);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Compose the configured [`Self::stack`] into a frame at the watched size
+    /// — the one place [`allocate`] runs for a composition. A caller that has
+    /// to know the rows element's grant *before* the frame is painted (the
+    /// page-scroll path) re-runs `allocate` over the same asks rather than
+    /// asking the painter to guess twice.
+    fn compose(&self) -> Frame {
+        let size = *self.size.borrow();
+        let (tw, th) = (size.width.max(1), size.height.max(1));
+        let asks: Vec<RowAsk> = self.stack.iter().map(|e| e.ask(tw)).collect();
+        let heights = allocate(&asks, th, self.budget(th));
+        render(&self.stack, &heights, tw)
     }
 
     /// Re-anchor the live-screen cache to the real cursor (DSR): the query
@@ -832,10 +856,10 @@ impl RenderManager {
     /// The content round trip — the design's `render(Some(w))` (§Render)
     /// content half, now folded into one verb. Every content write (streaming
     /// or replay) reaches the screen through here and never around it: the
-    /// write is choreographed against the live frame (consume → write →
-    /// reposition) inside [`Self::put_content`]. The batch deferral a replay
-    /// write takes is the shared `batch_active` flag's — it stays open across
-    /// the burst and the guard's drop emits the re-emit once (ui_draw_v2 R5).
+    /// merge (consume → write → reposition) happens in [`Draw::draw`]. The
+    /// batch deferral a replay write takes is the shared `batch_active` flag's
+    /// — it stays open across the burst and the guard's drop emits the re-emit
+    /// once (ui_draw_v2 R5).
     ///
     /// This is the content half of [`Self::render`] alone — the UI half is
     /// `render(None)`, which composes the configured stack and applies it.
@@ -897,26 +921,33 @@ impl RenderManager {
             return;
         }
         self.draw.cache.batch_active = false;
-        let Some(taken) = self.draw.cache.deferred.take() else {
+        let Some(deferred) = self.draw.cache.deferred.take() else {
             return;
         };
-        // The deferred frame re-renders at the watched size — read inside
-        // `reposition_area`, the same channel `Content` formats at.
-        let bytes = self.reposition_area(taken);
-        self.draw.write_bytes(bytes.as_bytes());
+        // Re-compose the configured stack at the watched size (the bar pulls
+        // live state); fall back to the consumed frame when no stack is
+        // configured — the invariant that matters is I5: an area that was
+        // consumed is always put back.
+        let frame = self.compose();
+        let frame = if frame.height() == 0 {
+            &deferred
+        } else {
+            &frame
+        };
+        self.draw.reposition(frame, deferred.height());
     }
 
     /// True while a capture is open on the content hand-off (design
-    /// §Content: the tap reads each `ContentWrite` as handed over).
+    /// §Content: the tap reads each write as handed over).
     pub fn is_capturing(&self) -> bool {
         self.captured.is_some()
     }
 
-    /// Open a capture: from here each [`ContentWrite`]'s bytes stop at the
-    /// hub instead of reaching the screen. Content bytes only — frame
-    /// bytes (`draw_frame`, the reposition) can never be caught, which is
-    /// the deliberate narrowing over the old writer swap; byte-edge tests
-    /// read `TermIO::recording()`.
+    /// Open a capture: from here each `Main` write's bytes stop at the hub
+    /// instead of reaching the screen. Content bytes only — frame bytes
+    /// (`draw_frame`, the reposition) can never be caught, which is the
+    /// deliberate narrowing over the old writer swap; byte-edge tests read
+    /// `TermIO::recording()`.
     pub fn begin_capture(&mut self) {
         self.captured = Some(Vec::new());
     }
@@ -926,151 +957,6 @@ impl RenderManager {
         self.captured
             .take()
             .expect("end_capture without begin_capture")
-    }
-
-    /// The area's re-emit: re-render the configured stack (§5.1.1) and walk
-    /// it to where the content write left off. The hub owns reposition, and
-    /// the configured stack is the hub's.
-    ///
-    /// Re-render rather than replay `taken`: a `Frame` is a snapshot of the
-    /// status as of the last compose, and the bar moves without the REPL
-    /// composing — the dot at `begin_response`/`end_response`, the usage
-    /// figure at every completion. The configured `stack` is the thing that
-    /// stays current (its elements pull live state at render), which is why
-    /// the hub re-composes it and not the rendered rows.
-    ///
-    /// `taken` is not a formality: it is the fallback when no stack was
-    /// configured — a frame applied without a composition behind it (a test,
-    /// or a direct `draw_frame`). Falling back keeps the invariant that
-    /// matters more than freshness, I5: an area that was consumed is always
-    /// put back, so a half-consumed frame is never left stranded on screen.
-    pub fn reposition_area(&mut self, taken: Frame) -> String {
-        // Dims never travel (design §Render): both come off the watched size
-        // — the same geometry `render` composes at, so a reposition after a
-        // resize re-lays-out at the settled width rather than the width the
-        // consumed frame was painted for.
-        let size = *self.size.borrow();
-        let (tw, th) = (size.width.max(1), size.height.max(1));
-        // The consumed frame's height is the `old_h` of the below-frame clear
-        // (`old_h - h_new - consumed_rows`) — read before `taken` moves into
-        // the fallback below.
-        let old_h = taken.height();
-        let frame = if self.stack.is_empty() {
-            taken
-        } else {
-            let heights = {
-                let asks: Vec<RowAsk> = self.stack.iter().map(|e| e.ask(tw)).collect();
-                // The hub's own budget: the stack re-renders at
-                // the same knob `render` composes under, so a configured
-                // ratio cannot make the two disagree.
-                allocate(&asks, th, self.budget(th))
-            };
-            render(&self.stack, &heights, tw)
-        };
-        // **A frame with no rows has nothing to put back.** `ui::resolve` clears
-        // a dialog by applying `Frame::empty()`, and `plan_apply` records that
-        // as a live frame of height 0 — so a content write right after a
-        // resolve consumes a zero-height area. Repositioning it would ask
-        // `plan_reposition` to paint nothing, which is a no-op at best and a
-        // `debug_assert!(h > 0)` panic in a debug build at worst. Returning
-        // empty is the honest answer: there is no area to re-emit, and the
-        // tracked row already moved with the content that consumed it. The
-        // accumulator goes with it — a stale count would misplace the *next*
-        // reposition's below-frame clear.
-        if frame.height() == 0 {
-            self.draw.cache.consumed_rows = 0;
-            return String::new();
-        }
-        plan_reposition(&mut self.draw.cache, &frame, old_h, tw, th)
-    }
-
-    /// The choreography every `Main`-stream content write takes: consume the
-    /// live frame, put
-    /// the block down at the fold, advance the tracked cursor by its
-    /// measured rows, and bring the frame back below — deferred while a
-    /// batch is open, whose guard's drop emits it once (ui_draw_v2 R5).
-    /// A `Meta` write takes the other route inside: `TermIO`'s meta sink,
-    /// no choreography.
-    fn put_content(&mut self, content: ContentWrite) {
-        let ContentWrite {
-            bytes,
-            rows,
-            stream,
-        } = content;
-        // The meta route: the meta sink, no choreography — no
-        // consume, no cursor advance, no reposition, and no capture
-        // interception (a capture taps *screen* content; diverted reasoning
-        // was never in one — `reasoning_is_routed_by_the_output_layer`
-        // pins that). Byte-identical to the stderr bypass it replaced:
-        // the same renderer bytes, written and flushed on the meta stream.
-        if stream == crate::termio::Stream::Meta {
-            self.draw.write_meta(&bytes);
-            return;
-        }
-        // **Consume, then write** (ui_draw_v2 §4.5 P1 / ui_draw_261001): the
-        // walk goes ahead of the bytes — cursor movement, straight to the
-        // writer, never through content's row counter — and the content
-        // follows, already carrying its per-line clears. No erase with the
-        // walk: each line clears the row it enters, and rows the content
-        // never reaches are the reposition's `old_h` tail to clear in its
-        // own pass.
-        let (walk, taken) = match plan_consume(&mut self.draw.cache) {
-            Some((walk, frame)) => (walk, Some(frame)),
-            // No live area: the cursor is wherever the last write left it,
-            // which is where the content belongs. Nothing to walk and no
-            // `CR` to emit — the column is the content path's own
-            // bookkeeping here, not something to reset.
-            None => (String::new(), None),
-        };
-        if !walk.is_empty() {
-            self.draw.write_bytes(walk.as_bytes());
-        }
-        // The tap (design §Content): with a capture open the block's bytes
-        // stop here — exactly as Content produced them, content only. The
-        // choreography runs either way: the cursor advance and the consume
-        // are facts about the screen, and a capture does not pause it.
-        match self.captured.as_mut() {
-            Some(cap) => cap.extend_from_slice(&bytes),
-            None => self.draw.write_bytes(&bytes),
-        }
-        // Zero rows means nothing moved, and a frame stays live.
-        if rows > 0 {
-            self.draw.note_lines(rows);
-        }
-        // The area comes back below what was just written — re-rendered
-        // rather than replayed, so its status row is whatever it is *now*:
-        // the turn's `set_status` and the dot's flip both happen after the
-        // REPL composed. The consume's rows ride along for the below-frame
-        // clear (`old_h - h_new - consumed_rows` in `paint_forward`),
-        // accumulated across a batch's writes and taken by whichever
-        // reposition follows.
-        //
-        // Inside a batch the reposition waits: the frame stays consumed for
-        // the whole burst and the guard's drop emits it once (ui_draw_v2 R5).
-        let taken = {
-            let cache = &mut self.draw.cache;
-            if taken.is_some() || cache.deferred.is_some() {
-                cache.consumed_rows += rows;
-            }
-            match taken {
-                Some(taken) if !cache.batch_active => Some(taken),
-                Some(taken) => {
-                    // Keep the *first* frame taken: it is `reposition_area`'s
-                    // fallback when no configured stack re-composes, and a
-                    // later write finds nothing to consume and so contributes
-                    // none.
-                    if cache.deferred.is_none() {
-                        cache.deferred = Some(taken);
-                    }
-                    None
-                }
-                None => None,
-            }
-        };
-        if let Some(taken) = taken {
-            let bytes = self.reposition_area(taken);
-            self.draw.write_bytes(bytes.as_bytes());
-        }
     }
 }
 

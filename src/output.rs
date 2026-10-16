@@ -1684,7 +1684,7 @@ mod tests {
     /// The meta sink under the hub: a diverted reasoning block rides
     /// the stream token down to `TermIO` — recorded on the meta edge,
     /// absent from main. Main's emptiness is the choreography pin: the
-    /// consume walk and reposition of `put_content`'s main route would put
+    /// consume walk and reposition of the main route would put
     /// bytes there, so none ran. The bytes themselves are the renderer's,
     /// fed untransformed — the bypass `ReasoningSink` died with, now
     /// routed by the token.
