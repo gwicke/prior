@@ -33,7 +33,7 @@
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use crate::ansi::display_width;
+use crate::ansi::{display_width, display_width_ansi, split_at_width};
 use crate::draw::{el_if_short, ApplyPolicy, Draw};
 use crate::termio::{CaretEvent, TermHandles, TermIO, TermSize};
 use tokio::sync::watch;
@@ -522,13 +522,16 @@ pub fn pad_row(row: &str, term_w: usize) -> String {
 }
 
 /// A content write handed to the hub (design §Render): the bytes one block
-/// produced, plus the facts needed to place them — the rows they occupy
-/// (measured from the bytes by content's `RowCounter`, not predicted from
-/// the source), the width they were rendered at (the reposition
-/// re-renders at it), and the stream they ride. On the screen route
-/// (`Main`) the bytes are complete, pre-wrapped, line-cleared rows ending
-/// at a line boundary; on the `Meta` route they are raw (see
-/// [`Self::stream`]).
+/// produced, plus the stream they ride. On the screen route (`Main`) the
+/// bytes are complete, pre-wrapped, line-cleared rows ending at a line
+/// boundary; on the `Meta` route they are raw (see [`Self::stream`]).
+///
+/// The payload is the bytes alone — the `\n` split **is** the row structure,
+/// so a separate count would be a second source of truth that can disagree.
+/// Render owns the number it writes: it repairs the bytes (forces the line
+/// terminator, re-wraps anything over the watched width) and reads the row
+/// count back off the result, so the count can never diverge from the bytes
+/// (see [`RenderManager::render`]).
 ///
 /// Content-specific classification stops *above* this type: the only
 /// vocabulary the design sends down with a write is `Stream` (main/meta),
@@ -540,17 +543,69 @@ pub fn pad_row(row: &str, term_w: usize) -> String {
 pub struct ContentWrite {
     /// The block's bytes as Content produced them.
     pub bytes: Vec<u8>,
-    /// Screen rows the bytes occupy at the watched width (a measured
-    /// count: a long line wraps, which the byte length alone cannot say).
-    /// Zero on the `Meta` route: stderr never moves the screen's cursor,
-    /// so the rows are not the route's to report.
-    pub rows: usize,
 
     /// Which stream these bytes ride — the stream decision is content's,
     /// made once at setup; below this the hub routes on the token and
     /// stays stream-generic (design §Render: `ContentWrite { lines,
     /// stream }`).
     pub stream: crate::termio::Stream,
+}
+
+/// Repair a `Main` write's bytes at the watched `term_w`: force the line
+/// terminator, then re-wrap every row that exceeds `term_w`, entering each
+/// continuation with `\n\x1b[K`. Returns the repaired bytes and Render's row
+/// count — the newline count of the result, so Render's number cannot disagree
+/// with what it writes. `Meta` is skipped (the caller checks the stream):
+/// stderr never moves the screen's cursor, so nothing is repaired.
+///
+/// This is the overwrite rule's last guard (ui_draw_261001): Draw clears per
+/// *terminal line* (an `EL` on each row's entry), so the only thing that
+/// defeats the clear is a row wide enough to wrap — the wrap crosses onto a
+/// row no byte entered, which keeps whatever the frame left there (the
+/// status-bar remnant in the right margin). With no row past `term_w`, no write
+/// can cross onto an uncleared row; the per-row entry `EL` covers the rest, and
+/// no padding is needed.
+fn repair_main(w: &mut ContentWrite, term_w: usize) -> usize {
+    if w.stream != crate::termio::Stream::Main {
+        return 0;
+    }
+    let term_w = term_w.max(1);
+    if w.bytes.is_empty() {
+        return 0;
+    }
+    let text = String::from_utf8_lossy(&w.bytes);
+    let mut out = String::with_capacity(text.len() + 1);
+    let mut rows = 0usize;
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+            rows += 1;
+        }
+        let mut rest = line;
+        while display_width_ansi(rest) > term_w {
+            let (head, tail) = split_at_width(rest, term_w);
+            out.push_str(head);
+            if tail.is_empty() {
+                // A glyph wider than the budget: the head swallowed the
+                // remainder, so the row ends here (no invented break).
+                rest = "";
+                break;
+            }
+            out.push('\n');
+            rows += 1;
+            out.push_str("\x1b[K"); // the continuation clears on entry
+            rest = tail;
+        }
+        out.push_str(rest);
+    }
+    // A block ends at a line boundary: a text that did not carry its
+    // terminator gets one here, and it counts as the row it moves to.
+    if !text.ends_with('\n') {
+        out.push('\n');
+        rows += 1;
+    }
+    w.bytes = out.into_bytes();
+    rows
 }
 
 // --- the frame hub -------------------------------------------------
@@ -777,10 +832,15 @@ impl RenderManager {
                 // write is handed on empty, but its row count stands, so the
                 // cursor advance and the choreography run either way.
                 let swallow = self.capture_tap(&w);
+                // Render owns the final guarantee: repair the bytes against the
+                // watched width, then read the row count back off them. The
+                // count is computed here, before a capture empties the bytes,
+                // so the swallowed write still advances the cursor.
+                let rows = repair_main(&mut w, self.size.borrow().width);
                 if swallow {
                     w.bytes.clear();
                 }
-                self.draw.draw(&frame, Some(&w));
+                self.draw.draw(&frame, Some((&w, rows)));
             }
         }
     }
@@ -1283,5 +1343,62 @@ mod tests {
             "\x1b[48;5;239mab  \x1b[0m"
         );
         assert_eq!(pad_row("abcde", 4), "abcde"); // never truncates
+    }
+
+    // ---- repair_main (Render width enforcement) ----
+
+    fn main_write(bytes: &[u8]) -> ContentWrite {
+        ContentWrite {
+            bytes: bytes.to_vec(),
+            stream: crate::termio::Stream::Main,
+        }
+    }
+
+    /// The payload's row structure is the `\n` split: Render forces the
+    /// terminator a non-conforming write owes, then counts the newlines of the
+    /// result. An empty write stays empty and moves nothing.
+    #[test]
+    fn repair_forces_the_terminator_and_counts_rows() {
+        let mut w = main_write(b"ab");
+        assert_eq!(repair_main(&mut w, 40), 1);
+        assert_eq!(w.bytes, b"ab\n", "a `\\n`-less tail is terminated");
+
+        let mut w = main_write(b"a\nb\n");
+        assert_eq!(repair_main(&mut w, 40), 2);
+        assert_eq!(w.bytes, b"a\nb\n", "a terminated block is unchanged");
+
+        let mut w = main_write(b"\n");
+        assert_eq!(repair_main(&mut w, 40), 1, "a blank row is still a row");
+
+        let mut w = main_write(b"");
+        assert_eq!(repair_main(&mut w, 40), 0);
+        assert!(w.bytes.is_empty());
+    }
+
+    /// A row over `term_w` is re-wrapped at the cell edge, each continuation
+    /// entered by `\n\x1b[K` so it clears on entry (the overwrite rule) — the
+    /// leak this enforcement closes. Escapes ride whole.
+    #[test]
+    fn repair_rewraps_an_over_wide_row_and_re_arms_the_clear() {
+        let mut w = main_write(b"\x1b[Kabcdef\n");
+        assert_eq!(repair_main(&mut w, 3), 2);
+        assert_eq!(w.bytes, b"\x1b[Kabc\n\x1b[Kdef\n");
+
+        // Fits: no invented break.
+        let mut w = main_write(b"\x1b[Kabc\n");
+        assert_eq!(repair_main(&mut w, 3), 1);
+        assert_eq!(w.bytes, b"\x1b[Kabc\n");
+    }
+
+    /// `Meta` is raw: stderr never moves the screen's cursor, so a meta write is
+    /// neither terminated nor wrapped, and contributes no rows.
+    #[test]
+    fn repair_leaves_the_meta_route_raw() {
+        let mut w = ContentWrite {
+            bytes: b"raw tail".to_vec(),
+            stream: crate::termio::Stream::Meta,
+        };
+        assert_eq!(repair_main(&mut w, 3), 0);
+        assert_eq!(w.bytes, b"raw tail");
     }
 }

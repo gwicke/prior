@@ -756,11 +756,16 @@ impl Draw {
     /// paint (`content == None`), or append `content` to scrollback —
     /// consuming the live frame's rows — then put `frame` back below it.
     ///
-    /// The manager composes `frame` first and hands it down; Draw does the
-    /// writing. A `Meta` write goes straight to the meta sink, with no
+    /// The manager composes `frame` first, repairs the write and reads its row
+    /// count, and hands both down; Draw does the writing but never the
+    /// measuring. `rows` is the count Render derived from the (repaired) bytes;
+    /// it is passed rather than recomputed here so a capture-emptied write —
+    /// bytes gone, screen still to be choreographed — keeps its advance.
+    ///
+    /// A `Meta` write goes straight to the meta sink, with no
     /// choreography: stderr never moves the screen's cursor.
-    pub fn draw(&mut self, frame: &Frame, content: Option<&ContentWrite>) {
-        let Some(w) = content else {
+    pub fn draw(&mut self, frame: &Frame, content: Option<(&ContentWrite, usize)>) {
+        let Some((w, rows)) = content else {
             self.apply(frame);
             return;
         };
@@ -781,9 +786,8 @@ impl Draw {
         // The write's bytes as handed down by the manager. A capture is the
         // manager's call (it hands an empty write instead), so Draw stays
         // capture-agnostic — and a write the tap emptied still advances the
-        // cursor by its row count below.
+        // cursor by the row count the manager passed.
         self.write_bytes(&w.bytes);
-        let rows = w.rows;
         if rows > 0 {
             self.cache.note_lines(rows, th);
         }

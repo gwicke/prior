@@ -16,7 +16,7 @@
 //! manager's, and `draw_frame` — the test drivers' edge — stays on `Output`
 //! until the drawing refactor retires it.
 
-use std::io::{self, Write};
+use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -33,7 +33,7 @@ use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, s
 use crate::content::text::wrap;
 use crate::output::Output;
 use crate::render::ContentWrite;
-use crate::row_count::RowCounter;
+
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
 use crate::termio::{TermIO, TermSize};
 use markdown_stream::{Parser, StreamParser};
@@ -460,19 +460,16 @@ impl Content {
             pending: true,
             enabled: !capturing,
         };
-        // The counter sits *below* the line-clear (the codes are added to the
-        // stream after it counts) and *above* the buffer, so it counts the
-        // bytes as the terminal will receive them. The consume's walk, when
-        // there is one, still goes straight to the writer, ahead of all of
-        // this: it is cursor movement, not content, and never passes through
-        // the counter or the clear.
-        let mut counter = RowCounter::new(&mut clear, width);
-        // The width guard goes between the hold and the counter: held
-        // newlines reset its column, its inserted newline reaches the
-        // counter (counted as the row move it replaces) and the line-clear
-        // (armed for the continuation row). See `WrapLines`.
+        // The width guard sits between the hold and the line-clear: held
+        // newlines reset its column, and its inserted newline reaches the
+        // line-clear (armed for the continuation row). See `WrapLines`. No
+        // counter rides here any more — the row count is Render's, read back
+        // off these bytes at the hand-off — so the clear writes straight to
+        // the buffer. The consume's walk, when there is one, still goes
+        // straight to the writer, ahead of all of this: it is cursor movement,
+        // not content, and never passes through the clear.
         let mut wrap = WrapLines {
-            inner: &mut counter,
+            inner: &mut clear,
             width: width.max(1),
             enabled: !capturing,
             col: 0,
@@ -572,9 +569,6 @@ impl Content {
             self.boundary
                 .restore_empty(old, closed, kind, closes_segment);
         }
-        let rows = counter.rows();
-        let _ = counter.flush();
-        drop(counter);
         drop(clear);
         // Nothing to hand over: no rows moved, nothing consumed, no
         // reposition owed — and the frame stays *live*, so the next compose
@@ -583,15 +577,14 @@ impl Content {
         if buf.is_empty() {
             return r;
         }
-        // The hand-off (design §Content/§Render): the block's
-        // bytes, its measured rows and the width it was rendered at —
-        // everything the screen choreography needs, and nothing about
-        // *what* it is. Content never touches the sink from here on;
-        // `RenderManager` consumes the live frame, writes the block,
-        // advances the cursor and brings the frame back below.
+        // The hand-off (design §Content/§Render): the block's bytes and the
+        // stream it rides — everything the screen choreography needs, and
+        // nothing about *what* it is. Content never touches the sink from here
+        // on; `RenderManager` repairs the bytes, reads the row count off them,
+        // consumes the live frame, writes the block, advances the cursor and
+        // brings the frame back below.
         let write = ContentWrite {
             bytes: buf,
-            rows,
             // The chain is the screen's path: every block it produced is
             // main-stream content. The meta route hands off beside this
             // one, raw — `commit_reasoning`.
@@ -1279,7 +1272,6 @@ impl Content {
             let mut mgr = self.manager.lock().unwrap();
             mgr.render_content(ContentWrite {
                 bytes,
-                rows: 0,
                 stream: crate::termio::Stream::Meta,
             });
         } else {
