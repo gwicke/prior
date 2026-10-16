@@ -81,6 +81,8 @@ and link a doc/ and/or commit hash
     4h-e (`14542025`+`744a8dfe`+`25730624`, selection figures live behind a shared
     handle; a cursor move updates in place, changed rows re-mint), 4h-f
     (`08ed747`+`be0e7b4`, the editor goes behind `Arc<Mutex<LineEditor>>` and the input
-    element pulls it; `Layout` comes home to repl); 4h-g next (the flip:
-    `configure` regains the full signature, dims come off the watch)
+    element pulls it; `Layout` comes home to repl), 4h-g (`ac92095`+`72a3ac7`+`fb3a793`,
+    the flip: `render` composes from the configured stack, membership reconfigured on
+    transitions; the bar is always present and pulls usage live); 4h-h next (confirm dialog
+    selection state + its place in the configured stack, out-of-crate callers, cleanup)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)

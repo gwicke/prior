@@ -657,90 +657,43 @@ most runway to expand into separate sub-commits.
      the contract (`LineEditor::layout` produces, `InputItem` consumes) are repl's.
   - `emit_commit` resets the buffer *before* the redraw rather than after (the closure paints
     through the shared handle now; every caller passes `""`, so same pixels).
-  - **4h-g — the flip.** The manager's `render` takes only content and composes from the
-    **configured** stack; membership lives on the manager, changed by the repl on *state
-    transitions*, never recomputed at paint. Bar is always present (no `is_off` gate) and pulls
-    **live** agent state (shared `usage` mutex) — killing the mid-turn context staleness.
-    Three commits, in dependency order. **Status: planned, not yet built — this is the spec to
-    implement.** (Parts 1–2–3 below are the todo, in order.)
+  - **4h-g — the flip.** *(landed — `ac92095` + `72a3ac7` + `fb3a793`, gate `799665f`, probe
+   `243890e`)* The manager's `render` takes only content and composes from the **configured**
+   stack; membership lives on the manager, changed by the repl on *state transitions*, never
+   recomputed at paint. Bar is always present (no `is_off` gate) and pulls **live** agent state
+   (shared `usage` mutex), which killed the mid-turn context staleness. Git summaries are the
+   record of what landed; what follows is only what the step left behind.
 
-    **The model (decided, not to re-litigate):** *membership is reconfigured only on user input or
-    streamed events, by the repl; paint just renders whatever is configured.* Transition points,
-    all verified in code: overlay open/close/change (`eval` repl.rs:990, Esc/close 1057/1073 — both
-    run before `settle` paints); confirm open/close (`open_confirm` turn.rs:587, `clear_confirm`
-    pumps.rs:100 — each immediately followed by a paint); submit clear (repl.rs:1815); and the bar,
-    which after part 2 is *not* a transition (always in). The input element is 4h-f's stable shared
-    handle — it never changes membership. `ActiveOverlay` variants carry `ElementSet` by value
-    (elements moved in, not rebuilt per paint), so membership genuinely changes only at these
-    transitions. Paint composes nothing.
+   **The model (settled here, reflected in the design doc §UI):** *membership is reconfigured only
+   on user input or streamed events, by the repl; paint just renders whatever is configured.* The
+   transition points are the callers of `PromptSession::sync_stack` — overlay open/close/change,
+   confirm open/close, submit clear, `emit_commit`'s redraw — each a `sync_stack` immediately
+   followed by a `paint_prompt`. The input element is 4h-f's stable shared handle and never changes
+   membership; `ActiveOverlay` variants carry `ElementSet` by value (elements moved in, not rebuilt
+   per paint), so membership genuinely changes only at those transitions. Paint composes nothing.
 
-    **Part 1 — the flip proper.**
-    - `RenderManager::render(&mut self, content: Option<ContentWrite>)` (no return): composes the
-      frame from `self.stack` (the configured membership), applies it, then — if `content` is
-      `Some` — runs the write choreography. The old `stack: Option<Vec<Element>>` param and the
-      `(usize, usize)` return are gone. A UI paint is `render(None)`; a content write is
-      `render(Some(w))`.
-    - `configure(frame_max_row_ratio, frame_elements)` is now the membership verb, called on
-      transitions (not the one-time wiring the old comment claimed). Rewrite that comment at
-      content/handle.rs:156.
-    - New `PromptSession::sync_stack(&self, content: &Content)`: rebuilds the whole membership from
-      `self.overlay` + `self.confirm` (+ the always-in bar/input, see part 2) and calls
-      `content.manager.lock().configure(...)`. Callers, one per transition: `settle` right after
-      `eval` returns (overlay may have changed); `settle`'s Error arm; the turn-pump submit arm
-      (repl.rs:1815); `emit_commit`'s redraw (menu-dismissal = set overlay `None`, sync, render — a
-      state change, not elements passed in).
-    - `paint_prompt(content, label, editor)` loses its `overlay: Vec<Element>` param: it locks the
-      manager and calls `render(None)`. Membership is already current (synced by the transition
-      that preceded this paint). `PromptSession::paint` just calls it.
-    - `compose_area` dies in production; its role (compose head = status + body) is absorbed by
-      `sync_stack`. Its **test twins** in output.rs (which compose a stack to drive `plan_apply`
-      / `draw_frame` directly) keep a local `compose_*` and hand the stack to `configure` then
-      `render(None)` — no production second pipeline (ui_draw_v2 §5.1.1).
-
-    **Part 2 — bar always present + live pull (kills the staleness).**
-    - `CodeAgent.usage` becomes `Arc<Mutex<SessionUsage>>` (wrap the existing `Mutex::new` at
-      agent.rs:33). The agent already updates `usage.last_input_tokens` per completion (turn.rs:302)
-      — mid-turn, after every tool-call round.
-    - The bar element's data source moves from `content.bar` (`Arc<Mutex<BarStatus>>`, a **snapshot**
-      `set_status` pushes once at turn start) to a **live** pull of that shared `usage` mutex plus
-      the session-name/first-message/provider/model/thinking/context_limit facts. Wire: the agent is
-      `Option<Arc<CodeAgent>>` on AppState (activated at interactive.rs:493/762); the repl wires a
-      clone of the `Arc<Mutex<SessionUsage>>` into the bar element it mints in `sync_stack`. Render
-      reads `usage.last_input_tokens` directly → the mid-turn context figure is current by
-      construction, no push to keep in step.
-    - `set_status` and `Content.bar` (and `BarStatus` as the bar's store) go. Bar presence is
-      unconditional — no `status_text(...).is_off()` gate, one less transition to sync. (The gate
-      was an artifact of push: it protected against a stale/absent pushed row. With pull the bar
-      always knows how to render itself.)
-    - `/stat` overlay (v25_stat.rs:42) reads the **same** shared `usage` live instead of the
-      `AppState.session_usage` snapshot (app_state.rs:651), so it too is current mid-turn. The
-      snapshot field/`update_cycle_view`'s usage copy can then shrink to what `/tree`-style overlays
-      still need, or go if nothing else reads it.
-    - The `streaming` flag stays as-is — it's already a live `Arc<AtomicBool>` pull (4h-f).
-
-    **Part 3 — shrink `area_body` to the membership builder.**
-    - `area_body(input, overlay)` (repl.rs:532) becomes `sync_stack`'s internal divider rule: input,
-      divider-if-overlay-nonempty, overlay. It stops returning a `Vec<Element>` for a caller to
-      `render`; it *is* the membership `configure` installs. The blank companion row (frame's row
-      between content and bar) is an ordinary element in the configured stack.
-
-    **Verification gates per part:** full suite green (970 lib + integration) + clippy clean. Part 2
-    additionally: a test that mid-turn `set_status`-equivalent usage change (bump the shared
-    `usage.last_input_tokens`, re-paint without any push) shows the new figure in the bar bytes —
-    pins that the bar pulls and cannot go stale. Part 1: the submit/error/commit transitions each
-    still paint the right membership (existing repl tests must stay green).
-  - **4h-h — remaining callers + cleanup.** Confirm dialog: own selection state and a place in the
-    repl-configured stack (its elements already come via the menu constructors with the
-    `OPTIONS.len()` floor — that half landed with **4h-d**, `8daa008`); the out-of-crate probe
-    keeps `draw_frame` through the re-exports. Anything left of per-paint element construction or
-    dims params dies; docs updated (design doc already carries the stack + crate sections).
-    `overlay_elements*` is already gone (**4h-d**).
-  Resolved during design (recorded here so they don't get re-litigated): RowAsk/RowSpec lands with
-  the stack (**4h-b**), not later; dims flow TermIO → Render exclusively (landed earlier in **4h-g**
- — the `render` no-dims sub-split, `10224a1`; the *flip* sub-split that follows keeps it); the input
-  element is always in the stack with height carrying presence (**4h-f**); menu elements hold
-  `Arc<ViewRows>` directly after the crate's `Arc` swap (**4h-d** — landed), preserving the
-  no-copy row iterator for filtered and unfiltered views alike.
+  **Follow-ups this step leaves:**
+  - `sync_stack` takes a `label: &str` (the prompt text) the design's signature does not carry —
+   the input element's label is not constant across a session's life, so it is threaded at the one
+   moment membership is built rather than stored. The design doc should either add it or say why
+   the label is not part of the membership it describes.
+  - The `estimated_ctx` → `usage.last_input_tokens` seeding (turn start, and the prompt cycle)
+   reads as a workaround for the bar having no fallback of its own. Worth stating in the design doc
+   why the seed lives at the push sites rather than as a `last_input_tokens.or(estimate)` fallback
+   inside the bar's render.
+  - `AppState.session_usage` and `update_cycle_view`'s usage copy are gone (part 2's cleanup ran);
+    `context_tokens` stays because `/tree`'s compact preview still reads it.
+  - **4h-h — remaining callers + cleanup.** *(landed)* The confirm dialog owns its selection state
+   (`ConfirmPrompt::sel`) and takes its place in the repl-configured stack (`sync_stack` extends the
+   overlay with `confirm.elements()`); the out-of-crate probe reached the flipped `render` in
+   `243890e` and no longer touches `draw_frame`. No production `render(Some(stack))` and no dims
+   param remain. `overlay_elements*` went in **4h-d**.
+  - Resolved during design (recorded here so they don't get re-litigated): RowAsk/RowSpec lands with
+   the stack (**4h-b**), not later; dims flow TermIO → Render exclusively (landed earlier in **4h-g**
+   — the `render` no-dims sub-split, `10224a1`; the *flip* sub-split that follows keeps it); the input
+   element is always in the stack with height carrying presence (**4h-f**); menu elements hold
+   `Arc<ViewRows>` directly after the crate's `Arc` swap (**4h-d** — landed), preserving the
+   no-copy row iterator for filtered and unfiltered views alike.
 
   Deferred beyond 4h — surfaced by **4h-f**, owned by no remaining sub-step:
 
