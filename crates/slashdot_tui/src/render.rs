@@ -1083,10 +1083,11 @@ mod tests {
         );
     }
 
-    /// A real non-terminal primary drops the frame wholesale (design §TermIO):
-    /// the paint composes but nothing reaches the stream — no bar, no rows —
-    /// and the live cache is left untouched, so content afterwards appends as
-    /// plain text rather than being positioned against a frame never painted.
+    /// A real non-terminal primary drops the frame bytes wholesale (design
+    /// §TermIO): the paint composes and the cache advances (the fiction Draw
+    /// always-merges accepts), but no frame byte — bar, rows, walk — reaches the
+    /// stream. Content is untouched by the drop: it is written and, at the
+    /// edge, stripped to text.
     #[test]
     fn a_non_terminal_primary_paints_no_frame() {
         let size = crate::termio::fixed(TermSize {
@@ -1115,8 +1116,9 @@ mod tests {
             "a frame must not reach a piped primary"
         );
         assert_eq!(
-            manager.draw.cache.applied, None,
-            "no live frame is recorded, so content appends rather than consuming"
+            manager.draw.cache.applied,
+            Some((40, 24)),
+            "the cache advances even though the frame bytes were dropped (fiction)"
         );
 
         // Content still flows — stripped at the edge, text only.

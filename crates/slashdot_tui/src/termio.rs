@@ -700,6 +700,20 @@ impl TermIO {
         }
     }
 
+    /// Frame bytes — the frame-side half of the kind vocabulary (design §Draw):
+    /// the consume walk, the frame planner, the caret show/hide, the re-anchor.
+    /// The primary sink, and **dropped wholesale** on a real stream that is not
+    /// a terminal (see [`Self::paints_frames`]): frames are screen choreography
+    /// a pipe consumer cannot use, and their row text would otherwise leak.
+    /// Content bytes never come through here — they keep their kind and go via
+    /// [`Self::write`], so the drop leaves them intact.
+    pub fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if !self.paints_frames() {
+            return Ok(());
+        }
+        self.write(Stream::Content, bytes)
+    }
+
     /// Whether frames belong on this output (design §TermIO: "non-tty
     /// primaries additionally drop frames wholesale at Draw"). A real stream
     /// that is not a terminal gets none — they are screen choreography a pipe
