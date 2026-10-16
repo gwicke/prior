@@ -44,6 +44,7 @@ and link a doc/ and/or commit hash
       doc/261013_multi_file_edit_id_continuity.md.
 - [x] More robust anchoring in crates/blockedit/src/diagnose.rs diagnose(). Currently uses longest
       common sub-string.
+- [ ] doc/261015_sed_parsing_bug.md
 
 ## Cleanup
 
