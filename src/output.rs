@@ -1031,6 +1031,43 @@ mod tests {
         );
     }
 
+    /// The context figure is **pulled live** off the agent's shared usage store
+    /// (4h-g part 2), not pushed into the status. Bump the store mid-turn and
+    /// the next compose shows the new number with no push — which is exactly
+    /// what the old `set_status` snapshot could not do (it was frozen at turn
+    /// start until the next push). A push-based bar would fail this: the store
+    /// moves, the pushed facts do not, and the figure follows the store.
+    #[test]
+    fn the_bar_pulls_the_context_figure_live_rather_than_a_pushed_snapshot() {
+        let (out, _reasoning) = capturing_output(60);
+        // The one pushed fact the figure is formatted beside: a window, so the
+        // figure renders as a percentage of it.
+        out.content.set_status(crate::agent::status::BarStatus {
+            context_limit: Some(200_000),
+            ..Default::default()
+        });
+        // A fresh store, as the agent's constructor installs it.
+        let usage = std::sync::Arc::new(Mutex::new(crate::agent::SessionUsage::default()));
+        out.content.set_usage(Some(usage.clone()));
+
+        let before = compose_rows(&compose_area(&out, None, Vec::new()), 60);
+        assert!(
+            !before[1].contains("50%"),
+            "no completion has reported, so no context figure: {:?}",
+            before[1]
+        );
+
+        // A completion reports, mid-turn, writing the store in place — the one
+        // thing the turn already does (agent/turn.rs, per completion).
+        usage.lock().unwrap().last_input_tokens = 100_000;
+        let after = compose_rows(&compose_area(&out, None, Vec::new()), 60);
+        assert!(
+            after[1].contains("50%"),
+            "the figure moved with the store, no push involved: {:?}",
+            after[1]
+        );
+    }
+
     fn capturing_output(width: u16) -> (ConsoleOutput, crate::settings::ShowReasoningHandle) {
         let reasoning = crate::settings::default_show_reasoning_handle();
         let out = ConsoleOutput::with_size(
