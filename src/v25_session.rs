@@ -225,6 +225,23 @@ impl SlashDotNode for SessionListingNode {
 /// the session info table, and the static action children are shown.
 pub struct SessionListNode {
     pub app_state: Arc<AppState>,
+    /// Rows memo — reused while every input the rows derive from still
+    /// holds (`/session`; mirrors `TreeListNode`/`ModelNode`): the repo
+    /// listing generation and the current session id.
+    cached_data: Option<Arc<DataResponse>>,
+    cached_generation: Option<u64>,
+    cached_current: String,
+}
+
+impl SessionListNode {
+    pub fn new(app_state: &Arc<AppState>) -> Self {
+        Self {
+            app_state: app_state.clone(),
+            cached_data: None,
+            cached_generation: None,
+            cached_current: String::new(),
+        }
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -233,15 +250,30 @@ impl SlashDotNode for SessionListNode {
         use crate::slashdot_menu::value::Value;
 
         let current_id = self.app_state.current_session_id();
-        let mut sessions: Vec<crate::repl::SessionMeta> = match self.app_state.repo() {
-            Some(repo) => repo
-                .list_sessions_overlay(None)
-                .await
-                .into_iter()
-                .map(crate::repl::session_meta_from)
-                .collect(),
-            None => Vec::new(),
+        let Some(repo) = self.app_state.repo() else {
+            return Ok(Arc::new(DataResponse {
+                rows: Vec::new(),
+                active_ids: Vec::new(),
+            }));
         };
+        // The repo listing is mtime-validated (a call that finds nothing
+        // changed re-parses nothing) and cheap to call every eval, but the
+        // row build below is not — memoize it on the repo's listing
+        // generation, which advances only when a session file actually
+        // changes, plus the current session (which reorders the listing and
+        // moves the `*` marker).
+        let mut sessions: Vec<crate::repl::SessionMeta> = repo
+            .list_sessions_overlay(None)
+            .await
+            .into_iter()
+            .map(crate::repl::session_meta_from)
+            .collect();
+        let generation = repo.sessions_generation();
+        if self.cached_generation == Some(generation) && self.cached_current == current_id {
+            if let Some(ref cached) = self.cached_data {
+                return Ok(Arc::clone(cached));
+            }
+        }
         // Current session first, then by recency (file mtime).
         sessions.sort_by(|a, b| {
             let a_cur = a.id == current_id;
@@ -318,10 +350,14 @@ impl SlashDotNode for SessionListNode {
         let active_ids = if current_id.is_empty() || !sessions.iter().any(|s| s.id == current_id) {
             Vec::new()
         } else {
-            vec![current_id]
+            vec![current_id.clone()]
         };
 
-        Ok(Arc::new(DataResponse { rows, active_ids }))
+        let response = Arc::new(DataResponse { rows, active_ids });
+        self.cached_data = Some(Arc::clone(&response));
+        self.cached_generation = Some(generation);
+        self.cached_current = current_id;
+        Ok(response)
     }
 
     fn columns(&self) -> Vec<ColumnDef> {
@@ -769,10 +805,7 @@ pub fn build_session_node(
 
     let mut listing: SlashDotMenuNode = SessionListingNode.into();
 
-    let mut session_node: SlashDotMenuNode = SessionListNode {
-        app_state: app_state.clone(),
-    }
-    .into();
+    let mut session_node: SlashDotMenuNode = SessionListNode::new(app_state).into();
     session_node.add_child(
         SessionResumeNode {
             app_state: app_state.clone(),
@@ -1339,5 +1372,46 @@ mod tests {
         ];
         let result = crate::agent::block_on_test(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some("session abc123 rename ".to_string()));
+    }
+
+    // --- row memo tests ---
+
+    /// Repeated `data()` calls with unchanged inputs reuse the same response
+    /// `Arc`: the repo scans the files by mtime, finds nothing changed, and
+    /// leaves its listing generation put. This is the signal `refresh_data`
+    /// gates on (`Arc::ptr_eq`), so a hit is a no-rebuild eval.
+    #[test]
+    fn session_list_data_memoizes_across_evals() {
+        use crate::slashdot_menu::node_impl::SlashDotNode;
+        let (_repo, app_state, uuid) = temp_repo_with_session();
+        app_state.set_current_session_id(uuid.clone());
+        let mut node = SessionListNode::new(&app_state);
+        let pa = PathArgs::new(vec!["session".to_string()], "");
+
+        let first = crate::agent::block_on_test(node.data(1, &pa)).unwrap();
+        assert_eq!(first.active_ids, vec![uuid.clone()], "current is marked");
+        let second = crate::agent::block_on_test(node.data(1, &pa)).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged inputs must reuse the cached response Arc"
+        );
+    }
+
+    /// A different current session is part of the key: it reorders the
+    /// listing and moves the `*` marker, so the memo must miss.
+    #[test]
+    fn session_list_data_memo_misses_on_current_change() {
+        use crate::slashdot_menu::node_impl::SlashDotNode;
+        let (_repo, app_state, uuid) = temp_repo_with_session();
+        let mut node = SessionListNode::new(&app_state);
+        let pa = PathArgs::new(vec!["session".to_string()], "");
+
+        app_state.set_current_session_id(String::new());
+        let before = crate::agent::block_on_test(node.data(1, &pa)).unwrap();
+        assert!(before.active_ids.is_empty(), "no current → no marker");
+        app_state.set_current_session_id(uuid.clone());
+        let after = crate::agent::block_on_test(node.data(1, &pa)).unwrap();
+        assert!(!Arc::ptr_eq(&before, &after), "current change must rebuild");
+        assert_eq!(after.active_ids, vec![uuid]);
     }
 }

@@ -10,8 +10,9 @@ use memchr::memmem;
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
 use crate::session::storage::*;
@@ -84,6 +85,12 @@ pub struct JsonlSessionRepo {
     /// Shared session metadata cache for the sync listing path (overlay).
     /// Clone shares the same `Arc`, so all copies see updates.
     cache: Arc<Mutex<Option<SessionMetaCache>>>,
+    /// Monotonic listing generation — bumped whenever the cached listing
+    /// changes (a scan observes a changed file set or mtime, or the cache is
+    /// invalidated). Kept out of the cache itself so an `invalidate_cache`
+    /// reset cannot rewind it and let a memoizing caller (`/session`) mistake
+    /// a fresh listing for a previously-seen one.
+    generation: Arc<AtomicU64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,11 +108,11 @@ struct CachedDir {
 
 /// Lightweight cache for session metadata listings.
 ///
-/// Validates freshness by comparing directory and file mtimes.
-/// A full re-scan is triggered at most once every 2 seconds.
+/// Validated by comparing each session file's mtime (and the file set): a
+/// scan that finds every cached file unchanged re-parses nothing, so a full
+/// re-read happens only when a file actually changed — never merely because
+/// time passed.
 struct SessionMetaCache {
-    /// When the last validation completed (monotonic clock).
-    last_validated_at: Instant,
     /// Per-directory cached state, keyed by the resolved directory path.
     dirs: HashMap<PathBuf, CachedDir>,
 }
@@ -113,8 +120,6 @@ struct SessionMetaCache {
 impl SessionMetaCache {
     fn new() -> Self {
         Self {
-            // Start far enough in the past so the first call always validates.
-            last_validated_at: Instant::now() - Duration::from_secs(10),
             dirs: HashMap::new(),
         }
     }
@@ -157,6 +162,7 @@ impl JsonlSessionRepo {
         Self {
             base_dir,
             cache: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -170,6 +176,7 @@ impl JsonlSessionRepo {
         if let Ok(mut guard) = self.cache.lock() {
             *guard = None;
         }
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Resolve the encoded CWD directory path.
@@ -1065,18 +1072,12 @@ impl JsonlSessionRepo {
             return Vec::new();
         }
 
-        // Lock cache and check debounce.
+        // Lock cache; validate by mtime (no time-based debounce — a scan that
+        // finds every cached file's mtime unchanged re-parses nothing).
         let mut cache_guard = self.cache.lock().unwrap();
-        if let Some(ref cache) = *cache_guard {
-            if cache.last_validated_at.elapsed() < Duration::from_secs(2) {
-                return cache.get_sessions(&dirs);
-            }
-        }
-
-        // Validate (or initialise) the cache.
         let cache: &mut SessionMetaCache = cache_guard.get_or_insert_with(SessionMetaCache::new);
-        cache.last_validated_at = Instant::now();
 
+        let mut changed = false;
         for dir in &dirs {
             // Always re-scan files; directory mtime doesn't change when existing
             // files are modified (only on create/delete). We must stat each file
@@ -1136,6 +1137,9 @@ impl JsonlSessionRepo {
                     .unwrap_or(0);
                 b_ts.cmp(&a_ts)
             });
+            if cache.dirs.get(dir).map(|c| &c.file_mtimes) != Some(&file_mtimes) {
+                changed = true;
+            }
             cache.dirs.insert(
                 dir.clone(),
                 CachedDir {
@@ -1144,16 +1148,20 @@ impl JsonlSessionRepo {
                 },
             );
         }
+        if changed {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
 
         cache.get_sessions(&dirs)
     }
 
-    /// Async overlay listing for the eval path: consults the shared
-    /// 2-second-debounced cache first (warm = zero IO, pure memory); a
-    /// stale cache triggers a `tokio::fs` scan so the eval task never
-    /// blocks a runtime worker on std::fs. Mirrors `list_sessions_sync`
-    /// semantics (per-file mtime reuse). The cache lock is never held
-    /// across an await (lock rule 3).
+    /// Async overlay listing for the eval path. Validated by stat-ing the
+    /// session files: every file whose mtime (and the file set) is unchanged
+    /// reuses its cached metadata, so a call that finds nothing changed
+    /// re-parses nothing — a full re-read happens only when a file actually
+    /// changed, never merely because time passed. `tokio::fs` keeps the eval
+    /// task off `std::fs`. Mirrors `list_sessions_sync` (lock rule 3: the
+    /// cache lock is never held across an await).
     pub async fn list_sessions_overlay(&self, cwd: Option<&Path>) -> Vec<SessionMetadata> {
         // Resolve directories (async).
         let dirs: Vec<PathBuf> = if let Some(cwd) = cwd {
@@ -1177,16 +1185,6 @@ impl JsonlSessionRepo {
         };
         if dirs.is_empty() {
             return Vec::new();
-        }
-
-        // Debounce fast path — cached, zero IO.
-        {
-            let cache = self.cache.lock().unwrap();
-            if let Some(ref cache) = *cache {
-                if cache.last_validated_at.elapsed() < Duration::from_secs(2) {
-                    return cache.get_sessions(&dirs);
-                }
-            }
         }
 
         // Snapshot prior per-dir state for mtime-based reuse (short lock).
@@ -1275,11 +1273,25 @@ impl JsonlSessionRepo {
         // Store + return (short lock).
         let mut cache_guard = self.cache.lock().unwrap();
         let cache: &mut SessionMetaCache = cache_guard.get_or_insert_with(SessionMetaCache::new);
-        cache.last_validated_at = Instant::now();
+        let mut changed = false;
         for (dir, cd) in scanned {
+            if cache.dirs.get(&dir).map(|c| &c.file_mtimes) != Some(&cd.file_mtimes) {
+                changed = true;
+            }
             cache.dirs.insert(dir, cd);
         }
+        if changed {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
         cache.get_sessions(&dirs)
+    }
+
+    /// The listing generation — bumped only when a scan observes a changed
+    /// file set or mtime (or the cache is invalidated). A caller that builds
+    /// rows from the listing memoizes on this (plus its own inputs): an
+    /// unchanged generation means the underlying metadata is unchanged.
+    pub fn sessions_generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 }
 
@@ -1401,6 +1413,41 @@ mod tests {
         assert!(
             repo.list_sessions_sync(Some(cwd)).is_empty(),
             "deleted session still visible via sync listing (stale cache)"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base_dir).await;
+    }
+
+    /// The listing generation is mtime-driven, not time-driven: a repeated
+    /// call that finds nothing changed leaves it put (so a memoizing caller
+    /// like `/session` re-derives nothing), while a changed file set bumps
+    /// it.
+    #[tokio::test]
+    async fn listing_generation_tracks_mtime_not_time() {
+        let (_guard, repo, base_dir) = create_test_repo().await;
+        let cwd = Path::new("/home/test");
+        let _storage = create_persisted(&repo, cwd).await;
+
+        assert_eq!(repo.list_sessions_overlay(None).await.len(), 1);
+        let gen1 = repo.sessions_generation();
+        assert!(gen1 > 0, "first scan establishes a generation");
+
+        // Nothing changed → no bump (a wall-clock debounce would have bumped
+        // this one only after the window, and re-derived needlessly).
+        assert_eq!(repo.list_sessions_overlay(None).await.len(), 1);
+        assert_eq!(
+            repo.sessions_generation(),
+            gen1,
+            "unchanged listing must not advance the generation"
+        );
+
+        // A changed file set (delete) is observed and bumps the generation.
+        let sessions = repo.list(None).await.unwrap();
+        repo.delete(&sessions[0]).await.unwrap();
+        assert!(repo.list_sessions_overlay(None).await.is_empty());
+        assert!(
+            repo.sessions_generation() > gen1,
+            "a changed listing must advance the generation"
         );
 
         let _ = tokio::fs::remove_dir_all(&base_dir).await;
