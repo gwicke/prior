@@ -117,6 +117,10 @@ tempfile = "3.24.0"
 portable-pty = "0.8"
 vt100 = "0.16"
 serial_test = "3.1"
+# tcgetattr/tcsetattr in the pty termios regression tests
+# (tests/quit_restores_cooked_mode.rs) — already a regular dependency; the
+# dev edge lets integration tests name it directly.
+libc = "0.2"
 rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["test-utils"] }
 # Test-only seams of the drawing crate (`TermIO::recording`, `RenderManager::draw`)
 # — features of a dependency unify per-build, so `cargo test` sees them and a
