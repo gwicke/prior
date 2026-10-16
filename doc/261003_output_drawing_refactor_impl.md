@@ -36,7 +36,20 @@ composed frame below it* — a purely downward call, no callback. (commit `da602
 
 The last delta. Design §Content: *Render re-checks the width and clamps / re-wraps if it disagrees.*
 Today content's `WrapLines` is the only guard, at content's width (`max(20)`); Render is to own the
-final guarantee. Normally a no-op.
+final guarantee.
+
+**Primary: no row may exceed `term_w`, so none wraps.** Draw clears per *terminal line* — an `EL` on
+each row's entry (the overwrite rule, ui_draw_261001) — so the `EL` erases the old frame's row no
+matter how short the new content is. Terminal wrapping defeats that: a wrapped continuation is a
+terminal line no byte entered, so it never gets its entry `EL` and keeps what the frame left there —
+the leak. Fix the wrapping and clear-then-write covers the rest.
+
+**Padding is the fallback, and only where clearing is not effective.** Without clearing, a row padded
+to `term_w` is what fully overwrites the old frame content; with reliable clearing, padding is
+redundant (the entry `EL` already erased the row). So padding to `term_w` is required *only* if
+draw's clearing cannot be trusted for a row / stream — it is **not** a second half of the width
+requirement. Width enforcement (re-wrap, never exceed) is the concern; under-full padding rides
+behind the clearing guarantee.
 
 **Payload: `bytes`, newline-split — no `Vec<Range>`.** `ContentWrite` stays `{ bytes, rows, stream }`;
 the row structure is the `\n` split.
@@ -57,31 +70,40 @@ the row structure is the `\n` split.
 3. if swallowing, `w.bytes.clear()` (rows stand) — the screen keeps the content out.
 4. `Draw::draw(&frame, Some(&w))`.
 
-**Enforcement**:
+**Enforcement** (over the watched width `term_w`):
 
-- Split `bytes` on `\n`; measure each row. All fit → leave the bytes untouched (the common case).
-- Otherwise re-wrap the over-wide rows at the cell edge, re-arming the line clear on every continuation
-  (`\n` + `\x1b[K`) so each row is entered by a byte (the overwrite rule, ui_draw_261001). Escapes ride
-  whole; SGR survives the break.
-- Recompute `rows` from the repaired bytes (`#\n`) — Render owns the count now, so it cannot disagree.
-- `Meta` is exempt (raw, never re-wrapped).
+- Split `bytes` on `\n`, keeping the split's trailing empty piece (`a\nb` → `["a","b"]`, `a\n` →
+  `["a",""]`): that final empty piece is the row the cursor rests *on*, not a row to repair.
+- **Re-wrap (primary):** a non-empty row over `term_w` is re-wrapped at the cell edge
+  (`wrap_to_width`), re-arming the line clear on every continuation (`\n` + `\x1b[K`) so each row is
+  entered by a byte (the overwrite rule, ui_draw_261001). Escapes ride whole; SGR survives the break.
+  Each repaired row now clears on entry, so it needs no padding.
+- **Pad (fallback):** only where draw's clearing is not effective, a row under `term_w` is padded to
+  exactly `term_w` display columns so it fully overwrites the cell row it lands on (an empty row to a
+  full blank row too). Pad *before* a trailing reset, as `pad_row` does; a re-wrapped continuation is
+  padded on its own account, only a row's true tail is exempt. Redundant — and skipped — behind a
+  trusted entry `EL`.
+- Recompute `rows` from the repaired bytes as the newline count — the count `rows_of` would report —
+  so Render owns it and it cannot disagree with what it writes; the tap's emptied write still needs it.
+- All-fit walks the rows once: a no-op when clearing is trusted, a pad pass when it is not. `Meta` is
+  exempt (raw, straight to the meta sink, never touched).
 
-**Decisions to settle before writing it:**
+**Settled — the width measure moves into `slashdot_tui`.** Content rows carry OSC 8 links, and the two
+measures today disagree: `slashdot_tui::ansi::display_width` is CSI-only (it counts an OSC URL as text
+— 39 where the visible width is 9), while the OSC-aware scanner is `row_count::display_width_ansi` in
+picocode. The design puts the width utilities in `slashdot_tui`, so the move is the fix, not a
+workaround: `display_width_ansi` + `wrap_to_width` (with the private `escape_end` / `split_at_width`
+they need) move into `slashdot_tui::ansi`; `row_count` re-exports / delegates so its callers
+(`ui/bar`, `agent/status`, `content`) are unchanged — one OSC-aware measure below both layers.
 
-- *The width measure.* Content rows carry OSC 8 links, and the two current measures disagree:
-  `slashdot_tui::ansi::display_width` is CSI-only (it counts an OSC URL as text — it returns 39 where
-  the visible width is 9), while the OSC-aware scanner `row_count::display_width_ansi` lives in
-  picocode. The design puts the width utilities in `slashdot_tui`. Proposal: move `display_width_ansi`
-  and `wrap_to_width` (with the private `escape_end`/`split_at_width` they need) into
-  `slashdot_tui::ansi` as the shared measure, and have `row_count` re-export/delegate — one
-  implementation, and `slashdot_tui` gains the OSC-aware width it lacks. This touches imports in
-  `row_count`, `ui/bar`, `agent/status`, `content`; confirm before doing it.
-- *The leak it is claimed to fix.* The "frame leaks a row when a content row fills the last cell": the
-  enforcement closes it by itself if the cause is a row wider than the watched terminal — content's
-  `max(20)` floor against a narrower terminal, or a width that raced a resize between content's format
-  and this call. Reproduce first (a padded row of exactly `term_w`; a terminal narrower than 20), then
-  confirm the re-wrap clears it. If a *fitting* row still leaks, the cause is the exact-fill /
-  deferred-wrap margin question — the independent follow-up below, not this enforcement.
+**Settled — the leak is the over-wide wrap defeating the entry clear.** With no row past `term_w`, no
+content write can cross onto a row no byte entered, so each row clears on entry and the frame's old
+row is erased without padding. Reproduce after the fact with a terminal narrower than content's
+`max(20)` floor — the over-wide case the re-wrap closes.
+
+**Build order.** Land the payload change **and the re-wrap** first — that is the fix for the concrete
+leak. Add the **pad fallback** only if draw's clearing turns out unreliable for a stream; it is not
+part of the width fix and can trail.
 
 ## Remaining: Step 5 — delete `output.rs`
 
@@ -104,17 +126,22 @@ Remove the sinks, the dead taps (`LogOutput`), and the `Output` trait; prune `li
 
 ## Follow-ups (beyond step 5)
 
-- **A content row that fills the final terminal cell → the frame leaks a row.** Space-padded rows
-  (`content::panel::panel_row`) reach *exactly* `width` columns; at the terminal's own width that fills
-  the last cell, and the deferred wrap advances a physical row no byte entered (`row_count.rs`
-  documents the same remnant). The enforcement above closes the *over-wide* case; the *exact-fill*
-  case is independent — reproduce with a padded row of exactly `term_w`, then decide between extending
-  the background with `EL` (BCE) instead of trailing spaces and padding to `width - 1`.
+- **`tests/confirm_raw_mode.rs::confirm_dialog_paints_then_clears_with_decision_line` fails.** Fallout
+  of this refactor, not a separate bug. Tackle **after** the cleanup deltas (the Render enforcement
+  above, then step 5), on its own.
+- **Watch item — a content row of exactly `term_w`.** With clearing trusted this is inert: the entry
+  `EL` erases the old row regardless. It matters only where the **pad fallback** is in use — a padded
+  row fills the last cell with no byte beyond it, so on a terminal whose deferred wrap wants a
+  following byte it is the edge to confirm end-to-end. `pad_row` fills to `term_w` for the same
+  reason.
 - **Design doc to sync** (authoritative, so edit there, not here):
-  - §Render's `ContentWrite { lines, stream }` → `{ bytes, rows, stream }` (payload decision above);
-    drop the `type Lines = Vec<String>` alias if it has no other user.
+  - §Content's `ContentWrite { lines, stream }` → `{ bytes, rows, stream }` (payload decision above);
+    drop the `type Lines = Vec<String>` alias if it has no other user. Its "clamps / re-wraps"
+    sentence gains the *pad to fill* half.
   - §Render's `RenderManager` sketch: add the `captured` tap field, and note `render` composes.
   - §Draw's `Draw::draw(frame, content)` already matches what landed.
+  - §End state layering's "the width utilities … live in their own crate" gains the OSC-aware
+    `display_width_ansi` beside `display_width`.
 
 ## Learnings
 
@@ -123,6 +150,10 @@ Decisions not obvious from the code or the design.
 - **The `ContentWrite` payload is `{ bytes, rows, stream }`.** `bytes` exists because it is the single
   source of truth and the tap hands writes on empty; the `rows` count is the piece that must survive
   that, which is why a *derived* count (newline-split alone) is not enough.
+- **Width enforcement and padding solve different problems.** Clearing is per *terminal line*, so the
+  only thing that defeats it is a row wide enough to wrap — that is the leak, and width enforcement
+  (never exceed `term_w`) is the fix. Padding to `term_w` is redundant while the entry `EL` is
+  trusted; it is a fallback for when clearing is not effective, not a second half of the requirement.
 - **Resize / caret reach who they reach.** Resize travels both the `size` watch and the `input`
   channel; caret invalidation travels the manager only, drained lazily at the prompt loop's top
   (`poll_caret`), not inside `render()`.

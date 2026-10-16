@@ -92,5 +92,8 @@ and link a doc/ and/or commit hash
     carry test (4i-b, `48e5e96`), and the large-row producer audit + `/session` memo on an
     mtime-driven listing generation (4i-c, `bff9c63`)
   - [ ] deltas before step 5: `f32` ratio (done `c3a2c13`) + `Draw::draw` merge (done `da6025d`);
-    Render width enforcement over the `ContentWrite` payload remains (design §Content/§Render)
+    the OSC-aware width move into `slashdot_tui` + Render width enforcement remain — re-wrap over-wide
+    (primary); pad under-full only where draw's clearing is unreliable (design §Content/§Render; plan
+    in the impl doc)
+  - [ ] after the deltas: `tests/confirm_raw_mode.rs` confirm-dialog paint test (refactor fallout)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)
