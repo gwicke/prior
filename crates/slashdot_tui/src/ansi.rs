@@ -451,6 +451,29 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// [`strip_ansi`] over raw bytes: drop every CSI / OSC / two-byte escape and
+/// keep the visible bytes, with no UTF-8 decode (the caller's bytes are
+/// already valid UTF-8, and copying them verbatim is the point).
+///
+/// This is the non-tty output edge (design §TermIO): the bytes were composed
+/// and measured as if a terminal would receive them, so removing the escapes
+/// is **zero-width** — the geometry decided above is untouched, and a pipe
+/// consumer sees only the text. A truncated trailing escape is consumed to
+/// the end of the slice: half a sequence is not text.
+pub fn strip_ansi_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i = escape_end(bytes, i);
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
 /// UTF-8 lead byte -> byte length (1..=4).
 pub fn utf8_len(b: u8) -> usize {
     if b < 0x80 {
@@ -623,6 +646,20 @@ pub const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// The non-tty edge strip: CSI (SGR, the line clear) and OSC-8 links go,
+    /// every visible byte stays, and the result is valid UTF-8.
+    #[test]
+    fn strip_ansi_bytes_keeps_the_text_and_drops_every_escape() {
+        let input =
+            b"\x1b[K\x1b[32mgreen\x1b[0m \x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\ caf\xc3\xa9\n";
+        let out = strip_ansi_bytes(input);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "green link caf\u{e9}\n",
+            "visible bytes and multi-byte chars survive; escapes do not"
+        );
+    }
 
     /// The width guard's own edges: escape bytes never count as cells, and a
     /// multi-byte char split across writes is held whole until the wrap

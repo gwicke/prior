@@ -818,9 +818,20 @@ impl Draw {
     /// Apply `frame` as a UI paint (plan §4.3–4.4): plan the bytes, write them,
     /// follow the frame's caret, and remember the size that was applied.
     fn apply(&mut self, frame: &Frame) {
+        if !self.paints_frames() {
+            return;
+        }
         let (tw, th) = self.watched_dims();
         let applied = self.draw_frame(frame, ApplyPolicy::Frame, (tw, th));
         self.cache.applied = Some(applied);
+    }
+
+    /// Whether frames belong on this output — a real non-terminal primary
+    /// drops them wholesale (design §TermIO). Content is untouched: it is
+    /// written and, at [`TermIO`]'s edge, stripped. A `recording`/`null`
+    /// double always paints, so the byte-edge tests still see the frames.
+    fn paints_frames(&self) -> bool {
+        self.term_io.paints_frames()
     }
 
     /// Paint a frame **below the cursor** — a reposition: the content write left
@@ -834,6 +845,10 @@ impl Draw {
     /// accumulator, so a stale count cannot misplace the next reposition's
     /// below-frame clear — is the honest answer.
     pub fn reposition(&mut self, frame: &Frame, old_h: usize) {
+        if !self.paints_frames() {
+            self.cache.consumed_rows = 0;
+            return;
+        }
         if frame.height() == 0 {
             self.cache.consumed_rows = 0;
             return;
@@ -890,6 +905,11 @@ impl Draw {
 
     /// Apply `frame` at the cursor under `policy` (plan §4.3–4.4): plan the
     /// bytes, write them, return the dims actually applied.
+    ///
+    /// On a real non-terminal primary the frame is dropped wholesale (design
+    /// §TermIO): the dims are still returned, but no bytes leave and the live
+    /// cache is left untouched, so content afterwards appends as plain text
+    /// rather than being positioned against a frame that was never painted.
     pub fn draw_frame(
         &mut self,
         frame: &Frame,
@@ -900,6 +920,9 @@ impl Draw {
         // source for both phases of the frame (ui_draw_v2 §9 #3). Clamped
         // to what `plan_apply` stores as the live frame's `term_w`/`term_h`.
         let (tw, th) = (dims.0.max(1), dims.1.max(1));
+        if !self.paints_frames() {
+            return (tw, th);
+        }
         let bytes = plan_apply(&mut self.cache, frame, policy, tw, th);
         self.write_bytes(bytes.as_bytes());
         // The cursor follows the frame's own caret. A composed frame with one is

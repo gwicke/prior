@@ -179,8 +179,8 @@ pub enum Stream {
 /// `TermIO` picks the *input / lifecycle* side
 /// (`Tty`/`Plain`, from stdin); caps adjust output fidelity independently.
 /// `picocode "q" | cat` is the case that splits them: a tty stdin with a
-/// non-tty primary — frames dropped (and, later, output stripped) for the
-/// stream, not for the process.
+/// non-tty primary — frames dropped and output stripped for the stream, not
+/// for the process (see [`TermIO::write`] and [`TermIO::paints_frames`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caps {
     /// The primary output stream (stdout) is a terminal: colour, clickable
@@ -355,6 +355,13 @@ pub struct PlainIo {
     size_tx: watch::Sender<TermSize>,
     /// Probed once at construction — see [`TtyIo::caps`].
     caps: Caps,
+    /// Whether this backend stands in for a **real** output stream, and so
+    /// applies the design's degradation (§TermIO): a non-terminal stream is
+    /// stripped at the edge and loses its frames. [`TermIO::plain`] — the
+    /// production non-REPL backend — says yes; the `recording`/`null` doubles
+    /// say no, because they observe the *composed* bytes rather than what a
+    /// real consumer would receive.
+    degrade: bool,
     handles: Option<TermHandles>,
 }
 
@@ -425,13 +432,16 @@ impl TermIO {
             sink: Sink::Stdio,
             size_tx,
             caps: Caps::probe(),
+            degrade: true,
             handles: Some(handles),
         })
     }
 
     /// Memory writers, per stream (design doc §Testing): what byte-edge
-    /// assertions record through once `Draw` writes via `TermIO`. Stripped
-    /// bytes with frames dropped by caps are Draw's decision, above this.
+    /// assertions record through once `Draw` writes via `TermIO`. A double,
+    /// not a real stream — it does **not** degrade, so the bytes come back as
+    /// composed (stripping and the frame drop are exercised by
+    /// [`Self::recording_degraded`]).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn recording() -> Self {
         let (handles, input_tx, caret_tx, size_tx) = term_channels();
@@ -444,6 +454,29 @@ impl TermIO {
             },
             size_tx,
             caps: Caps::probe(),
+            degrade: false,
+            handles: Some(handles),
+        })
+    }
+
+    /// A memory writer that stands in for a **real** stream with `caps`: it
+    /// degrades exactly as [`Self::plain`] would — a non-terminal stream is
+    /// stripped and drops frames — but records the result so a test can assert
+    /// the degradation. The caps are pinned by the caller, so the test does not
+    /// inherit the runner's terminal.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn recording_degraded(caps: Caps) -> Self {
+        let (handles, input_tx, caret_tx, size_tx) = term_channels();
+        drop(input_tx);
+        drop(caret_tx);
+        TermIO::Plain(PlainIo {
+            sink: Sink::Recording {
+                main: Vec::new(),
+                meta: Vec::new(),
+            },
+            size_tx,
+            caps,
+            degrade: true,
             handles: Some(handles),
         })
     }
@@ -457,6 +490,7 @@ impl TermIO {
             sink: Sink::Null,
             size_tx,
             caps: Caps::probe(),
+            degrade: false,
             handles: Some(handles),
         })
     }
@@ -599,7 +633,21 @@ impl TermIO {
     /// `Draw` writes comes through here; the byte-edge tests read what
     /// [`recording`](Self::recording) holds at the same edge, and
     /// [`null`](Self::null) discards.
+    ///
+    /// **The degradation edge** (design §TermIO): on a *real* stream that is
+    /// not a terminal, every CSI / OSC-8 escape is stripped — zero-width, so
+    /// the geometry decided above is untouched and a pipe consumer sees only
+    /// text. Frames never reach here in that case (they are dropped at
+    /// [`Draw`](crate::draw::Draw); see [`Self::paints_frames`]), so what is
+    /// stripped is content. The `recording`/`null` doubles do not degrade.
     pub fn write(&mut self, s: Stream, bytes: &[u8]) -> io::Result<()> {
+        let stripped;
+        let bytes = if self.degrades() && !self.stream_is_terminal(s) {
+            stripped = crate::ansi::strip_ansi_bytes(bytes);
+            stripped.as_slice()
+        } else {
+            bytes
+        };
         match self {
             TermIO::Tty(_) => write_stdio(s, bytes),
             TermIO::Plain(p) => match &mut p.sink {
@@ -614,6 +662,38 @@ impl TermIO {
                 }
                 Sink::Null => Ok(()),
             },
+        }
+    }
+
+    /// Whether frames belong on this output (design §TermIO: "non-tty
+    /// primaries additionally drop frames wholesale at Draw"). A real stream
+    /// that is not a terminal gets none — they are screen choreography a pipe
+    /// consumer cannot use, and their row text would otherwise leak. A
+    /// recording / sinkhole double always paints: it observes the composed
+    /// bytes, not the degradation.
+    pub fn paints_frames(&self) -> bool {
+        if !self.degrades() {
+            return true;
+        }
+        self.caps().primary
+    }
+
+    /// Whether this backend stands in for a real output stream (see
+    /// `PlainIo::degrade`). `Tty` and [`Self::plain`] always do.
+    fn degrades(&self) -> bool {
+        match self {
+            TermIO::Tty(_) => true,
+            TermIO::Plain(p) => p.degrade,
+        }
+    }
+
+    /// Whether `s` is a terminal on this backend — the per-stream half of the
+    /// degradation decision.
+    fn stream_is_terminal(&self, s: Stream) -> bool {
+        let caps = self.caps();
+        match s {
+            Stream::Main => caps.primary,
+            Stream::Meta => caps.meta,
         }
     }
 
@@ -1314,5 +1394,66 @@ mod tests {
         let mut sink = TermIO::null();
         sink.write(Stream::Main, b"gone").unwrap();
         assert_eq!(sink.recorded(Stream::Main), b"");
+    }
+
+    /// The degradation edge (design §TermIO): a *real* non-terminal stream is
+    /// stripped per stream from caps — `Main` when stdout is a pipe, `Meta`
+    /// when stderr is, each independently.
+    #[test]
+    fn the_edge_strips_a_non_terminal_stream_and_keeps_a_terminal_one() {
+        let mut io = TermIO::recording_degraded(Caps {
+            primary: false,
+            meta: true,
+        });
+        io.write(Stream::Main, b"\x1b[32mgreen\x1b[0m\x1b[K\n")
+            .unwrap();
+        io.write(Stream::Meta, b"\x1b[2mdim\x1b[0m\n").unwrap();
+        assert_eq!(
+            io.recorded(Stream::Main),
+            b"green\n",
+            "a non-terminal primary is stripped"
+        );
+        assert_eq!(
+            io.recorded(Stream::Meta),
+            b"\x1b[2mdim\x1b[0m\n",
+            "a terminal meta stream is left as composed"
+        );
+    }
+
+    /// The doubles observe the *composed* bytes: neither the plain `recording`
+    /// backend nor `null` degrades, whatever the runner's streams are.
+    #[test]
+    fn the_recording_and_null_doubles_do_not_degrade() {
+        let mut rec = TermIO::recording();
+        rec.write(Stream::Main, b"\x1b[32mgreen\x1b[0m\n").unwrap();
+        assert_eq!(
+            rec.recorded(Stream::Main),
+            b"\x1b[32mgreen\x1b[0m\n",
+            "raw bytes at the observation edge"
+        );
+        assert!(rec.paints_frames(), "a double always paints its frames");
+    }
+
+    /// The frame half (design §TermIO): a real non-terminal primary drops
+    /// frames; a terminal primary, and any double, keeps them.
+    #[test]
+    fn a_non_terminal_primary_drops_frames() {
+        assert!(
+            !TermIO::recording_degraded(Caps {
+                primary: false,
+                meta: false,
+            })
+            .paints_frames(),
+            "a piped primary gets no frames"
+        );
+        assert!(
+            TermIO::recording_degraded(Caps {
+                primary: true,
+                meta: false,
+            })
+            .paints_frames(),
+            "a terminal primary keeps them"
+        );
+        assert!(TermIO::null().paints_frames(), "a double always paints");
     }
 }

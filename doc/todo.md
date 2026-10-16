@@ -105,4 +105,5 @@ and link a doc/ and/or commit hash
     (5d-i quiet + input source; 5d-ii the tap seam and `ConsoleOutput` go; `AgentConfig.output`
     drops); 5e (the render test modules move to content, the `Output` trait + the module go, `lib.rs`
     pruned) — landed `9b0ce5c`…`bbc77aa`
-  - [ ] 5f (independent): the non-tty `StripAnsi` edge strip (impl doc)
+  - [x] 5f: the non-tty edge strip (`StripAnsi` per stream from caps) and the frame drop, both real
+    streams only; the recording/null doubles observe composed bytes — landed `HEAD`

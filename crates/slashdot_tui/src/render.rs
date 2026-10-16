@@ -1078,6 +1078,54 @@ mod tests {
         );
     }
 
+    /// A real non-terminal primary drops the frame wholesale (design §TermIO):
+    /// the paint composes but nothing reaches the stream — no bar, no rows —
+    /// and the live cache is left untouched, so content afterwards appends as
+    /// plain text rather than being positioned against a frame never painted.
+    #[test]
+    fn a_non_terminal_primary_paints_no_frame() {
+        let size = crate::termio::fixed(TermSize {
+            width: 40,
+            height: 24,
+        });
+        // A real stream (degrades) whose primary is not a terminal.
+        let mut manager = RenderManager::new(
+            size,
+            crate::termio::TermIO::recording_degraded(crate::termio::Caps {
+                primary: false,
+                meta: true,
+            }),
+        );
+        manager.configure(
+            crate::render::FRAME_MAX_ROW_RATIO,
+            vec![Element::lines(vec!["hello".to_string()])],
+        );
+        manager.render(None);
+        assert!(
+            manager
+                .draw
+                .term_io
+                .recorded(crate::termio::Stream::Main)
+                .is_empty(),
+            "a frame must not reach a piped primary"
+        );
+        assert_eq!(
+            manager.draw.cache.applied, None,
+            "no live frame is recorded, so content appends rather than consuming"
+        );
+
+        // Content still flows — stripped at the edge, text only.
+        manager.render_content(crate::render::ContentWrite {
+            bytes: b"\x1b[32mgreen\x1b[0m\x1b[K\n".to_vec(),
+            stream: crate::termio::Stream::Main,
+        });
+        assert_eq!(
+            manager.draw.term_io.recorded(crate::termio::Stream::Main),
+            b"green\n",
+            "content survives as stripped text"
+        );
+    }
+
     // ---- allocate ----
     //
     // The parity pins (design §6): these asked in `Extent`s before, and

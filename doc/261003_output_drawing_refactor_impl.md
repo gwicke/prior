@@ -4,15 +4,14 @@ Ephemeral companion to [`261003_output_drawing_refactor.md`](./261003_output_dra
 (the authoritative design). `git log` and `doc/todo.md` record what is done; this file tracks only
 what remains and the decisions worth keeping. Do not refer to this document from code comments.
 
-## Remaining
-
-### 5f (independent) — the non-tty `StripAnsi` edge strip
-Design §TermIO: a `StripAnsi` writer wrapper (per stream from caps) strips CSI/OSC-8 at the very
-edge, zero-width, so geometry is untouched; non-tty primaries additionally drop frames wholesale at
-Draw (done). Not implemented, claimed by no earlier step. Carve out here or defer.
-
 ## Follow-ups
 
+- **`TermGuard`'s mode sequences bypass the degradation edge.** It writes the bracketed-paste /
+  kitty-keyboard / cursor CSI straight to `io::stdout()`, not through [`TermIO::write`], so a tty
+  *stdin* with a piped primary (`picocode > out.txt`) still leaks those escapes into the file. Raw
+  mode only matters for an interactive stdin, and the leak is a handful of bytes at entry/exit, so
+  it was left out of 5f — but it is the one remaining path that reaches a non-terminal primary
+  unstripped.
 - **`tests/confirm_raw_mode.rs::confirm_dialog_paints_then_clears_with_decision_line` fails.**
   Fallout of this refactor, not a separate bug. On resolve the dialog's divider row survives: the
   assertion sees the header/options cleared but a full-width rule still on screen (the decision line
@@ -56,3 +55,9 @@ Decisions not obvious from the code or the design.
 - **Tests move with the code they test.** The render test modules lived in `output.rs` only because
   the trait they shared was there; once the trait goes, the suite belongs beside the `Content` it
   drives (`content/handle.rs`) and beside the preview helpers it exercises (`content/preview.rs`).
+- **Degradation is a property of a real stream, not of a cap alone.** The strip and the frame drop
+  key on caps, but only a *real* backend acts on them: a test double observes the composed bytes, so
+  `recording()`/`null()` neither strip nor drop frames. That is what keeps the byte-edge suite
+  (which asserts raw ANSI at the recording edge) deterministic regardless of the runner's terminal;
+  `recording_degraded(caps)` supplies the real-stream behaviour with pinned caps when a test needs
+  to exercise the degradation itself.

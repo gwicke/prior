@@ -296,11 +296,13 @@ impl TermIO {
 - `suspend()` stops the reader and drops raw mode ($EDITOR, Ctrl-Z); `resume()` reverses it. Upper
   layers reach it only through the RenderManager / Draw pass-throughs.
 - Two variants only. Constructors over Plain, not variants: `recording()` (memory writers,
-  `#[cfg(test)]` — stripped bytes, frames dropped by caps) and `null()` (sinkhole). `--quiet` is not
-  a backend: it selects Plain, whose answer is printed from `run_once`'s return (main.rs:366).
+  `#[cfg(test)]`) and `null()` (sinkhole). `--quiet` is not a backend: it selects Plain, whose answer
+  is printed from `run_once`'s return (main.rs:366).
 - Degradation: layers above always emit ANSI + OSC-8; a `StripAnsi` writer wrapper (per stream from
   caps) strips CSI/OSC-8 at the very edge — zero-width, so geometry is untouched. Non-tty primaries
-  additionally drop frames wholesale at Draw.
+  additionally drop frames wholesale at Draw. Both are a property of a **real** stream: the
+  `recording()`/`null()` doubles observe the *composed* bytes (no strip, frames kept), and a
+  `recording_degraded(caps)` double stands in for a real stream so the degradation is testable.
 - **Width is exposed because it cannot degrade late**: wrapping, table columns, panel and bar fit
   are decided at render time and destructive: a wrapped line cannot be unwrapped. ANSI is
   recoverable, geometry is not; height feeds only the frame budget.
