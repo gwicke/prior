@@ -24,6 +24,54 @@ what remains and the decisions worth keeping. Do not refer to this document from
   a following byte it is the edge to confirm end-to-end. `pad_row` fills to `term_w` for the same
   reason.
 
+### Next — step 6: output kinds, backend-owned routing
+
+The output vocabulary is a *sink* vocabulary today (`Stream::{Main, Meta}`), so Content decides
+routing (`reasoning_on_stderr = !caps.primary`) and Render/Draw special-case `Stream::Meta` (skip
+the frame merge; skip width repair). Turn it into a *kind* vocabulary and move the sink decision to
+the layer that owns the capability. When it lands, §TermIO/§Render/§Draw of the design doc get the
+new vocabulary as end state.
+
+The shape:
+
+- **Content-facing kinds, not sinks.** `Stream { Content, Reasoning, Error }`: Content says *what* a
+  write is. `Reasoning` replaces today's "divert to Meta"; `Error` names what is now `SystemMessage`
+  on `Main`. `Stream::Meta` goes. `Frame` never crosses the content API.
+- **TermIO owns kind → sink, from caps.** `Content`/`Error` → primary; `Reasoning` → primary when
+  the primary is a terminal, else the meta stream; `Frame` → primary, dropped when the primary is
+  not a terminal. The strip stays at the edge (5f), per *target* cap.
+- **`Frame` is a Draw → TermIO distinction**, not a `Stream` variant: `TermIO::write_frame` (or a
+  two-variant `TermTarget { Content(Stream), Frame }`). Draw's frame-side writes — `plan_consume`'s
+  walk, `apply`/`draw_frame`/`reposition`, the caret show/hide, the re-anchor — carry it; the
+  content write keeps its kind. Content bytes are never rewritten by the consume, so the drop
+  leaves them intact.
+- **No screen query is needed for the merge.** `Reasoning` is emitted exactly when the primary is
+  not a terminal — i.e. exactly when frames are dropped — so the walk/reposition around a
+  `Reasoning` write are `Frame` bytes TermIO discards. Draw can always merge (its cache advances
+  against dropped bytes, the fiction 5f already accepts).
+- **One screen predicate, one consumer left.** Render's `repair_main` applies the width net only to
+  a write bound for the primary screen; put the rule on `Caps` (`caps.kind_sink(kind)`), which
+  TermIO owns and probes, and let Render read it — a query, not a private table.
+
+Open before landing:
+
+- **`Error`'s sink is a decision, not a rename.** Errors are on `Main` today (stdout, so a piped
+  consumer sees them); only `--quiet` sends them to stderr, via `eprintln!`. Naming the kind forces
+  the choice — keep stdout to avoid a regression, or make it cap-driven.
+- **`--quiet` is unaffected** — it drops the hub hand-off entirely; keep it that way.
+- **Recording doubles:** record per *kind* or per *sink*? They key on `Main`/`Meta` now, and the
+  real-vs-double split (`recording`/`recording_degraded`) must survive.
+- **`Reasoning` vs a generic meta:** the only non-primary stream today *is* diverted reasoning, so
+  the semantic kind is a clean rename — but `show_reasoning` (whether it renders at all) stays
+  Content's, and only the sink moves.
+- **Churn:** `Stream`'s variants are a `termio` re-export, so `ContentWrite.stream`, `repair_main`,
+  `Draw::draw`, `write_stdio`, and a large block of `Stream::Main`/`Meta` test assertions move.
+- **`TermGuard`** (the first bullet above) is the same "TermIO owns output" finding and folds in
+  here.
+- **Non-tty width (CLI)** is independent geometry — the `term_w` hard requirement exists only so a
+  wrapped row cannot defeat the per-row entry `EL`, and a pipe has no screen, so a non-tty width can
+  be a configured value (default 80) or unlimited. Do it separately or accept the 80 fallback.
+
 ### Follow-up — track the repairs back into content
 
 Render repairs two broken conventions: a missing line terminator, and a row over the watched width.

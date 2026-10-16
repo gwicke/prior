@@ -100,6 +100,8 @@ and link a doc/ and/or commit hash
   - [ ] follow-up: track the line-terminator / width repairs back into content — Render's enforcement
     is a net, not the plan (impl doc)
   - [ ] `tests/confirm_raw_mode.rs` confirm-dialog paint test (refactor fallout)
+  - [ ] follow-up: step 6 — output kinds + backend-owned routing (`Stream { Content, Reasoning,
+    Error }`, `Frame` as a `Draw → TermIO` distinction, `Caps::kind_sink`); impl doc
   - [x] Step 5: delete `output.rs` (§8.5) — 5a/5b/5c (drawing verbs retire; the confirm half retires,
     no-port path denies; capture moves to Content and a capturing write never reaches render()); 5d
     (5d-i quiet + input source; 5d-ii the tap seam and `ConsoleOutput` go; `AgentConfig.output`
