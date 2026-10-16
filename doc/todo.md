@@ -101,6 +101,6 @@ and link a doc/ and/or commit hash
   - [ ] `tests/confirm_raw_mode.rs` confirm-dialog paint test (refactor fallout)
   - [ ] Step 5: delete `output.rs` (§8.5) — 5a/5b/5c done (drawing verbs retire; the confirm half
     retires, no-port path denies; capture moves to Content and a capturing write never reaches
-    render()). 5d the tap seam dissolves (`with_tap`/`RecordingOutput`/`content_for` go; quiet +
-    input move onto `Content`) and `AgentConfig.output` drops; 5e delete the module + prune `lib.rs`;
-    5f (independent) the non-tty `StripAnsi` edge strip (impl doc)
+    render()). 5d done (5d-i quiet + input source; 5d-ii the tap seam and `ConsoleOutput` go;
+    `AgentConfig.output` drops). 5e move the render test modules and delete the `Output` trait +
+    the module (prune `lib.rs`); 5f (independent) the non-tty `StripAnsi` edge strip (impl doc)

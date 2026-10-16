@@ -8,26 +8,16 @@ what remains and the decisions worth keeping. Do not refer to this document from
 
 The end state is a `Content` built directly (`Content::new` in production, `Content::quiet` for
 `--quiet`, a live `Content` + capture in tests) that the agent and its guards hold; `output.rs` and
-its trait dissolve. Landed as commits, each compiling and green on its own.
+its trait dissolve.
 
-### 5d — the tap seam dissolves; `AgentConfig.output` drops
-Capture is Content's now, so the `tap: Option<Arc<dyn Output>>` seam is all that stands between
-Content and a direct build. Fold its two remaining jobs into Content and delete the seam:
-
-- **quiet** — a `Content` flag: suppress the hub hand-off, route `display_error` to stderr
-  (`Content::quiet`); and
-- **the non-REPL input source** — production reads stdin, tests inject a script.
-
-That deletes `Content::with_tap`, `RecordingOutput`, `NoOutput`/`LogOutput` (dead), and
-`content_for`; every caller builds its `Content` directly (production `Content::new`, quiet
-`Content::quiet`, tests a live `Content` read through `begin_capture`). `ConsoleOutput` dissolves
-into `Content` plus a public `hub()`; `confirm_probe`, the examples, `main.rs` and the test harnesses
-(`for_test_with_output`, the `ScriptOutput` doubles, `repl`'s `commit_harness`) migrate;
-`AgentConfig.output` drops.
+5d (a/b/c) is done: quiet and the non-REPL input source are `Content` state, the `tap` seam and
+`ConsoleOutput` are gone, and `AgentConfig.output` is dropped. What is left of `output.rs` is the
+`Output` trait itself — with no implementors and no users — and the render test module.
 
 ### 5e — delete `output.rs`; prune `lib.rs`
-Remove the module; `Confirmation` is already gone and the sinks are content's (5c), so `lib.rs` loses
-the whole `output` re-export line.
+- Move the `sed_preview_body_tests` and the row-accounting/painting `tests` modules somewhere they
+  belong (they test content and the render pipeline; content's own tests are the natural home).
+- Delete the `Output` trait; `lib.rs` loses the `pub use output::Output;` line and the module.
 
 ### 5f (independent) — the non-tty `StripAnsi` edge strip
 Design §TermIO: a `StripAnsi` writer wrapper (per stream from caps) strips CSI/OSC-8 at the very

@@ -74,6 +74,10 @@ the agent holds a `Content` handle (never the hub); confirmation keeps its own `
 - Capture is Content's: `begin_capture`/`end_capture` tap the block's bytes at the output, and a
   capturing write never reaches `render()` — content only, never frame bytes — so `/replay Nl` and
   content-path tests compare what Content produced. Byte-edge tests use `TermIO::recording()`.
+- Quiet is Content's too, a flag rather than a backend: `Content::quiet` builds the same `Content`
+  and drops the hub hand-off (the bytes are still built), with `display_error` the one verb that
+  survives, to stderr. The non-REPL input read (the piped/batch driver) is a small `InputSource` on
+  the handle — stdin in production, a script in tests.
 - No direct agent → output path remains: every write enters through render().
 
 ## UI layer
