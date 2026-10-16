@@ -848,14 +848,26 @@ impl NodeEntry {
             // One shared `&PathArgs` for every child — built once above.
             match child.node_data(epoch, &path_args).await {
                 Ok(response) => {
-                    let same = match self.content.data_rc.get(i) {
-                        Some(Some(prev)) => Arc::ptr_eq(prev, &response),
-                        _ => false,
+                    // Fast path: the node handed back the same allocation.
+                    // Fallback: same *content* — the node minted a fresh
+                    // response but nothing a listing can see changed, so it
+                    // contributes no change and the stored `Arc` is reused
+                    // (writing the *stored* one, not the fresh one, so a
+                    // sibling's change cannot churn it). This is what keeps
+                    // the flicker-free carry on the real menu path, where
+                    // most nodes do not memoize.
+                    let reuse = match self.content.data_rc.get(i) {
+                        Some(Some(prev)) if Arc::ptr_eq(prev, &response) => Some(Arc::clone(prev)),
+                        Some(Some(prev)) if prev.same_content(&response) => Some(Arc::clone(prev)),
+                        _ => None,
                     };
-                    if !same {
-                        changed = true;
+                    match reuse {
+                        Some(arc) => new_data.push(Some(arc)),
+                        None => {
+                            changed = true;
+                            new_data.push(Some(response));
+                        }
                     }
-                    new_data.push(Some(response));
                 }
                 Err(_e) => {
                     // Keep stale rows; mark changed so view re-derives.
@@ -4088,5 +4100,83 @@ mod tests {
             vec!["model", "models", "model_xtra_long", "alphabet"],
             "{ids:?}"
         );
+    }
+
+    /// 4i-a: a node that mints a fresh response every call (the common,
+    /// non-memoizing case) contributes no change when its content is
+    /// unchanged, so the stored handle is reused and `slots_dirty` stays
+    /// clear — the flicker-free carry on the real menu path.
+    #[test]
+    fn fresh_but_equal_response_reuses_the_stored_handle() {
+        let mut root = root_with_cmds(vec![CmdNode::new("a")]);
+        assert!(
+            futures::executor::block_on(root.refresh_data(ep(), &[], "")),
+            "first scan is a change"
+        );
+        let stored = Arc::clone(root.content.data_rc[0].as_ref().unwrap());
+        // Stand in for the view pipeline having consumed the change.
+        root.content.slots_dirty = false;
+
+        // `CmdNode::data` builds a fresh `Arc` each call; the fallback
+        // compares content and reuses the stored handle.
+        assert!(
+            !futures::executor::block_on(root.refresh_data(ep(), &[], "")),
+            "an equal-but-fresh response is not a change"
+        );
+        assert!(!root.content.slots_dirty, "slots stay clean");
+        assert!(
+            Arc::ptr_eq(&stored, root.content.data_rc[0].as_ref().unwrap()),
+            "the stored handle is reused, not the fresh one"
+        );
+    }
+
+    /// The fallback still reports a real change: differing rows mint a new
+    /// handle and dirty the slots.
+    #[test]
+    fn differing_response_is_a_change() {
+        let mut root = root_with_cmds(vec![CmdNode::new("a")]);
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let stored = Arc::clone(root.content.data_rc[0].as_ref().unwrap());
+        root.content.slots_dirty = false;
+
+        // Swap the child's content.
+        root.children[0].inner = Box::new(CmdNode::new("b"));
+        assert!(
+            futures::executor::block_on(root.refresh_data(ep(), &[], "")),
+            "changed content is a change"
+        );
+        assert!(root.content.slots_dirty, "slots dirtied");
+        assert!(
+            !Arc::ptr_eq(&stored, root.content.data_rc[0].as_ref().unwrap()),
+            "a new handle for changed content"
+        );
+    }
+
+    #[test]
+    fn same_content_compares_rows_and_active_ids_as_a_set() {
+        let base = DataResponse {
+            rows: vec![crate::fields::Row::new("a").desc("ay")],
+            active_ids: vec!["a".into(), "b".into()],
+        };
+        // Same rows, active ids in a different order: same content.
+        let reordered = DataResponse {
+            rows: base.rows.clone(),
+            active_ids: vec!["b".into(), "a".into()],
+        };
+        assert!(base.same_content(&reordered));
+
+        // A different row breaks it.
+        let other_row = DataResponse {
+            rows: vec![crate::fields::Row::new("a").desc("bee")],
+            active_ids: base.active_ids.clone(),
+        };
+        assert!(!base.same_content(&other_row));
+
+        // A different active-id set breaks it.
+        let other_active = DataResponse {
+            rows: base.rows.clone(),
+            active_ids: vec!["a".into()],
+        };
+        assert!(!base.same_content(&other_active));
     }
 }

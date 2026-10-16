@@ -119,6 +119,24 @@ pub struct DataResponse {
     pub active_ids: Vec<String>,
 }
 
+impl DataResponse {
+    /// Content equality for the engine's memo gate (`refresh_data`): two
+    /// responses are interchangeable when their rows (in display order) and
+    /// active-id *sets* match. The rows need not be the same allocation —
+    /// only the same content — so a node that mints a fresh response per call
+    /// still contributes no change. `active_ids` is compared as a set because
+    /// a node may drain a `HashSet` (order not meaningful) and consumers only
+    /// ever insert into sets.
+    pub fn same_content(&self, other: &DataResponse) -> bool {
+        self.rows == other.rows
+            && self.active_ids.len() == other.active_ids.len()
+            && self
+                .active_ids
+                .iter()
+                .all(|id| other.active_ids.contains(id))
+    }
+}
+
 /// Error returned by `data()` when the node cannot produce rows.
 #[derive(Debug)]
 pub struct DataError {
