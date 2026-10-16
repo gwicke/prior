@@ -188,7 +188,13 @@ pub async fn run_interactive(
     auto_resume: bool,
 ) -> Result<()> {
     let mut interactive = Interactive::new(config, settings, auto_resume).await;
-    interactive.run().await
+    let result = interactive.run().await;
+    // Teardown: the loop's exits (`/quit`, an error mid-turn) leave raw mode
+    // on, and the `TermGuard` drop backstop can never fire — the persistent
+    // stdin reader holds an `Arc` clone for the process lifetime. The front
+    // door is idempotent and a no-op on Plain, so this is unconditional.
+    interactive.config.content.manager.lock().unwrap().suspend();
+    result
 }
 
 impl Interactive {
