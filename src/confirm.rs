@@ -13,7 +13,7 @@
 //! running, the REPL paints the dialog as an ordinary overlay element, and the
 //! answer goes back through the reply channel.
 //!
-//! What the agent gets back is [`ConfirmDecision`] — **not** `Confirmation` — so
+//! What the agent gets back is [`ConfirmDecision`] — an accept/deny bit — so
 //! "always" cannot leak across the boundary. Picking *always* is the REPL's
 //! business: it records the approval and answers `Accept`, exactly as it
 //! answers `Accept` for *yes*. The agent has one bit, and the one bit means one

@@ -38,7 +38,7 @@ use rig_core::tool::{Tool, ToolExecutionError};
 use rig_reqwest::client::{DefaultTransportBuilder, DefaultTransportClient};
 use serde_json;
 
-use crate::output::{Confirmation, Output};
+use crate::output::Output;
 use crate::params;
 use crate::Result;
 use std::path::Path;
@@ -60,9 +60,9 @@ use crate::tools::{
 pub struct AgentConfig {
     pub provider: String,
     pub model: String,
-    /// The frame + input seam — `set_status` / `frame_size` / `paint` /
-    /// `confirm_default` and, in the REPL, `get_user_input`. The drawing
-    /// refactor drops it; content calls live on [`Self::content`].
+    /// The frame + input seam — `set_status` / `frame_size` / `paint` and, in
+    /// the REPL, `get_user_input`. The drawing refactor drops it; content calls
+    /// live on [`Self::content`].
     pub output: Arc<dyn Output>,
     /// The content handle: every `display_*` / `stream_*` /
     /// `begin|end_response` call goes here. In production it is the same
@@ -74,10 +74,10 @@ pub struct AgentConfig {
     pub quiet: bool,
     /// The REPL's end of the confirm port, cloned into every guarded tool.
     ///
-    /// `None` means "nobody to ask", and the tools fall back to the output's
-    /// synchronous confirm policy — the correct behaviour for piped/batch input
-    /// and for one-shot `run_once`, where there is no key pump to drive a
-    /// dialog. Set once by `run_interactive` before the agent is built, so a
+    /// `None` means "nobody to ask", and the tools deny — the correct behaviour
+    /// for piped/batch input and for one-shot `run_once`, where there is no key
+    /// pump to drive a dialog. Set once by `run_interactive` before the agent is
+    /// built, so a
     /// `/model` rebuild (which clones this config) keeps the same port and the
     /// same session approvals.
     pub confirm_port: Option<crate::confirm::ConfirmPort>,
@@ -310,7 +310,6 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
             let rig_agent = build_rig_agent(
                 $builder,
                 config.yolo,
-                config.output.clone(),
                 config.confirm_port.clone(),
                 config.system_message_extension,
                 config.persona_prompt,
@@ -775,7 +774,6 @@ than the ~2 lines of trailing context you get by default."#;
 fn build_rig_agent(
     builder: AgentBuilder<NoToolConfig>,
     yolo: bool,
-    output: Arc<dyn Output>,
     confirm_port: Option<crate::confirm::ConfirmPort>,
     system_message_extension: Option<String>,
     persona_prompt: Option<String>,
@@ -839,34 +837,10 @@ fn build_rig_agent(
 
     let confirm_port = confirm_port.clone();
     builder = builder
-        .tool(guard(
-            MakeDir,
-            yolo,
-            output.clone(),
-            None,
-            confirm_port.clone(),
-        ))
-        .tool(guard(
-            Remove,
-            yolo,
-            output.clone(),
-            None,
-            confirm_port.clone(),
-        ))
-        .tool(guard(
-            MoveFile,
-            yolo,
-            output.clone(),
-            None,
-            confirm_port.clone(),
-        ))
-        .tool(guard(
-            CopyFile,
-            yolo,
-            output.clone(),
-            None,
-            confirm_port.clone(),
-        ));
+        .tool(guard(MakeDir, yolo, None, confirm_port.clone()))
+        .tool(guard(Remove, yolo, None, confirm_port.clone()))
+        .tool(guard(MoveFile, yolo, None, confirm_port.clone()))
+        .tool(guard(CopyFile, yolo, None, confirm_port.clone()));
 
     let auto_allow = bash_auto_allow.clone();
     // Publish the resolved sandbox config for the shell tools. picocode runs a
@@ -876,7 +850,6 @@ fn build_rig_agent(
     builder = builder.tool(guard(
         Bash,
         yolo,
-        output.clone(),
         Some(Arc::new(move |args| {
             auto_allow.iter().any(|pattern| {
                 regex::Regex::new(pattern)
@@ -888,13 +861,7 @@ fn build_rig_agent(
     ));
 
     if is_tool_available("agent-browser") {
-        builder = builder.tool(guard(
-            AgentBrowser,
-            yolo,
-            output.clone(),
-            None,
-            confirm_port.clone(),
-        ));
+        builder = builder.tool(guard(AgentBrowser, yolo, None, confirm_port.clone()));
     }
     builder.build()
 }
@@ -902,30 +869,25 @@ fn build_rig_agent(
 struct Guard<T: Tool> {
     tool: T,
     yolo: bool,
-    output: Arc<dyn Output>,
     /// The REPL's end of the confirm port, `None` where there is no REPL to
-    /// ask (piped/batch, one-shot `run_once`).
+    /// ask (piped/batch, one-shot `run_once`) — a gated call is then denied.
     ///
     /// With a port, a gated call *awaits* the REPL's answer and the turn's
     /// `select!` keeps running throughout (doc/confirm_as_menu_261002.md).
     confirm: Option<crate::confirm::ConfirmPort>,
-    /// Session approval for the no-port path only — see [`Self::call`]. The
-    /// port carries its own (`Approvals`), so with a REPL this is never read.
-    always: Arc<AtomicBool>,
     auto_approve: Option<Arc<dyn Fn(&T::Args) -> bool + Send + Sync>>,
 }
 
 impl<T: Tool> Guard<T> {
     /// Whether this tool is already cleared for the session.
     ///
-    /// With a port that is the REPL's `Approvals` store — the one place an
-    /// *always* choice is recorded, so the agent never sees the third option.
-    /// Without one it falls back to this guard's own flag, which is what keeps
-    /// the piped `Always` answer meaningful now that there is no dialog.
+    /// Only a port can record an *always* choice (the REPL's `Approvals`
+    /// store); without one nothing is ever approved, so every gated call is
+    /// asked and — with no port to ask — denied.
     fn already_approved(&self) -> bool {
         match &self.confirm {
             Some(port) => port.approvals().is_approved(T::NAME),
-            None => self.always.load(Ordering::Relaxed),
+            None => false,
         }
     }
 }
@@ -975,17 +937,11 @@ impl<T: Tool<Error = crate::tools::ToolError>> Tool for Guard<T> {
                 // side. Nothing here blocks: the turn's loop keeps pumping
                 // keys while this call is parked.
                 Some(port) => port.request(Self::NAME, message).await,
-                // No REPL: the output's own synchronous policy, and *this* flag
-                // is the only thing that can remember an `Always` — a piped
-                // session's "s" (session) has no port to record it in.
-                None => match self.output.confirm_default(&message) {
-                    Confirmation::Always => {
-                        self.always.store(true, Ordering::Relaxed);
-                        crate::confirm::ConfirmDecision::Accept
-                    }
-                    Confirmation::Yes => crate::confirm::ConfirmDecision::Accept,
-                    Confirmation::No => crate::confirm::ConfirmDecision::Deny,
-                },
+                // No REPL: nobody to ask, so deny. A piped session's "s"
+                // (session) has no port to record it in, and an interactive one
+                // reaches this only if the port failed to install — a bug worth
+                // seeing rather than papering over (doc/confirm_as_menu_261002.md).
+                None => crate::confirm::ConfirmDecision::Deny,
             };
             if decision == crate::confirm::ConfirmDecision::Deny {
                 return Err(crate::tools::ToolError::Generic(
@@ -1000,16 +956,13 @@ impl<T: Tool<Error = crate::tools::ToolError>> Tool for Guard<T> {
 fn guard<T: Tool>(
     tool: T,
     yolo: bool,
-    output: Arc<dyn Output>,
     auto_approve: Option<Arc<dyn Fn(&T::Args) -> bool + Send + Sync>>,
     confirm: Option<crate::confirm::ConfirmPort>,
 ) -> Guard<T> {
     Guard {
         tool,
         yolo,
-        output,
         confirm,
-        always: Arc::new(AtomicBool::new(false)),
         auto_approve,
     }
 }

@@ -28,13 +28,6 @@ use markdown_terminal::{Renderer, Theme};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, PartialEq)]
-pub enum Confirmation {
-    Yes,
-    No,
-    Always,
-}
-
 pub trait Output: Send + Sync {
     fn display_text(&self, text: &str);
     /// Render a model *response* as markdown. Defaults to `display_text` so
@@ -88,19 +81,6 @@ pub trait Output: Send + Sync {
     fn get_user_input(&self) -> String;
     fn display_error(&self, error: &str);
     fn display_system(&self, text: &str);
-    fn confirm(&self, message: &str) -> Confirmation;
-    /// The **no-pump** policy for a gated tool call: what to answer when there
-    /// is no REPL to draw a dialog and no key to draw it with (piped/batch
-    /// input, one-shot `run_once`, `--quiet`).
-    ///
-    /// Defaults to the output's own `confirm` behavior, which is the right
-    /// answer for every output that *can* ask — `QuietOutput` reads a line from
-    /// stdin, `NoOutput` says yes. It is `confirm_default` that an interactive
-    /// session reaches only if the port failed to install, because with a port
-    /// the REPL's dialog answers instead.
-    fn confirm_default(&self, message: &str) -> Confirmation {
-        self.confirm(message)
-    }
     fn display_separator(&self);
     /// Set the transient status line the output should paint after each content
     /// block while a turn runs — the session / model / context readout.
@@ -178,16 +158,6 @@ impl Output for QuietOutput {
         eprintln!("Error: {}", error);
     }
     fn display_system(&self, _text: &str) {}
-    fn confirm(&self, message: &str) -> Confirmation {
-        eprintln!("Confirm: {} [y/n/s]", message);
-        let mut input = String::new();
-        let _ = std::io::stdin().read_line(&mut input);
-        match input.trim().to_lowercase().as_str() {
-            "y" | "yes" => Confirmation::Yes,
-            "s" | "session" => Confirmation::Always,
-            _ => Confirmation::No,
-        }
-    }
     fn display_separator(&self) {}
     fn display_header(
         &self,
@@ -211,9 +181,6 @@ impl Output for NoOutput {
     }
     fn display_error(&self, _error: &str) {}
     fn display_system(&self, _text: &str) {}
-    fn confirm(&self, _message: &str) -> Confirmation {
-        Confirmation::Yes
-    }
     fn display_separator(&self) {}
     fn display_header(
         &self,
@@ -276,9 +243,6 @@ impl Output for RecordingOutput {
     fn display_system(&self, text: &str) {
         self.lines.lock().unwrap().push(text.to_string());
     }
-    fn confirm(&self, _message: &str) -> Confirmation {
-        Confirmation::Yes
-    }
     fn display_separator(&self) {}
     fn display_header(
         &self,
@@ -316,10 +280,6 @@ impl Output for LogOutput {
 
     fn display_system(&self, text: &str) {
         tracing::debug!(target: "picocode", "System: {}", text);
-    }
-
-    fn confirm(&self, _message: &str) -> Confirmation {
-        Confirmation::No
     }
 
     fn display_separator(&self) {}
@@ -675,21 +635,6 @@ impl Output for ConsoleOutput {
 
     fn display_system(&self, text: &str) {
         self.content.display_system(text);
-    }
-
-    /// The **no-pump** confirm policy: nobody is driving keys, so there is no
-    /// dialog to show, and this output denies.
-    ///
-    /// This used to open the blocking dialog in `ui::confirm`. That path is
-    /// gone — a confirmation is session state in the REPL's pump now
-    /// (doc/confirm_as_menu_261002.md) — so the only callers left here are the
-    /// ones with no REPL to ask: one-shot `run_once`, piped/batch input, and
-    /// `--quiet`. Denying is the safe direction for all of them: it is what
-    /// `Esc` meant, and it cannot run a tool the user never agreed to. An
-    /// interactive session reaches this only if the port failed to install,
-    /// which is a bug worth seeing rather than papering over.
-    fn confirm(&self, _message: &str) -> Confirmation {
-        Confirmation::No
     }
 
     fn display_separator(&self) {

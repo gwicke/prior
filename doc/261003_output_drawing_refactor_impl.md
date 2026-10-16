@@ -10,13 +10,6 @@ The end state is a `Content` built directly (`Content::new` in production, `Cont
 `--quiet`, a live `Content` + capture in tests) that the agent and its guards hold; `output.rs` and
 its trait dissolve. Landed as commits, each compiling and green on its own.
 
-### 5b — the confirm half of `Output` retires; the no-port path denies
-`Output`'s confirm pair is the *no-pump* policy (a REPL confirmation is the port's now), reached only
-by `Guard` when `confirm_port` is `None`. Non-TTY operation supports static decisions only —
-**deny every gated call, or `yolo`** (settled). So `Guard` with no port simply denies:
-`Confirmation`, `Output::confirm`/`confirm_default`, and `Guard`'s session `always` flag all go.
-`Output` is left with content verbs only.
-
 ### 5c — capture becomes Content's; the record-tap folds into it
 `RenderManager`'s capture (`captured` + `capture_tap` + the `render()` swallow) and `Content`'s
 `tap` are the same idea — record what Content produced — so fold them and put the one seam at
@@ -43,8 +36,8 @@ into `Content` plus a public `hub()`; `confirm_probe`, the examples, `main.rs` a
 (`for_test_with_output`, the `ScriptOutput` doubles, `repl`'s `commit_harness`) migrate.
 
 ### 5e — delete `output.rs`; prune `lib.rs`
-Remove the module; `Confirmation` is already gone (5b) and the sinks are content's (5c), so `lib.rs`
-loses the whole `output` re-export line.
+Remove the module; `Confirmation` is already gone and the sinks are content's (5c), so `lib.rs` loses
+the whole `output` re-export line.
 
 ### 5f (independent) — the non-tty `StripAnsi` edge strip
 Design §TermIO: a `StripAnsi` writer wrapper (per stream from caps) strips CSI/OSC-8 at the very

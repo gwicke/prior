@@ -1399,7 +1399,6 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         use crate::config::{BindPath, SandboxConfig};
-        use crate::output::Confirmation;
         use crate::AgentConfig;
         use crate::Output;
         use std::sync::atomic::AtomicBool;
@@ -1471,9 +1470,6 @@ mod tests {
             fn display_tool_result(&self, _: &str) {}
             fn display_error(&self, _: &str) {}
             fn display_system(&self, _: &str) {}
-            fn confirm(&self, _: &str) -> Confirmation {
-                Confirmation::No
-            }
             fn display_header(&self, _: &str, _: &str, _: bool, _: usize, _: Option<&str>) {}
         }
 
@@ -1552,7 +1548,6 @@ mod tests {
         use std::collections::VecDeque;
         use std::sync::{Arc, Mutex};
 
-        use crate::output::Confirmation;
         use crate::AgentConfig;
         use crate::Output;
         use std::sync::atomic::AtomicBool;
@@ -1584,9 +1579,6 @@ mod tests {
             fn display_tool_result(&self, _: &str) {}
             fn display_error(&self, _: &str) {}
             fn display_system(&self, _: &str) {}
-            fn confirm(&self, _: &str) -> Confirmation {
-                Confirmation::No
-            }
             fn display_header(&self, _: &str, _: &str, _: bool, _: usize, _: Option<&str>) {}
         }
 
