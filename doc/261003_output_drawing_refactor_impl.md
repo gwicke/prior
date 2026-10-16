@@ -6,22 +6,54 @@ what remains and the decisions worth keeping. Do not refer to this document from
 
 ## Remaining: Step 5 — delete `output.rs`
 
-Remove the sinks, the dead taps (`LogOutput`), and the `Output` trait; prune `lib.rs` re-exports.
+The end state is a `Content` built directly (`Content::new` in production, `Content::quiet` for
+`--quiet`, `Content::with_tap` in tests) that the agent and its guards hold; `output.rs` and its
+trait dissolve. Landed as commits, each compiling and green on its own.
 
-- **Drop `AgentConfig.output`** → the design's `AgentConfig { content, confirm_port }`.
-  `AgentConfig::content_for` and `ConsoleOutput::content()` exist only for the dual field and go
-  with it, as does `ConsoleOutput` itself — ending the `Arc<Content>` sharing.
-- **Re-shape the tap.** `Content::tap` is `Option<Arc<dyn Output>>`; make it a verb recorder
-  (`FnMut`/sink) or fold it into capture. `content_for` then reduces to a quiet-vs-record switch;
-  `RecordingOutput`/`ScriptOutput` lose their content duties.
-- **Retire the `Output`-shaped sinks.** `QuietOutput`/`NoOutput`/`RecordingOutput`/`ScriptOutput`
-  remain only for `content_for` + the frame handle; with the tap re-shaped content is covered and
-  the frame is gone. `LogOutput` (dead, zero users) dies here regardless.
-- **Verify capture** stays at the `ContentWrite` hand-off: content bytes only, never frames. Nothing
-  to migrate; confirm as the sinks die.
-- **Degradation's output half** (design §TermIO): non-tty primaries drop frames wholesale at Draw
-  (done); the `StripAnsi` edge strip (CSI/OSC-8, zero-width) is not implemented and is claimed by no
-  step. Natural home: step 5, beside the sink dissolution.
+### 5a — the drawing half of `Output` retires
+`Output::draw_frame` (default + `ConsoleOutput`'s forward), `begin_batch`/`end_batch` and
+`BatchGuard` are dead: the manager already owns all of them (`RenderManager::draw_frame`,
+`begin_batch`/`end_batch`, `ContentBatchGuard`). Remove the three verbs and the guard; the few test
+callers that used the `Output` forward reach the hub directly (`content.manager.lock().draw_frame`,
+`ContentBatchGuard::open`). No behavior change. Also drop `display_tool_error` (a default impl with
+no production caller, an `agent.rs` test only). The trait is left with content verbs +
+`confirm`/`confirm_default`.
+
+### 5b — `Confirmation` out of `output.rs`; the no-port policy stands alone
+`Output`'s confirm pair is the *no-pump* policy (a REPL confirmation is the port's now), reached only
+by `Guard` when `confirm_port` is `None`. Move `Confirmation` beside `ConfirmDecision`; give the
+Guard a `ConfirmPolicy` value rather than an `Output`. See the open question below on what that
+policy resolves to. `Output` then carries content verbs only.
+
+### 5c — the tap narrows to a content-only seam
+`Content::tap` is `Option<Arc<dyn Output>>` but is used only for content verbs; give it a
+content-only trait (in `content/`) and implement it for the quiet / record / test sinks. `Content`
+stops importing `crate::output`. `NoOutput`/`LogOutput` (dead) die here.
+
+### 5d — `AgentConfig.output` drops; the agent + guards hold `Content`
+`content_for` dies; every caller builds its `Content` directly (production `Content::new`, quiet
+`Content::quiet`, tests `Content::with_tap`). `ConsoleOutput` dissolves into `Content` plus a public
+`hub()`; `confirm_probe`, the examples, `main.rs` and the test harnesses (`for_test_with_output`, the
+`ScriptOutput` doubles, `repl`'s `commit_harness`) migrate. Confirm capture stays at the
+`ContentWrite` hand-off — content bytes only, never frames — as the sinks die.
+
+### 5e — delete `output.rs`; prune `lib.rs`
+Remove the module and re-export the survivors (`Confirmation`/`ConfirmPolicy` from `confirm`, the
+sink types from `content`).
+
+### 5f (independent) — the non-tty `StripAnsi` edge strip
+Design §TermIO: a `StripAnsi` writer wrapper (per stream from caps) strips CSI/OSC-8 at the very
+edge, zero-width, so geometry is untouched; non-tty primaries additionally drop frames wholesale at
+Draw (done). Not implemented, claimed by no earlier step. Carve out here or defer.
+
+### Open questions
+- **the no-port confirm policy.** Today it is per-consumer: `QuietOutput` asks on stdin,
+  `ConsoleOutput` denies, the test doubles answer a fixed value. Design §UI says batch / one-shot
+  gated tools *require yolo*, which argues for a flat **deny**. That drops quiet's stdin ask — a
+  behavior change to confirm before landing.
+- **the seam's shape.** A trait (minimal edits to the test doubles) vs a closed enum
+  (`Live | Quiet | Record(..)`, matching the TermIO/Draw style). The `ScriptOutput` double wants a
+  queued `get_user_input` *and* a recorded buffer, which an enum models awkwardly — leaning trait.
 
 ## Follow-ups (beyond step 5)
 

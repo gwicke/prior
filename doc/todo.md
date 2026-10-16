@@ -99,4 +99,7 @@ and link a doc/ and/or commit hash
   - [ ] follow-up: track the line-terminator / width repairs back into content — Render's enforcement
     is a net, not the plan (impl doc)
   - [ ] `tests/confirm_raw_mode.rs` confirm-dialog paint test (refactor fallout)
-  - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)
+  - [ ] Step 5: delete `output.rs` (§8.5) — 5a the drawing verbs retire; 5b `Confirmation` + the
+    no-port policy leave the trait; 5c the tap narrows to a content-only seam; 5d
+    `AgentConfig.output` drops, callers hold `Content`; 5e delete the module + prune `lib.rs`;
+    5f (independent) the non-tty `StripAnsi` edge strip (impl doc)
