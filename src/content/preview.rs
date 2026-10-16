@@ -484,3 +484,162 @@ pub(crate) fn refined_diff_lines(old: &str, new: &str) -> Vec<String> {
     }
     out
 }
+
+#[cfg(test)]
+mod sed_preview_body_tests {
+    use super::{get_preview, sed_preview_body, short_banner, SED_PREVIEW_BANNER};
+
+    const RESULT: &str = "sed preview: 2 blocks for src/x.rs (1 expression). Review the blocks below, then pass them to the `edit` tool as its `blocks` argument.
+src/x.rs:5
+@@@OLD
+    run();
+@@@NEW
+    walk();
+@@@END
+
+src/x.rs:9
+@@@OLD
+    drop();
+    // tail
+@@@NEW
+    // tail
+@@@END
+";
+
+    #[test]
+    fn renders_blocks_as_a_diff_with_anchors() {
+        let lines = sed_preview_body(RESULT).expect("body");
+        let joined = lines.join("\n");
+        // The counts survive as a short closing line; the instruction telling the
+        // model to pass the blocks to `edit` is not something a human needs.
+        assert!(
+            joined.contains("2 blocks in src/x.rs, from 1 expression"),
+            "{joined}"
+        );
+        assert!(!joined.contains("pass them to the `edit` tool"), "{joined}");
+        // Each block becomes a -/+ pair under its anchor.
+        assert!(joined.contains("@@ -5,1 +5,1 @@"), "{joined}");
+        assert!(joined.contains("-     run();"), "{joined}");
+        assert!(joined.contains("+     walk();"), "{joined}");
+        assert!(joined.contains("@@ -9,2 +9,1 @@"), "{joined}");
+        // A deletion keeps its removed lines and has no additions.
+        assert!(joined.contains("-     drop();"), "{joined}");
+        assert!(!joined.contains("+     drop();"), "{joined}");
+    }
+
+    #[test]
+    fn notes_survive_because_they_say_what_is_missing() {
+        // `bsed` emits NOTEs straight after the banner, before the first block
+        // (see the banner builder in crates/bsed/src/lib.rs).
+        let note = "NOTE: only 37 of 152 blocks are shown. The other 115 are NOT included.";
+        let with_note = RESULT.replacen("\nsrc/x.rs:5", &format!("\n{note}\nsrc/x.rs:5"), 1);
+        assert!(
+            with_note.contains(note),
+            "fixture must place the note in the banner"
+        );
+        let joined = sed_preview_body(&with_note).expect("body").join("\n");
+        assert!(joined.contains("only 37 of 152 blocks"), "{joined}");
+        // It is kept, and it is not mistaken for the one-line summary.
+        assert!(
+            joined.contains("2 blocks in src/x.rs, from 1 expression"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn short_banner_drops_the_model_instruction() {
+        assert_eq!(
+            short_banner(
+                "sed preview: 3 blocks for src/x.rs (2 expressions). Review the blocks below, \
+                 then pass them to the `edit` tool as its `blocks` argument."
+            ),
+            "3 blocks in src/x.rs, from 2 expressions"
+        );
+        // A no-change banner has nothing to condense.
+        assert_eq!(
+            short_banner("no lines matched \u{2014} src/x.rs is unchanged by this 1 expression."),
+            "no lines matched \u{2014} src/x.rs is unchanged by this 1 expression"
+        );
+    }
+
+    #[test]
+    fn the_label_carries_the_expressions_on_one_line() {
+        let args = serde_json::json!({
+            "path": "./test_engine.rs",
+            "expressions": "s/pub fn /fn /\n    s/^    /        /",
+        });
+        let (label, extra) = get_preview("sed", &args);
+        assert!(label.starts_with("sed ./test_engine.rs  $ "), "{label}");
+        // Newlines collapse, so the whole script stays on the label's one line.
+        assert!(!label.contains('\n'), "{label}");
+        assert!(
+            label.contains("s/pub fn /fn /; s/^    /        /"),
+            "{label}"
+        );
+        assert!(extra.is_empty(), "{extra:?}");
+    }
+
+    #[test]
+    fn a_long_script_is_truncated_rather_than_wrapping_the_panel() {
+        let args = serde_json::json!({
+            "path": "x.rs",
+            "expressions": format!("s/{}/y/", "a".repeat(200)),
+        });
+        let (label, _) = get_preview("sed", &args);
+        assert!(label.ends_with("..."), "{label}");
+        assert!(label.lines().count() == 1, "{label}");
+    }
+
+    #[test]
+    fn leaves_other_results_alone() {
+        // Not a sed preview: the caller falls through to the generic renderer.
+        assert!(sed_preview_body("Replaced 1 block(s) in src/x.rs").is_none());
+        assert!(sed_preview_body("").is_none());
+    }
+
+    /// The banner has two shapes in `bsed` — "N blocks for PATH" (the library)
+    /// and "N block(s) in M of K file(s) under DIR" (the CLI). The gate keys on
+    /// their shared prefix, so both must still render.
+    #[test]
+    fn both_banner_shapes_are_still_recognized() {
+        let multi = "sed preview: 4 block(s) in 2 of 3 file(s) under /tmp/x. \
+             Check and apply them with `edit`.\n\
+             a/x.rs:5\n@@@OLD\n    run();\n@@@NEW\n    walk();\n@@@END\n";
+        let joined = sed_preview_body(multi).expect("body").join("\n");
+        assert!(joined.contains("@@ -5,1 +5,1 @@"), "{joined}");
+        assert!(
+            joined.contains("4 block(s) in 2 of 3 file(s)"),
+            "counts lost: {joined}"
+        );
+    }
+
+    /// An `edit` argument error is not a preview, however block-shaped it looks.
+    ///
+    /// A blob-shaped one used to be claimed by a content sniff for `@@@OLD`: its
+    /// `Expected:` example *is* a well-formed block, so the panel drew the
+    /// example as a diff and hid the error behind it. The gate is the
+    /// `sed preview:` banner now; no argument error carries one.
+    #[test]
+    fn an_edit_argument_error_is_not_mistaken_for_a_preview() {
+        // Blob shapes (once drawn as a phantom diff) and single-edit shapes
+        // alike: none of them is a preview.
+        for raw in [
+            serde_json::json!({"blocks": "@@ -10,1 +10,1 @@\n- a\n+ b"}),
+            serde_json::json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@END"}),
+            serde_json::json!({"oldText": "a", "newText": "b"}),
+            serde_json::json!({"path": "src/x.rs:10", "startLine": 3, "oldText": "a", "newText": "b"}),
+            serde_json::json!({"edits": [{"path": "a.rs", "oldText": "a", "newText": "b"},
+                                          {"path": "b.rs", "oldText": "a", "newText": "b"}]}),
+        ] {
+            let msg = crate::tools::EditArgs::from_wire(&raw).expect_err("must fail");
+            assert!(
+                !msg.starts_with(SED_PREVIEW_BANNER),
+                "claimed as a preview:\n{msg}"
+            );
+            assert!(
+                sed_preview_body(&msg).is_none(),
+                "claimed as a preview:\n{msg}"
+            );
+        }
+    }
+}

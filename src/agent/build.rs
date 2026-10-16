@@ -62,8 +62,8 @@ pub struct AgentConfig {
     /// The content handle: every `display_*` / `stream_*` /
     /// `begin|end_response` call goes here. In production it is the same
     /// `Content` the paint path holds; under `--quiet` it is
-    /// [`Content::quiet`]; in a test it is a `Content` whose verbs
-    /// short-circuit through a tap.
+    /// [`Content::quiet`]; in a test it is a `Content` built for capture or
+    /// scripted input.
     pub content: Arc<crate::content::Content>,
     pub yolo: bool,
     pub quiet: bool,
@@ -653,7 +653,8 @@ impl AgentHook for LoggingHook {
             .unwrap_or(serde_json::Value::String(event.args.to_string()));
         // Canonicalize `edit` arguments to the array form for display, so
         // `get_preview` sees the same shape it gets on replay (the parser stays
-        // out of `output.rs`). No-op for other tools / already-canonical args.
+        // out of the preview helpers). No-op for other tools / already-canonical
+        // args.
         if event.tool_name == "edit" {
             args_json = crate::edit_blocks::canonicalize_edit_value(&args_json);
         }

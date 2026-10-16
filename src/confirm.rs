@@ -304,7 +304,8 @@ pub fn decision_line(subject: &str, decision: ConfirmDecision) -> String {
 /// overlay's — that append is pinned by a session-level test, because it needs
 /// an `AppState` to build a session and a probe cannot have one. What a probe
 /// *can* do is drive the real reducer ([`ConfirmPrompt::handle_key`]) and the
-/// real bytes ([`ConfirmPrompt::elements`] → `Output::draw_elements`), which is
+/// real bytes ([`ConfirmPrompt::elements`] → the manager's `configure` +
+/// `render`), which is
 /// what this exposes; the only thing it re-states is the tail the session also
 /// ends in.
 pub fn paint(
@@ -340,10 +341,10 @@ pub fn paint(
 /// own paint (it still owns the prompt and any menu underneath); the probe
 /// passes the empty stack.
 ///
-/// Takes content for the decision line: `display_plain` is a
-/// content verb — boundary rules and the tap seam included — and the line
-/// stays inside this function because the repaint-then-decide order is the
-/// invariant, not something each caller may remember.
+/// Takes content for the decision line: `display_plain` is a content verb —
+/// boundary rules included — and the line stays inside this function because
+/// the repaint-then-decide order is the invariant, not something each caller
+/// may remember.
 pub fn resolve(
     content: &crate::content::Content,
     redraw: impl FnOnce(),

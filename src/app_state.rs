@@ -792,8 +792,8 @@ impl AppState {
         Self::for_test_with_content(settings, Arc::new(crate::content::Content::quiet()))
     }
 
-    /// Like [`for_test`], with a caller-chosen content — tests assert on
-    /// captured display lines via a tap or `begin_capture`.
+    /// Like [`for_test`], with a caller-chosen content — tests assert on the
+    /// display lines it captured via `begin_capture`.
     #[cfg(test)]
     pub fn for_test_with_content(
         settings: SettingsStore,

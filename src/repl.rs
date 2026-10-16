@@ -1452,7 +1452,7 @@ impl Repl {
     /// entry) and is *not* forced to the screen bottom, so closing an overlay
     /// never leaves a gap in the scrollback. Drawing goes through the unified
     /// frame pipeline (plan `doc/ui_draw_v2.md` §5.2): `redraw` composes
-    /// `[Input, Divider?, Overlay?]`, and `Output::draw_frame` draws from the
+    /// `[Input, Divider?, Overlay?]`, and `RenderManager::render` draws from the
     /// cursor, scrolls and clears within the live region — all
     /// clearing is confined to the frame region and below, so the greeter /
     /// status / session content above the input is never touched. The whole
@@ -1812,7 +1812,7 @@ impl Repl {
     /// no output handle to go through.
     ///
     /// `#[cfg(test)]` on purpose: it is the only remaining way to reach the pure
-    /// pipeline outside `Output::draw_elements`, so production *cannot* build a
+    /// pipeline outside the manager's `render`, so production *cannot* build a
     /// frame by hand. Dropping the `cfg` would silently reintroduce the second
     /// pipeline that `ui.rs` used to have (ui_draw_v2 §5.1.1).
     #[cfg(test)]
@@ -4388,7 +4388,7 @@ mod tests {
     // ===== vt100 terminal-emulator tests =====
     //
     // Build the frame production draws — `Repl::compose_frame` →
-    // `plan_apply`, i.e. the exact bytes `Output::draw_frame` writes
+    // `plan_apply`, i.e. the exact bytes the manager's frame apply writes
     // (ONLCR-translated by [`onlcr`]) — and feed them through a real vt100
     // terminal emulator. This checks both visible cell content and the final
     // cursor position — the strongest test possible without a real TTY.
