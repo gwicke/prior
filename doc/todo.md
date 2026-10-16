@@ -3,11 +3,12 @@
 NOTE: Keep things tight - normally no more than 1-2 lines per bullet point. More detail -> create
 and link a doc/ and/or commit hash
 
-- [ ] `--quiet` with no positional prompt spins: the non-REPL input arm (`repl == None`) pairs a
-      `QuietOutput::get_user_input` that always returns `""` with `if input.is_empty() { continue }`
-      — a pre-existing hot loop (reproduces at `50e4e69`; piped stdin was never a command source —
-      one-shots go through `Commands::Input`/the positional prompt). Either make `QuietOutput` read
-      lines (batch-friendly: pairs with `Repl::batch_slash`) or stop the loop on empty input.
+- [ ] `--quiet` with no positional prompt spins: the non-REPL input arm (`repl == None`) pairs
+      `Content::quiet`'s empty input source (`InputSource::Empty`, always `""`) with
+      `if input.is_empty() { continue }` — a pre-existing hot loop (reproduces at `50e4e69`; piped
+      stdin was never a command source — one-shots go through `Commands::Input`/the positional
+      prompt). Either make the empty input source read lines (batch-friendly: pairs with
+      `Repl::batch_slash`) or stop the loop on empty input.
 - [ ] table rendering and filtering: dynamic columns
   - Include filter / sort columns in layout (.columns)
   - [ ] Less misleading / confusing modifier value auto-complete - headers currently say MODIFIER |
@@ -99,8 +100,9 @@ and link a doc/ and/or commit hash
   - [ ] follow-up: track the line-terminator / width repairs back into content — Render's enforcement
     is a net, not the plan (impl doc)
   - [ ] `tests/confirm_raw_mode.rs` confirm-dialog paint test (refactor fallout)
-  - [ ] Step 5: delete `output.rs` (§8.5) — 5a/5b/5c done (drawing verbs retire; the confirm half
-    retires, no-port path denies; capture moves to Content and a capturing write never reaches
-    render()). 5d done (5d-i quiet + input source; 5d-ii the tap seam and `ConsoleOutput` go;
-    `AgentConfig.output` drops). 5e move the render test modules and delete the `Output` trait +
-    the module (prune `lib.rs`); 5f (independent) the non-tty `StripAnsi` edge strip (impl doc)
+  - [x] Step 5: delete `output.rs` (§8.5) — 5a/5b/5c (drawing verbs retire; the confirm half retires,
+    no-port path denies; capture moves to Content and a capturing write never reaches render()); 5d
+    (5d-i quiet + input source; 5d-ii the tap seam and `ConsoleOutput` go; `AgentConfig.output`
+    drops); 5e (the render test modules move to content, the `Output` trait + the module go, `lib.rs`
+    pruned) — landed `9b0ce5c`…`bbc77aa`
+  - [ ] 5f (independent): the non-tty `StripAnsi` edge strip (impl doc)
