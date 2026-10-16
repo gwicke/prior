@@ -91,4 +91,6 @@ and link a doc/ and/or commit hash
     production menu path — `same_content` fallback in `refresh_data` (4i-a, `237d9ab`), engine-path
     carry test (4i-b, `48e5e96`), and the large-row producer audit + `/session` memo on an
     mtime-driven listing generation (4i-c, `bff9c63`)
+  - [ ] deltas before step 5: `f32` ratio (done `c3a2c13`) + `Draw::draw` merge (done `da6025d`);
+    Render width enforcement over the `ContentWrite` payload remains (design §Content/§Render)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)
