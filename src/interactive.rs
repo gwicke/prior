@@ -1398,7 +1398,6 @@ mod tests {
 
         use crate::config::{BindPath, SandboxConfig};
         use crate::AgentConfig;
-        use crate::Output;
         use std::sync::atomic::AtomicBool;
 
         // bwrap is required for the sandbox to engage at all.
@@ -1440,57 +1439,24 @@ mod tests {
             max_output_bytes: crate::config::SandboxMaxOutputBytes(None),
         };
 
-        // In-memory `Output`: replays a fixed script and records what is shown.
-        struct ScriptOutput {
-            inputs: Arc<Mutex<VecDeque<String>>>,
-            shown: Arc<Mutex<String>>,
-        }
-        impl Output for ScriptOutput {
-            fn display_text(&self, t: &str) {
-                self.shown.lock().unwrap().push_str(t);
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn display_plain(&self, t: &str) {
-                self.shown.lock().unwrap().push_str(t);
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn display_separator(&self) {
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn get_user_input(&self) -> String {
-                self.inputs
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or_else(|| "/q".to_string())
-            }
-            fn display_tool_call(&self, _: &str, _: &serde_json::Value) {}
-            fn display_tool_result(&self, _: &str) {}
-            fn display_error(&self, _: &str) {}
-            fn display_system(&self, _: &str) {}
-            fn display_header(&self, _: &str, _: &str, _: bool, _: usize, _: Option<&str>) {}
-        }
-
+        // A scripted input line replays the `!` command; captured bytes record
+        // what content shows.
         let inputs = Arc::new(Mutex::new(VecDeque::from([
             format!("!cat {}", probe),
             "/q".to_string(),
         ])));
-        let shown = Arc::new(Mutex::new(String::new()));
-        let out = ScriptOutput {
-            inputs,
-            shown: shown.clone(),
-        };
+        let content = Arc::new(crate::content::Content::for_test());
+        content.set_input_script(inputs);
 
         // Use a temp directory for session storage to avoid littering the user's config.
         // tempfile::TempDir cleans up automatically on drop.
         let sessions_tempdir = tempfile::tempdir().unwrap();
         let sessions_dir = sessions_tempdir.path().to_path_buf();
 
-        let content = Arc::new(crate::content::Content::with_tap(Arc::new(out)));
         let config = AgentConfig {
             provider: "openai".into(),
             model: "gpt-4o".into(),
-            content,
+            content: content.clone(),
             yolo: true,
             confirm_port: None,
             quiet: true,
@@ -1515,11 +1481,12 @@ mod tests {
         // No normal prompt is ever submitted, so the agent is never created and
         // `create_agent` (and its `set_sandbox`) is never called — exactly the
         // pre-fix condition where `!` would otherwise run unsandboxed.
+        content.begin_capture();
         super::run_interactive(config, settings, false)
             .await
             .unwrap();
 
-        let shown = shown.lock().unwrap().clone();
+        let shown = String::from_utf8_lossy(&content.end_capture()).into_owned();
         let _ = std::fs::remove_file(&host_path);
         // sessions_tempdir is automatically cleaned up when dropped here
 
@@ -1545,38 +1512,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         use crate::AgentConfig;
-        use crate::Output;
         use std::sync::atomic::AtomicBool;
-
-        struct ScriptOutput {
-            inputs: Arc<Mutex<VecDeque<String>>>,
-            shown: Arc<Mutex<String>>,
-        }
-        impl Output for ScriptOutput {
-            fn display_text(&self, t: &str) {
-                self.shown.lock().unwrap().push_str(t);
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn display_plain(&self, t: &str) {
-                self.shown.lock().unwrap().push_str(t);
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn display_separator(&self) {
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn get_user_input(&self) -> String {
-                self.inputs
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or_else(|| "/q".to_string())
-            }
-            fn display_tool_call(&self, _: &str, _: &serde_json::Value) {}
-            fn display_tool_result(&self, _: &str) {}
-            fn display_error(&self, _: &str) {}
-            fn display_system(&self, _: &str) {}
-            fn display_header(&self, _: &str, _: &str, _: bool, _: usize, _: Option<&str>) {}
-        }
 
         // `/thinking high` commits through the engine (echoed line proves
         // `batch_slash` ran); `/quit` must then end the loop — if the eval
@@ -1587,18 +1523,13 @@ mod tests {
             "/reasoning high".to_string(),
             "/quit".to_string(),
         ])));
-        let shown = Arc::new(Mutex::new(String::new()));
-        let out = ScriptOutput {
-            inputs: inputs.clone(),
-            shown: shown.clone(),
-        };
-
         let sessions_tempdir = tempfile::tempdir().unwrap();
-        let content = Arc::new(crate::content::Content::with_tap(Arc::new(out)));
+        let content = Arc::new(crate::content::Content::for_test());
+        content.set_input_script(inputs.clone());
         let config = AgentConfig {
             provider: "openai".into(),
             model: "gpt-4o".into(),
-            content,
+            content: content.clone(),
             yolo: true,
             confirm_port: None,
             quiet: true,
@@ -1620,11 +1551,12 @@ mod tests {
         };
         let settings = SettingsStore::from_agent_config(&config, &Default::default(), None);
 
+        content.begin_capture();
         super::run_interactive(config, settings, false)
             .await
             .unwrap();
 
-        let shown = shown.lock().unwrap().clone();
+        let shown = String::from_utf8_lossy(&content.end_capture()).into_owned();
         assert!(
             shown.contains("reasoning high"),
             "expected the batch commit echo for `/thinking high`, got:\n{shown}"

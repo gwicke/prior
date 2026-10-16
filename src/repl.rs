@@ -3193,8 +3193,8 @@ mod tests {
     #[test]
     fn batch_slash_reasoning_high_commits_in_one_enter() {
         let state = batch_state();
-        let (out, lines) = crate::output::RecordingOutput::new();
-        let content = Content::with_tap(out);
+        let content = Content::for_test();
+        content.begin_capture();
         let action = crate::agent::block_on_test(Repl::batch_slash(
             &state,
             "/reasoning high",
@@ -3205,7 +3205,7 @@ mod tests {
         // The node wrote the runtime target; the loop's convergence step
         // would apply it on the same cycle.
         assert_eq!(state.reasoning().as_deref(), Some("high"));
-        let captured = crate::output::RecordingOutput::joined(&lines);
+        let captured = String::from_utf8_lossy(&content.end_capture()).into_owned();
         assert!(
             captured.contains("reasoning high"),
             "committed line not echoed: {:?}",
@@ -3216,8 +3216,7 @@ mod tests {
     #[test]
     fn batch_slash_quit_latches_control_target() {
         let state = batch_state();
-        let (out, _lines) = crate::output::RecordingOutput::new();
-        let content = Content::with_tap(out);
+        let content = Content::quiet();
         let action = crate::agent::block_on_test(Repl::batch_slash(
             &state,
             "/quit",
@@ -3233,8 +3232,7 @@ mod tests {
         // Empty, prose, and the `/q` alias fall back to raw `Submit`
         // (the agent loop's `/q`/`exit` arm keeps owning them).
         let state = batch_state();
-        let (out, _lines) = crate::output::RecordingOutput::new();
-        let content = Content::with_tap(out);
+        let content = Content::quiet();
         for line in ["", "hello", "/q"] {
             let action = crate::agent::block_on_test(Repl::batch_slash(
                 &state,
@@ -3249,8 +3247,7 @@ mod tests {
     #[test]
     fn batch_slash_unknown_command_returns_instead_of_hanging() {
         let state = batch_state();
-        let (out, _lines) = crate::output::RecordingOutput::new();
-        let content = Content::with_tap(out);
+        let content = Content::quiet();
         let action = crate::agent::block_on_test(Repl::batch_slash(
             &state,
             "/definitely-not-a-command",

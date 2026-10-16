@@ -648,10 +648,10 @@ mod tests {
             pi_user_entry("m1", Some("s1"), "continue"),
         ];
         let units = build_replay_units(&branch);
-        let (out, lines) = crate::output::RecordingOutput::new();
-        let content = Content::with_tap(out);
+        let content = Content::for_test();
+        content.begin_capture();
         replay_units(&content, &units, 0);
-        let captured = crate::output::RecordingOutput::joined(&lines);
+        let captured = String::from_utf8_lossy(&content.end_capture()).into_owned();
         assert!(
             captured.contains("[branch summary from m0]"),
             "marker carries the copy-pasteable id: {captured}"

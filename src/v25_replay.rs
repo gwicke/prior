@@ -141,14 +141,15 @@ mod tests {
 
     #[test]
     fn replay_submit_without_session_displays_message() {
-        let (out, lines) = crate::output::RecordingOutput::new();
-        let app_state = test_app_state_with(Arc::new(crate::content::Content::with_tap(out)));
+        let content = Arc::new(crate::content::Content::for_test());
+        let app_state = test_app_state_with(content.clone());
         let mut menu = build_replay_menu(&app_state);
         let mut handle = menu.get_handle();
         // Drill in then Enter.
+        content.begin_capture();
         let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::None, 80));
         let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::Enter, 80));
-        let captured = crate::output::RecordingOutput::joined(&lines);
+        let captured = String::from_utf8_lossy(&content.end_capture()).into_owned();
         assert!(
             captured.contains("No active session to replay"),
             "expected the no-session message, got: {captured}"
@@ -157,15 +158,16 @@ mod tests {
 
     #[test]
     fn replay_with_suffix_renders_history() {
-        let (out, lines) = crate::output::RecordingOutput::new();
-        let app_state = test_app_state_with(Arc::new(crate::content::Content::with_tap(out)));
+        let content = Arc::new(crate::content::Content::for_test());
+        let app_state = test_app_state_with(content.clone());
         let (_guard, session) = crate::agent::test_session_with_entries(vec![replay_entry()]);
         app_state.set_session(Some(session));
         let mut menu = build_replay_menu(&app_state);
         let mut handle = menu.get_handle();
+        content.begin_capture();
         let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::None, 80));
         let _ = futures::executor::block_on(handle.eval_prompt("replay 10t ", HostKey::Enter, 80));
-        let captured = crate::output::RecordingOutput::joined(&lines);
+        let captured = String::from_utf8_lossy(&content.end_capture()).into_owned();
         assert!(
             captured.contains("hello-replay"),
             "replay must render the session history, got: {captured}"

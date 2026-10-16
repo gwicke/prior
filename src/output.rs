@@ -133,67 +133,6 @@ pub trait Output: Send + Sync {
     // `RenderManager::painted_size`'s.
 }
 
-/// Test helper: an `Output` that captures every `display_text` line for
-/// assertions; everything else is a no-op. Construct the handle, then wrap it
-/// in `Content::with_tap`.
-#[cfg(test)]
-pub struct RecordingOutput {
-    pub lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-}
-
-#[cfg(test)]
-impl RecordingOutput {
-    pub fn new() -> (
-        std::sync::Arc<Self>,
-        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    ) {
-        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        (
-            std::sync::Arc::new(RecordingOutput {
-                lines: lines.clone(),
-            }),
-            lines,
-        )
-    }
-
-    /// Joined contents of everything displayed so far.
-    pub fn joined(lines: &std::sync::Mutex<Vec<String>>) -> String {
-        lines.lock().unwrap().join("\n")
-    }
-}
-
-#[cfg(test)]
-impl Output for RecordingOutput {
-    fn display_text(&self, text: &str) {
-        self.lines.lock().unwrap().push(text.to_string());
-    }
-    fn display_markdown(&self, text: &str) {
-        self.lines.lock().unwrap().push(text.to_string());
-    }
-    fn display_plain(&self, text: &str) {
-        self.lines.lock().unwrap().push(text.to_string());
-    }
-    fn display_tool_call(&self, _name: &str, _args: &Value) {}
-    fn display_tool_result(&self, _result: &str) {}
-    fn get_user_input(&self) -> String {
-        String::new()
-    }
-    fn display_error(&self, _error: &str) {}
-    fn display_system(&self, text: &str) {
-        self.lines.lock().unwrap().push(text.to_string());
-    }
-    fn display_separator(&self) {}
-    fn display_header(
-        &self,
-        _provider: &str,
-        _model: &str,
-        _yolo: bool,
-        _limit: usize,
-        _persona: Option<&str>,
-    ) {
-    }
-}
-
 /// The merged output — the agent's `Arc<dyn Output>` — whose content half is
 /// now the [`Content`] handle: `content` owns the boundary, the
 /// width watch and the streaming renderers, and `Output`'s content methods

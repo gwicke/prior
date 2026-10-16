@@ -31,7 +31,6 @@ use crate::content::markdown::{
 };
 use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno};
 use crate::content::text::wrap;
-use crate::output::Output;
 use crate::render::ContentWrite;
 
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
@@ -113,20 +112,15 @@ pub struct Content {
     /// through a shared handle ([`Self::set_usage`]) while the bar's element
     /// reads it concurrently.
     pub(crate) usage: Mutex<Option<Arc<Mutex<crate::agent::SessionUsage>>>>,
-    /// The content seam (design §Content): when set, every content verb hands
-    /// the call to this handle and returns without touching the sink — the
-    /// `RecordingOutput` pattern, covered without a live render stack behind
-    /// it. `None` in production, where `ConsoleOutput` holds this `Content` by
-    /// `Arc` and its own content methods forward here.
-    pub(crate) tap: Option<Arc<dyn Output>>,
     /// Whether content is suppressed — the `--quiet` flag, which is a property
     /// of the content, not a backend (design §Content). The bytes are still
     /// built through the boundary/wrap chain, then dropped at the hub
     /// hand-off, so nothing reaches the screen; `display_error` is the one
     /// verb that survives, to stderr.
     quiet: bool,
-    /// Where the non-REPL input read ([`Self::get_user_input`]) gets a line.
-    input: InputSource,
+    /// Where the non-REPL input read ([`Self::get_user_input`]) gets a line —
+    /// a `Mutex` so a test can install a script after construction.
+    input: Mutex<InputSource>,
     /// The capture buffer (design §Content): `Some` while a capture session is
     /// open. Content taps its own write *before* the hub hand-off, so a
     /// capturing write never reaches `render()` — content bytes only, never
@@ -141,6 +135,10 @@ enum InputSource {
     Stdin,
     /// Quiet: no input to read; the driver answers nothing.
     Empty,
+    /// A test's script, shared so the test can watch it drain. Falls back to
+    /// `/q` when exhausted, so a script that omits a terminator still stops.
+    #[cfg(test)]
+    Script(Arc<Mutex<std::collections::VecDeque<String>>>),
 }
 
 impl Content {
@@ -214,9 +212,8 @@ impl Content {
             streaming: Arc::new(AtomicBool::new(false)),
             building: AtomicBool::new(false),
             usage: Mutex::new(None),
-            tap: None,
             quiet: false,
-            input: InputSource::Stdin,
+            input: Mutex::new(InputSource::Stdin),
             captured: Mutex::new(None),
         }
     }
@@ -235,27 +232,27 @@ impl Content {
             crate::settings::default_show_reasoning_handle(),
         );
         content.quiet = true;
-        content.input = InputSource::Empty;
+        *content.input.lock().unwrap() = InputSource::Empty;
         content
     }
 
-    /// A `Content` whose content verbs delegate to `tap` instead of rendering
-    /// (the tap test seam). `RecordingOutput` records the source strings an
-    /// assertion compares; it needs no render stack or terminal behind it.
-    ///
-    /// The geometry is this instance's own Plain backend, not a private
-    /// watch: with the verbs short-circuited there is no rendering to get
-    /// wrong, and a test that needs a pinned width renders through
-    /// `ConsoleOutput::with_size` as it always has. Plain is the backend a
-    /// tapped content deserves — no reader, no raw mode — and the `Draw`
-    /// underneath it (which no tapped verb reaches) still has a sink to own.
-    pub fn with_tap(tap: Arc<dyn Output>) -> Self {
-        let mut content = Self::new(
-            TermIO::plain(),
+    /// A live `Content` on a null backend for tests that drive its verbs
+    /// directly and read the result through [`Self::begin_capture`] — no
+    /// terminal is touched, and the bytes captured are the content's own.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self::new(
+            TermIO::null(),
             crate::settings::default_show_reasoning_handle(),
-        );
-        content.tap = Some(tap);
-        content
+        )
+    }
+
+    /// Test seam: drive the non-REPL input read from `script` rather than
+    /// stdin. The queue is shared, so the test can watch it drain; it falls
+    /// back to `/q` when exhausted.
+    #[cfg(test)]
+    pub(crate) fn set_input_script(&self, script: Arc<Mutex<std::collections::VecDeque<String>>>) {
+        *self.input.lock().unwrap() = InputSource::Script(script);
     }
 
     /// Test knob: pin where reasoning goes, so a capture harness sees it on
@@ -1088,10 +1085,6 @@ impl Content {
 
 impl Content {
     pub(crate) fn display_committed_prompt(&self, line: &str) {
-        if let Some(tap) = &self.tap {
-            tap.display_committed_prompt(line);
-            return;
-        }
         let shares_rule = self.boundary.last_kind() == Some(ContentDisplayKind::Prompt);
         let rule = separator_line(self.width());
         let block = if shares_rule {
@@ -1103,10 +1096,6 @@ impl Content {
     }
 
     pub(crate) fn display_plain(&self, text: &str) {
-        if let Some(tap) = &self.tap {
-            tap.display_plain(text);
-            return;
-        }
         // The count comes from the bytes: `writeln!` adds the newline, and a
         // caller-supplied line is padded or not as it likes. Then normalized —
         // a caller whose text already ends in a newline would otherwise emit a
@@ -1120,10 +1109,6 @@ impl Content {
     }
 
     pub(crate) fn display_markdown(&self, text: &str) {
-        if let Some(tap) = &self.tap {
-            tap.display_markdown(text);
-            return;
-        }
         let color = self.caps.primary;
         let rendered = render_markdown(text, self.width(), color);
         let mut block = String::with_capacity(rendered.len() + 1);
@@ -1143,10 +1128,6 @@ impl Content {
     }
 
     pub(crate) fn display_text(&self, text: &str) {
-        if let Some(tap) = &self.tap {
-            tap.display_text(text);
-            return;
-        }
         // The bytes, not the source, decide the height: the `⏺ ` prefix is two
         // columns the old `wrap(text).len()` count never saw, inline markdown
         // rewrites the text, and a message that exactly fills the width wraps
@@ -1165,10 +1146,7 @@ impl Content {
     /// production, nothing under quiet. The read writes the `❯ ` prompt
     /// through the chain — zero rows, but it closes any blank line.
     pub(crate) fn get_user_input(&self) -> String {
-        if let Some(tap) = &self.tap {
-            return tap.get_user_input();
-        }
-        match self.input {
+        match &*self.input.lock().unwrap() {
             InputSource::Empty => String::new(),
             InputSource::Stdin => {
                 self.write_content(format!("{} ", style("❯").bold().blue()).as_bytes());
@@ -1176,14 +1154,16 @@ impl Content {
                 let _ = io::stdin().read_line(&mut input);
                 input.trim().to_string()
             }
+            #[cfg(test)]
+            InputSource::Script(script) => script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| "/q".to_string()),
         }
     }
 
     pub(crate) fn begin_response(&self) {
-        if let Some(tap) = &self.tap {
-            tap.begin_response();
-            return;
-        }
         // The bar's dot goes green for the turn. Set here rather than at the
         // call site that builds the text: this layer draws the bar, and a turn
         // starting is exactly when its state changes.
@@ -1218,10 +1198,6 @@ impl Content {
     }
 
     pub(crate) fn stream_text(&self, delta: &str) {
-        if let Some(tap) = &self.tap {
-            tap.stream_text(delta);
-            return;
-        }
         // Sync terminal width (updated by in-flight reader on resize) so
         // renderers reflow on the next feed.
         let current_width = self.width();
@@ -1279,10 +1255,6 @@ impl Content {
     }
 
     pub(crate) fn stream_thinking(&self, delta: &str) {
-        if let Some(tap) = &self.tap {
-            tap.stream_thinking(delta);
-            return;
-        }
         // Content mode => stream the reasoning text; otherwise suppress it.
         if *self.show_reasoning.lock().unwrap() != ShowReasoning::Content {
             return;
@@ -1348,10 +1320,6 @@ impl Content {
     }
 
     pub(crate) fn end_response_segment(&self) {
-        if let Some(tap) = &self.tap {
-            tap.end_response_segment();
-            return;
-        }
         let current_width = self.width();
         // One counted block: the answer commit, the thinking commit, the
         // boundary blank and the dim reset. Inside the turn, so `Response`:
@@ -1394,10 +1362,6 @@ impl Content {
     }
 
     pub(crate) fn end_response(&self) {
-        if let Some(tap) = &self.tap {
-            tap.end_response();
-            return;
-        }
         // Before the flush, so the last bar of the turn is still the streaming
         // one; the bar painted after this is the idle one.
         self.streaming
@@ -1430,10 +1394,6 @@ impl Content {
     }
 
     pub(crate) fn display_tool_call(&self, name: &str, args: &Value) {
-        if let Some(tap) = &self.tap {
-            tap.display_tool_call(name, args);
-            return;
-        }
         // Remember the tool so `display_tool_result` can render the result
         // tool-aware (strip `read_file` line-number gutters, pick a highlight
         // language). The hook always fires the call immediately before its
@@ -1451,10 +1411,6 @@ impl Content {
     }
 
     pub(crate) fn display_tool_result(&self, result: &str) {
-        if let Some(tap) = &self.tap {
-            tap.display_tool_result(result);
-            return;
-        }
         // A multi-file result renders as N complete call-result pairs — label,
         // diff, note — one per file, through the very same renderers a
         // sequence of single-file calls uses. The call half is deferred to here
@@ -1490,10 +1446,6 @@ impl Content {
     }
 
     pub(crate) fn display_error(&self, error: &str) {
-        if let Some(tap) = &self.tap {
-            tap.display_error(error);
-            return;
-        }
         // Quiet's one surviving verb: the screen is suppressed, but a consumer
         // piping the answer still wants the error, and it goes to stderr
         // (design §Content).
@@ -1511,10 +1463,6 @@ impl Content {
     }
 
     pub(crate) fn display_system(&self, text: &str) {
-        if let Some(tap) = &self.tap {
-            tap.display_system(text);
-            return;
-        }
         let block = format!("{}\n", style(text).bold().dim());
         self.write_content_kinded(
             &at_line_start(block.as_bytes()),
@@ -1523,10 +1471,6 @@ impl Content {
     }
 
     pub(crate) fn display_separator(&self) {
-        if let Some(tap) = &self.tap {
-            tap.display_separator();
-            return;
-        }
         // `separator` writes through the row counter; noting again here would
         // count the same row twice.
         self.separator();
@@ -1540,10 +1484,6 @@ impl Content {
         limit: usize,
         persona: Option<&str>,
     ) {
-        if let Some(tap) = &self.tap {
-            tap.display_header(provider, model, yolo, limit, persona);
-            return;
-        }
         let block =
             content::text::header_block(provider, model, yolo, limit, persona, self.width());
         self.write_content(block.as_bytes());
@@ -1572,54 +1512,5 @@ impl Content {
             .unwrap()
             .take()
             .expect("end_capture without begin_capture")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The content seam (design §Content): a tapped `Content` hands its verbs to
-    /// the seam and never reaches its own sink — the `RecordingOutput` pattern,
-    /// covered without a render stack behind it.
-    #[test]
-    fn tap_short_circuits_content_verbs_to_the_seam() {
-        let (out, lines) = crate::output::RecordingOutput::new();
-        let content = Content::with_tap(out);
-        content.display_text("hello");
-        content.display_separator();
-        content.begin_response();
-        content.stream_text("streamed");
-        content.end_response();
-        assert_eq!(
-            crate::output::RecordingOutput::joined(&lines),
-            "hello",
-            "the seam sees the source strings, unrendered"
-        );
-        assert!(
-            content
-                .manager
-                .lock()
-                .unwrap()
-                .draw()
-                .cache
-                .applied
-                .is_none(),
-            "a tapped verb must not move the real screen"
-        );
-    }
-
-    /// Capture reads Content's own write path: a tapped `Content`'s verbs go to
-    /// the tap, never the buffer, so a capture opened over one is empty.
-    #[test]
-    fn tapped_content_captures_nothing() {
-        let (out, _lines) = crate::output::RecordingOutput::new();
-        let content = Content::with_tap(out);
-        content.begin_capture();
-        content.display_text("capped");
-        assert!(
-            content.end_capture().is_empty(),
-            "a tapped verb never reaches the capture buffer"
-        );
     }
 }
