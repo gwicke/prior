@@ -10,15 +10,6 @@ The end state is a `Content` built directly (`Content::new` in production, `Cont
 `--quiet`, a live `Content` + capture in tests) that the agent and its guards hold; `output.rs` and
 its trait dissolve. Landed as commits, each compiling and green on its own.
 
-### 5a — the drawing half of `Output` retires
-`Output::draw_frame` (default + `ConsoleOutput`'s forward), `begin_batch`/`end_batch` and
-`BatchGuard` are dead: the manager already owns all of them (`RenderManager::draw_frame`,
-`begin_batch`/`end_batch`, `ContentBatchGuard`). Remove the three verbs and the guard; the few test
-callers that used the `Output` forward reach the hub directly (`content.manager.lock().draw_frame`,
-`ContentBatchGuard::open`). No behavior change. Also drop `display_tool_error` (a default impl with
-no production caller, an `agent.rs` test only). The trait is left with content verbs +
-`confirm`/`confirm_default`.
-
 ### 5b — the confirm half of `Output` retires; the no-port path denies
 `Output`'s confirm pair is the *no-pump* policy (a REPL confirmation is the port's now), reached only
 by `Guard` when `confirm_port` is `None`. Non-TTY operation supports static decisions only —
@@ -41,10 +32,9 @@ and resume-line, already capture-and-print, hub-free too. What remains of the ol
 - **the non-REPL input source** — production reads stdin, tests inject a script.
 
 Neither needs `Output`; no new trait is required. `NoOutput`/`LogOutput` (dead) die here too.
-Two design edits follow: §Render drops `captured`; §Content moves capture up to the output.
-**Consequence to confirm:** a capture then suppresses the *frame* as well, where today the frame
-apply still reaches the screen (`capture_catches_content_but_never_frame_bytes` pins the old
-behaviour). The simpler "capture takes the write out entirely" is preferred.
+Design settled and applied already (§Render drops `captured`; §Content moves capture up to the
+output): a capture takes the write out entirely, so no frame is applied either. This retires
+`capture_catches_content_but_never_frame_bytes`, which pins the old "frame still applies" rule.
 
 ### 5d — `AgentConfig.output` drops; the agent + guards hold `Content`
 `content_for` dies; every caller builds its `Content` directly (production `Content::new`, quiet
@@ -60,12 +50,6 @@ loses the whole `output` re-export line.
 Design §TermIO: a `StripAnsi` writer wrapper (per stream from caps) strips CSI/OSC-8 at the very
 edge, zero-width, so geometry is untouched; non-tty primaries additionally drop frames wholesale at
 Draw (done). Not implemented, claimed by no earlier step. Carve out here or defer.
-
-### Open question
-- **the capture/frame behaviour.** Moving capture to Content means a capturing content no longer
-  calls the hub, so nothing (content *or* frame) reaches the screen — cleaner, but it retires
-  `capture_catches_content_but_never_frame_bytes`, which pins the old "frame still applies" rule.
-  Confirming before landing.
 
 ## Follow-ups (beyond step 5)
 

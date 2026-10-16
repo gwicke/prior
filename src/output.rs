@@ -12,8 +12,8 @@ use crate::content::text::wrap;
 use crate::content::Content;
 #[cfg(test)]
 use crate::content::ContentDisplayKind;
+#[cfg(test)]
 use crate::draw::ApplyPolicy;
-use crate::render::Frame;
 #[cfg(test)]
 use crate::settings::ShowReasoning;
 use crate::settings::ShowReasoningHandle;
@@ -35,44 +35,7 @@ pub enum Confirmation {
     Always,
 }
 
-/// Ends a content batch when dropped: one frame re-emit for the whole burst,
-/// instead of one per write (ui_draw_v2 R5).
-///
-/// Dropped rather than called, because `?`, an early `return` and a panic all
-/// release it. The failure mode of *forgetting* to end a batch would be a
-/// suppressed reposition — an area that was consumed and never comes back,
-/// which is exactly the invariant the per-write re-emit exists to hold. `Drop`
-/// makes that unreachable rather than merely documented.
-pub struct BatchGuard<'a> {
-    out: Option<&'a dyn Output>,
-}
-
-impl Drop for BatchGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(out) = self.out {
-            out.end_batch();
-        }
-    }
-}
-
 pub trait Output: Send + Sync {
-    /// Open a batch of content writes: repositioning is suppressed until the
-    /// returned guard drops, which emits the frame once (ui_draw_v2 R5).
-    ///
-    /// For bursts — replay, resume, anything that prints history — where the
-    /// per-write re-emit costs `O(writes × frame rows)` and the frame is not
-    /// changing anyway. **Not** for live streaming: there the re-emit is what
-    /// keeps the input row visible while content flows past it, and batching a
-    /// turn would hide the prompt for the whole response.
-    ///
-    /// The default guard does nothing, which is correct rather than lazy: an
-    /// output that does not override this already repositions on every write,
-    /// and that *is* the unbatched case.
-    fn begin_batch(&self) -> BatchGuard<'_> {
-        BatchGuard { out: None }
-    }
-    /// Ends a batch, called by [`BatchGuard`]'s drop. Default no-op.
-    fn end_batch(&self) {}
     fn display_text(&self, text: &str);
     /// Render a model *response* as markdown. Defaults to `display_text` so
     /// non-console impls (quiet/log/no-op) need no change; `ConsoleOutput`
@@ -122,23 +85,6 @@ pub trait Output: Send + Sync {
     fn end_response(&self) {}
     fn display_tool_call(&self, name: &str, args: &Value);
     fn display_tool_result(&self, result: &str);
-    /// Render a tool execution failure in a dedicated error panel.
-    ///
-    /// `kind` is a stable, machine-readable classification from
-    /// `rig_core::tool::ToolErrorKind::as_str()` (e.g. `"invalid_args"`,
-    /// `"timeout"`, `"not_found"`, `"permission_denied"`, `"rate_limited"`,
-    /// `"provider"`, `"network"`, `"cancelled"`, `"other"`). `message` is
-    /// the operator-facing `ToolExecutionError::message()` — redaction-safe
-    /// because rig strips operator-only content into the kind-level
-    /// `model_feedback()` separately.
-    ///
-    /// Default impl formats `{tool_name} failed [{kind}]: {message}` and
-    /// forwards to `display_error`. `ConsoleOutput` overrides this with
-    /// a styled error panel using the same `paint_panel` /
-    /// `tool_panel` helpers as the tool-call and tool-result panels.
-    fn display_tool_error(&self, tool_name: &str, kind: &str, message: &str) {
-        self.display_error(&format!("{tool_name} failed [{kind}]: {message}"));
-    }
     fn get_user_input(&self) -> String;
     fn display_error(&self, error: &str);
     fn display_system(&self, text: &str);
@@ -204,25 +150,7 @@ pub trait Output: Send + Sync {
     // frame is composed and applied for) is `Content::frame_size`'s — the
     // content handle carries the same receiver the manager clones; the
     // applied size (what resize detection compares against) is
-    // `RenderManager::painted_size`'s. Callers that hold their own read (the
-    // REPL loop's per-iteration size) still pass it into [`Self::draw_frame`].
-
-    /// Draw a composed UI frame (ui_draw_v2 §5.1) with its top row at absolute
-    /// `anchor` (1-based). `dims` is the (width, height) the frame was
-    /// composed for: the apply uses exactly these, so the frame's bounding
-    /// box can never disagree with its content (§9 #3). Returns the dims
-    /// actually applied (clamped), for the caller's repaint bookkeeping.
-    /// Default: drop the frame — non-console outputs carry no interactive
-    /// UI, so the raw-mode REPL never runs against them. This is the *UI*
-    /// surface; content output (`display_*`) stays separate.
-    fn draw_frame(
-        &self,
-        _frame: &Frame,
-        _policy: ApplyPolicy,
-        dims: (usize, usize),
-    ) -> (usize, usize) {
-        (dims.0.max(1), dims.1.max(1))
-    }
+    // `RenderManager::painted_size`'s.
 }
 
 /// Output for a non-terminal consumer (`picocode "q" | cat`): no interactive UI
@@ -663,21 +591,6 @@ impl ConsoleOutput {
 }
 
 impl Output for ConsoleOutput {
-    fn begin_batch(&self) -> BatchGuard<'_> {
-        // The mechanics (flag, debug assert, the deferred reposition) live on
-        // the hub; only the guard, which has to name an `Output`
-        // for its drop, is this layer's.
-        if self.content.manager.lock().unwrap().begin_batch() {
-            BatchGuard { out: Some(self) }
-        } else {
-            BatchGuard { out: None }
-        }
-    }
-
-    fn end_batch(&self) {
-        self.content.manager.lock().unwrap().end_batch();
-    }
-
     /// Bracketed, and — where the previous content was also a committed
     /// prompt — *sharing* the closing rule with it instead of stacking one
     /// (ui_draw_v2 R4).
@@ -702,22 +615,6 @@ impl Output for ConsoleOutput {
     /// two commits sharing one rule.
     fn display_committed_prompt(&self, line: &str) {
         self.content.display_committed_prompt(line);
-    }
-
-    fn draw_frame(
-        &self,
-        frame: &Frame,
-        policy: ApplyPolicy,
-        dims: (usize, usize),
-    ) -> (usize, usize) {
-        // Through the hub, not straight to `Draw`: a frame no
-        // composition produced clears the hub's recipe, so a content write
-        // must not re-emit an area that is no longer on screen.
-        self.content
-            .manager
-            .lock()
-            .unwrap()
-            .draw_frame(frame, policy, dims)
     }
 
     fn display_plain(&self, text: &str) {
@@ -2706,7 +2603,11 @@ mod tests {
         let frame =
             crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, Vec::new(), 40, 10);
         out.begin_capture();
-        out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
+        out.content
+            .manager
+            .lock()
+            .unwrap()
+            .draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         out.display_text("content only");
         let cap = out.end_capture();
         let cap = String::from_utf8_lossy(&cap).into_owned();
@@ -2803,7 +2704,12 @@ mod tests {
         let heights = allocate(&asks, dims.1, live_budget(dims.1));
         let frame = render(&stack, &heights, dims.0);
         let hand_sink = record_bytes(&hand);
-        let b = hand.draw_frame(&frame, ApplyPolicy::Frame, dims);
+        let b = hand
+            .content
+            .manager
+            .lock()
+            .unwrap()
+            .draw_frame(&frame, ApplyPolicy::Frame, dims);
         let via_hand = hand_sink.bytes();
 
         assert_eq!(a, b, "the same painted dims either way");
@@ -2840,7 +2746,11 @@ mod tests {
         );
         let frame =
             crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, overlay, 40, 10);
-        out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
+        out.content
+            .manager
+            .lock()
+            .unwrap()
+            .draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         out.display_text("Cannot start agent: Missing API key for provider.");
         let bytes = sink.bytes();
 
@@ -2996,9 +2906,13 @@ mod tests {
         );
         let frame =
             crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, overlay, 40, 10);
-        out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
+        out.content
+            .manager
+            .lock()
+            .unwrap()
+            .draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         {
-            let _batch = out.begin_batch();
+            let _batch = crate::render::ContentBatchGuard::open(&out.content.manager);
             out.display_text("first line");
             out.display_text("second line");
             out.display_text("third line");
