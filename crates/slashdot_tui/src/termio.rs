@@ -371,10 +371,10 @@ pub struct PlainIo {
     caps: Caps,
     /// Whether this backend stands in for a **real** output stream, and so
     /// applies the design's degradation (§TermIO): a non-terminal stream is
-    /// stripped at the edge and loses its frames. [`TermIO::plain`] — the
-    /// production non-REPL backend — says yes; the `recording`/`null` doubles
-    /// say no, because they observe the *composed* bytes rather than what a
-    /// real consumer would receive.
+    /// stripped at the edge, and a non-terminal primary loses its frames.
+    /// [`TermIO::plain`] — the production non-REPL backend — and
+    /// [`TermIO::recording_with`] (a real backend with pinned caps) say yes;
+    /// only the [`TermIO::null`] sinkhole says no, because it observes nothing.
     degrade: bool,
     handles: Option<TermHandles>,
 }
@@ -423,12 +423,13 @@ impl TermIO {
     /// [`handles`]: Self::handles
     pub fn tty() -> Self {
         register_sigcont();
+        let caps = Caps::probe();
         let (handles, input_tx, caret_tx, size_tx) = term_channels();
         TermIO::Tty(TtyIo {
-            guard: Arc::new(TermGuard::new()),
+            guard: Arc::new(TermGuard::new(caps.primary)),
             pause_owned: AtomicBool::new(false),
             size_tx,
-            caps: Caps::probe(),
+            caps,
             input_tx: Some(input_tx),
             caret_tx,
             handles: Some(handles),
@@ -451,49 +452,25 @@ impl TermIO {
         })
     }
 
-    /// Memory writers, per stream (design doc §Testing): what byte-edge
-    /// assertions record through once `Draw` writes via `TermIO`. A double,
-    /// not a real stream — it does **not** degrade, so the bytes come back as
-    /// composed (stripping and the frame drop are exercised by
-    /// [`Self::recording_degraded`]).
+    /// [`Self::recording`] with the **screen** caps (both streams terminals):
+    /// the byte-edge suite's double, so it sees the composed screen — no strip,
+    /// frames painted.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn recording() -> Self {
-        // A screen double: both streams are "terminals", so the diverting kinds
-        // ride the primary and the primary bucket holds the whole screen.
         Self::recording_with(Caps {
             primary: true,
             meta: true,
         })
     }
 
-    /// A non-degrading recording double with `caps` pinned, so its bucket
-    /// routing is deterministic whatever the runner's streams are. `degrade` is
-    /// false: the double observes the *composed* bytes, not a real stream's
-    /// degraded form (that is [`Self::recording_degraded`]).
+    /// A memory writer standing in for a **real** backend with `caps` pinned:
+    /// it degrades exactly as [`Self::plain`] would — a non-terminal stream is
+    /// stripped, a non-terminal primary drops frames — but records the result
+    /// so a test can assert the degradation. The caps are the caller's, so the
+    /// test does not inherit the runner's terminal. Screen caps make it the
+    /// byte-edge double ([`Self::recording`]); pipe caps exercise degradation.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn recording_with(caps: Caps) -> Self {
-        let (handles, input_tx, caret_tx, size_tx) = term_channels();
-        drop(input_tx);
-        drop(caret_tx);
-        TermIO::Plain(PlainIo {
-            sink: Sink::Recording {
-                main: Vec::new(),
-                meta: Vec::new(),
-            },
-            size_tx,
-            caps,
-            degrade: false,
-            handles: Some(handles),
-        })
-    }
-
-    /// A memory writer that stands in for a **real** stream with `caps`: it
-    /// degrades exactly as [`Self::plain`] would — a non-terminal stream is
-    /// stripped and drops frames — but records the result so a test can assert
-    /// the degradation. The caps are pinned by the caller, so the test does not
-    /// inherit the runner's terminal.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn recording_degraded(caps: Caps) -> Self {
         let (handles, input_tx, caret_tx, size_tx) = term_channels();
         drop(input_tx);
         drop(caret_tx);
@@ -911,17 +888,27 @@ pub fn spawn_stdin_reader(
 pub struct TermGuard {
     active: AtomicBool,
     saved_paste: AtomicBool,
+    /// Whether the primary output is a terminal — the guard's escape
+    /// sequences (bracketed paste, kitty keyboard, cursor) are the primary
+    /// stream's, so on a real non-terminal primary they are **not emitted at
+    /// all** (design §TermIO: the frame drop's rule, applied to this writer).
+    /// Raw-mode flipping still runs — it is a stdin concern, and
+    /// `picocode > out.txt` over an interactive stdin still wants it.
+    primary: bool,
 }
 
 impl TermGuard {
-    pub fn new() -> Self {
+    pub fn new(primary: bool) -> Self {
         Self {
             active: AtomicBool::new(false),
             saved_paste: AtomicBool::new(false),
+            primary,
         }
     }
 
-    /// Enter raw mode and negotiate capabilities. Idempotent.
+    /// Enter raw mode and negotiate capabilities. Idempotent. The capability
+    /// escapes are emitted only when the primary is a terminal; raw mode
+    /// itself is unconditional (a stdin concern).
     pub fn start(&self) -> io::Result<()> {
         if self.active.load(Ordering::SeqCst) {
             return Ok(());
@@ -937,17 +924,19 @@ impl TermGuard {
         // column 0, while keeping raw *input* semantics (no canonical line
         // editing, no echo). `disable_raw_mode` restores the original mode.
         enable_output_processing();
-        Self::csi("?2004h")?; // bracketed paste on
-                              // Kitty keyboard protocol: disambiguate keys + report all keys as CSI u,
-                              // so Shift+Enter arrives as Enter+SHIFT (newline) and Alt+Letter as a
-                              // distinct Alt-modified char. Honored by wezterm/alacritty/kitty.
-        crossterm::execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
-            )
-        )?;
+        if self.primary {
+            Self::csi("?2004h")?; // bracketed paste on
+                                  // Kitty keyboard protocol: disambiguate keys + report all keys as CSI u,
+                                  // so Shift+Enter arrives as Enter+SHIFT (newline) and Alt+Letter as a
+                                  // distinct Alt-modified char. Honored by wezterm/alacritty/kitty.
+            crossterm::execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+                )
+            )?;
+        }
         self.active.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -957,21 +946,25 @@ impl TermGuard {
         if !self.active.load(Ordering::SeqCst) {
             return Ok(());
         }
-        // Pop one level of Kitty keyboard enhancement (matches the single push).
-        let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        if self.saved_paste.load(Ordering::SeqCst) {
-            Self::csi("?2004h")?;
-        } else {
-            Self::csi("?2004l")?;
+        // The stream escapes are the primary's: skipped on a non-terminal
+        // primary so nothing leaks into the redirected file.
+        if self.primary {
+            // Pop one level of Kitty keyboard enhancement (matches the push).
+            let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+            if self.saved_paste.load(Ordering::SeqCst) {
+                Self::csi("?2004h")?;
+            } else {
+                Self::csi("?2004l")?;
+            }
+            // The status line hides the cursor while a turn streams, and
+            // `draw_frame` shows it again when the prompt returns. If the turn is
+            // interrupted instead — a tool error, a confirm, a panic — nothing shows
+            // it again, and an invisible cursor follows the user into their shell.
+            // Unconditional and idempotent: showing a cursor that was never hidden
+            // costs nothing, and this is the last writer before the tty is the
+            // user's again.
+            io::stdout().write_all(crate::ansi::SHOW_CURSOR)?;
         }
-        // The status line hides the cursor while a turn streams, and
-        // `draw_frame` shows it again when the prompt returns. If the turn is
-        // interrupted instead — a tool error, a confirm, a panic — nothing shows
-        // it again, and an invisible cursor follows the user into their shell.
-        // Unconditional and idempotent: showing a cursor that was never hidden
-        // costs nothing, and this is the last writer before the tty is the
-        // user's again.
-        io::stdout().write_all(crate::ansi::SHOW_CURSOR)?;
         disable_raw_mode()?;
         self.active.store(false, Ordering::SeqCst);
         Ok(())
@@ -986,8 +979,10 @@ impl TermGuard {
 }
 
 impl Default for TermGuard {
+    /// A guard that emits its capability escapes — the interactive default.
+    /// [`TermIO::tty`] builds the real one from the probed caps.
     fn default() -> Self {
-        Self::new()
+        Self::new(true)
     }
 }
 
@@ -1460,7 +1455,7 @@ mod tests {
     /// diverts to meta (the primary is not a terminal).
     #[test]
     fn the_edge_strips_a_non_terminal_stream_and_keeps_a_terminal_one() {
-        let mut io = TermIO::recording_degraded(Caps {
+        let mut io = TermIO::recording_with(Caps {
             primary: false,
             meta: true,
         });
@@ -1479,10 +1474,12 @@ mod tests {
         );
     }
 
-    /// The doubles observe the *composed* bytes: neither the plain `recording`
-    /// backend nor `null` degrades, whatever the runner's streams are.
+    /// A recording double on a **terminal** primary observes the composed
+    /// bytes — the screen caps make strip and frame-drop inert — so the
+    /// byte-edge suite reads raw ANSI at the observation edge regardless of the
+    /// runner's terminal.
     #[test]
-    fn the_recording_and_null_doubles_do_not_degrade() {
+    fn a_recording_double_on_a_terminal_primary_keeps_composed_bytes() {
         let mut rec = TermIO::recording();
         rec.write(Stream::Content, b"\x1b[32mgreen\x1b[0m\n")
             .unwrap();
@@ -1491,15 +1488,15 @@ mod tests {
             b"\x1b[32mgreen\x1b[0m\n",
             "raw bytes at the observation edge"
         );
-        assert!(rec.paints_frames(), "a double always paints its frames");
+        assert!(rec.paints_frames(), "a terminal primary paints its frames");
     }
 
     /// The frame half (design §TermIO): a real non-terminal primary drops
-    /// frames; a terminal primary, and any double, keeps them.
+    /// frames; a terminal primary keeps them, and the sinkhole paints.
     #[test]
     fn a_non_terminal_primary_drops_frames() {
         assert!(
-            !TermIO::recording_degraded(Caps {
+            !TermIO::recording_with(Caps {
                 primary: false,
                 meta: false,
             })
@@ -1507,13 +1504,13 @@ mod tests {
             "a piped primary gets no frames"
         );
         assert!(
-            TermIO::recording_degraded(Caps {
+            TermIO::recording_with(Caps {
                 primary: true,
                 meta: false,
             })
             .paints_frames(),
             "a terminal primary keeps them"
         );
-        assert!(TermIO::null().paints_frames(), "a double always paints");
+        assert!(TermIO::null().paints_frames(), "the sinkhole paints");
     }
 }

@@ -1097,7 +1097,7 @@ mod tests {
         // A real stream (degrades) whose primary is not a terminal.
         let mut manager = RenderManager::new(
             size,
-            crate::termio::TermIO::recording_degraded(crate::termio::Caps {
+            crate::termio::TermIO::recording_with(crate::termio::Caps {
                 primary: false,
                 meta: true,
             }),

@@ -79,9 +79,8 @@ Decisions not obvious from the code or the design.
 - **Tests move with the code they test.** The render test modules lived in `output.rs` only because
   the trait they shared was there; once the trait goes, the suite belongs beside the `Content` it
   drives (`content/handle.rs`) and beside the preview helpers it exercises (`content/preview.rs`).
-- **Degradation is a property of a real stream, not of a cap alone.** The strip and the frame drop
-  key on caps, but only a *real* backend acts on them: a test double observes the composed bytes, so
-  `recording()`/`null()` neither strip nor drop frames. That is what keeps the byte-edge suite
-  (which asserts raw ANSI at the recording edge) deterministic regardless of the runner's terminal;
-  `recording_degraded(caps)` supplies the real-stream behaviour with pinned caps when a test needs
-  to exercise the degradation itself.
+- **Degradation keys on caps; a pinned double makes it deterministic.** The strip and the frame drop
+  read caps, so a recording double's **caps** decide whether it degrades: `recording_with(screen
+  caps)` keeps it inert (the byte-edge suite sees composed bytes regardless of the runner's
+  terminal), `recording_with(pipe caps)` exercises the degradation. The one non-real double left is
+  `null` (a sinkhole), which does not degrade.
