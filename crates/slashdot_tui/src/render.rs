@@ -49,10 +49,13 @@ pub type SizeWatch = watch::Receiver<TermSize>;
 /// [`RenderManager::configure`] is seeded and wired with (design §Render:
 /// the ratio is configuration, not a constant buried in the budget fn).
 ///
-/// `f64`, not the design sketch's `f32`: the budget is a `ceil`, and `f32`'s
-/// rounding of 2/3 lands *above* the exact fraction (`24·(2/3 as f32) >
-/// 16`), which would turn the pinned `ceil(24·2/3) = 16` into 17.
-pub const FRAME_MAX_ROW_RATIO: f64 = 2.0 / 3.0;
+/// `f32`, the same width as the in-frame [`RowSpec::RatioAndNum`] ratio the
+/// design sketch uses: both are rough preferences about a *share*, resolved
+/// to integral rows either way, so there is no precision here worth a wider
+/// type. The `f32` product `ceil`s identically to the exact `f64` one for
+/// every height in `1..=500`, so the pinned `ceil(24·2/3) = 16` holds (see
+/// `live_budget_caps_at_two_thirds`).
+pub const FRAME_MAX_ROW_RATIO: f32 = 2.0 / 3.0;
 
 /// Live-region budget for a terminal of `term_h` rows at the default ratio:
 /// the frame may occupy at most this many rows; the rest of the screen is
@@ -73,8 +76,8 @@ pub fn live_budget(term_h: usize) -> usize {
 /// Private: the manager is the only caller, which is what rules
 /// out two computations of the frame's row count — the configured ratio
 /// resolving one way here and another way in a caller that re-derived it.
-fn live_budget_ratio(term_h: usize, ratio: f64) -> usize {
-    ((term_h as f64 * ratio).ceil() as usize).max(1)
+fn live_budget_ratio(term_h: usize, ratio: f32) -> usize {
+    ((term_h as f32 * ratio).ceil() as usize).max(1)
 }
 
 /// One height bound, as a **spec** the allocator resolves against the frame
@@ -593,7 +596,7 @@ pub struct RenderManager {
     /// The fraction of the frame's terminal height the area may occupy —
     /// [`configure`](Self::configure)'s, resolved against the render's
     /// height on every call.
-    frame_max_row_ratio: f64,
+    frame_max_row_ratio: f32,
     /// The watched geometry — the handle `TermIO` hands out at setup (design
     /// §3). `render` composes and paints at this size; `Content::frame_size`
     /// carries the same channel, and [`Self::painted_size`] reads through
@@ -722,7 +725,7 @@ impl RenderManager {
     /// configured, with nothing handed in per paint. `reposition_area`
     /// re-composes the same stack to bring the area back after a content
     /// write.
-    pub fn configure(&mut self, frame_max_row_ratio: f64, frame_elements: Vec<Element>) {
+    pub fn configure(&mut self, frame_max_row_ratio: f32, frame_elements: Vec<Element>) {
         self.frame_max_row_ratio = frame_max_row_ratio;
         self.stack = frame_elements;
     }
