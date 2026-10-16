@@ -6,12 +6,6 @@ what remains and the decisions worth keeping. Do not refer to this document from
 
 ## Follow-ups
 
-- **`TermGuard`'s mode sequences bypass the degradation edge.** It writes the bracketed-paste /
-  kitty-keyboard / cursor CSI straight to `io::stdout()`, not through [`TermIO::write`], so a tty
-  *stdin* with a piped primary (`picocode > out.txt`) still leaks those escapes into the file. Raw
-  mode only matters for an interactive stdin, and the leak is a handful of bytes at entry/exit, so
-  it was left out of 5f — but it is the one remaining path that reaches a non-terminal primary
-  unstripped.
 - **`tests/confirm_raw_mode.rs::confirm_dialog_paints_then_clears_with_decision_line` fails.**
   Fallout of this refactor, not a separate bug. On resolve the dialog's divider row survives: the
   assertion sees the header/options cleared but a full-width rule still on screen (the decision line
@@ -26,68 +20,33 @@ what remains and the decisions worth keeping. Do not refer to this document from
 
 ### Next — step 6: output kinds, backend-owned routing
 
-The output vocabulary is a *sink* vocabulary today (`Stream::{Main, Meta}`), so Content decides
-routing (`reasoning_on_stderr = !caps.primary`) and Render/Draw special-case `Stream::Meta` (skip
-the frame merge; skip width repair). Turn it into a *kind* vocabulary and move the sink decision to
-the layer that owns the capability. When it lands, §TermIO/§Render/§Draw of the design doc get the
-new vocabulary as end state.
+The kind vocabulary (`Stream { Content, Reasoning, Error }`) and TermIO-owned routing landed (git
+log); `repair` is kind-blind and Draw no longer forks on the sink. What remains is the `Frame`
+target and its consequences.
 
-The shape:
+Remaining (rough commit order; git log records what landed):
 
-- **Content-facing kinds, not sinks.** `Stream { Content, Reasoning, Error }`: Content says *what* a
-  write is. `Reasoning` replaces today's "divert to Meta"; `Error` names what is now `SystemMessage`
-  on `Main`. `Stream::Meta` goes. `Frame` never crosses the content API. Finer kinds buy future
-  flexibility even where two route alike today (`Reasoning` and `Error` do: primary-on-tty,
-  meta-on-pipe).
-- **TermIO owns kind → sink, from caps.** `Content` → primary; `Reasoning`/`Error` → primary when
-  the primary is a terminal, else the meta stream; `Frame` → primary, dropped when the primary is
-  not a terminal. The strip stays at the edge (5f), per *target* cap. `Error` on a tty stays on
-  stdout (so a piped consumer still sees it), which is today's `Main` behavior — the kind only makes
-  the sink a TermIO decision.
-- **`Frame` is a Draw → TermIO distinction**, not a `Stream` variant: `TermIO::write_frame` (or a
-  two-variant `TermTarget { Content(Stream), Frame }`). Draw's frame-side writes — `plan_consume`'s
-  walk, `apply`/`draw_frame`/`reposition`, the caret show/hide, the re-anchor — carry it; the
-  content write keeps its kind. Content bytes are never rewritten by the consume, so the drop
-  leaves them intact. This also lets the 5f `paints_frames` gate leave `Draw`: TermIO drops `Frame`.
-- **Nothing above TermIO needs the mapping.** `repair_main` needs the *width*, not the sink: a
-  non-primary (stderr) write occurs only when the primary is not a terminal — exactly when frames
-  are dropped and the live-screen cache is already fiction — so the net and the returned row count
-  can apply uniformly (the count only matters on a screen, where every write is a screen write). So
-  no `Caps::kind_sink` surfaces above TermIO; the mapping is TermIO's alone, and Draw always merges
-  (its cache advances against dropped bytes, the fiction 5f accepts).
-
-Commits:
-
-1. **Kind vocabulary + TermIO routing.** Rename `Stream::{Main, Meta}` → `{Content, Reasoning,
-   Error}`; TermIO maps kind → sink from caps; `repair` loses the stream gate; `Draw::draw` loses
-   the meta special-case and writes content with its kind. Content's raw reasoning route carries
-   `Reasoning`. `Frame` still not a target — the `paints_frames` gates stay for this commit.
-2. **`Frame` target.** `TermIO::write_frame` (drops on a real non-terminal primary); route Draw's
-   frame-side writes through it and remove the `paints_frames` gate from Draw.
-3. **Recording doubles become real backends; `TermGuard` routes through the edge.** The 5f `degrade`
-   flag goes, `recording()`/`recording_degraded()` become one caps-parameterised real backend,
-   `Content` is built over it; the guard's CSI goes through the write edge, gated on `caps.primary`.
-
-Open before landing:
-
-- **Recording doubles model real backends.** They should replicate what a tty or a plain backend
-  would emit — so a recording backend takes caps and always behaves real (the 5f `degrade` flag
-  becomes "always", `recording()` pins tty caps), the byte-edge suite pinning tty caps and the
-  degradation tests pinning pipe caps. `Content`'s caps must match for colour and routing, so build
-  it over the recording backend rather than swapping the sink after construction.
-- **`--quiet` is unaffected** — it drops the hub hand-off entirely; keep it that way.
-- **Churn:** `Stream`'s variants are a `termio` re-export, so `ContentWrite.stream`, `repair_main`,
-  `Draw::draw`, `write_stdio`, and a large block of `Stream::Main`/`Meta` test assertions move.
-  Accepted: a one-off cost, not a reason to keep the sink vocabulary.
-- **`TermGuard`** (the first bullet above) folds in here: it is a TermIO concern already (`TtyIo`
-  owns it), but the fix keys on the **target** cap, not the backend kind — an interactive stdin can
-  have a piped primary (`picocode > out.txt`), which is exactly the leak. Route the guard's CSI
-  (bracketed paste, kitty keyboard, cursor) through the same degradation edge, gated on
-  `caps.primary`.
+- **`Frame` target.** `Frame` is a Draw → TermIO distinction, not a `Stream` variant:
+  `TermIO::write_frame` (or a two-variant `TermTarget { Content(Stream), Frame }`). Draw's
+  frame-side writes — `plan_consume`'s walk, `apply`/`draw_frame`/`reposition`, the caret show/hide,
+  the re-anchor — carry it; the content write keeps its kind, and the consume never rewrites content
+  bytes, so the drop leaves them intact. This also lets the 5f `paints_frames` gate leave `Draw`:
+  TermIO drops `Frame`.
+- **`TermGuard` routes through the edge.** It is a TermIO concern already (`TtyIo` owns it), but the
+  fix keys on the **target** cap, not the backend kind — an interactive stdin can have a piped
+  primary (`picocode > out.txt`), which is exactly the leak. Route the guard's CSI (bracketed paste,
+  kitty keyboard, cursor) through the write edge, gated on `caps.primary`.
+- **Recording doubles converge on one real backend.** `recording`/`recording_with`/`recording_degraded`
+  are three constructors around the 5f `degrade` flag: a screen double, a caps-pinned non-degrading
+  double, and a caps-pinned degrading one. Collapse to one real backend taking caps; the byte-edge
+  suite pins screen caps and the degradation tests pipe caps. `Content`'s caps must match for colour
+  and routing, so build it over the recording backend rather than swapping the sink after
+  construction.
 - **Non-tty width (CLI)** is independent geometry — the `term_w` hard requirement exists only so a
   wrapped row cannot defeat the per-row entry `EL`, and a pipe has no screen. Accepted: keep the
   80 fallback (`TermSize::default` via `probe`'s `Err` arm) for now; make it configurable later if
   wanted.
+- **`--quiet` is unaffected** by all of this — it drops the hub hand-off entirely; keep it that way.
 
 ### Follow-up — track the repairs back into content
 
