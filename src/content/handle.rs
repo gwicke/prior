@@ -119,6 +119,11 @@ pub struct Content {
     /// render stack behind them. `None` in production, where `ConsoleOutput`
     /// holds this `Content` by `Arc` and its own content methods forward here.
     pub(crate) tap: Option<Arc<dyn Output>>,
+    /// The capture buffer (design §Content): `Some` while a capture session is
+    /// open. Content taps its own write *before* the hub hand-off, so a
+    /// capturing write never reaches `render()` — content bytes only, never
+    /// frame bytes.
+    captured: Mutex<Option<Vec<u8>>>,
 }
 
 impl Content {
@@ -193,6 +198,7 @@ impl Content {
             building: AtomicBool::new(false),
             usage: Mutex::new(None),
             tap: None,
+            captured: Mutex::new(None),
         }
     }
 
@@ -448,12 +454,10 @@ impl Content {
         // frame stays live and the next compose can still diff it.
         //
         // Captures get the raw bytes — they are assertions against content,
-        // not against a screen — tapped at the hand-off below, which is why
-        // the transforms step aside while one is open. Its own short lock:
-        // capture toggles are same-task with writes (proof above),
-        // so this one read stands for the span — nothing can open or close a
-        // capture between here and the hand-off.
-        let capturing = self.manager.lock().unwrap().is_capturing();
+        // not against a screen — appended at the hand-off below, which is why
+        // the transforms step aside while one is open. Same-task with writes
+        // (proof above), so this one read stands for the span.
+        let capturing = self.is_capturing();
         let mut buf: Vec<u8> = Vec::new();
         let mut clear = LineClear {
             inner: &mut buf,
@@ -575,6 +579,18 @@ impl Content {
         // can still diff it. The kind/hold bookkeeping above already ran: an
         // empty write is still a statement about the boundary.
         if buf.is_empty() {
+            return r;
+        }
+        // A capturing write is Content's to keep (design §Content): append the
+        // raw bytes and stop — the hub is never reached, so no frame is
+        // composed, consumed or re-emitted for it.
+        if capturing {
+            self.captured
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("capturing but no capture buffer open")
+                .extend_from_slice(&buf);
             return r;
         }
         // The hand-off (design §Content/§Render): the block's bytes and the
@@ -1474,26 +1490,29 @@ impl Content {
         self.write_content(block.as_bytes());
     }
 
-    /// Begin capturing everything content hands to the hub (design §Content:
-    /// capture is content's, tapped at the hand-off — each `ContentWrite` is
-    /// read exactly as `render()` receives it: content bytes
-    /// only, never frame bytes). With a tap set there is nothing reaching
-    /// the hub to capture, so the tap's own capture policy answers.
-    pub(crate) fn begin_capture(&self) {
-        if let Some(tap) = &self.tap {
-            tap.begin_capture();
-            return;
-        }
-        self.manager.lock().unwrap().begin_capture();
+    /// True while a capture session is open. Same-task with writes (the
+    /// single-writer proof at [`Self::with_content_writer`]), so the read needs
+    /// no lock held across the span.
+    fn is_capturing(&self) -> bool {
+        self.captured.lock().unwrap().is_some()
     }
 
-    /// End a capture session and return what content handed over. See
+    /// Begin capturing what Content hands over (design §Content: capture is
+    /// Content's — the block's bytes are tapped at the output, before the hub
+    /// hand-off, so a capturing write never reaches `render()`; content bytes
+    /// only, never frame bytes).
+    pub(crate) fn begin_capture(&self) {
+        *self.captured.lock().unwrap() = Some(Vec::new());
+    }
+
+    /// End a capture session and return what Content produced. See
     /// [`Self::begin_capture`].
     pub(crate) fn end_capture(&self) -> Vec<u8> {
-        if let Some(tap) = &self.tap {
-            return tap.end_capture();
-        }
-        self.manager.lock().unwrap().end_capture()
+        self.captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("end_capture without begin_capture")
     }
 }
 
@@ -1531,18 +1550,17 @@ mod tests {
         );
     }
 
-    /// Capture is content's (§4) and obeys the same seam: with a tap set there
-    /// is nothing reaching the sink to capture, so the tap's own policy
-    /// answers instead.
+    /// Capture reads Content's own write path: a tapped `Content`'s verbs go to
+    /// the tap, never the buffer, so a capture opened over one is empty.
     #[test]
-    fn tap_captures_through_the_seam() {
+    fn tapped_content_captures_nothing() {
         let (out, _lines) = crate::output::RecordingOutput::new();
         let content = Content::with_tap(out);
         content.begin_capture();
         content.display_text("capped");
         assert!(
             content.end_capture().is_empty(),
-            "RecordingOutput captures nothing"
+            "a tapped verb never reaches the capture buffer"
         );
     }
 }

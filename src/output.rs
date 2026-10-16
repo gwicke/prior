@@ -1145,11 +1145,11 @@ mod tests {
         // A message that exactly fills the width, and one that is a column
         // wider: the old `wrap(text).len()` count called both one row.
         let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
+        let sink = record_bytes(&out);
         out.begin_response();
         out.display_text(&"x".repeat(36)); // + "⏺ " = 38 columns
         out.display_text(&"y".repeat(39)); // + "⏺ " = 41 -> wraps
-        let bytes = out.end_capture();
+        let bytes = sink.bytes();
         assert_eq!(
             tracked_row(&out),
             screen_row(&bytes, 40),
@@ -1160,11 +1160,11 @@ mod tests {
     #[test]
     fn display_text_counts_a_wide_character_as_two_columns() {
         let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
+        let sink = record_bytes(&out);
         out.begin_response();
         // 19 CJK chars = 38 columns, plus the 2-column marker: wraps at 40.
         out.display_text(&"漢".repeat(19));
-        let bytes = out.end_capture();
+        let bytes = sink.bytes();
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
     }
 
@@ -1173,12 +1173,12 @@ mod tests {
         // The untracked path (§9 #10): a streamed paragraph used to leave the
         // tracked row where it was.
         let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
+        let sink = record_bytes(&out);
         out.begin_response();
         out.stream_text("First paragraph of the answer.\n\n");
         out.stream_text("Second paragraph, streamed.\n\n");
         out.end_response();
-        let bytes = out.end_capture();
+        let bytes = sink.bytes();
         assert_eq!(
             tracked_row(&out),
             screen_row(&bytes, 40),
@@ -1190,34 +1190,34 @@ mod tests {
     fn streamed_thinking_is_counted() {
         let (out, reasoning) = capturing_output(40);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.begin_capture();
+        let sink = record_bytes(&out);
         out.begin_response();
         out.stream_thinking("Thinking about the problem.\n\n");
-        let bytes = out.end_capture();
+        let bytes = sink.bytes();
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
     }
 
     #[test]
     fn tool_panel_is_counted() {
         let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
+        let sink = record_bytes(&out);
         out.begin_response();
         out.display_tool_call("Bash", &serde_json::json!({"command": "ls -la"}));
         out.display_tool_result("a\nb\nc");
-        let bytes = out.end_capture();
+        let bytes = sink.bytes();
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
     }
 
     #[test]
     fn markdown_and_error_and_plain_are_counted() {
         let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
+        let sink = record_bytes(&out);
         out.begin_response();
         out.display_markdown("# Title\n\nA paragraph long enough to wrap at forty columns.\n");
         out.display_error("an error long enough to wrap onto a second row at forty");
         out.display_plain("plain text that is long enough to wrap at forty columns ok");
         out.display_system("a system line long enough to wrap at forty columns");
-        let bytes = out.end_capture();
+        let bytes = sink.bytes();
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
     }
 
@@ -2536,11 +2536,10 @@ mod tests {
         assert_eq!(cap, expect, "captured bytes are the raw content");
     }
 
-    /// Capture taps the content hand-off, never the sink (design
-    /// §Content): the block's bytes stop at the tap, while the frame — its
-    /// apply, the consume's walk, the reposition — keeps flowing to the
-    /// screen. The narrowing the writer swap retired, pinned: a capture
-    /// session with a *live frame* catches content only.
+    /// Capture is Content's and a frame paint is screen-side (design §Content):
+    /// an explicit `draw_frame` reaches the screen and is never caught, while a
+    /// captured content write stops at Content's output — content bytes only,
+    /// never frame bytes.
     #[test]
     fn capture_catches_content_but_never_frame_bytes() {
         let (out, _reasoning) = capturing_output(40);
@@ -2811,23 +2810,17 @@ mod tests {
         );
     }
 
-    /// The clear only applies when a frame is live: streamed blocks just
-    /// append, so the tracked row stays in step with the screen and a
-    /// scrolled-back viewport is never written into.
+    /// Without a live frame the streamed blocks just append — no consume, no
+    /// reposition — so the tracked row stays in step with the screen.
     #[test]
-    fn content_without_a_live_frame_is_untouched() {
+    fn streamed_content_without_a_live_frame_stays_in_step() {
         let (out, _reasoning) = capturing_output(40);
-        out.begin_capture();
+        let sink = record_bytes(&out);
         out.begin_response();
         out.stream_text("a streamed paragraph.\n\n");
         out.stream_text("another one.\n\n");
         out.end_response();
-        let bytes = out.end_capture();
-        assert!(
-            !String::from_utf8_lossy(&bytes).contains("\x1b[K"),
-            "nothing to clear while streaming: {:?}",
-            String::from_utf8_lossy(&bytes).escape_debug().to_string()
-        );
+        let bytes = sink.bytes();
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
     }
 

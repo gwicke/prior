@@ -626,12 +626,6 @@ pub struct RenderManager {
     /// bookkeeping, owned — the design's `Draw { … }` under this roof. Plain
     /// fields inside; this manager's `Mutex` is what serializes them.
     draw: Draw,
-    /// The capture tap (design §Content): while open, each `Main` write's
-    /// bytes are recorded here at the content-emit boundary — before any
-    /// width enforcement — and handed on empty, so the screen keeps the
-    /// content out. Content bytes only; frame bytes can never be caught, which
-    /// is the deliberate narrowing over the old writer swap.
-    captured: Option<Vec<u8>>,
     /// The configured long-lived element stack — bar, input, blank row, plus
     /// the overlay/confirm when one is open — installed by [`Self::configure`]
     /// (the repl owns membership, design §Render: "the manager's `stack` is
@@ -673,7 +667,6 @@ impl RenderManager {
     pub fn new(size: SizeWatch, term_io: TermIO) -> Self {
         Self {
             draw: Draw::new(size.clone(), term_io),
-            captured: None,
             stack: Vec::new(),
             frame_max_row_ratio: FRAME_MAX_ROW_RATIO,
             size,
@@ -827,38 +820,11 @@ impl RenderManager {
         match content {
             None => self.draw.draw(&frame, None),
             Some(mut w) => {
-                // The tap first — at the content-emit boundary, so what is
-                // recorded is what Content produced, before enforcement. The
-                // write is handed on empty, but its row count stands, so the
-                // cursor advance and the choreography run either way.
-                let swallow = self.capture_tap(&w);
                 // Render owns the final guarantee: repair the bytes against the
-                // watched width, then read the row count back off them. The
-                // count is computed here, before a capture empties the bytes,
-                // so the swallowed write still advances the cursor.
+                // watched width, then read the row count back off them.
                 let rows = repair_main(&mut w, self.size.borrow().width);
-                if swallow {
-                    w.bytes.clear();
-                }
                 self.draw.draw(&frame, Some((&w, rows)));
             }
-        }
-    }
-
-    /// Record a `Main` write's bytes at the content-emit boundary (design
-    /// §Content) — before any width enforcement — returning whether the screen
-    /// must keep them out. The `Meta` route is never captured: diverted
-    /// reasoning was never on the screen's path.
-    fn capture_tap(&mut self, w: &ContentWrite) -> bool {
-        if w.stream != crate::termio::Stream::Main {
-            return false;
-        }
-        match self.captured.as_mut() {
-            Some(cap) => {
-                cap.extend_from_slice(&w.bytes);
-                true
-            }
-            None => false,
         }
     }
 
@@ -995,28 +961,6 @@ impl RenderManager {
             &frame
         };
         self.draw.reposition(frame, deferred.height());
-    }
-
-    /// True while a capture is open on the content hand-off (design
-    /// §Content: the tap reads each write as handed over).
-    pub fn is_capturing(&self) -> bool {
-        self.captured.is_some()
-    }
-
-    /// Open a capture: from here each `Main` write's bytes stop at the hub
-    /// instead of reaching the screen. Content bytes only — frame bytes
-    /// (`draw_frame`, the reposition) can never be caught, which is the
-    /// deliberate narrowing over the old writer swap; byte-edge tests read
-    /// `TermIO::recording()`.
-    pub fn begin_capture(&mut self) {
-        self.captured = Some(Vec::new());
-    }
-
-    /// End the capture and return what the content path handed over.
-    pub fn end_capture(&mut self) -> Vec<u8> {
-        self.captured
-            .take()
-            .expect("end_capture without begin_capture")
     }
 }
 

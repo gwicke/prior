@@ -10,30 +10,20 @@ The end state is a `Content` built directly (`Content::new` in production, `Cont
 `--quiet`, a live `Content` + capture in tests) that the agent and its guards hold; `output.rs` and
 its trait dissolve. Landed as commits, each compiling and green on its own.
 
-### 5c — capture becomes Content's; the record-tap folds into it
-`RenderManager`'s capture (`captured` + `capture_tap` + the `render()` swallow) and `Content`'s
-`tap` are the same idea — record what Content produced — so fold them and put the one seam at
-Content's output: Content owns the capture buffer and taps its own write *before* the hub hand-off,
-so a capturing content never calls the hub (record + suppress in one). This deletes
-`RecordingOutput`, `content_for`'s record mode and the manager's capture state
-(`begin_capture`/`end_capture`/`is_capturing`/`captured`/`capture_tap` move up), and makes the
-content-only tests (the `batch_slash` family, the replay units) hub-free — and makes `/replay Nl`
-and resume-line, already capture-and-print, hub-free too. What remains of the old tap is just:
+### 5d — the tap seam dissolves; `AgentConfig.output` drops
+Capture is Content's now, so the `tap: Option<Arc<dyn Output>>` seam is all that stands between
+Content and a direct build. Fold its two remaining jobs into Content and delete the seam:
 
 - **quiet** — a `Content` flag: suppress the hub hand-off, route `display_error` to stderr
   (`Content::quiet`); and
 - **the non-REPL input source** — production reads stdin, tests inject a script.
 
-Neither needs `Output`; no new trait is required. `NoOutput`/`LogOutput` (dead) die here too.
-Design settled and applied already (§Render drops `captured`; §Content moves capture up to the
-output): a capture takes the write out entirely, so no frame is applied either. This retires
-`capture_catches_content_but_never_frame_bytes`, which pins the old "frame still applies" rule.
-
-### 5d — `AgentConfig.output` drops; the agent + guards hold `Content`
-`content_for` dies; every caller builds its `Content` directly (production `Content::new`, quiet
+That deletes `Content::with_tap`, `RecordingOutput`, `NoOutput`/`LogOutput` (dead), and
+`content_for`; every caller builds its `Content` directly (production `Content::new`, quiet
 `Content::quiet`, tests a live `Content` read through `begin_capture`). `ConsoleOutput` dissolves
 into `Content` plus a public `hub()`; `confirm_probe`, the examples, `main.rs` and the test harnesses
-(`for_test_with_output`, the `ScriptOutput` doubles, `repl`'s `commit_harness`) migrate.
+(`for_test_with_output`, the `ScriptOutput` doubles, `repl`'s `commit_harness`) migrate;
+`AgentConfig.output` drops.
 
 ### 5e — delete `output.rs`; prune `lib.rs`
 Remove the module; `Confirmation` is already gone and the sinks are content's (5c), so `lib.rs` loses
