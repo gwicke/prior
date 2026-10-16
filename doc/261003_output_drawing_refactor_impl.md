@@ -36,34 +36,34 @@ The shape:
 
 - **Content-facing kinds, not sinks.** `Stream { Content, Reasoning, Error }`: Content says *what* a
   write is. `Reasoning` replaces today's "divert to Meta"; `Error` names what is now `SystemMessage`
-  on `Main`. `Stream::Meta` goes. `Frame` never crosses the content API.
-- **TermIO owns kind → sink, from caps.** `Content`/`Error` → primary; `Reasoning` → primary when
+  on `Main`. `Stream::Meta` goes. `Frame` never crosses the content API. Finer kinds buy future
+  flexibility even where two route alike today (`Reasoning` and `Error` do: primary-on-tty,
+  meta-on-pipe).
+- **TermIO owns kind → sink, from caps.** `Content` → primary; `Reasoning`/`Error` → primary when
   the primary is a terminal, else the meta stream; `Frame` → primary, dropped when the primary is
-  not a terminal. The strip stays at the edge (5f), per *target* cap.
+  not a terminal. The strip stays at the edge (5f), per *target* cap. `Error` on a tty stays on
+  stdout (so a piped consumer still sees it), which is today's `Main` behavior — the kind only makes
+  the sink a TermIO decision.
 - **`Frame` is a Draw → TermIO distinction**, not a `Stream` variant: `TermIO::write_frame` (or a
   two-variant `TermTarget { Content(Stream), Frame }`). Draw's frame-side writes — `plan_consume`'s
   walk, `apply`/`draw_frame`/`reposition`, the caret show/hide, the re-anchor — carry it; the
   content write keeps its kind. Content bytes are never rewritten by the consume, so the drop
-  leaves them intact.
-- **No screen query is needed for the merge.** `Reasoning` is emitted exactly when the primary is
-  not a terminal — i.e. exactly when frames are dropped — so the walk/reposition around a
-  `Reasoning` write are `Frame` bytes TermIO discards. Draw can always merge (its cache advances
-  against dropped bytes, the fiction 5f already accepts).
-- **One screen predicate, one consumer left.** Render's `repair_main` applies the width net only to
-  a write bound for the primary screen; put the rule on `Caps` (`caps.kind_sink(kind)`), which
-  TermIO owns and probes, and let Render read it — a query, not a private table.
+  leaves them intact. This also lets the 5f `paints_frames` gate leave `Draw`: TermIO drops `Frame`.
+- **Nothing above TermIO needs the mapping.** `repair_main` needs the *width*, not the sink: a
+  non-primary (stderr) write occurs only when the primary is not a terminal — exactly when frames
+  are dropped and the live-screen cache is already fiction — so the net and the returned row count
+  can apply uniformly (the count only matters on a screen, where every write is a screen write). So
+  no `Caps::kind_sink` surfaces above TermIO; the mapping is TermIO's alone, and Draw always merges
+  (its cache advances against dropped bytes, the fiction 5f accepts).
 
 Open before landing:
 
-- **`Error`'s sink is a decision, not a rename.** Errors are on `Main` today (stdout, so a piped
-  consumer sees them); only `--quiet` sends them to stderr, via `eprintln!`. Naming the kind forces
-  the choice — keep stdout to avoid a regression, or make it cap-driven.
+- **Recording doubles model real backends.** They should replicate what a tty or a plain backend
+  would emit — so a recording backend takes caps and always behaves real (the 5f `degrade` flag
+  becomes "always", `recording()` pins tty caps), the byte-edge suite pinning tty caps and the
+  degradation tests pinning pipe caps. `Content`'s caps must match for colour and routing, so build
+  it over the recording backend rather than swapping the sink after construction.
 - **`--quiet` is unaffected** — it drops the hub hand-off entirely; keep it that way.
-- **Recording doubles:** record per *kind* or per *sink*? They key on `Main`/`Meta` now, and the
-  real-vs-double split (`recording`/`recording_degraded`) must survive.
-- **`Reasoning` vs a generic meta:** the only non-primary stream today *is* diverted reasoning, so
-  the semantic kind is a clean rename — but `show_reasoning` (whether it renders at all) stays
-  Content's, and only the sink moves.
 - **Churn:** `Stream`'s variants are a `termio` re-export, so `ContentWrite.stream`, `repair_main`,
   `Draw::draw`, `write_stdio`, and a large block of `Stream::Main`/`Meta` test assertions move.
 - **`TermGuard`** (the first bullet above) is the same "TermIO owns output" finding and folds in
