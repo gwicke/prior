@@ -9,6 +9,7 @@ use crate::content::preview::{
 };
 #[cfg(test)]
 use crate::content::text::wrap;
+#[cfg(test)]
 use crate::content::Content;
 #[cfg(test)]
 use crate::content::ContentDisplayKind;
@@ -16,7 +17,7 @@ use crate::content::ContentDisplayKind;
 use crate::draw::ApplyPolicy;
 #[cfg(test)]
 use crate::settings::ShowReasoning;
-use crate::settings::ShowReasoningHandle;
+#[cfg(test)]
 use crate::termio::TermIO;
 #[cfg(test)]
 use crate::termio::TermSize;
@@ -26,12 +27,13 @@ use markdown_stream::{Parser, StreamParser};
 #[cfg(test)]
 use markdown_terminal::{Renderer, Theme};
 use serde_json::Value;
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 pub trait Output: Send + Sync {
     fn display_text(&self, text: &str);
     /// Render a model *response* as markdown. Defaults to `display_text` so
-    /// non-console impls (quiet/log/no-op) need no change; `ConsoleOutput`
+    /// non-console impls (quiet/log/no-op) need no change; `Content`
     /// overrides it with full block-markdown rendering (code blocks, tables,
     /// headings, lists) via `codewandler-markdown-terminal`. Error/status text
     /// should still go through `display_text` (inline/plain), not this.
@@ -41,7 +43,7 @@ pub trait Output: Send + Sync {
     // ---- Response event sequence ----
     // Both the live streaming path (`CodeAgent::prompt`) and the session
     // replay path (`replay_units`) drive these methods in the same
-    // order, so `ConsoleOutput` only needs one rendering implementation and
+    // order, so `Content` only needs one rendering implementation and
     // replay output is guaranteed to match live output.
     //
     // Required call order per agent response:
@@ -93,7 +95,7 @@ pub trait Output: Send + Sync {
         persona: Option<&str>,
     );
     /// Begin capturing what the content path hands to the hub, into a byte
-    /// buffer. `ConsoleOutput` taps the `ContentWrite` hand-off — content
+    /// buffer. `Content` taps the `ContentWrite` hand-off — content
     /// bytes only, never frame bytes (design §Content: an
     /// assertion against content, not against a screen). Must be paired
     /// with a subsequent call to [`end_capture`] which returns the bytes.
@@ -112,7 +114,7 @@ pub trait Output: Send + Sync {
     /// or a `!command` — bracketed by rules, the way a turn is (ui_draw_v2 R4).
     ///
     /// The default draws all three parts unconditionally, which is what every
-    /// implementation that does not override it wants. `ConsoleOutput`
+    /// implementation that does not override it wants. `Content`
     /// overrides it to *share* a rule with a directly preceding commit rather
     /// than stacking one between each pair; that is a drawing decision about
     /// how a kind looks, and no other implementation draws rules to collapse.
@@ -132,26 +134,6 @@ pub trait Output: Send + Sync {
     // applied size (what resize detection compares against) is
     // `RenderManager::painted_size`'s.
 }
-
-/// The merged output — the agent's `Arc<dyn Output>` — whose content half is
-/// now the [`Content`] handle: `content` owns the boundary, the
-/// width watch and the streaming renderers, and `Output`'s content methods
-/// forward through it. The watched size is `Content::frame_size`, the applied
-/// size `RenderManager::painted_size`; `cursor_row` is the manager's. What
-/// remains here is the batch guard and `draw_frame` — the test drivers' edge
-/// into the hub's pipeline.
-pub struct ConsoleOutput {
-    /// The content owner, shared by `Arc` with `AgentConfig.content`, so the
-    /// config's frame handle and its content handle are one state. `Output`'s
-    /// content methods forward through it; the drawing edge stays reachable
-    /// through its `manager`.
-    pub(crate) content: Arc<Content>,
-}
-
-// Every caller reads a width/height handle it already holds —
-// `Content::width`/`height`/`frame_size` (floors unchanged:
-// 20 columns, 1 row), reached through the content handle or, in the REPL
-// key paths, the prompt session's cloned receiver.
 
 #[cfg(test)]
 mod sed_preview_body_tests {
@@ -312,193 +294,6 @@ src/x.rs:9
     }
 }
 
-impl ConsoleOutput {
-    /// The production constructor: the terminal backend moves in
-    /// and seeds everything per-process — the caps it probed, the size watch
-    /// content and the manager read, the `Draw` sink — so `TermIO` is
-    /// constructed first, in the caller (`main`).
-    pub fn new(term_io: TermIO, show_reasoning: ShowReasoningHandle) -> Self {
-        Self {
-            content: Arc::new(Content::new(term_io, show_reasoning)),
-        }
-    }
-
-    /// The content handle this console owns — what `AgentConfig.content` is
-    /// set to, so the config's two handles share one `Content`.
-    pub fn content(&self) -> Arc<Content> {
-        self.content.clone()
-    }
-
-    /// A `ConsoleOutput` on a privately seeded size watch — the test
-    /// harness's answer to [`Self::new`]. The geometry becomes
-    /// per-instance state, so tests that pin a width need no serialization.
-    /// The backend underneath is a sinkhole: these tests pin geometry, not
-    /// bytes, and the byte-edge tests record through `TermIO::recording()`.
-    #[cfg(test)]
-    pub(crate) fn with_size(show_reasoning: ShowReasoningHandle, size: TermSize) -> Self {
-        Self::with_size_at(show_reasoning, size).0
-    }
-
-    /// [`Self::with_size`] that also hands back the private size watch's
-    /// sending half. The watch `render()` composes at is per-instance state
-    /// (the manager reads it directly), and `fixed()` drops its sender, so a
-    /// test that needs the geometry *under test* to differ from the width it
-    /// seeded — both paths composing at one watched size, not a width the
-    /// harness hardcoded — keeps this to move it. `set_size` cannot: that
-    /// publishes to `term_io`'s watch, which the private one replaced.
-    #[cfg(test)]
-    pub(crate) fn with_size_at(
-        show_reasoning: ShowReasoningHandle,
-        size: TermSize,
-    ) -> (Self, tokio::sync::watch::Sender<TermSize>) {
-        let term_io = TermIO::null();
-        let (size_tx, size_rx) = tokio::sync::watch::channel(size);
-        let out = Self {
-            content: Arc::new(Content::new_from(term_io, size_rx, show_reasoning)),
-        };
-        (out, size_tx)
-    }
-}
-
-impl Default for ConsoleOutput {
-    fn default() -> Self {
-        Self::new(
-            TermIO::plain(),
-            crate::settings::default_show_reasoning_handle(),
-        )
-    }
-}
-
-impl ConsoleOutput {
-    /// The frame hub behind this output: what the paint path
-    /// composes and renders through. Out-of-crate drivers (the confirm
-    /// probe) reach it here; the in-crate path goes through
-    /// `Content::manager`.
-    pub fn hub(&self) -> Arc<Mutex<crate::render::RenderManager>> {
-        self.content.manager.clone()
-    }
-}
-
-impl ConsoleOutput {
-    // --- Multi-file rendering primitives ----------------------------------
-    //
-    // These live on an inherent impl, not in `impl Output`: they are the
-    // *same* rendering a single-file call uses, invoked once per file, so the
-    // view layer has exactly one code path for a tool call-result pair.
-}
-
-impl Output for ConsoleOutput {
-    /// Bracketed, and — where the previous content was also a committed
-    /// prompt — *sharing* the closing rule with it instead of stacking one
-    /// (ui_draw_v2 R4).
-    ///
-    /// **One** `with_content_writer`, declared as `Prompt`. The rules are
-    /// formatting, drawn here inside the block the prompt owns, rather than
-    /// separate writes that would each have to declare a kind of their own —
-    /// which is also why the share-or-open decision is taken *before* that
-    /// write: read after it, the last kind could only ever be this prompt.
-    ///
-    /// ```text
-    /// ────
-    /// first
-    /// ────
-    /// second
-    /// ────
-    /// ```
-    ///
-    /// The prompt stops at its rules rather than carrying blank lines of its
-    /// own: a blank row either side comes from `boundary_spacer`, so a prompt
-    /// against model output reads as a turn while two adjacent prompts read as
-    /// two commits sharing one rule.
-    fn display_committed_prompt(&self, line: &str) {
-        self.content.display_committed_prompt(line);
-    }
-
-    fn display_plain(&self, text: &str) {
-        self.content.display_plain(text);
-    }
-
-    fn display_markdown(&self, text: &str) {
-        self.content.display_markdown(text);
-    }
-
-    fn display_text(&self, text: &str) {
-        self.content.display_text(text);
-    }
-
-    fn begin_response(&self) {
-        self.content.begin_response();
-    }
-
-    fn stream_text(&self, delta: &str) {
-        self.content.stream_text(delta);
-    }
-
-    fn stream_thinking(&self, delta: &str) {
-        self.content.stream_thinking(delta);
-    }
-
-    fn end_response_segment(&self) {
-        self.content.end_response_segment();
-    }
-
-    fn end_response(&self) {
-        self.content.end_response();
-    }
-
-    fn display_tool_call(&self, name: &str, args: &Value) {
-        self.content.display_tool_call(name, args);
-    }
-
-    /// A tool block ends without a blank line: the panel rows are the last
-    /// thing written, so whatever comes next — the next segment's text, another
-    /// tool call, the turn's trailing blank — opens with one. Every exit below
-    /// ends the block with it, which is the knowledge the `last_was_tool` flag
-    /// used to carry, stated by the block that has it.
-    fn display_tool_result(&self, result: &str) {
-        self.content.display_tool_result(result);
-    }
-
-    fn get_user_input(&self) -> String {
-        // The duty lives on `Content` (the prompt is a content
-        // write; the answer goes through the §4 tap when one is installed);
-        // this is the trait-facing forward.
-        self.content.get_user_input()
-    }
-
-    fn display_error(&self, error: &str) {
-        self.content.display_error(error);
-    }
-
-    fn display_system(&self, text: &str) {
-        self.content.display_system(text);
-    }
-
-    fn display_separator(&self) {
-        self.content.display_separator();
-    }
-
-    fn display_header(
-        &self,
-        provider: &str,
-        model: &str,
-        yolo: bool,
-        limit: usize,
-        persona: Option<&str>,
-    ) {
-        self.content
-            .display_header(provider, model, yolo, limit, persona);
-    }
-
-    fn begin_capture(&self) {
-        self.content.begin_capture();
-    }
-
-    fn end_capture(&self) -> Vec<u8> {
-        self.content.end_capture()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,7 +312,7 @@ mod tests {
     // against the screen: run a writer, replay its bytes through a terminal
     // emulator, and require the tracked row to be the row the cursor is on.
 
-    /// A `ConsoleOutput` writing into a capture buffer, with the shared width
+    /// A `Content` writing into a capture buffer, with the shared width
     /// pinned so the expected geometry does not depend on the test runner's
     /// terminal. Height is not pinned (the clamp in `note_lines` needs a real
     /// terminal size), so the cases stay well under one screen.
@@ -580,9 +375,7 @@ mod tests {
     fn the_dot_follows_the_response_lifecycle() {
         let (out, _reasoning) = capturing_output(60);
         assert!(
-            !out.content
-                .streaming
-                .load(std::sync::atomic::Ordering::Relaxed),
+            !out.streaming.load(std::sync::atomic::Ordering::Relaxed),
             "no turn in flight, so the bar is idle"
         );
         // Composed while idle — the REPL composes once per keystroke, and the
@@ -602,9 +395,7 @@ mod tests {
             "and idle again once the turn is over: {after:?}"
         );
         assert!(
-            !out.content
-                .streaming
-                .load(std::sync::atomic::Ordering::Relaxed),
+            !out.streaming.load(std::sync::atomic::Ordering::Relaxed),
             "and the flag went back down"
         );
     }
@@ -729,7 +520,7 @@ mod tests {
         let (out, _reasoning) = capturing_output(60);
         // A fresh store, as the agent's constructor installs it.
         let usage = std::sync::Arc::new(Mutex::new(crate::agent::SessionUsage::default()));
-        out.content.set_usage(Some(usage.clone()));
+        out.set_usage(Some(usage.clone()));
 
         let before = compose_rows(&compose_area(&out, None, Vec::new()), 60);
         assert!(
@@ -759,9 +550,9 @@ mod tests {
         );
     }
 
-    fn capturing_output(width: u16) -> (ConsoleOutput, crate::settings::ShowReasoningHandle) {
+    fn capturing_output(width: u16) -> (Content, crate::settings::ShowReasoningHandle) {
         let reasoning = crate::settings::default_show_reasoning_handle();
-        let out = ConsoleOutput::with_size(
+        let out = Content::with_size(
             reasoning.clone(),
             TermSize {
                 width: width as usize,
@@ -771,7 +562,7 @@ mod tests {
         // Pinned rather than probed: the routing is not this suite's subject,
         // and a capture harness should capture everything the code might
         // write (the doc on this helper says why in full).
-        out.content.set_reasoning_on_stderr(false);
+        out.set_reasoning_on_stderr(false);
         (out, reasoning)
     }
 
@@ -788,11 +579,7 @@ mod tests {
         let stack = || {
             vec![
                 Element::lines(vec![String::new()]),
-                crate::ui::bar::status(
-                    app.clone(),
-                    out.content.usage_handle(),
-                    out.content.streaming.clone(),
-                ),
+                crate::ui::bar::status(app.clone(), out.usage_handle(), out.streaming.clone()),
             ]
         };
         let before = compose_rows(&stack(), 60);
@@ -835,11 +622,7 @@ mod tests {
         let stack = || {
             vec![
                 Element::lines(vec![String::new()]),
-                crate::ui::bar::status(
-                    app.clone(),
-                    out.content.usage_handle(),
-                    out.content.streaming.clone(),
-                ),
+                crate::ui::bar::status(app.clone(), out.usage_handle(), out.streaming.clone()),
             ]
         };
         let empty = compose_rows(&stack(), 60);
@@ -881,17 +664,13 @@ mod tests {
     /// the plan keeps: compose a stack, then `configure` + `render(None)`).
     /// Mirrors `PromptSession::sync_stack`: gap, always-present bar, input, and
     /// the divider-then-overlay tail when an overlay is open.
-    fn compose_area(
-        out: &ConsoleOutput,
-        input: Option<Element>,
-        overlay: Vec<Element>,
-    ) -> Vec<Element> {
+    fn compose_area(out: &Content, input: Option<Element>, overlay: Vec<Element>) -> Vec<Element> {
         let mut stack = Vec::new();
         stack.push(Element::lines(vec![String::new()]));
         stack.push(crate::ui::bar::status(
             bar_app("[bar]"),
-            out.content.usage_handle(),
-            out.content.streaming.clone(),
+            out.usage_handle(),
+            out.streaming.clone(),
         ));
         stack.extend(input);
         if !overlay.is_empty() {
@@ -907,21 +686,20 @@ mod tests {
     /// (design §Content) — frame bytes can never be caught — so a test
     /// asserting on what reached the terminal reads `TermIO`'s recording
     /// backend under the manager's `Draw`.
-    fn record_bytes(out: &ConsoleOutput) -> Recording {
-        out.content.manager.lock().unwrap().draw().term_io = crate::termio::TermIO::recording();
-        Recording(out.content.clone())
+    fn record_bytes(out: &Content) -> Recording {
+        let hub = out.manager.clone();
+        hub.lock().unwrap().draw().term_io = crate::termio::TermIO::recording();
+        Recording(hub)
     }
 
     /// What a [`record_bytes`] swap captured — read at assert time through
-    /// the same content handle, so a test keeps no lock and no borrow into
-    /// the manager.
-    struct Recording(Arc<Content>);
+    /// the hub handle, so a test keeps no lock and no borrow into the manager.
+    struct Recording(Arc<Mutex<crate::render::RenderManager>>);
 
     impl Recording {
         /// The main stream — screen bytes, choreography included.
         fn bytes(&self) -> Vec<u8> {
             self.0
-                .manager
                 .lock()
                 .unwrap()
                 .draw()
@@ -932,7 +710,6 @@ mod tests {
         /// The meta stream — the diverted-reasoning edge.
         fn meta(&self) -> Vec<u8> {
             self.0
-                .manager
                 .lock()
                 .unwrap()
                 .draw()
@@ -942,15 +719,8 @@ mod tests {
     }
 
     /// Tracked cursor row of `out` (0-based, as the screen reports it).
-    fn tracked_row(out: &ConsoleOutput) -> usize {
-        out.content
-            .manager
-            .lock()
-            .unwrap()
-            .draw()
-            .cache
-            .tracked_row()
-            - 1
+    fn tracked_row(out: &Content) -> usize {
+        out.manager.lock().unwrap().draw().cache.tracked_row() - 1
     }
 
     /// Row the cursor ends on when `bytes` are replayed into a `width`x24
@@ -1109,8 +879,8 @@ mod tests {
     }
 
     /// Deliver one `Say`/`Think` delta in this chunking.
-    fn feed(out: &ConsoleOutput, step: Step, chunk: Chunking) {
-        let (text, stream): (&str, fn(&ConsoleOutput, &str)) = match step {
+    fn feed(out: &Content, step: Step, chunk: Chunking) {
+        let (text, stream): (&str, fn(&Content, &str)) = match step {
             Step::Say(t) => (t, |o, t| o.stream_text(t)),
             Step::Think(t) => (t, |o, t| o.stream_thinking(t)),
             _ => return,
@@ -1161,7 +931,7 @@ mod tests {
         // the pin is exactly the kind of thing a future edit drops as
         // "obviously already handled". The routing itself is the subject of
         // `reasoning_is_routed_by_the_output_layer`, which names both values.
-        out.content.set_reasoning_on_stderr(false);
+        out.set_reasoning_on_stderr(false);
         out.begin_capture();
         out.begin_response();
         for step in steps {
@@ -1334,7 +1104,7 @@ mod tests {
         // contain). The meta edge itself is `reasoning_to_meta_lands_on_…`.
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.content.set_reasoning_on_stderr(true);
+        out.set_reasoning_on_stderr(true);
         out.begin_capture();
         out.begin_response();
         feed(&out, script[0], Chunking::Whole);
@@ -1348,7 +1118,7 @@ mod tests {
         // On the screen: the other side of the same decision.
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.content.set_reasoning_on_stderr(false);
+        out.set_reasoning_on_stderr(false);
         out.begin_capture();
         out.begin_response();
         feed(&out, script[0], Chunking::Whole);
@@ -1371,7 +1141,7 @@ mod tests {
     fn reasoning_to_meta_lands_on_the_meta_edge() {
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.content.set_reasoning_on_stderr(true);
+        out.set_reasoning_on_stderr(true);
         out.begin_response();
         let recording = record_bytes(&out);
         feed(
@@ -1440,7 +1210,7 @@ mod tests {
     fn an_empty_segment_puts_no_blank_between_retries() {
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.content.set_reasoning_on_stderr(false);
+        out.set_reasoning_on_stderr(false);
         out.begin_capture();
         // Three failed attempts, each an empty turn: `begin_response` then a
         // stream that errors before a single delta reaches the parser.
@@ -1484,7 +1254,7 @@ mod tests {
     fn a_segment_that_streamed_still_closes_for_the_notice_after_it() {
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.content.set_reasoning_on_stderr(false);
+        out.set_reasoning_on_stderr(false);
         out.begin_capture();
         // The answer streams and is emitted as it arrives; the paragraph is
         // closed by its own trailing blank, so the flush below is genuinely
@@ -2252,7 +2022,7 @@ mod tests {
     fn multi_turn_answer_boundary_single_blank() {
         // Reproduces the TTY orchestration with *persistent* renderers across a
         // multi-turn turn (thinking1 -> answer1 -> tool -> thinking2 -> answer2),
-        // exactly as the `ConsoleOutput` fields behave. Before the fix, the
+        // exactly as the `Content` fields behave. Before the fix, the
         // answer renderer's `pending_gap` (set when the answer paragraph was
         // committed at the tool boundary) fired at answer2's first block, on
         // top of the one blank the thinking→answer transition emits — TWO
@@ -2322,11 +2092,10 @@ mod tests {
         let (out, _reasoning) = capturing_output(60);
         let sink = record_bytes(&out);
         let y = "y".repeat(120);
-        out.content
-            .with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
-                w.write_all(y.as_bytes()).unwrap();
-                w.write_all(b"\n").unwrap();
-            });
+        out.with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
+            w.write_all(y.as_bytes()).unwrap();
+            w.write_all(b"\n").unwrap();
+        });
         let bytes = sink.bytes();
         let text = String::from_utf8(bytes).expect("utf-8 content");
         let expect = format!("\x1b[K{}\n\x1b[K{}\n", &y[..60], &y[60..]);
@@ -2345,10 +2114,9 @@ mod tests {
         let sink = record_bytes(&out);
         let y = "y".repeat(120);
         let input = format!("\x1b[32m{y}\x1b[0m\n");
-        out.content
-            .with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
-                w.write_all(input.as_bytes()).unwrap();
-            });
+        out.with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
+            w.write_all(input.as_bytes()).unwrap();
+        });
         let bytes = sink.bytes();
         let text = String::from_utf8(bytes).expect("utf-8 content");
         let expect = format!("\x1b[K\x1b[32m{}\n\x1b[K{}\x1b[0m\n", &y[..60], &y[60..]);
@@ -2362,11 +2130,10 @@ mod tests {
         let (out, _reasoning) = capturing_output(60);
         let y = "y".repeat(120);
         out.begin_capture();
-        out.content
-            .with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
-                w.write_all(y.as_bytes()).unwrap();
-                w.write_all(b"\n").unwrap();
-            });
+        out.with_content_writer(60, Some(ContentDisplayKind::ResponseText), false, |w| {
+            w.write_all(y.as_bytes()).unwrap();
+            w.write_all(b"\n").unwrap();
+        });
         let cap = out.end_capture();
         let mut expect = y.into_bytes();
         expect.push(b'\n');
@@ -2384,8 +2151,7 @@ mod tests {
         let frame =
             crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, Vec::new(), 40, 10);
         out.begin_capture();
-        out.content
-            .manager
+        out.manager
             .lock()
             .unwrap()
             .draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
@@ -2450,7 +2216,7 @@ mod tests {
         let dims = (60, 20);
 
         let reasoning = crate::settings::default_show_reasoning_handle();
-        let (tail, _tail_tx) = ConsoleOutput::with_size_at(
+        let (tail, _tail_tx) = Content::with_size_at(
             reasoning.clone(),
             TermSize {
                 width: dims.0,
@@ -2460,7 +2226,7 @@ mod tests {
         let tail_sink = record_bytes(&tail);
         let (input, overlay) = pieces();
         let a = {
-            let mut mgr = tail.content.manager.lock().unwrap();
+            let mut mgr = tail.manager.lock().unwrap();
             mgr.configure(
                 crate::render::FRAME_MAX_ROW_RATIO,
                 compose_area(&tail, input, overlay),
@@ -2470,7 +2236,7 @@ mod tests {
         };
         let via_tail = tail_sink.bytes();
 
-        let (hand, _hand_tx) = ConsoleOutput::with_size_at(
+        let (hand, _hand_tx) = Content::with_size_at(
             reasoning,
             TermSize {
                 width: dims.0,
@@ -2486,7 +2252,6 @@ mod tests {
         let frame = render(&stack, &heights, dims.0);
         let hand_sink = record_bytes(&hand);
         let b = hand
-            .content
             .manager
             .lock()
             .unwrap()
@@ -2527,8 +2292,7 @@ mod tests {
         );
         let frame =
             crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, overlay, 40, 10);
-        out.content
-            .manager
+        out.manager
             .lock()
             .unwrap()
             .draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
@@ -2606,15 +2370,15 @@ mod tests {
             let hidden = crate::repl::input(
                 shared_editor(|_| {}),
                 "> ".to_string(),
-                out.content.streaming.clone(),
+                out.streaming.clone(),
             );
-            let mut mgr = out.content.manager.lock().unwrap();
+            let mut mgr = out.manager.lock().unwrap();
             mgr.configure(
                 crate::render::FRAME_MAX_ROW_RATIO,
                 compose_area(&out, Some(hidden), Vec::new()),
             );
         }
-        crate::repl::paint_prompt(&out.content);
+        crate::repl::paint_prompt(&out);
         let bytes = sink.bytes();
         assert!(
             String::from_utf8_lossy(&bytes).contains("\x1b[?25l"),
@@ -2625,7 +2389,7 @@ mod tests {
         let sink = record_bytes(&out);
         let editor = shared_editor(|e| e.set("hi"));
         {
-            let mut mgr = out.content.manager.lock().unwrap();
+            let mut mgr = out.manager.lock().unwrap();
             mgr.configure(
                 crate::render::FRAME_MAX_ROW_RATIO,
                 compose_area(
@@ -2635,7 +2399,7 @@ mod tests {
                 ),
             );
         }
-        crate::repl::paint_prompt(&out.content);
+        crate::repl::paint_prompt(&out);
         let text = String::from_utf8_lossy(&sink.bytes()).into_owned();
         assert!(
             text.contains("\x1b[?25h"),
@@ -2681,13 +2445,12 @@ mod tests {
         );
         let frame =
             crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, overlay, 40, 10);
-        out.content
-            .manager
+        out.manager
             .lock()
             .unwrap()
             .draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         {
-            let _batch = crate::render::ContentBatchGuard::open(&out.content.manager);
+            let _batch = crate::render::ContentBatchGuard::open(&out.manager);
             out.display_text("first line");
             out.display_text("second line");
             out.display_text("third line");
@@ -2827,7 +2590,7 @@ mod tests {
         //  (b) in the held-answer (reasoning-enabled) path the answer started
         //      immediately after the reasoning with no separating blank line.
         //
-        // Using StreamParser+Renderer directly (not ConsoleOutput) avoids
+        // Using StreamParser+Renderer directly (not Content) avoids
         // fd-level stdout capture, which is fragile under parallel test
         // execution (the test harness writes "test ... ok" lines to stdout
         // from concurrent threads, polluting the capture).
@@ -2915,7 +2678,7 @@ Invalid block: an edit block is missing its `@@@NEW` section\n\
 Expected:\nsome/path:1234\n@@@OLD\nold text\n@@@NEW\nnew text\n@@@END\n\
 \n\
 Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.draw.lock().unwrap().anchor()\n";
-        let out = ConsoleOutput::with_size(
+        let out = Content::with_size(
             crate::settings::default_show_reasoning_handle(),
             TermSize {
                 width: 80,
@@ -3074,7 +2837,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
 
     #[test]
     fn tmp_repro_separator_blanks() {
-        let out = ConsoleOutput::new(
+        let out = Content::new(
             TermIO::plain(),
             crate::settings::default_show_reasoning_handle(),
         );
@@ -3190,7 +2953,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         // The multi-file result is a bare array; it must render as one labelled
         // batch per file — a failure's short ui_view and a success's note — with
         // no aggregate line and no model_view diff leaking into scrollback.
-        let out = ConsoleOutput::new(
+        let out = Content::new(
             TermIO::plain(),
             crate::settings::default_show_reasoning_handle(),
         );
@@ -3213,7 +2976,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     fn an_array_of_plain_strings_is_not_a_multi_file_result() {
         // Another tool's list must keep its existing rendering; the multi-file
         // branch must not swallow it.
-        let out = ConsoleOutput::new(
+        let out = Content::new(
             TermIO::plain(),
             crate::settings::default_show_reasoning_handle(),
         );
@@ -3229,7 +2992,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         // after a tool block when more text follows, so replay output matches
         // the live path (where each CompletionCall flushes) — the trailing text
         // is separated from the tool-result line by a blank line.
-        let out = ConsoleOutput::new(
+        let out = Content::new(
             TermIO::plain(),
             crate::settings::default_show_reasoning_handle(),
         );
@@ -3262,7 +3025,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     fn write_tool_renders_content_like_read() {
         // Write tool result should render with path header and syntax-highlighted
         // content preview (first 10 lines), matching read_file's rendering.
-        let out = ConsoleOutput::new(
+        let out = Content::new(
             TermIO::plain(),
             crate::settings::default_show_reasoning_handle(),
         );
@@ -3316,7 +3079,7 @@ mod ui_render_scope_tests {
     use crate::settings::default_show_reasoning_handle;
 
     fn render(result: &str) -> String {
-        let out = ConsoleOutput::new(TermIO::plain(), default_show_reasoning_handle());
+        let out = Content::new(TermIO::plain(), default_show_reasoning_handle());
         out.begin_capture();
         out.display_tool_result(result);
         let d = strip_ansi(&String::from_utf8_lossy(&out.end_capture()));

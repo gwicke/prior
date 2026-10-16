@@ -80,7 +80,7 @@ pub(crate) fn separator_line(width: usize) -> String {
 ///
 /// This is the whole separator matrix gathered into one content-owned unit.
 /// It used to live half in `DrawCache` (`last_content_display_kind` /
-/// `last_content_closes_segment`) and half on `ConsoleOutput` (`held_blank`);
+/// `last_content_closes_segment`) and half on `Content` (`held_blank`);
 /// the output-drawing refactor moves it here so none of it crosses below the
 /// content layer (design `doc/261003_output_drawing_refactor.md`, §Content).
 pub(crate) struct ContentBoundary {

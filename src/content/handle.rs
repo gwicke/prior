@@ -13,8 +13,7 @@
 //! setup decision diverts reasoning — the hub routes on the token.
 //! Of the frame *verbs*, `frame_size` lives here (the watch this handle
 //! carries *is* the dims source), `painted_size` and `cursor_row` are the
-//! manager's, and `draw_frame` — the test drivers' edge — stays on `Output`
-//! until the drawing refactor retires it.
+//! manager's, and `draw_frame` — the test drivers' edge — is the manager's too.
 
 use std::io;
 use std::sync::atomic::AtomicBool;
@@ -41,10 +40,9 @@ use markdown_terminal::{Renderer, Theme};
 use super::composition::ContentBoundary;
 use super::{boundary_spacer, separator_line, ContentDisplayKind};
 
-/// The agent-facing content owner.
-///
-/// The fields are `pub(crate)` so the content methods still forwarded by
-/// `ConsoleOutput` can reach them.
+/// The agent-facing content owner: the display verbs, the width watch, the
+/// streaming renderers and the frame hub, all in one handle the agent and the
+/// paint path share.
 pub struct Content {
     /// The frame hub: where the frame pipeline *and* the drawing edge live —
     /// allocate → render → apply → remember, with the `Draw` sink under the
@@ -148,9 +146,16 @@ impl Content {
     /// it owns). The frame hub is built from the same watch and takes the
     /// `TermIO` under `Draw` — one wiring point, one geometry source; the
     /// renderers start blank at a placeholder width.
-    pub(crate) fn new(term_io: TermIO, show_reasoning: ShowReasoningHandle) -> Self {
+    pub fn new(term_io: TermIO, show_reasoning: ShowReasoningHandle) -> Self {
         let size = term_io.subscribe_size();
         Self::new_from(term_io, size, show_reasoning)
+    }
+
+    /// The frame hub behind this content: what the paint path composes and
+    /// renders through. Out-of-crate drivers (the confirm probe) reach it
+    /// here; the in-crate path goes through `Content::manager`.
+    pub fn hub(&self) -> Arc<Mutex<crate::render::RenderManager>> {
+        self.manager.clone()
     }
 
     /// Point the bar at a running agent's live usage store, so
@@ -172,10 +177,10 @@ impl Content {
     }
 
     /// [`Self::new`] with the geometry channel chosen by the caller — the
-    /// test seam behind `ConsoleOutput::with_size`, where a privately seeded
-    /// watch replaces the instance's own (the manager and `Draw` read the
-    /// seeded one; publishes to `term_io`'s watch go where they always did
-    /// relative to a pinned test: nowhere the test reads).
+    /// test seam behind [`Self::with_size`], where a privately seeded watch
+    /// replaces the instance's own (the manager and `Draw` read the seeded
+    /// one; publishes to `term_io`'s watch go where they always did relative
+    /// to a pinned test: nowhere the test reads).
     pub(crate) fn new_from(
         term_io: TermIO,
         size: watch::Receiver<TermSize>,
@@ -262,6 +267,34 @@ impl Content {
     pub(crate) fn set_reasoning_on_stderr(&self, on: bool) {
         self.reasoning_on_stderr
             .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A `Content` on a privately seeded size watch — the test harness's
+    /// answer to [`Self::new`]. The geometry becomes per-instance state, so
+    /// tests that pin a width need no serialization. The backend underneath is
+    /// a sinkhole: these tests pin geometry, not bytes, and the byte-edge
+    /// tests record through `TermIO::recording()`.
+    #[cfg(test)]
+    pub(crate) fn with_size(show_reasoning: ShowReasoningHandle, size: TermSize) -> Self {
+        Self::with_size_at(show_reasoning, size).0
+    }
+
+    /// [`Self::with_size`] that also hands back the private size watch's
+    /// sending half. The watch `render()` composes at is per-instance state
+    /// (the manager reads it directly), and `fixed()` drops its sender, so a
+    /// test that needs the geometry *under test* to differ from the width it
+    /// seeded — both paths composing at one watched size, not a width the
+    /// harness hardcoded — keeps this to move it. `set_size` cannot: that
+    /// publishes to `term_io`'s watch, which the private one replaced.
+    #[cfg(test)]
+    pub(crate) fn with_size_at(
+        show_reasoning: ShowReasoningHandle,
+        size: TermSize,
+    ) -> (Self, tokio::sync::watch::Sender<TermSize>) {
+        let term_io = TermIO::null();
+        let (size_tx, size_rx) = tokio::sync::watch::channel(size);
+        let content = Self::new_from(term_io, size_rx, show_reasoning);
+        (content, size_tx)
     }
 
     /// The size frames are composed and applied for (ui_draw_v2 §9 #3) — the

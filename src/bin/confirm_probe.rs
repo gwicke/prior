@@ -19,7 +19,7 @@
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, KeyModifiers};
 use picocode::confirm::{ConfirmBridge, ConfirmDecision};
 use picocode::termio::TermIO;
-use picocode::ConsoleOutput;
+use picocode::Content;
 
 #[tokio::main]
 async fn main() {
@@ -32,14 +32,12 @@ async fn main() {
     // Plain is enough for an out-of-crate driver: caps probe the real
     // streams either way, no reader is wanted (the probe reads stdin
     // itself), and the frames apply through the hub's writer.
-    let out = ConsoleOutput::new(
+    let out = Content::new(
         TermIO::plain(),
         picocode::settings::default_show_reasoning_handle(),
     );
     // The frame dims come from the content handle's `frame_size`:
-    // the watched geometry, read fresh per paint — the same watch
-    // `ConsoleOutput`'s answer came from, so the probe composes exactly
-    // what it did before.
+    // the watched geometry, read fresh per paint.
 
     let mut bridge = ConfirmBridge::new();
     let tool = msg
@@ -105,7 +103,7 @@ async fn main() {
     // Same resolve the REPL's dispatcher runs: repaint without the dialog,
     // then write the decision line where it was.
     picocode::confirm::resolve(
-        out.content().as_ref(),
+        &out,
         || {
             // The empty membership: with nothing configured the area is
             // nothing, and applying it is the erase (dropping the element is

@@ -1,6 +1,6 @@
 //! Tool-call panel rows: the full-width grey panel background and the
 //! per-line foreground styling behind it. The *emission* of these rows stays
-//! on `ConsoleOutput`
+//! on `Content`
 //! (`paint_panel` / `tool_panel`), which writes each through the content
 //! pipeline with the `ResponseTool` kind.
 

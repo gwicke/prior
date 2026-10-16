@@ -61,7 +61,7 @@ pub struct AgentConfig {
     pub model: String,
     /// The content handle: every `display_*` / `stream_*` /
     /// `begin|end_response` call goes here. In production it is the same
-    /// `Content` `ConsoleOutput` holds; under `--quiet` it is
+    /// `Content` the paint path holds; under `--quiet` it is
     /// [`Content::quiet`]; in a test it is a `Content` whose verbs
     /// short-circuit through a tap.
     pub content: Arc<crate::content::Content>,

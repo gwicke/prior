@@ -2924,7 +2924,6 @@ mod tests {
         e
     }
     use super::*;
-    use crate::output::Output;
 
     /// A committed line is bracketed by rules: one above, one below, and the
     /// line between them.
@@ -2944,7 +2943,7 @@ mod tests {
         let reasoning = crate::settings::default_show_reasoning_handle();
         // The width is per-instance state (`with_size`
         // seeds a private size watch), so no serialization is needed.
-        let out = crate::output::ConsoleOutput::with_size(
+        let out = Content::with_size(
             reasoning,
             crate::termio::TermSize {
                 width: 80,
@@ -2965,7 +2964,7 @@ mod tests {
         // The redraw closure is a no-op: this test is about what `emit_commit`
         // writes, and the real closure's frame apply is covered by the REPL's
         // own tests. Passing a real one here would only add a bar row to search.
-        Repl::emit_commit(&out.content, &editor, &|| {}, line, "", &mut history);
+        Repl::emit_commit(&out, &editor, &|| {}, line, "", &mut history);
         let bytes = out.end_capture();
         let text = String::from_utf8_lossy(&bytes);
 
@@ -3023,11 +3022,11 @@ mod tests {
             .collect()
     }
 
-    /// A `ConsoleOutput` carrying a status, plus the redraw `emit_commit`
+    /// A `Content` carrying a status, plus the redraw `emit_commit`
     /// expects: compose the area and draw it, the way `read_input` does.
-    fn commit_harness() -> (crate::output::ConsoleOutput, Arc<Mutex<LineEditor>>) {
+    fn commit_harness() -> (Content, Arc<Mutex<LineEditor>>) {
         let reasoning = crate::settings::default_show_reasoning_handle();
-        let out = crate::output::ConsoleOutput::with_size(
+        let out = Content::with_size(
             reasoning,
             crate::termio::TermSize {
                 width: 40,
@@ -3037,12 +3036,9 @@ mod tests {
         (out, Arc::new(Mutex::new(LineEditor::new())))
     }
 
-    fn redraw_fn<'o>(
-        out: &'o crate::output::ConsoleOutput,
-        _editor: &Arc<Mutex<LineEditor>>,
-    ) -> impl Fn() + 'o {
+    fn redraw_fn<'o>(out: &'o Content, _editor: &Arc<Mutex<LineEditor>>) -> impl Fn() + 'o {
         // The membership is already configured; the redraw just applies it.
-        move || paint_prompt(&out.content)
+        move || paint_prompt(out)
     }
 
     /// Two committed prompts render as two rule-pairs with **no blank row
@@ -3067,7 +3063,7 @@ mod tests {
             "/model xiaomimimo:mimo-v2.6-flash activate",
             "/reasoning high",
         ] {
-            Repl::emit_commit(&out.content, &editor, &redraw, line, "", &mut history);
+            Repl::emit_commit(&out, &editor, &redraw, line, "", &mut history);
         }
         let rows = screen_rows(&out.end_capture());
 
@@ -3118,7 +3114,7 @@ mod tests {
         // Turn content the way a real turn leaves it: output ending in a blank.
         out.display_plain("git status output line\nmore output\n");
         Repl::emit_commit(
-            &out.content,
+            &out,
             &editor,
             &redraw,
             "Great, nice work! Please commit your changes.",

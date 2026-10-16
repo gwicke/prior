@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use picocode::termio::TermIO;
-use picocode::{config::Config, create_agent, AgentConfig, ConsoleOutput, SettingsStore};
+use picocode::{config::Config, create_agent, AgentConfig, Content, SettingsStore};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -297,10 +297,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             TermIO::plain()
         };
-        // Production: share the `Content` this console already owns, so the
-        // config's frame handle and its content handle are one state.
-        let console = ConsoleOutput::new(term_io, show_reasoning_handle.clone());
-        console.content()
+        // Production: the `Content` the config and the paint path share.
+        Arc::new(Content::new(term_io, show_reasoning_handle.clone()))
     };
 
     let system_message_extension = picocode::load_agents_md();

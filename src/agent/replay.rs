@@ -14,10 +14,6 @@
 //! executions. A turn is a user prompt followed by a chain of them.
 
 use crate::content::Content;
-// Tests only: the byte-comparison below drives `ConsoleOutput` through the
-// `Output` trait's own verbs. Production content calls `Content` directly.
-#[cfg(test)]
-use crate::Output;
 use rig_core::message::{
     AssistantContent, Message, ReasoningContent, ToolResultContent, UserContent,
 };
@@ -505,7 +501,7 @@ pub(crate) async fn replay_last_turn_silent(session: &crate::session::Session, c
 mod tests {
     use super::*;
 
-    use crate::output::ConsoleOutput;
+    use crate::content::Content;
 
     // ── Phase 2: replay units ─────────────────────────────────────────
 
@@ -739,8 +735,8 @@ mod tests {
         // asked onto the captured stream so the comparison sees it (a test's
         // stdout is not a terminal, and without this it would be routed to
         // stderr by both sides and the test would prove nothing).
-        let live = ConsoleOutput::with_size(reasoning.clone(), size);
-        live.content.set_reasoning_on_stderr(false);
+        let live = Content::with_size(reasoning.clone(), size);
+        live.set_reasoning_on_stderr(false);
         live.begin_capture();
         live.begin_response();
         for thinking in &turn.segments[0].thinking {
@@ -762,10 +758,10 @@ mod tests {
         // The same turn through replay. `render_turn` draws the user prompt
         // (bracketed) and then the response, so the live output should be the
         // *tail* of what replay paints — byte for byte, reasoning included.
-        let replay = ConsoleOutput::with_size(reasoning, size);
-        replay.content.set_reasoning_on_stderr(false);
+        let replay = Content::with_size(reasoning, size);
+        replay.set_reasoning_on_stderr(false);
         replay.begin_capture();
-        render_turn(&replay.content, &turn);
+        render_turn(&replay, &turn);
         let replay_bytes = replay.end_capture();
 
         let live_text = String::from_utf8_lossy(&live_bytes).to_string();

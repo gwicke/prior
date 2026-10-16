@@ -148,7 +148,7 @@ fn popup_scroll_does_not_duplicate_input() {
         eprintln!("[test] PRE('/') screen ({} rows):\n{:?}", pre.len(), pre);
     }
 
-    // `ConsoleOutput::cursor_row()` blocks up to ~60ms on the DSR reply we just
+    // `Content`'s cursor re-anchor blocks up to ~60ms on the DSR reply we just
     // supplied. Wait it out before typing so the first `/` reaches the editor
     // rather than the DSR read, then give the opening redraw time to settle.
     thread::sleep(Duration::from_millis(400));

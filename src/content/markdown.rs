@@ -89,7 +89,7 @@ pub(crate) fn guess_lang(path: &str) -> &'static str {
 /// a terminal, plain otherwise. Shared with the tests, whose "what did the
 /// renderer alone produce" reference has to agree with it byte for byte or the
 /// comparison flags styling as host contribution. `color` is the primary
-/// stream's caps (`ConsoleOutput`), pinned by the one test that asks.
+/// stream's caps (`Content`), pinned by the one test that asks.
 pub(crate) fn answer_theme(color: bool) -> Theme {
     if color {
         Theme {

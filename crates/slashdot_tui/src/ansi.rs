@@ -4,7 +4,7 @@
 //! Everything here is a pure transform over a byte stream — the width / escape
 //! math ([`strip_ansi`], [`utf8_len`], `bytes_width`) plus the pipeline
 //! wrappers ([`WrapLines`], [`LineClear`], [`StripLeading`], [`HoldTrailing`])
-//! that `ConsoleOutput::with_content_writer` stacks around one content write.
+//! that `Content::with_content_writer` stacks around one content write.
 //! No terminal is touched from here; the wrappers rewrite bytes on their way
 //! to whatever writer sits beneath them, and the *policy* of when to stack
 //! which — the boundary rule, the hold accounting — stays with that caller.
