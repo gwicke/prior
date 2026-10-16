@@ -1,7 +1,7 @@
 //! Terminal row accounting: how many screen rows a byte stream occupies.
 //!
 //! The draw cache tracks the cursor so the next frame can anchor to it
-//! (`ui::frame::DrawCache`), and every content writer has to tell it how far
+//! (`draw::DrawCache`), and every content writer has to tell it how far
 //! the cursor moved. Guessing that from the *source* text is where the drift
 //! came from: the bytes that reach the terminal are a prefix plus rendered
 //! markdown, ANSI styling, panels, and lines that wrap — none of which the
@@ -19,7 +19,7 @@
 //! Design notes (doc/row_accounting.md §6, phase B):
 //! - Counting happens per *block*, not per delta, so the streaming path pays
 //!   one scan per rendered block.
-//! - Escape handling mirrors [`crate::output::strip_ansi`] — CSI, and OSC
+//! - Escape handling mirrors [`crate::ansi::strip_ansi`] — CSI, and OSC
 //!   terminated by BEL or ST. The OSC case is load-bearing: the markdown
 //!   renderer emits OSC 8 hyperlinks on a real tty
 //!   (`Theme::clickable_links`), and a scanner that stopped at the first
@@ -31,64 +31,15 @@ use std::io::{self, Write};
 
 use unicode_width::UnicodeWidthChar;
 
-/// Display width of a terminal row in columns: ANSI escapes are transparent,
-/// wide characters count as two, combining marks as none.
-///
-/// Same escape rules as `strip_ansi`, without allocating. See
-/// `width_matches_stripped_width` for the cross-check that keeps the two in
-/// step.
-pub fn display_width_ansi(s: &str) -> usize {
-    let bytes = s.as_bytes();
-    let mut width = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            i = escape_end(bytes, i);
-            continue;
-        }
-        // Multi-byte UTF-8: decode one char so a wide glyph counts as one
-        // character with width 2, not two characters of width 1.
-        let rest = &s[i..];
-        let ch = rest.chars().next().unwrap_or('\0');
-        i += ch.len_utf8();
-        width += UnicodeWidthChar::width(ch).unwrap_or(0);
-    }
-    width
-}
+use crate::ansi::escape_end;
 
-/// Index just past the escape sequence starting at `start` (which must be an
-/// ESC): CSI (`ESC [ … final`), or OSC / other string sequences (`ESC ] …`
-/// terminated by BEL or ST). Mirrors `strip_ansi`'s rules.
-fn escape_end(bytes: &[u8], start: usize) -> usize {
-    let mut i = start + 1;
-    if i < bytes.len() && bytes[i] == b'[' {
-        // CSI: parameters/intermediates, then one final byte in 0x40..=0x7e.
-        i += 1;
-        while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-            i += 1;
-        }
-        return (i + 1).min(bytes.len());
-    }
-    if i < bytes.len() && bytes[i] == b']' {
-        // OSC: terminated by BEL, or by ST (the two bytes ESC \).
-        i += 1;
-        while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == 0x1b {
-            return (i + 2).min(bytes.len());
-        }
-        return (i + 1).min(bytes.len());
-    }
-    // Any other two-character escape (ESC + a final byte, e.g. a bare ST):
-    // zero width, and skipping both keeps a truncated sequence from leaving a
-    // phantom column behind.
-    if start + 1 < bytes.len() && (0x20..=0x7e).contains(&bytes[start + 1]) {
-        return start + 2;
-    }
-    // Truncated sequence: keep it for the next write.
-    bytes.len()
-}
+/// The OSC-aware width measure, owned by `slashdot_tui::ansi` and re-exported
+/// here so picocode's callers (`ui/bar`, `agent/status`, and this module's
+/// tests) keep one path. See [`crate::ansi::display_width_ansi`].
+pub use crate::ansi::display_width_ansi;
+/// The explicit-wrap spec, owned by `slashdot_tui::ansi` and re-exported here.
+/// See [`crate::ansi::wrap_to_width`].
+pub use crate::ansi::wrap_to_width;
 
 /// How far a run of `width_cols` columns moves the cursor down: once per wrap,
 /// since the cursor ends *on* the run's last row.
@@ -138,82 +89,6 @@ pub fn rows_of(text: &str, term_w: usize) -> usize {
         rows += wrap_rows(display_width_ansi(line), term_w);
     }
     rows
-}
-
-/// Wrap `text`'s lines at `width` display columns — the terminal's own wrap
-/// points, made explicit as `\n` bytes.
-///
-/// The overwrite rule (ui_draw_261001) needs every terminal row a content
-/// line occupies to be **entered by a byte**: [`crate::output`]'s line-clear
-/// transform arms on `\n` and at write start only, so a row the terminal
-/// wraps into *without* a byte never gets its entry `EL` and keeps whatever
-/// the frame before it painted — the reported committed-prompt remnant in
-/// the right margin (a sharing commit starts its block directly with the
-/// line, at the frame's gap row, whose natural wrap lands on the status
-/// bar's row). Wrapping here is cell-identical to the natural wrap (same
-/// break columns, wide glyphs moved whole, escapes never split), and the row
-/// count does not move: `rows_of` counts a wrap and a `\n` the same way —
-/// pinned by `wrap_to_width_keeps_rows_of_honest`.
-///
-/// The batch form of the guard: production wraps incrementally in
-/// `output::WrapLines` (the one choke `with_content_writer` puts under every
-/// writer). This stays as the readable specification of the break rule and
-/// the accounting pin both forms share.
-pub fn wrap_to_width(text: &str, width: usize) -> String {
-    if width == 0 {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        let mut rest = line;
-        while display_width_ansi(rest) > width {
-            let (head, tail) = split_at_width(rest, width);
-            out.push_str(head);
-            if tail.is_empty() {
-                // The head swallowed the remainder — a glyph wider than the
-                // budget. The line ends here; a break after it would invent
-                // an empty row the terminal never shows.
-                rest = "";
-                break;
-            }
-            out.push('\n');
-            rest = tail;
-        }
-        out.push_str(rest);
-    }
-    out
-}
-
-/// Byte index at which `s` first exceeds `width` display columns: escapes
-/// are carried whole (they hold no width), and a wide glyph that would
-/// straddle the edge moves to the next row whole — where the terminal would
-/// move it, too. Never returns an empty head for non-empty input.
-fn split_at_width(s: &str, width: usize) -> (&str, &str) {
-    let bytes = s.as_bytes();
-    let mut used = 0usize;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            i = escape_end(bytes, i);
-            continue;
-        }
-        let ch = s[i..].chars().next().unwrap_or('\0');
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + cw > width {
-            if i == 0 {
-                // Degenerate budget (a wide glyph against a 1-column edge):
-                // take it anyway — a byte must leave the head for progress.
-                i = ch.len_utf8();
-            }
-            break;
-        }
-        used += cw;
-        i += ch.len_utf8();
-    }
-    (&s[..i], &s[i..])
 }
 
 /// A writer that counts the terminal rows passing through it.
@@ -421,7 +296,7 @@ mod tests {
         ] {
             assert_eq!(
                 display_width_ansi(s),
-                crate::output::strip_ansi(s)
+                crate::ansi::strip_ansi(s)
                     .chars()
                     .map(|c| { unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) })
                     .sum::<usize>(),

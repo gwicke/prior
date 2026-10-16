@@ -8,8 +8,6 @@ use std::sync::Arc;
 
 use crate::app_state::AppState;
 
-use std::rc::Rc;
-
 use crate::slashdot_menu::menu::SlashDotMenuNode;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
@@ -43,7 +41,7 @@ impl SlashDotNode for PersonaEnumNode {
         if current.is_empty() {
             active_ids.push("none".to_string());
         }
-        Ok(Rc::new(DataResponse { rows, active_ids }))
+        Ok(Arc::new(DataResponse { rows, active_ids }))
     }
 
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {

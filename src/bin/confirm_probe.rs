@@ -18,8 +18,8 @@
 
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, KeyModifiers};
 use picocode::confirm::{ConfirmBridge, ConfirmDecision};
-use picocode::ui::frame::ApplyPolicy;
-use picocode::{ConsoleOutput, Output};
+use picocode::termio::TermIO;
+use picocode::Content;
 
 #[tokio::main]
 async fn main() {
@@ -29,7 +29,15 @@ async fn main() {
 
     // Exercise the real raw-mode confirm path (mirrors the REPL's terminal).
     let _ = crossterm::terminal::enable_raw_mode();
-    let out = ConsoleOutput::new(picocode::settings::default_show_reasoning_handle());
+    // Plain is enough for an out-of-crate driver: caps probe the real
+    // streams either way, no reader is wanted (the probe reads stdin
+    // itself), and the frames apply through the hub's writer.
+    let out = Content::new(
+        TermIO::plain(),
+        picocode::settings::default_show_reasoning_handle(),
+    );
+    // The frame dims come from the content handle's `frame_size`:
+    // the watched geometry, read fresh per paint.
 
     let mut bridge = ConfirmBridge::new();
     let tool = msg
@@ -52,7 +60,7 @@ async fn main() {
         return;
     };
     let mut confirm = picocode::confirm::ConfirmPrompt::new(req, bridge.port.approvals().clone());
-    picocode::confirm::paint(&out, &confirm, out.frame_size());
+    picocode::confirm::paint(&confirm, &out.hub());
 
     // The dialog no longer takes the reader gate — that was the whole reason it
     // had to be a blocking loop. Sampled while it is up, so the test can assert
@@ -60,9 +68,7 @@ async fn main() {
     //
     // Sampled here, *printed* at the end: a `println!` now would land on the
     // pty's own rows and overwrite the frame the positional assertions measure.
-    let gate_up = out
-        .confirm_gate()
-        .is_some_and(|g| g.load(std::sync::atomic::Ordering::SeqCst));
+    let gate_up = picocode::termio::reader_paused();
 
     let decision = loop {
         // Raw mode delivers `Enter` as CR and no line discipline translates it,
@@ -79,11 +85,11 @@ async fn main() {
                     if let Some(decided) = confirm.handle_key(KeyEvent::new(code, modifiers)) {
                         break decided;
                     }
-                    picocode::confirm::paint(&out, &confirm, out.frame_size());
+                    picocode::confirm::paint(&confirm, &out.hub());
                 }
             }
             Ok(Event::Resize(_, _)) => {
-                picocode::confirm::paint(&out, &confirm, out.frame_size());
+                picocode::confirm::paint(&confirm, &out.hub());
             }
             Ok(_) => {}
             Err(_) => break ConfirmDecision::Deny,
@@ -99,7 +105,15 @@ async fn main() {
     picocode::confirm::resolve(
         &out,
         || {
-            out.draw_elements(None, Vec::new(), ApplyPolicy::Frame, out.frame_size());
+            // The empty membership: with nothing configured the area is
+            // nothing, and applying it is the erase (dropping the element is
+            // the clear). Configure-then-apply, the same two-step
+            // `confirm::paint` above runs — `configure` is the membership
+            // verb, so a paint composes nothing.
+            let hub = out.hub();
+            let mut hub = hub.lock().unwrap();
+            hub.configure(picocode::render::FRAME_MAX_ROW_RATIO, Vec::new());
+            hub.render(None);
         },
         confirm.subject(),
         answered,
@@ -121,9 +135,5 @@ async fn main() {
     println!("APPROVED={approved}");
     // Printed after RESULT so a harness waiting on RESULT has captured it too.
     println!("GATE_WHILE_UP={gate_up}");
-    println!(
-        "GATE_AFTER={}",
-        out.confirm_gate()
-            .is_some_and(|g| g.load(std::sync::atomic::Ordering::SeqCst))
-    );
+    println!("GATE_AFTER={}", picocode::termio::reader_paused());
 }

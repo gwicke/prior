@@ -15,7 +15,6 @@
 //! submit therefore clears the setting back to `None`, which is the inverse of
 //! setting it and the only undo that does not need `$EDITOR`.
 
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::app_state::AppState;
@@ -212,7 +211,7 @@ impl SlashDotNode for NumberParamNode {
             "value",
             crate::slashdot_menu::value::Value::Str(display_value(self.param, &params)),
         );
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![row],
             active_ids: Vec::new(),
         }))

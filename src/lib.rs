@@ -2,14 +2,19 @@ use thiserror::Error;
 
 pub mod agent;
 pub mod config;
+pub mod content;
 pub mod edit_blocks;
 pub mod edit_match;
 pub mod editor;
-pub mod output;
+
 pub mod persona;
 pub mod platform;
 pub mod tools;
 pub use slashdot_menu;
+// The drawing stack lives in its own crate; re-exported so every
+// `crate::{ansi,draw,render,termio}::…` path and the out-of-crate consumers
+// (`confirm_probe`, examples) keep their names.
+pub use slashdot_tui::{ansi, draw, render, termio};
 pub mod app_state;
 pub mod confirm;
 pub mod interactive;
@@ -58,8 +63,8 @@ pub use rig_core::providers;
 
 pub use agent::build::{create_agent, load_agents_md, AgentConfig};
 pub use agent::CodeAgent;
+pub use content::Content;
 pub use interactive::run_interactive;
-pub use output::{Confirmation, ConsoleOutput, LogOutput, NoOutput, Output, QuietOutput};
 
 /// A provider's own explanation of a failure, reduced to one readable line.
 ///

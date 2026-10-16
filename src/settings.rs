@@ -904,10 +904,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = store(tmp.path().join("picocode.toml").as_path());
         // Baseline `AgentConfig` built the way `main.rs` does.
+        let content = std::sync::Arc::new(crate::content::Content::quiet());
         let mut cfg = crate::AgentConfig {
             provider: "anthropic".into(),
             model: "claude-3-5-sonnet-20241022".into(),
-            output: std::sync::Arc::new(crate::QuietOutput::new()),
+            content,
             yolo: false,
             confirm_port: None,
             quiet: true,
@@ -1438,10 +1439,11 @@ mod tests {
     }
 
     fn test_agent_config() -> crate::AgentConfig {
+        let content = Arc::new(crate::content::Content::quiet());
         crate::AgentConfig {
             provider: "test".to_string(),
             model: "model".to_string(),
-            output: Arc::new(crate::output::NoOutput),
+            content,
             yolo: false,
             confirm_port: None,
             quiet: true,

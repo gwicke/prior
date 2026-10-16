@@ -5,7 +5,7 @@
 //! learn provider vocabularies. What a level *turns into* is a backend
 //! question, and `header()` is where the answer is disclosed.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, SubmitResult,
@@ -131,7 +131,7 @@ impl SlashDotNode for ReasoningEnumNode {
                 crate::slashdot_menu::fields::Row::new(*l).desc(desc)
             })
             .collect();
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows,
             active_ids: vec![active],
         }))

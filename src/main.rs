@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
-use picocode::{config::Config, create_agent, AgentConfig, ConsoleOutput, SettingsStore};
+use picocode::termio::TermIO;
+use picocode::{config::Config, create_agent, AgentConfig, Content, SettingsStore};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -107,6 +108,10 @@ fn is_executable(name: &str) -> bool {
 #[tokio::main]
 async fn main() {
     std::panic::set_hook(Box::new(|info| {
+        // Restore cooked mode first: the guard lives under `Draw`, out of
+        // reach here, and the `Drop` backstop cannot fire while the reader
+        // thread holds its `Arc`. Idempotent, no-op without a Tty backend.
+        picocode::termio::emergency_stop();
         let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s.to_string()
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
@@ -139,6 +144,9 @@ async fn main() {
     }));
 
     if let Err(e) = run().await {
+        // `process::exit` skips destructors; `run_interactive` already
+        // suspended on its own paths, but nothing here did. Idempotent.
+        picocode::termio::emergency_stop();
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -278,10 +286,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let show_reasoning_handle: picocode::settings::ShowReasoningHandle =
         std::sync::Arc::new(std::sync::Mutex::new(show_reasoning));
     let reasoning_in_context = config.reasoning_in_context.unwrap_or_default();
-    let output: Arc<dyn picocode::Output> = if quiet {
-        Arc::new(picocode::QuietOutput::new())
+    let content: Arc<picocode::Content> = if quiet {
+        // Quiet: content's own flag suppresses the screen, and `display_error`
+        // still goes to stderr. Quiet is a property of the content, not a
+        // backend — the condition below is exactly what would have selected
+        // Plain.
+        Arc::new(picocode::Content::quiet())
     } else {
-        Arc::new(ConsoleOutput::new(show_reasoning_handle.clone()))
+        // The terminal backend is constructed **first**: it probes
+        // the caps, owns the size watch, and moves into `Content::new` →
+        // `Draw`. Tty iff the input is an interactive terminal — the same
+        // condition `Interactive::new` derives `repl` from (a Tty whose
+        // handles are never taken simply never starts the reader, which is
+        // the one-shot recipe/input path).
+        let term_io = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            TermIO::tty()
+        } else {
+            TermIO::plain()
+        };
+        // Production: the `Content` the config and the paint path share.
+        Arc::new(Content::new(term_io, show_reasoning_handle.clone()))
     };
 
     let system_message_extension = picocode::load_agents_md();
@@ -309,7 +333,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let agent_config = AgentConfig {
         provider: provider.clone(),
         model,
-        output,
+        content,
         yolo,
         quiet,
         // Installed by `run_interactive` before the agent is built, so every

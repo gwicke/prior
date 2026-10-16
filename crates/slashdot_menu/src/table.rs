@@ -305,25 +305,7 @@ impl Table {
     }
 }
 
-/// Visible width of `s`, ignoring ANSI SGR escapes (so styled cells size
-/// correctly). Falls back to width 1 for control/ambiguous chars.
-pub fn display_width(s: &str) -> usize {
-    let mut w = 0;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip an escape sequence up to and including the final letter.
-            for e in chars.by_ref() {
-                if e.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-            continue;
-        }
-        w += char_width(c);
-    }
-    w
-}
+pub use slashdot_tui::ansi::display_width;
 
 fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(1)

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/bsed"]
+members = [".", "crates/slashdot_menu", "crates/slashdot_tui", "crates/blockedit", "crates/bsed"]
 resolver = "2"
 
 # Two lints that fire on shape rather than on correctness. Both are answered by
@@ -38,6 +38,7 @@ workspace = true
 [dependencies]
 rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
 slashdot_menu = { path = "crates/slashdot_menu" }
+slashdot_tui = { path = "crates/slashdot_tui" }
 blockedit = { path = "crates/blockedit" }
 bsed = { path = "crates/bsed" }
 rig-agent = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
@@ -116,7 +117,15 @@ tempfile = "3.24.0"
 portable-pty = "0.8"
 vt100 = "0.16"
 serial_test = "3.1"
+# tcgetattr/tcsetattr in the pty termios regression tests
+# (tests/quit_restores_cooked_mode.rs) — already a regular dependency; the
+# dev edge lets integration tests name it directly.
+libc = "0.2"
 rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["test-utils"] }
+# Test-only seams of the drawing crate (`TermIO::recording`, `RenderManager::draw`)
+# — features of a dependency unify per-build, so `cargo test` sees them and a
+# production `cargo build` does not.
+slashdot_tui = { path = "crates/slashdot_tui", features = ["test-helpers"] }
 
 # Fork of codewandler-markdown-terminal adding OSC 8 clickable inline links
 # (gated by Theme.clickable_links) and a faded `Theme::dimmed()` for streamed

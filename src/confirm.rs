@@ -13,7 +13,7 @@
 //! running, the REPL paints the dialog as an ordinary overlay element, and the
 //! answer goes back through the reply channel.
 //!
-//! What the agent gets back is [`ConfirmDecision`] — **not** `Confirmation` — so
+//! What the agent gets back is [`ConfirmDecision`] — an accept/deny bit — so
 //! "always" cannot leak across the boundary. Picking *always* is the REPL's
 //! business: it records the approval and answers `Accept`, exactly as it
 //! answers `Accept` for *yes*. The agent has one bit, and the one bit means one
@@ -213,6 +213,8 @@ impl ConfirmPrompt {
                 rows,
                 selected: Some(DEFAULT_SEL),
                 active_rows: vec![],
+                view: None,
+                columns: Vec::new(),
             },
             sel: DEFAULT_SEL,
             subject: req.subject,
@@ -227,8 +229,8 @@ impl ConfirmPrompt {
     /// The option rows are pinned to the full option count, so a starved
     /// budget cannot squeeze the choices away — a consent prompt you cannot read
     /// is not a consent prompt.
-    pub fn elements(&self, term_w: usize) -> Vec<crate::ui::frame::Element> {
-        crate::ui::overlay_elements_with(&self.plan, term_w, Some(self.sel), OPTIONS.len())
+    pub fn elements(&self) -> Vec<crate::render::Element> {
+        self.plan.elements(OPTIONS.len())
     }
 
     /// Feed one key. `Some(decision)` means the dialog is finished — the
@@ -302,17 +304,29 @@ pub fn decision_line(subject: &str, decision: ConfirmDecision) -> String {
 /// overlay's — that append is pinned by a session-level test, because it needs
 /// an `AppState` to build a session and a probe cannot have one. What a probe
 /// *can* do is drive the real reducer ([`ConfirmPrompt::handle_key`]) and the
-/// real bytes ([`ConfirmPrompt::elements`] → `Output::draw_elements`), which is
+/// real bytes ([`ConfirmPrompt::elements`] → the manager's `configure` +
+/// `render`), which is
 /// what this exposes; the only thing it re-states is the tail the session also
 /// ends in.
-pub fn paint(out: &dyn crate::output::Output, confirm: &ConfirmPrompt, dims: (usize, usize)) {
-    let (tw, th) = (dims.0.max(1), dims.1.max(1));
-    out.draw_elements(
-        None,
-        confirm.elements(tw),
-        crate::ui::frame::ApplyPolicy::Frame,
-        (tw, th),
-    );
+pub fn paint(
+    confirm: &ConfirmPrompt,
+    manager: &std::sync::Arc<std::sync::Mutex<crate::render::RenderManager>>,
+) {
+    // No compose head: a probe's dialog is the whole area — the
+    // stack below is the same divider-then-elements the session's own paint
+    // layers under its bar and input, so the two cannot drift.
+    //
+    // A probe has no session to own membership, so it configures the manager
+    // directly (`configure` is the membership verb) and then applies it.
+    let mut stack = Vec::new();
+    let elements = confirm.elements();
+    if !elements.is_empty() {
+        stack.push(crate::render::Element::divider());
+        stack.extend(elements);
+    }
+    let mut manager = manager.lock().unwrap();
+    manager.configure(crate::render::FRAME_MAX_ROW_RATIO, stack);
+    manager.render(None);
 }
 
 /// Resolve a confirmed dialog: **repaint without it, then record the decision**.
@@ -326,14 +340,19 @@ pub fn paint(out: &dyn crate::output::Output, confirm: &ConfirmPrompt, dims: (us
 /// `redraw` repaints the area without the dialog. The REPL passes the session's
 /// own paint (it still owns the prompt and any menu underneath); the probe
 /// passes the empty stack.
+///
+/// Takes content for the decision line: `display_plain` is a content verb —
+/// boundary rules included — and the line stays inside this function because
+/// the repaint-then-decide order is the invariant, not something each caller
+/// may remember.
 pub fn resolve(
-    out: &dyn crate::output::Output,
+    content: &crate::content::Content,
     redraw: impl FnOnce(),
     subject: &str,
     decision: ConfirmDecision,
 ) {
     redraw();
-    out.display_plain(&decision_line(subject, decision));
+    content.display_plain(&decision_line(subject, decision));
 }
 
 #[cfg(test)]

@@ -1,46 +1,39 @@
 //! Raw-mode REPL input layer (Stages 2–4).
 //!
-//! - [`TermGuard`] owns terminal raw-mode lifecycle + capability negotiation
-//!   (plan §3.5.2) and is safe to call from `Drop`/panic hook/signal handler.
-//! - [`Repl`] is the raw-mode driver. [`Repl::read_input`] is a multi-line
+//! - Raw-mode lifecycle + capability negotiation live in `crate::termio`
+//!   (`TermGuard`, safe from `Drop`/panic hook/signal handler); this module
+//!   reaches them only through the content handle's manager —
+//!   the design's suspend/resume front door (§Render).
+//! - [`Repl`] is the input driver. [`Repl::read_input`] is a multi-line
 //!   line editor with the v2.5 slash-menu frame.
 //!
 //! The line editor keeps a single flat `Vec<char>` buffer (with `'\n'` as a
 //! hard line break) plus a char-index cursor. Rendering wraps the buffer to
 //! visual rows via [`layout`] (word-boundary wrap, CJK char-wrap) and positions
 //! the cursor. All editor *logic* is pure and unit-tested; the on-screen frame
-//! is composed and applied by the shared draw pipeline (`crate::ui::frame`,
-//! plan `doc/ui_draw_v2.md`).
+//! is composed and applied by the shared draw pipeline (`crate::render`,
+//! `crate::draw`, plan `doc/ui_draw_v2.md`).
 
-use crate::agent::SessionUsage;
 use crate::app_state::AppState;
+use crate::content::Content;
+use crate::draw::el_if_short;
 use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
-use crate::output::Output;
-use crate::session::SessionTreeNode;
-use crate::ui::frame::{
-    allocate, el_if_short, live_budget, window, ApplyPolicy, Element, Extent, RenderAt, Rendered,
-};
 #[cfg(test)]
-use crate::ui::frame::{render, Frame};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crate::render::live_budget;
+use crate::render::{allocate, window, Element, RenderElement, Rendered, RowAsk};
+#[cfg(test)]
+use crate::render::{render, Frame};
+use crate::session::SessionTreeNode;
+use crate::termio::InputEvent;
+use crossterm::event::{self, KeyCode, KeyModifiers};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-/// Set by the `SIGCONT` handler on resume from `Ctrl-Z`. Read by the
-/// in-flight reader thread, which re-enters raw mode once it sees the
-/// flag cleared.
-pub(crate) static RESUMED: AtomicBool = AtomicBool::new(false);
 
 /// The entry DSR at [`read_input`] has run once this process.
 ///
@@ -55,280 +48,24 @@ pub(crate) static RESUMED: AtomicBool = AtomicBool::new(false);
 /// (ui_draw_261001).
 static ENTRY_DSR_DONE: AtomicBool = AtomicBool::new(false);
 
-/// `SIGCONT` handler: we just record that the process resumed.
-/// It must stay async-signal-safe (no I/O, no allocation), so the
-/// actual terminal re-entry is performed by the reader thread (a normal
-/// thread context) or by `read_input`'s loop, which poll this flag.
-extern "C" fn on_sigcont(_sig: i32) {
-    RESUMED.store(true, Ordering::SeqCst);
-}
-
-/// Current terminal width in columns, updated by the in-flight reader
-/// on `Event::Resize`. Defaults to 80; renderers read this to pick up
-/// size changes mid-stream.
-pub(crate) static TERMINAL_WIDTH: AtomicUsize = AtomicUsize::new(80);
-
-/// Get the current terminal width (updated by the in-flight reader).
-/// Falls back to 80 if not yet initialized.
-pub(crate) fn current_term_width() -> usize {
-    TERMINAL_WIDTH.load(Ordering::SeqCst).max(20)
-}
-
-/// Register the `SIGCONT` handler exactly once. Safe to call multiple
-/// times; `libc::signal` just replaces the handler. Required so that
-/// `Ctrl-Z` suspend/resume restores raw mode.
-pub(crate) fn register_sigcont() {
-    unsafe {
-        libc::signal(libc::SIGCONT, on_sigcont as *const () as usize);
+/// The entry DSR: anchor the draw cache to the real cursor once, at startup,
+/// **before the persistent reader starts consuming stdin**.
+/// Running it here — with the reader still paused — is what guarantees the
+/// terminal's reply (or a test harness's pre-written one) is not swallowed by
+/// the reader's first poll. Idempotent via [`ENTRY_DSR_DONE`], so
+/// `read_input`'s own entry check becomes a no-op. The caller side takes the
+/// content handle (the query is the manager's `cursor_row`); the *answer*
+/// lives inside `TermIO`.
+pub(crate) fn run_entry_dsr(content: &Content) {
+    if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
+        let _ = content.manager.lock().unwrap().cursor_row();
     }
 }
 
-/// Where the in-flight reader sends one terminal event.
-///
-/// Split out of `spawn_in_flight_reader` because the *policy* is the part
-/// worth arguing about and the part worth testing: which keys may wait, and
-/// which may not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReaderRoute {
-    /// Deal with it here — process/terminal/abort state, or an event with
-    /// nobody to hand it to.
-    Inline,
-    /// Hand it to the turn's key branch on the channel.
-    Forward,
-}
-
-/// Route one terminal event arriving while a request is in flight.
-///
-/// **Inline — must not wait:**
-/// - `Resize`: the streaming renderers read `TERMINAL_WIDTH`, and only this
-///   thread can update it while the main task is parked on the turn.
-///   Forwarding it too would make the turn consume the width instead of the
-///   renderers reading it directly.
-/// - `Ctrl-C` / `Ctrl-Z`: process and terminal state (`exit`,
-///   `killpg(SIGTSTP)`), handled where they land, never queued.
-///
-/// **Forwarded:** every other key, plus `Paste`. These are content for the
-/// prompt; `read_input` already treats `Event::Paste` as a bulk insert, so
-/// the turn's key branch reads them the same way (U4.3). `Esc` is one of
-/// them, and that is a change:
-///
-/// `Esc` used to be Inline, and Inline meant *abort* — unconditionally, from
-/// here. Settled U4 makes it menu-first: the ladder runs while a menu is
-/// open, and it aborts only at root. This thread cannot make that call (it
-/// has no session to look at), so the decision moves to the one that can,
-/// and `Esc` rides the forwarded path with everything else. The cost is
-/// explicit: a root `Esc` is no longer guaranteed to land ahead of a paste
-/// backlog, where it was before. `Ctrl-C` still is, and it still never
-/// queues — that is what "immediately reachable" now rests on.
-///
-/// Everything else — mouse, focus — returns [`ReaderRoute::Inline`] and is
-/// ignored, exactly as it was before there was anywhere to forward to.
-pub(crate) fn route_event(ev: &Event) -> ReaderRoute {
-    match ev {
-        Event::Resize(..) => ReaderRoute::Inline,
-        Event::Key(key) => match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ReaderRoute::Inline
-            }
-            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ReaderRoute::Inline
-            }
-            _ => ReaderRoute::Forward,
-        },
-        Event::Paste(..) => ReaderRoute::Forward,
-        _ => ReaderRoute::Inline,
-    }
-}
-
-/// What to do with each event is [`route_event`]'s call, not a pile of
-/// branches here. The reader handles three things inline and forwards the
-/// rest on `keys` (ui_draw_v2 §4.5 U4.2); until U4.2 nothing was
-/// forwarded and edit keys typed mid-request were simply dropped.
-///
-/// `keys` is **unbounded** on purpose: a bounded channel that filled would
-/// block this thread at precisely the moment it has to deliver `Ctrl-C`.
-///
-/// Spawned *only* while an LLM request is in flight (`prompt().await`
-/// blocks the main task). In raw mode `event::read` is blocking and the
-/// main task cannot read keys during the await, so this thread is what
-/// sees `Ctrl-C`/`Ctrl-Z` arriving mid-request. `Esc` was this thread's
-/// until U4.3 made it menu-first — a decision it cannot make without a
-/// session to look at — so it is forwarded now and the turn decides; see
-/// [`route_event`].
-///
-/// `done` is set by the caller once the await returns, so the loop can
-/// exit and be joined. `guard` is `Arc` and `stop()` is process-wide, so
-/// calling it from this thread is safe. `paused` is set by a confirmation
-/// dialog on the main task while it owns stdin; while it is `true` this
-/// reader must not read, or it would swallow the dialog's keystrokes.
-pub(crate) fn spawn_in_flight_reader(
-    guard: Arc<TermGuard>,
-    done: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    keys: tokio::sync::mpsc::UnboundedSender<Event>,
-) -> std::thread::JoinHandle<()> {
-    thread::spawn(move || loop {
-        if done.load(Ordering::SeqCst) {
-            break;
-        }
-        if RESUMED.swap(false, Ordering::SeqCst) {
-            let _ = guard.start();
-        }
-        // A confirmation dialog on the main task owns stdin right now; back
-        // off so we don't consume the keystrokes it is waiting for.
-        if paused.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(10));
-            continue;
-        }
-        if let Ok(true) = event::poll(Duration::from_millis(50)) {
-            match event::read() {
-                // U4.2: edit keys this thread used to drop now go to the turn.
-                // `send` on an unbounded tokio mpsc never blocks, so this is
-                // safe from a plain OS thread — and being non-blocking is the
-                // whole reason the channel is unbounded (see `route_event`).
-                Ok(ev) if route_event(&ev) == ReaderRoute::Forward => {
-                    let _ = keys.send(ev);
-                }
-                Ok(Event::Resize(w, _h)) => {
-                    // Update the shared terminal width so renderers pick up
-                    // the change on their next streaming call.
-                    TERMINAL_WIDTH.store(w as usize, Ordering::SeqCst);
-                }
-                Ok(Event::Key(key)) => {
-                    if let KeyCode::Char('c') = key.code {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            let _ = guard.stop();
-                            process::exit(1);
-                        }
-                    } else if let KeyCode::Char('z') = key.code {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            let _ = guard.stop();
-                            unsafe {
-                                libc::killpg(libc::getpgrp(), libc::SIGTSTP);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    })
-}
-
-/// Owns terminal mode transitions. [`TermGuard::start`] enters raw mode and
-/// negotiates capabilities; [`TermGuard::stop`] (idempotent) restores cooked
-/// mode. Safe to call from `Drop`, a panic hook, or a signal handler.
-pub struct TermGuard {
-    active: AtomicBool,
-    saved_paste: AtomicBool,
-}
-
-impl Default for TermGuard {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TermGuard {
-    pub fn new() -> Self {
-        Self {
-            active: AtomicBool::new(false),
-            saved_paste: AtomicBool::new(false),
-        }
-    }
-
-    /// Enter raw mode and negotiate capabilities. Idempotent.
-    pub fn start(&self) -> io::Result<()> {
-        if self.active.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        self.saved_paste.store(false, Ordering::SeqCst);
-        enable_raw_mode()?;
-        // crossterm's `enable_raw_mode` calls `cfmakeraw`, which clears `OPOST`.
-        // With `OPOST` off the terminal does NOT translate `\n` -> `\r\n`, so
-        // every bare `\n` (help text, separators, agent responses) only moves
-        // down a row and leaves the cursor at the same column — producing the
-        // staggered "indentation" seen on a full screen. Re-enable output
-        // post-processing (specifically `ONLCR`) so line breaks return to
-        // column 0, while keeping raw *input* semantics (no canonical line
-        // editing, no echo). `disable_raw_mode` restores the original mode.
-        enable_output_processing();
-        Self::csi("?2004h")?; // bracketed paste on
-                              // Kitty keyboard protocol: disambiguate keys + report all keys as CSI u,
-                              // so Shift+Enter arrives as Enter+SHIFT (newline) and Alt+Letter as a
-                              // distinct Alt-modified char. Honored by wezterm/alacritty/kitty.
-        crossterm::execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
-            )
-        )?;
-        self.active.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Restore cooked mode. Idempotent; safe to call multiple times / from `Drop`.
-    pub fn stop(&self) -> io::Result<()> {
-        if !self.active.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        // Pop one level of Kitty keyboard enhancement (matches the single push).
-        let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        if self.saved_paste.load(Ordering::SeqCst) {
-            Self::csi("?2004h")?;
-        } else {
-            Self::csi("?2004l")?;
-        }
-        // The status line hides the cursor while a turn streams, and
-        // `draw_frame` shows it again when the prompt returns. If the turn is
-        // interrupted instead — a tool error, a confirm, a panic — nothing shows
-        // it again, and an invisible cursor follows the user into their shell.
-        // Unconditional and idempotent: showing a cursor that was never hidden
-        // costs nothing, and this is the last writer before the tty is the
-        // user's again.
-        io::stdout().write_all(crate::output::SHOW_CURSOR)?;
-        disable_raw_mode()?;
-        self.active.store(false, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn csi(seq: &str) -> io::Result<()> {
-        let mut s = String::from("\x1b[");
-        s.push_str(seq);
-        io::stdout().write_all(s.as_bytes())?;
-        io::stdout().flush()
-    }
-}
-
-/// Re-enable terminal output post-processing (specifically `OPOST`/`ONLCR`)
-/// on the stdout terminal. `crossterm::enable_raw_mode` runs `cfmakeraw`, which
-/// disables `OPOST`; without it a bare `\n` does not return the cursor to
-/// column 0, so agent responses and separators stagger. We operate on fd 1
-/// (stdout), which is the pty slave when interactive and a pipe otherwise
-/// (tcsetattr on a pipe harmlessly fails). Best-effort: errors are ignored.
-fn enable_output_processing() {
-    let fd = libc::STDOUT_FILENO;
-    unsafe {
-        let mut termios: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut termios) != 0 {
-            return;
-        }
-        termios.c_oflag |= libc::OPOST | libc::ONLCR;
-        let _ = libc::tcsetattr(fd, libc::TCSANOW, &termios);
-    }
-}
-
-impl Drop for TermGuard {
-    fn drop(&mut self) {
-        let _ = self.stop();
-    }
-}
-
-/// The interactive REPL driver.
-pub struct Repl {
-    guard: Arc<TermGuard>,
-}
+/// The interactive input driver — a unit: every duty its former
+/// guard/output handles served now takes the content handle, whose manager
+/// is the front door for raw mode, the DSR re-anchors and the frame.
+pub struct Repl;
 
 /// The currently-active model id, from the settings store (the authority).
 /// `provider:model` — the same canonical form rows carry (`qualified()`),
@@ -357,16 +94,10 @@ pub enum InputAction {
 /// session output after an inline overlay is dismissed. Rebuilt each loop
 /// iteration from the live `AgentConfig`.
 pub struct ReplCtx {
-    pub provider: String,
-    pub model: String,
     pub recent: Vec<String>,
     /// Currently active runtime persona name (None => none), for marking the
     /// active entry in the `/persona` overlay.
     pub persona: Option<String>,
-    /// Accumulated agent token usage (per-turn + session totals), snapshotted
-    /// by `run_interactive` each loop iteration so the `/stat` overlay can
-    /// render without direct access to the agent.
-    pub session_usage: SessionUsage,
     /// Session repository (if available), for on-demand loading in `/session` overlay.
     pub repo: Option<crate::session::repo::JsonlSessionRepo>,
     /// The ID of the currently active session (empty if no session).
@@ -382,18 +113,15 @@ pub struct ReplCtx {
     pub leaf_id: Option<String>,
     /// Estimated tokens of the current (compaction-scoped) context. Shown in
     /// the `/tree compact` sub-menu header; the compact handler writes the
-    /// same estimate as `tokensBefore` (same `estimate_context_tokens` call).
+    /// same estimate as `tokensBefore` (same `estimate_context_tokens` call),
+    /// and the loop records it as the live usage store's
+    /// `estimated_input_tokens`.
     pub context_tokens: u64,
-    /// The resolved context window for the prompt-side bar's percentage.
-    pub context_limit: Option<u64>,
     /// Current model filter/sort state for the `/model` overlay.
     pub model_filter: ModelFilter,
-    /// Currently-active reasoning level (for the `*` marker in `/reasoning`).
-    pub reasoning_level: Option<String>,
-    /// The session's name, for the prompt-side status bar. `None` when unnamed,
-    /// in which case the bar falls back to the session's opening message — the
-    /// mid-turn bar reads the same two fields off the session index, and the two
-    /// bars must not be able to disagree about which session they are naming.
+    /// The session's name, written to `AppState` (`update_cycle_view`) — the
+    /// source the status bar reads at render. `None` when unnamed, in which
+    /// case the bar falls back to the session's opening message.
     pub session_name: Option<String>,
     /// The session's opening user message, for the same fallback.
     pub session_first_message: Option<String>,
@@ -512,29 +240,66 @@ pub fn session_meta_from(m: crate::session::types::SessionMetadata) -> SessionMe
 
 /// The input-region overlay currently shown: none, the v2.5 menu frame,
 /// or the prompt-line (prose) completion dialog. Both plan-carrying
-/// variants are pure display snapshots — key dispatch routes through the
-/// engine that produced the plan (slash handle / prose completer).
+/// variants are paint state — a panel's [`ElementSet`], whose plan the
+/// host's cursor math reads and whose elements paint. Key dispatch
+/// still routes through the engine that minted the plan (slash handle /
+/// prose completer); the set is updated from that engine's fresh plan
+/// every eval (see [`ActiveOverlay::menu`] / [`ActiveOverlay::path_complete`]).
 pub(crate) enum ActiveOverlay {
     None,
 
-    /// v2.5 engine overlay: carries a `RenderPlan` from the v2.5
-    /// `SlashDotHandle::eval_prompt`. All key dispatch goes through the
-    /// persistent handle — the overlay is purely a display snapshot.
+    /// v2.5 engine overlay: the element set of a panel the v2.5
+    /// `SlashDotHandle::eval_prompt` keeps open. All key dispatch goes
+    /// through the persistent handle — the set is display state.
     V25Menu {
-        /// The render plan from the v2.5 engine.
-        plan: crate::slashdot_menu::render::RenderPlan,
+        /// The panel's element set (its plan included).
+        set: crate::slashdot_menu::ElementSet,
     },
 
-    /// Prose completion dialog: a `RenderPlan` from
+    /// Prose completion dialog: the element set minted by
     /// `prompt_complete::PromptCompletion::eval`. Tab splices the
     /// cursor row's id through the prose layer; Enter/Esc bypass
     /// (submit the raw line / no-op — stateless dismissal).
     PathComplete {
-        plan: crate::slashdot_menu::render::RenderPlan,
+        set: crate::slashdot_menu::ElementSet,
     },
 }
 
 impl ActiveOverlay {
+    /// The v2.5 menu overlay for a fresh engine plan, taking the overlay
+    /// it replaces: the open panel's element set carries over when the
+    /// plan's rows are the ones it was minted from — a cursor keystroke,
+    /// where only the selection figures move, in place — and re-mints
+    /// for anything else (see [`ElementSet::update`]). Either way the
+    /// returned set paints `plan` and holds it.
+    fn menu(prev: ActiveOverlay, plan: crate::slashdot_menu::render::RenderPlan) -> ActiveOverlay {
+        let set = match prev {
+            ActiveOverlay::V25Menu { mut set } => {
+                set.update(&plan);
+                set
+            }
+            _ => plan.element_set(OVERLAY_ROW_MIN),
+        };
+        ActiveOverlay::V25Menu { set }
+    }
+
+    /// [`Self::menu`] for the prose completion dialog — same carry-or-
+    /// re-mint rule, keyed on the dialog's own variant so a kind change
+    /// (menu ⇄ dialog) always re-mints.
+    fn path_complete(
+        prev: ActiveOverlay,
+        plan: crate::slashdot_menu::render::RenderPlan,
+    ) -> ActiveOverlay {
+        let set = match prev {
+            ActiveOverlay::PathComplete { mut set } => {
+                set.update(&plan);
+                set
+            }
+            _ => plan.element_set(OVERLAY_ROW_MIN),
+        };
+        ActiveOverlay::PathComplete { set }
+    }
+
     /// Decompose an engine [`RenderPlan`] into the legacy `(opts, active)`
     /// contract for a verbatim plan-painted overlay: one logical option per
     /// candidate (visual lines joined with `\n`, marker-free text), plus the
@@ -552,7 +317,8 @@ impl ActiveOverlay {
     fn display_rows(&self) -> (Vec<String>, Option<usize>) {
         match self {
             ActiveOverlay::None => (vec![], None),
-            ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
+            ActiveOverlay::V25Menu { set } | ActiveOverlay::PathComplete { set } => {
+                let plan = set.plan();
                 if plan.rows.is_empty() {
                     return (vec!["(no results)".into()], None);
                 }
@@ -566,7 +332,9 @@ impl ActiveOverlay {
     fn cursor_row(&self) -> Option<usize> {
         match self {
             ActiveOverlay::None => None,
-            ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => plan.selected,
+            ActiveOverlay::V25Menu { set } | ActiveOverlay::PathComplete { set } => {
+                set.plan().selected
+            }
         }
     }
 
@@ -594,86 +362,87 @@ enum V25Frame {
 //
 // The editor's own element, carrying the editor's own squeeze policy: how
 // many rows of context to keep above a caret is an opinion about *editing*
-// (ui_draw_v2 §3.2.2). It used to sit in `frame.rs` as `render`'s `Input`
+// (ui_draw_v2 §3.2.2). It used to sit in the frame layer as `render`'s `Input`
 // arm, where the frame layer could not help but accumulate opinions like it.
 
 /// Rows of context preferred above the caret when an input window must clip
 /// its wrapped height (plan §3.4).
 const INPUT_CONTEXT_ROWS: usize = 3;
 
-impl Element {
-    /// Prompt + editor content. `layout` is the editor's visual layout
-    /// (prompt rendered on row 0); the caret lives at `layout.cursor_row` /
-    /// `layout.cursor_col` — derived, not stored.
-    ///
-    /// `must` is the caret's own row, which is why the input can never be
-    /// squeezed away entirely; wrapping grows `might`.
-    pub(crate) fn input(layout: Layout, prompt: String) -> Self {
-        let might = layout.row_count.max(1);
-        Element::new(1, might, InputItem { layout, prompt })
-    }
-
-    /// An input that occupies **no rows at all** — the mid-turn case.
-    ///
-    /// An input row with nothing in it reads as "type here", and while a turn is
-    /// running there is nothing to submit, so the row is a claim the screen
-    /// cannot back up. Between turns it is the opposite: it is what tells the
-    /// reader where input goes, so [`Self::input`] keeps it. The REPL is live
-    /// either way (OQ2) — the frame is composed and applied on every keystroke;
-    /// it simply has no row to draw until something is typed.
-    ///
-    /// `must == might == 0`, so the allocator serves it nothing and
-    /// `InputItem::render_at(0, _)` returns the empty `Rendered`. The choice is
-    /// made here rather than inferred inside the element, because "is a turn
-    /// running" is the output's fact (`streaming`), not the frame layer's.
-    pub(crate) fn input_hidden(layout: Layout, prompt: String) -> Self {
-        Element::new(0, 0, InputItem { layout, prompt })
-    }
+/// Prompt + editor content, and the R1 rule in one place.
+///
+/// The element holds the session's editor *handle* and content's streaming
+/// flag and resolves both inside `height`/`render` at the width being
+/// composed for — the layout is computed at the render width rather than
+/// snapshotted at compose. The caret lives at `layout.cursor_row` /
+/// `layout.cursor_col` — derived, not stored.
+///
+/// **R1: the input is `0` rows mid-turn with an empty buffer; the prompt row
+/// between turns even with no content; sized to the wrapped buffer whenever
+/// content is present, in either case.** An input row with nothing in it
+/// reads as "type here", and while a turn is running there is nothing to
+/// submit, so the row is a claim the screen cannot back up. Between turns it
+/// is the opposite: it is what tells the reader where input goes, so it
+/// stays. The REPL is live either way (OQ2) — the frame is composed and
+/// applied on every keystroke; it simply has no row to draw until something
+/// is typed. And `min` is the caret's own row, which is why a visible input
+/// can never be squeezed away entirely; wrapping grows `max`.
+///
+/// "Is a turn running" is the output's fact (`streaming`), not the frame
+/// layer's — the element does not own it, it pulls the handle content
+/// shares, the way the bar element pulls its store. Read at pull
+/// time, the fact cannot go stale between compose and paint.
+///
+/// A free function, not `Element::input`: inherent methods on `Element` would
+/// live in `slashdot_tui`, and this element is repl's (it holds
+/// [`LineEditor`]). Same shape as `Element::new`, whose `RenderElement` impl
+/// lives here.
+pub(crate) fn input(
+    editor: Arc<Mutex<LineEditor>>,
+    prompt: String,
+    streaming: Arc<AtomicBool>,
+) -> Element {
+    Element::new(InputItem {
+        editor,
+        prompt,
+        streaming,
+    })
 }
 
-/// The input element for one compose, and the R1 rule in one place.
-///
-/// Mid-turn an empty input is **no row at all**; between turns it is the resting
-/// row that says where to type; anything typed is an ordinary input either way.
-/// [`Element::input_hidden`] has the reasoning.
-///
-/// Shared by the REPL's redraw and the test harness rather than written twice —
-/// a copy would drift, and then the tests would pin a rule that production does
-/// not follow.
-pub(crate) fn input_element(
-    editor: &LineEditor,
-    prompt: &str,
-    streaming: bool,
-    term_w: usize,
-) -> Element {
-    let layout = editor.layout(term_w, prompt);
-    if streaming && editor.text().is_empty() {
-        Element::input_hidden(layout, prompt.to_string())
-    } else {
-        Element::input(layout, prompt.to_string())
-    }
+/// The resting (between-turns) input for tests: a not-streaming flag beside
+/// the caller's editor — R1's default, the prompt row that says where to
+/// type. Tests that pin the mid-turn rule mint [`input`] with their own
+/// flag.
+#[cfg(test)]
+pub(crate) fn test_input(editor: &Arc<Mutex<LineEditor>>, prompt: &str) -> Element {
+    input(
+        editor.clone(),
+        prompt.to_string(),
+        Arc::new(AtomicBool::new(false)),
+    )
 }
 
 /// Overlay elements for a plain list of rows — for tests that care about the
 /// frame, not about a menu's sections. See [`test_overlay_parts`].
 #[cfg(test)]
-pub(crate) fn test_overlay(lines: &[&str], sel: usize, term_w: usize) -> Vec<Element> {
-    test_overlay_parts(None, &[], lines, Some(sel), term_w)
+pub(crate) fn test_overlay(lines: &[&str], sel: usize) -> Vec<Element> {
+    test_overlay_parts(None, &[], lines, Some(sel))
 }
 
 /// Overlay elements from a plan's three sections, for tests that want a header
 /// or detail as well as rows.
 ///
-/// Goes through a real [`RenderPlan`] and the real [`overlay_elements`], so a
-/// test that pastes in arbitrary strings is still exercising production's
-/// composition rather than a shortcut that can drift from it.
+/// Goes through a real [`RenderPlan`] and the real [`RenderPlan::elements`],
+/// so a test that pastes in arbitrary strings is still exercising production's
+/// composition rather than a shortcut that can drift from it. No width: the
+/// minted elements lay themselves out at the render width, so a
+/// compose-time width has nothing to hand them.
 #[cfg(test)]
 pub(crate) fn test_overlay_parts(
     header: Option<&str>,
     detail: &[&str],
     rows: &[&str],
     sel: Option<usize>,
-    term_w: usize,
 ) -> Vec<Element> {
     use crate::slashdot_menu::render::{LogicalLine, RenderPlan};
     let plan = RenderPlan {
@@ -682,8 +451,10 @@ pub(crate) fn test_overlay_parts(
         rows: std::sync::Arc::new(rows.iter().map(|l| LogicalLine::new(*l)).collect()),
         selected: sel,
         active_rows: vec![],
+        view: None,
+        columns: Vec::new(),
     };
-    crate::ui::overlay_elements(&plan, term_w, sel)
+    plan.elements(1)
 }
 
 /// The rows element's allocation in a prompt frame — the page size a PageUp or
@@ -696,40 +467,46 @@ pub(crate) fn test_overlay_parts(
 /// let a page move by more than one screen.
 ///
 /// This runs the same composition and the same `allocate` the frame will, so
-/// the two cannot differ. The status row is left out — it is one row, and a
+/// the two cannot differ — and the `budget` is the manager's own
+/// ([`RenderManager::budget`]), the number the frame *will* be budgeted
+/// with, so the ratio resolves in exactly one place and the grant cannot
+/// disagree with the paint. The status row is left out — it is one row, and a
 /// menu is only open between turns, when there is nothing streaming to report.
 pub(crate) fn rows_grant(
-    editor: &LineEditor,
+    editor: &Arc<Mutex<LineEditor>>,
     prompt: &str,
     overlay: Vec<Element>,
     term_w: usize,
     term_h: usize,
+    budget: usize,
 ) -> usize {
-    let elements = Repl::compose_elements(editor, prompt, None, overlay, term_w);
-    let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
-    let heights = allocate(&extents, live_budget(term_h.max(1)));
+    let elements = Repl::compose_elements(editor, prompt, None, overlay);
+    let asks: Vec<RowAsk> = elements.iter().map(|e| e.ask(term_w)).collect();
+    let heights = allocate(&asks, term_h.max(1), budget);
     // The rows element is the last of the overlay's sections by construction
     // (`overlay_elements` appends detail, header, then rows).
     heights.last().copied().unwrap_or(0)
 }
 
+/// The floor an overlay's element set mints with: one row, if there is
+/// anything to show.
+const OVERLAY_ROW_MIN: usize = 1;
+
 /// The overlay's frame elements: no overlay ⇒ none.
 ///
-/// The overlay is *not* painted here. Its sections become elements and the
-/// frame allocates them, so there is no painted row list to hand on and no
-/// focus index to translate — the cursor's logical row index goes straight to
-/// the rows element, which is the only thing that scrolls.
-pub(crate) fn overlay_elements(overlay: &ActiveOverlay, term_w: usize) -> Vec<Element> {
+/// The overlay is *not* painted here. Its sections are elements the set
+/// already minted and the frame allocates them, so there is no painted
+/// row list to hand on and no focus index to translate — the cursor's
+/// logical row index goes straight to the rows element, which is the
+/// only thing that scrolls.
+pub(crate) fn overlay_elements(overlay: &ActiveOverlay) -> Vec<Element> {
     match overlay {
         ActiveOverlay::None => Vec::new(),
-        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
-            crate::ui::overlay_elements(plan, term_w, plan.selected)
-        }
+        ActiveOverlay::V25Menu { set } | ActiveOverlay::PathComplete { set } => set.elements(),
     }
 }
 
-/// Compose and apply the prompt frame: `[Input]`, or
-/// `[Input, Divider, Overlay]` while a pop-up shows (plan §5.2).
+/// Paint the prompt frame: lock the manager and apply the configured stack.
 ///
 /// **The one way the prompt writes to the terminal.** `read_input`'s blocking
 /// loop and the turn's `select!` key branch both come here (ui_draw_v2 §4.5
@@ -737,41 +514,55 @@ pub(crate) fn overlay_elements(overlay: &ActiveOverlay, term_w: usize) -> Vec<El
 /// like — the split that made `handle_key` and `eval` draw nothing only holds
 /// if the pixels they are silent about have exactly one owner.
 ///
-/// The apply phase owns the rest: an intact live frame means a partial row-diff
-/// (so a tall pop-up's scroll is followed without a row counter), and the
-/// scroll `delta` and bounded clear live in `plan_apply`. Content *above* the
-/// frame — greeter, status, session — is never touched.
-pub(crate) fn paint_prompt(
-    output: &dyn Output,
-    label: &str,
-    editor: &LineEditor,
-    overlay: Vec<Element>,
-    dims: (usize, usize),
-) {
-    let dims = (dims.0.max(1), dims.1.max(1));
-    // The REPL supplies only what changes: the input, and the menu when one is
-    // open. The status row is `compose_area`'s to resolve — it is made of
-    // `status_text` and `streaming`, which are this output's facts and not
-    // something this module may reason about — and so is the divider that
-    // separates the menu from the input above it (ui_draw_v2 §5.1.1).
-    let input = input_element(editor, label, output.is_streaming(), dims.0);
-    // Composition *and* division are the tail's now: pieces move in and nothing
-    // comes back, so no `Vec<Element>` crosses a call site (ui_draw_v2 §5.1.1).
-    let _ = output.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
+/// No overlay param, no compose: membership is whatever the
+/// preceding transition left configured (`sync_stack`), so this just applies
+/// it. The apply phase owns the rest: an intact live frame means a partial
+/// row-diff (so a tall pop-up's scroll is followed without a row counter), and
+/// the scroll `delta` and bounded clear live in `plan_apply`. Content *above*
+/// the frame — greeter, status, session — is never touched.
+///
+/// Goes through the manager content holds (design §Content), not `&dyn Output`.
+pub(crate) fn paint_prompt(content: &Content) {
+    content.manager.lock().unwrap().render(None);
 }
 
 /// Editor content: the prompt on row 0, the wrapped buffer below it.
+///
+/// Holds the session's editor *handle* and content's streaming flag — the
+/// same pull-the-shared-store shape as the bar element. The layout is
+/// computed inside `height`/`render` at the width being composed for, so a
+/// compose at one width and a render at another cannot disagree about the
+/// wrap.
 struct InputItem {
-    layout: Layout,
+    editor: Arc<Mutex<LineEditor>>,
     prompt: String,
+    /// The output's turn-presence fact, read at pull time (see [`input`]).
+    streaming: Arc<AtomicBool>,
 }
 
-impl RenderAt for InputItem {
-    fn render_at(&self, h: usize, tw: usize) -> Rendered {
+impl RenderElement for InputItem {
+    fn height(&self, width: usize) -> RowAsk {
+        // R1 (the reasoning lives on [`input`]): mid-turn an empty input is
+        // no row at all — `min == max == 0`, so the allocator serves it
+        // nothing and `render(0, _)` returns the empty `Rendered`.
+        if self.streaming.load(Ordering::Relaxed) && self.editor.lock().unwrap().text().is_empty() {
+            return RowAsk::fixed(0, 0);
+        }
+        // The floor is the caret's own row; wrapping grows the want to the
+        // wrapped buffer — laid out at *this* width, the one the allocator
+        // is resolving the frame at.
+        let layout = self.editor.lock().unwrap().layout(width, &self.prompt);
+        RowAsk::fixed(1, layout.row_count.max(1))
+    }
+
+    fn render(&self, h: usize, tw: usize) -> Rendered {
         if h == 0 {
             return Rendered::default();
         }
-        let layout = &self.layout;
+        // Computed here, at the render width — the same number `height`
+        // answered with for this compose (single-threaded prompt, nothing
+        // mutates the buffer between the two calls of one paint).
+        let layout = self.editor.lock().unwrap().layout(tw, &self.prompt);
         let n = layout.row_count.max(1);
         // Three rows above the caret: enough to see the argument you just
         // edited without losing the caret off the top. This constant is
@@ -864,7 +655,13 @@ pub(crate) enum EvalOutcome {
 pub struct PromptSession {
     /// The input buffer, cursor, wrap layout, and the `Up`/`Down` history-recall
     /// position (which lives on the editor — see [`LineEditor::nav`]).
-    editor: LineEditor,
+    ///
+    /// Shared, not owned outright: the input *element* holds a clone of this
+    /// handle and pulls the buffer at paint time, so the frame always
+    /// shows the live editor rather than a layout snapshotted at compose.
+    /// Locks are statement-scoped — no path holds one across a paint (the
+    /// element locks it again inside the manager's render).
+    editor: Arc<Mutex<LineEditor>>,
     /// Selected row of the current overlay.
     sel: usize,
     /// Overlay discriminant, for resetting `sel` when the overlay *kind*
@@ -892,6 +689,17 @@ pub struct PromptSession {
     /// against. Recomputed every iteration; held here so `handle_key` sees the
     /// same frame that was just painted.
     overlay: ActiveOverlay,
+    /// This session's view of the size watch — a clone of the content
+    /// handle's receiver, for the key paths that hold the session and not
+    /// the content. Same channel, so a
+    /// resize published by the loop-top probe or the reader is what these
+    /// reads see.
+    size: tokio::sync::watch::Receiver<crate::termio::TermSize>,
+    /// The injected state handle: the bar element reads the
+    /// model in force, the thinking level and the context window off it at
+    /// render, so a mid-turn `/reasoning` or `/model` commit shows at the next
+    /// paint. Cloned into `sync_stack`'s bar element.
+    app_state: Arc<AppState>,
     /// A gated tool call's confirmation, if one is on screen.
     ///
     /// Not an `ActiveOverlay` variant and not `None`-when-absent by design: a
@@ -925,7 +733,7 @@ pub struct InTurnInput<'a> {
     /// The in-flight reader's channel. Unbounded because a bounded one that
     /// filled would block the reader at the moment it most needs to deliver
     /// `Ctrl-C` (see `route_event`).
-    pub keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    pub keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     /// Confirmation requests from gated tool calls, answered by the session's
     /// own dialog (doc/confirm_as_menu_261002.md). Borrowed per turn for the
     /// same reason `keys` is: a request must not outlive the pump that would
@@ -935,11 +743,6 @@ pub struct InTurnInput<'a> {
     pub label: &'a str,
     /// History the Up/Down keys page through.
     pub history: &'a mut History,
-    /// For [`open_editor`](PromptSession::open_editor) when `Ctrl-E` lands
-    /// mid-turn. There is no reader to stop in that case — the turn's own is
-    /// what handed us the key — but the raw-mode turnover and the DSR
-    /// re-anchor are still the wrapper's to do.
-    pub guard: &'a TermGuard,
 }
 
 impl PromptSession {
@@ -952,7 +755,7 @@ impl PromptSession {
             editor.set(s);
         }
         Self {
-            editor,
+            editor: Arc::new(Mutex::new(editor)),
             sel: 0,
             last_disc: 0,
             prose: crate::prompt_complete::PromptCompletion::new(),
@@ -961,7 +764,15 @@ impl PromptSession {
             epoch_active: false,
             overlay: ActiveOverlay::None,
             confirm: None,
+            size: app_state.content().size.clone(),
+            app_state: app_state.clone(),
         }
+    }
+
+    /// The current width — the retired `output::term_width` answer (same
+    /// 20-column floor), off the session's cloned receiver.
+    fn term_width(&self) -> usize {
+        self.size.borrow().width.max(20)
     }
 
     /// Open a gated tool call's confirmation.
@@ -1020,7 +831,7 @@ impl PromptSession {
     /// it had: the `/` prompt *is* the menu state, so the buffer that ends a
     /// turn is the buffer the next prompt opens with.
     pub(crate) fn apply_prefill(&mut self, text: &str) {
-        self.editor.set(text);
+        self.editor.lock().unwrap().set(text);
     }
 
     /// The handle to eval with, for the `/`-session the buffer is currently in.
@@ -1063,6 +874,9 @@ impl PromptSession {
     /// both pumps drive one session by reference, and neither may see it split
     /// apart.
     pub(crate) async fn eval(&mut self) -> EvalOutcome {
+        // The watched width for this eval — read before the destructure
+        // below borrows `self` apart (the free function `v25_eval` used).
+        let width = self.term_width();
         let Self {
             editor,
             pending_key,
@@ -1075,16 +889,21 @@ impl PromptSession {
         let key = pending_key
             .take()
             .unwrap_or(crate::slashdot_menu::HostKey::None);
-        let buf_text = editor.text();
+        // The overlay being replaced: `menu`/`path_complete` carry its
+        // element set over when the panel underneath did not change, or
+        // re-mint. Taking it here also clears the slot, so an early
+        // `return` leaves no overlay behind.
+        let prev = std::mem::replace(overlay, ActiveOverlay::None);
+        let buf_text = editor.lock().unwrap().text();
         *overlay = if buf_text.starts_with('/') {
             // All `/` commands route through the v2.5 engine. The handle is
             // minted for the eval and dropped with it — it carries no state
             // beyond the borrowed root and the epoch, both of which live in
             // the session's menu (`slash_handle` decides which epoch).
-            let cursor = editor.cursor;
+            let cursor = editor.lock().unwrap().cursor;
             let result = {
                 let mut handle = Self::slash_handle(menu, epoch_active);
-                Repl::v25_eval(&mut handle, &buf_text, cursor, key).await
+                Repl::v25_eval(&mut handle, &buf_text, cursor, key, width).await
             };
             match result {
                 V25Frame::Continue(plan, prompt) => {
@@ -1101,10 +920,11 @@ impl PromptSession {
                     // in the recalled prompt with `Up`/`Down` refusing to
                     // browse. Derived writes keep them walking.
                     let new_buf = format!("/{}", prompt);
-                    if new_buf != editor.text() {
-                        editor.set_derived(&new_buf);
+                    let mut ed = editor.lock().unwrap();
+                    if new_buf != ed.text() {
+                        ed.set_derived(&new_buf);
                     }
-                    ActiveOverlay::V25Menu { plan }
+                    ActiveOverlay::menu(prev, plan)
                 }
                 V25Frame::DoneSuccess(msg, prompt)
                     if matches!(key, crate::slashdot_menu::HostKey::Enter) =>
@@ -1133,14 +953,14 @@ impl PromptSession {
                 // `/`-session are cleared here rather than by the caller,
                 // because they are state, not pixels.
                 V25Frame::DoneError(err, _) => {
-                    editor.set("");
+                    editor.lock().unwrap().set("");
                     *epoch_active = false;
-                    *overlay = ActiveOverlay::None;
+                    // `overlay` is already None — `prev` was taken above.
                     return EvalOutcome::Error { message: err };
                 }
                 // Esc at root — close the overlay.
                 V25Frame::DoneSuccess(_, _) => {
-                    editor.set("");
+                    editor.lock().unwrap().set("");
                     *epoch_active = false;
                     ActiveOverlay::None
                 }
@@ -1152,12 +972,16 @@ impl PromptSession {
             // Prose frames: one eval drives the word gate, the debounce, and
             // the dialog. Idle ⇒ no overlay (stateless dismissal: the next
             // frame re-derives from the buffer).
+            // Direct field read: `self` is destructured above, so a method
+            // call would borrow the whole session against the live bindings.
             let ctx = crate::slashdot_menu::RenderContext {
-                term_width: crate::output::term_width().max(1),
+                term_width: self.size.borrow().width.max(20),
             };
-            match prose.eval(editor, key, ctx) {
+            match prose.eval(&mut editor.lock().unwrap(), key, ctx) {
                 crate::prompt_complete::Frame::Idle => ActiveOverlay::None,
-                crate::prompt_complete::Frame::Dialog(plan) => ActiveOverlay::PathComplete { plan },
+                crate::prompt_complete::Frame::Dialog(plan) => {
+                    ActiveOverlay::path_complete(prev, plan)
+                }
             }
         };
         EvalOutcome::Frame
@@ -1244,9 +1068,13 @@ impl PromptSession {
     /// the raw-mode turnover and the DSR re-anchor — and a failure that
     /// surfaces differently depending on which pump took the key is a failure
     /// the user sees one way out of two.
-    pub(crate) fn open_editor(&mut self, guard: &TermGuard, output: &dyn Output) {
-        match run_editor(guard, output, &self.editor.text(), EditorMode::Edit) {
-            Ok(new_text) => self.editor.set(&new_text),
+    pub(crate) fn open_editor(&mut self, content: &Content) {
+        // The buffer text is taken and the guard dropped before the takeover:
+        // `$EDITOR` runs the whole raw-mode turnover and must not queue behind
+        // a lock the paint path also wants.
+        let current = self.editor.lock().unwrap().text();
+        match run_editor(content, &current, EditorMode::Edit) {
+            Ok(new_text) => self.editor.lock().unwrap().set(&new_text),
             Err(e) => {
                 let _ = io::stdout().write_all(format!("\r\neditor error: {}\r\n", e).as_bytes());
             }
@@ -1256,7 +1084,7 @@ impl PromptSession {
     /// Insert pasted text at the caret. Shared so "paste" is one operation
     /// rather than one each pump reaches for differently.
     pub(crate) fn paste(&mut self, text: &str) {
-        self.editor.insert_str(text);
+        self.editor.lock().unwrap().insert_str(text);
     }
 
     /// eval → outcome → sync → paint: the whole "make the session say
@@ -1274,27 +1102,30 @@ impl PromptSession {
     /// is already painted.
     pub(crate) async fn settle(
         &mut self,
-        output: &dyn Output,
-        prompt: &str,
+        content: &Content,
+        label: &str,
         history: &mut History,
-        dims: (usize, usize),
     ) -> Option<InputAction> {
         // `emit_commit` wants a painter as a closure; the painter it wants is
-        // the same one everything else uses, so this is an adapter over
-        // `paint_prompt` and not a second composition.
-        let redraw = |editor: &LineEditor, overlay: Vec<Element>, dims: (usize, usize)| {
-            paint_prompt(output, prompt, editor, overlay, dims);
-        };
+        // the same one everything else uses — apply the configured stack,
+        // whose membership was already synced by the transition that led here.
+        // `eval` needs `&mut self` next, so the closure holds no borrow.
+        let redraw = move || paint_prompt(content);
         // Bound before the `match` on purpose: a future in a match scrutinee
         // lives to the end of the `match`, and it would still hold the borrow
         // of `self` the arms below want back.
         let eval = self.eval().await;
+        // The eval may have changed the overlay (open/close/change) — a state
+        // transition, so membership is reconfigured *here*, before any paint,
+        // not recomputed at paint time (design §Render: membership changes on
+        // transitions, never at paint).
+        self.sync_stack(content, label);
         match eval {
             EvalOutcome::Frame => {}
             EvalOutcome::Commit { line, message } => {
-                Repl::emit_commit(output, &mut self.editor, &redraw, dims, &line, "", history);
+                Repl::emit_commit(content, &self.editor, &redraw, &line, "", history);
                 if let Some(text) = message {
-                    output.display_text(&text);
+                    content.display_text(&text);
                 }
                 // Dismiss the overlay and hand control back to the agent loop,
                 // whose convergence step applies the targets this eval wrote.
@@ -1315,30 +1146,68 @@ impl PromptSession {
                 // an error path — rare, and the cost of being wrong is a
                 // stranded input region — not because the accounting needs
                 // rescuing.
-                redraw(&LineEditor::new(), Vec::new(), dims);
-                output.display_text(&message);
-                let _ = output.cursor_row();
+                // The eval emptied the buffer and answered `Error` with no
+                // overlay behind it, so the sync above already installed the
+                // bare membership; this just applies it.
+                paint_prompt(content);
+                content.display_text(&message);
+                let _ = content.manager.lock().unwrap().cursor_row();
             }
         }
         self.sync_selection();
-        self.paint(output, prompt, dims);
+        paint_prompt(content);
         None
     }
 
-    /// The session's frame, as one composition: the open overlay and then — if a
-    /// gated tool is waiting — the confirmation below it.
+    /// The session's membership, rebuilt from state: the bar, the input, the
+    /// open overlay, and then — if a gated tool is waiting — the confirmation
+    /// appended below it.
     ///
-    /// The single place the area is composed from session state, so `settle`
+    /// The single place membership is rebuilt from session state, so `settle`
     /// and the turn's confirm arm cannot disagree about what the screen shows.
     /// A confirm *appends* rather than replaces (§3 of
     /// doc/confirm_as_menu_261002.md): it is modal over the menu, and the
     /// prompt that drives that menu stays exactly where it was.
-    pub(crate) fn paint(&self, output: &dyn Output, prompt: &str, dims: (usize, usize)) {
-        let mut overlay = overlay_elements(&self.overlay, dims.0);
+    ///
+    /// Called on every state transition that changes what is on screen
+    /// (design §Render: membership reconfigures on transitions, never at
+    /// paint). It rebuilds the whole membership from `self.overlay` +
+    /// `self.confirm` (+ the always-in bar/input) and hands it to the
+    /// manager via `configure`; the next `paint_prompt` just applies it.
+    ///
+    /// The label is a parameter, not a field: it is threaded by the pumps and
+    /// never constant across a session's life, so the input element takes it
+    /// here at the one moment membership is built.
+    pub(crate) fn sync_stack(&self, content: &Content, label: &str) {
+        let input = input(
+            self.editor.clone(),
+            label.to_string(),
+            content.streaming.clone(),
+        );
+        let mut stack = Vec::new();
+        // The bar is always present: no `is_off` gate — with a
+        // live pull the bar always knows how to render itself, and the gate
+        // was an artifact of the old push.
+        stack.push(Element::lines(vec![String::new()]));
+        stack.push(crate::ui::bar::status(
+            self.app_state.clone(),
+            content.usage_handle(),
+            content.streaming.clone(),
+        ));
+        stack.push(input);
+        let mut overlay = overlay_elements(&self.overlay);
         if let Some(confirm) = &self.confirm {
-            overlay.extend(confirm.elements(dims.0));
+            overlay.extend(confirm.elements());
         }
-        paint_prompt(output, prompt, &self.editor, overlay, dims);
+        if !overlay.is_empty() {
+            stack.push(Element::divider());
+            stack.extend(overlay);
+        }
+        content
+            .manager
+            .lock()
+            .unwrap()
+            .configure(crate::render::FRAME_MAX_ROW_RATIO, stack);
     }
 
     /// Apply one key to the session.
@@ -1367,9 +1236,21 @@ impl PromptSession {
         // host-side cursor needs. Passed rather than recomputed so the
         // dispatch and the paint cannot disagree about how many rows there are.
         opts_len: usize,
+        // The live-region budget the frame will be composed under, from the
+        // one place a ratio resolves to rows (`RenderManager::budget`).
+        // Passed for the same reason `opts_len` is: the ratio is the
+        // manager's configuration, so a caller that re-derived it here would
+        // be a second computation of the same number.
+        budget: usize,
         prompt: &str,
         history: &mut History,
     ) -> KeyOutcome {
+        // The watched geometry for this dispatch: one read of this session's
+        // cloned receiver, taken before the destructure below borrows `self`
+        // apart. Raw
+        // values, so each use keeps exactly the floor it applied before.
+        let watched = *self.size.borrow();
+        let term_w = self.term_width();
         let Self {
             editor,
             sel,
@@ -1430,8 +1311,8 @@ impl PromptSession {
                     // through the engine that owns the cursor (slash handle /
                     // prose).
                     let plan = match overlay {
-                        ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
-                            Some(plan)
+                        ActiveOverlay::V25Menu { set } | ActiveOverlay::PathComplete { set } => {
+                            Some(set.plan())
                         }
                         ActiveOverlay::None => None,
                     };
@@ -1445,14 +1326,13 @@ impl PromptSession {
                         // composition and the same `allocate` the frame will
                         // run. Measured on the rows as the engine wrote them,
                         // which is the unit the rows element windows in.
-                        let (_, cur_h) = crossterm::terminal::size().unwrap_or((80, 24));
-                        let term_w = crate::output::term_width().max(1);
                         let page = rows_grant(
                             &self.editor,
                             prompt,
-                            overlay_elements(overlay, term_w),
+                            overlay_elements(overlay),
                             term_w,
-                            cur_h.max(1) as usize,
+                            watched.height.max(1),
+                            budget,
                         );
                         let direction = if matches!(key.code, KeyCode::PageDown) {
                             1
@@ -1467,10 +1347,7 @@ impl PromptSession {
                         }
                         return KeyOutcome::Continue;
                     }
-                    let page = {
-                        let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                        (h as usize).saturating_sub(2).max(1)
-                    };
+                    let page = watched.height.saturating_sub(2).max(1);
                     let max = opts_len.saturating_sub(1);
                     if matches!(key.code, KeyCode::PageDown) {
                         *sel = (*sel + page).min(max);
@@ -1502,7 +1379,13 @@ impl PromptSession {
                     // Prose dialog: Enter bypasses completion — submit the raw
                     // line (Shift+Enter inserts a newline). Tab is the only
                     // expansion key.
-                    if let Some(a) = Repl::edit_key(key, editor, history, prompt) {
+                    if let Some(a) = Repl::edit_key(
+                        key,
+                        &mut editor.lock().unwrap(),
+                        history,
+                        prompt,
+                        watched.width,
+                    ) {
                         return KeyOutcome::Action(a);
                     }
                     return KeyOutcome::Continue;
@@ -1521,7 +1404,13 @@ impl PromptSession {
                     // Editing keys pass through in both cases; dismissal is
                     // stateless — the next eval re-derives the dialog from
                     // the buffer.
-                    if let Some(a) = Repl::edit_key(key, editor, history, prompt) {
+                    if let Some(a) = Repl::edit_key(
+                        key,
+                        &mut editor.lock().unwrap(),
+                        history,
+                        prompt,
+                        watched.width,
+                    ) {
                         return KeyOutcome::Action(a);
                     }
                 }
@@ -1531,38 +1420,20 @@ impl PromptSession {
         // No overlay: normal editing (Tab with no dialog is inert — implicit
         // open means the dialog is already up whenever there is anything to
         // complete).
-        if let Some(a) = Repl::edit_key(key, editor, history, prompt) {
+        if let Some(a) = Repl::edit_key(
+            key,
+            &mut editor.lock().unwrap(),
+            history,
+            prompt,
+            watched.width,
+        ) {
             return KeyOutcome::Action(a);
         }
         KeyOutcome::Continue
     }
 }
 
-impl Default for Repl {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Repl {
-    pub fn new() -> Self {
-        Self {
-            guard: Arc::new(TermGuard::new()),
-        }
-    }
-
-    /// Enter raw mode (idempotent). Best-effort; `Drop` still restores.
-    pub fn start(&self) -> io::Result<()> {
-        self.guard.start()
-    }
-
-    /// Shared handle to the terminal-mode guard. Used by `run_interactive` to
-    /// drive suspend/resume (Ctrl-Z) and in-flight cancel from a background
-    /// reader thread while an LLM request is in flight.
-    pub(crate) fn guard(&self) -> Arc<TermGuard> {
-        self.guard.clone()
-    }
-
     /// Read a multi-line input in raw mode, with the v2.5 slash-menu frame.
     ///
     /// Returns `Some(InputAction::Submit(text))` with the submitted prompt,
@@ -1581,7 +1452,7 @@ impl Repl {
     /// entry) and is *not* forced to the screen bottom, so closing an overlay
     /// never leaves a gap in the scrollback. Drawing goes through the unified
     /// frame pipeline (plan `doc/ui_draw_v2.md` §5.2): `redraw` composes
-    /// `[Input, Divider?, Overlay?]`, and `Output::draw_frame` draws from the
+    /// `[Input, Divider?, Overlay?]`, and `RenderManager::render` draws from the
     /// cursor, scrolls and clears within the live region — all
     /// clearing is confined to the frame region and below, so the greeter /
     /// status / session content above the input is never touched. The whole
@@ -1596,7 +1467,14 @@ impl Repl {
         history: &mut History,
         ctx: &ReplCtx,
         app_state: &Arc<AppState>,
-        output: &dyn Output,
+        // The one handle: content carries the resize-replay source, the frame
+        // pipeline (through its manager), and the manager's front door for raw
+        // mode + the DSR re-anchors.
+        content: &Content,
+        // The persistent reader's event queue. The reader is
+        // the sole stdin owner; this loop consumes what it forwards rather
+        // than calling `event::poll`/`event::read` itself.
+        keys: &mut UnboundedReceiver<InputEvent>,
     ) -> Option<InputAction> {
         // Re-anchor the draw cache to the real cursor (DSR) before the first
         // paint (plan §4.2).
@@ -1614,7 +1492,7 @@ impl Repl {
         // First prompt of the process only — every later prompt's tracked row
         // is measured from the bytes it wrote (see `ENTRY_DSR_DONE`).
         if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
-            let _ = output.cursor_row();
+            let _ = content.manager.lock().unwrap().cursor_row();
         }
         // Refresh the menu-facing view from this cycle's context. The loop
         // is the sole writer of these display fields (one acquisition);
@@ -1622,48 +1500,39 @@ impl Repl {
         // copies, no sync flags.
         app_state.update_cycle_view(
             ctx.current_session_id.clone(),
-            ctx.session_usage,
-            ctx.context_tokens,
+            ctx.session_name.clone(),
+            ctx.session_first_message.clone(),
             ctx.tree.clone(),
             ctx.leaf_id.clone(),
         );
         // Repo handle: refresh in case the loop replaced its local Option
         // (clone-shared Arc cache — same listing state either way).
         app_state.set_repo(ctx.repo.clone());
-        // The prompt-side bar's **data**, pushed rather than rendered: this
-        // module no longer builds the row, `Output::compose_area` does, from
-        // whatever is stored here (ui_draw_v2 §5.1.1).
-        //
-        // Pushed once per cycle from the same `ctx` the overlays read, so the
-        // prompt-side bar and the mid-turn one cannot name different sessions —
-        // and pushed before the first paint, because the very first prompt runs
-        // before any turn has set a status, and an unset one draws no bar at all.
-        output.set_status(&crate::agent::status::status_text(
-            ctx.session_name.as_deref(),
-            ctx.session_first_message.as_deref(),
-            crate::agent::status::BarModel {
-                provider: &ctx.provider,
-                model: &ctx.model,
-                thinking: ctx.reasoning_level.as_deref(),
-                context_tokens: ctx.context_tokens,
-                context_limit: ctx.context_limit,
-            },
-        ));
+        // The context figure is read *live* by the bar and `/stat` off the
+        // agent's usage store — so this cycle's estimate is recorded as an
+        // **estimate**, not a push into the status and not
+        // a report. Before any completion has reported the estimate is what
+        // `context_figure` falls back to; after one has, the provider's own
+        // count wins and this write is simply unused.
+        if let Some(usage) = content.usage_handle() {
+            usage.lock().unwrap().estimated_input_tokens = ctx.context_tokens;
+        }
         // The session's state, as the loop's own bindings. Destructuring a
         // `&mut PromptSession` reborrows each field *disjointly*, so the body
         // keeps addressing them as locals while they are, in fact, one movable
         // value — and `PromptSession::handle_key` can be handed exactly the
         // fields it touches instead of a `&mut self` that would conflict with
         // these bindings.
-        // Terminal size at the last paint is `output.painted_size()`'s answer,
-        // read fresh each iteration rather than kept in a `Cell` here. Resizes
+        // Terminal size at the last paint is the hub's `painted_size()` answer
+        // (the manager's own), read fresh each iteration rather
+        // than kept in a `Cell` here. Resizes
         // are consumed without repainting (see the wait below), so a mismatch at
         // the top of the loop is the "repaint is due, and re-anchor first"
         // signal (plan §4.2); a *width* change additionally wipes + replays
         // first. The clear bound this pair used to provide is `plan_apply`'s
         // `screen_bottom` now (plan §4.3).
         //
-        // Owning it in the output rather than here also means a resize that
+        // Owning it in the hub rather than here also means a resize that
         // happens *during a turn* is caught when the next prompt opens, instead
         // of being absorbed by a fresh read at entry.
 
@@ -1690,16 +1559,17 @@ impl Repl {
         // lands mid-edit re-flows the bar with the frame instead of leaving a
         // bar sized for the old terminal.
         loop {
-            // On resume from Ctrl-Z (editing phase; the in-flight reader thread
-            // is not running then), re-enter raw mode so the next keystroke is
-            // read correctly. Idempotent; a no-op on every normal iteration.
-            // The shell may have repainted while we were stopped, so re-anchor
-            // the draw cache (DSR) before the next paint (plan §4.2).
-            if RESUMED.swap(false, Ordering::SeqCst) {
-                let _ = self.guard.start();
-                let _ = output.cursor_row();
-            }
-            // Resize detection against the output's `painted_size`. Resize events are
+            // On resume from Ctrl-Z, re-anchor the draw cache (DSR): the shell
+            // may have repainted while we were stopped, so the cached frame
+            // rows can no longer be trusted (plan §4.2). This is
+            // the caret channel's invalidation, drained through the manager
+            // (`poll_caret`) — the reader emits it only after its own
+            // raw-mode re-entry (`RESUMED`), so the DSR below finds raw mode
+            // back; the old loop-local `RESUMED_REANCHOR` flag and its
+            // belt-and-suspenders `resume()` are gone with it.
+            content.manager.lock().unwrap().poll_caret();
+            // Resize detection against the hub's `painted_size` (the manager's
+            // own applied size, not an `Output` verb). Resize events are
             // consumed without repainting (see the wait below), so after a drag
             // this check first fires on the keystroke that triggers the
             // repaint: a size mismatch means "repaint is due, and re-anchor
@@ -1708,10 +1578,15 @@ impl Repl {
             // stale `prev_term_h` used to provide lives in `plan_apply`
             // (`screen_bottom`) now, so a grow's revealed scrollback survives
             // without any state here.
-            let (cur_w_u16, cur_h_u16) = crossterm::terminal::size().unwrap_or((80, 24));
-            let cur_h = cur_h_u16 as usize;
-            let cur_w = cur_w_u16 as usize;
-            let (painted_w, painted_h) = output.painted_size();
+            // The one place that still queries the terminal live: a resize
+            // that produced no event has to be caught somewhere, and this is
+            // the loop that runs per keystroke. The query lives under
+            // `TermIO`'s roof (`manager.probe_size()`) and its answer is
+            // *published* there too, so every reader below and
+            // around consumes the watch rather than a private query.
+            let cur = content.manager.lock().unwrap().probe_size();
+            let (cur_w, cur_h) = (cur.width, cur.height);
+            let (painted_w, painted_h) = content.manager.lock().unwrap().painted_size();
             if cur_w != painted_w || cur_h != painted_h {
                 // Key-triggered repaint after a size change. A *width*
                 // change makes a reflowing terminal (wezterm) re-wrap the
@@ -1729,14 +1604,14 @@ impl Repl {
                     if let Some(s) = app_state.session() {
                         let _ = io::stdout().write_all(b"\x1b[0J");
                         let _ = io::stdout().flush();
-                        crate::agent::replay::replay_last_turn_silent(&s, output).await;
+                        crate::agent::replay::replay_last_turn_silent(&s, content).await;
                     }
                 }
-                let _ = output.cursor_row();
+                let _ = content.manager.lock().unwrap().cursor_row();
             }
-            // Keep the shared width in sync (covers width changes even without
-            // an explicit Resize event, e.g. on some terminals).
-            TERMINAL_WIDTH.store(cur_w, Ordering::SeqCst);
+            // (The watch is already in sync — `probe_size` published as it
+            // answered; the explicit `set_size` call this used to carry
+            // after the compare is gone with it.)
             // --- Eval → outcome → sync → paint, and end the read if that
             // produced an action. The whole sequence lives in `settle`
             // because the turn's `select!` branch runs it too (ui_draw_v2
@@ -1745,33 +1620,31 @@ impl Repl {
             // Everything after it here is the *other* half of the iteration —
             // waiting for a key — which is exactly what the turn has instead
             // of a wait.
-            if let Some(action) = session
-                .settle(output, prompt, history, (cur_w, cur_h))
-                .await
-            {
+            if let Some(action) = session.settle(content, prompt, history).await {
                 return Some(action);
             }
 
             // --- Wait for a key (or a prose-completion wake). While a
-            // prose request is armed/in flight, poll with a deadline so
+            // prose request is armed/in flight, wait with a deadline so
             // the dialog can open (or the debounce fire) without a
             // keystroke; otherwise block as before. Slash frames block —
             // prose state is not consulted while `/` owns the buffer.
             //
-            // Resize events are consumed *here, without repainting*. A drag
-            // emits a stream of them, and repainting per event writes
-            // absolute-positioned frames while a reflowing terminal is still
-            // moving rows around (wezterm) — interleaving that strands stale
-            // frames; xterm doesn't reflow, which is why it never corrupted.
-            // The painted frame is left for the terminal to reflow on its own;
-            // the next keystroke re-anchors via DSR at the top of the loop and
-            // repaints once, against the settled size. ---
-            let prose_wait = if session.editor.chars().first() == Some(&'/') {
+            // Events come from the **persistent reader** (`keys`), the sole
+            // stdin owner — this loop no longer calls `event::poll`/`read`.
+            // Resize reaches here on the channel (the reader
+            // publishes the watch *and* forwards), but never acts: the arms
+            // below republish idempotently and keep waiting, so a drag's
+            // stream cannot force a per-event repaint (which would strand
+            // frames while a reflowing terminal is still moving rows). The
+            // loop-top probe above notices the settled size and repaints
+            // once, re-anchoring via DSR. ---
+            let prose_wait = if session.editor.lock().unwrap().chars().first() == Some(&'/') {
                 None
             } else {
                 session.prose.poll_timeout()
             };
-            let ev: Option<Event> = loop {
+            let ev: Option<InputEvent> = loop {
                 // Keys a window pump parked while nobody could read stdin
                 // (the compaction LLM window — `WindowKeySource`) dispatch
                 // exactly as if they arrived just now: same Resize
@@ -1781,39 +1654,46 @@ impl Repl {
                 // waiting in the tty.
                 if let Some(parked) = app_state.take_parked_key() {
                     match parked {
-                        Event::Resize(w, _) => {
-                            TERMINAL_WIDTH.store(w as usize, Ordering::SeqCst);
+                        InputEvent::Resize(size) => {
+                            content.manager.lock().unwrap().set_size(size);
                             continue;
                         }
                         e => break Some(e),
                     }
                 }
-                let e = match prose_wait {
-                    Some(d) => match event::poll(d) {
-                        Ok(true) => event::read(),
-                        Ok(false) => break None, // prose wake: re-eval
-                        Err(_) => return None,
+                // One event off the reader's queue. A deadline when a prose
+                // request may wake us; a block otherwise. The reader is the
+                // sole sender and lives for the process, so a `None` here means
+                // it is gone — treated as a read error, as `event::read`'s `Err`
+                // was.
+                let e: Option<InputEvent> = match prose_wait {
+                    Some(d) => match tokio::time::timeout(d, keys.recv()).await {
+                        Ok(Some(ev)) => Some(ev),
+                        Ok(None) => return None,
+                        Err(_) => break None, // prose wake: re-eval
                     },
-                    None => event::read(),
+                    None => keys.recv().await,
                 };
                 match e {
-                    Ok(Event::Resize(w, _)) => {
-                        // Track the width for renderers; the repaint is
-                        // deferred to the next key / content wake.
-                        TERMINAL_WIDTH.store(w as usize, Ordering::SeqCst);
+                    // The reader's forwarded Resize: republish —
+                    // idempotent, the reader already published it — and keep
+                    // waiting rather than treating it as a key. A drag never
+                    // repaints per event; the loop-top probe settles it.
+                    Some(InputEvent::Resize(size)) => {
+                        content.manager.lock().unwrap().set_size(size);
                         continue;
                     }
-                    Ok(e) => break Some(e),
-                    Err(_) => return None,
+                    Some(e) => break Some(e),
+                    None => return None,
                 }
             };
             // --- Dispatch one key. ---
             match ev {
-                Some(Event::Key(key)) => {
+                Some(InputEvent::Key(key)) => {
                     // Ctrl-C: restore terminal, hard exit.
                     if let KeyCode::Char('c') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            let _ = self.guard.stop();
+                            content.manager.lock().unwrap().suspend();
                             std::process::exit(1);
                         }
                     }
@@ -1823,7 +1703,7 @@ impl Repl {
                     // handled as a key event rather than relying on the kernel.
                     if let KeyCode::Char('z') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            let _ = self.guard.stop();
+                            content.manager.lock().unwrap().suspend();
                             unsafe {
                                 libc::killpg(libc::getpgrp(), libc::SIGTSTP);
                             }
@@ -1831,7 +1711,7 @@ impl Repl {
                             // resumes here (in the main thread, a safe context)
                             // once the shell sends `SIGCONT`. Re-enter raw mode so
                             // the next keystroke is read correctly.
-                            let _ = self.guard.start();
+                            content.manager.lock().unwrap().resume();
                         }
                     }
                     // The dispatcher. It answers with what *should* happen on
@@ -1842,14 +1722,18 @@ impl Repl {
                     // would otherwise still be live while the argument reads
                     // the same session for its row count.
                     let opts_len = session.opts_len();
-                    match session.handle_key(key, opts_len, prompt, history) {
+                    // The frame's budget comes from the manager — the one
+                    // place a ratio resolves to a row count — at the
+                    // watched height the dispatch already keys off.
+                    let budget = content.manager.lock().unwrap().budget(content.height());
+                    match session.handle_key(key, opts_len, budget, prompt, history) {
                         KeyOutcome::Continue => {}
                         KeyOutcome::RunEditor => {
                             // The wrapper owns the whole turnover — reader
                             // gate, raw mode, DSR re-anchor; no local logic
                             // here (doc/editor_cleanup.md §2). It is shared
                             // because the turn's arm calls it too.
-                            session.open_editor(&self.guard, output);
+                            session.open_editor(content);
                         }
                         KeyOutcome::Action(a) => {
                             if let InputAction::Submit(_) = &a {
@@ -1861,24 +1745,20 @@ impl Repl {
                                 // which is what the *next* compose paints — so
                                 // the first keystroke of the turn, or the next
                                 // prompt, put the old text back on screen. Clear
-                                // the real one and paint that.
-                                session.editor.set("");
-                                paint_prompt(
-                                    output,
-                                    prompt,
-                                    &session.editor,
-                                    Vec::new(),
-                                    (cur_w, cur_h),
-                                );
+                                // the real one, resync membership (the submit is a
+                                // transition), and paint that.
+                                session.editor.lock().unwrap().set("");
+                                session.sync_stack(content, prompt);
+                                paint_prompt(content);
                             }
                             return Some(a);
                         }
                     }
                 }
-                Some(Event::Paste(text)) => {
+                Some(InputEvent::Paste(text)) => {
                     session.paste(&text);
                 }
-                Some(_) => {} // other events (mouse): ignored
+                Some(_) => {} // no other input variants today: ignored
                 None => {}    // prose wake with no key: re-eval below
             }
         }
@@ -1886,29 +1766,45 @@ impl Repl {
 
     /// The prompt area's composition: `[Status?, Input, Divider?, Overlay…]`.
     ///
-    /// The twin of [`crate::output::Output::compose_area`] — same body
-    /// ([`crate::output::area_body`]), with the status row arriving as a literal
-    /// `&str` rather than a rendered bar. Two callers, and both need it to be
-    /// *this* composition: the tests, which assert against bytes they wrote, and
-    /// [`rows_grant`], which has to know the rows element's allocation before the
-    /// frame exists. Sharing it is what makes a page one screen of rows by
-    /// construction — a second composer here is how the page size and the
-    /// painted height drifted apart in the first place.
+    /// The membership `sync_stack` builds for production, minus the rendered
+    /// bar — the status row arrives as a literal `&str` instead. Two callers,
+    /// and both need it to be *this* composition: the tests, which assert
+    /// against bytes they wrote, and [`rows_grant`], which has to know the rows
+    /// element's allocation before the frame exists. Sharing it is what makes
+    /// a page one screen of rows by construction — a second composer here is
+    /// how the page size and the painted height drifted apart in the first
+    /// place.
+    ///
+    /// No width: the input element lays itself out at the width it is asked
+    /// at, so there is nothing to snapshot here. The not-streaming
+    /// flag is safe in both callers' worlds — the tests are between turns,
+    /// and `rows_grant` only runs with an overlay up, which means a
+    /// non-empty buffer, which means the input is visible under either flag.
     pub(crate) fn compose_elements(
-        editor: &LineEditor,
+        editor: &Arc<Mutex<LineEditor>>,
         prompt: &str,
         status: Option<&str>,
         overlay: Vec<Element>,
-        term_w: usize,
     ) -> Vec<Element> {
-        let term_w = term_w.max(1);
-        let layout = editor.layout(term_w, prompt);
-        let input = Element::input(layout, prompt.to_string());
+        let input = input(
+            editor.clone(),
+            prompt.to_string(),
+            Arc::new(AtomicBool::new(false)),
+        );
         let mut items: Vec<Element> = Vec::new();
         if let Some(bar) = status {
             items.push(Element::lines(vec![bar.to_string()]));
         }
-        items.extend(crate::output::area_body(Some(input), overlay));
+        items.push(input);
+        // The divider arrives *with* the overlay, never on its own: a
+        // separator with nothing below it is a rule nobody wanted, and an
+        // empty overlay has no element to draw either (ui_draw_v2 §5.1.1).
+        // This is the rule `sync_stack` builds production's membership by —
+        // both must agree, so it is stated once, here.
+        if !overlay.is_empty() {
+            items.push(Element::divider());
+        }
+        items.extend(overlay);
         items
     }
 
@@ -1916,12 +1812,12 @@ impl Repl {
     /// no output handle to go through.
     ///
     /// `#[cfg(test)]` on purpose: it is the only remaining way to reach the pure
-    /// pipeline outside `Output::draw_elements`, so production *cannot* build a
+    /// pipeline outside the manager's `render`, so production *cannot* build a
     /// frame by hand. Dropping the `cfg` would silently reintroduce the second
     /// pipeline that `ui.rs` used to have (ui_draw_v2 §5.1.1).
     #[cfg(test)]
     pub(crate) fn compose_frame(
-        editor: &LineEditor,
+        editor: &Arc<Mutex<LineEditor>>,
         prompt: &str,
         status: Option<&str>,
         overlay: Vec<Element>,
@@ -1929,9 +1825,10 @@ impl Repl {
         term_h: usize,
     ) -> Frame {
         let term_w = term_w.max(1);
-        let elements = Self::compose_elements(editor, prompt, status, overlay, term_w);
-        let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
-        let heights = allocate(&extents, live_budget(term_h.max(1)));
+        let elements = Self::compose_elements(editor, prompt, status, overlay);
+        let asks: Vec<RowAsk> = elements.iter().map(|e| e.ask(term_w)).collect();
+        let term_h = term_h.max(1);
+        let heights = allocate(&asks, term_h, live_budget(term_h));
         render(&elements, &heights, term_w)
     }
 
@@ -1957,6 +1854,9 @@ impl Repl {
         buf: &str,
         cursor_char: usize,
         key: crate::slashdot_menu::HostKey,
+        // The watched width, read by the caller off its session —
+        // a parameter because this is a static helper with no session.
+        width: usize,
     ) -> V25Frame {
         use crate::slashdot_menu::node_impl::MenuResult;
         // Max rewrites before we call it a cycle. Normal chains are
@@ -1975,7 +1875,7 @@ impl Repl {
                 .unwrap_or(buf.len());
             let cursor = byte_in_buf.saturating_sub(buf.len() - line.len());
             match handle
-                .eval_prompt_with_cursor(&line, key, crate::output::term_width(), cursor)
+                .eval_prompt_with_cursor(&line, key, width, cursor)
                 .await
             {
                 MenuResult::ContinuePrompt(new_prompt) => {
@@ -2028,7 +1928,7 @@ impl Repl {
     pub(crate) async fn batch_slash(
         app_state: &Arc<AppState>,
         input: &str,
-        output: &dyn Output,
+        content: &Content,
         history: &mut History,
     ) -> Option<InputAction> {
         use crate::slashdot_menu::node_impl::MenuResult;
@@ -2042,7 +1942,7 @@ impl Repl {
         }
         let mut menu = crate::v25_menu::build_menu(app_state);
         let mut handle = menu.get_handle();
-        let width = crate::output::term_width();
+        let width = content.width();
         let mut buf = input.to_string();
         // Prompt of the last Continue — the node an Enter acts on. `None`
         // means "derive passively before pressing".
@@ -2087,11 +1987,11 @@ impl Repl {
                     press_enter = true;
                 }
                 MenuResult::DoneSuccess(msg, prompt) => {
-                    Self::batch_commit(output, history, &prompt, msg.as_deref());
+                    Self::batch_commit(content, history, &prompt, msg.as_deref());
                     return Some(InputAction::MenuDone);
                 }
                 MenuResult::DoneError(err, prompt) => {
-                    Self::batch_commit(output, history, &prompt, Some(&err));
+                    Self::batch_commit(content, history, &prompt, Some(&err));
                     return Some(InputAction::MenuDone);
                 }
             }
@@ -2104,12 +2004,12 @@ impl Repl {
     /// Echo a batch-committed prompt to the transcript and surface the
     /// node's message — the drawing-free counterpart of `emit_commit`
     /// (no input region to clear, no prefill to seed).
-    fn batch_commit(output: &dyn Output, history: &mut History, prompt: &str, msg: Option<&str>) {
+    fn batch_commit(content: &Content, history: &mut History, prompt: &str, msg: Option<&str>) {
         let committed = format!("/{}", prompt);
         history.add(&committed);
-        output.display_plain(&committed);
+        content.display_plain(&committed);
         if let Some(m) = msg {
-            output.display_text(m);
+            content.display_text(m);
         }
     }
 
@@ -2175,11 +2075,10 @@ impl Repl {
     /// The status bar follows underneath without being asked for: the commit is
     /// written at the caret, which pushes the tracked row down, so the next
     /// frame apply draws the area below what was just written.
-    fn emit_commit<F: Fn(&LineEditor, Vec<Element>, (usize, usize))>(
-        output: &dyn Output,
-        editor: &mut LineEditor,
+    fn emit_commit<F: Fn()>(
+        content: &Content,
+        editor: &Arc<Mutex<LineEditor>>,
         redraw: &F,
-        dims: (usize, usize),
         line: &str,
         next_input: &str,
         history: &mut History,
@@ -2192,9 +2091,14 @@ impl Repl {
         // No DSR here: the draw cache's tracked row is the steady-state
         // anchor, content writes advance it, and a foreign
         // screen writer ($EDITOR through `run_editor`) re-anchors on exit
-        // (plan §4.2). Clear the input region, then echo the line
-        // at the caret the frame apply left.
-        redraw(&LineEditor::new(), Vec::new(), dims);
+        // (plan §4.2). Reset the buffer, clear the input region by painting
+        // it, then echo the line at the caret the frame apply left. The
+        // reset leads rather than trails the paint: the closure
+        // paints through the shared handle, so what it shows *is* the
+        // editor — an empty one, which is what every caller's
+        // `next_input` (`""`) asks for.
+        editor.lock().unwrap().set(next_input);
+        redraw();
         // Bracketed by rules, the way a turn is — and, when a prompt follows
         // directly, sharing one with it rather than stacking two (ui_draw_v2
         // R4). A committed line is a real event in the transcript — `/thinking
@@ -2204,8 +2108,7 @@ impl Repl {
         // underneath, because the next `redraw` repaints the frame below
         // whatever was just written: content written at the caret pushes the
         // tracked row down, and the next apply clears from *there*.
-        output.display_committed_prompt(line);
-        editor.set(next_input);
+        content.display_committed_prompt(line);
     }
 
     /// Apply a normal editing key to the line editor. Returns `Some(action)`
@@ -2218,6 +2121,11 @@ impl Repl {
         editor: &mut LineEditor,
         history: &mut History,
         prompt: &str,
+        // The watched width: `visual_up`/`visual_down` lay the
+        // buffer out against it. A parameter rather than a session read so
+        // the unit tests drive `edit_key` with no session at all — they pin
+        // 80, the seed every geometry had when the read was global.
+        width: usize,
     ) -> Option<InputAction> {
         match key.code {
             KeyCode::Enter => {
@@ -2295,10 +2203,10 @@ impl Repl {
                 None
             }
             KeyCode::Up => {
-                let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
+                let w = width;
                 // Not on the first visual row: this is cursor movement inside a
                 // multi-line line, not recall.
-                if !editor.visual_up(w as usize, prompt) {
+                if !editor.visual_up(w, prompt) {
                     // History is browsed only from an *empty* line, plus while a
                     // walk is in progress — the recalled entry on screen is not
                     // a draft, so `Up` keeps stepping back through it. Any text
@@ -2315,8 +2223,8 @@ impl Repl {
                 None
             }
             KeyCode::Down => {
-                let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
-                if !editor.visual_down(w as usize, prompt) {
+                let w = width;
+                if !editor.visual_down(w, prompt) {
                     // Forward-only: `Down` moves through a walk that `Up` began,
                     // and does nothing at all otherwise. With no walk in progress
                     // `nav` is `None` — the line is either empty or the user's own
@@ -2332,6 +2240,24 @@ impl Repl {
             _ => None,
         }
     }
+}
+
+/// Visual layout of an editor buffer for one element render: the wrapped
+/// content-only rows (the prompt renders separately on row 0) plus the cursor.
+///
+/// The input element's data contract, and repl's alone: [`LineEditor::layout`]
+/// produces it and [`InputItem`] consumes it inside `render` (no side of the
+/// contract is above this module: the element pulls the editor).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Layout {
+    /// Content-only visual rows (the prompt is rendered separately on row 0).
+    pub rows: Vec<String>,
+    /// Visual row (0-based) the cursor is on.
+    pub cursor_row: usize,
+    /// Absolute column (0-based) the cursor is on, counting the prompt on row 0.
+    pub cursor_col: usize,
+    /// Total visual rows.
+    pub row_count: usize,
 }
 
 /// A flat character buffer + cursor for multi-line editing, plus the `Up`/`Down`
@@ -2777,18 +2703,6 @@ impl LineEditor {
     }
 }
 
-/// Visual layout of a [`LineEditor`] buffer.
-pub struct Layout {
-    /// Content-only visual rows (the prompt is rendered separately on row 0).
-    pub rows: Vec<String>,
-    /// Visual row (0-based) the cursor is on.
-    pub cursor_row: usize,
-    /// Absolute column (0-based) the cursor is on, counting the prompt on row 0.
-    pub cursor_col: usize,
-    /// Total visual rows.
-    pub row_count: usize,
-}
-
 /// Word-boundary wrap of one logical line (no `'\n'`). Returns, for each
 /// visual row, the `(start, end_exclusive)` char range **within `line`**, and if
 /// `cursor` is `Some`, the `(row, col)` where that char lands (`col` is the
@@ -3002,108 +2916,14 @@ fn history_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A shared editor for a test — the `Arc<Mutex<LineEditor>>` handle the
+    /// input element and `compose_frame` want, seeded through a scoped lock.
+    fn shared(build: impl FnOnce(&mut LineEditor)) -> Arc<Mutex<LineEditor>> {
+        let e = Arc::new(Mutex::new(LineEditor::new()));
+        build(&mut e.lock().unwrap());
+        e
+    }
     use super::*;
-    use crossterm::event::KeyEvent;
-
-    /// The in-flight reader's routing policy: which events may wait, and which
-    /// may not.
-    ///
-    /// Pinned as a *correctness* property rather than a preference — "an abort
-    /// cannot ride behind a paste backlog" (ui_draw_v2 §4.5) — and the
-    /// channel's unboundedness follows from it: a bounded one that filled would
-    /// block the reader at precisely the moment it has to deliver `Ctrl-C`.
-    ///
-    /// `Esc` used to be in this list and is deliberately gone from it now, for
-    /// the reason [`esc_is_forwarded_so_the_turn_can_decide`] pins.
-    #[test]
-    fn an_abort_never_queues_behind_content() {
-        let urgent = [
-            (
-                "Ctrl-C",
-                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            ),
-            (
-                "Ctrl-Z",
-                Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
-            ),
-            ("Resize", Event::Resize(120, 40)),
-        ];
-        for (what, ev) in urgent {
-            assert_eq!(
-                route_event(&ev),
-                ReaderRoute::Inline,
-                "{} must be handled inline, never queued",
-                what
-            );
-        }
-    }
-
-    /// `Esc` is forwarded, and that is the fix for the settled menu-first rule
-    /// (ui_draw_v2 §4.5, "abort only at root").
-    ///
-    /// It could not be decided where it used to be decided: routing `Esc`
-    /// Inline here meant routing it to *abort*, with no way to ask whether a
-    /// menu was open, because this function has no session to look at. Moving
-    /// it to the forwarded path is what lets the turn answer the question
-    /// correctly — step the ladder when a menu is up, stop the turn when there
-    /// is not. The trade is stated in [`route_event`]'s doc: a root `Esc` now
-    /// rides the queue like any other key.
-    #[test]
-    fn esc_is_forwarded_so_the_turn_can_decide() {
-        let ev = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(route_event(&ev), ReaderRoute::Forward);
-    }
-
-    /// Everything the prompt can hold is content, and content goes to the turn
-    /// instead of being dropped the way it was before U4.2.
-    #[test]
-    fn what_the_prompt_can_hold_is_forwarded() {
-        let content = [
-            (
-                "a character",
-                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
-            ),
-            (
-                "Enter",
-                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            ),
-            (
-                "Shift+Enter (a newline)",
-                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
-            ),
-            (
-                "Up",
-                Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-            ),
-            (
-                "Backspace",
-                Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
-            ),
-            ("a paste", Event::Paste("hello world".to_string())),
-        ];
-        for (what, ev) in content {
-            assert_eq!(
-                route_event(&ev),
-                ReaderRoute::Forward,
-                "{} is content for the prompt",
-                what
-            );
-        }
-    }
-
-    /// Events with nowhere to go keep their old fate instead of being
-    /// forwarded, so the channel carries no more than the prompt could ever
-    /// show.
-    #[test]
-    fn events_with_nowhere_to_go_stay_inline() {
-        let ev = Event::Mouse(crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Moved,
-            column: 3,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(route_event(&ev), ReaderRoute::Inline);
-    }
 
     /// A committed line is bracketed by rules: one above, one below, and the
     /// line between them.
@@ -3118,18 +2938,19 @@ mod tests {
     ///
     /// What is asserted is the *order and kind* of the three writes, which is
     /// the whole contract: `display_separator`, `display_plain`, `display_separator`.
-    // `#[serial]`: this test pins the process-global `TERMINAL_WIDTH`, and the
-    // `output` tests pin it to their own widths through `capturing_output`. Two
-    // tests that write the same global must not run concurrently, or one
-    // renders at the other's width and reports a phantom row-accounting
-    // failure. (Parallel-only: the whole suite passes under `--test-threads=1`.)
     #[test]
-    #[serial_test::serial]
     fn a_committed_line_is_written_between_two_rules() {
         let reasoning = crate::settings::default_show_reasoning_handle();
-        crate::repl::TERMINAL_WIDTH.store(80, std::sync::atomic::Ordering::SeqCst);
-        let out = crate::output::ConsoleOutput::new(reasoning);
-        let mut editor = LineEditor::new();
+        // The width is per-instance state (`with_size`
+        // seeds a private size watch), so no serialization is needed.
+        let out = Content::with_size(
+            reasoning,
+            crate::termio::TermSize {
+                width: 80,
+                height: 24,
+            },
+        );
+        let editor = Arc::new(Mutex::new(LineEditor::new()));
         // Built by hand rather than `History::load()`, which reads the real
         // history file — a test that depends on the machine's `~/.picocode`, and
         // `add` would then write to it.
@@ -3143,15 +2964,7 @@ mod tests {
         // The redraw closure is a no-op: this test is about what `emit_commit`
         // writes, and the real closure's frame apply is covered by the REPL's
         // own tests. Passing a real one here would only add a bar row to search.
-        Repl::emit_commit(
-            &out,
-            &mut editor,
-            &|_, _, _| {},
-            (80, 24),
-            line,
-            "",
-            &mut history,
-        );
+        Repl::emit_commit(&out, &editor, &|| {}, line, "", &mut history);
         let bytes = out.end_capture();
         let text = String::from_utf8_lossy(&bytes);
 
@@ -3173,7 +2986,7 @@ mod tests {
         // And the editor is re-seeded for the next prompt, so the committed text
         // is not left in the input row as if it were still being typed.
         assert_eq!(
-            editor.text(),
+            editor.lock().unwrap().text(),
             "",
             "the input row is cleared for the next prompt"
         );
@@ -3209,33 +3022,23 @@ mod tests {
             .collect()
     }
 
-    /// A `ConsoleOutput` carrying a status, plus the redraw `emit_commit`
+    /// A `Content` carrying a status, plus the redraw `emit_commit`
     /// expects: compose the area and draw it, the way `read_input` does.
-    fn commit_harness() -> (crate::output::ConsoleOutput, LineEditor) {
+    fn commit_harness() -> (Content, Arc<Mutex<LineEditor>>) {
         let reasoning = crate::settings::default_show_reasoning_handle();
-        crate::repl::TERMINAL_WIDTH.store(40, Ordering::SeqCst);
-        let out = crate::output::ConsoleOutput::new(reasoning);
-        out.set_status(&crate::agent::status::status_text(
-            Some("sess"),
-            None,
-            crate::agent::status::BarModel {
-                provider: "llamacpp",
-                model: "test",
-                thinking: None,
-                context_tokens: 0,
-                context_limit: None,
+        let out = Content::with_size(
+            reasoning,
+            crate::termio::TermSize {
+                width: 40,
+                height: 24,
             },
-        ));
-        (out, LineEditor::new())
+        );
+        (out, Arc::new(Mutex::new(LineEditor::new())))
     }
 
-    fn redraw_fn(
-        out: &crate::output::ConsoleOutput,
-    ) -> impl Fn(&LineEditor, Vec<Element>, (usize, usize)) + '_ {
-        move |editor: &LineEditor, overlay: Vec<Element>, dims: (usize, usize)| {
-            let input = input_element(editor, "> ", out.is_streaming(), dims.0);
-            out.draw_elements(Some(input), overlay, ApplyPolicy::Frame, dims);
-        }
+    fn redraw_fn<'o>(out: &'o Content, _editor: &Arc<Mutex<LineEditor>>) -> impl Fn() + 'o {
+        // The membership is already configured; the redraw just applies it.
+        move || paint_prompt(out)
     }
 
     /// Two committed prompts render as two rule-pairs with **no blank row
@@ -3247,21 +3050,20 @@ mod tests {
     /// (its status and input rows), and if the re-draw's position leaves a row
     /// of air, the next commit's opening rule lands below it.
     #[test]
-    #[serial_test::serial]
     fn two_committed_prompts_render_without_a_blank_between_their_rules() {
-        let (out, mut editor) = commit_harness();
+        let (out, editor) = commit_harness();
         let mut history = History {
             entries: Vec::new(),
             file: None,
         };
-        let redraw = redraw_fn(&out);
+        let redraw = redraw_fn(&out, &editor);
 
         out.begin_capture();
         for line in [
             "/model xiaomimimo:mimo-v2.6-flash activate",
             "/reasoning high",
         ] {
-            Repl::emit_commit(&out, &mut editor, &redraw, (40, 24), line, "", &mut history);
+            Repl::emit_commit(&out, &editor, &redraw, line, "", &mut history);
         }
         let rows = screen_rows(&out.end_capture());
 
@@ -3300,23 +3102,21 @@ mod tests {
     /// its own trailing blank, and the commit's opening rule has to land on the
     /// row directly after it rather than be absorbed into the gap.
     #[test]
-    #[serial_test::serial]
     fn a_committed_prompt_after_turn_content_keeps_its_upper_rule() {
-        let (out, mut editor) = commit_harness();
+        let (out, editor) = commit_harness();
         let mut history = History {
             entries: Vec::new(),
             file: None,
         };
-        let redraw = redraw_fn(&out);
+        let redraw = redraw_fn(&out, &editor);
 
         out.begin_capture();
         // Turn content the way a real turn leaves it: output ending in a blank.
         out.display_plain("git status output line\nmore output\n");
         Repl::emit_commit(
             &out,
-            &mut editor,
+            &editor,
             &redraw,
-            (40, 24),
             "Great, nice work! Please commit your changes.",
             "",
             &mut history,
@@ -3389,18 +3189,19 @@ mod tests {
     #[test]
     fn batch_slash_reasoning_high_commits_in_one_enter() {
         let state = batch_state();
-        let (out, lines) = crate::output::RecordingOutput::new();
+        let content = Content::for_test();
+        content.begin_capture();
         let action = crate::agent::block_on_test(Repl::batch_slash(
             &state,
             "/reasoning high",
-            out.as_ref(),
+            &content,
             &mut batch_hist(),
         ));
         assert!(matches!(action, Some(InputAction::MenuDone)));
         // The node wrote the runtime target; the loop's convergence step
         // would apply it on the same cycle.
         assert_eq!(state.reasoning().as_deref(), Some("high"));
-        let captured = crate::output::RecordingOutput::joined(&lines);
+        let captured = String::from_utf8_lossy(&content.end_capture()).into_owned();
         assert!(
             captured.contains("reasoning high"),
             "committed line not echoed: {:?}",
@@ -3411,11 +3212,11 @@ mod tests {
     #[test]
     fn batch_slash_quit_latches_control_target() {
         let state = batch_state();
-        let (out, _lines) = crate::output::RecordingOutput::new();
+        let content = Content::quiet();
         let action = crate::agent::block_on_test(Repl::batch_slash(
             &state,
             "/quit",
-            out.as_ref(),
+            &content,
             &mut batch_hist(),
         ));
         assert!(matches!(action, Some(InputAction::MenuDone)));
@@ -3427,12 +3228,12 @@ mod tests {
         // Empty, prose, and the `/q` alias fall back to raw `Submit`
         // (the agent loop's `/q`/`exit` arm keeps owning them).
         let state = batch_state();
-        let (out, _lines) = crate::output::RecordingOutput::new();
+        let content = Content::quiet();
         for line in ["", "hello", "/q"] {
             let action = crate::agent::block_on_test(Repl::batch_slash(
                 &state,
                 line,
-                out.as_ref(),
+                &content,
                 &mut batch_hist(),
             ));
             assert!(action.is_none(), "{:?} should fall through", line);
@@ -3442,11 +3243,11 @@ mod tests {
     #[test]
     fn batch_slash_unknown_command_returns_instead_of_hanging() {
         let state = batch_state();
-        let (out, _lines) = crate::output::RecordingOutput::new();
+        let content = Content::quiet();
         let action = crate::agent::block_on_test(Repl::batch_slash(
             &state,
             "/definitely-not-a-command",
-            out.as_ref(),
+            &content,
             &mut batch_hist(),
         ));
         // Whatever the engine reports for garbage input, the driver must
@@ -3760,7 +3561,7 @@ mod tests {
     fn recalled_newest() -> (History, LineEditor) {
         let mut h = recall_hist();
         let mut ed = LineEditor::new();
-        Repl::edit_key(up_key(), &mut ed, &mut h, "");
+        Repl::edit_key(up_key(), &mut ed, &mut h, "", 80);
         assert_eq!(ed.text(), "third");
         (h, ed)
     }
@@ -3801,13 +3602,13 @@ mod tests {
         // over a draft, this is the test that has to be re-read.
         let mut h = recall_hist();
         let mut ed = LineEditor::new();
-        Repl::edit_key(up_key(), &mut ed, &mut h, "");
+        Repl::edit_key(up_key(), &mut ed, &mut h, "", 80);
         assert_eq!(
             ed.draft, "",
             "recall starts on an empty line, so nothing to stash"
         );
         ed.set_recalled("second");
-        Repl::edit_key(up_key(), &mut ed, &mut h, "");
+        Repl::edit_key(up_key(), &mut ed, &mut h, "", 80);
         assert_eq!(ed.draft, "");
     }
 
@@ -3822,7 +3623,7 @@ mod tests {
         let mut h = recall_hist();
         let mut editor = LineEditor::from_text("in progress");
         editor.end();
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(
             editor.text(),
             "in progress",
@@ -3842,7 +3643,7 @@ mod tests {
         // (the original reason Up-on-top exists) is preserved.
         let mut h = recall_hist();
         let mut editor = LineEditor::new();
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(
             editor.text(),
             "third",
@@ -3861,11 +3662,11 @@ mod tests {
         // `browsable = text.is_empty() || nav.is_some()`.
         let mut h = recall_hist();
         let mut editor = LineEditor::new();
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "third");
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "second");
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "third");
     }
 
@@ -3879,7 +3680,7 @@ mod tests {
         let (mut h, mut editor) = recalled_newest();
         editor.insert_str(" EDITED");
         assert_eq!(editor.text(), "third EDITED");
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(
             editor.text(),
             "third EDITED",
@@ -3895,7 +3696,7 @@ mod tests {
         let mut h = recall_hist();
         let mut editor = LineEditor::from_text("half-written thought");
         editor.end();
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "half-written thought");
     }
 
@@ -3907,18 +3708,19 @@ mod tests {
         // ends the walk, so the next Down does nothing.
         let mut h = recall_hist();
         let mut editor = LineEditor::new();
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "second");
         Repl::edit_key(
             event::KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
             &mut editor,
             &mut h,
             "",
+            80,
         );
         assert_eq!(editor.text(), "");
         assert!(editor.nav.is_none(), "clearing the line ends the walk");
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(
             editor.text(),
             "",
@@ -3932,7 +3734,7 @@ mod tests {
         // be overwritten by the next `Up` with nothing stashed to recover it.
         let (mut h, mut editor) = recalled_newest();
         editor.insert_str(" EDITED");
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "third EDITED");
     }
 
@@ -3945,7 +3747,7 @@ mod tests {
         // `replace_range` for the prose completion splice).
         let mut h = recall_hist();
         let mut editor = LineEditor::new();
-        Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert!(editor.nav.is_some());
         // Cursor moves are not content writes and must keep the walk alive —
         // this is what lets `Up`/`Down` move the caret inside a recalled
@@ -3967,7 +3769,7 @@ mod tests {
             ("set", 7),
         ] {
             let mut ed = LineEditor::new();
-            Repl::edit_key(up_key(), &mut ed, &mut h, "");
+            Repl::edit_key(up_key(), &mut ed, &mut h, "", 80);
             assert!(ed.nav.is_some(), "{what}: recall to start from");
             match f {
                 1 => ed.insert_str("x"),
@@ -3996,12 +3798,12 @@ mod tests {
         // editor that `read_input` clears on submit now carries the reset.
         let mut h = recall_hist();
         let mut editor = LineEditor::new();
-        Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         // Submit: the buffer is cleared and the line recorded (repl.rs:1707).
         editor.set("");
         h.add("third");
         assert!(editor.nav.is_none());
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "third", "recall starts at the newest entry");
     }
 
@@ -4023,12 +3825,12 @@ mod tests {
         );
         // …and the walk still works: `Up` steps one entry further back.
         h.add("/model");
-        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(up_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "second", "Up still walks the history");
         // `Down` likewise, and back to the newest entry rather than locking.
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "third");
-        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "");
+        let _ = Repl::edit_key(down_key(), &mut editor, &mut h, "", 80);
         assert_eq!(editor.text(), "/model", "Down reaches the newest entry");
     }
 
@@ -4052,8 +3854,8 @@ mod tests {
         h.add("older line");
         h.add("/model");
         let mut sess = PromptSession::new(None, &batch_state());
-        Repl::edit_key(up_key(), &mut sess.editor, &mut h, "");
-        assert_eq!(sess.editor.text(), "/model");
+        Repl::edit_key(up_key(), &mut sess.editor.lock().unwrap(), &mut h, "", 80);
+        assert_eq!(sess.editor.lock().unwrap().text(), "/model");
         sess.pending_key = Some(crate::slashdot_menu::HostKey::Tab);
         let outcome = crate::agent::block_on_test(sess.eval());
         assert!(
@@ -4064,14 +3866,22 @@ mod tests {
             matches!(sess.overlay, ActiveOverlay::V25Menu { .. }),
             "recalling a `/`-command re-opens its menu"
         );
-        assert_eq!(sess.editor.text(), "/model ", "the menu rewrote the prompt");
+        assert_eq!(
+            sess.editor.lock().unwrap().text(),
+            "/model ",
+            "the menu rewrote the prompt"
+        );
         assert!(
-            sess.editor.nav.is_some(),
+            sess.editor.lock().unwrap().nav.is_some(),
             "the rewrite must not end the walk"
         );
         // …and history still answers.
-        let _ = Repl::edit_key(up_key(), &mut sess.editor, &mut h, "");
-        assert_eq!(sess.editor.text(), "older line", "Up still walks history");
+        let _ = Repl::edit_key(up_key(), &mut sess.editor.lock().unwrap(), &mut h, "", 80);
+        assert_eq!(
+            sess.editor.lock().unwrap().text(),
+            "older line",
+            "Up still walks history"
+        );
     }
 
     #[test]
@@ -4101,7 +3911,7 @@ mod tests {
         // marked and every continuation indented under the option text.
         use crate::slashdot_menu::render::{paint_rows, LogicalLine};
         let long = "deepseek:deepseek-v4-flash ctx 1048576 $0.000000435/0.00000087 per M (est) and some extra trailing text to force a wrap";
-        let wrapped = crate::output::wrap(long, 60);
+        let wrapped = crate::content::text::wrap(long, 60);
         assert!(wrapped.len() > 1, "long option must wrap at 60 cols");
         let s = paint_rows(&[LogicalLine::new(wrapped.join("\n"))], Some(0), &[], 60);
         assert!(s.heights[0] > 1, "the option wraps: {:?}", s.heights);
@@ -4159,7 +3969,7 @@ mod tests {
     }
 
     // `next_input_row` / `clear_rows_to` were folded into `plan_apply` by
-    // ui_draw_v2 P3; their cases live on in `ui::frame::apply_tests`
+    // ui_draw_v2 P3; their cases live on in `draw::apply_tests`
     // (`frame_tracks_scroll_then_stays_on_shrink`,
     // `full_clears_nothing_when_frame_sits_below_the_old_bottom`,
     // `grow_preserves_revealed_rows_below_old_bottom`).
@@ -4578,14 +4388,15 @@ mod tests {
     // ===== vt100 terminal-emulator tests =====
     //
     // Build the frame production draws — `Repl::compose_frame` →
-    // `plan_apply`, i.e. the exact bytes `Output::draw_frame` writes
+    // `plan_apply`, i.e. the exact bytes the manager's frame apply writes
     // (ONLCR-translated by [`onlcr`]) — and feed them through a real vt100
     // terminal emulator. This checks both visible cell content and the final
     // cursor position — the strongest test possible without a real TTY.
     #[cfg(test)]
     mod vt100_tests {
+        use crate::draw::{plan_apply, ApplyPolicy, DrawCache};
         use crate::repl::{LineEditor, Repl};
-        use crate::ui::frame::{plan_apply, ApplyPolicy, DrawCache};
+        use std::sync::{Arc, Mutex};
         use vt100::Parser;
 
         /// Simulate the tty's OPOST/ONLCR: `plan_apply` emits bare `\n` (the
@@ -4604,7 +4415,7 @@ mod tests {
         /// full path with the frame's top at `anchor`. Returns (cursor row,
         /// cursor col, screen rows, post-apply anchor).
         fn render_overlay_through_vt100(
-            editor: &LineEditor,
+            editor: &Arc<Mutex<LineEditor>>,
             width: usize,
             prompt: &str,
             term_rows: usize,
@@ -4613,7 +4424,7 @@ mod tests {
             overlay: &[&str],
             focus: usize,
         ) -> (usize, usize, Vec<String>, usize) {
-            let overlay = crate::repl::test_overlay(overlay, focus, width);
+            let overlay = crate::repl::test_overlay(overlay, focus);
             let frame = Repl::compose_frame(editor, prompt, None, overlay, width, term_rows);
             let mut cache = DrawCache::new(term_rows);
             // The tracked row is the block's position (A3.2): the apply reads it
@@ -4653,7 +4464,7 @@ mod tests {
         /// Input-only variant (no overlay): the pre-existing entry point the
         /// cursor-positioning tests use.
         fn render_through_vt100(
-            editor: &LineEditor,
+            editor: &Arc<Mutex<LineEditor>>,
             width: usize,
             prompt: &str,
             term_rows: usize,
@@ -4673,11 +4484,14 @@ mod tests {
             (cr, cc, rows)
         }
 
+        use super::shared;
+
         #[test]
         fn vt100_cursor_at_start_of_single_line() {
-            let mut e = LineEditor::new();
-            e.insert_str("Hello");
-            e.cursor = 0;
+            let e = shared(|e| {
+                e.insert_str("Hello");
+                e.cursor = 0;
+            });
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             // anchor=10 is 1-indexed; vt100 uses 0-indexed rows, so row = 9
             assert_eq!((cr, cc), (9, 2), "cursor at start should be row 9 col 2");
@@ -4686,9 +4500,10 @@ mod tests {
 
         #[test]
         fn vt100_cursor_at_start_of_multi_line() {
-            let mut e = LineEditor::new();
-            e.insert_str("abc def ghi\njk lm");
-            e.cursor = 0;
+            let e = shared(|e| {
+                e.insert_str("abc def ghi\njk lm");
+                e.cursor = 0;
+            });
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             assert_eq!(
                 (cr, cc),
@@ -4700,9 +4515,10 @@ mod tests {
 
         #[test]
         fn vt100_cursor_at_mid_of_first_line() {
-            let mut e = LineEditor::new();
-            e.insert_str("abc def ghi\njk lm");
-            e.cursor = 4;
+            let e = shared(|e| {
+                e.insert_str("abc def ghi\njk lm");
+                e.cursor = 4;
+            });
             let (cr, cc, _) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             // cursor_col = pcols(2) + index(4) = 6
             assert_eq!((cr, cc), (9, 6), "cursor at pos 4 should be row 9 col 6");
@@ -4710,9 +4526,10 @@ mod tests {
 
         #[test]
         fn vt100_cursor_at_start_of_second_line() {
-            let mut e = LineEditor::new();
-            e.insert_str("abc def ghi\njk lm");
-            e.cursor = 12;
+            let e = shared(|e| {
+                e.insert_str("abc def ghi\njk lm");
+                e.cursor = 12;
+            });
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             // cursor on second visual row (row 10 0-indexed), col 0
             assert_eq!(
@@ -4725,15 +4542,16 @@ mod tests {
 
         #[test]
         fn vt100_user_exact_text_cursor_at_start() {
-            let mut e = LineEditor::new();
-            for c in "some text and more".chars() {
-                e.insert(c);
-            }
-            e.insert_newline();
-            for c in "and even more text in this line".chars() {
-                e.insert(c);
-            }
-            e.cursor = 0;
+            let e = shared(|e| {
+                for c in "some text and more".chars() {
+                    e.insert(c);
+                }
+                e.insert_newline();
+                for c in "and even more text in this line".chars() {
+                    e.insert(c);
+                }
+                e.cursor = 0;
+            });
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             // cursor_row=0 in layout → 0-indexed vt100 row = 9 + 0 = 9
             assert_eq!(
@@ -4760,11 +4578,10 @@ mod tests {
             let text = "some text and more\nand even more text in this line";
             let w = 80usize;
             let prompt = "> ";
-            let mut e = LineEditor::new();
-            e.insert_str(text);
+            let e = shared(|e| e.insert_str(text));
             for pos in 0..=text.len() {
-                e.cursor = pos;
-                let layout = e.layout(w, prompt);
+                e.lock().unwrap().cursor = pos;
+                let layout = e.lock().unwrap().layout(w, prompt);
                 let (cr, cc, _) = render_through_vt100(&e, w, prompt, 24, 80, 10);
                 // vt100 rows are 0-indexed; anchor=10 1-indexed = 9 0-indexed
                 let expected_row = 9 + layout.cursor_row;
@@ -4790,11 +4607,10 @@ mod tests {
             let widths = [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15];
             for text in &texts {
                 for w in &widths {
-                    let mut e = LineEditor::new();
-                    e.insert_str(text);
+                    let e = shared(|e| e.insert_str(text));
                     for pos in 0..=text.len() {
-                        e.cursor = pos;
-                        let layout = e.layout(*w, "> ");
+                        e.lock().unwrap().cursor = pos;
+                        let layout = e.lock().unwrap().layout(*w, "> ");
                         let (cr, cc, _) = render_through_vt100(&e, *w, "> ", 24, 80, 5);
                         // anchor=5 1-indexed = 4 0-indexed
                         assert_eq!(
@@ -4813,9 +4629,10 @@ mod tests {
 
         #[test]
         fn vt100_single_row_no_prompt() {
-            let mut e = LineEditor::new();
-            e.insert_str("Hello");
-            e.cursor = 0;
+            let e = shared(|e| {
+                e.insert_str("Hello");
+                e.cursor = 0;
+            });
             let (cr, cc, rows) = render_through_vt100(&e, 80, "", 24, 80, 5);
             // anchor=5 1-indexed = 4 0-indexed. No prompt, so col=0.
             assert_eq!(
@@ -4834,8 +4651,7 @@ mod tests {
             // fits both the screen and the budget, so nothing scrolls. The
             // overlay must appear directly below the input, the caret must
             // return to the input, and the live frame's anchor must not move.
-            let mut e = LineEditor::new();
-            e.insert_str("hi");
+            let e = shared(|e| e.insert_str("hi"));
             let overlay = ["one", "two", "three"];
             let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 10, &overlay, 0);
@@ -4866,8 +4682,7 @@ mod tests {
             // the cache, and the caret must land on the input row — this is
             // exactly the bug class the old hand-rolled test copy could not
             // catch.
-            let mut e = LineEditor::new();
-            e.insert_str("hi");
+            let e = shared(|e| e.insert_str("hi"));
             let overlay = ["one", "two", "three", "four", "five", "six"];
             let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 20, &overlay, 0);
@@ -4908,7 +4723,7 @@ mod tests {
             // windowed around the selection, so the frame fits at its anchor
             // (row 8 + 16 - 1 = 23 ≤ 24): no scroll, top 1/3 of the screen
             // stays scrollback.
-            let e = LineEditor::new();
+            let e = shared(|_| {});
             let overlay: Vec<String> = (0..100).map(|i| format!("item {i}")).collect();
             let overlay: Vec<&str> = overlay.iter().map(|s| s.as_str()).collect();
             let (cr, cc, rows, anchor) =
@@ -4953,57 +4768,338 @@ mod tests {
         }
     }
 
+    // The input element driven straight through the frame pipeline — no
+    // `compose_frame`, no overlay: just the [`input`] element handed to
+    // `plan_apply`, exactly as draw.rs's input-frame tests did before the crate
+    // split. They moved here because they build the repl's own input
+    // element (`LineEditor` + [`input`]), which the drawing crate no longer
+    // knows about.
+    mod input_frame_tests {
+        use super::super::test_input;
+        use super::shared;
+        use crate::draw::{plan_apply, ApplyPolicy, DrawCache};
+        use crate::render::render;
+        use crate::repl::LineEditor;
+        use std::sync::{Arc, Mutex};
+        use vt100::Parser;
+
+        fn onlcr(s: &str) -> Vec<u8> {
+            s.replace('\n', "\r\n").into_bytes()
+        }
+
+        fn at(rows: usize, cols: usize, n: usize) -> Parser {
+            let mut p = Parser::new(rows as u16, cols as u16, 2000);
+            p.process(&onlcr(&"\n".repeat(n)));
+            p
+        }
+
+        fn feed(p: &mut Parser, chunk: &str) {
+            p.process(&onlcr(chunk));
+        }
+
+        fn row(p: &Parser, r: usize, cols: usize) -> String {
+            (0..cols)
+                .map(|c| {
+                    p.screen()
+                        .cell(r as u16, c as u16)
+                        .map(|cell| cell.contents())
+                        .unwrap_or(" ")
+                        .chars()
+                        .next()
+                        .unwrap_or(' ')
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        }
+
+        /// Put the tracked cursor on 1-based `row` — where a run of content
+        /// lines would have left it.
+        fn cursor_to(cache: &mut DrawCache, row: usize, th: usize) {
+            cache.note_lines(row.saturating_sub(1), th);
+        }
+
+        #[test]
+        fn a_frame_that_grows_below_the_caret_takes_the_caret_with_it() {
+            let e = shared(|e| e.insert_str("abc"));
+            let input = |e: &Arc<Mutex<LineEditor>>, rows: &[usize]| {
+                render(&[test_input(e, "> ")], rows, 20)
+            };
+            let mut cache = DrawCache::new(24);
+            cursor_to(&mut cache, 5, 24);
+            let s1 = plan_apply(&mut cache, &input(&e, &[1]), ApplyPolicy::Frame, 20, 24);
+            // Shift+Enter: a second row appears and the caret moves onto it. The
+            // apply needs no row from anyone — it follows the live frame.
+            e.lock().unwrap().insert_newline();
+            let s2 = plan_apply(&mut cache, &input(&e, &[2]), ApplyPolicy::Frame, 20, 24);
+            let mut p = at(24, 20, 4);
+            feed(&mut p, &s1);
+            feed(&mut p, &s2);
+            assert_eq!(row(&p, 4, 20), "> abc", "first row survives");
+            assert_eq!(
+                p.screen().cursor_position(),
+                (5, 0),
+                "the caret follows the caret onto the new row"
+            );
+            // The next keystroke lands on the new row, and the first keeps its text.
+            e.lock().unwrap().insert_str("d");
+            let s3 = plan_apply(&mut cache, &input(&e, &[2]), ApplyPolicy::Frame, 20, 24);
+            feed(&mut p, &s3);
+            assert_eq!(row(&p, 4, 20), "> abc");
+            assert_eq!(row(&p, 5, 20), "d");
+        }
+
+        #[test]
+        fn consume_walks_to_the_frame_top_at_column_zero_without_erasing() {
+            let mut cache = DrawCache::new(24);
+            let e = shared(|e| e.insert_str("hi there"));
+            let h = e.lock().unwrap().layout(20, "> ").row_count.max(1);
+            let f = render(&[test_input(&e, "> ")], &[h], 20);
+            cursor_to(&mut cache, 5, 24);
+            let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+            let mut p = at(24, 20, 4);
+            feed(&mut p, &s);
+            // The caret is on the input row, out at the prompt's width — not at
+            // column 0, which is the whole reason consume's walk needs its own
+            // `CR`. The exact column is the layout's business, so assert the
+            // property.
+            assert_eq!(cache.tracked_row(), 5, "the frame's caret row");
+            let before = (0..24).map(|r| row(&p, r, 20)).collect::<Vec<_>>();
+            assert_eq!(before[4], "> hi there");
+
+            let (walk, taken) = crate::draw::plan_consume(&mut cache).expect("a live frame");
+            assert_eq!(taken.height(), f.height(), "the same frame comes back");
+            // `EL` is `"\x1b[K"` (draw.rs, private): the fold carries no erase —
+            // the content write clears the rows it enters, the walk does not.
+            assert!(!walk.contains("\x1b[K"), "no erase in the fold: {walk:?}");
+            feed(&mut p, &walk);
+            assert_eq!(
+                p.screen().cursor_position(),
+                (4, 0),
+                "the fold, at column 0 — not the input's column"
+            );
+            let after = (0..24).map(|r| row(&p, r, 20)).collect::<Vec<_>>();
+            assert_eq!(
+                after, before,
+                "the frame still stands as painted — ownership changed, pixels did not"
+            );
+        }
+
+        #[test]
+        fn places_caret_for_input_frame() {
+            let mut cache = DrawCache::new(24);
+            let e = shared(|e| e.insert_str("hi"));
+            let f = render(&[test_input(&e, "> ")], &[1], 20);
+            cursor_to(&mut cache, 5, 24);
+            let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
+            let mut p = at(24, 20, 4);
+            feed(&mut p, &s);
+            // "> hi" at 1-based row 5; caret after "hi" → col 4.
+            assert_eq!(p.screen().cursor_position(), (4, 4));
+            assert_eq!(cache.anchor(), 5);
+        }
+    }
+
     /// **R1: the input is a row between turns and no row at all mid-turn.**
     ///
     /// The contract has three cases, and the third is the one that keeps it from
     /// being "never draw the input": between turns an empty buffer still shows
     /// its row, because that row is what tells the reader where to type.
     ///
-    /// Asserted through [`input_element`] rather than through a composed frame,
-    /// because this is a property of the element's `(must, might)` and a test
-    /// that replayed bytes to find it would pass just as well with the frame
-    /// layer accidentally padding the gap back in.
+    /// Asserted through the element's [`RowAsk`] rather than through a composed
+    /// frame, because this is a property of the element and a test that
+    /// replayed bytes to find it would pass just as well with the frame layer
+    /// accidentally padding the gap back in. The element *pulls*
+    /// the flag and the buffer, so the test drives one element through all
+    /// three states by moving the shared state underneath it — a push-model
+    /// test could only mint three and hope.
     #[test]
     fn an_empty_input_is_a_row_between_turns_and_none_mid_turn() {
-        let empty = LineEditor::new();
+        let editor = shared(|_| {});
+        let streaming = Arc::new(AtomicBool::new(false));
+        let e = input(editor.clone(), "> ".to_string(), streaming.clone());
 
-        // Between turns: the resting row, `must == 1`.
-        let e = input_element(&empty, "> ", false, 60);
+        // Between turns: the resting row, `min == 1`.
         assert_eq!(
-            (e.must, e.might),
-            (1, 1),
+            e.ask(60),
+            RowAsk::fixed(1, 1),
             "an idle REPL keeps its prompt row — it is where input goes"
         );
 
         // Mid-turn, still empty: nothing to submit, so no row and no claim.
-        let e = input_element(&empty, "> ", true, 60);
+        // The *same element* answers — the flag moved under it.
+        streaming.store(true, Ordering::Relaxed);
         assert_eq!(
-            (e.must, e.might),
-            (0, 0),
+            e.ask(60),
+            RowAsk::fixed(0, 0),
             "an empty input mid-turn is not a row"
         );
 
-        // Mid-turn with something typed: an ordinary input again, and `must` is
+        // Mid-turn with something typed: an ordinary input again, and `min` is
         // the caret's row so it can never be squeezed away entirely.
-        let mut typed = LineEditor::new();
-        typed.set("hello");
-        let e = input_element(&typed, "> ", true, 60);
+        editor.lock().unwrap().set("hello");
         assert_eq!(
-            (e.must, e.might),
-            (1, 1),
+            e.ask(60),
+            RowAsk::fixed(1, 1),
             "typed input is drawn mid-turn: the row appears on the first keystroke"
         );
 
         // And through the real pipeline, a zero-row element really yields a zero-row
-        // frame — otherwise `must == might == 0` would only be a claim.
-        use crate::ui::frame::{allocate, live_budget, render};
-        let height = |streaming: bool| {
-            let e = input_element(&empty, "> ", streaming, 60);
-            let heights = allocate(&[e.extent()], live_budget(24));
-            render(&[e], &heights, 60).height()
-        };
-        assert_eq!(height(true), 0, "a hidden input paints no row at all");
-        assert_eq!(height(false), 1, "a resting input paints its row");
+        // frame — otherwise `min == max == 0` would only be a claim.
+        use crate::render::{allocate, live_budget, render};
+        editor.lock().unwrap().set("");
+        let heights = allocate(&[e.ask(60)], 24, live_budget(24));
+        assert_eq!(
+            render(&[e], &heights, 60).height(),
+            0,
+            "a hidden input paints no row at all"
+        );
+        streaming.store(false, Ordering::Relaxed);
+        let e = input(editor.clone(), "> ".to_string(), streaming.clone());
+        let heights = allocate(&[e.ask(60)], 24, live_budget(24));
+        assert_eq!(
+            render(&[e], &heights, 60).height(),
+            1,
+            "a resting input paints its row"
+        );
+    }
+
+    // ---- the input element through the frame pipeline ----
+    //
+    // Relocated from `slashdot_tui`'s `render` tests with the crate split:
+    // they build a [`LineEditor`] and the repl's [`input`] element, so
+    // they belong with the input's owner, not with the generic frame layer.
+    // They exercise the *real* pipeline (`render`, `allocate`, `live_budget`)
+    // rather than a stub, so the contract they pin is unchanged.
+
+    #[test]
+    fn render_input_row_prompt_and_caret() {
+        let e = shared(|e| e.insert_str("hi"));
+        let els = [test_input(&e, "> ")];
+        let f = render(&els, &[1], 20);
+        assert_eq!(f.height(), 1);
+        assert_eq!(f.row(0), "> hi\x1b[K");
+        // Prompt (2) + "hi" (2) = col 4; caret on the frame's only row.
+        assert_eq!(f.caret, Some((0, 4)));
+        assert_eq!(f.spans, vec![(0, 0..1)]);
+        assert_eq!(f.extents, vec![0..7]);
+    }
+
+    #[test]
+    fn render_windowed_input_keeps_caret_visible() {
+        // 6-row input squeezed into 3 rows with the caret on row 5:
+        // window keeps the caret with context above — rows 3..6.
+        let e = shared(|e| e.insert_str("aa\nbb\ncc\ndd\nee\nff")); // caret ends at buffer end
+        {
+            let layout = e.lock().unwrap().layout(20, "> ");
+            assert_eq!(layout.row_count, 6);
+            assert_eq!(layout.cursor_row, 5);
+        }
+        let els = [test_input(&e, "> ")];
+        let f = render(&els, &[3], 20);
+        assert_eq!(f.height(), 3);
+        // Prompt row scrolled out: no "> " on the first visible row.
+        assert_eq!(f.row(0), "dd\x1b[K");
+        assert_eq!(f.row(2), "ff\x1b[K");
+        // Caret at frame row 2, content col 2 (no prompt on this row).
+        assert_eq!(f.caret, Some((2, 2)));
+    }
+
+    /// The sizing declaration is the *trait's* now (§3.2.3), which means
+    /// it can be wrong without the allocator noticing: `allocate` reads the
+    /// ask the element answers, not the impl.
+    ///
+    /// One assertion per kind, because this is the part the refactor moved from
+    /// a `match` into impls — and mutation-checking `must: 1 → 0` on the input
+    /// sailed through the whole suite. A wrong ask here shows up much later as
+    /// a frame squeezed wrong on a short terminal, so it is named instead.
+    #[test]
+    fn each_kind_declares_the_floor_and_want_it_promised() {
+        let e = shared(|e| e.insert_str("hi"));
+        assert_eq!(
+            test_input(&e, "> ").ask(20),
+            RowAsk::fixed(1, e.lock().unwrap().layout(20, "> ").row_count.max(1)),
+            "the caret's own row is the floor: the input can never be squeezed away"
+        );
+        let empty = shared(|_| {});
+        assert_eq!(
+            input(empty.clone(), "> ".into(), Arc::new(AtomicBool::new(true))).ask(20),
+            RowAsk::fixed(0, 0),
+            "an empty mid-turn input claims no rows at all"
+        );
+        assert_eq!(
+            Element::divider().ask(20),
+            RowAsk::fixed(1, 1),
+            "a rule is all-or-nothing"
+        );
+        assert_eq!(
+            Element::lines(vec!["a".to_string(), "b".to_string(), "c".to_string()]).ask(20),
+            RowAsk::fixed(3, 3),
+            "fixed content is served whole in pass 1 — that is what the floor is for"
+        );
+    }
+
+    /// The caret is **frame-relative**, and there is exactly one thing that can
+    /// make that false: an input that is not the first element.
+    ///
+    /// Every caret test in this file puts the input at index 0, where
+    /// `first_row` is 0 — so deleting the offset from `render` passed all 850.
+    /// In production the input is *always* second, behind the status row, and
+    /// `compose_frame`'s tests pass `status: None`, so the offset has never
+    /// been exercised either. The refactor moved this arithmetic out of
+    /// `render`'s `Input` arm into `Rendered::caret`; pin it where it is, and
+    /// pin `spans` while there, since both come from the same `first_row`.
+    #[test]
+    fn the_input_caret_is_offset_by_its_element_first_row() {
+        let e = shared(|e| e.insert_str("hi"));
+        let els = [
+            Element::lines(vec!["bar".to_string()]),
+            test_input(&e, "> "),
+        ];
+        let f = render(&els, &[1, 1], 20);
+        assert_eq!(f.height(), 2);
+        // Frame row 1, not 0 — the status row occupies row 0.
+        assert_eq!(
+            f.caret,
+            Some((1, 4)),
+            "prompt (2) + \"hi\" (2) = col 4, but on the input's own row"
+        );
+        assert_eq!(f.spans, vec![(0, 0..1), (1, 1..2)]);
+    }
+
+    #[test]
+    fn render_full_composition_extents_and_spans() {
+        // REPL composition: input + divider + overlay, allocated heights
+        // straight from `allocate`.
+        let e = shared(|e| e.insert_str("ls -la"));
+        let els = [
+            test_input(&e, "> "),
+            Element::divider(),
+            Element::lines(vec!["one".to_string(), "two".to_string()]),
+        ];
+        let heights = allocate(
+            &els.iter().map(|el| el.ask(80)).collect::<Vec<_>>(),
+            24,
+            live_budget(24),
+        );
+        assert_eq!(heights, vec![1, 1, 2]); // all wants fit in 16
+        let f = render(&els, &heights, 80);
+
+        // Contiguous extents covering the buffer exactly.
+        let mut expect = 0;
+        for r in &f.extents {
+            assert_eq!(r.start, expect);
+            expect = r.end;
+        }
+        assert_eq!(expect, f.buf.len());
+        // Spans tile the frame in element order.
+        assert_eq!(f.spans, vec![(0, 0..1), (1, 1..2), (2, 2..4)]);
+        assert_eq!(f.height(), 4);
+        assert_eq!(f.row(0), "> ls -la\x1b[K");
+        assert!(f.row(1).starts_with("\x1b[2m"));
+        assert_eq!(f.row(3), "two\x1b[K", "`lines` ends a short row with EL");
+        // Caret follows the input element, prompt-inclusive column.
+        assert_eq!(f.caret, Some((0, 8)));
     }
 }
 
@@ -5046,15 +5142,18 @@ mod confirm_tests {
     #[test]
     fn a_confirm_appends_below_an_open_menu() {
         let mut sess = session();
-        sess.overlay = ActiveOverlay::V25Menu {
-            plan: crate::slashdot_menu::render::RenderPlan {
+        sess.overlay = ActiveOverlay::menu(
+            ActiveOverlay::None,
+            crate::slashdot_menu::render::RenderPlan {
                 table_header: None,
                 detail: vec![LogicalLine::new("pick a model")],
                 rows: std::sync::Arc::new(vec![LogicalLine::new("menu-row")]),
                 selected: Some(0),
                 active_rows: vec![],
+                view: None,
+                columns: Vec::new(),
             },
-        };
+        );
         let bridge = ConfirmBridge::new();
         let (reply, _rx) = tokio::sync::oneshot::channel();
         sess.open_confirm(
@@ -5070,11 +5169,11 @@ mod confirm_tests {
         // Compose the whole stack the way `paint` does, then read the frame:
         // element order is the row order, so "where in the stack" is exactly
         // "where on screen".
-        let mut els = overlay_elements(&sess.overlay, 40);
-        els.extend(sess.confirm.as_ref().unwrap().elements(40));
-        let extents: Vec<Extent> = els.iter().map(Element::extent).collect();
-        let heights = crate::ui::frame::allocate(&extents, 40);
-        let frame = crate::ui::frame::render(&els, &heights, 40);
+        let mut els = overlay_elements(&sess.overlay);
+        els.extend(sess.confirm.as_ref().unwrap().elements());
+        let asks: Vec<RowAsk> = els.iter().map(|e| e.ask(40)).collect();
+        let heights = crate::render::allocate(&asks, 24, 40);
+        let frame = crate::render::render(&els, &heights, 40);
         let joined = (0..frame.height())
             .map(|i| frame.row(i).to_string())
             .collect::<Vec<_>>()
@@ -5177,17 +5276,17 @@ mod confirm_tests {
             },
             bridge.port.approvals().clone(),
         );
-        let els = prompt.elements(40);
+        let els = prompt.elements();
         let rows_el = els.last().expect("the rows element");
         assert_eq!(
-            rows_el.extent().must,
+            rows_el.ask(40).resolve(24).must,
             3,
             "all three options are pinned, not just one row"
         );
         // Under a budget that cannot fit the header, the rows still get their
         // three: `allocate` serves every `must` before any `might`.
-        let all: Vec<_> = els.iter().map(Element::extent).collect();
-        let heights = crate::ui::frame::allocate(&all, 3);
+        let all: Vec<RowAsk> = els.iter().map(|e| e.ask(40)).collect();
+        let heights = crate::render::allocate(&all, 24, 3);
         assert_eq!(
             heights[heights.len() - 1],
             3,

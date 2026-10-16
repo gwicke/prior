@@ -16,8 +16,6 @@
 //! re-publish at the cycle point.
 use std::sync::Arc;
 
-use std::rc::Rc;
-
 use crate::app_state::{AppState, SandboxOp};
 use crate::config::BindMode;
 use crate::sandbox_state::CombinedBind;
@@ -126,14 +124,14 @@ impl SlashDotNode for SandboxMappingNode {
                     .field("source", Value::Str(source_str(&b).to_string()))
             })
             .collect();
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows,
             active_ids: Vec::new(),
         }))
     }
 
     async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let render_ctx = crate::v25_listing_node::header_ctx();
+        let render_ctx = crate::v25_listing_node::header_ctx(&self.app_state);
         let header = self.header(path_args, &render_ctx).await;
         crate::v25_listing_node::view_header(&self.app_state, &header)
     }
@@ -197,14 +195,14 @@ impl SlashDotNode for SandboxRemoveNode {
             Some(b) if b.is_session => Row::new("remove").desc("remove this session mapping"),
             Some(_) => Row::new("remove").desc("exclude this config mapping"),
         };
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![row],
             active_ids: Vec::new(),
         }))
     }
 
     async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let render_ctx = crate::v25_listing_node::header_ctx();
+        let render_ctx = crate::v25_listing_node::header_ctx(&self.app_state);
         let header = self.header(path_args, &render_ctx).await;
         crate::v25_listing_node::view_header(&self.app_state, &header)
     }
@@ -272,14 +270,14 @@ impl SlashDotNode for SandboxRemoveNode {
 /// `complete_parameter` follows the settled contract
 /// (sandbox_design.md): gate → route by committed count (0 = host FS,
 /// 1 = sandbox-aware) → `path_complete::complete` → exactness → rows,
-/// with an L2 `Rc` cache keyed by (arg, word) that
+/// with an L2 `Arc` cache keyed by (arg, word) that
 /// `path_complete::listing_stale` invalidates.
 pub struct AddSandboxMappingNode {
     pub app_state: Arc<AppState>,
-    /// L2: (arg position, word) → rows. Same `Rc` on unchanged-word
+    /// L2: (arg position, word) → rows. Same `Arc` on unchanged-word
     /// frames ⇒ `ptr_eq` skips the view re-derive; rebuilt when the
     /// word/arg changes or the L1 listing goes stale.
-    last_rows: Option<(usize, String, Rc<CompletionRows>)>,
+    last_rows: Option<(usize, String, Arc<CompletionRows>)>,
 }
 
 impl AddSandboxMappingNode {
@@ -294,7 +292,7 @@ impl AddSandboxMappingNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for AddSandboxMappingNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![
                 Row::new("ro").desc("read only mapping"),
                 Row::new("rw").desc("read-write mapping"),
@@ -304,7 +302,7 @@ impl SlashDotNode for AddSandboxMappingNode {
     }
 
     async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let render_ctx = crate::v25_listing_node::header_ctx();
+        let render_ctx = crate::v25_listing_node::header_ctx(&self.app_state);
         let header = self.header(path_args, &render_ctx).await;
         crate::v25_listing_node::view_header(&self.app_state, &header)
     }
@@ -326,9 +324,9 @@ impl SlashDotNode for AddSandboxMappingNode {
         &mut self,
         args: &PathArgs,
         cursor_pos: usize,
-    ) -> Result<Rc<CompletionRows>, DataError> {
+    ) -> Result<Arc<CompletionRows>, DataError> {
         let empty = || {
-            Rc::new(CompletionRows {
+            Arc::new(CompletionRows {
                 rows: Vec::new(),
                 labels: None,
                 match_indices: None,
@@ -350,7 +348,7 @@ impl SlashDotNode for AddSandboxMappingNode {
         // L2 hit: same (arg, word) and the L1 listing still fresh.
         if let Some((a, w, rc)) = &self.last_rows {
             if *a == arg_idx && *w == word && !crate::path_complete::listing_stale(sandbox) {
-                return Ok(Rc::clone(rc));
+                return Ok(Arc::clone(rc));
             }
         }
 
@@ -371,12 +369,12 @@ impl SlashDotNode for AddSandboxMappingNode {
             if sandbox { "Sandbox path" } else { "Host path" }.to_string(),
             "Description".to_string(),
         ));
-        let rc = Rc::new(CompletionRows {
+        let rc = Arc::new(CompletionRows {
             rows,
             labels,
             match_indices: None,
         });
-        self.last_rows = Some((arg_idx, word, Rc::clone(&rc)));
+        self.last_rows = Some((arg_idx, word, Arc::clone(&rc)));
         Ok(rc)
     }
 

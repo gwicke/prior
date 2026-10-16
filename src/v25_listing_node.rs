@@ -11,12 +11,11 @@
 //! read-only (`EditorMode::View`) look at this level's `header()`. Rows in
 //! the view are a later addition, once specced.
 
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::app_state::AppState;
 use crate::editor::EditorMode;
-use crate::output;
+
 use crate::slashdot_menu::fields::{ColumnDef, FieldSpec};
 use crate::slashdot_menu::node_impl::{
     CompletionRows, DataError, DataResult, PathArgs, RenderContext, SlashDotNode,
@@ -25,9 +24,13 @@ use crate::slashdot_menu::node_impl::{
 
 /// Render context for driving a node's own `header()` from `edit()` — the
 /// engine's `RenderContext` is not passed through `edit()`.
-pub(crate) fn header_ctx() -> RenderContext {
+///
+/// Width comes off the state's content handle: a real geometry source, not a
+/// process-wide read, so a caller's width and the frames it paints share one
+/// watch.
+pub(crate) fn header_ctx(app_state: &AppState) -> RenderContext {
     RenderContext {
-        term_width: output::term_width(),
+        term_width: app_state.content().width(),
     }
 }
 
@@ -101,7 +104,7 @@ impl SlashDotNode for ListingNode {
         &mut self,
         args: &PathArgs,
         cursor_pos: usize,
-    ) -> Result<Rc<CompletionRows>, DataError> {
+    ) -> Result<Arc<CompletionRows>, DataError> {
         self.inner.complete_parameter(args, cursor_pos).await
     }
 
@@ -123,7 +126,7 @@ impl SlashDotNode for ListingNode {
     /// `StaticListingNode` has no override, and this host behavior is the
     /// point of the decorator.)
     async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let render_ctx = header_ctx();
+        let render_ctx = header_ctx(&self.app_state);
         let header = self.inner.header(path_args, &render_ctx).await;
         view_header(&self.app_state, &header)
     }
@@ -185,9 +188,9 @@ mod tests {
 
     #[test]
     fn edit_with_a_header_needs_an_interactive_guard() {
-        // `AppState::for_test` has no term guard → `edit_text` reports
-        // `Unsupported`, surfaced as `Error` (the engine shows it and the
-        // menu stays open).
+        // `AppState::for_test`'s manager carries no mode guard → `edit_text`
+        // reports `Unsupported`, surfaced as `Error` (the engine shows it and
+        // the menu stays open).
         let state = app_state();
         let mut node = ListingNode::new(&state, &[]).with_header(vec!["hdr".into()]);
         match block_on(node.edit(1, &PathArgs::new(vec![], ""))) {

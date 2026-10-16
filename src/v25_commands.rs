@@ -7,6 +7,7 @@
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     use crate::slashdot_menu::menu::SlashDotMenu;
     use crate::slashdot_menu::node_impl::{
@@ -65,7 +66,7 @@ mod tests {
                 .iter()
                 .map(|l| crate::slashdot_menu::fields::Row::new(*l).desc(""))
                 .collect();
-            Ok(Rc::new(DataResponse {
+            Ok(Arc::new(DataResponse {
                 rows,
                 active_ids: vec![active],
             }))
@@ -335,6 +336,7 @@ mod tests {
 mod persona_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     use crate::slashdot_menu::menu::SlashDotMenu;
     use crate::slashdot_menu::node_impl::{
@@ -375,7 +377,7 @@ mod persona_tests {
                     active_ids.push(name.to_string());
                 }
             }
-            Ok(Rc::new(DataResponse { rows, active_ids }))
+            Ok(Arc::new(DataResponse { rows, active_ids }))
         }
 
         async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {

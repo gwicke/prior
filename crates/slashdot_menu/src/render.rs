@@ -24,6 +24,14 @@ impl LogicalLine {
 /// 1. `detail` — `header()` output (truncatable from bottom on tight space)
 /// 2. `table_header` — single-line column headings (always shown, never truncated)
 /// 3. `rows` — scrollable data (Arc-shared; same pointer on cursor moves)
+///
+/// The panel as *data*: [`RenderPlan::elements`] turns it into the frame
+/// elements a host stacks, and each element formats from raw data at the
+/// render width (design §RenderElement stack). Engine plans carry the
+/// [`view`](RenderPlan::view) handle their `rows` were laid out from, so
+/// their elements re-lay-out at the width being composed for; a host that
+/// builds a plan by hand (the confirm dialog, tests) leaves it `None` and
+/// gets elements over the pre-laid-out `rows` above.
 #[derive(Debug, Clone)]
 pub struct RenderPlan {
     /// Table column header (e.g. "Model   Ctx   Coding   Price in").
@@ -50,6 +58,20 @@ pub struct RenderPlan {
     pub selected: Option<usize>,
     /// Indices of active (`*`-marked) rows (design §5.2).
     pub active_rows: Vec<usize>,
+    /// The view handle `rows` was laid out from, when this plan came from
+    /// the engine ([`RowView::plan`](crate::view::RowView::plan)).
+    ///
+    /// What makes the plan more than data: [`Self::elements`] mints rows /
+    /// header elements that hold the raw view and format inside
+    /// `render(h, w)` at the render width — filtered and unfiltered views
+    /// resolve through the same iterator, stale slots skip, and no row is
+    /// copied into an element. `None` for hand-built plans (the confirm
+    /// dialog, tests), which paint the pre-laid-out rows above instead.
+    pub view: Option<Arc<crate::view::ViewRows>>,
+    /// The node config the view's elements format with — the `columns()`
+    /// list; empty for the implicit id/description pair and for hand-built
+    /// plans.
+    pub columns: Vec<crate::fields::ColumnDef>,
 }
 
 impl Default for RenderPlan {
@@ -60,6 +82,8 @@ impl Default for RenderPlan {
             rows: Arc::new(Vec::new()),
             selected: None,
             active_rows: Vec::new(),
+            view: None,
+            columns: Vec::new(),
         }
     }
 }
@@ -402,8 +426,11 @@ use crate::table::display_width;
 use crate::wrap::split_to_width;
 
 /// Width of the marker column every painted row starts with: `"> "`, `"* "`,
-/// or two spaces.
-const MARKER: usize = 2;
+/// or two spaces. The layout width a painter's content is split at is
+/// `term_w - MARKER` — the convention producers lay rows out under (see
+/// [`RenderPlan::rows`]) and what the view's elements lay out at inside
+/// `render(h, w)`.
+pub(crate) const MARKER: usize = 2;
 
 /// How one painted overlay row is styled, and what the marker on its first
 /// visual row says.

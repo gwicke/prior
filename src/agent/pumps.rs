@@ -11,8 +11,9 @@
 //! Both are absolute-deadline waits. A dispatched or parked key must not extend
 //! the delay.
 
-use super::Output;
 use crate::app_state::WindowKeySource;
+use crate::repl::paint_prompt;
+use crate::termio::InputEvent;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -70,21 +71,22 @@ pub(crate) enum InTurnDispatch {
 /// is a next iteration — which is why this still settles, and the screen stays
 /// true to the state the key left behind.
 pub(crate) async fn dispatch_in_turn_event(
-    ev: Option<crossterm::event::Event>,
+    ev: Option<InputEvent>,
     sess: Option<&mut crate::repl::PromptSession>,
     history: Option<&mut crate::repl::History>,
     label: &str,
-    guard: Option<&crate::repl::TermGuard>,
-    output: &dyn Output,
+    // Content is the one handle: the frame dims, the paint path, and —
+    // through its manager — the `$EDITOR` turnover the guard/output pair used
+    // to carry.
+    content: &crate::content::Content,
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
 ) -> InTurnDispatch {
     let (Some(ev), Some(sess), Some(history)) = (ev, sess, history) else {
         return InTurnDispatch::Ignored;
     };
-    let dims = output.frame_size();
     match ev {
-        crossterm::event::Event::Key(key) => {
+        InputEvent::Key(key) => {
             // The confirm is **modal**, and this is the top of the `Esc` ladder:
             // dialog first, menu second, turn third. The root-`Esc` cancel below
             // is unconditional, so without this precedence one `Esc` would
@@ -98,15 +100,19 @@ pub(crate) async fn dispatch_in_turn_event(
                         let subject = sess.confirm_subject().unwrap_or_default();
                         sess.clear_confirm();
                         crate::confirm::resolve(
-                            output,
-                            || sess.paint(output, label, dims),
+                            content,
+                            || {
+                                sess.sync_stack(content, label);
+                                paint_prompt(content);
+                            },
                             &subject,
                             decision,
                         );
                         InTurnDispatch::Handled
                     }
                     None => {
-                        sess.paint(output, label, dims);
+                        sess.sync_stack(content, label);
+                        paint_prompt(content);
                         InTurnDispatch::Handled
                     }
                 };
@@ -126,11 +132,14 @@ pub(crate) async fn dispatch_in_turn_event(
                 return InTurnDispatch::CancelFired;
             }
             let opts_len = sess.opts_len();
-            match sess.handle_key(key, opts_len, label, history) {
+            // The frame's budget, from the one place a ratio resolves to a row
+            // count: `budget_now` reads the watched height — the same
+            // geometry the settle and paint below compose at — so the grant
+            // and the frame cannot disagree.
+            let budget = content.manager.lock().unwrap().budget_now();
+            match sess.handle_key(key, opts_len, budget, label, history) {
                 crate::repl::KeyOutcome::RunEditor => {
-                    if let Some(g) = guard {
-                        sess.open_editor(g, output);
-                    }
+                    sess.open_editor(content);
                 }
                 crate::repl::KeyOutcome::Continue | crate::repl::KeyOutcome::Action(_) => {}
             }
@@ -138,10 +147,10 @@ pub(crate) async fn dispatch_in_turn_event(
             // as it does at the prompt. Its `MenuDone` is dropped: applying a
             // command needs the convergence machinery that runs *after*
             // `prompt()` returns, which is still post-turn only (U4.3+).
-            let _ = sess.settle(output, label, history, dims).await;
+            let _ = sess.settle(content, label, history).await;
             InTurnDispatch::Handled
         }
-        crossterm::event::Event::Paste(text) => {
+        InputEvent::Paste(text) => {
             // A confirm has no text field, so a paste has nowhere to go; drop
             // it rather than pushing it into the prompt the dialog is layered
             // over, which would change the menu's meaning behind the modal.
@@ -149,7 +158,7 @@ pub(crate) async fn dispatch_in_turn_event(
                 return InTurnDispatch::Ignored;
             }
             sess.paste(&text);
-            let _ = sess.settle(output, label, history, dims).await;
+            let _ = sess.settle(content, label, history).await;
             InTurnDispatch::Handled
         }
         _ => InTurnDispatch::Ignored,
@@ -160,12 +169,15 @@ pub(crate) async fn dispatch_in_turn_event(
 /// borrows so keys keep dispatching between attempts exactly as they do inside
 /// `prompt()`'s select — the back-off is part of the turn, not a hole in it.
 pub(crate) struct TurnPump<'a> {
-    keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
+    keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     session: &'a mut crate::repl::PromptSession,
     history: &'a mut crate::repl::History,
     label: &'a str,
-    guard: &'a crate::repl::TermGuard,
-    output: &'a dyn Output,
+    /// The one handle: paints and settles go through content's manager, the
+    /// frame dims read content's watch, and the
+    /// `$EDITOR` turnover reaches the manager's front door through it too —
+    /// the guard/output pair this pump used to carry is gone.
+    content: &'a crate::content::Content,
 }
 
 impl<'a> TurnPump<'a> {
@@ -174,20 +186,18 @@ impl<'a> TurnPump<'a> {
     /// it `zip`s the optional pieces and yields `None` where they are absent.
     #[cfg(test)]
     pub(crate) fn new(
-        keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
+        keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
         session: &'a mut crate::repl::PromptSession,
         history: &'a mut crate::repl::History,
         label: &'a str,
-        guard: &'a crate::repl::TermGuard,
-        output: &'a dyn Output,
+        content: &'a crate::content::Content,
     ) -> Self {
         Self {
             keys,
             session,
             history,
             label,
-            guard,
-            output,
+            content,
         }
     }
 }
@@ -199,20 +209,20 @@ impl<'a> TurnPump<'a> {
 /// deadline and cancel signal only.
 pub(crate) fn turn_backoff_pump<'a>(
     prompt_session: &'a mut Option<crate::repl::PromptSession>,
-    keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
+    keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     history: &'a mut crate::repl::History,
     label: &'a str,
-    guard: &'a Option<Arc<crate::repl::TermGuard>>,
-    output: &'a dyn Output,
+    content: &'a crate::content::Content,
 ) -> Option<TurnPump<'a>> {
-    match (prompt_session.as_mut(), history, guard.as_deref()) {
-        (Some(session), history, Some(guard)) => Some(TurnPump {
+    // A prompt session exists only in the REPL (interactive tty) — the same
+    // fact the old `guard` zip re-checked, since TermIO is Tty iff there is one.
+    match (prompt_session.as_mut(), history) {
+        (Some(session), history) => Some(TurnPump {
             keys,
             session,
             history,
             label,
-            guard,
-            output,
+            content,
         }),
         _ => None,
     }
@@ -262,8 +272,7 @@ pub(crate) async fn cancellable_sleep_pumped(
                         Some(&mut *p.session),
                         Some(&mut *p.history),
                         p.label,
-                        Some(p.guard),
-                        p.output,
+                        p.content,
                         user_cancel,
                         cancel_notify,
                     )
@@ -285,10 +294,9 @@ pub(crate) async fn cancellable_sleep_pumped(
                 }
             } => {
                 if let Some(p) = pump.as_mut() {
-                    let dims = p.output.frame_size();
                     let _ = p
                         .session
-                        .settle(p.output, p.label, &mut *p.history, dims)
+                        .settle(p.content, p.label, &mut *p.history)
                         .await;
                 }
             }
@@ -386,13 +394,14 @@ mod tests {
     // The window-pump tests need a long-running operation to pump during, and
     // a retried summarization is the one that exists.
     use super::super::compaction::retry_summarization;
+    use crate::content::Content;
     use crate::settings::SettingsStore;
     use serial_test::serial;
 
-    fn null_output() -> std::sync::Arc<dyn Output> {
-        // The pumps paint through `Output`; the existing `NoOutput` impl in
-        // `crate::output` is a no-op for everything they touch.
-        std::sync::Arc::new(crate::output::NoOutput) as std::sync::Arc<dyn Output>
+    /// The content half of the same idea: `retry_summarization` reaches
+    /// content, and a quiet `Content` discards it.
+    fn null_content() -> std::sync::Arc<Content> {
+        std::sync::Arc::new(Content::quiet())
     }
 
     fn test_settings() -> SettingsStore {
@@ -411,19 +420,14 @@ mod tests {
         }
     }
     /// The pieces a back-off pump needs: a prompt session over the test app
-    /// state, a history, and a guard that never enters raw mode (the root-Esc
-    /// path returns before any terminal call, so none of it is exercised).
+    /// state and a history (no guard — the pump does not carry one,
+    /// and the root-Esc path returns before any terminal call anyway).
     fn backoff_pump_parts(
         app_state: &std::sync::Arc<crate::app_state::AppState>,
-    ) -> (
-        crate::repl::PromptSession,
-        crate::repl::History,
-        crate::repl::TermGuard,
-    ) {
+    ) -> (crate::repl::PromptSession, crate::repl::History) {
         (
             crate::repl::PromptSession::new(None, app_state),
             crate::repl::History::load(),
-            crate::repl::TermGuard::new(),
         )
     }
 
@@ -441,26 +445,17 @@ mod tests {
     #[serial]
     async fn backoff_pump_cancels_promptly_on_queued_esc() {
         let app_state = crate::app_state::AppState::for_test(test_settings());
-        let (mut session, mut history, guard) = backoff_pump_parts(&app_state);
-        let output = null_output();
+        let (mut session, mut history) = backoff_pump_parts(&app_state);
+        let content = null_content();
         let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(crossterm::event::Event::Key(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Esc,
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        ))
+        tx.send(InputEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        )))
         .unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let pump = TurnPump::new(
-            &mut keys,
-            &mut session,
-            &mut history,
-            "",
-            &guard,
-            output.as_ref(),
-        );
+        let pump = TurnPump::new(&mut keys, &mut session, &mut history, "", content.as_ref());
         let started = std::time::Instant::now();
         let completed = cancellable_sleep_pumped(&cancel, &notify, 60_000, Some(pump)).await;
         assert!(
@@ -480,26 +475,17 @@ mod tests {
     #[tokio::test]
     async fn backoff_pump_plain_key_does_not_cancel_the_wait() {
         let app_state = crate::app_state::AppState::for_test(test_settings());
-        let (mut session, mut history, guard) = backoff_pump_parts(&app_state);
-        let output = null_output();
+        let (mut session, mut history) = backoff_pump_parts(&app_state);
+        let content = null_content();
         let (tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(crossterm::event::Event::Key(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('x'),
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        ))
+        tx.send(InputEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        )))
         .unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let pump = TurnPump::new(
-            &mut keys,
-            &mut session,
-            &mut history,
-            "",
-            &guard,
-            output.as_ref(),
-        );
+        let pump = TurnPump::new(&mut keys, &mut session, &mut history, "", content.as_ref());
         let started = std::time::Instant::now();
         let completed = cancellable_sleep_pumped(&cancel, &notify, 1_000, Some(pump)).await;
         assert!(
@@ -617,10 +603,10 @@ mod tests {
         keys.push(esc_event());
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let output = null_output();
+        let content = null_content();
         let started = std::time::Instant::now();
         let r = retry_summarization(
-            output.as_ref(),
+            content.as_ref(),
             &cancel,
             &notify,
             Some(&keys),
@@ -655,11 +641,11 @@ mod tests {
         });
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let output = null_output();
+        let content = null_content();
         let mut calls = 0;
         let started = std::time::Instant::now();
         let r = retry_summarization(
-            output.as_ref(),
+            content.as_ref(),
             &cancel,
             &notify,
             Some(keys.as_ref()),
@@ -691,9 +677,9 @@ mod tests {
         keys.push(char_event('x'));
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let output = null_output();
+        let content = null_content();
         let r = retry_summarization(
-            output.as_ref(),
+            content.as_ref(),
             &cancel,
             &notify,
             Some(&keys),
@@ -720,9 +706,9 @@ mod tests {
         keys.push(esc_event());
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let output = null_output();
+        let content = null_content();
         let r = retry_summarization(
-            output.as_ref(),
+            content.as_ref(),
             &cancel,
             &notify,
             Some(&keys),
@@ -739,9 +725,10 @@ mod tests {
         assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// The real source on a test state: no term guard was published, so the
-    /// window is inactive (poll yields nothing — stdin untouched), and the
-    /// park round-trips in order: that queue is what `read_input` drains.
+    /// The real source on a test state: its manager carries no mode guard
+    /// (test states never install one), so the window is inactive (poll
+    /// yields nothing — stdin untouched), and the park round-trips in order:
+    /// that queue is what `read_input` drains.
     #[test]
     fn appstate_window_gate_and_park_roundtrip() {
         let app_state = crate::app_state::AppState::for_test(test_settings());
@@ -749,8 +736,16 @@ mod tests {
         assert!(app_state.poll_key().is_none(), "inactive must not read");
         app_state.park_key(char_event('a'));
         app_state.park_key(char_event('b'));
-        assert_eq!(app_state.take_parked_key(), Some(char_event('a')));
-        assert_eq!(app_state.take_parked_key(), Some(char_event('b')));
+        // The park converts to the input channel's vocabulary —
+        // that queue is what `read_input` drains, and it speaks `InputEvent`.
+        let expect = |c: char| {
+            Some(InputEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            )))
+        };
+        assert_eq!(app_state.take_parked_key(), expect('a'));
+        assert_eq!(app_state.take_parked_key(), expect('b'));
         assert_eq!(app_state.take_parked_key(), None);
     }
 }

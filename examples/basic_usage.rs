@@ -1,10 +1,13 @@
-use picocode::{create_agent, AgentConfig, ConsoleOutput};
+use picocode::termio::TermIO;
+use picocode::{create_agent, AgentConfig, Content};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Setup the output handler (ConsoleOutput provides pretty terminal printing)
-    let output = Arc::new(ConsoleOutput::new(
+    // 1. Setup the content handler. The terminal backend is constructed first —
+    //    it owns the size watch and caps from there.
+    let content = Arc::new(Content::new(
+        TermIO::plain(),
         picocode::settings::default_show_reasoning_handle(),
     ));
 
@@ -13,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = create_agent(AgentConfig {
         provider: "anthropic".into(),
         model: "claude-3-5-sonnet-latest".into(),
-        output,
+        content,
         yolo: false,
         confirm_port: None,
         context_limit: None,

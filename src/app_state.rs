@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::agent::{CodeAgent, SessionUsage};
+use crate::agent::CodeAgent;
 use crate::session::repo::JsonlSessionRepo;
 use crate::session::{Session, SessionTreeNode};
 use crate::settings::{SettingKey, SettingsStore};
@@ -172,10 +172,15 @@ pub struct State {
     /// Session entry tree snapshot (source of truth for `/tree`).
     pub(crate) raw_tree: Arc<Vec<SessionTreeNode>>,
     pub(crate) leaf_id: Option<String>,
-    /// Session token usage snapshot (`/stat`).
-    pub(crate) session_usage: SessionUsage,
-    /// Estimated tokens of the next-turn context (`/stat`).
-    pub(crate) context_tokens: u64,
+    /// The session's user-assigned name, or `None` when unnamed — the status
+    /// bar's leading label. Written once per cycle by the loop
+    /// off the session index; the bar reads it at render rather than a
+    /// per-turn push.
+    pub(crate) session_name: Option<String>,
+    /// The session's opening user message — the bar's label when the session
+    /// has no name. Written per cycle off the branch, and filled in by the
+    /// submit path on the first prompt (before the message is persisted).
+    pub(crate) session_first_message: Option<String>,
     /// Declarative control targets (see [`ControlConfig`]).
     pub(crate) control: ControlConfig,
     /// One-shot prompt prefill (resume's `/model …` model decision, the
@@ -183,14 +188,15 @@ pub struct State {
     /// handlers/appliers/the loop, **taken by the loop** right before
     /// the next `read_input` (sole consumer).
     pub(crate) prefill: Option<String>,
-    /// REPL raw-mode guard — a service handle published once at startup;
-    /// the compaction review closure clones it out to suspend raw mode
-    /// around `$EDITOR` (same pattern as the Ctrl-E path).
-    pub(crate) term_guard: Option<Arc<crate::repl::TermGuard>>,
     /// Key events captured by a window pump while nobody could read stdin
     /// (the compaction LLM window), parked for `read_input` to dispatch on
     /// its next iteration — never dropped, never leaked into `$EDITOR`.
-    pub(crate) parked_keys: VecDeque<crossterm::event::Event>,
+    /// Converted to [`InputEvent`] at the park edge: the drain
+    /// speaks the input channel's vocabulary; events the prompt could never
+    /// show (mouse, focus) are dropped here, as the drain used to ignore them.
+    ///
+    /// [`InputEvent`]: crate::termio::InputEvent
+    pub(crate) parked_keys: VecDeque<crate::termio::InputEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -282,11 +288,10 @@ impl AppState {
                 recent_models: Vec::new(),
                 raw_tree: Arc::new(Vec::new()),
                 leaf_id: None,
-                session_usage: SessionUsage::default(),
-                context_tokens: 0,
+                session_name: None,
+                session_first_message: None,
                 control: ControlConfig::default(),
                 prefill: None,
-                term_guard: None,
                 parked_keys: VecDeque::new(),
             }),
         })
@@ -457,6 +462,15 @@ impl AppState {
         self.state.lock().config.clone()
     }
 
+    /// The content handle this state's config carries — the same `Arc` the
+    /// loop's applied config holds (clones share it). Setup paths that need
+    /// a geometry read but hold no content — the prompt session's cloned
+    /// size watch, the header context's width — go through here
+    /// instead of cloning the whole config.
+    pub(crate) fn content(&self) -> Arc<crate::content::Content> {
+        self.state.lock().config.content.clone()
+    }
+
     // --- settings (durable target; the one copy) ---
 
     /// Read access to the settings store.
@@ -607,17 +621,42 @@ impl AppState {
     pub fn update_cycle_view(
         &self,
         current_id: String,
-        usage: SessionUsage,
-        context_tokens: u64,
+        session_name: Option<String>,
+        session_first_message: Option<String>,
         tree: Arc<Vec<SessionTreeNode>>,
         leaf_id: Option<String>,
     ) {
         let mut st = self.state.lock();
         st.session.current_id = current_id;
-        st.session_usage = usage;
-        st.context_tokens = context_tokens;
+        st.session_name = session_name;
+        st.session_first_message = session_first_message;
         st.raw_tree = tree;
         st.leaf_id = leaf_id;
+    }
+
+    /// The status bar's leading label: the session name, else
+    /// its opening message. Both come off the per-cycle write
+    /// ([`Self::update_cycle_view`]) except on the first prompt, where the
+    /// branch is still empty and [`Self::set_first_message_if_unset`] fills the
+    /// message in at submit.
+    pub fn bar_identity(&self) -> (Option<String>, Option<String>) {
+        let st = self.state.lock();
+        (st.session_name.clone(), st.session_first_message.clone())
+    }
+
+    /// Fill the bar's message label when the cycle view has none: on the
+    /// very first prompt the branch is not yet persisted, so the
+    /// loop's cycle write leaves it empty. The submit path knows the text it
+    /// is about to send, so it stands in — the `first_user_text(prior).or(input)`
+    /// fallback the turn used to carry, relocated to where the input is.
+    pub fn set_first_message_if_unset(&self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let mut st = self.state.lock();
+        if st.session_first_message.is_none() {
+            st.session_first_message = Some(text.to_string());
+        }
     }
 
     pub fn raw_tree(&self) -> Arc<Vec<SessionTreeNode>> {
@@ -637,14 +676,6 @@ impl AppState {
     /// Single-field leaf write (same caveat as [`set_raw_tree`]).
     pub fn set_leaf_id(&self, leaf_id: Option<String>) {
         self.state.lock().leaf_id = leaf_id;
-    }
-
-    pub fn session_usage(&self) -> SessionUsage {
-        self.state.lock().session_usage
-    }
-
-    pub fn context_tokens(&self) -> u64 {
-        self.state.lock().context_tokens
     }
 
     // --- recent models (loop is the sole writer) ---
@@ -715,51 +746,42 @@ impl AppState {
     /// Resize handling, same dispatcher — and *after* any `$EDITOR` the
     /// window opened, instead of leaking into its stdin.
     pub fn park_key(&self, ev: crossterm::event::Event) {
-        self.state.lock().parked_keys.push_back(ev);
+        if let Some(ev) = crate::termio::InputEvent::from_event(ev) {
+            self.state.lock().parked_keys.push_back(ev);
+        }
     }
 
     /// Oldest parked key, if any — one per `read_input` iteration.
-    pub fn take_parked_key(&self) -> Option<crossterm::event::Event> {
+    pub fn take_parked_key(&self) -> Option<crate::termio::InputEvent> {
         self.state.lock().parked_keys.pop_front()
     }
 
-    /// Is stdin owned by the interactive REPL? True iff the term guard was
-    /// published (interactive tty, non-quiet) — a window pump may read keys
-    /// only then: piped/batch stdin belongs to the script, and test states
-    /// have no guard at all.
+    /// Is stdin owned by the interactive REPL? True iff the config's manager
+    /// carries the mode guard (interactive tty, non-quiet — the same
+    /// published-at-setup fact the term-guard slot used to answer) — a
+    /// window pump may read keys only then: piped/batch stdin belongs to the
+    /// script, and test states have no guard at all.
     pub fn window_pump_active(&self) -> bool {
-        self.state.lock().term_guard.is_some()
-    }
-
-    /// Publish the REPL's term guard (set once at startup).
-    pub fn set_term_guard(&self, guard: Arc<crate::repl::TermGuard>) {
-        self.state.lock().term_guard = Some(guard);
-    }
-
-    /// Clone-out of the term guard (rule 3 — callers hold it across the
-    /// editor outside any lock; `edit_text` does exactly that).
-    pub fn term_guard(&self) -> Option<Arc<crate::repl::TermGuard>> {
-        self.state.lock().term_guard.clone()
+        let content = self.with_config(|c| c.content.clone());
+        // Bound: the lock guard must drop before `content` (a tail-expression
+        // temporary would outlive the borrow).
+        let is_tty = content.manager.lock().unwrap().is_tty();
+        is_tty
     }
 
     /// Run the external editor over `current` through the single wrapper
     /// (`crate::editor::run_editor`): reader gate, raw-mode turnover, DSR
-    /// re-anchor (doc/editor_cleanup.md §2). Requires an interactive term
-    /// guard — without one (quiet/pipe) there is no tty to hand over, so
-    /// this reports `Unsupported`.
+    /// re-anchor (doc/editor_cleanup.md §2). The turnover goes through the
+    /// config's manager — the front door for suspend/resume — which
+    /// reports `Unsupported` when no mode guard was installed (quiet/pipe:
+    /// no tty to hand over).
     pub fn edit_text(
         &self,
         current: &str,
         mode: crate::editor::EditorMode,
     ) -> std::io::Result<String> {
-        let guard = self.term_guard().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "editor requires an interactive terminal",
-            )
-        })?;
-        let output = self.with_config(|c| c.output.clone());
-        crate::editor::run_editor(&guard, output.as_ref(), current, mode)
+        let content = self.with_config(|c| c.content.clone());
+        crate::editor::run_editor(&content, current, mode)
     }
 
     // --- test constructor ---
@@ -767,20 +789,20 @@ impl AppState {
     /// Minimal state bundle for in-crate tests (no repo).
     #[cfg(test)]
     pub fn for_test(settings: SettingsStore) -> Arc<AppState> {
-        Self::for_test_with_output(settings, Arc::new(crate::output::NoOutput))
+        Self::for_test_with_content(settings, Arc::new(crate::content::Content::quiet()))
     }
 
-    /// Like [`for_test`], with a caller-chosen output — tests assert on
-    /// captured display lines via `RecordingOutput`.
+    /// Like [`for_test`], with a caller-chosen content — tests assert on the
+    /// display lines it captured via `begin_capture`.
     #[cfg(test)]
-    pub fn for_test_with_output(
+    pub fn for_test_with_content(
         settings: SettingsStore,
-        output: Arc<dyn crate::output::Output>,
+        content: Arc<crate::content::Content>,
     ) -> Arc<AppState> {
         let config = AgentConfig {
             provider: "test".to_string(),
             model: "model".to_string(),
-            output,
+            content,
             yolo: false,
             confirm_port: None,
             quiet: true,
@@ -853,7 +875,7 @@ mod tests {
     #[test]
     fn edit_text_requires_an_interactive_guard() {
         let app_state = AppState::for_test(test_settings());
-        // No term guard (quiet/pipe): there is no tty to hand to $EDITOR.
+        // No mode guard on the manager (quiet/pipe): no tty to hand to $EDITOR.
         let err = app_state
             .edit_text("draft", crate::editor::EditorMode::Edit)
             .unwrap_err();
@@ -899,13 +921,13 @@ mod tests {
         let app_state = AppState::for_test(test_settings());
         app_state.update_cycle_view(
             "sess-1".into(),
-            SessionUsage::default(),
-            42_000,
+            Some("work".into()),
+            None,
             Arc::new(vec![]),
             Some("leaf-1".into()),
         );
         assert_eq!(app_state.current_session_id(), "sess-1");
-        assert_eq!(app_state.context_tokens(), 42_000);
+        assert_eq!(app_state.bar_identity(), (Some("work".to_string()), None));
         assert_eq!(app_state.leaf_id().as_deref(), Some("leaf-1"));
     }
 

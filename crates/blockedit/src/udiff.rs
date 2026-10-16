@@ -5,7 +5,8 @@
 //! `@@` hunk markers, which is what a pager, `patch` and every diff tool expect.
 //!
 //! This is deliberately *not* the same shape as picocode's in-panel edit preview
-//! (`refined_diff_lines` in `src/output.rs`), which is a display format: no file
+//! (`refined_diff_lines` in `content/preview.rs`), which is a display format: no
+//! file
 //! headers at all, a space after each `-`/`+` marker so the terminal panel can
 //! align columns, and a 60-line cap because it is about to be drawn in a
 //! scrollback. None of that survives a redirect to a file, and a multi-file `-u`

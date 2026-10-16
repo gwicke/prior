@@ -5,8 +5,6 @@
 //! idempotent (a missing/stale outgoing id is a no-op).
 use std::sync::Arc;
 
-use std::rc::Rc;
-
 use crate::app_state::AppState;
 use crate::session::repo::SessionRepo;
 use crate::slashdot_menu::node_impl::{
@@ -20,7 +18,7 @@ pub struct ClearNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for ClearNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("clear")
                 .desc("delete session and start fresh")],
             active_ids: Vec::new(),
@@ -28,7 +26,7 @@ impl SlashDotNode for ClearNode {
     }
 
     async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let render_ctx = crate::v25_listing_node::header_ctx();
+        let render_ctx = crate::v25_listing_node::header_ctx(&self.app_state);
         let header = self.header(path_args, &render_ctx).await;
         crate::v25_listing_node::view_header(&self.app_state, &header)
     }

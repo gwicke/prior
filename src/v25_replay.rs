@@ -5,8 +5,6 @@
 //! active session + output, both loop-owned) at the cycle point.
 use std::sync::Arc;
 
-use std::rc::Rc;
-
 use crate::app_state::AppState;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, SubmitResult,
@@ -19,7 +17,7 @@ pub struct ReplayNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for ReplayNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("replay")
                 .desc("history replay; optional limits 10 (turns) 10t (turns) 10l (lines)")],
             active_ids: Vec::new(),
@@ -27,7 +25,7 @@ impl SlashDotNode for ReplayNode {
     }
 
     async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let render_ctx = crate::v25_listing_node::header_ctx();
+        let render_ctx = crate::v25_listing_node::header_ctx(&self.app_state);
         let header = self.header(path_args, &render_ctx).await;
         crate::v25_listing_node::view_header(&self.app_state, &header)
     }
@@ -47,13 +45,13 @@ impl SlashDotNode for ReplayNode {
 
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let arg = path_args.suffix.trim().to_string();
-        // Data-plane inline: replay renders through the shared output
+        // Data-plane inline: replay renders through the shared content
         // handle; no active session → the same message the old applier
-        // showed. Session and output are both reachable via the slot.
-        let out = self.app_state.with_config(|c| c.output.clone());
+        // showed. Session and content are both reachable via the slot.
+        let content = self.app_state.with_config(|c| c.content.clone());
         match self.app_state.session() {
-            Some(s) => crate::agent::replay::handle_replay(&arg, &s, out.as_ref()).await,
-            None => out.display_text("No active session to replay"),
+            Some(s) => crate::agent::replay::handle_replay(&arg, &s, content.as_ref()).await,
+            None => content.display_text("No active session to replay"),
         }
         SubmitResult::Done(None)
     }
@@ -86,8 +84,8 @@ mod tests {
         crate::app_state::AppState::for_test(test_settings())
     }
 
-    fn test_app_state_with(output: Arc<dyn crate::output::Output>) -> Arc<AppState> {
-        crate::app_state::AppState::for_test_with_output(test_settings(), output)
+    fn test_app_state_with(content: Arc<crate::content::Content>) -> Arc<AppState> {
+        crate::app_state::AppState::for_test_with_content(test_settings(), content)
     }
 
     /// One user message the replay assertions look for.
@@ -143,14 +141,15 @@ mod tests {
 
     #[test]
     fn replay_submit_without_session_displays_message() {
-        let (out, lines) = crate::output::RecordingOutput::new();
-        let app_state = test_app_state_with(out);
+        let content = Arc::new(crate::content::Content::for_test());
+        let app_state = test_app_state_with(content.clone());
         let mut menu = build_replay_menu(&app_state);
         let mut handle = menu.get_handle();
         // Drill in then Enter.
+        content.begin_capture();
         let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::None, 80));
         let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::Enter, 80));
-        let captured = crate::output::RecordingOutput::joined(&lines);
+        let captured = String::from_utf8_lossy(&content.end_capture()).into_owned();
         assert!(
             captured.contains("No active session to replay"),
             "expected the no-session message, got: {captured}"
@@ -159,15 +158,16 @@ mod tests {
 
     #[test]
     fn replay_with_suffix_renders_history() {
-        let (out, lines) = crate::output::RecordingOutput::new();
-        let app_state = test_app_state_with(out);
+        let content = Arc::new(crate::content::Content::for_test());
+        let app_state = test_app_state_with(content.clone());
         let (_guard, session) = crate::agent::test_session_with_entries(vec![replay_entry()]);
         app_state.set_session(Some(session));
         let mut menu = build_replay_menu(&app_state);
         let mut handle = menu.get_handle();
+        content.begin_capture();
         let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::None, 80));
         let _ = futures::executor::block_on(handle.eval_prompt("replay 10t ", HostKey::Enter, 80));
-        let captured = crate::output::RecordingOutput::joined(&lines);
+        let captured = String::from_utf8_lossy(&content.end_capture()).into_owned();
         assert!(
             captured.contains("hello-replay"),
             "replay must render the session history, got: {captured}"

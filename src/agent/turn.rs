@@ -27,9 +27,9 @@ use std::sync::Arc;
 
 use crate::agent::build::{request_additional_params, LoggingHook};
 use crate::agent::compaction::session_context_messages;
-use crate::agent::status::{first_user_text, status_text, BarModel};
+
 use crate::agent::CodeAgent;
-use crate::agent::{estimate_ctx_with, SessionUsage, TurnPersistence};
+use crate::agent::{estimate_ctx_with, TurnPersistence};
 use crate::session::Session;
 use std::sync::Mutex;
 
@@ -42,7 +42,7 @@ impl CodeAgent {
     ///
     /// **This future is `!Send`; the summarizers below are not.** Since U4.3
     /// the turn carries the REPL's prompt session in, and that session is
-    /// single-threaded by construction — `Rc` line windows, `Rc` menu views, a
+    /// single-threaded by construction — `Arc` line windows, `Arc` menu views, a
     /// sync `mpsc` completer — and it never leaves the task `run_interactive`
     /// runs on. Requiring `Send` would mean rewriting that chain to `Arc` for a
     /// property nothing uses: `main` awaits `run_interactive`, every test
@@ -98,22 +98,19 @@ impl CodeAgent {
             },
             None => Vec::new(),
         };
-        // The stand-in label for a session with no name: its opening user
-        // message. `prior` holds everything before this turn, so from the second
-        // turn onward that *is* the first message; on the first turn it is empty
-        // and this turn's own prompt is. Captured here, before `prior` moves
-        // into the agent.
-        let first_message: Option<String> = first_user_text(&prior)
-            .or_else(|| (!input.trim().is_empty()).then_some(input))
-            .map(str::to_string);
-        // The same shape, for the ctx figure: the first turn has no reported
-        // usage at all (the first completion call is still in flight), so the
-        // status line would have no context number for exactly the turn a new
-        // session is most likely to be watched. The estimate `/tree compact`
-        // already uses is computable from the messages in hand — `prior` plus
-        // this turn's prompt — so use it, and let the provider's own count
-        // replace it from the second turn on.
+        // The first turn has no reported usage at all (the first completion
+        // call is still in flight), so the status line would have no context
+        // number for exactly the turn a new session is most likely to be
+        // watched. The estimate `/tree compact` already uses is computable from
+        // the messages in hand — `prior` plus this turn's prompt — so record it
+        // as an *estimate*; the provider's own count replaces it
+        // through `context_figure` from the second turn on, with nothing
+        // impersonating a report.
         let estimated_ctx = estimate_ctx_with(&prior, input);
+        {
+            let mut usage = self.usage.lock().unwrap();
+            usage.estimated_input_tokens = estimated_ctx;
+        }
 
         // `stream_prompt(...).await` yields the item stream (rig 0.40's
         // `IntoFuture` returns the stream itself, not a collected response).
@@ -143,7 +140,7 @@ impl CodeAgent {
         };
         let mut stream = request
             .add_hook(LoggingHook {
-                output: self.output.clone(),
+                content: self.content.clone(),
                 user_cancel: self.user_cancel.clone(),
                 message_logger: self.message_logger.clone(),
                 reasoning_in_context: self.reasoning_in_context,
@@ -173,63 +170,34 @@ impl CodeAgent {
         let mut aborted = false;
         // The transient status line (doc/row_accounting.md zone 2) is set before
         // the turn's first content write, because that is where the output
-        // paints it — after each block, for the whole turn. The context figure
-        // is the *previous* turn's, which is the best available at this point
-        // and honest about being one turn behind; the next turn's start
-        // refreshes it. The thinking level is not in it: the agent carries none
-        // (it went with the hold-back in B3b) and it only changes on an
-        // explicit commit, so it belongs to the prompt-side carrier.
-        let session_name = session.and_then(|s| {
-            let index = s.index.try_lock().ok()?;
-            index.header.name.clone()
-        });
-        let reported_ctx = self.usage.lock().unwrap().last_input_tokens;
-        self.output.set_status(&status_text(
-            session_name.as_deref(),
-            first_message.as_deref(),
-            BarModel {
-                provider: &self.provider,
-                model: &self.model,
-                // The status bar's own field is upstream's `thinking`; the
-                // value it reads is now the renamed reasoning level.
-                thinking: self.live_params.reasoning_str().as_deref(),
-                context_limit: self.context_limit,
-                // Reported wins: it is the provider's own count of what it was
-                // sent. The estimate only stands in while there is none — turn
-                // one, where the alternative is no figure at all.
-                context_tokens: if reported_ctx > 0 {
-                    reported_ctx
-                } else {
-                    estimated_ctx
-                },
-            },
-        ));
-        self.output.begin_response();
+        // paints it — after each block, for the whole turn. The thinking level
+        // is not in it: the agent carries none (it went with the hold-back in
+        // B3b) and it only changes on an explicit commit, so it belongs to the
+        // prompt-side carrier.
+        self.content.begin_response();
         // U4.3: the turn's second pump, split out of `in_turn` into bindings the
         // two new futures below can borrow *disjointly* — one future per
         // binding, so neither is borrowed twice at once. `tokio::select!`
         // scopes its futures to their own block ("a scope to separate polling
         // from handling the output"), so by the time a handler runs these are
         // free again for the handler to take.
-        let (mut it_keys, mut it_confirms, mut it_session, it_label, mut it_history, it_guard) =
-            match in_turn {
-                Some(crate::repl::InTurnInput {
-                    session,
-                    keys,
-                    confirms,
-                    label,
-                    history,
-                    guard,
-                }) => (
-                    Some(keys),
-                    Some(confirms),
-                    Some(session),
-                    label,
-                    Some(history),
-                    Some(guard),
-                ),
-                None => (None, None, None, "", None, None),
-            };
+        let (mut it_keys, mut it_confirms, mut it_session, it_label, mut it_history) = match in_turn
+        {
+            Some(crate::repl::InTurnInput {
+                session,
+                keys,
+                confirms,
+                label,
+                history,
+            }) => (
+                Some(keys),
+                Some(confirms),
+                Some(session),
+                label,
+                Some(history),
+            ),
+            None => (None, None, None, "", None),
+        };
         // The area has to say the turn started *now*. `begin_response` above
         // flipped `streaming`, and the frame on screen was composed while it was
         // false — so until some keystroke happened to compose again, the input
@@ -240,14 +208,7 @@ impl CodeAgent {
         // by the submit, so its `eval` is a passive derive with nothing to
         // dispatch and the action it returns is empty by construction.
         if let (Some(sess), Some(hist)) = (it_session.as_deref_mut(), it_history.as_deref_mut()) {
-            let _ = sess
-                .settle(
-                    self.output.as_ref(),
-                    it_label,
-                    hist,
-                    self.output.frame_size(),
-                )
-                .await;
+            let _ = sess.settle(self.content.as_ref(), it_label, hist).await;
         }
         loop {
             // Prose's wake-up for this iteration, resolved *before* the select
@@ -266,19 +227,19 @@ impl CodeAgent {
                             StreamedAssistantContent::Text(text) => {
                                 let delta = text.text();
                                 output.push_str(delta);
-                                self.output.stream_text(delta);
+                                self.content.stream_text(delta);
                             }
                             StreamedAssistantContent::Reasoning { reasoning, .. } => {
                                 let t = reasoning_text(&reasoning);
                                 if !t.is_empty() {
                                     reasoning_buffer.push_str(&t); // Accumulate for partial persistence
-                                    self.output.stream_thinking(&t);
+                                    self.content.stream_thinking(&t);
                                 }
                             }
                             StreamedAssistantContent::ReasoningDelta { reasoning, .. }
                                 if !reasoning.is_empty() => {
                                     reasoning_buffer.push_str(&reasoning); // Accumulate for partial persistence
-                                    self.output.stream_thinking(&reasoning);
+                                    self.content.stream_thinking(&reasoning);
                                 }
                             _ => {}
                         },
@@ -319,7 +280,7 @@ impl CodeAgent {
                                 }
                             }
                             // Commit the text so far before the tool call / result line.
-                            self.output.end_response_segment();
+                            self.content.end_response_segment();
                         }
                         Some(Ok(MultiTurnStreamItem::FinalResponse(resp))) => {
                             final_history = resp.messages().map(|h| h.to_vec());
@@ -519,7 +480,7 @@ impl CodeAgent {
                                     }
                                 }
                             }
-                            self.output.end_response();
+                            self.content.end_response();
                             // A retryable error that interrupted the run AFTER
                             // progress: signal the REPL (via `LlmInterrupted`)
                             // so it resets the back-off and continues from the
@@ -593,7 +554,8 @@ impl CodeAgent {
                 } => {
                     if let Some(sess) = it_session.as_deref_mut() {
                         sess.open_confirm(req, self.confirm_approvals.clone());
-                        sess.paint(self.output.as_ref(), it_label, self.output.frame_size());
+                        sess.sync_stack(self.content.as_ref(), it_label);
+                        crate::repl::paint_prompt(self.content.as_ref());
                     }
                 }
 
@@ -622,8 +584,7 @@ impl CodeAgent {
                         it_session.as_deref_mut(),
                         it_history.as_deref_mut(),
                         it_label,
-                        it_guard,
-                        self.output.as_ref(),
+                        self.content.as_ref(),
                         &self.user_cancel,
                         &self.cancel_notify,
                     )
@@ -646,15 +607,14 @@ impl CodeAgent {
                     if let (Some(sess), Some(history)) =
                         (it_session.as_deref_mut(), it_history.as_deref_mut())
                     {
-                        let dims = self.output.frame_size();
                         let _ = sess
-                            .settle(self.output.as_ref(), it_label, history, dims)
+                            .settle(self.content.as_ref(), it_label, history)
                             .await;
                     }
                 }
             }
         }
-        self.output.end_response();
+        self.content.end_response();
 
         // Persist the turn into the session (or fallback to no persistence).
         if let Some(s) = session {
@@ -700,14 +660,14 @@ impl CodeAgent {
     }
 
     pub async fn run_once(&self, input: String) -> Result<String> {
-        self.output.display_header(
+        self.content.display_header(
             &self.provider,
             &self.model,
             self.yolo,
             self.tool_call_limit,
             self.persona_name.as_deref(),
         );
-        self.output.display_separator();
+        self.content.display_separator();
         // `prompt` now renders the response itself via the streaming Output
         // methods, so there is no separate `display_markdown` here.
         let turn = TurnPersistence::new();
@@ -720,12 +680,6 @@ impl CodeAgent {
             .prompt(&input, None, &turn, &self.live_params, None)
             .await?;
         Ok(response)
-    }
-
-    /// Snapshot of the accumulated session token usage (for `/stat`). A zeroed
-    /// result means no completion call has reported usage yet.
-    pub fn session_usage(&self) -> SessionUsage {
-        self.usage.lock().map(|g| *g).unwrap_or_default()
     }
 
     /// Generate a concise summary of the given text using the agent's model.

@@ -2,13 +2,12 @@
 //! cut (doc/slashdot/arg_and_modifier_autocomplete.md).
 //!
 //! `ViewRows` is the single input: source rows + display order + active
-//! markers behind one Rc, minted by the content side (rows pipeline or
+//! markers behind one Arc, minted by the content side (rows pipeline or
 //! completer wrap). `RowView` owns the cursor and the row-line render
 //! cache and assembles `RenderPlan`s. The render side never sees how
 //! rows are stored: it mints `iter()`.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::fields::ColumnDef;
@@ -17,14 +16,15 @@ use crate::node_entry::RowRef;
 use crate::node_impl::{DataResponse, RenderContext};
 use crate::render::{LogicalLine, RenderPlan};
 use crate::table::{display_width, highlight_matches};
+use std::fmt;
 
 /// The view's single input: source rows + display order + markers,
-/// bundled behind one Rc so "data OR query OR typed input changed"
+/// bundled behind one Arc so "data OR query OR typed input changed"
 /// collapses to one ptr_eq signal. Minted content-side only — fields
 /// private: storage (slots / RowRef / id set) is an implementation
 /// detail the render side never sees.
 pub struct ViewRows {
-    slots: Vec<Option<Rc<DataResponse>>>,
+    slots: Vec<Option<Arc<DataResponse>>>,
     order: Vec<RowRef>,
     active_ids: HashSet<String>,
     /// Per-row match indices for fuzzy highlighting: RowRef → (field_name → byte indices).
@@ -32,10 +32,20 @@ pub struct ViewRows {
     match_indices: HashMap<RowRef, HashMap<String, Vec<usize>>>,
 }
 
+/// The slots are not `Debug` (and do not need to be): a plan carries the
+/// handle, and a debugger that wants the rows can ask the iterator.
+impl fmt::Debug for ViewRows {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ViewRows")
+            .field("rows", &self.order.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ViewRows {
     /// Content-side constructor (rows pipeline / completer wrap only).
     pub(crate) fn new(
-        slots: Vec<Option<Rc<DataResponse>>>,
+        slots: Vec<Option<Arc<DataResponse>>>,
         order: Vec<RowRef>,
         active_ids: HashSet<String>,
         match_indices: HashMap<RowRef, HashMap<String, Vec<usize>>>,
@@ -50,7 +60,7 @@ impl ViewRows {
 
     /// Content-side constructor without match indices (backward compatible).
     pub(crate) fn new_empty_match(
-        slots: Vec<Option<Rc<DataResponse>>>,
+        slots: Vec<Option<Arc<DataResponse>>>,
         order: Vec<RowRef>,
         active_ids: HashSet<String>,
     ) -> Self {
@@ -65,13 +75,13 @@ impl ViewRows {
     /// Completion source → view: one slot, identity order, no active
     /// markers. The public entry for a completer's `Vec<Row>` (host
     /// prose completion and the engine's `wrap_completion` shape).
-    pub fn of(rows: Vec<Row>) -> Rc<ViewRows> {
+    pub fn of(rows: Vec<Row>) -> Arc<ViewRows> {
         let n = rows.len();
-        let resp = Some(Rc::new(DataResponse {
+        let resp = Some(Arc::new(DataResponse {
             rows,
             active_ids: Vec::new(),
         }));
-        Rc::new(ViewRows::new_empty_match(
+        Arc::new(ViewRows::new_empty_match(
             vec![resp],
             (0..n as u32)
                 .map(|i| RowRef {
@@ -87,13 +97,13 @@ impl ViewRows {
     pub fn of_with_match_indices(
         rows: Vec<Row>,
         match_indices: HashMap<RowRef, HashMap<String, Vec<usize>>>,
-    ) -> Rc<ViewRows> {
+    ) -> Arc<ViewRows> {
         let n = rows.len();
-        let resp = Some(Rc::new(DataResponse {
+        let resp = Some(Arc::new(DataResponse {
             rows,
             active_ids: Vec::new(),
         }));
-        Rc::new(ViewRows::new(
+        Arc::new(ViewRows::new(
             vec![resp],
             (0..n as u32)
                 .map(|i| RowRef {
@@ -133,6 +143,167 @@ impl ViewRows {
     }
 }
 
+/// Does this (view, columns) pair get a table-header line at all? The
+/// one place the answer is decided — the plan cache and the element mint
+/// share it, so a header element exists exactly when a header line would
+/// be laid out.
+pub(crate) fn has_table_header(view: &ViewRows, columns: &[ColumnDef]) -> bool {
+    !columns.is_empty() && !view.is_empty() && columns.iter().any(|c| !c.header.is_empty())
+}
+
+/// One table layout at one content width: the header line (when
+/// [`has_table_header`]) plus the laid-out row lines, in `iter()` order.
+///
+/// The shared core of every place rows become terminal text: the plan's
+/// render cache (rebuild caching in [`RowView::plan`]) and the view's
+/// frame elements (which format at the render width), so the
+/// paint cannot drift from the plan that pages over the same rows.
+pub(crate) struct AssembledTable {
+    pub header: Option<LogicalLine>,
+    pub lines: Vec<LogicalLine>,
+    /// Indices (into `lines` / `iter()` order) of active (`*`) rows.
+    pub active: Vec<usize>,
+}
+
+/// Lay `view` out as a table at `content_w` columns: cell extraction,
+/// fuzzy highlighting / snippet extraction, column balancing, wrapping.
+/// Extracted verbatim from `RowView::rebuild_rows` — the cache there
+/// gates on ptr_eq; this function is what the gate buys.
+pub(crate) fn assemble_table(
+    view: &ViewRows,
+    columns: &[ColumnDef],
+    width: usize,
+) -> AssembledTable {
+    use crate::table::{extract_snippet, Align, Table};
+    let col_field_names: Vec<String> = if !columns.is_empty() {
+        columns.iter().map(|c| c.field.clone()).collect()
+    } else {
+        vec!["id".to_string(), "description".to_string()]
+    };
+    let has_table_header = has_table_header(view, columns);
+    // Column count comes from the labels (Table::new), so the
+    // default id/description pair must be passed even when the
+    // header row itself is never rendered (has_table_header false).
+    let header_labels: Vec<&str> = if !columns.is_empty() {
+        columns.iter().map(|c| c.header.as_str()).collect()
+    } else {
+        col_field_names.iter().map(|s| s.as_str()).collect()
+    };
+
+    // Wrapping vs single-line is decided by the columndefs; when there
+    // are none, the implicit id/description pair wraps (matching today).
+    let use_wrap = columns.iter().all(|c| c.wrap);
+
+    // Two-pass when single-line: compute column widths from the raw
+    // (unhighlighted) cells first, so snippet extraction can target the
+    // exact budget a cell will be rendered into. The wrap path needs no
+    // snippet (wrapping handles overflow), so it stays single-pass.
+    let col_widths: Vec<usize> = if use_wrap {
+        Vec::new()
+    } else {
+        let mut temp = Table::new(&header_labels).set_gap(1);
+        if !columns.is_empty() {
+            let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
+            let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
+            let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
+            temp = temp
+                .with_aligns(&aligns)
+                .with_min_widths(&mins)
+                .with_priorities(&prios);
+        }
+        for (row, _active) in view.iter() {
+            let raw: Vec<String> = col_field_names
+                .iter()
+                .map(|k| {
+                    row.field_display(k)
+                        .or_else(|| {
+                            row_field_value(row, k).map(|v| match v {
+                                crate::value::Value::Str(s) => s,
+                                crate::value::Value::Num(n) => crate::value::fmt_num(n),
+                            })
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
+            temp.add_row(&raw);
+        }
+        temp.column_widths(width)
+    };
+
+    let mut t = Table::new(&header_labels).set_gap(1);
+    if !columns.is_empty() {
+        let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
+        let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
+        let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
+        t = t
+            .with_aligns(&aligns)
+            .with_min_widths(&mins)
+            .with_priorities(&prios);
+    }
+    let mut active = Vec::new();
+    for (i, (row, is_active)) in view.iter().enumerate() {
+        if is_active {
+            active.push(i);
+        }
+        let rref = view.order[i];
+        let match_indices = view.match_indices(&rref);
+        let mut cells: Vec<String> = Vec::with_capacity(col_field_names.len());
+        for (col_idx, k) in col_field_names.iter().enumerate() {
+            let cell = row
+                .field_display(k)
+                .or_else(|| {
+                    row_field_value(row, k).map(|v| match v {
+                        crate::value::Value::Str(s) => s,
+                        crate::value::Value::Num(n) => crate::value::fmt_num(n),
+                    })
+                })
+                .unwrap_or_default();
+
+            // Highlight fuzzy matches on every string column (explicit
+            // ColumnDefs and the implicit id/description pair alike).
+            let cell = if let Some(indices_map) = match_indices {
+                if let Some(indices) = indices_map.get(k) {
+                    // Single-line column whose content would truncate:
+                    // extract a snippet centered on the matches (and
+                    // highlight it). Otherwise highlight in place (the
+                    // wrap path renders the whole cell).
+                    let col_w = col_widths.get(col_idx).copied().unwrap_or(0);
+                    if !use_wrap && col_w > 0 && display_width(&cell) > col_w {
+                        extract_snippet(&cell, indices, col_w)
+                    } else {
+                        highlight_matches(&cell, indices)
+                    }
+                } else {
+                    cell
+                }
+            } else {
+                cell
+            };
+            cells.push(cell);
+        }
+        t.add_row(&cells);
+    }
+
+    let table_header = if has_table_header {
+        Some(LogicalLine::new(t.render_header(width)))
+    } else {
+        None
+    };
+    let lines: Vec<LogicalLine> = if use_wrap {
+        t.render_multiline(width)
+    } else {
+        t.render(width)
+    }
+    .into_iter()
+    .map(LogicalLine::new)
+    .collect();
+    AssembledTable {
+        header: table_header,
+        lines,
+        active,
+    }
+}
+
 /// Per-view render cache: table header + row lines + active indices.
 /// Row lines depend only on (view, columns, render_ctx).
 #[derive(Default)]
@@ -140,8 +311,10 @@ struct RenderCache {
     table_header: Option<LogicalLine>,
     /// `Arc` because this is the *plan's* rows, which a host holds in a frame
     /// element — and elements are `Send + Sync` (stashed in the draw cache
-    /// behind a `Mutex`). `ViewRows`' own slots stay `Rc`: they never leave
-    /// this thread.
+    /// behind a `Mutex`). `ViewRows`' slots are `Arc` for the same reason:
+    /// the whole handle chain is `Arc`, so a view handle can
+    /// ride into an element without smuggling a non-`Send` `Rc` across the
+    /// boundary.
     rows: Arc<Vec<LogicalLine>>,
     active_rows: Vec<usize>,
 }
@@ -188,7 +361,7 @@ pub struct ViewPlan {
 
 pub struct RowView {
     /// Last view passed to plan; ptr-diff vs incoming = dirty.
-    last_view: Option<Rc<ViewRows>>,
+    last_view: Option<Arc<ViewRows>>,
     // --- cursor (per view; pub(crate) for cross-module tests) ---
     pub(crate) cursor_id: Option<String>,
     pub(crate) cursor_idx: usize,
@@ -222,17 +395,17 @@ impl RowView {
     /// is ptr/context driven and internal. `view` is taken by value
     /// (stored as `last_view`); the returned `cursor_row` covers
     /// drill/expand — callers need no second call.
-    pub fn plan(&mut self, view: Rc<ViewRows>, req: &ViewRequest<'_>) -> ViewPlan {
+    pub fn plan(&mut self, view: Arc<ViewRows>, req: &ViewRequest<'_>) -> ViewPlan {
         // 1. View changed → cursor reconcile (today's seed_or_keep).
         let changed = match &self.last_view {
-            Some(prev) => !Rc::ptr_eq(prev, &view),
+            Some(prev) => !Arc::ptr_eq(prev, &view),
             None => true,
         };
         if changed {
             self.reconcile(&view, req.seed_id);
         }
         // 2. Pin (§5.1 restore — applies even with no view change, which
-        //    is what keeps restore cheap: memo hit ⇒ same Rc ⇒ no
+        //    is what keeps restore cheap: memo hit ⇒ same Arc ⇒ no
         //    reconcile ⇒ pin alone moves the cursor).
         if let Some(id) = req.pin {
             self.cursor_id = Some(id.to_string());
@@ -254,7 +427,7 @@ impl RowView {
             self.rebuild_rows(&view, req.columns, req.render_ctx);
             self.last_render_ctx = req.render_ctx;
         }
-        self.last_view = Some(Rc::clone(&view));
+        self.last_view = Some(Arc::clone(&view));
         // 5. Assemble.
         let selected = if view.is_empty() {
             None
@@ -270,6 +443,12 @@ impl RowView {
                 rows: Arc::clone(&self.render.rows),
                 selected,
                 active_rows: self.render.active_rows.clone(),
+                // The handle + config the elements format from: the plan
+                // hands its host both forms — the laid-out snapshot above
+                // (cursor math, paging) and the raw view (render-width
+                // elements).
+                view: Some(Arc::clone(&view)),
+                columns: req.columns.to_vec(),
             },
         }
     }
@@ -312,137 +491,14 @@ impl RowView {
         }
     }
 
-    /// Rebuild table header + row lines + active indices from scratch
-    /// (extracted from `NodeEntry::build_render_plan`).
+    /// Rebuild table header + row lines + active indices from scratch —
+    /// the shared [`assemble_table`], gated by the ptr_eq/ctx checks in
+    /// [`RowView::plan`].
     fn rebuild_rows(&mut self, view: &ViewRows, columns: &[ColumnDef], render_ctx: RenderContext) {
-        use crate::table::{extract_snippet, Align, Table};
-        let col_field_names: Vec<String> = if !columns.is_empty() {
-            columns.iter().map(|c| c.field.clone()).collect()
-        } else {
-            vec!["id".to_string(), "description".to_string()]
-        };
-        let has_table_header =
-            !columns.is_empty() && !view.is_empty() && columns.iter().any(|c| !c.header.is_empty());
-        // Column count comes from the labels (Table::new), so the
-        // default id/description pair must be passed even when the
-        // header row itself is never rendered (has_table_header false).
-        let header_labels: Vec<&str> = if !columns.is_empty() {
-            columns.iter().map(|c| c.header.as_str()).collect()
-        } else {
-            col_field_names.iter().map(|s| s.as_str()).collect()
-        };
-
-        let width = render_ctx.term_width.saturating_sub(2);
-        // Wrapping vs single-line is decided by the columndefs; when there
-        // are none, the implicit id/description pair wraps (matching today).
-        let use_wrap = columns.iter().all(|c| c.wrap);
-
-        // Two-pass when single-line: compute column widths from the raw
-        // (unhighlighted) cells first, so snippet extraction can target the
-        // exact budget a cell will be rendered into. The wrap path needs no
-        // snippet (wrapping handles overflow), so it stays single-pass.
-        let col_widths: Vec<usize> = if use_wrap {
-            Vec::new()
-        } else {
-            let mut temp = Table::new(&header_labels).set_gap(1);
-            if !columns.is_empty() {
-                let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
-                let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
-                let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
-                temp = temp
-                    .with_aligns(&aligns)
-                    .with_min_widths(&mins)
-                    .with_priorities(&prios);
-            }
-            for (row, _active) in view.iter() {
-                let raw: Vec<String> = col_field_names
-                    .iter()
-                    .map(|k| {
-                        row.field_display(k)
-                            .or_else(|| {
-                                row_field_value(row, k).map(|v| match v {
-                                    crate::value::Value::Str(s) => s,
-                                    crate::value::Value::Num(n) => crate::value::fmt_num(n),
-                                })
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect();
-                temp.add_row(&raw);
-            }
-            temp.column_widths(width)
-        };
-
-        let mut t = Table::new(&header_labels).set_gap(1);
-        if !columns.is_empty() {
-            let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
-            let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
-            let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
-            t = t
-                .with_aligns(&aligns)
-                .with_min_widths(&mins)
-                .with_priorities(&prios);
-        }
-        let mut active_rows = Vec::new();
-        for (i, (row, active)) in view.iter().enumerate() {
-            if active {
-                active_rows.push(i);
-            }
-            let rref = view.order[i];
-            let match_indices = view.match_indices(&rref);
-            let mut cells: Vec<String> = Vec::with_capacity(col_field_names.len());
-            for (col_idx, k) in col_field_names.iter().enumerate() {
-                let cell = row
-                    .field_display(k)
-                    .or_else(|| {
-                        row_field_value(row, k).map(|v| match v {
-                            crate::value::Value::Str(s) => s,
-                            crate::value::Value::Num(n) => crate::value::fmt_num(n),
-                        })
-                    })
-                    .unwrap_or_default();
-
-                // Highlight fuzzy matches on every string column (explicit
-                // ColumnDefs and the implicit id/description pair alike).
-                let cell = if let Some(indices_map) = match_indices {
-                    if let Some(indices) = indices_map.get(k) {
-                        // Single-line column whose content would truncate:
-                        // extract a snippet centered on the matches (and
-                        // highlight it). Otherwise highlight in place (the
-                        // wrap path renders the whole cell).
-                        let col_w = col_widths.get(col_idx).copied().unwrap_or(0);
-                        if !use_wrap && col_w > 0 && display_width(&cell) > col_w {
-                            extract_snippet(&cell, indices, col_w)
-                        } else {
-                            highlight_matches(&cell, indices)
-                        }
-                    } else {
-                        cell
-                    }
-                } else {
-                    cell
-                };
-                cells.push(cell);
-            }
-            t.add_row(&cells);
-        }
-
-        let table_header = if has_table_header {
-            Some(LogicalLine::new(t.render_header(width)))
-        } else {
-            None
-        };
-        let lines: Vec<LogicalLine> = if use_wrap {
-            t.render_multiline(width)
-        } else {
-            t.render(width)
-        }
-        .into_iter()
-        .map(LogicalLine::new)
-        .collect();
-        self.render.table_header = table_header;
-        self.render.rows = Arc::new(lines);
-        self.render.active_rows = active_rows;
+        let out = assemble_table(view, columns, render_ctx.term_width.saturating_sub(2));
+        self.render.table_header = out.header;
+        self.render.rows = Arc::new(out.lines);
+        self.render.active_rows = out.active;
     }
 }
 
@@ -450,16 +506,16 @@ impl RowView {
 mod tests {
     use super::*;
 
-    fn resp(rows: Vec<Row>) -> Option<Rc<DataResponse>> {
-        Some(Rc::new(DataResponse {
+    fn resp(rows: Vec<Row>) -> Option<Arc<DataResponse>> {
+        Some(Arc::new(DataResponse {
             rows,
             active_ids: Vec::new(),
         }))
     }
 
-    fn view_of(rows: Vec<Row>) -> Rc<ViewRows> {
+    fn view_of(rows: Vec<Row>) -> Arc<ViewRows> {
         let n = rows.len();
-        Rc::new(ViewRows::new(
+        Arc::new(ViewRows::new(
             vec![resp(rows)],
             (0..n as u32)
                 .map(|i| crate::node_entry::RowRef {
@@ -479,7 +535,7 @@ mod tests {
         }
     }
 
-    fn rows3() -> Rc<ViewRows> {
+    fn rows3() -> Arc<ViewRows> {
         view_of(vec![Row::new("a"), Row::new("b"), Row::new("c")])
     }
 
@@ -495,7 +551,7 @@ mod tests {
     fn delta_moves_cursor() {
         let mut v = RowView::new();
         let view = rows3();
-        v.plan(Rc::clone(&view), &req());
+        v.plan(Arc::clone(&view), &req());
         let mut r = req();
         r.cursor_delta = Some(2);
         let out = v.plan(view, &r);
@@ -509,10 +565,10 @@ mod tests {
         let view = rows3();
         let mut r = req();
         r.cursor_delta = Some(1);
-        v.plan(Rc::clone(&view), &r);
-        // Same Rc handed again: cursor must survive even though a naive
+        v.plan(Arc::clone(&view), &r);
+        // Same Arc handed again: cursor must survive even though a naive
         // reconcile (!user_moved path is skipped — user_moved is true).
-        let out = v.plan(Rc::clone(&view), &req());
+        let out = v.plan(Arc::clone(&view), &req());
         assert_eq!(out.plan.selected, Some(1));
     }
 
@@ -540,20 +596,20 @@ mod tests {
     fn pin_forces_cursor_without_view_change() {
         let mut v = RowView::new();
         let view = rows3();
-        v.plan(Rc::clone(&view), &req());
+        v.plan(Arc::clone(&view), &req());
         let mut r = req();
         r.pin = Some("c");
-        let out = v.plan(view, &r); // identical Rc — pin still applies
+        let out = v.plan(view, &r); // identical Arc — pin still applies
         assert_eq!(out.plan.selected, Some(2));
     }
 
     #[test]
     fn active_rows_resolved_through_iterator() {
-        let slots = vec![Some(Rc::new(DataResponse {
+        let slots = vec![Some(Arc::new(DataResponse {
             rows: vec![Row::new("a"), Row::new("b")],
             active_ids: vec!["b".to_string()],
         }))];
-        let view = Rc::new(ViewRows::new(
+        let view = Arc::new(ViewRows::new(
             slots,
             vec![
                 crate::node_entry::RowRef {

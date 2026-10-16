@@ -1,8 +1,8 @@
 use crate::app_state::AppState;
+use crate::content::Content;
 use crate::session::repo::{ForkMode, SessionRepo};
 use crate::session::storage::SessionStorage;
 use crate::session::Session;
-use crate::Output;
 
 use rig_agent::agent::Agent;
 
@@ -41,6 +41,12 @@ pub struct SessionUsage {
     /// Input ("prompt") tokens of the most recent completion request — the
     /// size of the context that would be re-sent on the next turn.
     pub last_input_tokens: u64,
+    /// The **estimated** input size, recorded by the loop and the turn before
+    /// any completion has reported. An estimate is kept as an
+    /// estimate: it never impersonates a provider report in
+    /// [`Self::last_input_tokens`]. [`Self::context_figure`] is the one read
+    /// that falls back to it.
+    pub estimated_input_tokens: u64,
     /// Output ("completion") tokens of the most recent completion request.
     pub last_output_tokens: u64,
     /// Cache-read tokens of the most recent completion request.
@@ -57,6 +63,21 @@ pub struct SessionUsage {
     pub session_cache_creation_input_tokens: u64,
     /// Cumulative reasoning tokens across the session.
     pub session_reasoning_tokens: u64,
+}
+
+impl SessionUsage {
+    /// The context figure the bar and `/stat` show: the provider's own count of
+    /// what it last sent when one has reported, else the loop's/turn's
+    /// estimate. One read, so the two surfaces cannot disagree
+    /// about which number stands — and so the estimate never has to pretend to
+    /// be a provider report to be seen.
+    pub fn context_figure(&self) -> u64 {
+        if self.last_input_tokens > 0 {
+            self.last_input_tokens
+        } else {
+            self.estimated_input_tokens
+        }
+    }
 }
 
 /// Per-turn persistence state threaded across `prompt()` retries inside one
@@ -167,7 +188,10 @@ impl TurnPersistence {
 
 pub struct CodeAgent {
     agent: Agent,
-    output: Arc<dyn Output>,
+    /// Content: what the turn's `display_*` / `stream_*` /
+    /// `begin|end_response` calls go through, and the turn's whole frame/input
+    /// seam.
+    content: Arc<crate::content::Content>,
     tool_call_limit: usize,
     provider: String,
     model: String,
@@ -178,9 +202,6 @@ pub struct CodeAgent {
     /// The live params this agent was built with: the default for a turn with
     /// no per-turn override, and the status bar's reasoning level.
     live_params: crate::params::ModelParams,
-    /// The resolved context window, so the per-turn status bar divides by the
-    /// number in force rather than looking one up per paint.
-    context_limit: Option<u64>,
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
@@ -203,7 +224,13 @@ pub struct CodeAgent {
     /// Accumulated token-usage telemetry captured from the streaming run
     /// (see [`SessionUsage`]). Backs `/stat` and is the measurement primitive
     /// compaction will rely on (doc/compaction.md §2.7).
-    usage: Mutex<SessionUsage>,
+    ///
+    /// Shared, not owned: the bar element and `/stat` clone this
+    /// `Arc` and read it at render, so a mid-turn completion's
+    /// `last_input_tokens` reaches the status line the moment the next paint
+    /// runs — no `set_status` push to keep in step, and no stale context
+    /// figure. The turn writes it in place; every reader pulls.
+    usage: Arc<Mutex<SessionUsage>>,
 }
 
 /// Build session context data for the REPL overlays.
@@ -561,7 +588,7 @@ pub(crate) async fn resume_session(
     repo: &crate::session::repo::JsonlSessionRepo,
     meta: &crate::session::SessionMetadata,
     replay: (usize, bool),
-    output: &dyn Output,
+    content: &Content,
     qualified_id: &str,
     level_on_activate: Option<crate::params::ReasoningLevel>,
 ) -> std::result::Result<(Arc<Session>, String, Option<String>), String> {
@@ -603,9 +630,9 @@ pub(crate) async fn resume_session(
         let total = count_turns(&units);
         if is_lines {
             // Line-based: capture full replay via writer, tail lines.
-            output.begin_capture();
-            replay_units(output, &units, 0);
-            let bytes = output.end_capture();
+            content.begin_capture();
+            replay_units(content, &units, 0);
+            let bytes = content.end_capture();
             let captured = String::from_utf8_lossy(&bytes);
             let lines: Vec<&str> = captured.lines().collect();
             let start = lines.len().saturating_sub(count);
@@ -617,7 +644,7 @@ pub(crate) async fn resume_session(
             }
             let _ = handle.flush();
         } else {
-            replay_last_turns(output, &units, count.min(total));
+            replay_last_turns(content, &units, count.min(total));
         }
     }
     let prefill = compute_resume_model_prefill(&new_session, qualified_id, level_on_activate).await;
@@ -647,9 +674,9 @@ pub(crate) async fn start_fresh_session(app_state: &AppState, name: &str) {
     app_state.activate_session(fresh.clone(), id);
     if !name.is_empty() {
         if let Some(ref s) = fresh {
-            let out = app_state.with_config(|c| c.output.clone());
+            let content = app_state.with_config(|c| c.content.clone());
             if let Err(e) = s.set_session_name(name).await {
-                out.display_text(&format!("Could not name session: {}", e));
+                content.display_text(&format!("Could not name session: {}", e));
             } else if let Some(r) = app_state.repo() {
                 r.invalidate_cache();
             }
@@ -660,8 +687,7 @@ pub(crate) async fn start_fresh_session(app_state: &AppState, name: &str) {
 impl CodeAgent {
     pub fn new(
         agent: Agent,
-        output: Arc<dyn Output>,
-        context_limit: Option<u64>,
+        content: Arc<crate::content::Content>,
         tool_call_limit: usize,
         provider: String,
         model: String,
@@ -676,8 +702,7 @@ impl CodeAgent {
     ) -> Self {
         Self {
             agent,
-            output,
-            context_limit,
+            content,
             tool_call_limit,
             provider,
             model,
@@ -689,8 +714,27 @@ impl CodeAgent {
             cancel_notify,
             reasoning_in_context,
             message_logger,
-            usage: Mutex::new(SessionUsage::default()),
+            usage: Arc::new(Mutex::new(SessionUsage::default())),
         }
+        // Wire the bar to this agent's usage store before it exists as a
+        // handle anywhere else: the constructor is the moment
+        // the agent and its content are first paired, and the bar has to read
+        // the turn's in-place writes from its very first paint.
+        .tap_content()
+    }
+
+    /// Point the content bar at this agent's usage store. Split out of
+    /// [`Self::new`]'s tail so the constructor stays a plain struct literal.
+    fn tap_content(self) -> Self {
+        self.content.set_usage(Some(self.usage.clone()));
+        self
+    }
+
+    /// The shared usage store — the bar element's and `/stat`'s live source
+    /// Cloned out, never locked across a call: the turn writes
+    /// it in place, so a reader always sees the latest completion's figures.
+    pub fn usage_handle(&self) -> Arc<Mutex<SessionUsage>> {
+        self.usage.clone()
     }
 }
 
@@ -1293,76 +1337,6 @@ mod tests {
         assert_eq!(m, model);
     }
 
-    // ---- display_tool_error plumbing ----
-    //
-    // Layer-1 Task 1 added `Output::display_tool_error` as a default-impl
-    // method. The default impl formats a string and forwards to
-    // `display_error`. This test pins the default-impl contract so a future
-    // refactor that, say, calls `display_error` twice (once with the
-    // formatted string, once with the message) or forgets to include the
-    // tool name in the formatted output is caught.
-
-    use crate::output::{Confirmation, Output};
-    use serde_json::Value as JsonValue;
-    use std::sync::{Arc as StdArc, Mutex as StdMutex};
-
-    struct ErrorRecorder {
-        errors: StdArc<StdMutex<Vec<String>>>,
-    }
-    impl Output for ErrorRecorder {
-        fn display_text(&self, _t: &str) {}
-        fn display_markdown(&self, _t: &str) {
-            self.display_text(_t);
-        }
-        fn begin_response(&self) {}
-        fn stream_text(&self, _d: &str) {}
-        fn stream_thinking(&self, _d: &str) {}
-        fn end_response_segment(&self) {}
-        fn end_response(&self) {}
-        fn display_tool_call(&self, _n: &str, _a: &JsonValue) {}
-        fn display_tool_result(&self, _r: &str) {}
-        fn get_user_input(&self) -> String {
-            String::new()
-        }
-        fn display_error(&self, e: &str) {
-            self.errors.lock().unwrap().push(e.to_string());
-        }
-        fn display_system(&self, _t: &str) {}
-        fn confirm(&self, _m: &str) -> Confirmation {
-            Confirmation::No
-        }
-        fn display_separator(&self) {}
-        fn display_header(&self, _p: &str, _m: &str, _y: bool, _l: usize, _pn: Option<&str>) {}
-    }
-    #[test]
-    fn display_tool_error_default_impl_forwards_to_display_error_with_tool_name() {
-        // The default impl on the `Output` trait is the path used by every
-        // `Output` impl that doesn't override `display_tool_error` (e.g.
-        // `QuietOutput`, `NoOutput` would no-op via their own method, but
-        // any future `Output` impl that forgets to override gets this
-        // default). Format check: tool name + kind + message all present.
-        let errors = StdArc::new(StdMutex::new(Vec::new()));
-        let recorder = ErrorRecorder {
-            errors: errors.clone(),
-        };
-        // Call through the trait so we exercise the default impl, not a
-        // concrete method.
-        <dyn Output>::display_tool_error(
-            &recorder,
-            "edit",
-            "invalid_args",
-            "expected `,` or `}` at line 1",
-        );
-        let recorded = errors.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 1, "expected exactly one display_error call");
-        let msg = &recorded[0];
-        assert!(msg.contains("edit"), "tool name missing: {msg}");
-        assert!(msg.contains("invalid_args"), "kind missing: {msg}");
-        assert!(
-            msg.contains("expected `,` or `}` at line 1"),
-            "message missing: {msg}"
-        );
-    }
     // Regression test for the `/new` (and `/clear`) bug: those commands set
     // the in-memory `session = None`, but the prior implementation never
     // recreated a session before the next Submit. As a result

@@ -8,8 +8,6 @@
 //! Leaf settings (int, freetext) return their value directly in `data()`.
 use std::sync::Arc;
 
-use std::rc::Rc;
-
 use crate::app_state::AppState;
 use crate::settings::{SettingKey, ValueKind, SETTINGS};
 use crate::slashdot_menu::fields::Row;
@@ -37,7 +35,7 @@ impl SlashDotNode for EnumSettingNode {
             .iter()
             .map(|(val, desc)| Row::new(*val).desc(*desc))
             .collect();
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows,
             active_ids: vec![current],
         }))
@@ -69,7 +67,7 @@ impl SlashDotNode for SettingLeafNode {
         let rows = vec![Row::new(meta.name)
             .desc(meta.description)
             .field("value", crate::slashdot_menu::value::Value::Str(val))];
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows,
             active_ids: Vec::new(),
         }))
@@ -89,7 +87,7 @@ impl SlashDotNode for SettingLeafNode {
     }
 
     async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let render_ctx = crate::v25_listing_node::header_ctx();
+        let render_ctx = crate::v25_listing_node::header_ctx(&self.app_state);
         let header = self.header(path_args, &render_ctx).await;
         crate::v25_listing_node::view_header(&self.app_state, &header)
     }

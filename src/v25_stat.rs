@@ -2,7 +2,6 @@
 //!
 //! Leaf node: header() shows session stats; submit() closes the menu.
 
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::app_state::AppState;
@@ -17,7 +16,7 @@ pub struct StatNode {
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for StatNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
+        Ok(Arc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("stat")
                 .desc("session stats: context window, usage, cost, cache hit")],
             active_ids: Vec::new(),
@@ -25,7 +24,7 @@ impl SlashDotNode for StatNode {
     }
 
     async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let render_ctx = crate::v25_listing_node::header_ctx();
+        let render_ctx = crate::v25_listing_node::header_ctx(&self.app_state);
         let header = self.header(path_args, &render_ctx).await;
         crate::v25_listing_node::view_header(&self.app_state, &header)
     }
@@ -40,7 +39,21 @@ impl SlashDotNode for StatNode {
             (String::new(), model)
         };
 
-        let usage = self.app_state.session_usage();
+        // Read live off the agent's usage store rather than the
+        // loop's per-cycle snapshot, so a `/stat` opened mid-turn reports the
+        // most recent completion — the same source the status bar pulls (both
+        // reach it through content's handle). No agent yet means no completions,
+        // so the default store is the honest answer.
+        let usage = self
+            .app_state
+            .content()
+            .usage_handle()
+            .map(|u| *u.lock().unwrap())
+            .unwrap_or_default();
+        // The estimate line's figure, off the same one read the bar uses
+        // the provider's count when one has reported, else the
+        // recorded estimate.
+        let context_figure = usage.context_figure();
 
         let session_info = {
             let session_id = self.app_state.current_session_id();
@@ -70,7 +83,7 @@ impl SlashDotNode for StatNode {
             &model,
             usage,
             session_info,
-            self.app_state.context_tokens(),
+            context_figure,
             self.app_state
                 .with_settings(|s| s.model_settings(&format!("{provider}:{model}")).cloned())
                 .as_ref(),
@@ -299,13 +312,16 @@ mod tests {
     fn stat_header_shows_estimated_context_tokens() {
         let app_state = test_app_state();
         app_state.set_model("openai:gpt-4o");
-        app_state.update_cycle_view(
-            String::new(),
-            Default::default(),
-            42_000,
-            Arc::new(Vec::new()),
-            None,
-        );
+        // The estimate lives on the usage store, read off
+        // the same handle the bar pulls; seed it as an estimate, not a report.
+        app_state
+            .content()
+            .set_usage(Some(Arc::new(std::sync::Mutex::new(
+                crate::agent::SessionUsage {
+                    estimated_input_tokens: 42_000,
+                    ..Default::default()
+                },
+            ))));
         let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = futures::executor::block_on(handle.eval_prompt("stat ", HostKey::None, 80));

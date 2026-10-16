@@ -17,6 +17,7 @@ pub mod menu;
 
 // --- Engine modules ---
 pub mod cursor;
+pub mod elements;
 pub mod fields;
 pub mod filter;
 pub mod fuzzy;
@@ -31,6 +32,7 @@ pub mod view;
 pub mod wrap;
 
 // Re-export public types for convenience.
+pub use elements::{ElementSet, Update};
 pub use fields::ColumnDef;
 pub use menu::{SlashDotHandle, SlashDotMenu, SlashDotMenuNode};
 pub use node_entry::{HostKey, RowRef};

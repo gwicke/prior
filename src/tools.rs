@@ -44,9 +44,12 @@ impl From<tokio::task::JoinError> for ToolError {
     }
 }
 
-/// Process-wide registry of tool-cancel senders.  When `<Esc>` is pressed,
-/// `spawn_in_flight_reader` sends `()` on every registered sender, which wakes
-/// the corresponding watchdog thread to kill the child process.
+/// Process-wide registry of tool-cancel senders.  When `<Esc>` is pressed, the
+/// turn's key dispatcher (via the back-off / window pumps in `agent::pumps`)
+/// sends `()` on every registered sender, which wakes the corresponding
+/// watchdog thread to kill the child process.  (The persistent stdin reader
+/// forwards `Esc`; it does not cancel tools itself — U4.3 made `Esc`
+/// menu-first, a decision only the turn can make.)
 ///
 /// Registration is scoped: `capture_bounded` pushes an `(id, sender)` pair
 /// before spawning the watchdog and removes *that pair* when the function
@@ -1178,8 +1181,9 @@ fn capture_bounded(
     // which unblocks `recv_timeout` in the watchdog thread immediately so that
     // `g.join()` returns promptly when the command finishes before the timeout.
     // A clone of `cancel_tx` is registered in the process-wide
-    // `TOOL_CANCEL_SENDERS` list so the in-flight reader thread can send `()`
-    // on it when `<Esc>` is pressed — waking the watchdog to kill the child.
+    // `TOOL_CANCEL_SENDERS` list so the turn's Esc dispatcher (via the pumps)
+    // can send `()` on it when `<Esc>` is pressed — waking the watchdog to kill
+    // the child.
     let timed_out = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();

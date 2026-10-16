@@ -20,9 +20,10 @@ use crate::app_state::AppState;
 use crate::confirm::ConfirmBridge;
 use crate::model_catalog;
 use crate::params;
-use crate::repl::{History, InputAction, ModelFilter, PromptSession, Repl, ReplCtx, TermGuard};
+use crate::repl::{History, InputAction, ModelFilter, PromptSession, Repl, ReplCtx};
 use crate::session::repo::JsonlSessionRepo;
 use crate::settings::SettingsStore;
+use crate::termio::InputEvent;
 use crate::tools::set_sandbox;
 use crate::Result;
 
@@ -148,8 +149,8 @@ pub(crate) fn plan_rebuild(
 /// The state of a live interactive session, carried across REPL turns.
 ///
 /// Everything that must survive one input cycle is a field here: the applied
-/// config, the REPL handle and its reader guard, the carried prompt session,
-/// the cancel flags, the session repo, and the rebuild gate's fingerprint.
+/// config, the REPL handle, the carried prompt session, the cancel flags, the
+/// session repo, and the rebuild gate's fingerprint.
 /// [`run_interactive`] builds one of these and drives [`Interactive::run`].
 struct Interactive {
     config: AgentConfig,
@@ -161,8 +162,16 @@ struct Interactive {
     cancel: Arc<AtomicBool>,
     app_state: Arc<AppState>,
     last_attempted_target: Option<RebuildFingerprint>,
-    guard: Option<Arc<TermGuard>>,
     prompt_session: Option<PromptSession>,
+    /// The persistent reader's input queue — the one receiver of the
+    /// `TermIO::handles()` distribution this struct keeps (design §3:
+    /// distributed once at setup). `read_input`
+    /// consumes it at the prompt, each turn borrows it as `InTurnInput::keys`
+    /// — one channel for the process, so a key typed at the end of a turn
+    /// lands in the next prompt instead of dying with a per-turn queue.
+    /// `caret` went to the manager (the event's only consumer), `size` was
+    /// a spare — content and the manager took theirs at construction.
+    input: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
 }
 
 /// Whether the input loop keeps going after an arm runs.
@@ -179,7 +188,13 @@ pub async fn run_interactive(
     auto_resume: bool,
 ) -> Result<()> {
     let mut interactive = Interactive::new(config, settings, auto_resume).await;
-    interactive.run().await
+    let result = interactive.run().await;
+    // Teardown: the loop's exits (`/quit`, an error mid-turn) leave raw mode
+    // on, and the `TermGuard` drop backstop can never fire — the persistent
+    // stdin reader holds an `Arc` clone for the process lifetime. The front
+    // door is idempotent and a no-op on Plain, so this is unconditional.
+    interactive.config.content.manager.lock().unwrap().suspend();
+    result
 }
 
 impl Interactive {
@@ -225,13 +240,19 @@ impl Interactive {
         if use_repl {
             config.confirm_port = Some(confirm_bridge.port.clone());
         }
-        let mut repl = if use_repl { Some(Repl::new()) } else { None };
-        if let Some(r) = repl.as_mut() {
-            let _ = r.start();
+        // The terminal backend was constructed first, in `main`:
+        // Tty iff `use_repl`, already seeded into `Content` (caps, size
+        // watch) and moved under `Draw` on the way in. Nothing here names
+        // `TermIO` — the manager's front door is the whole surface
+        // (`resume`/`suspend`/`is_tty`/`handles`/`probe_size`).
+        let repl = use_repl.then_some(Repl);
+        if repl.is_some() {
+            // Raw-mode entry (idempotent), where `Repl::start` used to do it.
+            config.content.manager.lock().unwrap().resume();
             // First screen: a one-line hint
-            let ref output = config.output;
-            output.display_text("Welcome to picocode - type `/` for details.");
-            output.display_separator();
+            let content = &config.content;
+            content.display_text("Welcome to picocode - type `/` for details.");
+            content.display_separator();
         }
 
         // Persistent session storage.
@@ -316,17 +337,52 @@ impl Interactive {
         // un-retried until the target changes — one error per distinct target,
         // not one per cycle while the user navigates back to the menu.
         let last_attempted_target: Option<RebuildFingerprint> = None;
-        // Guard handle for the reader thread (suspend/resume / hard-exit).
-        let guard = repl.as_ref().map(|r| r.guard());
-        // Publish to the slot: the inline compact node's review closure
-        // suspends raw mode around `$EDITOR` with it (service handle,
-        // clone-out — never held behind the lock across the editor).
-        if let Some(g) = guard.clone() {
-            app_state.set_term_guard(g);
-        }
-        if guard.is_some() {
-            crate::repl::register_sigcont();
-        }
+        // The persistent stdin reader: one thread, spawned
+        // once by `TermIO::handles` — reached through the manager, which has
+        // owned the backend since construction (raw mode is already on),
+        // owning stdin for the process lifetime. It forwards keys/paste on
+        // this channel; the prompt loop and every turn consume the receiver
+        // half. The reader backs off whenever the main task owns stdin —
+        // `$EDITOR`, a DSR query, or the compaction window — via the pause
+        // gate (`termio::PAUSE_GATE`), the one flag `ReaderPauseGuard` and
+        // `TermIO::suspend` raise.
+        //
+        // The guard is raised *before* `handles()` so the reader starts parked
+        // and cannot consume the entry DSR's reply: the draw cache is anchored
+        // (`run_entry_dsr`) while nothing reads stdin, then the guard drops —
+        // lowering the gate — and the reader takes over for the prompt.
+        // Without this ordering the reader's first poll would swallow the
+        // terminal's cursor-position report before `cursor_row` could read it.
+        // The guard is the front door for this window: nesting-safe,
+        // and it lowers on drop, so an early return can no longer leak the
+        // gate up. The reader isn't running yet when it is raised (the thread
+        // starts inside `handles()` below), so the raise is instant.
+        let handles = if use_repl {
+            let _pause = crate::termio::ReaderPauseGuard::raise();
+            let handles = config.content.manager.lock().unwrap().handles();
+            crate::repl::run_entry_dsr(config.content.as_ref());
+            handles
+        } else {
+            // Plain (piped/quiet): no reader, and `handles()`' input channel
+            // arrives closed — the shape piped mode had when it dropped the
+            // sender half, so nothing ever reads it in that mode.
+            config.content.manager.lock().unwrap().handles()
+        };
+        // Distribute the hand-out (design §3): the caret half's only
+        // consumer is the render manager, which takes it here — the reader
+        // sends its `Invalidated` events from the first poll onward, so the
+        // receiver must be installed before the prompt loop runs.
+        let crate::termio::TermHandles {
+            input,
+            size: _size,
+            caret,
+        } = handles;
+        config
+            .content
+            .manager
+            .lock()
+            .unwrap()
+            .set_caret_receiver(caret);
         // Warm the model catalog cache in the background so the `/model`
         // overlay is populated within a few seconds *without* blocking the
         // first prompt. The overlay falls back to the cached/static list
@@ -375,8 +431,8 @@ impl Interactive {
             cancel,
             app_state,
             last_attempted_target,
-            guard,
             prompt_session,
+            input,
         }
     }
 
@@ -457,7 +513,7 @@ impl Interactive {
                         "set persona"
                     };
                     self.config
-                        .output
+                        .content
                         .display_text(&format!("Cannot {}: {}", kind, e));
                 }
             }
@@ -532,11 +588,11 @@ impl Interactive {
                             format!("sandbox: restored {} (ok)", sandbox_path)
                         }
                     };
-                    self.config.output.display_text(&msg);
+                    self.config.content.display_text(&msg);
                 }
                 Err(e) => {
                     self.config
-                        .output
+                        .content
                         .display_text(&format!("sandbox error: {}", e));
                 }
             }
@@ -566,21 +622,21 @@ impl Interactive {
         // reaches the live params or the next turn.
         let split = crate::turn_overrides::split(&input);
         for w in &split.warnings {
-            self.config.output.display_text(w);
+            self.config.content.display_text(w);
         }
         // An overrides-only prompt has nothing to send. Checked *before*
         // `ensure_session` below, or a turn that never runs would still
         // create a session.
         if split.text.trim().is_empty() {
             self.config
-                .output
+                .content
                 .display_text("nothing to send — the prompt was only overrides");
             return LoopCtl::Continue;
         }
         let input = split.text;
         let (effective_params, notes) = effective_params(&self.app_state, &split.overrides);
         for n in &notes {
-            self.config.output.display_text(n);
+            self.config.content.display_text(n);
         }
         // Safety net: any code path that drops the in-memory session
         // (notably `/new` and `/clear`) must leave us with a fresh one
@@ -618,6 +674,12 @@ impl Interactive {
         // `/stat` is handled by the REPL overlay (typing it opens the
         // stats panel); it is never submitted here, so there's nothing
         // to do for that keyword.
+        // The bar's label for an unnamed session on the very first prompt: the
+        // cycle view is written before this message is persisted, so the branch
+        // is still empty then. Record the text being sent as the stand-in (the
+        // `first_user_text(prior).or(input)` fallback, relocated here from the
+        // turn); the next cycle's branch write supersedes it.
+        self.app_state.set_first_message_if_unset(&input);
         // Reprint the submitted prompt via the `Output` impl so the
         // session (and cursor tracking) stays correct; `read_input`
         // cleared the input line on submit. Bracketed — a rule above
@@ -643,9 +705,9 @@ impl Interactive {
         // Reprint the submitted command (cleared by `read_input`),
         // bracketed like every other line the user committed with
         // Enter (ui_draw_v2 R4).
-        self.config.output.display_committed_prompt(input);
+        self.config.content.display_committed_prompt(input);
         if cmd.is_empty() {
-            self.config.output.display_plain(
+            self.config.content.display_plain(
                 "Usage: !<command> (capture output into context), or !!<command> (display only)",
             );
         } else {
@@ -661,9 +723,9 @@ impl Interactive {
                 Ok(out) => {
                     let out = out.trim();
                     if out.is_empty() {
-                        self.config.output.display_plain("(no output)");
+                        self.config.content.display_plain("(no output)");
                     } else {
-                        self.config.output.display_plain(out);
+                        self.config.content.display_plain(out);
                     }
                     if capture {
                         // Mirror a normal turn so the model sees
@@ -682,13 +744,13 @@ impl Interactive {
                         }
                     } else {
                         self.config
-                            .output
+                            .content
                             .display_plain("(output was displayed but not added to context)");
                     }
                 }
                 Err(e) => {
                     self.config
-                        .output
+                        .content
                         .display_text(&format!("shell error: {}", e));
                 }
             }
@@ -704,7 +766,7 @@ impl Interactive {
         input: String,
         effective_params: crate::params::ModelParams,
     ) {
-        self.config.output.display_committed_prompt(&input);
+        self.config.content.display_committed_prompt(&input);
         // Normal prompt — create the agent lazily on first use
         // (loop-side, applied config; published to the slot).
         if self.app_state.agent().is_none() {
@@ -712,7 +774,7 @@ impl Interactive {
                 Ok(a) => self.app_state.activate_agent(Arc::from(a)),
                 Err(e) => {
                     self.config
-                        .output
+                        .content
                         .display_text(&format!("Cannot start agent: {}", e));
                     return;
                 }
@@ -721,43 +783,22 @@ impl Interactive {
         // Clone-out for this turn (lock rule 3: no guard across await).
         let agent = self.app_state.agent();
         let session = self.app_state.session();
-        // Single attempt + auto-retry, with the in-flight reader
-        // (if any) spanning the whole window. `Esc` is dispatched by
-        // the turn's one key dispatcher wherever the turn is: inside
-        // `prompt()` while an attempt streams, by the back-off pump
-        // while a retry delay runs (`cancellable_sleep_pumped`) —
-        // either way it fires the cancel signal, and the wait (or the
-        // stream) ends immediately, returning `Cancelled`.
-        // U4.2/U4.3: edit keys typed while the turn runs. The reader
-        // owns the sender; the receiver is bound for the whole turn so
-        // the queue lives exactly as long as the reader can feed it,
-        // and it is handed into `prompt()` as `InTurnInput::keys` for
-        // the key branch to drain.
+        // Single attempt + auto-retry, with the persistent reader spanning the
+        // whole window. `Esc` is dispatched by the turn's one key dispatcher
+        // wherever the turn is: inside `prompt()` while an attempt streams, by
+        // the back-off pump while a retry delay runs (`cancellable_sleep_pumped`)
+        // — either way it fires the cancel signal, and the wait (or the stream)
+        // ends immediately, returning `Cancelled`.
         //
-        // Holding it is what keeps `send` working — a dropped receiver
-        // makes every send a no-op, which would silently turn the
-        // forwarding back into the drop U4.2 existed to remove. It
-        // dies with this scope, so the queue dies with it and a
-        // keystroke queued at the end of one turn cannot leak into the
-        // next prompt.
-        let (in_turn_keys_tx, mut in_turn_keys) = tokio::sync::mpsc::unbounded_channel();
-        let reader_handle = if let Some(g) = &self.guard {
-            let done = Arc::new(AtomicBool::new(false));
-            let confirm_gate = self
-                .config
-                .output
-                .confirm_gate()
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-            let h = crate::repl::spawn_in_flight_reader(
-                g.clone(),
-                done.clone(),
-                confirm_gate,
-                in_turn_keys_tx,
-            );
-            Some((h, done))
-        } else {
-            None
-        };
+        // U4.2/U4.3: edit keys typed while the turn runs come from the **one
+        // process-lifetime channel** the persistent reader feeds
+        // (`self.input`,
+        // — a process-lifetime channel, no per-turn reader, no per-turn queue. The
+        // receiver is borrowed for the whole turn and handed into `prompt()` as
+        // `InTurnInput::keys`; because the channel is never dropped between
+        // turns, a key typed at the very end of a turn lands in the next
+        // prompt rather than being discarded (a deliberate change from the
+        // per-turn queue, which died with the turn).
         let response: std::result::Result<String, crate::PicocodeError> = {
             let mut consecutive_failures: u8 = 0;
             let mut next_input: String = input.clone();
@@ -796,21 +837,21 @@ impl Interactive {
                         session.as_deref(),
                         &turn,
                         &turn_params,
-                        // `zip`: the key branch exists only where there
-                        // is both a session to receive the key and a
-                        // guard to stop the reader for it. Piped input
-                        // has neither, and piped input with a guard
-                        // has no reader, so there is no key either.
+                        // The key branch exists only where there is a session
+                        // to receive it — built by the REPL arm alone, i.e.
+                        // interactive tty (the same fact the old `guard` zip
+                        // re-checked). Piped input gets no key branch: the
+                        // persistent reader's queue is simply not read there.
+                        // `keys` is the one process-lifetime channel the
+                        // reader feeds.
                         self.prompt_session
                             .as_mut()
-                            .zip(self.guard.as_deref())
-                            .map(|(sess, g)| crate::repl::InTurnInput {
+                            .map(|sess| crate::repl::InTurnInput {
                                 session: sess,
-                                keys: &mut in_turn_keys,
+                                keys: &mut self.input,
                                 confirms: &mut self.confirm_bridge.requests,
                                 label: &self.prompt_str,
                                 history: &mut self.line_history,
-                                guard: g,
                             }),
                     )
                     .await;
@@ -841,7 +882,7 @@ impl Interactive {
                         // so re-sending it would duplicate the user's
                         // request.
                         let ms = retry_delay_ms(&cause, 1);
-                        self.config.output.display_text(&format!(
+                        self.config.content.display_text(&format!(
                             "Error: {}. Retrying in {}s...",
                             cause,
                             ms / 1000
@@ -852,11 +893,10 @@ impl Interactive {
                             ms,
                             turn_backoff_pump(
                                 &mut self.prompt_session,
-                                &mut in_turn_keys,
+                                &mut self.input,
                                 &mut self.line_history,
                                 &self.prompt_str,
-                                &self.guard,
-                                self.config.output.as_ref(),
+                                &self.config.content,
                             ),
                         )
                         .await;
@@ -918,7 +958,7 @@ impl Interactive {
                     Err(e) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         let ms = retry_delay_ms(&e, consecutive_failures);
-                        self.config.output.display_text(&format!(
+                        self.config.content.display_text(&format!(
                             "Error: {}. Retrying in {}s...",
                             e,
                             ms / 1000
@@ -929,11 +969,10 @@ impl Interactive {
                             ms,
                             turn_backoff_pump(
                                 &mut self.prompt_session,
-                                &mut in_turn_keys,
+                                &mut self.input,
                                 &mut self.line_history,
                                 &self.prompt_str,
-                                &self.guard,
-                                self.config.output.as_ref(),
+                                &self.config.content,
                             ),
                         )
                         .await;
@@ -971,20 +1010,19 @@ impl Interactive {
             };
             outcome
         };
-        if let Some((h, done)) = reader_handle {
-            done.store(true, Ordering::SeqCst);
-            let _ = h.join();
-        }
+        // No reader teardown here: the stdin reader is process-lifetime now
+        // — it keeps feeding the one channel across turns
+        // and into the next prompt.
         match response {
             Ok(_) => {}
             Err(crate::PicocodeError::Cancelled(msg)) => {
                 // Turn aborted via `<Esc>`; `prompt()` already persisted
                 // the in-flight history, so show a clear notice instead
                 // of a generic "Error:".
-                self.config.output.display_text(&msg);
+                self.config.content.display_text(&msg);
             }
             Err(e) => {
-                self.config.output.display_text(&format!("Error: {}", e));
+                self.config.content.display_text(&format!("Error: {}", e));
             }
         }
     }
@@ -1021,17 +1059,8 @@ impl Interactive {
                         branch_messages.first().map(|(_, preview)| preview.clone());
 
                     let ctx = ReplCtx {
-                        provider: self.config.provider.clone(),
-                        model: self.config.model.clone(),
                         recent: self.app_state.recent_models(),
                         persona: self.config.persona_name.clone(),
-                        // Snapshot the agent's accumulated token usage so the `/stat`
-                        // overlay can render without needing the agent directly.
-                        session_usage: self
-                            .app_state
-                            .agent()
-                            .map(|a| a.session_usage())
-                            .unwrap_or_default(),
                         repo: self.repo.clone(),
                         current_session_id: self.app_state.current_session_id(),
                         branch_messages,
@@ -1039,17 +1068,11 @@ impl Interactive {
                         leaf_id,
                         context_tokens,
                         model_filter: ModelFilter::default_for_coding(),
-                        // P1's accessor (the level now lives in `ModelParams`)
-                        // plus upstream's two new status-bar fields.
-                        reasoning_level: self.config.params.reasoning_str(),
-                        // The resolved context window, so the prompt-side bar's
-                        // percentage uses the same denominator as the mid-turn one.
-                        context_limit: resolved_context_limit(&self.app_state),
-                        // The prompt-side bar names the session the same way the
-                        // mid-turn one does: off the session index, with the opening
-                        // message as the fallback when it has no name. Read here, at
-                        // the top of the cycle, so both bars are looking at one
-                        // snapshot rather than at whatever the index holds later.
+                        // The bar names the session off `AppState`, which this
+                        // cycle writes below: the name off the session index,
+                        // with the opening message as the fallback. The model,
+                        // thinking level and context window are read straight
+                        // off `AppState` by the bar at render.
                         session_name,
                         session_first_message,
                     };
@@ -1074,7 +1097,8 @@ impl Interactive {
                         &mut self.line_history,
                         &ctx,
                         &self.app_state,
-                        self.config.output.as_ref(),
+                        self.config.content.as_ref(),
+                        &mut self.input,
                     )
                     .await
                 }
@@ -1086,11 +1110,11 @@ impl Interactive {
                     // BEFORE the convergence step below, so control/target
                     // writes land the same cycle as an interactive `MenuDone`
                     // (doc/editor_cleanup.md §10.9).
-                    let input = self.config.output.get_user_input();
+                    let input = self.config.content.get_user_input();
                     match Repl::batch_slash(
                         &self.app_state,
                         &input,
-                        self.config.output.as_ref(),
+                        self.config.content.as_ref(),
                         &mut self.line_history,
                     )
                     .await
@@ -1135,10 +1159,11 @@ mod tests {
     /// Minimal `AgentConfig` for gate decisions — the plan only reads the
     /// model id, params, and persona, so the rest is filler.
     fn gate_cfg(provider: &str, model: &str, params: crate::params::ModelParams) -> AgentConfig {
+        let content = Arc::new(crate::content::Content::quiet());
         AgentConfig {
             provider: provider.into(),
             model: model.into(),
-            output: Arc::new(crate::output::NoOutput),
+            content,
             yolo: false,
             confirm_port: None,
             quiet: true,
@@ -1378,9 +1403,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         use crate::config::{BindPath, SandboxConfig};
-        use crate::output::Confirmation;
         use crate::AgentConfig;
-        use crate::Output;
         use std::sync::atomic::AtomicBool;
 
         // bwrap is required for the sandbox to engage at all.
@@ -1422,49 +1445,14 @@ mod tests {
             max_output_bytes: crate::config::SandboxMaxOutputBytes(None),
         };
 
-        // In-memory `Output`: replays a fixed script and records what is shown.
-        struct ScriptOutput {
-            inputs: Arc<Mutex<VecDeque<String>>>,
-            shown: Arc<Mutex<String>>,
-        }
-        impl Output for ScriptOutput {
-            fn display_text(&self, t: &str) {
-                self.shown.lock().unwrap().push_str(t);
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn display_plain(&self, t: &str) {
-                self.shown.lock().unwrap().push_str(t);
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn display_separator(&self) {
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn get_user_input(&self) -> String {
-                self.inputs
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or_else(|| "/q".to_string())
-            }
-            fn display_tool_call(&self, _: &str, _: &serde_json::Value) {}
-            fn display_tool_result(&self, _: &str) {}
-            fn display_error(&self, _: &str) {}
-            fn display_system(&self, _: &str) {}
-            fn confirm(&self, _: &str) -> Confirmation {
-                Confirmation::No
-            }
-            fn display_header(&self, _: &str, _: &str, _: bool, _: usize, _: Option<&str>) {}
-        }
-
+        // A scripted input line replays the `!` command; captured bytes record
+        // what content shows.
         let inputs = Arc::new(Mutex::new(VecDeque::from([
             format!("!cat {}", probe),
             "/q".to_string(),
         ])));
-        let shown = Arc::new(Mutex::new(String::new()));
-        let out = ScriptOutput {
-            inputs,
-            shown: shown.clone(),
-        };
+        let content = Arc::new(crate::content::Content::for_test());
+        content.set_input_script(inputs);
 
         // Use a temp directory for session storage to avoid littering the user's config.
         // tempfile::TempDir cleans up automatically on drop.
@@ -1474,7 +1462,7 @@ mod tests {
         let config = AgentConfig {
             provider: "openai".into(),
             model: "gpt-4o".into(),
-            output: Arc::new(out),
+            content: content.clone(),
             yolo: true,
             confirm_port: None,
             quiet: true,
@@ -1499,11 +1487,12 @@ mod tests {
         // No normal prompt is ever submitted, so the agent is never created and
         // `create_agent` (and its `set_sandbox`) is never called — exactly the
         // pre-fix condition where `!` would otherwise run unsandboxed.
+        content.begin_capture();
         super::run_interactive(config, settings, false)
             .await
             .unwrap();
 
-        let shown = shown.lock().unwrap().clone();
+        let shown = String::from_utf8_lossy(&content.end_capture()).into_owned();
         let _ = std::fs::remove_file(&host_path);
         // sessions_tempdir is automatically cleaned up when dropped here
 
@@ -1528,43 +1517,8 @@ mod tests {
         use std::collections::VecDeque;
         use std::sync::{Arc, Mutex};
 
-        use crate::output::Confirmation;
         use crate::AgentConfig;
-        use crate::Output;
         use std::sync::atomic::AtomicBool;
-
-        struct ScriptOutput {
-            inputs: Arc<Mutex<VecDeque<String>>>,
-            shown: Arc<Mutex<String>>,
-        }
-        impl Output for ScriptOutput {
-            fn display_text(&self, t: &str) {
-                self.shown.lock().unwrap().push_str(t);
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn display_plain(&self, t: &str) {
-                self.shown.lock().unwrap().push_str(t);
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn display_separator(&self) {
-                self.shown.lock().unwrap().push('\n');
-            }
-            fn get_user_input(&self) -> String {
-                self.inputs
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or_else(|| "/q".to_string())
-            }
-            fn display_tool_call(&self, _: &str, _: &serde_json::Value) {}
-            fn display_tool_result(&self, _: &str) {}
-            fn display_error(&self, _: &str) {}
-            fn display_system(&self, _: &str) {}
-            fn confirm(&self, _: &str) -> Confirmation {
-                Confirmation::No
-            }
-            fn display_header(&self, _: &str, _: &str, _: bool, _: usize, _: Option<&str>) {}
-        }
 
         // `/thinking high` commits through the engine (echoed line proves
         // `batch_slash` ran); `/quit` must then end the loop — if the eval
@@ -1575,17 +1529,13 @@ mod tests {
             "/reasoning high".to_string(),
             "/quit".to_string(),
         ])));
-        let shown = Arc::new(Mutex::new(String::new()));
-        let out = ScriptOutput {
-            inputs: inputs.clone(),
-            shown: shown.clone(),
-        };
-
         let sessions_tempdir = tempfile::tempdir().unwrap();
+        let content = Arc::new(crate::content::Content::for_test());
+        content.set_input_script(inputs.clone());
         let config = AgentConfig {
             provider: "openai".into(),
             model: "gpt-4o".into(),
-            output: Arc::new(out),
+            content: content.clone(),
             yolo: true,
             confirm_port: None,
             quiet: true,
@@ -1607,11 +1557,12 @@ mod tests {
         };
         let settings = SettingsStore::from_agent_config(&config, &Default::default(), None);
 
+        content.begin_capture();
         super::run_interactive(config, settings, false)
             .await
             .unwrap();
 
-        let shown = shown.lock().unwrap().clone();
+        let shown = String::from_utf8_lossy(&content.end_capture()).into_owned();
         assert!(
             shown.contains("reasoning high"),
             "expected the batch commit echo for `/thinking high`, got:\n{shown}"
