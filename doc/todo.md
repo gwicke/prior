@@ -91,9 +91,12 @@ and link a doc/ and/or commit hash
     production menu path — `same_content` fallback in `refresh_data` (4i-a, `237d9ab`), engine-path
     carry test (4i-b, `48e5e96`), and the large-row producer audit + `/session` memo on an
     mtime-driven listing generation (4i-c, `bff9c63`)
-  - [ ] deltas before step 5: `f32` ratio (done `c3a2c13`) + `Draw::draw` merge (done `da6025d`);
-    the OSC-aware width move into `slashdot_tui` + Render width enforcement remain — re-wrap over-wide
-    (primary); pad under-full only where draw's clearing is unreliable (design §Content/§Render; plan
-    in the impl doc)
-  - [ ] after the deltas: `tests/confirm_raw_mode.rs` confirm-dialog paint test (refactor fallout)
+  - [x] deltas before step 5: `f32` ratio `c3a2c13`; `Draw::draw` merge `da6025d`; the OSC-aware width
+    move into `slashdot_tui` (`c515a5e`); `ContentWrite { bytes, stream }` + Render width enforcement
+    (`0761231`)
+  - [ ] deferred: pad a short row to `term_w` only where draw's per-row entry `EL` proves unreliable
+    (design §Content; impl doc)
+  - [ ] follow-up: track the line-terminator / width repairs back into content — Render's enforcement
+    is a net, not the plan (impl doc)
+  - [ ] `tests/confirm_raw_mode.rs` confirm-dialog paint test (refactor fallout)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)

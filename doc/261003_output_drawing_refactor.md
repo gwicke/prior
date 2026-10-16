@@ -32,7 +32,9 @@ migration detail: `./261003_output_drawing_refactor_impl.md`.
 
 Render, Draw and TermIO (plus the width utilities and the `RenderElement` trait) live in their own
 crate, `slashdot_tui`. `slashdot_menu` and picocode's UI/content layers depend on it — the layering
-above is enforced by the dependency graph, not by convention.
+above is enforced by the dependency graph, not by convention. Two width measures live there:
+`display_width` (CSI-only) and the OSC-8-aware `display_width_ansi` (with `wrap_to_width`), so links
+and styling measure the same below both layers.
 
 ## End state UI flow
 
@@ -61,11 +63,14 @@ the agent holds a `Content` handle (never the hub); confirmation keeps its own `
   (today's separator matrix, `last_content_*`, `held_blank`). None crosses below: the only
   vocabulary going down is `Stream` (main / meta).
 - Holds a cloned width-watch handle (from TermIO at setup) and formats at the current watched width
-  before each block — no hub round-trip — then hands a `ContentWrite { lines, stream }` to
-  `render()`. `lines` are complete, pre-wrapped, styled screen rows; boundary, hold and line-clear
-  (`EL`) bookkeeping stay here. Render re-checks the width and clamps / re-wraps (`WrapLines` with
-  ANSI restore) if it disagrees. A new width applies from the next block on; the width-change replay
-  stays the repl's, at its next size check — content never initiates it.
+  before each block — no hub round-trip — then hands a `ContentWrite { bytes, stream }` to
+  `render()`. `bytes` are complete, pre-wrapped, line-cleared screen rows ending at a line boundary;
+  boundary, hold and line-clear (`EL`) bookkeeping stay here. The `\n` split **is** the row structure
+  — no separate count rides with the write. Render owns the final guarantee: it forces the line
+  terminator a block owes and re-wraps any row over the watched width, re-arming the clear on each
+  continuation; where Draw's entry `EL` cannot be trusted, it pads a short row to `term_w` as a
+  fallback. A new width applies from the next block on; the width-change replay stays the repl's, at
+  its next size check — content never initiates it.
 - Capture (`begin_capture`/`end_capture`) taps the `ContentWrite` as handed to `render()` —
   pre width-recheck, content only, never frame bytes — so `/replay Nl` and content-path tests
   compare what Content produced. Byte-edge tests use `TermIO::recording()`.
@@ -141,25 +146,29 @@ pub trait RenderElement {
 // Elements are reused across compositions (UI layer) — shared and dynamic.
 type Element = Arc<Mutex<dyn RenderElement + Send + Sync>>;
 
-/// A content write handed to render(): complete styled rows + the stream.
-/// All content-specific classification stays above this interface; below
-/// it the only vocabulary is main / meta, so Render and Draw stay generic.
-pub struct ContentWrite { lines: Lines, stream: Stream }
+/// A content write handed to render(): the block's bytes + the stream. The
+/// `\n` split is the row structure; Render repairs the bytes (terminator,
+/// width) and reads the row count back off them. All content-specific
+/// classification stays above this interface; below it the only vocabulary
+/// is main / meta, so Render and Draw stay generic.
+pub struct ContentWrite { bytes: Vec<u8>, stream: Stream }
 
 /// The stream token shared by Content → Render → Draw → TermIO.
 pub enum Stream { Main, Meta }
 
 pub struct RenderManager {
     stack: Vec<Element>,
-    draw: Draw,        // fully owned drawing + output path
-    size: SizeWatch,   // = watch::Receiver<TermSize>, cloned handle
+    draw: Draw,               // fully owned drawing + output path
+    captured: Option<Vec<u8>>, // the capture tap (content bytes only)
+    size: SizeWatch,          // = watch::Receiver<TermSize>, cloned handle
 }
 
 impl RenderManager {
     fn configure(&mut self, frame_max_row_ratio: f32, frame_elements: Vec<Element>);
 
     // UI calls with content = None; content paths pass one write. Composes at
-    // the watched size, hands frame + content to Draw. No return: width lives
+    // the watched size, repairs the write (terminator, width) and reads its
+    // row count, hands frame + content + rows to Draw. No return: width lives
     // on the size watch; the repl keys off resize events + the current size,
     // never off the applied size.
     fn render(&mut self, content: Option<ContentWrite>);
@@ -203,8 +212,10 @@ impl Draw {
     pub fn term_size(&self) -> TermSize;
 
     /// Append `content` to scrollback (consuming the frame's rows,
-    /// paint-forward per ui_draw_261001), then apply `frame` below it.
-    pub fn draw(&mut self, frame: &Frame, content: Option<&ContentWrite>);
+    /// paint-forward per ui_draw_261001), then apply `frame` below it. `rows`
+    /// is the count Render read off the repaired bytes; Draw writes but never
+    /// measures.
+    pub fn draw(&mut self, frame: &Frame, content: Option<(&ContentWrite, usize)>);
 
     /// Raw mode off. Resume is implicit in the next draw()/render(); the
     /// RenderManager re-anchors the caret (DSR, answered by TermIO).
