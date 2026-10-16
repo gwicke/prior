@@ -1071,6 +1071,7 @@ mod tests {
         stack.push(Element::lines(vec![String::new()]));
         stack.push(crate::ui::bar::status(
             out.content.bar.clone(),
+            out.content.usage_handle(),
             out.content.streaming.clone(),
         ));
         stack.extend(input);

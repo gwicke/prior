@@ -14,7 +14,6 @@
 //! is composed and applied by the shared draw pipeline (`crate::render`,
 //! `crate::draw`, plan `doc/ui_draw_v2.md`).
 
-use crate::agent::SessionUsage;
 use crate::app_state::AppState;
 use crate::content::Content;
 use crate::draw::el_if_short;
@@ -101,10 +100,6 @@ pub struct ReplCtx {
     /// Currently active runtime persona name (None => none), for marking the
     /// active entry in the `/persona` overlay.
     pub persona: Option<String>,
-    /// Accumulated agent token usage (per-turn + session totals), snapshotted
-    /// by `run_interactive` each loop iteration so the `/stat` overlay can
-    /// render without direct access to the agent.
-    pub session_usage: SessionUsage,
     /// Session repository (if available), for on-demand loading in `/session` overlay.
     pub repo: Option<crate::session::repo::JsonlSessionRepo>,
     /// The ID of the currently active session (empty if no session).
@@ -1217,6 +1212,7 @@ impl PromptSession {
         stack.push(Element::lines(vec![String::new()]));
         stack.push(crate::ui::bar::status(
             content.bar.clone(),
+            content.usage_handle(),
             content.streaming.clone(),
         ));
         stack.push(input);
@@ -1526,7 +1522,6 @@ impl Repl {
         // copies, no sync flags.
         app_state.update_cycle_view(
             ctx.current_session_id.clone(),
-            ctx.session_usage,
             ctx.context_tokens,
             ctx.tree.clone(),
             ctx.leaf_id.clone(),
@@ -1534,6 +1529,19 @@ impl Repl {
         // Repo handle: refresh in case the loop replaced its local Option
         // (clone-shared Arc cache — same listing state either way).
         app_state.set_repo(ctx.repo.clone());
+        // The context figure is read *live* by the bar (4h-g part 2), off the
+        // agent's usage store — so this cycle's estimate is a **seed** for the
+        // store, not a push into the status. Seeding only while the store reads
+        // empty is what keeps the two sources honest: before any completion has
+        // reported (the very first prompt, which runs before any turn has set a
+        // status) the estimate is all there is; after one has, the provider's
+        // own count is the truth and this must not overwrite it.
+        if let Some(usage) = content.usage_handle() {
+            let mut usage = usage.lock().unwrap();
+            if usage.last_input_tokens == 0 {
+                usage.last_input_tokens = ctx.context_tokens;
+            }
+        }
         // The prompt-side bar's **raw data**, pushed rather than rendered:
         // this module builds no row — the bar element formats whatever is
         // stored here at its own render (step 4f-a, design §UI).
@@ -1548,7 +1556,6 @@ impl Repl {
             provider: ctx.provider.clone(),
             model: ctx.model.clone(),
             thinking: ctx.reasoning_level.clone(),
-            context_tokens: ctx.context_tokens,
             context_limit: ctx.context_limit,
         });
         // The session's state, as the loop's own bindings. Destructuring a

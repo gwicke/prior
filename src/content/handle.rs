@@ -113,6 +113,17 @@ pub struct Content {
     /// Beside `streaming`, which it is shared the same way (the element
     /// clones the `Arc`).
     pub(crate) bar: Arc<Mutex<crate::agent::status::BarStatus>>,
+    /// The running agent's token-usage store, shared with the turn that writes
+    /// it in place (4h-g part 2). The one fact the bar reads *live* at render
+    /// — `context_tokens` — comes from here, so a mid-turn completion's count
+    /// lands on the next paint with no push to keep in step. `None` until the
+    /// agent is built (and again briefly across a rebuild); the bar then shows
+    /// no context figure rather than a stale one.
+    ///
+    /// `Mutex`, not a bare `Option`, because it is written after construction
+    /// through a shared handle ([`Self::set_usage`]) while the bar's element
+    /// reads it concurrently.
+    pub(crate) usage: Mutex<Option<Arc<Mutex<crate::agent::SessionUsage>>>>,
     /// The content seam (impl doc §4): when set, every content verb hands the
     /// call to this handle and returns without touching the sink — the
     /// `RecordingOutput` / `QuietOutput` patterns, covered without a live
@@ -131,6 +142,26 @@ impl Content {
     pub(crate) fn new(term_io: TermIO, show_reasoning: ShowReasoningHandle) -> Self {
         let size = term_io.subscribe_size();
         Self::new_from(term_io, size, show_reasoning)
+    }
+
+    /// Point the bar at a running agent's live usage store (4h-g part 2), so
+    /// its context figure is read at render rather than snapshotted at turn
+    /// start. Call on the transitions that change who is answering: agent
+    /// build/rebuild. The `BarStatus` identity fields keep coming from the
+    /// pushes ([`Self::set_status`]) — they come off the async session index,
+    /// which nothing here can block on.
+    pub(crate) fn set_usage(&self, usage: Option<Arc<Mutex<crate::agent::SessionUsage>>>) {
+        *self.usage.lock().unwrap() = usage;
+    }
+
+    /// The bar's live usage handle, as the element's constructor wants it.
+    ///
+    /// Cloned out here rather than at every call site so the `Mutex` guarding
+    /// it stays this module's business — the bar element never touches the
+    /// outer lock, it holds the inner `Arc` and reads the turn's in-place
+    /// writes.
+    pub(crate) fn usage_handle(&self) -> Option<Arc<Mutex<crate::agent::SessionUsage>>> {
+        self.usage.lock().unwrap().clone()
     }
 
     /// [`Self::new`] with the geometry channel chosen by the caller — the
@@ -174,6 +205,7 @@ impl Content {
             streaming: Arc::new(AtomicBool::new(false)),
             building: AtomicBool::new(false),
             bar: Arc::new(Mutex::new(crate::agent::status::BarStatus::default())),
+            usage: Mutex::new(None),
             tap: None,
         }
     }
@@ -653,6 +685,11 @@ impl Content {
     /// never shaped text: the bar element formats whatever stands here at its
     /// next render — shaping and fit both — so a figure refreshed mid-turn is
     /// current at the next paint without a re-shaping push.
+    ///
+    /// One fact is no longer pushed (4h-g part 2): `context_tokens` comes off
+    /// the live usage store ([`Self::set_usage`]) at render, so this carries
+    /// the identity fields and the window, which come off the async session
+    /// index and the applied config.
     ///
     /// A store, not a write: nothing reaches the sink, so the tap seam has
     /// nothing to intercept (the verbs that do reach the sink are the ones

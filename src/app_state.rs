@@ -172,8 +172,6 @@ pub struct State {
     /// Session entry tree snapshot (source of truth for `/tree`).
     pub(crate) raw_tree: Arc<Vec<SessionTreeNode>>,
     pub(crate) leaf_id: Option<String>,
-    /// Session token usage snapshot (`/stat`).
-    pub(crate) session_usage: SessionUsage,
     /// Estimated tokens of the next-turn context (`/stat`).
     pub(crate) context_tokens: u64,
     /// Declarative control targets (see [`ControlConfig`]).
@@ -283,7 +281,6 @@ impl AppState {
                 recent_models: Vec::new(),
                 raw_tree: Arc::new(Vec::new()),
                 leaf_id: None,
-                session_usage: SessionUsage::default(),
                 context_tokens: 0,
                 control: ControlConfig::default(),
                 prefill: None,
@@ -616,14 +613,12 @@ impl AppState {
     pub fn update_cycle_view(
         &self,
         current_id: String,
-        usage: SessionUsage,
         context_tokens: u64,
         tree: Arc<Vec<SessionTreeNode>>,
         leaf_id: Option<String>,
     ) {
         let mut st = self.state.lock();
         st.session.current_id = current_id;
-        st.session_usage = usage;
         st.context_tokens = context_tokens;
         st.raw_tree = tree;
         st.leaf_id = leaf_id;
@@ -648,12 +643,20 @@ impl AppState {
         self.state.lock().leaf_id = leaf_id;
     }
 
-    pub fn session_usage(&self) -> SessionUsage {
-        self.state.lock().session_usage
-    }
-
     pub fn context_tokens(&self) -> u64 {
         self.state.lock().context_tokens
+    }
+
+    /// The running agent's live usage handle (4h-g part 2), or `None` while no
+    /// agent is up. Cloned out so the content bar reads the turn's in-place
+    /// writes at every paint rather than a snapshot taken at turn start.
+    pub fn usage_handle(&self) -> Option<Arc<std::sync::Mutex<SessionUsage>>> {
+        self.state
+            .lock()
+            .session
+            .agent
+            .as_ref()
+            .map(|a| a.usage_handle())
     }
 
     // --- recent models (loop is the sole writer) ---
@@ -901,7 +904,6 @@ mod tests {
         let app_state = AppState::for_test(test_settings());
         app_state.update_cycle_view(
             "sess-1".into(),
-            SessionUsage::default(),
             42_000,
             Arc::new(vec![]),
             Some("leaf-1".into()),

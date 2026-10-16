@@ -53,18 +53,19 @@ pub struct SessionStatsInfo {
 ///
 /// The bar's line is `● session | provider:model thinking 34% 78k` — the
 /// mid-turn readout (doc/row_accounting.md, zone 2) — carried here as *facts*,
-/// never as shaped text: the push stores this, and the bar element pulls it and
-/// runs both halves of the drawing in its own render — the shaping
-/// ([`status_text`]: name fallback to the opening-message preview, the field
-/// list, the drop order) and the fit (`ui::bar::status_bar`). A mid-turn figure
-/// (context tokens) is then current at the next paint without a re-shaping
-/// push, and neither half can be applied without the other.
+/// never as shaped text. These are the facts that come off a *push* — the
+/// session's identity off the index, the model/thinking off the config in
+/// force. The context figure is deliberately absent (4h-g part 2): it is the
+/// one fact that moves mid-turn, so the bar reads it off the agent's shared
+/// usage store at render and [`status_text`] takes it as an argument. The
+/// shaping (name fallback to the opening-message preview, the field list, the
+/// drop order) is `status_text`'s; the fit is `ui::bar::status_bar`'s.
 ///
-/// A struct rather than five more positional arguments because those five are
-/// two strings, two `Option`s and a number in a row: nothing at the call site
-/// says which `Option<String>` is the thinking level and which the first
-/// message, and getting that wrong compiles. The field names are the
-/// documentation. Fields that are unknown are dropped rather than shown empty.
+/// A struct rather than four more positional arguments because those four are
+/// two strings and two `Option`s in a row: nothing at the call site says which
+/// `Option<String>` is the thinking level and which the first message, and
+/// getting that wrong compiles. The field names are the documentation. Fields
+/// that are unknown are dropped rather than shown empty.
 #[derive(Default, Clone)]
 pub struct BarStatus {
     /// The session name, when it has one. Wins over [`Self::first_message`]:
@@ -77,11 +78,8 @@ pub struct BarStatus {
     pub model: String,
     /// The active thinking level, if any.
     pub thinking: Option<String>,
-    /// Context tokens in use. `0` means "not known yet" and drops the figure
-    /// rather than showing a zero.
-    pub context_tokens: u64,
-    /// The model's context window, already *resolved* (catalog overlaid with
-    /// any stored per-model override).
+    /// The context window in force for the current model, resolved: the
+    /// catalog overlaid with any stored per-model override.
     ///
     /// Supplied by the caller rather than looked up here: `status_text` is a
     /// pure function with no store to read, and the raw-catalog lookup it used
@@ -90,11 +88,6 @@ pub struct BarStatus {
     /// an unknown window always did.
     pub context_limit: Option<u64>,
 }
-///
-/// The group's fields are pushed in the order they should be *dropped* from the
-/// right: the context figure first, because it changes every turn and a missing
-/// one reads as "no context yet" rather than as a wrong model; then the thinking
-/// level; the model name last, because it is what identifies who is answering.
 /// The context window in force for the current model, resolved: the catalog
 /// overlaid with any stored per-model override.
 ///
@@ -140,24 +133,6 @@ pub struct StatusText {
     pub group: Vec<String>,
 }
 
-impl StatusText {
-    /// Whether there is a bar to draw at all: both fields empty means off.
-    ///
-    /// Tested on the **stored content**, never on the rendered bar — a rendered
-    /// bar is a full-width row, so it is never empty even when there is nothing
-    /// to say, and testing *it* would paint a blank bar where the status is
-    /// supposed to be off.
-    ///
-    /// One definition for every path that asks: the compose-side presence
-    /// check (`repl::compose_area`, which must not reserve a row for an
-    /// off bar) and the bar's own render (the bar element, which must not
-    /// draw one). Two answers to "is there a status?" is how the two end up
-    /// disagreeing about their own existence.
-    pub(crate) fn is_off(&self) -> bool {
-        self.name.is_empty() && self.group.is_empty()
-    }
-}
-
 /// The shaping half of the bar's drawing: raw [`BarStatus`] to the shaped pair
 /// `status_bar` fits — the name (session name, else the opening
 /// message's preview) and the model group in drop order.
@@ -170,7 +145,13 @@ impl StatusText {
 /// means. That holds because a per-model `context_length` edit moves both: the
 /// prompt-side bar re-reads it every cycle, and `plan_rebuild` compares it so
 /// the mid-turn agent is rebuilt with the new one.
-pub fn status_text(status: &BarStatus) -> StatusText {
+///
+/// `context_tokens` is a parameter, not a field (4h-g part 2): it is the one
+/// figure that moves mid-turn, so it comes off the agent's live usage store
+/// rather than the pushed `status`, which no one re-pushes per completion.
+/// `0` means "not known yet" and drops the figure rather than showing a zero —
+/// the window before the first completion has reported.
+pub fn status_text(status: &BarStatus, context_tokens: u64) -> StatusText {
     let mut fields: Vec<String> = Vec::new();
     if !status.provider.is_empty() || !status.model.is_empty() {
         fields.push(format!("{}:{}", status.provider, status.model));
@@ -183,7 +164,7 @@ pub fn status_text(status: &BarStatus) -> StatusText {
     {
         fields.push(level.to_string());
     }
-    if status.context_tokens > 0 {
+    if context_tokens > 0 {
         // The percentage needs the catalog's context window, and a model
         // missing from it is normal (a local endpoint, a new release). So the
         // count stands alone rather than the whole figure disappearing: no
@@ -191,10 +172,10 @@ pub fn status_text(status: &BarStatus) -> StatusText {
         let window = status.context_limit.filter(|max| *max > 0);
         fields.push(match window {
             Some(max) => {
-                let pct = (status.context_tokens as f64 / max as f64) * 100.0;
-                format!("{pct:.0}% {}", compact_tokens(status.context_tokens))
+                let pct = (context_tokens as f64 / max as f64) * 100.0;
+                format!("{pct:.0}% {}", compact_tokens(context_tokens))
             }
-            None => compact_tokens(status.context_tokens),
+            None => compact_tokens(context_tokens),
         });
     }
 
@@ -258,7 +239,7 @@ mod status_bar_tests {
     fn bar(
         session_name: Option<&str>,
         first_message: Option<&str>,
-        m: BarStatus,
+        (m, context_tokens): (BarStatus, u64),
         width: usize,
         streaming: bool,
     ) -> String {
@@ -267,7 +248,10 @@ mod status_bar_tests {
             first_message: first_message.map(str::to_string),
             ..m
         };
-        crate::ui::bar::status_bar(&status_text(&status), width, streaming)
+        // `context_tokens` is the one live fact (4h-g part 2), so it arrives
+        // alongside the pushed facts — destructured here exactly as the bar's
+        // own render pulls it from the live store beside `Content::bar`.
+        crate::ui::bar::status_bar(&status_text(&status, context_tokens), width, streaming)
     }
 
     /// A [`BarStatus`] for the tests, identity fields unset — the `bar` helper
@@ -275,21 +259,29 @@ mod status_bar_tests {
     /// things, and the field names at each of the twenty-odd call sites would
     /// be noise. The names are still checked, because the layout test is about
     /// the order they render in.
+    ///
+    /// `context_tokens` rides *beside* the struct rather than inside it (4h-g
+    /// part 2): it is the one fact the bar no longer pushes, so the tests pass
+    /// it the same way production supplies it — alongside the pushed facts, not
+    /// as one of them. Returning the pair keeps the twenty-odd `model(...)`
+    /// call sites unchanged.
     fn model(
         provider: &str,
         model: &str,
         thinking: Option<&str>,
         context_tokens: u64,
         context_limit: Option<u64>,
-    ) -> BarStatus {
-        BarStatus {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            thinking: thinking.map(str::to_string),
+    ) -> (BarStatus, u64) {
+        (
+            BarStatus {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                thinking: thinking.map(str::to_string),
+                context_limit,
+                ..Default::default()
+            },
             context_tokens,
-            context_limit,
-            ..Default::default()
-        }
+        )
     }
 
     /// The dot never touches the text: there is always a column of air after it.
@@ -786,6 +778,11 @@ fn compact_tokens(n: u64) -> String {
 /// you look when a request is rejected: the provider's error names the limit it
 /// enforced, and these say what was actually sent and what the resolved
 /// context window is — the two facts needed to see why.
+///
+/// Both token figures are read **live** off the agent's shared usage store
+/// (4h-g part 2): `usage` for the session/cost/cache totals, `context_tokens`
+/// for the estimated next-turn context — so `/stat` opened mid-turn is current,
+/// not a loop-cycle snapshot.
 pub fn session_stats_lines(
     provider: &str,
     model: &str,

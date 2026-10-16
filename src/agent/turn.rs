@@ -29,7 +29,7 @@ use crate::agent::build::{request_additional_params, LoggingHook};
 use crate::agent::compaction::session_context_messages;
 use crate::agent::status::{first_user_text, BarStatus};
 use crate::agent::CodeAgent;
-use crate::agent::{estimate_ctx_with, SessionUsage, TurnPersistence};
+use crate::agent::{estimate_ctx_with, TurnPersistence};
 use crate::session::Session;
 use std::sync::Mutex;
 
@@ -173,17 +173,26 @@ impl CodeAgent {
         let mut aborted = false;
         // The transient status line (doc/row_accounting.md zone 2) is set before
         // the turn's first content write, because that is where the output
-        // paints it — after each block, for the whole turn. The context figure
-        // is the *previous* turn's, which is the best available at this point
-        // and honest about being one turn behind; the next turn's start
-        // refreshes it. The thinking level is not in it: the agent carries none
-        // (it went with the hold-back in B3b) and it only changes on an
-        // explicit commit, so it belongs to the prompt-side carrier.
+        // paints it — after each block, for the whole turn. The thinking level
+        // is not in it: the agent carries none (it went with the hold-back in
+        // B3b) and it only changes on an explicit commit, so it belongs to the
+        // prompt-side carrier.
         let session_name = session.and_then(|s| {
             let index = s.index.try_lock().ok()?;
             index.header.name.clone()
         });
-        let reported_ctx = self.usage.lock().unwrap().last_input_tokens;
+        // Seed the context figure *into* the live store rather than pushing it
+        // into the status (4h-g part 2): the bar reads `last_input_tokens` at
+        // render, so the estimate is the seed that stands in until the first
+        // completion reports — a real count replaces it mid-turn, unprompted.
+        // Seeding before any completion has reported is what makes this safe:
+        // once one has, the report is the truth and the seed is overwritten.
+        {
+            let mut usage = self.usage.lock().unwrap();
+            if usage.last_input_tokens == 0 {
+                usage.last_input_tokens = estimated_ctx;
+            }
+        }
         // Raw data, formatted by the bar at render (step 4f-a, design §UI):
         // the push stores facts, so the figure refreshes with the next paint
         // — no re-shaping push to keep in step.
@@ -196,14 +205,6 @@ impl CodeAgent {
             // value it reads is now the renamed reasoning level.
             thinking: self.live_params.reasoning_str(),
             context_limit: self.context_limit,
-            // Reported wins: it is the provider's own count of what it was
-            // sent. The estimate only stands in while there is none — turn
-            // one, where the alternative is no figure at all.
-            context_tokens: if reported_ctx > 0 {
-                reported_ctx
-            } else {
-                estimated_ctx
-            },
         });
         self.content.begin_response();
         // U4.3: the turn's second pump, split out of `in_turn` into bindings the
@@ -711,12 +712,6 @@ impl CodeAgent {
             .prompt(&input, None, &turn, &self.live_params, None)
             .await?;
         Ok(response)
-    }
-
-    /// Snapshot of the accumulated session token usage (for `/stat`). A zeroed
-    /// result means no completion call has reported usage yet.
-    pub fn session_usage(&self) -> SessionUsage {
-        self.usage.lock().map(|g| *g).unwrap_or_default()
     }
 
     /// Generate a concise summary of the given text using the agent's model.

@@ -207,7 +207,13 @@ pub struct CodeAgent {
     /// Accumulated token-usage telemetry captured from the streaming run
     /// (see [`SessionUsage`]). Backs `/stat` and is the measurement primitive
     /// compaction will rely on (doc/compaction.md §2.7).
-    usage: Mutex<SessionUsage>,
+    ///
+    /// Shared, not owned (4h-g part 2): the bar element and `/stat` clone this
+    /// `Arc` and read it at render, so a mid-turn completion's
+    /// `last_input_tokens` reaches the status line the moment the next paint
+    /// runs — no `set_status` push to keep in step, and no stale context
+    /// figure. The turn writes it in place; every reader pulls.
+    usage: Arc<Mutex<SessionUsage>>,
 }
 
 /// Build session context data for the REPL overlays.
@@ -693,8 +699,27 @@ impl CodeAgent {
             cancel_notify,
             reasoning_in_context,
             message_logger,
-            usage: Mutex::new(SessionUsage::default()),
+            usage: Arc::new(Mutex::new(SessionUsage::default())),
         }
+        // Wire the bar to this agent's usage store before it exists as a
+        // handle anywhere else (4h-g part 2): the constructor is the moment
+        // the agent and its content are first paired, and the bar has to read
+        // the turn's in-place writes from its very first paint.
+        .tap_content()
+    }
+
+    /// Point the content bar at this agent's usage store. Split out of
+    /// [`Self::new`]'s tail so the constructor stays a plain struct literal.
+    fn tap_content(self) -> Self {
+        self.content.set_usage(Some(self.usage.clone()));
+        self
+    }
+
+    /// The shared usage store — the bar element's and `/stat`'s live source
+    /// (4h-g part 2). Cloned out, never locked across a call: the turn writes
+    /// it in place, so a reader always sees the latest completion's figures.
+    pub fn usage_handle(&self) -> Arc<Mutex<SessionUsage>> {
+        self.usage.clone()
     }
 }
 

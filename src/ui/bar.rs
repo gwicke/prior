@@ -4,11 +4,16 @@
 //!
 //! Moved here from `output.rs` in step 4h-c: the bar is UI chrome, so its
 //! element lives with the rest of the UI layer's elements. The *data* half of
-//! the seam stays on the agent side — the store carries
-//! [`crate::agent::status::BarStatus`] facts, and
-//! [`crate::agent::status::status_text`] shapes them into a
-//! [`StatusText`]; both halves of the *drawing* (the shaping's fit and the
-//! dot) run in the element's own render, below.
+//! the seam stays on the agent side — [`Content::bar`] carries the facts and
+//! [`crate::agent::status::status_text`] shapes them into a [`StatusText`];
+//! both halves of the *drawing* (the shaping's fit and the dot) run in the
+//! element's own render, below.
+//!
+//! One fact is **live** (4h-g part 2): the context figure comes off the agent's
+//! shared usage store, written in place by the turn, so a mid-turn completion's
+//! count is current on the next paint with no push to keep in step. The rest
+//! are pushed once per cycle (and once at turn start) — they come off the async
+//! session index, which a render must not block on.
 
 use crate::agent::status::{status_text, BarStatus, StatusText};
 use crate::render::{Element, RenderElement, Rendered, RowAsk};
@@ -184,7 +189,26 @@ struct StatusItem {
     /// The bar's **raw data** (step 4f-a, design §UI): the store is content's
     /// (`Content::bar`), shared the same way the streaming flag is.
     status: Arc<Mutex<BarStatus>>,
+    /// The running agent's usage store (4h-g part 2): the *live* source for
+    /// the context figure. Shared with the turn that writes it in place, so a
+    /// mid-turn completion's count is current at the next render. `None` before
+    /// the first agent is built.
+    usage: Option<Arc<Mutex<crate::agent::SessionUsage>>>,
     streaming: Arc<AtomicBool>,
+}
+
+impl StatusItem {
+    /// The context figure, live: the usage store's `last_input_tokens` — the
+    /// provider's own count of what it last sent, so it is the truth the moment
+    /// a completion reports it. `0` means "not known yet", which drops the
+    /// figure: that is the whole window before the first agent is built and
+    /// turn one, before any completion has reported.
+    fn context_tokens(&self) -> u64 {
+        self.usage
+            .as_ref()
+            .and_then(|u| u.lock().ok().map(|g| g.last_input_tokens))
+            .unwrap_or(0)
+    }
 }
 
 impl RenderElement for StatusItem {
@@ -198,16 +222,18 @@ impl RenderElement for StatusItem {
         // field list, drop order) and the fit at the width being rendered
         // for. Neither can be applied without the other, so neither left with
         // the data.
+        // One fact is live (4h-g part 2): the context figure comes off the
+        // usage store at render, so a mid-turn completion lands without a push.
+        // The identity fields stay as the last push left them — they come off
+        // the async session index, which a render must not block on.
         let status = self.status.lock().unwrap();
-        let text = status_text(&status);
-        // Off between compose and render → say nothing rather than render an
-        // empty bar's furniture. The row was reserved by the allocator either
-        // way, so nothing below it moves.
-        let row = if text.is_off() {
-            String::new()
-        } else {
-            status_bar(&text, term_w, self.streaming.load(Ordering::Relaxed))
-        };
+        let text = status_text(&status, self.context_tokens());
+        // The bar is always present (4h-g part 2): no `is_off` gate. With a
+        // live pull the bar always knows how to render itself, so an empty
+        // status still paints its row (dot + padding) rather than vanishing —
+        // the row is the frame's furniture, and its content is whatever the
+        // sources say now.
+        let row = status_bar(&text, term_w, self.streaming.load(Ordering::Relaxed));
         Rendered {
             rows: vec![row],
             caret: None,
@@ -216,13 +242,19 @@ impl RenderElement for StatusItem {
 }
 
 /// The status row: `min == max == 1`, data resolved at render time.
-/// Presence is the compose's decision (`repl::compose_area`); this is
-/// only ever built when there is something to say (see [`StatusItem`]).
 ///
 /// A free function rather than an inherent method on `Element`: those would
 /// live in `slashdot_tui`, and this element is the UI layer's (it holds
 /// content's bar store). Same shape as `Element::new`, whose `RenderElement`
 /// impl lives there.
-pub(crate) fn status(status: Arc<Mutex<BarStatus>>, streaming: Arc<AtomicBool>) -> Element {
-    Element::new(StatusItem { status, streaming })
+pub(crate) fn status(
+    status: Arc<Mutex<BarStatus>>,
+    usage: Option<Arc<Mutex<crate::agent::SessionUsage>>>,
+    streaming: Arc<AtomicBool>,
+) -> Element {
+    Element::new(StatusItem {
+        status,
+        usage,
+        streaming,
+    })
 }

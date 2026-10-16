@@ -1051,13 +1051,6 @@ impl Interactive {
                         model: self.config.model.clone(),
                         recent: self.app_state.recent_models(),
                         persona: self.config.persona_name.clone(),
-                        // Snapshot the agent's accumulated token usage so the `/stat`
-                        // overlay can render without needing the agent directly.
-                        session_usage: self
-                            .app_state
-                            .agent()
-                            .map(|a| a.session_usage())
-                            .unwrap_or_default(),
                         repo: self.repo.clone(),
                         current_session_id: self.app_state.current_session_id(),
                         branch_messages,
