@@ -108,6 +108,10 @@ fn is_executable(name: &str) -> bool {
 #[tokio::main]
 async fn main() {
     std::panic::set_hook(Box::new(|info| {
+        // Restore cooked mode first: the guard lives under `Draw`, out of
+        // reach here, and the `Drop` backstop cannot fire while the reader
+        // thread holds its `Arc`. Idempotent, no-op without a Tty backend.
+        picocode::termio::emergency_stop();
         let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s.to_string()
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
@@ -140,6 +144,9 @@ async fn main() {
     }));
 
     if let Err(e) = run().await {
+        // `process::exit` skips destructors; `run_interactive` already
+        // suspended on its own paths, but nothing here did. Idempotent.
+        picocode::termio::emergency_stop();
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }

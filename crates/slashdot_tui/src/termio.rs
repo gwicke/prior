@@ -425,8 +425,15 @@ impl TermIO {
         register_sigcont();
         let caps = Caps::probe();
         let (handles, input_tx, caret_tx, size_tx) = term_channels();
+        let guard = Arc::new(TermGuard::new(caps.primary));
+        // The panic hook's handle: `main` cannot reach the guard (it lives
+        // under `Draw`, deep inside the agent config), and the `Drop` backstop
+        // never fires at process exit — the reader thread holds an `Arc`
+        // clone for the process lifetime. Registration replaces any previous
+        // entry: exactly one Tty backend is live per process.
+        *EMERGENCY.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard.clone());
         TermIO::Tty(TtyIo {
-            guard: Arc::new(TermGuard::new(caps.primary)),
+            guard,
             pause_owned: AtomicBool::new(false),
             size_tx,
             caps,
@@ -895,6 +902,26 @@ pub struct TermGuard {
     /// Raw-mode flipping still runs — it is a stdin concern, and
     /// `picocode > out.txt` over an interactive stdin still wants it.
     primary: bool,
+}
+
+/// The panic hook's handle on the live [`TermGuard`], registered by
+/// [`TermIO::tty`]. The hook cannot reach the guard through the config (it
+/// lives under `Draw`), and the `Drop` backstop never fires at process exit —
+/// the persistent stdin reader holds an `Arc` clone for the process
+/// lifetime — so this static is the one way a panic can restore cooked mode.
+/// Replaced (not appended) on each `tty()`; one Tty backend per process.
+static EMERGENCY: std::sync::Mutex<Option<Arc<TermGuard>>> = std::sync::Mutex::new(None);
+
+/// Restore cooked mode from the panic hook (or anywhere that cannot reach
+/// the live `TermIO`): stop the registered guard, idempotently. A no-op
+/// when no Tty backend was ever built. The mutex guard tolerates poisoning —
+/// a panic while registering must not leave the hook unable to restore the
+/// terminal.
+pub fn emergency_stop() {
+    let guard = EMERGENCY.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(g) = guard {
+        let _ = g.stop();
+    }
 }
 
 impl TermGuard {
