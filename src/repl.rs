@@ -511,26 +511,6 @@ pub(crate) fn overlay_elements(overlay: &ActiveOverlay) -> Vec<Element> {
     }
 }
 
-/// The area below the status row: `[Input?, Divider?, Overlay?]`.
-///
-/// The membership divider rule, as `sync_stack` builds it. It *is* the
-/// membership `configure` installs — no caller renders its `Vec` — so the
-/// divider that separates the overlay from the input above it is decided
-/// here and nowhere else (ui_draw_v2 §5.1.1).
-///
-/// `overlay` is empty when there is no menu: a separator with nothing below it
-/// is a rule nobody wanted, and the empty overlay case has no element to draw
-/// either.
-pub(crate) fn area_body(input: Option<Element>, overlay: Vec<Element>) -> Vec<Element> {
-    let mut items = Vec::new();
-    items.extend(input);
-    if !overlay.is_empty() {
-        items.push(Element::divider());
-    }
-    items.extend(overlay);
-    items
-}
-
 /// Paint the prompt frame: lock the manager and apply the configured stack.
 ///
 /// **The one way the prompt writes to the terminal.** `read_input`'s blocking
@@ -1807,14 +1787,14 @@ impl Repl {
 
     /// The prompt area's composition: `[Status?, Input, Divider?, Overlay…]`.
     ///
-    /// The twin of [`compose_area`] — same body ([`area_body`]), with the
-    /// status row arriving as a literal `&str` rather than a rendered bar.
-    /// Two callers, and both need it to be *this* composition: the tests,
-    /// which assert against bytes they wrote, and [`rows_grant`], which has to
-    /// know the rows element's allocation before the frame exists. Sharing it
-    /// is what makes a page one screen of rows by construction — a second
-    /// composer here is how the page size and the painted height drifted apart
-    /// in the first place.
+    /// The membership `sync_stack` builds for production, minus the rendered
+    /// bar — the status row arrives as a literal `&str` instead. Two callers,
+    /// and both need it to be *this* composition: the tests, which assert
+    /// against bytes they wrote, and [`rows_grant`], which has to know the rows
+    /// element's allocation before the frame exists. Sharing it is what makes
+    /// a page one screen of rows by construction — a second composer here is
+    /// how the page size and the painted height drifted apart in the first
+    /// place.
     ///
     /// No width: the input element lays itself out at the width it is asked
     /// at (4h-f), so there is nothing to snapshot here. The not-streaming
@@ -1836,7 +1816,16 @@ impl Repl {
         if let Some(bar) = status {
             items.push(Element::lines(vec![bar.to_string()]));
         }
-        items.extend(area_body(Some(input), overlay));
+        items.push(input);
+        // The divider arrives *with* the overlay, never on its own: a
+        // separator with nothing below it is a rule nobody wanted, and an
+        // empty overlay has no element to draw either (ui_draw_v2 §5.1.1).
+        // This is the rule `sync_stack` builds production's membership by —
+        // both must agree, so it is stated once, here.
+        if !overlay.is_empty() {
+            items.push(Element::divider());
+        }
+        items.extend(overlay);
         items
     }
 
