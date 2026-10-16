@@ -99,8 +99,8 @@ and link a doc/ and/or commit hash
   - [ ] follow-up: track the line-terminator / width repairs back into content — Render's enforcement
     is a net, not the plan (impl doc)
   - [ ] `tests/confirm_raw_mode.rs` confirm-dialog paint test (refactor fallout)
-  - [ ] Step 5: delete `output.rs` (§8.5) — 5a the drawing verbs retire; 5b the confirm half
-    retires (no-port path denies, or `yolo`); 5c capture moves to Content and the record-tap folds
-    in (one seam at Content's output; quiet + input remain); 5d `AgentConfig.output` drops, callers
-    hold `Content`; 5e delete the module + prune `lib.rs`; 5f (independent) the non-tty `StripAnsi`
-    edge strip (impl doc)
+  - [ ] Step 5: delete `output.rs` (§8.5) — 5a/5b/5c done (drawing verbs retire; the confirm half
+    retires, no-port path denies; capture moves to Content and a capturing write never reaches
+    render()). 5d the tap seam dissolves (`with_tap`/`RecordingOutput`/`content_for` go; quiet +
+    input move onto `Content`) and `AgentConfig.output` drops; 5e delete the module + prune `lib.rs`;
+    5f (independent) the non-tty `StripAnsi` edge strip (impl doc)
