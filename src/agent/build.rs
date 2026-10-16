@@ -38,7 +38,6 @@ use rig_core::tool::{Tool, ToolExecutionError};
 use rig_reqwest::client::{DefaultTransportBuilder, DefaultTransportClient};
 use serde_json;
 
-use crate::output::Output;
 use crate::params;
 use crate::Result;
 use std::path::Path;
@@ -60,15 +59,11 @@ use crate::tools::{
 pub struct AgentConfig {
     pub provider: String,
     pub model: String,
-    /// The frame + input seam — `set_status` / `frame_size` / `paint` and, in
-    /// the REPL, `get_user_input`. The drawing refactor drops it; content calls
-    /// live on [`Self::content`].
-    pub output: Arc<dyn Output>,
     /// The content handle: every `display_*` / `stream_*` /
     /// `begin|end_response` call goes here. In production it is the same
-    /// `Content` `ConsoleOutput` holds; in tests and `--quiet` it is a
-    /// `Content` whose verbs short-circuit through [`Self::output`] — see
-    /// [`Self::content_for`].
+    /// `Content` `ConsoleOutput` holds; under `--quiet` it is
+    /// [`Content::quiet`]; in a test it is a `Content` whose verbs
+    /// short-circuit through a tap.
     pub content: Arc<crate::content::Content>,
     pub yolo: bool,
     pub quiet: bool,
@@ -119,8 +114,8 @@ pub struct AgentConfig {
     /// startup), so commands always run inside the namespace. There is no
     /// enable switch — the sandbox is always active when a config is present.
     pub sandbox: Option<crate::config::SandboxConfig>,
-    /// Shared, live-editable `show_reasoning` display mode. The `Output` impl
-    /// holds a clone and reads it on every thinking event, so `/set
+    /// Shared, live-editable `show_reasoning` display mode. `Content` holds a
+    /// clone and reads it on every thinking event, so `/set
     /// show_reasoning …` updates the rendering immediately (no agent rebuild).
     pub show_reasoning_handle: crate::settings::ShowReasoningHandle,
     /// How reasoning blocks are kept in the LLM context. Default `Never`.
@@ -145,18 +140,6 @@ impl AgentConfig {
     /// Mirrors `ModelEntry::qualified()` for catalog entries.
     pub fn qualified_model_id(&self) -> String {
         format!("{}:{}", self.provider, self.model)
-    }
-
-    /// The `content` handle for a config whose frame+input handle is `output`.
-    ///
-    /// Content verbs short-circuit through that same handle, so
-    /// `RecordingOutput` still records the source strings an assertion
-    /// compares and `QuietOutput` / `NoOutput` still discard — the content
-    /// seam without a render stack behind it. `ConsoleOutput` passes its own
-    /// tap-less `Content`; that is the one case where content
-    /// renders for real.
-    pub fn content_for(output: &Arc<dyn Output>) -> Arc<crate::content::Content> {
-        Arc::new(crate::content::Content::with_tap(output.clone()))
     }
 }
 
@@ -1172,8 +1155,7 @@ mod tests {
         ]]);
         let agent = AgentBuilder::new(model).build();
 
-        let no_output: Arc<dyn Output> = Arc::new(crate::NoOutput);
-        let hook_content = AgentConfig::content_for(&no_output);
+        let hook_content = Arc::new(crate::content::Content::quiet());
         let mut stream = agent
             .stream_prompt("hi")
             .add_hook(LoggingHook {

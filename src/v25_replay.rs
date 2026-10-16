@@ -84,8 +84,8 @@ mod tests {
         crate::app_state::AppState::for_test(test_settings())
     }
 
-    fn test_app_state_with(output: Arc<dyn crate::output::Output>) -> Arc<AppState> {
-        crate::app_state::AppState::for_test_with_output(test_settings(), output)
+    fn test_app_state_with(content: Arc<crate::content::Content>) -> Arc<AppState> {
+        crate::app_state::AppState::for_test_with_content(test_settings(), content)
     }
 
     /// One user message the replay assertions look for.
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn replay_submit_without_session_displays_message() {
         let (out, lines) = crate::output::RecordingOutput::new();
-        let app_state = test_app_state_with(out);
+        let app_state = test_app_state_with(Arc::new(crate::content::Content::with_tap(out)));
         let mut menu = build_replay_menu(&app_state);
         let mut handle = menu.get_handle();
         // Drill in then Enter.
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn replay_with_suffix_renders_history() {
         let (out, lines) = crate::output::RecordingOutput::new();
-        let app_state = test_app_state_with(out);
+        let app_state = test_app_state_with(Arc::new(crate::content::Content::with_tap(out)));
         let (_guard, session) = crate::agent::test_session_with_entries(vec![replay_entry()]);
         app_state.set_session(Some(session));
         let mut menu = build_replay_menu(&app_state);

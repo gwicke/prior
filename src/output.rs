@@ -133,70 +133,9 @@ pub trait Output: Send + Sync {
     // `RenderManager::painted_size`'s.
 }
 
-/// Output for a non-terminal consumer (`picocode "q" | cat`): no interactive UI
-/// and no reasoning text, because there is no screen to show it on and the
-/// answer is what the caller piped for. It therefore has no state at all — it
-/// used to hold a `show_reasoning` handle for the spinner, and the spinner is
-/// gone (row_accounting §3.6).
-#[derive(Default)]
-pub struct QuietOutput;
-
-impl QuietOutput {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Output for QuietOutput {
-    fn display_text(&self, _text: &str) {}
-    fn display_tool_call(&self, _name: &str, _args: &Value) {}
-    fn display_tool_result(&self, _result: &str) {}
-    fn get_user_input(&self) -> String {
-        String::new()
-    }
-    fn display_error(&self, error: &str) {
-        eprintln!("Error: {}", error);
-    }
-    fn display_system(&self, _text: &str) {}
-    fn display_separator(&self) {}
-    fn display_header(
-        &self,
-        _provider: &str,
-        _model: &str,
-        _yolo: bool,
-        _limit: usize,
-        _persona: Option<&str>,
-    ) {
-    }
-}
-
-pub struct NoOutput;
-
-impl Output for NoOutput {
-    fn display_text(&self, _text: &str) {}
-    fn display_tool_call(&self, _name: &str, _args: &Value) {}
-    fn display_tool_result(&self, _result: &str) {}
-    fn get_user_input(&self) -> String {
-        String::new()
-    }
-    fn display_error(&self, _error: &str) {}
-    fn display_system(&self, _text: &str) {}
-    fn display_separator(&self) {}
-    fn display_header(
-        &self,
-        _provider: &str,
-        _model: &str,
-        _yolo: bool,
-        _limit: usize,
-        _persona: Option<&str>,
-    ) {
-    }
-}
-
 /// Test helper: an `Output` that captures every `display_text` line for
-/// assertions; everything else is a no-op (mirroring `NoOutput`).
-/// Construct the handle, then feed it into
-/// `AppState::for_test_with_output`.
+/// assertions; everything else is a no-op. Construct the handle, then wrap it
+/// in `Content::with_tap`.
 #[cfg(test)]
 pub struct RecordingOutput {
     pub lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -252,47 +191,6 @@ impl Output for RecordingOutput {
         _limit: usize,
         _persona: Option<&str>,
     ) {
-    }
-}
-
-pub struct LogOutput;
-
-impl Output for LogOutput {
-    fn display_text(&self, text: &str) {
-        tracing::info!(target: "picocode", "{}", text);
-    }
-
-    fn display_tool_call(&self, name: &str, args: &Value) {
-        tracing::info!(target: "picocode", "Tool call: {} with args: {:?}", name, args);
-    }
-
-    fn display_tool_result(&self, result: &str) {
-        tracing::info!(target: "picocode", "Tool result: {}", result);
-    }
-
-    fn get_user_input(&self) -> String {
-        String::new()
-    }
-
-    fn display_error(&self, error: &str) {
-        tracing::error!(target: "picocode", "{}", error);
-    }
-
-    fn display_system(&self, text: &str) {
-        tracing::debug!(target: "picocode", "System: {}", text);
-    }
-
-    fn display_separator(&self) {}
-
-    fn display_header(
-        &self,
-        provider: &str,
-        model: &str,
-        yolo: bool,
-        limit: usize,
-        persona: Option<&str>,
-    ) {
-        tracing::info!(target: "picocode", "picocode | {} | {} | persona:{} | yolo:{} limit:{}", provider, model, persona.unwrap_or("default"), yolo, limit);
     }
 }
 

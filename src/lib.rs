@@ -65,7 +65,7 @@ pub use agent::build::{create_agent, load_agents_md, AgentConfig};
 pub use agent::CodeAgent;
 pub use content::Content;
 pub use interactive::run_interactive;
-pub use output::{ConsoleOutput, LogOutput, NoOutput, Output, QuietOutput};
+pub use output::{ConsoleOutput, Output};
 
 /// A provider's own explanation of a failure, reduced to one readable line.
 ///

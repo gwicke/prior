@@ -398,12 +398,10 @@ mod tests {
     use crate::settings::SettingsStore;
     use serial_test::serial;
 
-    /// The content half of the same idea: `retry_summarization`
-    /// reaches content, and a `Content` tapped through `NoOutput` discards it.
+    /// The content half of the same idea: `retry_summarization` reaches
+    /// content, and a quiet `Content` discards it.
     fn null_content() -> std::sync::Arc<Content> {
-        std::sync::Arc::new(Content::with_tap(std::sync::Arc::new(
-            crate::output::NoOutput,
-        )))
+        std::sync::Arc::new(Content::quiet())
     }
 
     fn test_settings() -> SettingsStore {

@@ -789,21 +789,19 @@ impl AppState {
     /// Minimal state bundle for in-crate tests (no repo).
     #[cfg(test)]
     pub fn for_test(settings: SettingsStore) -> Arc<AppState> {
-        Self::for_test_with_output(settings, Arc::new(crate::output::NoOutput))
+        Self::for_test_with_content(settings, Arc::new(crate::content::Content::quiet()))
     }
 
-    /// Like [`for_test`], with a caller-chosen output — tests assert on
-    /// captured display lines via `RecordingOutput`.
+    /// Like [`for_test`], with a caller-chosen content — tests assert on
+    /// captured display lines via a tap or `begin_capture`.
     #[cfg(test)]
-    pub fn for_test_with_output(
+    pub fn for_test_with_content(
         settings: SettingsStore,
-        output: Arc<dyn crate::output::Output>,
+        content: Arc<crate::content::Content>,
     ) -> Arc<AppState> {
-        let content = AgentConfig::content_for(&output);
         let config = AgentConfig {
             provider: "test".to_string(),
             model: "model".to_string(),
-            output,
             content,
             yolo: false,
             confirm_port: None,

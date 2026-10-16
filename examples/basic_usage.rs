@@ -1,25 +1,22 @@
 use picocode::termio::TermIO;
 use picocode::{create_agent, AgentConfig, ConsoleOutput};
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Setup the output handler (ConsoleOutput provides pretty terminal printing)
-    //    The terminal backend is constructed first — it moves into the
-    //    console and owns the size watch and caps from there.
-    let output = Arc::new(ConsoleOutput::new(
+    // 1. Setup the content handler (ConsoleOutput provides pretty terminal
+    //    printing). The terminal backend is constructed first — it moves into
+    //    the console and owns the size watch and caps from there.
+    let content = ConsoleOutput::new(
         TermIO::plain(),
         picocode::settings::default_show_reasoning_handle(),
-    ));
-    // The content handle shares the console's own `Content`.
-    let content = output.content();
+    )
+    .content();
 
     // 2. Create the agent with a simple config struct
     // You no longer need to manually initialize Rig clients or builders.
     let agent = create_agent(AgentConfig {
         provider: "anthropic".into(),
         model: "claude-3-5-sonnet-latest".into(),
-        output,
         content,
         yolo: false,
         confirm_port: None,

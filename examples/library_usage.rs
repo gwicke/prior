@@ -1,18 +1,16 @@
-use picocode::{create_agent, AgentConfig, NoOutput};
+use picocode::{create_agent, AgentConfig};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Setup the output handler with NoOutput for silent execution
-    let output: Arc<dyn picocode::Output> = Arc::new(NoOutput);
-    // Content's verbs short-circuit through the same silent handle.
-    let content = AgentConfig::content_for(&output);
+    // 1. Setup a quiet content for silent execution: nothing reaches the
+    //    screen, and errors still go to stderr.
+    let content = Arc::new(picocode::Content::quiet());
 
     // 2. Create the agent
     let agent = create_agent(AgentConfig {
         provider: "anthropic".into(),
         model: "claude-3-5-sonnet-latest".into(),
-        output,
         content,
         yolo: true,         // Auto-confirm everything since there's no output
         confirm_port: None, // No REPL to ask, so nothing drives a confirm dialog

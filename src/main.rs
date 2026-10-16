@@ -279,15 +279,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let show_reasoning_handle: picocode::settings::ShowReasoningHandle =
         std::sync::Arc::new(std::sync::Mutex::new(show_reasoning));
     let reasoning_in_context = config.reasoning_in_context.unwrap_or_default();
-    let (output, content): (Arc<dyn picocode::Output>, Arc<picocode::Content>) = if quiet {
-        // Quiet: content's verbs short-circuit through the same handle (the §4
-        // content seam), so nothing reaches stdout and `display_error` still
-        // goes to stderr exactly as `QuietOutput` always did. `with_tap`
-        // builds its own Plain backend — the condition below is exactly what
-        // would have selected one.
-        let out: Arc<dyn picocode::Output> = Arc::new(picocode::QuietOutput::new());
-        let content = Arc::new(picocode::Content::with_tap(out.clone()));
-        (out, content)
+    let content: Arc<picocode::Content> = if quiet {
+        // Quiet: content's own flag suppresses the screen, and `display_error`
+        // still goes to stderr. Quiet is a property of the content, not a
+        // backend — the condition below is exactly what would have selected
+        // Plain.
+        Arc::new(picocode::Content::quiet())
     } else {
         // The terminal backend is constructed **first**: it probes
         // the caps, owns the size watch, and moves into `Content::new` →
@@ -301,12 +298,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             TermIO::plain()
         };
         // Production: share the `Content` this console already owns, so the
-        // config's frame handle and its content handle are one state — and
-        // content renders for real, because this `Content`'s tap is `None`.
-        let console = Arc::new(ConsoleOutput::new(term_io, show_reasoning_handle.clone()));
-        let content = console.content();
-        let out: Arc<dyn picocode::Output> = console;
-        (out, content)
+        // config's frame handle and its content handle are one state.
+        let console = ConsoleOutput::new(term_io, show_reasoning_handle.clone());
+        console.content()
     };
 
     let system_message_extension = picocode::load_agents_md();
@@ -334,7 +328,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let agent_config = AgentConfig {
         provider: provider.clone(),
         model,
-        output,
         content,
         yolo,
         quiet,

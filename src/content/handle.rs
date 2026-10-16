@@ -115,15 +115,32 @@ pub struct Content {
     pub(crate) usage: Mutex<Option<Arc<Mutex<crate::agent::SessionUsage>>>>,
     /// The content seam (design §Content): when set, every content verb hands
     /// the call to this handle and returns without touching the sink — the
-    /// `RecordingOutput` / `QuietOutput` patterns, covered without a live
-    /// render stack behind them. `None` in production, where `ConsoleOutput`
-    /// holds this `Content` by `Arc` and its own content methods forward here.
+    /// `RecordingOutput` pattern, covered without a live render stack behind
+    /// it. `None` in production, where `ConsoleOutput` holds this `Content` by
+    /// `Arc` and its own content methods forward here.
     pub(crate) tap: Option<Arc<dyn Output>>,
+    /// Whether content is suppressed — the `--quiet` flag, which is a property
+    /// of the content, not a backend (design §Content). The bytes are still
+    /// built through the boundary/wrap chain, then dropped at the hub
+    /// hand-off, so nothing reaches the screen; `display_error` is the one
+    /// verb that survives, to stderr.
+    quiet: bool,
+    /// Where the non-REPL input read ([`Self::get_user_input`]) gets a line.
+    input: InputSource,
     /// The capture buffer (design §Content): `Some` while a capture session is
     /// open. Content taps its own write *before* the hub hand-off, so a
     /// capturing write never reaches `render()` — content bytes only, never
     /// frame bytes.
     captured: Mutex<Option<Vec<u8>>>,
+}
+
+/// Where [`Content::get_user_input`] gets a line — the non-REPL (piped/batch)
+/// input read, the `else` arm of the interactive loop.
+enum InputSource {
+    /// Production: the process's stdin, one line per read.
+    Stdin,
+    /// Quiet: no input to read; the driver answers nothing.
+    Empty,
 }
 
 impl Content {
@@ -198,14 +215,33 @@ impl Content {
             building: AtomicBool::new(false),
             usage: Mutex::new(None),
             tap: None,
+            quiet: false,
+            input: InputSource::Stdin,
             captured: Mutex::new(None),
         }
     }
 
+    /// The `--quiet` content: no output, no input, errors to stderr (design
+    /// §Content: quiet is a flag on the content, not a backend). Content code
+    /// runs unchanged — the bytes are built and then dropped at the hub
+    /// hand-off, so nothing reaches the screen.
+    ///
+    /// Also the content for tests that build a config whose display is never
+    /// asserted: [`Self::new`] would reach a real terminal, and there is
+    /// nothing to draw.
+    pub fn quiet() -> Self {
+        let mut content = Self::new(
+            TermIO::plain(),
+            crate::settings::default_show_reasoning_handle(),
+        );
+        content.quiet = true;
+        content.input = InputSource::Empty;
+        content
+    }
+
     /// A `Content` whose content verbs delegate to `tap` instead of rendering
-    /// (the tap test seam). `RecordingOutput` records the source strings
-    /// an assertion compares; `QuietOutput` discards them; neither needs a
-    /// render stack or a terminal behind it.
+    /// (the tap test seam). `RecordingOutput` records the source strings an
+    /// assertion compares; it needs no render stack or terminal behind it.
     ///
     /// The geometry is this instance's own Plain backend, not a private
     /// watch: with the verbs short-circuited there is no rendering to get
@@ -579,6 +615,13 @@ impl Content {
         // can still diff it. The kind/hold bookkeeping above already ran: an
         // empty write is still a statement about the boundary.
         if buf.is_empty() {
+            return r;
+        }
+        // Quiet drops the hand-off, not the work: the bytes were built through
+        // the chain above — the boundary state advanced with them — and are
+        // discarded here, so nothing reaches the screen (design §Content:
+        // quiet is a flag on the content, not a backend).
+        if self.quiet {
             return r;
         }
         // A capturing write is Content's to keep (design §Content): append the
@@ -1117,19 +1160,23 @@ impl Content {
     }
 
     /// One line of non-REPL input — the piped/batch `/`-driver's read. Like
-    /// every
-    /// content verb it short-circuits through the tap when one is installed
-    /// (quiet's `QuietOutput` answers empty, a test's script answers its
-    /// script); without one it writes the `❯ ` prompt through the counter —
-    /// zero rows, but it closes any blank line — and reads the line.
+    /// every content verb it short-circuits through the tap when one is
+    /// installed. Otherwise the line comes from [`Self::input`]: stdin in
+    /// production, nothing under quiet. The read writes the `❯ ` prompt
+    /// through the chain — zero rows, but it closes any blank line.
     pub(crate) fn get_user_input(&self) -> String {
         if let Some(tap) = &self.tap {
             return tap.get_user_input();
         }
-        self.write_content(format!("{} ", style("❯").bold().blue()).as_bytes());
-        let mut input = String::new();
-        let _ = io::stdin().read_line(&mut input);
-        input.trim().to_string()
+        match self.input {
+            InputSource::Empty => String::new(),
+            InputSource::Stdin => {
+                self.write_content(format!("{} ", style("❯").bold().blue()).as_bytes());
+                let mut input = String::new();
+                let _ = io::stdin().read_line(&mut input);
+                input.trim().to_string()
+            }
+        }
     }
 
     pub(crate) fn begin_response(&self) {
@@ -1279,6 +1326,11 @@ impl Content {
     /// zero-byte hand-off would open a block on the main route.
     fn commit_reasoning(&self, bytes: Vec<u8>) {
         if bytes.is_empty() {
+            return;
+        }
+        // Quiet suppresses the meta hand-off too — nothing reaches either
+        // stream.
+        if self.quiet {
             return;
         }
         if self
@@ -1440,6 +1492,13 @@ impl Content {
     pub(crate) fn display_error(&self, error: &str) {
         if let Some(tap) = &self.tap {
             tap.display_error(error);
+            return;
+        }
+        // Quiet's one surviving verb: the screen is suppressed, but a consumer
+        // piping the answer still wants the error, and it goes to stderr
+        // (design §Content).
+        if self.quiet {
+            eprintln!("Error: {}", error);
             return;
         }
         // Measured: a long error wraps, and the message carries a 2-column

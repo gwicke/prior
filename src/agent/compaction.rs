@@ -1057,11 +1057,9 @@ mod tests {
 
     fn null_content() -> std::sync::Arc<Content> {
         // `retry_summarization` surfaces retry notices through content; a
-        // `Content` tapped through `NoOutput` discards them, which is what
-        // this suite wants — no rendering, no terminal behind it.
-        std::sync::Arc::new(Content::with_tap(std::sync::Arc::new(
-            crate::output::NoOutput,
-        )))
+        // quiet `Content` discards them, which is what this suite wants — no
+        // rendering, no terminal behind it.
+        std::sync::Arc::new(Content::quiet())
     }
 
     /// Test app state for the compaction data path: writable session and
