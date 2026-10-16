@@ -7,8 +7,8 @@ what remains and the decisions worth keeping. Do not refer to this document from
 ## Remaining: Step 5 — delete `output.rs`
 
 The end state is a `Content` built directly (`Content::new` in production, `Content::quiet` for
-`--quiet`, `Content::with_tap` in tests) that the agent and its guards hold; `output.rs` and its
-trait dissolve. Landed as commits, each compiling and green on its own.
+`--quiet`, a live `Content` + capture in tests) that the agent and its guards hold; `output.rs` and
+its trait dissolve. Landed as commits, each compiling and green on its own.
 
 ### 5a — the drawing half of `Output` retires
 `Output::draw_frame` (default + `ConsoleOutput`'s forward), `begin_batch`/`end_batch` and
@@ -19,41 +19,53 @@ callers that used the `Output` forward reach the hub directly (`content.manager.
 no production caller, an `agent.rs` test only). The trait is left with content verbs +
 `confirm`/`confirm_default`.
 
-### 5b — `Confirmation` out of `output.rs`; the no-port policy stands alone
+### 5b — the confirm half of `Output` retires; the no-port path denies
 `Output`'s confirm pair is the *no-pump* policy (a REPL confirmation is the port's now), reached only
-by `Guard` when `confirm_port` is `None`. Move `Confirmation` beside `ConfirmDecision`; give the
-Guard a `ConfirmPolicy` value rather than an `Output`. See the open question below on what that
-policy resolves to. `Output` then carries content verbs only.
+by `Guard` when `confirm_port` is `None`. Non-TTY operation supports static decisions only —
+**deny every gated call, or `yolo`** (settled). So `Guard` with no port simply denies:
+`Confirmation`, `Output::confirm`/`confirm_default`, and `Guard`'s session `always` flag all go.
+`Output` is left with content verbs only.
 
-### 5c — the tap narrows to a content-only seam
-`Content::tap` is `Option<Arc<dyn Output>>` but is used only for content verbs; give it a
-content-only trait (in `content/`) and implement it for the quiet / record / test sinks. `Content`
-stops importing `crate::output`. `NoOutput`/`LogOutput` (dead) die here.
+### 5c — capture becomes Content's; the record-tap folds into it
+`RenderManager`'s capture (`captured` + `capture_tap` + the `render()` swallow) and `Content`'s
+`tap` are the same idea — record what Content produced — so fold them and put the one seam at
+Content's output: Content owns the capture buffer and taps its own write *before* the hub hand-off,
+so a capturing content never calls the hub (record + suppress in one). This deletes
+`RecordingOutput`, `content_for`'s record mode and the manager's capture state
+(`begin_capture`/`end_capture`/`is_capturing`/`captured`/`capture_tap` move up), and makes the
+content-only tests (the `batch_slash` family, the replay units) hub-free — and makes `/replay Nl`
+and resume-line, already capture-and-print, hub-free too. What remains of the old tap is just:
+
+- **quiet** — a `Content` flag: suppress the hub hand-off, route `display_error` to stderr
+  (`Content::quiet`); and
+- **the non-REPL input source** — production reads stdin, tests inject a script.
+
+Neither needs `Output`; no new trait is required. `NoOutput`/`LogOutput` (dead) die here too.
+Two design edits follow: §Render drops `captured`; §Content moves capture up to the output.
+**Consequence to confirm:** a capture then suppresses the *frame* as well, where today the frame
+apply still reaches the screen (`capture_catches_content_but_never_frame_bytes` pins the old
+behaviour). The simpler "capture takes the write out entirely" is preferred.
 
 ### 5d — `AgentConfig.output` drops; the agent + guards hold `Content`
 `content_for` dies; every caller builds its `Content` directly (production `Content::new`, quiet
-`Content::quiet`, tests `Content::with_tap`). `ConsoleOutput` dissolves into `Content` plus a public
-`hub()`; `confirm_probe`, the examples, `main.rs` and the test harnesses (`for_test_with_output`, the
-`ScriptOutput` doubles, `repl`'s `commit_harness`) migrate. Confirm capture stays at the
-`ContentWrite` hand-off — content bytes only, never frames — as the sinks die.
+`Content::quiet`, tests a live `Content` read through `begin_capture`). `ConsoleOutput` dissolves
+into `Content` plus a public `hub()`; `confirm_probe`, the examples, `main.rs` and the test harnesses
+(`for_test_with_output`, the `ScriptOutput` doubles, `repl`'s `commit_harness`) migrate.
 
 ### 5e — delete `output.rs`; prune `lib.rs`
-Remove the module and re-export the survivors (`Confirmation`/`ConfirmPolicy` from `confirm`, the
-sink types from `content`).
+Remove the module; `Confirmation` is already gone (5b) and the sinks are content's (5c), so `lib.rs`
+loses the whole `output` re-export line.
 
 ### 5f (independent) — the non-tty `StripAnsi` edge strip
 Design §TermIO: a `StripAnsi` writer wrapper (per stream from caps) strips CSI/OSC-8 at the very
 edge, zero-width, so geometry is untouched; non-tty primaries additionally drop frames wholesale at
 Draw (done). Not implemented, claimed by no earlier step. Carve out here or defer.
 
-### Open questions
-- **the no-port confirm policy.** Today it is per-consumer: `QuietOutput` asks on stdin,
-  `ConsoleOutput` denies, the test doubles answer a fixed value. Design §UI says batch / one-shot
-  gated tools *require yolo*, which argues for a flat **deny**. That drops quiet's stdin ask — a
-  behavior change to confirm before landing.
-- **the seam's shape.** A trait (minimal edits to the test doubles) vs a closed enum
-  (`Live | Quiet | Record(..)`, matching the TermIO/Draw style). The `ScriptOutput` double wants a
-  queued `get_user_input` *and* a recorded buffer, which an enum models awkwardly — leaning trait.
+### Open question
+- **the capture/frame behaviour.** Moving capture to Content means a capturing content no longer
+  calls the hub, so nothing (content *or* frame) reaches the screen — cleaner, but it retires
+  `capture_catches_content_but_never_frame_bytes`, which pins the old "frame still applies" rule.
+  Confirming before landing.
 
 ## Follow-ups (beyond step 5)
 
