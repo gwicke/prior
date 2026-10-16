@@ -18,7 +18,6 @@
 
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, KeyModifiers};
 use picocode::confirm::{ConfirmBridge, ConfirmDecision};
-use picocode::draw::ApplyPolicy;
 use picocode::termio::TermIO;
 use picocode::ConsoleOutput;
 
@@ -109,9 +108,15 @@ async fn main() {
     picocode::confirm::resolve(
         out.content().as_ref(),
         || {
-            // The empty stack: with no compose head the area is nothing, and
-            // applying it is the erase (dropping the element is the clear).
-            out.hub().lock().unwrap().render(Some(Vec::new()), None);
+            // The empty membership: with nothing configured the area is
+            // nothing, and applying it is the erase (dropping the element is
+            // the clear). Configure-then-apply, the same two-step
+            // `confirm::paint` above runs — `configure` is the membership
+            // verb since 4h-g, so a paint composes nothing.
+            let hub = out.hub();
+            let mut hub = hub.lock().unwrap();
+            hub.configure(picocode::render::FRAME_MAX_ROW_RATIO, Vec::new());
+            hub.render(None);
         },
         confirm.subject(),
         answered,
