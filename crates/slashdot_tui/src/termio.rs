@@ -1,6 +1,5 @@
-//! Terminal I/O — the `TermIO` layer (impl doc
-//! `doc/261003_output_drawing_refactor_impl.md`, step 4a; the setup rework,
-//! 4f-e).
+//! Terminal I/O — the `TermIO` layer (design
+//! `doc/261003_output_drawing_refactor.md`, §TermIO).
 //!
 //! The closed `TermIO { Tty | Plain }` enum is the sole owner of the terminal:
 //! the **Tty** variant folds the former `repl::TermGuard` (raw-mode lifecycle)
@@ -10,9 +9,9 @@
 //! no reader and no raw mode; its channels are closed at construction, the
 //! shape piped mode had when it simply dropped the sender.
 //!
-//! Constructed first at setup (4f-e, in `main`), before `Content`: it probes
+//! Constructed first at setup (in `main`), before `Content`: it probes
 //! the caps once at construction ([`TermIO::caps`]) and owns the size watch —
-//! one channel per instance, no process-wide sender. Its receivers feed
+//! one channel per instance. Its receivers feed
 //! content (format width) and the render manager (frame dims) through
 //! [`TermIO::subscribe_size`]; those who publish ([`TermIO::set_size`],
 //! [`TermIO::probe_size`], the reader) write through the same instance, reached
@@ -22,9 +21,9 @@
 //! through the manager once `Draw` holds it): the `input` channel to the
 //! repl, plus fresh `size` / `caret` receivers.
 //!
-//! Not yet here (tracked in the impl doc): DSR answered inside `TermIO`
-//! (4g). Since 4f-e-b every production byte — frames, the re-anchor, the
-//! content choreography — leaves through [`TermIO::write`].
+//! DSR queries are answered inside `TermIO` (the sole stdin owner). Every
+//! production byte — frames, the re-anchor, the content choreography — leaves
+//! through [`TermIO::write`].
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
@@ -88,8 +87,7 @@ impl TermSize {
 // The per-instance size watch lives on the variant structs below (one channel
 // per `TermIO`, seeded from [`TermSize::probe`] at construction); its sender
 // methods are [`TermIO::set_size`] / [`TermIO::subscribe_size`] /
-// [`TermIO::probe_size`]. The process-wide `LazyLock` channel these used to
-// wrap died in 4f-e.
+// [`TermIO::probe_size`].
 
 /// A private watch seeded at `size`: the test harness's stand-in for a
 /// subscription, so a test's geometry is per-instance state and needs no
@@ -112,9 +110,9 @@ pub enum InputEvent {
     Key(KeyEvent),
     /// Bracketed paste payload — a bulk insert for the prompt.
     Paste(String),
-    /// A settled resize — on the channel since 4f-e-d: the reader forwards
-    /// what it also publishes to the size watch (both edges, design
-    /// §TermIO), and the window pump parks one for the same arms to drain.
+    /// A settled resize: the reader forwards what it also publishes to the
+    /// size watch (both edges, design §TermIO), and the window pump parks one
+    /// for the same arms to drain.
     /// Consumers republish idempotently and wait; nobody acts per event
     /// (see [`route_event`]).
     Resize(TermSize),
@@ -143,7 +141,7 @@ impl InputEvent {
 /// means the shell may have repainted, so the cached frame rows can no longer
 /// be trusted (design doc §9). The reader produces it (after its own
 /// raw-mode re-entry); the render manager is the one consumer — it drains
-/// the channel in `poll_caret` and re-anchors via DSR (4g-c, design §3).
+/// the channel in `poll_caret` and re-anchors via DSR (design §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaretEvent {
     Invalidated,
@@ -151,7 +149,7 @@ pub enum CaretEvent {
 
 /// Acquired once at setup, then distributed (design doc §3): the reader's
 /// channel to the repl, `caret` to the render manager — its only consumer,
-/// taking the receiver in `Interactive::new`'s hand-out (4g-c) — and `size`,
+/// taking the receiver in `Interactive::new`'s hand-out — and `size`,
 /// a fresh receiver on the instance's watch (content and the manager usually
 /// already hold their own, taken at construction; the hand-out's third is a
 /// spare). `TermIO` keeps the senders until `handles()` hands the receivers
@@ -227,7 +225,7 @@ pub enum ReaderRoute {
 ///   `killpg(SIGTSTP)`), handled where they land, never queued.
 ///
 /// **Forwarded:** every other key, plus `Paste` **and `Resize`** — resize
-/// travels *both* edges since 4f-e-d (design §TermIO: "resize → both the
+/// travels *both* edges (design §TermIO: "resize → both the
 /// `size` watch and the `input` channel"; the reader publishes the watch as
 /// the event arrives, then forwards). The channel copy is the repl's, and
 /// the repl consumes it *without acting*: `read_input`'s arms republish
@@ -273,8 +271,7 @@ pub fn route_event(ev: &Event) -> ReaderRoute {
 /// Set by the `SIGCONT` handler on resume from `Ctrl-Z`. Read by the
 /// persistent stdin reader, which re-enters raw mode once it sees the flag
 /// and then pushes the caret invalidation (a [`CaretEvent`]) toward the
-/// render manager — the whole resume signal is this one flag plus that
-/// event; the loop-local `RESUMED_REANCHOR` flag died in 4g-c.
+/// render manager — the whole resume signal is this one flag plus that event.
 pub static RESUMED: AtomicBool = AtomicBool::new(false);
 
 /// `SIGCONT` handler: record that the process resumed.
@@ -300,7 +297,7 @@ pub fn register_sigcont() {
 /// §TermIO). The variant picks the input / lifecycle side; caps adjust output
 /// fidelity separately (see [`Caps`]).
 ///
-/// Wiring (design doc §3): build `TermIO` first (4f-e, `main`), take its
+/// Wiring (design doc §3): build `TermIO` first (`main`), take its
 /// caps and a size-watch receiver for `Content::new`, move the enum itself
 /// under `Draw`, and call [`handles`](Self::handles) once through the render
 /// manager — the one hand-out, at the pause-gated entry-DSR window. No layer
@@ -322,13 +319,12 @@ pub struct TtyIo {
     /// The canonical mode guard — raw-mode lifecycle, shared by every caller
     /// that must flip it: the reader, the prompt loop, `$EDITOR`'s takeover.
     /// The render manager's suspend/resume front door reaches it through
-    /// `Draw`, which owns this enum since 4f-e (the `set_mode_guard` hand-off
-    /// of 4f-d retired with it).
+    /// `Draw`, which owns this enum.
     guard: Arc<TermGuard>,
     /// Did this instance's [`TermIO::suspend`] raise the pause gate? Only
     /// that raise is released by the matching [`TermIO::resume`] — an outer
     /// holder's pause (the compaction window) outlives a nested
-    /// suspend/resume pair (4f-e-c).
+    /// suspend/resume pair.
     pause_owned: AtomicBool,
     /// The per-instance size watch's sending half: the reader publishes
     /// resizes here, and [`TermIO::set_size`] / [`TermIO::probe_size`] write
@@ -475,7 +471,7 @@ impl TermIO {
     }
 
     /// The design's `suspend()` (§TermIO: "stops the reader and drops raw
-    /// mode"), complete since 4f-e-c: park the sole stdin owner — raise the
+    /// mode"): park the sole stdin owner — raise the
     /// pause gate, waiting out its last poll — then drop raw mode, the
     /// order `$EDITOR`'s hand-off used to run by hand before folding into
     /// here. Idempotent; a no-op on Plain. Nested against an outer holder
@@ -512,8 +508,6 @@ impl TermIO {
 
     /// Whether this terminal flips raw mode at all (Tty, not Plain) — what
     /// `$EDITOR` and the window pump ask before expecting a mode turnover.
-    /// The predicate the old `mode_guard: Option<…>` field's mere presence
-    /// answered (4f-d).
     pub fn is_tty(&self) -> bool {
         matches!(self, TermIO::Tty(_))
     }
@@ -549,7 +543,7 @@ impl TermIO {
     }
 
     /// Probe the terminal for its current size and publish the answer — the
-    /// prompt loop's live query moved under this roof (4f-e): one live read
+    /// prompt loop's live query: one live read
     /// for a resize that produced no event, written to the watch every
     /// reader consumes instead of only to the loop's local variables. Never
     /// falls back to the watch: the point of the probe is to notice what the
@@ -598,15 +592,13 @@ impl TermIO {
         }
     }
 
-    // `guard()` — the 4f-d hand-off that published the `Arc` into
-    // `RenderManager::set_mode_guard` — died with this move: `Draw` owns the
-    // enum now, and [`Self::suspend`] / [`Self::resume`] / [`Self::is_tty`]
-    // are the front door the manager forwards to.
+    // `Draw` owns the enum; [`Self::suspend`] / [`Self::resume`] /
+    // [`Self::is_tty`] are the front door the manager forwards to.
 
-    /// Bytes to the stream's sink (design doc §TermIO `write`). `Draw`'s
-    /// every byte comes through here since 4f-e-b (the writer field died);
-    /// the byte-edge tests read what [`recording`](Self::recording) holds at
-    /// the same edge, and [`null`](Self::null) discards.
+    /// Bytes to the stream's sink (design doc §TermIO `write`). Every byte
+    /// `Draw` writes comes through here; the byte-edge tests read what
+    /// [`recording`](Self::recording) holds at the same edge, and
+    /// [`null`](Self::null) discards.
     pub fn write(&mut self, s: Stream, bytes: &[u8]) -> io::Result<()> {
         match self {
             TermIO::Tty(_) => write_stdio(s, bytes),
@@ -701,8 +693,8 @@ pub fn spawn_stdin_reader(
         if RESUMED.swap(false, Ordering::SeqCst) {
             let _ = guard.start();
             // Resume invalidated the screen (design doc §9): push it toward
-            // the render manager, the channel's one consumer since 4g-c
-            // (it drains the event in `poll_caret` and re-anchors via DSR).
+            // the render manager, the channel's one consumer (it drains the
+            // event in `poll_caret` and re-anchors via DSR).
             // Sent only after `guard.start()`, so the invalidation cannot
             // reach the manager before raw mode is back — and before any
             // later key this thread forwards, so the loop cannot wake on a
@@ -721,7 +713,7 @@ pub fn spawn_stdin_reader(
         READER_PARKED.store(false, Ordering::SeqCst);
         if let Ok(true) = event::poll(Duration::from_millis(50)) {
             if let Ok(ev) = event::read() {
-                // Resize: *both* edges (4f-e-d, design §TermIO). The
+                // Resize: *both* edges (design §TermIO). The
                 // watch first — geometry readers (the streaming
                 // renderers, the loop-top compare) must see the new
                 // size by the time anyone reacts to the channel copy —
@@ -774,20 +766,18 @@ pub fn spawn_stdin_reader(
     });
 }
 
-/// Owns terminal mode transitions — the folded former `repl::TermGuard`.
-/// [`TermIO::Tty`] holds the canonical instance and keeps the only `Arc`
-/// clones: its own and the reader's (resume / `Ctrl-C` / `Ctrl-Z`). The
-/// prompt loop, `$EDITOR` and the back-off pump flip raw mode through the
-/// render manager's suspend/resume front door, which reaches this enum
-/// under `Draw` since 4f-e — no holder outside `TermIO` names the guard
-/// (`TermIO::guard()` died with the `set_mode_guard` hand-off).
-/// [`start`](Self::start) enters raw mode and negotiates capabilities;
-/// [`stop`](Self::stop) (idempotent) restores cooked mode. Safe to call from
-/// `Drop`, a panic hook, or a signal handler.
+/// Owns terminal mode transitions. [`TermIO::Tty`] holds the canonical
+/// instance and keeps the only `Arc` clones: its own and the reader's
+/// (resume / `Ctrl-C` / `Ctrl-Z`). The prompt loop, `$EDITOR` and the
+/// back-off pump flip raw mode through the render manager's suspend/resume
+/// front door, which reaches this enum under `Draw` — no holder outside
+/// `TermIO` names the guard. [`start`](Self::start) enters raw mode and
+/// negotiates capabilities; [`stop`](Self::stop) (idempotent) restores cooked
+/// mode. Safe to call from `Drop`, a panic hook, or a signal handler.
 ///
-/// The design gives the whole lifecycle to `TermIO`: suspend/resume with
-/// the reader-stop is the enum's since 4f-e-c, Ctrl-C/Ctrl-Z are handled
-/// in the reader — DSR answered inside `TermIO` is 4g.
+/// The design gives the whole lifecycle to `TermIO`: suspend/resume includes
+/// the reader-stop, Ctrl-C/Ctrl-Z are handled in the reader, and DSR is
+/// answered inside `TermIO`.
 pub struct TermGuard {
     active: AtomicBool,
     saved_paste: AtomicBool,
@@ -919,7 +909,7 @@ pub static READER_PARKED: AtomicBool = AtomicBool::new(false);
 pub static READER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Pauses the persistent reader for a window in which the main task owns stdin
-/// and reads it directly (step 2 commit C) — a DSR query, `$EDITOR`'s
+/// and reads it directly — a DSR query, `$EDITOR`'s
 /// takeover, or the compaction window's key pump. Raising waits for the reader
 /// to actually park ([`READER_PARKED`]); dropping lowers the gate again.
 ///
@@ -965,7 +955,7 @@ impl Drop for ReaderPauseGuard {
 }
 
 /// The cursor row from a DSR query, answered with the reader paused so the
-/// reply cannot be swallowed (step 2 commit C). This is the *whole* of the
+/// reply cannot be swallowed. This is the *whole* of the
 /// terminal-I/O-layer DSR: pause dispatch, write the query, match the reply.
 pub fn query_cursor_row() -> Option<usize> {
     let _pause = ReaderPauseGuard::raise();
@@ -1059,7 +1049,7 @@ mod tests {
 
     /// `ReaderPauseGuard` owns the pause gate for its lifetime and is
     /// nesting-safe — the replacement for the old `confirm_gate`/`ReaderHold`
-    /// plumbing (step 2 commit C). No reader runs in a unit test
+    /// plumbing. No reader runs in a unit test
     /// (`READER_RUNNING` is false), so `raise` never blocks on a park and the
     /// assertions are purely about the flag's ownership.
     #[test]
@@ -1080,7 +1070,7 @@ mod tests {
         assert!(!reader_paused(), "dropped once, clear again");
     }
 
-    /// The reader-stop half of `TermIO::suspend` (4f-e-c): suspend parks
+    /// The reader-stop half of `TermIO::suspend`: suspend parks
     /// the reader before dropping raw mode, a repeated suspend keeps its
     /// claim, and the matching resume releases exactly that raise — an
     /// outer holder's pause (the compaction window) outlives a nested
@@ -1118,7 +1108,7 @@ mod tests {
         assert!(!reader_paused(), "the outer drop clears it");
     }
 
-    // --- the routing policy, moved from `repl.rs` with the reader (4a) ------
+    // --- the routing policy ------
 
     /// The in-flight reader's routing policy: which events may wait, and which
     /// may not.
@@ -1152,7 +1142,7 @@ mod tests {
         }
     }
 
-    /// Resize travels *both* edges since 4f-e-d (design §TermIO): the watch
+    /// Resize travels *both* edges (design §TermIO): the watch
     /// for the geometry readers, the input channel for the repl — which
     /// consumes it without acting (the prompt's arms republish idempotently
     /// and keep waiting, the turn's dispatch ignores it), so forwarding is
@@ -1235,7 +1225,7 @@ mod tests {
         assert_eq!(route_event(&ev), ReaderRoute::Inline);
     }
 
-    // --- the TermIO type itself (4a) ----------------------------------------
+    // --- the TermIO type itself ----------------------------------------
 
     /// The send-edge conversion: three variants map one-to-one, everything
     /// else (mouse, focus, whatever a window pump might park) has nowhere to

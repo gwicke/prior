@@ -5,7 +5,7 @@ use std::sync::Arc;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Setup the output handler with NoOutput for silent execution
     let output: Arc<dyn picocode::Output> = Arc::new(NoOutput);
-    // Content's verbs short-circuit through the same silent handle (step 3d).
+    // Content's verbs short-circuit through the same silent handle.
     let content = AgentConfig::content_for(&output);
 
     // 2. Create the agent

@@ -1,8 +1,8 @@
 //! Raw-mode REPL input layer (Stages 2–4).
 //!
 //! - Raw-mode lifecycle + capability negotiation live in `crate::termio`
-//!   (`TermGuard`, safe from `Drop`/panic hook/signal handler); since 4f-d
-//!   this module reaches them only through the content handle's manager —
+//!   (`TermGuard`, safe from `Drop`/panic hook/signal handler); this module
+//!   reaches them only through the content handle's manager —
 //!   the design's suspend/resume front door (§Render).
 //! - [`Repl`] is the input driver. [`Repl::read_input`] is a multi-line
 //!   line editor with the v2.5 slash-menu frame.
@@ -49,20 +49,20 @@ use std::time::Duration;
 static ENTRY_DSR_DONE: AtomicBool = AtomicBool::new(false);
 
 /// The entry DSR: anchor the draw cache to the real cursor once, at startup,
-/// **before the persistent reader starts consuming stdin** (step 2 commit B).
+/// **before the persistent reader starts consuming stdin**.
 /// Running it here — with the reader still paused — is what guarantees the
 /// terminal's reply (or a test harness's pre-written one) is not swallowed by
 /// the reader's first poll. Idempotent via [`ENTRY_DSR_DONE`], so
 /// `read_input`'s own entry check becomes a no-op. The caller side takes the
-/// content handle since 4f-d (the query is the manager's `cursor_row`); the
-/// *answer* moving inside `TermIO` is 4g.
+/// content handle (the query is the manager's `cursor_row`); the *answer*
+/// lives inside `TermIO`.
 pub(crate) fn run_entry_dsr(content: &Content) {
     if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
         let _ = content.manager.lock().unwrap().cursor_row();
     }
 }
 
-/// The interactive input driver — a unit since 4f-d: every duty its former
+/// The interactive input driver — a unit: every duty its former
 /// guard/output handles served now takes the content handle, whose manager
 /// is the front door for raw mode, the DSR re-anchors and the frame.
 pub struct Repl;
@@ -115,7 +115,7 @@ pub struct ReplCtx {
     /// the `/tree compact` sub-menu header; the compact handler writes the
     /// same estimate as `tokensBefore` (same `estimate_context_tokens` call),
     /// and the loop records it as the live usage store's
-    /// `estimated_input_tokens` (4h-g4 part 3).
+    /// `estimated_input_tokens`.
     pub context_tokens: u64,
     /// Current model filter/sort state for the `/model` overlay.
     pub model_filter: ModelFilter,
@@ -374,7 +374,7 @@ const INPUT_CONTEXT_ROWS: usize = 3;
 /// The element holds the session's editor *handle* and content's streaming
 /// flag and resolves both inside `height`/`render` at the width being
 /// composed for — the layout is computed at the render width rather than
-/// snapshotted at compose (4h-f). The caret lives at `layout.cursor_row` /
+/// snapshotted at compose. The caret lives at `layout.cursor_row` /
 /// `layout.cursor_col` — derived, not stored.
 ///
 /// **R1: the input is `0` rows mid-turn with an empty buffer; the prompt row
@@ -390,7 +390,7 @@ const INPUT_CONTEXT_ROWS: usize = 3;
 ///
 /// "Is a turn running" is the output's fact (`streaming`), not the frame
 /// layer's — the element does not own it, it pulls the handle content
-/// shares, the way the bar element pulls the bar store (4h-c). Read at pull
+/// shares, the way the bar element pulls its store. Read at pull
 /// time, the fact cannot go stale between compose and paint.
 ///
 /// A free function, not `Element::input`: inherent methods on `Element` would
@@ -435,7 +435,7 @@ pub(crate) fn test_overlay(lines: &[&str], sel: usize) -> Vec<Element> {
 /// Goes through a real [`RenderPlan`] and the real [`RenderPlan::elements`],
 /// so a test that pastes in arbitrary strings is still exercising production's
 /// composition rather than a shortcut that can drift from it. No width: the
-/// minted elements lay themselves out at the render width (step 4h-d), so a
+/// minted elements lay themselves out at the render width, so a
 /// compose-time width has nothing to hand them.
 #[cfg(test)]
 pub(crate) fn test_overlay_parts(
@@ -468,7 +468,7 @@ pub(crate) fn test_overlay_parts(
 ///
 /// This runs the same composition and the same `allocate` the frame will, so
 /// the two cannot differ — and the `budget` is the manager's own
-/// ([`RenderManager::budget`], 4h-b), the number the frame *will* be budgeted
+/// ([`RenderManager::budget`]), the number the frame *will* be budgeted
 /// with, so the ratio resolves in exactly one place and the grant cannot
 /// disagree with the paint. The status row is left out — it is one row, and a
 /// menu is only open between turns, when there is nothing streaming to report.
@@ -514,7 +514,7 @@ pub(crate) fn overlay_elements(overlay: &ActiveOverlay) -> Vec<Element> {
 /// like — the split that made `handle_key` and `eval` draw nothing only holds
 /// if the pixels they are silent about have exactly one owner.
 ///
-/// No overlay param and no compose since 4h-g: membership is whatever the
+/// No overlay param, no compose: membership is whatever the
 /// preceding transition left configured (`sync_stack`), so this just applies
 /// it. The apply phase owns the rest: an intact live frame means a partial
 /// row-diff (so a tall pop-up's scroll is followed without a row counter), and
@@ -529,10 +529,10 @@ pub(crate) fn paint_prompt(content: &Content) {
 /// Editor content: the prompt on row 0, the wrapped buffer below it.
 ///
 /// Holds the session's editor *handle* and content's streaming flag — the
-/// same pull-the-shared-store shape as the bar element (4h-c). The layout is
+/// same pull-the-shared-store shape as the bar element. The layout is
 /// computed inside `height`/`render` at the width being composed for, so a
 /// compose at one width and a render at another cannot disagree about the
-/// wrap (4h-f).
+/// wrap.
 struct InputItem {
     editor: Arc<Mutex<LineEditor>>,
     prompt: String,
@@ -657,7 +657,7 @@ pub struct PromptSession {
     /// position (which lives on the editor — see [`LineEditor::nav`]).
     ///
     /// Shared, not owned outright: the input *element* holds a clone of this
-    /// handle and pulls the buffer at paint time (4h-f), so the frame always
+    /// handle and pulls the buffer at paint time, so the frame always
     /// shows the live editor rather than a layout snapshotted at compose.
     /// Locks are statement-scoped — no path holds one across a paint (the
     /// element locks it again inside the manager's render).
@@ -690,13 +690,12 @@ pub struct PromptSession {
     /// same frame that was just painted.
     overlay: ActiveOverlay,
     /// This session's view of the size watch — a clone of the content
-    /// handle's receiver (4f-e-a: the retired `termio::size()` /
-    /// `output::term_width()` free functions' replacement for the key paths,
-    /// which hold the session and not the content). Same channel, so a
+    /// handle's receiver, for the key paths that hold the session and not
+    /// the content. Same channel, so a
     /// resize published by the loop-top probe or the reader is what these
     /// reads see.
     size: tokio::sync::watch::Receiver<crate::termio::TermSize>,
-    /// The injected state handle (4h-g4 part 1): the bar element reads the
+    /// The injected state handle: the bar element reads the
     /// model in force, the thinking level and the context window off it at
     /// render, so a mid-turn `/reasoning` or `/model` commit shows at the next
     /// paint. Cloned into `sync_stack`'s bar element.
@@ -876,8 +875,7 @@ impl PromptSession {
     /// apart.
     pub(crate) async fn eval(&mut self) -> EvalOutcome {
         // The watched width for this eval — read before the destructure
-        // below borrows `self` apart (4f-e-a's replacement for the
-        // `output::term_width()` free function in `v25_eval`).
+        // below borrows `self` apart (the free function `v25_eval` used).
         let width = self.term_width();
         let Self {
             editor,
@@ -1187,7 +1185,7 @@ impl PromptSession {
             content.streaming.clone(),
         );
         let mut stack = Vec::new();
-        // The bar is always present (4h-g part 2): no `is_off` gate — with a
+        // The bar is always present: no `is_off` gate — with a
         // live pull the bar always knows how to render itself, and the gate
         // was an artifact of the old push.
         stack.push(Element::lines(vec![String::new()]));
@@ -1239,7 +1237,7 @@ impl PromptSession {
         // dispatch and the paint cannot disagree about how many rows there are.
         opts_len: usize,
         // The live-region budget the frame will be composed under, from the
-        // one place a ratio resolves to rows (`RenderManager::budget`, 4h-b).
+        // one place a ratio resolves to rows (`RenderManager::budget`).
         // Passed for the same reason `opts_len` is: the ratio is the
         // manager's configuration, so a caller that re-derived it here would
         // be a second computation of the same number.
@@ -1247,10 +1245,9 @@ impl PromptSession {
         prompt: &str,
         history: &mut History,
     ) -> KeyOutcome {
-        // The watched geometry for this dispatch — the retired
-        // `termio::size()` / `output::term_width()` free functions'
-        // replacement (4f-e-a): one read of this session's cloned receiver,
-        // taken before the destructure below borrows `self` apart. Raw
+        // The watched geometry for this dispatch: one read of this session's
+        // cloned receiver, taken before the destructure below borrows `self`
+        // apart. Raw
         // values, so each use keeps exactly the floor it applied before.
         let watched = *self.size.borrow();
         let term_w = self.term_width();
@@ -1470,11 +1467,11 @@ impl Repl {
         history: &mut History,
         ctx: &ReplCtx,
         app_state: &Arc<AppState>,
-        // The one handle since 4f-d: content carries the resize-replay
-        // source, the frame pipeline (through its manager), and the manager's
-        // front door for raw mode + the DSR re-anchors.
+        // The one handle: content carries the resize-replay source, the frame
+        // pipeline (through its manager), and the manager's front door for raw
+        // mode + the DSR re-anchors.
         content: &Content,
-        // The persistent reader's event queue (step 2 commit B). The reader is
+        // The persistent reader's event queue. The reader is
         // the sole stdin owner; this loop consumes what it forwards rather
         // than calling `event::poll`/`event::read` itself.
         keys: &mut UnboundedReceiver<InputEvent>,
@@ -1511,9 +1508,9 @@ impl Repl {
         // Repo handle: refresh in case the loop replaced its local Option
         // (clone-shared Arc cache — same listing state either way).
         app_state.set_repo(ctx.repo.clone());
-        // The context figure is read *live* by the bar and `/stat` (4h-g part
-        // 2) off the agent's usage store — so this cycle's estimate is recorded
-        // as an **estimate** (4h-g4 part 3), not a push into the status and not
+        // The context figure is read *live* by the bar and `/stat` off the
+        // agent's usage store — so this cycle's estimate is recorded as an
+        // **estimate**, not a push into the status and not
         // a report. Before any completion has reported the estimate is what
         // `context_figure` falls back to; after one has, the provider's own
         // count wins and this write is simply unused.
@@ -1527,7 +1524,7 @@ impl Repl {
         // fields it touches instead of a `&mut self` that would conflict with
         // these bindings.
         // Terminal size at the last paint is the hub's `painted_size()` answer
-        // (the manager's own since 4f-c), read fresh each iteration rather
+        // (the manager's own), read fresh each iteration rather
         // than kept in a `Cell` here. Resizes
         // are consumed without repainting (see the wait below), so a mismatch at
         // the top of the loop is the "repaint is due, and re-anchor first"
@@ -1564,14 +1561,14 @@ impl Repl {
         loop {
             // On resume from Ctrl-Z, re-anchor the draw cache (DSR): the shell
             // may have repainted while we were stopped, so the cached frame
-            // rows can no longer be trusted (plan §4.2). Since 4g-c this is
+            // rows can no longer be trusted (plan §4.2). This is
             // the caret channel's invalidation, drained through the manager
             // (`poll_caret`) — the reader emits it only after its own
             // raw-mode re-entry (`RESUMED`), so the DSR below finds raw mode
             // back; the old loop-local `RESUMED_REANCHOR` flag and its
             // belt-and-suspenders `resume()` are gone with it.
             content.manager.lock().unwrap().poll_caret();
-            // Resize detection against the hub's `painted_size` (4f-c: the manager's
+            // Resize detection against the hub's `painted_size` (the manager's
             // own applied size, not an `Output` verb). Resize events are
             // consumed without repainting (see the wait below), so after a drag
             // this check first fires on the keystroke that triggers the
@@ -1583,9 +1580,9 @@ impl Repl {
             // without any state here.
             // The one place that still queries the terminal live: a resize
             // that produced no event has to be caught somewhere, and this is
-            // the loop that runs per keystroke. Since 4f-e-a the query
-            // lives under `TermIO`'s roof (`manager.probe_size()`) and its
-            // answer is *published* there too, so every reader below and
+            // the loop that runs per keystroke. The query lives under
+            // `TermIO`'s roof (`manager.probe_size()`) and its answer is
+            // *published* there too, so every reader below and
             // around consumes the watch rather than a private query.
             let cur = content.manager.lock().unwrap().probe_size();
             let (cur_w, cur_h) = (cur.width, cur.height);
@@ -1635,7 +1632,7 @@ impl Repl {
             //
             // Events come from the **persistent reader** (`keys`), the sole
             // stdin owner — this loop no longer calls `event::poll`/`read`.
-            // Resize reaches here on the channel since 4f-e-d (the reader
+            // Resize reaches here on the channel (the reader
             // publishes the watch *and* forwards), but never acts: the arms
             // below republish idempotently and keep waiting, so a drag's
             // stream cannot force a per-event repaint (which would strand
@@ -1678,7 +1675,7 @@ impl Repl {
                     None => keys.recv().await,
                 };
                 match e {
-                    // The reader's forwarded Resize (4f-e-d): republish —
+                    // The reader's forwarded Resize: republish —
                     // idempotent, the reader already published it — and keep
                     // waiting rather than treating it as a key. A drag never
                     // repaints per event; the loop-top probe settles it.
@@ -1726,7 +1723,7 @@ impl Repl {
                     // the same session for its row count.
                     let opts_len = session.opts_len();
                     // The frame's budget comes from the manager — the one
-                    // place a ratio resolves to a row count (4h-b) — at the
+                    // place a ratio resolves to a row count — at the
                     // watched height the dispatch already keys off.
                     let budget = content.manager.lock().unwrap().budget(content.height());
                     match session.handle_key(key, opts_len, budget, prompt, history) {
@@ -1779,7 +1776,7 @@ impl Repl {
     /// place.
     ///
     /// No width: the input element lays itself out at the width it is asked
-    /// at (4h-f), so there is nothing to snapshot here. The not-streaming
+    /// at, so there is nothing to snapshot here. The not-streaming
     /// flag is safe in both callers' worlds — the tests are between turns,
     /// and `rows_grant` only runs with an overlay up, which means a
     /// non-empty buffer, which means the input is visible under either flag.
@@ -1857,7 +1854,7 @@ impl Repl {
         buf: &str,
         cursor_char: usize,
         key: crate::slashdot_menu::HostKey,
-        // The watched width (4f-e-a), read by the caller off its session —
+        // The watched width, read by the caller off its session —
         // a parameter because this is a static helper with no session.
         width: usize,
     ) -> V25Frame {
@@ -2096,7 +2093,7 @@ impl Repl {
         // screen writer ($EDITOR through `run_editor`) re-anchors on exit
         // (plan §4.2). Reset the buffer, clear the input region by painting
         // it, then echo the line at the caret the frame apply left. The
-        // reset leads rather than trails the paint since 4h-f: the closure
+        // reset leads rather than trails the paint: the closure
         // paints through the shared handle, so what it shows *is* the
         // editor — an empty one, which is what every caller's
         // `next_input` (`""`) asks for.
@@ -2124,7 +2121,7 @@ impl Repl {
         editor: &mut LineEditor,
         history: &mut History,
         prompt: &str,
-        // The watched width (4f-e-a): `visual_up`/`visual_down` lay the
+        // The watched width: `visual_up`/`visual_down` lay the
         // buffer out against it. A parameter rather than a session read so
         // the unit tests drive `edit_key` with no session at all — they pin
         // 80, the seed every geometry had when the read was global.
@@ -2249,9 +2246,8 @@ impl Repl {
 /// content-only rows (the prompt renders separately on row 0) plus the cursor.
 ///
 /// The input element's data contract, and repl's alone: [`LineEditor::layout`]
-/// produces it and [`InputItem`] consumes it inside `render` (4h-f moved it
-/// home from `slashdot_tui` — with the element pulling the editor, no side of
-/// the contract is above this module any more).
+/// produces it and [`InputItem`] consumes it inside `render` (no side of the
+/// contract is above this module: the element pulls the editor).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Layout {
     /// Content-only visual rows (the prompt is rendered separately on row 0).
@@ -2946,7 +2942,7 @@ mod tests {
     #[test]
     fn a_committed_line_is_written_between_two_rules() {
         let reasoning = crate::settings::default_show_reasoning_handle();
-        // The width is per-instance state since step 2 commit A (`with_size`
+        // The width is per-instance state (`with_size`
         // seeds a private size watch), so no serialization is needed.
         let out = crate::output::ConsoleOutput::with_size(
             reasoning,
@@ -4782,7 +4778,7 @@ mod tests {
     // The input element driven straight through the frame pipeline — no
     // `compose_frame`, no overlay: just the [`input`] element handed to
     // `plan_apply`, exactly as draw.rs's input-frame tests did before the crate
-    // split (4h-a). They moved here because they build the repl's own input
+    // split. They moved here because they build the repl's own input
     // element (`LineEditor` + [`input`]), which the drawing crate no longer
     // knows about.
     mod input_frame_tests {
@@ -4920,7 +4916,7 @@ mod tests {
     /// Asserted through the element's [`RowAsk`] rather than through a composed
     /// frame, because this is a property of the element and a test that
     /// replayed bytes to find it would pass just as well with the frame layer
-    /// accidentally padding the gap back in. Since 4h-f the element *pulls*
+    /// accidentally padding the gap back in. The element *pulls*
     /// the flag and the buffer, so the test drives one element through all
     /// three states by moving the shared state underneath it — a push-model
     /// test could only mint three and hope.
@@ -4977,8 +4973,8 @@ mod tests {
 
     // ---- the input element through the frame pipeline ----
     //
-    // Relocated from `slashdot_tui`'s `render` tests with the crate split
-    // (4h-a): they build a [`LineEditor`] and the repl's [`input`] element, so
+    // Relocated from `slashdot_tui`'s `render` tests with the crate split:
+    // they build a [`LineEditor`] and the repl's [`input`] element, so
     // they belong with the input's owner, not with the generic frame layer.
     // They exercise the *real* pipeline (`render`, `allocate`, `live_budget`)
     // rather than a stub, so the contract they pin is unchanged.
@@ -5016,7 +5012,7 @@ mod tests {
         assert_eq!(f.caret, Some((2, 2)));
     }
 
-    /// The sizing declaration is the *trait's* now (§3.2.3, 4h-b), which means
+    /// The sizing declaration is the *trait's* now (§3.2.3), which means
     /// it can be wrong without the allocator noticing: `allocate` reads the
     /// ask the element answers, not the impl.
     ///

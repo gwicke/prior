@@ -4102,7 +4102,7 @@ mod tests {
         );
     }
 
-    /// 4i-a: a node that mints a fresh response every call (the common,
+    /// A node that mints a fresh response every call (the common,
     /// non-memoizing case) contributes no change when its content is
     /// unchanged, so the stored handle is reused and `slots_dirty` stays
     /// clear — the flicker-free carry on the real menu path.
@@ -4152,11 +4152,11 @@ mod tests {
         );
     }
 
-    /// 4i-b: on the engine path — a real listing node whose `data()` mints a
+    /// On the engine path — a real listing node whose `data()` mints a
     /// fresh `DataResponse` every call — a cursor move yields a *stable*
     /// `ViewRows` handle: `plan.view` is the same `Arc` across evals, so
     /// `ElementSet::update` sees `same_panel` and moves figures instead of
-    /// rebuilding. 4h-e's crate tests reached this only with a hand-built
+    /// rebuilding. The crate tests reached this only with a hand-built
     /// plan; `refresh_data`'s content-equality fallback is what makes it hold
     /// here.
     #[test]

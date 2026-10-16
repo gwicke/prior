@@ -156,7 +156,7 @@ pub(crate) fn has_table_header(view: &ViewRows, columns: &[ColumnDef]) -> bool {
 ///
 /// The shared core of every place rows become terminal text: the plan's
 /// render cache (rebuild caching in [`RowView::plan`]) and the view's
-/// frame elements (step 4h-d, which format at the render width), so the
+/// frame elements (which format at the render width), so the
 /// paint cannot drift from the plan that pages over the same rows.
 pub(crate) struct AssembledTable {
     pub header: Option<LogicalLine>,
@@ -312,7 +312,7 @@ struct RenderCache {
     /// `Arc` because this is the *plan's* rows, which a host holds in a frame
     /// element — and elements are `Send + Sync` (stashed in the draw cache
     /// behind a `Mutex`). `ViewRows`' slots are `Arc` for the same reason:
-    /// the whole handle chain is `Arc` (step 4h-d), so a view handle can
+    /// the whole handle chain is `Arc`, so a view handle can
     /// ride into an element without smuggling a non-`Send` `Rc` across the
     /// boundary.
     rows: Arc<Vec<LogicalLine>>,
@@ -446,7 +446,7 @@ impl RowView {
                 // The handle + config the elements format from: the plan
                 // hands its host both forms — the laid-out snapshot above
                 // (cursor math, paging) and the raw view (render-width
-                // elements, 4h-d).
+                // elements).
                 view: Some(Arc::clone(&view)),
                 columns: req.columns.to_vec(),
             },
@@ -493,7 +493,7 @@ impl RowView {
 
     /// Rebuild table header + row lines + active indices from scratch —
     /// the shared [`assemble_table`], gated by the ptr_eq/ctx checks in
-    /// [`RowView::plan`] (untouched by the element move, 4h-d).
+    /// [`RowView::plan`].
     fn rebuild_rows(&mut self, view: &ViewRows, columns: &[ColumnDef], render_ctx: RenderContext) {
         let out = assemble_table(view, columns, render_ctx.term_width.saturating_sub(2));
         self.render.table_header = out.header;

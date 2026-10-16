@@ -145,7 +145,7 @@ pub struct DataError {
 
 /// Result type for `data()`. `Arc`, not `Rc`: a response rides the handle
 /// chain into the host's frame elements and crosses the completer's worker
-/// thread, so it must be `Send` (step 4h-d).
+/// thread, so it must be `Send`.
 pub type DataResult = Result<std::sync::Arc<DataResponse>, DataError>;
 
 use std::collections::HashMap;

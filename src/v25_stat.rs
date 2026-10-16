@@ -39,7 +39,7 @@ impl SlashDotNode for StatNode {
             (String::new(), model)
         };
 
-        // Read live off the agent's usage store (4h-g part 2) rather than the
+        // Read live off the agent's usage store rather than the
         // loop's per-cycle snapshot, so a `/stat` opened mid-turn reports the
         // most recent completion — the same source the status bar pulls (both
         // reach it through content's handle). No agent yet means no completions,
@@ -51,7 +51,7 @@ impl SlashDotNode for StatNode {
             .map(|u| *u.lock().unwrap())
             .unwrap_or_default();
         // The estimate line's figure, off the same one read the bar uses
-        // (4h-g4 part 3): the provider's count when one has reported, else the
+        // the provider's count when one has reported, else the
         // recorded estimate.
         let context_figure = usage.context_figure();
 
@@ -312,7 +312,7 @@ mod tests {
     fn stat_header_shows_estimated_context_tokens() {
         let app_state = test_app_state();
         app_state.set_model("openai:gpt-4o");
-        // The estimate now lives on the usage store (4h-g4 part 3), read off
+        // The estimate lives on the usage store, read off
         // the same handle the bar pulls; seed it as an estimate, not a report.
         app_state
             .content()

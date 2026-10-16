@@ -1,5 +1,5 @@
 //! Tool-call previews: command labels, edit diffs, sed previews, and the
-//! banner/diff helpers behind them (step 3b of the output-drawing refactor).
+//! banner/diff helpers behind them.
 
 use crate::content::text::wrap;
 use crate::tools::EditOp;

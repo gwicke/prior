@@ -173,7 +173,7 @@ pub struct State {
     pub(crate) raw_tree: Arc<Vec<SessionTreeNode>>,
     pub(crate) leaf_id: Option<String>,
     /// The session's user-assigned name, or `None` when unnamed — the status
-    /// bar's leading label (4h-g4 part 2). Written once per cycle by the loop
+    /// bar's leading label. Written once per cycle by the loop
     /// off the session index; the bar reads it at render rather than a
     /// per-turn push.
     pub(crate) session_name: Option<String>,
@@ -191,7 +191,7 @@ pub struct State {
     /// Key events captured by a window pump while nobody could read stdin
     /// (the compaction LLM window), parked for `read_input` to dispatch on
     /// its next iteration — never dropped, never leaked into `$EDITOR`.
-    /// Converted to [`InputEvent`] at the park edge (step 4a): the drain
+    /// Converted to [`InputEvent`] at the park edge: the drain
     /// speaks the input channel's vocabulary; events the prompt could never
     /// show (mouse, focus) are dropped here, as the drain used to ignore them.
     ///
@@ -465,7 +465,7 @@ impl AppState {
     /// The content handle this state's config carries — the same `Arc` the
     /// loop's applied config holds (clones share it). Setup paths that need
     /// a geometry read but hold no content — the prompt session's cloned
-    /// size watch, the header context's width (4f-e-a) — go through here
+    /// size watch, the header context's width — go through here
     /// instead of cloning the whole config.
     pub(crate) fn content(&self) -> Arc<crate::content::Content> {
         self.state.lock().config.content.clone()
@@ -634,7 +634,7 @@ impl AppState {
         st.leaf_id = leaf_id;
     }
 
-    /// The status bar's leading label (4h-g4 part 2): the session name, else
+    /// The status bar's leading label: the session name, else
     /// its opening message. Both come off the per-cycle write
     /// ([`Self::update_cycle_view`]) except on the first prompt, where the
     /// branch is still empty and [`Self::set_first_message_if_unset`] fills the
@@ -644,8 +644,8 @@ impl AppState {
         (st.session_name.clone(), st.session_first_message.clone())
     }
 
-    /// Fill the bar's message label when the cycle view has none (4h-g4 part
-    /// 2): on the very first prompt the branch is not yet persisted, so the
+    /// Fill the bar's message label when the cycle view has none: on the
+    /// very first prompt the branch is not yet persisted, so the
     /// loop's cycle write leaves it empty. The submit path knows the text it
     /// is about to send, so it stands in — the `first_user_text(prior).or(input)`
     /// fallback the turn used to carry, relocated to where the input is.
@@ -772,7 +772,7 @@ impl AppState {
     /// Run the external editor over `current` through the single wrapper
     /// (`crate::editor::run_editor`): reader gate, raw-mode turnover, DSR
     /// re-anchor (doc/editor_cleanup.md §2). The turnover goes through the
-    /// config's manager — the front door for suspend/resume (4f-d) — which
+    /// config's manager — the front door for suspend/resume — which
     /// reports `Unsupported` when no mode guard was installed (quiet/pipe:
     /// no tty to hand over).
     pub fn edit_text(

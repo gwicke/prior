@@ -1,21 +1,20 @@
-//! The `Content` handle (step 3c of the output-drawing refactor): the agent-
+//! The `Content` handle: the agent-
 //! facing owner of the transcript's content. It holds the content boundary
 //! state, the width watch and the streaming renderers, formats content at the
 //! watched width, and writes through the byte sink — which lives inside the
-//! frame hub it holds (steps 4b/4c).
+//! frame hub it holds.
 //!
-//! It also holds the frame hub (steps 4b/4c): `RenderManager` runs the frame
-//! pipeline and has owned the `Draw` sink since 4c. Since 4d every write
+//! It also holds the frame hub: `RenderManager` runs the frame
+//! pipeline and owns the `Draw` sink. Every write
 //! this layer produces leaves as a `ContentWrite` handed to that hub
 //! (`with_content_writer` → `render_content`/`render_batch`) — the sink is
-//! never named here. Since 4f-f every hand-off also carries its stream:
+//! never named here. Every hand-off also carries its stream:
 //! `Main` from the boundary chain, `Meta` from `commit_reasoning` when the
 //! setup decision diverts reasoning — the hub routes on the token.
-//! Of the frame *verbs*, `frame_size` lives here since 4f-c
-//! (the watch this handle carries *is* the dims source), `painted_size` is the
-//! manager's (`RenderManager::painted_size`), `cursor_row` is the manager's
-//! with `Output` forwarding, and `draw_frame` — the test drivers' edge — stays
-//! on `Output` until step 5.
+//! Of the frame *verbs*, `frame_size` lives here (the watch this handle
+//! carries *is* the dims source), `painted_size` and `cursor_row` are the
+//! manager's, and `draw_frame` — the test drivers' edge — stays on `Output`
+//! until the drawing refactor retires it.
 
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
@@ -43,19 +42,16 @@ use markdown_terminal::{Renderer, Theme};
 use super::composition::ContentBoundary;
 use super::{boundary_spacer, separator_line, ContentDisplayKind};
 
-/// The agent-facing content owner (step 3c).
+/// The agent-facing content owner.
 ///
-/// The fields are `pub(crate)` while the content methods still live on
-/// `ConsoleOutput` and reach them through `self.content.…`; they tighten to
-/// private once those methods move onto `Content` (3c-b).
+/// The fields are `pub(crate)` so the content methods still forwarded by
+/// `ConsoleOutput` can reach them.
 pub struct Content {
-    /// The frame hub (steps 4b/4c): where the frame pipeline *and* the
-    /// drawing edge live — allocate → render → apply → remember, with the
-    /// `Draw` sink under the manager's roof since 4c. `Arc<Mutex<…>>` is the
-    /// design's handle shape (§Render: UI and content both hold one); today
-    /// the only holder is this `Content`, reached by `ConsoleOutput` through
-    /// it. Since 4d every content write reaches the screen as a
-    /// `ContentWrite` handed to this hub (`render_content`/`render_batch`)
+    /// The frame hub: where the frame pipeline *and* the drawing edge live —
+    /// allocate → render → apply → remember, with the `Draw` sink under the
+    /// manager's roof. `Arc<Mutex<…>>` is the design's handle shape (§Render:
+    /// UI and content both hold one). Every content write reaches the screen
+    /// as a `ContentWrite` handed to this hub (`render_content`/`render_batch`)
     /// — nothing here touches the sink. Everything that writes locks this
     /// first.
     pub(crate) manager: Arc<Mutex<crate::render::RenderManager>>,
@@ -64,20 +60,19 @@ pub struct Content {
     /// the content path's width reads and the frame path's geometry cannot
     /// disagree. In tests, a private seeded one.
     pub(crate) size: watch::Receiver<TermSize>,
-    /// Per-stream capabilities, probed once at `TermIO` construction
-    /// (4f-e-a): colour and the reasoning routing read this instead of
-    /// calling `is_terminal()` per site — the probe site left content with
-    /// this step.
+    /// Per-stream capabilities, probed once at `TermIO` construction: colour
+    /// and the reasoning routing read this instead of calling `is_terminal()`
+    /// per site.
     pub(crate) caps: crate::termio::Caps,
-    /// Where reasoning goes — the stream decision (4f-f): `true` picks
+    /// Where reasoning goes — the stream decision: `true` picks
     /// `Stream::Meta` (stderr, the real backends'), so a consumer of
     /// `picocode "q" | cat` can drop it (`2>/dev/null`) or merge it
     /// (`2>&1`) without touching stdout. Picked once, in [`Self::new`]
     /// from the caps; [`Self::commit_reasoning`] hands the pick down as
     /// the `ContentWrite`'s stream, and the hub routes on the token from
     /// there. `AtomicBool` rather than `bool` only because the handle is
-    /// now shared behind an `Arc` (step 3d) and a test pins it to the
-    /// screen for a byte comparison — see [`Self::set_reasoning_on_stderr`].
+    /// shared behind an `Arc` and a test pins it to the screen for a byte
+    /// comparison — see [`Self::set_reasoning_on_stderr`].
     pub(crate) reasoning_on_stderr: AtomicBool,
     /// Incremental GFM markdown parser for the current response (TTY only).
     pub(crate) parser: Mutex<StreamParser>,
@@ -93,14 +88,14 @@ pub struct Content {
     /// `display_tool_call` and read back in `display_tool_result` so the
     /// result can be rendered tool-aware.
     pub(crate) last_tool: Mutex<Option<(String, Value)>>,
-    /// The content boundary/separator state (step 3a): the last declared kind,
+    /// The content boundary/separator state: the last declared kind,
     /// its segment-closed flag, and the held blank rows.
     pub(crate) boundary: ContentBoundary,
     /// Whether a turn is in flight — the bar dot's only state, flipped in
     /// `begin_response`/`end_response`. Owned by content (the path that knows
     /// when a response starts/ends); the frame reads it via a shared handle.
     pub(crate) streaming: Arc<AtomicBool>,
-    /// The formatting span's tripwire (4f-f-b): raised while a write builds
+    /// The formatting span's tripwire: raised while a write builds
     /// its `ContentWrite` outside the hub lock, cleared when the write ends
     /// (`SpanGuard`). The proof that the unlocked span is safe — one writer
     /// per content, `f` never re-entering — is recorded at
@@ -108,7 +103,7 @@ pub struct Content {
     /// held lock used to make it a self-deadlock. Debug-asserted only.
     building: AtomicBool,
     /// The running agent's token-usage store, shared with the turn that writes
-    /// it in place (4h-g part 2). The bar's context figure and `/stat`'s read
+    /// it in place. The bar's context figure and `/stat`'s read
     /// *live* here, so a mid-turn completion's count lands on the next paint
     /// with no push to keep in step. `None` until the agent is built (and again
     /// briefly across a rebuild); the bar then shows no context figure rather
@@ -118,8 +113,8 @@ pub struct Content {
     /// through a shared handle ([`Self::set_usage`]) while the bar's element
     /// reads it concurrently.
     pub(crate) usage: Mutex<Option<Arc<Mutex<crate::agent::SessionUsage>>>>,
-    /// The content seam (impl doc §4): when set, every content verb hands the
-    /// call to this handle and returns without touching the sink — the
+    /// The content seam (design §Content): when set, every content verb hands
+    /// the call to this handle and returns without touching the sink — the
     /// `RecordingOutput` / `QuietOutput` patterns, covered without a live
     /// render stack behind them. `None` in production, where `ConsoleOutput`
     /// holds this `Content` by `Arc` and its own content methods forward here.
@@ -128,8 +123,8 @@ pub struct Content {
 
 impl Content {
     /// Build the content half from its per-process inputs: the terminal
-    /// backend (4f-e — constructed first at setup, so *it* seeds both facts
-    /// content used to gather itself: the caps it probed, and the size watch
+    /// backend (constructed first at setup, so *it* seeds both facts content
+    /// used to gather itself: the caps it probed, and the size watch
     /// it owns). The frame hub is built from the same watch and takes the
     /// `TermIO` under `Draw` — one wiring point, one geometry source; the
     /// renderers start blank at a placeholder width.
@@ -138,7 +133,7 @@ impl Content {
         Self::new_from(term_io, size, show_reasoning)
     }
 
-    /// Point the bar at a running agent's live usage store (4h-g part 2), so
+    /// Point the bar at a running agent's live usage store, so
     /// its context figure is read at render rather than snapshotted at turn
     /// start. Call on the transitions that change who is answering: agent
     /// build/rebuild.
@@ -167,7 +162,7 @@ impl Content {
         show_reasoning: ShowReasoningHandle,
     ) -> Self {
         let caps = term_io.caps();
-        // The hub is born with its geometry and its budget ratio (step 4b):
+        // The hub is born with its geometry and its budget ratio:
         // `configure` is the ratio's home, and this is the one wiring point.
         let manager = Arc::new(Mutex::new(crate::render::RenderManager::new(
             size.clone(),
@@ -202,7 +197,7 @@ impl Content {
     }
 
     /// A `Content` whose content verbs delegate to `tap` instead of rendering
-    /// (impl doc §4's test seam). `RecordingOutput` records the source strings
+    /// (the tap test seam). `RecordingOutput` records the source strings
     /// an assertion compares; `QuietOutput` discards them; neither needs a
     /// render stack or a terminal behind it.
     ///
@@ -233,10 +228,9 @@ impl Content {
     /// The size frames are composed and applied for (ui_draw_v2 §9 #3) — the
     /// watched geometry, floored at 20 columns / 1 row (`plan_apply`
     /// misbehaves under 20 columns; an uninitialized geometry must not get
-    /// there). `frame_size` left `Output` in 4f-c; since 4f-e-a it is also
-    /// the out-of-crate driver's answer (the confirm probe's `dims`, which
-    /// the retired `term_width`/`term_height` free functions used to
-    /// serve), hence `pub`. This handle's receiver is the source, the same
+    /// there). It is also the out-of-crate driver's answer (the confirm
+    /// probe's `dims`), hence `pub`. This handle's receiver is the source, the
+    /// same
     /// channel `RenderManager::new` clones at construction, so a paint's
     /// dims and the manager's own view of the geometry cannot disagree.
     pub fn frame_size(&self) -> (usize, usize) {
@@ -323,7 +317,7 @@ impl Content {
 
     /// Run `f` with this write's bytes collected through the boundary/hold/
     /// wrap/line-clear chain, then hand the result to the hub as a
-    /// [`ContentWrite`] (step 4d, design §Content) — the one way content
+    /// [`ContentWrite`] (design §Content) — the one way content
     /// reaches the screen. For the writers that produce their own bytes —
     /// the streaming markdown renderers, which want a `Write` to feed.
     ///
@@ -334,7 +328,7 @@ impl Content {
     /// satisfies the `Sized` bound that `&mut dyn Write` cannot. `f` is the
     /// *build* and must stay inside `out`: a `write_all` or a
     /// parser/renderer feed, never a content write and never the hub (the
-    /// span below runs unlocked since 4f-f-b; the tripwire asserts this).
+    /// span below runs unlocked; the tripwire asserts this).
     ///
     /// `width` is the width the content is being rendered for; pass the
     /// renderer's own width so a line that wrapped at render time is counted
@@ -373,7 +367,7 @@ impl Content {
     where
         F: FnOnce(&mut dyn io::Write) -> T,
     {
-        // The formatting span runs **unlocked** (4f-f-b; design §Content:
+        // The formatting span runs **unlocked** (design §Content:
         // "formats … before each block — no hub round-trip"): boundary, chain
         // and `f` touch content's own state or a private buffer, and the
         // hand-off at the end takes the hub's lock for exactly the one round
@@ -402,7 +396,7 @@ impl Content {
                 .swap(true, std::sync::atomic::Ordering::Relaxed),
             "content write re-entered (or a second writer started) while a \
              formatting span was open: the build runs outside the hub lock \
-             since 4f-f-b, and only the single-writer + non-reentrancy \
+             and only the single-writer + non-reentrancy \
              proof keeps the boundary state correct\n{}",
             std::backtrace::Backtrace::force_capture()
         );
@@ -455,8 +449,8 @@ impl Content {
         //
         // Captures get the raw bytes — they are assertions against content,
         // not against a screen — tapped at the hand-off below, which is why
-        // the transforms step aside while one is open. Its own short lock
-        // (4f-f-b): capture toggles are same-task with writes (proof above),
+        // the transforms step aside while one is open. Its own short lock:
+        // capture toggles are same-task with writes (proof above),
         // so this one read stands for the span — nothing can open or close a
         // capture between here and the hand-off.
         let capturing = self.manager.lock().unwrap().is_capturing();
@@ -589,7 +583,7 @@ impl Content {
         if buf.is_empty() {
             return r;
         }
-        // The hand-off (step 4d, design §Content/§Render): the block's
+        // The hand-off (design §Content/§Render): the block's
         // bytes, its measured rows and the width it was rendered at —
         // everything the screen choreography needs, and nothing about
         // *what* it is. Content never touches the sink from here on;
@@ -607,11 +601,11 @@ impl Content {
         // writes inside a batch and hands off as `render_batch`, the
         // streaming path as `render_content` — today one body under both
         // names, the batch flag inside deferring the reposition (ui_draw_v2
-        // R5) either way. The guard moved to the hub in 4e; the deferral
-        // stays the shared flag's until the final `render()` round trip
-        // (4f/4h) gives `render_batch` its own end.
+        // R5) either way. The guard belongs to the hub; the deferral stays the
+        // shared flag's until a final `render()` round trip gives
+        // `render_batch` its own end.
         //
-        // The one hub round trip (4f-f-b): lock, route, release — the
+        // The one hub round trip: lock, route, release — the
         // serialization the span used to carry whole is exactly this now.
         {
             let mut mgr = self.manager.lock().unwrap();
@@ -1113,8 +1107,8 @@ impl Content {
         );
     }
 
-    /// One line of non-REPL input — the piped/batch `/`-driver's read (4f-d,
-    /// where the duty left `Output::get_user_input`'s call site). Like every
+    /// One line of non-REPL input — the piped/batch `/`-driver's read. Like
+    /// every
     /// content verb it short-circuits through the tap when one is installed
     /// (quiet's `QuietOutput` answers empty, a test's script answers its
     /// script); without one it writes the `❯ ` prompt through the counter —
@@ -1265,9 +1259,9 @@ impl Content {
     /// Land a rendered reasoning block — the stream decision, made once at
     /// setup (caps: `Meta` when the meta stream carries it), picks between
     /// two routes. `Meta`: the bytes hand off raw as a `ContentWrite`
-    /// (4f-f — the meta sink under the hub, no boundary chain, no line
-    /// clear, no counter: byte-for-byte the stderr bypass the
-    /// `ReasoningSink` died with, and no choreography because stderr
+    /// (the meta sink under the hub, no boundary chain, no line clear, no
+    /// counter: byte-for-byte the stderr bypass it replaced, and no
+    /// choreography because stderr
     /// never moves the screen's cursor). `Main`: the block runs the
     /// chain like any other, under the reasoning kind, so the boundary
     /// after it is drawn as its own.
@@ -1488,9 +1482,9 @@ impl Content {
         self.write_content(block.as_bytes());
     }
 
-    /// Begin capturing everything content hands to the hub (§4: capture is
-    /// content's, tapped at the hand-off — step 4d reads each
-    /// `ContentWrite` exactly as `render()` receives it: content bytes
+    /// Begin capturing everything content hands to the hub (design §Content:
+    /// capture is content's, tapped at the hand-off — each `ContentWrite` is
+    /// read exactly as `render()` receives it: content bytes
     /// only, never frame bytes). With a tap set there is nothing reaching
     /// the hub to capture, so the tap's own capture policy answers.
     pub(crate) fn begin_capture(&self) {
@@ -1515,7 +1509,7 @@ impl Content {
 mod tests {
     use super::*;
 
-    /// The content seam (impl doc §4): a tapped `Content` hands its verbs to
+    /// The content seam (design §Content): a tapped `Content` hands its verbs to
     /// the seam and never reaches its own sink — the `RecordingOutput` pattern,
     /// covered without a render stack behind it.
     #[test]

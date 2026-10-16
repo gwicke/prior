@@ -1,5 +1,5 @@
 //! Text formatting: word wrap, the discrete-message block, and the start-up
-//! greeter header (step 3b of the output-drawing refactor).
+//! greeter header.
 
 use console::{style, StyledObject};
 

@@ -1,9 +1,9 @@
 //! The two readouts the user sees without asking the model anything: the
 //! transient status line under each content block, and the `/stat` overlay.
 //!
-//! Both are pure. [`status_text`] shapes a [`BarStatus`] push (raw facts) into
+//! Both are pure. [`status_text`] shapes a [`BarStatus`] (raw facts) into
 //! the pair `ui::bar::status_bar` fits — both halves run inside the bar's own
-//! render (step 4f-a); [`session_stats_lines`] takes the session's stored
+//! render; [`session_stats_lines`] takes the session's stored
 //! facts and returns lines. Neither reads a store or holds state — the
 //! caller resolves the context window ([`resolved_context_limit`]) and the
 //! session metadata and hands them over — which is what makes them testable
@@ -47,7 +47,7 @@ pub struct SessionStatsInfo {
     pub user_message_count: usize,
 }
 
-/// What the status bar shows, as **raw data**, assembled at render (4h-g4
+/// What the status bar shows, as **raw data**, assembled at render
 /// part 1; design §UI: "the bar's held state is raw data, formatted by the
 /// bar").
 ///
@@ -111,7 +111,7 @@ pub fn resolved_context_limit(app_state: &crate::app_state::AppState) -> Option<
         .filter(|max| *max > 0)
 }
 
-/// Assemble the bar's raw data from the **stores** (4h-g4 part 1): the model
+/// Assemble the bar's raw data from the **stores**: the model
 /// in force, the thinking level, the resolved context window, and the session
 /// identity — all read live off `AppState`'s sync accessors at render. The
 /// bar element calls this each paint, so a mid-turn `/reasoning` or `/model`
@@ -137,7 +137,7 @@ pub fn bar_status(app_state: &crate::app_state::AppState) -> BarStatus {
 /// session, and the model group as separate fields. [`status_text`] below
 /// builds this from the raw [`BarStatus`]; the fit (`ui::bar::status_bar`)
 /// turns it into a row at a width. Both halves run inside the bar's own
-/// render (step 4f-a).
+/// render.
 ///
 /// **Data, not drawing, and deliberately not the rendered bar.** Nothing here
 /// needs to know how wide the terminal is, which is what lets the two halves
@@ -160,7 +160,7 @@ pub struct StatusText {
 /// `status_bar` fits — the name (session name, else the opening
 /// message's preview) and the model group in drop order.
 ///
-/// Run by the bar's own render (step 4f-a), which is why it takes the raw
+/// Run by the bar's own render, which is why it takes the raw
 /// data by reference: nothing here is width-dependent, and the fit that is
 /// lives on the other side. Built from the same pieces `session_stats_lines`
 /// uses — the caller for the resolved context window, its own token count for
@@ -169,7 +169,7 @@ pub struct StatusText {
 /// prompt-side bar re-reads it every cycle, and `plan_rebuild` compares it so
 /// the mid-turn agent is rebuilt with the new one.
 ///
-/// `context_tokens` is a parameter, not a field (4h-g part 2): it is the one
+/// `context_tokens` is a parameter, not a field: it is the one
 /// figure that moves mid-turn, so it comes off the agent's live usage store
 /// rather than the pushed `status`, which no one re-pushes per completion.
 /// `0` means "not known yet" and drops the figure rather than showing a zero —
@@ -250,7 +250,7 @@ mod status_bar_tests {
     use crate::ui::bar::BAR_SEPARATOR as SEPARATOR;
 
     /// The whole bar: the raw push shaped and fitted — exactly the two calls
-    /// the bar's own render makes (step 4f-a), spelled out here so the tests
+    /// the bar's own render makes, spelled out here so the tests
     /// can pass borrowed literals where the store carries owned data.
     ///
     /// Every test here is really about the *pair* — `status_text` builds the
@@ -271,9 +271,9 @@ mod status_bar_tests {
             first_message: first_message.map(str::to_string),
             ..m
         };
-        // `context_tokens` is the one live fact (4h-g part 2), so it arrives
+        // `context_tokens` is the one live fact, so it arrives
         // alongside the pushed facts — destructured here exactly as the bar's
-        // own render pulls it from the live store beside `Content::bar`.
+        // own render pulls it from the live usage store.
         crate::ui::bar::status_bar(&status_text(&status, context_tokens), width, streaming)
     }
 
@@ -283,8 +283,8 @@ mod status_bar_tests {
     /// be noise. The names are still checked, because the layout test is about
     /// the order they render in.
     ///
-    /// `context_tokens` rides *beside* the struct rather than inside it (4h-g
-    /// part 2): it is the one fact the bar no longer pushes, so the tests pass
+    /// `context_tokens` rides *beside* the struct rather than inside it:
+    /// it is the one fact the bar no longer pushes, so the tests pass
     /// it the same way production supplies it — alongside the pushed facts, not
     /// as one of them. Returning the pair keeps the twenty-odd `model(...)`
     /// call sites unchanged.
@@ -789,8 +789,8 @@ fn compact_tokens(n: u64) -> String {
 /// enforced, and these say what was actually sent and what the resolved
 /// context window is — the two facts needed to see why.
 ///
-/// Both token figures are read **live** off the agent's shared usage store
-/// (4h-g part 2): `usage` for the session/cost/cache totals, `context_tokens`
+/// Both token figures are read **live** off the agent's shared usage store:
+/// `usage` for the session/cost/cache totals, `context_tokens`
 /// for the estimated next-turn context — so `/stat` opened mid-turn is current,
 /// not a loop-cycle snapshot.
 pub fn session_stats_lines(

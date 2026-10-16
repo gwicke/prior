@@ -289,7 +289,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let content = Arc::new(picocode::Content::with_tap(out.clone()));
         (out, content)
     } else {
-        // The terminal backend is constructed **first** (4f-e-a): it probes
+        // The terminal backend is constructed **first**: it probes
         // the caps, owns the size watch, and moves into `Content::new` →
         // `Draw`. Tty iff the input is an interactive terminal — the same
         // condition `Interactive::new` derives `repl` from (a Tty whose

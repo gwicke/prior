@@ -429,7 +429,7 @@ use crate::wrap::split_to_width;
 /// or two spaces. The layout width a painter's content is split at is
 /// `term_w - MARKER` — the convention producers lay rows out under (see
 /// [`RenderPlan::rows`]) and what the view's elements lay out at inside
-/// `render(h, w)` (step 4h-d).
+/// `render(h, w)`.
 pub(crate) const MARKER: usize = 2;
 
 /// How one painted overlay row is styled, and what the marker on its first

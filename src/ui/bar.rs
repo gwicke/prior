@@ -2,14 +2,13 @@
 //! row (design `doc/261003_output_drawing_refactor.md` §UI — "the bar's held
 //! state is raw data, formatted by the bar").
 //!
-//! Moved here from `output.rs` in step 4h-c: the bar is UI chrome, so its
-//! element lives with the rest of the UI layer's elements. The *data* half of
-//! the seam stays on the agent side — [`Content::bar`] carries the facts and
-//! [`crate::agent::status::status_text`] shapes them into a [`StatusText`];
-//! both halves of the *drawing* (the shaping's fit and the dot) run in the
-//! element's own render, below.
+//! The bar is UI chrome: its element lives with the UI layer's elements. The
+//! *data* half of the seam stays on the agent side —
+//! [`crate::agent::status::status_text`] shapes the raw facts into a
+//! [`StatusText`]; both halves of the *drawing* (the shaping's fit and the
+//! dot) run in the element's own render, below.
 //!
-//! Every fact is **live** (4h-g4): the model/thinking and the session identity
+//! Every fact is **live**: the model/thinking and the session identity
 //! come off `AppState`'s sync accessors at render, and the context figure off
 //! the agent's shared usage store, written in place by the turn. So a mid-turn
 //! `/reasoning` or `/model` commit, or a completion's count, is current on the
@@ -83,8 +82,8 @@ fn dot_cell(width: usize) -> (&'static str, &'static str, usize) {
 ///
 /// Deliberately **one** function: "fit the group, then style it" is one
 /// decision, and a second rendering of it would be a place for the two to
-/// drift apart. Its only production caller is the bar's own render (step
-/// 4f-a); the tests beside `agent::status` are the other readers.
+/// drift apart. Its only production caller is the bar's own render; the
+/// tests beside `agent::status` are the other readers.
 ///
 /// One pipe, and single spaces between the model fields. The labels went
 /// ("ctx 34% · 78k" → "34% 78k") because on a 120-column bar they were most of
@@ -168,7 +167,7 @@ pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> St
 }
 
 /// The area's status row, as an element that resolves **when it is drawn** —
-/// both halves of the drawing (step 4f-a, design §UI: the bar formats itself
+/// both halves of the drawing (design §UI: the bar formats itself
 /// from raw data).
 ///
 /// `Element::lines` would bake `status_bar(...)`'s output into the element at
@@ -187,7 +186,7 @@ pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> St
 /// no output in sight, so §3.1's unit-testability is intact rather than traded
 /// away.
 struct StatusItem {
-    /// The **stores** the bar reads at render (4h-g4): the model in force, the
+    /// The **stores** the bar reads at render: the model in force, the
     /// thinking level, the context window and the session identity, all off
     /// `AppState`'s sync accessors. Read here, not pushed, so a mid-turn
     /// config commit (which lands on `AppState`) shows at the next paint.
@@ -220,18 +219,18 @@ impl RenderElement for StatusItem {
     }
 
     fn render(&self, _h: usize, term_w: usize) -> Rendered {
-        // The bar formats itself (step 4f-a): the held state is facts, and
+        // The bar formats itself: the held state is facts, and
         // both halves of the drawing run here — the shaping (name fallback,
         // field list, drop order) and the fit at the width being rendered
         // for. Neither can be applied without the other, so neither left with
         // the data.
-        // Every fact is live (4h-g4): the raw data is assembled from the
+        // Every fact is live: the raw data is assembled from the
         // stores now — the model/thinking/window and identity off `AppState`,
         // the context figure off the usage store — so a mid-turn config commit
         // or completion lands without a push.
         let status = bar_status(&self.app_state);
         let text = status_text(&status, self.context_tokens());
-        // The bar is always present (4h-g part 2): no `is_off` gate. With a
+        // The bar is always present: no `is_off` gate. With a
         // live pull the bar always knows how to render itself, so an empty
         // status still paints its row (dot + padding) rather than vanishing —
         // the row is the frame's furniture, and its content is whatever the

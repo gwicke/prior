@@ -36,8 +36,7 @@ async fn main() {
         TermIO::plain(),
         picocode::settings::default_show_reasoning_handle(),
     );
-    // The frame dims `Output::frame_size` used to answer (4f-c), now the
-    // content handle's `frame_size` (4f-e-a retired the free functions):
+    // The frame dims come from the content handle's `frame_size`:
     // the watched geometry, read fresh per paint — the same watch
     // `ConsoleOutput`'s answer came from, so the probe composes exactly
     // what it did before.
@@ -112,7 +111,7 @@ async fn main() {
             // nothing, and applying it is the erase (dropping the element is
             // the clear). Configure-then-apply, the same two-step
             // `confirm::paint` above runs — `configure` is the membership
-            // verb since 4h-g, so a paint composes nothing.
+            // verb, so a paint composes nothing.
             let hub = out.hub();
             let mut hub = hub.lock().unwrap();
             hub.configure(picocode::render::FRAME_MAX_ROW_RATIO, Vec::new());

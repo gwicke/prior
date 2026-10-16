@@ -33,7 +33,7 @@ pub enum EditorMode {
 /// 1. Suspend (§Render → `TermIO::suspend`): park the sole stdin owner —
 ///    the editor child's keystrokes arrive on stdin, so an unpaused reader
 ///    would swallow them — and drop raw mode. Nesting-safe inside TermIO
-///    (4f-e-c folded this window's pause in; an outer holder's pause — the
+///    (an outer holder's pause — the
 ///    compaction window — outlives it).
 /// 2. Run `$EDITOR` on a tempfile (foreground child with inherited stdio),
 ///    then resume: raw mode back, reader released.
@@ -46,7 +46,7 @@ pub enum EditorMode {
 /// Blocking by design: while the editor owns the tty nothing else may write
 /// to it, so there is nothing for a concurrent task to do (§7 of the plan).
 pub(crate) fn run_editor(content: &Content, current: &str, mode: EditorMode) -> io::Result<String> {
-    // One handle since 4f-d: the content handle's manager is the design's
+    // One handle: the content handle's manager is the design's
     // front door for suspend/resume (§Render) and the owner of the DSR
     // re-anchor (`cursor_row`). Without a mode guard — Plain, quiet, test
     // states — there is no tty to hand over, so this reports `Unsupported`,

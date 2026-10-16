@@ -42,7 +42,7 @@ pub struct SessionUsage {
     /// size of the context that would be re-sent on the next turn.
     pub last_input_tokens: u64,
     /// The **estimated** input size, recorded by the loop and the turn before
-    /// any completion has reported (4h-g4 part 3). An estimate is kept as an
+    /// any completion has reported. An estimate is kept as an
     /// estimate: it never impersonates a provider report in
     /// [`Self::last_input_tokens`]. [`Self::context_figure`] is the one read
     /// that falls back to it.
@@ -68,7 +68,7 @@ pub struct SessionUsage {
 impl SessionUsage {
     /// The context figure the bar and `/stat` show: the provider's own count of
     /// what it last sent when one has reported, else the loop's/turn's
-    /// estimate (4h-g4 part 3). One read, so the two surfaces cannot disagree
+    /// estimate. One read, so the two surfaces cannot disagree
     /// about which number stands — and so the estimate never has to pretend to
     /// be a provider report to be seen.
     pub fn context_figure(&self) -> u64 {
@@ -188,10 +188,9 @@ impl TurnPersistence {
 
 pub struct CodeAgent {
     agent: Agent,
-    /// Content (step 3d): what the turn's `display_*` / `stream_*` /
-    /// `begin|end_response` calls go through. Since 4f-d it is also the
-    /// turn's whole frame/input seam — the `output` copy this struct used
-    /// to carry left with the dispatcher's last duty (`$EDITOR`).
+    /// Content: what the turn's `display_*` / `stream_*` /
+    /// `begin|end_response` calls go through, and the turn's whole frame/input
+    /// seam.
     content: Arc<crate::content::Content>,
     tool_call_limit: usize,
     provider: String,
@@ -226,7 +225,7 @@ pub struct CodeAgent {
     /// (see [`SessionUsage`]). Backs `/stat` and is the measurement primitive
     /// compaction will rely on (doc/compaction.md §2.7).
     ///
-    /// Shared, not owned (4h-g part 2): the bar element and `/stat` clone this
+    /// Shared, not owned: the bar element and `/stat` clone this
     /// `Arc` and read it at render, so a mid-turn completion's
     /// `last_input_tokens` reaches the status line the moment the next paint
     /// runs — no `set_status` push to keep in step, and no stale context
@@ -718,7 +717,7 @@ impl CodeAgent {
             usage: Arc::new(Mutex::new(SessionUsage::default())),
         }
         // Wire the bar to this agent's usage store before it exists as a
-        // handle anywhere else (4h-g part 2): the constructor is the moment
+        // handle anywhere else: the constructor is the moment
         // the agent and its content are first paired, and the bar has to read
         // the turn's in-place writes from its very first paint.
         .tap_content()
@@ -732,7 +731,7 @@ impl CodeAgent {
     }
 
     /// The shared usage store — the bar element's and `/stat`'s live source
-    /// (4h-g part 2). Cloned out, never locked across a call: the turn writes
+    /// Cloned out, never locked across a call: the turn writes
     /// it in place, so a reader always sees the latest completion's figures.
     pub fn usage_handle(&self) -> Arc<Mutex<SessionUsage>> {
         self.usage.clone()

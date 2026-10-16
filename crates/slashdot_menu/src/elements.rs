@@ -14,7 +14,7 @@
 //! Nothing here sees a painted row before the width is known, so there is
 //! no compose-width `PaintedSection` snapshot on either path.
 //!
-//! Since 4h-e a host that keeps a menu open mints an [`ElementSet`] — the
+//! A host that keeps a menu open mints an [`ElementSet`] — the
 //! elements plus the [`Selection`] figures a keystroke moves — and a cursor
 //! move updates the figures **in place** through the shared handle, without
 //! re-minting (design §RenderElement stack: "a menu open constructs its
@@ -102,7 +102,7 @@ pub(crate) fn window_keeps(heights: &[usize], focus: usize, budget: usize) -> (u
 /// lines above the table (the node's `header()` output tracks the focused
 /// row, so it moves with the cursor too). Shared between the host, which
 /// writes it on each engine plan, and the elements, which read it inside
-/// `render` — a selection move is a write, not a rebuild (step 4h-e).
+/// `render` — a selection move is a write, not a rebuild.
 #[derive(Default)]
 struct Selection {
     selected: Option<usize>,
@@ -444,7 +444,7 @@ impl ElementSet {
     /// set was minted from — a cursor keystroke, no rebuild; rows that
     /// actually changed (filter, new plan) re-mint the set.
     ///
-    /// A width change is *not* a rebuild: the elements lay themselves out /// at the render width (4h-d), so the same elements re-wrap for the /// new width — only the host's laid-out snapshot ([`RenderPlan::rows`]) /// is refreshed here for cursor math.
+    /// A width change is *not* a rebuild: the elements lay themselves out /// at the render width, so the same elements re-wrap for the /// new width — only the host's laid-out snapshot ([`RenderPlan::rows`]) /// is refreshed here for cursor math.
     pub fn update(&mut self, plan: &RenderPlan) -> Update {
         if self.same_panel(plan) {
             let mut sel = self.selection.lock().unwrap();
@@ -505,7 +505,7 @@ impl RenderPlan {
 
     /// The element set for an open panel: the elements [`Self::elements`]
     /// returns, plus the shared selection handle a keystroke moves in
-    /// place (step 4h-e).
+    /// place.
     pub fn element_set(&self, row_min: usize) -> ElementSet {
         let selection = Arc::new(Mutex::new(Selection {
             selected: self.selected,
@@ -957,7 +957,7 @@ mod tests {
         assert_eq!(ext.might, 2, "unwrapped: one row per logical row");
     }
 
-    // --- ElementSet::update (step 4h-e) ------------------------------------
+    // --- ElementSet::update ------------------------------------
 
     /// A cursor keystroke moves the selection figures through the shared /// handle: the *same* elements (clones taken before the move) paint /// the new cursor and the new detail — no rebuild.
     #[test]

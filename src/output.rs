@@ -168,7 +168,7 @@ pub trait Output: Send + Sync {
     );
     /// Begin capturing what the content path hands to the hub, into a byte
     /// buffer. `ConsoleOutput` taps the `ContentWrite` hand-off — content
-    /// bytes only, never frame bytes (step 4d, design §Content: an
+    /// bytes only, never frame bytes (design §Content: an
     /// assertion against content, not against a screen). Must be paired
     /// with a subsequent call to [`end_capture`] which returns the bytes.
     fn begin_capture(&self) {}
@@ -195,12 +195,12 @@ pub trait Output: Send + Sync {
         self.display_plain(line);
         self.display_separator();
     }
-    // `cursor_row` died in 4g-a: the re-anchor verbs' home is the manager
+    // The re-anchor verb's home is the manager
     // (`RenderManager::cursor_row`, the DSR query + the cache sync) and every
     // caller names it directly — a trait forward had no caller left, and its
     // default was the last live `crossterm::terminal::size()` in this file.
 
-    // The frame *size* verbs left with 4f-c: the watched size (the dims a
+    // The watched size (the dims a
     // frame is composed and applied for) is `Content::frame_size`'s — the
     // content handle carries the same receiver the manager clones; the
     // applied size (what resize detection compares against) is
@@ -409,24 +409,22 @@ impl Output for LogOutput {
 }
 
 /// The merged output — the agent's `Arc<dyn Output>` — whose content half is
-/// now the [`Content`] handle (step 3c): `content` owns the boundary, the
+/// now the [`Content`] handle: `content` owns the boundary, the
 /// width watch and the streaming renderers, and `Output`'s content methods
-/// forward through it. The size verbs re-homed with 4f-c (frame dims to
-/// `Content::frame_size`, the applied size to `RenderManager::painted_size`);
-/// `cursor_row`'s forward died with the verb in 4g-a. What remains here is
-/// the batch guard and `draw_frame` — the test drivers' edge into the hub's
-/// pipeline (4b/4c).
+/// forward through it. The watched size is `Content::frame_size`, the applied
+/// size `RenderManager::painted_size`; `cursor_row` is the manager's. What
+/// remains here is the batch guard and `draw_frame` — the test drivers' edge
+/// into the hub's pipeline.
 pub struct ConsoleOutput {
-    /// The content owner (steps 3c–3d), shared by `Arc` with
-    /// `AgentConfig.content`, so the config's frame handle and its content
-    /// handle are one state. `Output`'s content methods forward through it;
-    /// the drawing edge stays reachable through its `manager` (step 4c).
+    /// The content owner, shared by `Arc` with `AgentConfig.content`, so the
+    /// config's frame handle and its content handle are one state. `Output`'s
+    /// content methods forward through it; the drawing edge stays reachable
+    /// through its `manager`.
     pub(crate) content: Arc<Content>,
 }
 
-// `term_width`/`term_height` (the free functions over the process-wide size
-// watch) died in 4f-e-a with that watch: every caller now reads a handle it
-// already holds — `Content::width`/`height`/`frame_size` (floors unchanged:
+// Every caller reads a width/height handle it already holds —
+// `Content::width`/`height`/`frame_size` (floors unchanged:
 // 20 columns, 1 row), reached through the content handle or, in the REPL
 // key paths, the prompt session's cloned receiver.
 
@@ -590,7 +588,7 @@ src/x.rs:9
 }
 
 impl ConsoleOutput {
-    /// The production constructor: the terminal backend (4f-e-a) moves in
+    /// The production constructor: the terminal backend moves in
     /// and seeds everything per-process — the caps it probed, the size watch
     /// content and the manager read, the `Draw` sink — so `TermIO` is
     /// constructed first, in the caller (`main`).
@@ -647,7 +645,7 @@ impl Default for ConsoleOutput {
 }
 
 impl ConsoleOutput {
-    /// The frame hub behind this output (step 4f-b): what the paint path
+    /// The frame hub behind this output: what the paint path
     /// composes and renders through. Out-of-crate drivers (the confirm
     /// probe) reach it here; the in-crate path goes through
     /// `Content::manager`.
@@ -667,7 +665,7 @@ impl ConsoleOutput {
 impl Output for ConsoleOutput {
     fn begin_batch(&self) -> BatchGuard<'_> {
         // The mechanics (flag, debug assert, the deferred reposition) live on
-        // the hub (step 4e); only the guard, which has to name an `Output`
+        // the hub; only the guard, which has to name an `Output`
         // for its drop, is this layer's.
         if self.content.manager.lock().unwrap().begin_batch() {
             BatchGuard { out: Some(self) }
@@ -712,7 +710,7 @@ impl Output for ConsoleOutput {
         policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
-        // Through the hub, not straight to `Draw` (step 4e): a frame no
+        // Through the hub, not straight to `Draw`: a frame no
         // composition produced clears the hub's recipe, so a content write
         // must not re-emit an area that is no longer on screen.
         self.content
@@ -768,7 +766,7 @@ impl Output for ConsoleOutput {
     }
 
     fn get_user_input(&self) -> String {
-        // The duty lives on `Content` since 4f-d (the prompt is a content
+        // The duty lives on `Content` (the prompt is a content
         // write; the answer goes through the §4 tap when one is installed);
         // this is the trait-facing forward.
         self.content.get_user_input()
@@ -857,7 +855,7 @@ mod tests {
     ///
     /// An `AppState` whose bar carries exactly `name` as the session label, for
     /// the marker the painting tests look for on screen. The bar reads its
-    /// facts off `AppState` now (4h-g4), so the tests hand it one rather than
+    /// facts off `AppState`, so the tests hand it one rather than
     /// pushing a status; the model is a fixed unknown so no window shows and
     /// the name renders verbatim between the dot and the padding.
     ///
@@ -1019,7 +1017,7 @@ mod tests {
         let _ = out.end_capture();
     }
 
-    /// The bar is **always present** (4h-g part 2): no `is_off` gate, so the
+    /// The bar is **always present**: no `is_off` gate, so the
     /// membership is the same shape whether or not the status has anything to
     /// say. The gate was an artifact of the old push — it protected against a
     /// stale/absent pushed row. With a live pull the bar always knows how to
@@ -1027,7 +1025,7 @@ mod tests {
     #[test]
     fn compose_area_keeps_the_bar_present_even_with_nothing_to_say() {
         let (out, _reasoning) = capturing_output(60);
-        // The bar is always present (4h-g): gap, then the bar row — whether or
+        // The bar is always present: gap, then the bar row — whether or
         // not the stores have anything to say. There is no "off" state to
         // test; an unnamed, window-less session still reserves its row.
         assert_eq!(
@@ -1038,13 +1036,13 @@ mod tests {
     }
 
     /// The context figure is **pulled live** off the agent's shared usage store
-    /// (4h-g part 2), not pushed into the status. Bump the store mid-turn and
+    /// not pushed into the status. Bump the store mid-turn and
     /// the next compose shows the new number with no push — which is exactly
     /// what the old `set_status` snapshot could not do (it was frozen at turn
     /// start until the next push). A push-based bar would fail this: the store
     /// moves, the pushed facts do not, and the figure follows the store.
     ///
-    /// Since 4h-g4 the figure goes through `context_figure`, so an estimate
+    /// The figure goes through `context_figure`, so an estimate
     /// stands in before any completion reports — set it and the bar shows it
     /// just the same, then the provider's count wins.
     #[test]
@@ -1098,10 +1096,10 @@ mod tests {
         (out, reasoning)
     }
 
-    /// The bar holds **stores**, not a snapshot (4h-g4 part 1): a mid-turn
+    /// The bar holds **stores**, not a snapshot: a mid-turn
     /// `/reasoning` commit lands on `AppState` (`settle`), and the bar — which
     /// reads the level off `AppState` at render — shows the new level at the
-    /// next paint with no push. This is the staleness the 4h-g live context
+    /// next paint with no push. This is the staleness the live context
     /// pull did not cover: a push-based bar would keep the old level until the
     /// turn ended (the running turn keeps its `live_params`).
     #[test]
@@ -1135,7 +1133,7 @@ mod tests {
         );
     }
 
-    /// The bar's label comes off `AppState` (4h-g4 part 2): the opening message
+    /// The bar's label comes off `AppState`: the opening message
     /// stands in for an unnamed session, and the submit path's
     /// `set_first_message_if_unset` fills it before the branch has it.
     #[test]
@@ -1190,7 +1188,7 @@ mod tests {
     }
 
     /// A shared editor for a test — the handle `compose_frame`/`paint_prompt`
-    /// take (4h-f), seeded through a scoped lock.
+    /// take, seeded through a scoped lock.
     fn shared_editor(
         build: impl FnOnce(&mut crate::repl::LineEditor),
     ) -> Arc<Mutex<crate::repl::LineEditor>> {
@@ -1225,12 +1223,10 @@ mod tests {
     }
 
     /// Swap `out`'s byte edge for a recording `TermIO` and return the handle
-    /// a test reads the bytes back through (4f-e-b: `recording()` took the
-    /// seam wholesale — the writer field this used to swap is gone). The
-    /// byte-edge seam for tests that need *frame* bytes: capture taps the
-    /// content hand-off only (step 4d, design §Content) — frame bytes can
-    /// never be caught — so a test asserting on what reached the terminal
-    /// reads the sink, where "the sink" is now `TermIO`'s recording
+    /// a test reads the bytes back through. The byte-edge seam for tests that
+    /// need *frame* bytes: capture taps the content hand-off only
+    /// (design §Content) — frame bytes can never be caught — so a test
+    /// asserting on what reached the terminal reads `TermIO`'s recording
     /// backend under the manager's `Draw`.
     fn record_bytes(out: &ConsoleOutput) -> Recording {
         out.content.manager.lock().unwrap().draw().term_io = crate::termio::TermIO::recording();
@@ -1254,7 +1250,7 @@ mod tests {
                 .recorded(crate::termio::Stream::Main)
         }
 
-        /// The meta stream — the diverted-reasoning edge (4f-f).
+        /// The meta stream — the diverted-reasoning edge.
         fn meta(&self) -> Vec<u8> {
             self.0
                 .manager
@@ -1685,7 +1681,7 @@ mod tests {
         );
     }
 
-    /// The meta sink under the hub (4f-f): a diverted reasoning block rides
+    /// The meta sink under the hub: a diverted reasoning block rides
     /// the stream token down to `TermIO` — recorded on the meta edge,
     /// absent from main. Main's emptiness is the choreography pin: the
     /// consume walk and reposition of `put_content`'s main route would put
@@ -2698,7 +2694,7 @@ mod tests {
         assert_eq!(cap, expect, "captured bytes are the raw content");
     }
 
-    /// Capture taps the content hand-off, never the sink (step 4d, design
+    /// Capture taps the content hand-off, never the sink (design
     /// §Content): the block's bytes stop at the tap, while the frame — its
     /// apply, the consume's walk, the reposition — keeps flowing to the
     /// screen. The narrowing the writer swap retired, pinned: a capture
@@ -2735,7 +2731,7 @@ mod tests {
         );
     }
 
-    /// The paint path's pipeline (compose + `manager.render`, step 4f-b) is the
+    /// The paint path's pipeline (compose + `manager.render`) is the
     /// hand-rolled path, not a new one: it must paint **byte-identically** to
     /// `draw_frame` fed exactly what it composes.
     ///

@@ -6,7 +6,7 @@
 //! into the exact escape bytes and the post-apply cache state — bytes out,
 //! cache in/out — so the REPL, the dialogs and the vt100 tests all exercise
 //! the *same* sequence. [`Draw`] is the impure edge: it owns the `TermIO`
-//! sink (4f-e-b), and is the only thing that writes. Newlines are emitted
+//! sink, and is the only thing that writes. Newlines are emitted
 //! bare — the tty's OPOST/ONLCR maps them to CRLF (the same convention as
 //! the REPL's redraw) — so any harness that bypasses the tty must do that
 //! mapping.
@@ -689,34 +689,32 @@ fn erase_down(s: &mut String, h: usize) {
     }
 }
 
-// The DSR query moved to `crate::termio` (the sole stdin owner) in step 2
-// commit C: it pauses the reader around the query so the reply cannot be
-// swallowed. `Draw::reanchor_to_cursor` now takes the answer as a parameter.
+// The DSR query lives in `crate::termio` (the sole stdin owner): it pauses
+// the reader around the query so the reply cannot be swallowed.
+// `Draw::reanchor_to_cursor` takes the answer as a parameter.
 
 // --- the live screen --------------------------------------------------------
 
 /// The live screen: the byte sink, and what is believed to be on it.
 ///
-/// Plain fields, no locks of its own (step 4c): `Draw` is reached only
+/// Plain fields, no locks of its own: `Draw` is reached only
 /// through `RenderManager`'s `Mutex`, which is what serializes byte emission
 /// with the bookkeeping advance — the old writer-then-cache lock order,
 /// encapsulated one layer up. Methods that write or advance therefore take
 /// `&mut self`.
 pub struct Draw {
-    /// The terminal backend — the design's `Draw { term_io, cache }`, owned
-    /// here since 4f-e. Every byte leaves through [`Self::write_bytes`]:
-    /// the mode guard, the size watch, the caps *and* the sink all reach
-    /// the layers above through this one field. Content bytes never name it
-    /// directly — they arrive through the manager's `ContentWrite` hand-off
-    /// (step 4d).
+    /// The terminal backend — the design's `Draw { term_io, cache }`. Every
+    /// byte leaves through [`Self::write_bytes`]: the mode guard, the size
+    /// watch, the caps *and* the sink all reach the layers above through this
+    /// one field. Content bytes never name it directly — they arrive through
+    /// the manager's `ContentWrite` hand-off.
     pub term_io: TermIO,
-    /// The size watch (step 2 commit A): the latest `TermSize`, without a
+    /// The size watch: the latest `TermSize`, without a
     /// per-call terminal query. The same channel the manager holds — a
     /// subscribed receiver, so a test's private watch pins both.
     pub size: watch::Receiver<TermSize>,
     /// Live-screen bookkeeping (plan §4.1): tracked cursor row, clear floor,
-    /// last applied frame. (The content-path state moved to `content/` in
-    /// step 3a of the output-drawing refactor.)
+    /// last applied frame. (The content-path state lives in `content/`.)
     pub cache: DrawCache,
 }
 
@@ -730,7 +728,7 @@ impl Draw {
         }
     }
 
-    /// The one choke point for byte emission (4f-e-b): the frame planner,
+    /// The one choke point for byte emission: the frame planner,
     /// the re-anchor and the hub's content choreography all land here, and
     /// this goes out `TermIO`'s main sink — written and flushed per call (a
     /// frame must be on screen before the next one is planned; the sink
@@ -742,7 +740,7 @@ impl Draw {
         let _ = self.term_io.write(crate::termio::Stream::Main, bytes);
     }
 
-    /// The meta sink's bytes (4f-f): `TermIO`'s `Stream::Meta`, no
+    /// The meta sink's bytes: `TermIO`'s `Stream::Meta`, no
     /// bookkeeping — a stderr write does not move the screen's cursor, so
     /// there is no consume, row count or cache note to keep for it, and
     /// the byte edge records the two streams apart (design §TermIO: one
@@ -761,7 +759,7 @@ impl Draw {
         self.term_io.handles()
     }
 
-    /// The full `TermIO::suspend` — reader parked, raw mode off (4f-e-c).
+    /// The full `TermIO::suspend` — reader parked, raw mode off.
     /// Idempotent; a no-op on Plain.
     pub fn suspend(&self) {
         let _ = self.term_io.suspend();
@@ -786,7 +784,7 @@ impl Draw {
     }
 
     /// Probe + publish the live terminal size (the prompt loop's loop-top
-    /// refresh, since 4f-e-a under TermIO's roof).
+    /// refresh, under TermIO's roof).
     pub fn probe_size(&self) -> TermSize {
         self.term_io.probe_size()
     }
@@ -835,7 +833,7 @@ impl Draw {
     ///
     /// `row` is the DSR answer the caller already obtained (via
     /// `termio::query_cursor_row`, which pauses the sole stdin owner around the
-    /// query — step 2 commit C). Passing `None` (a terminal that did not answer)
+    /// query). Passing `None` (a terminal that did not answer)
     /// is "no new information": `reanchor` invalidates only on disagreement (a
     /// foreign cursor, a reflow), never on a silent terminal (ui_draw_261001).
     ///

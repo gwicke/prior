@@ -25,8 +25,7 @@ use crate::slashdot_menu::node_impl::{
 /// Render context for driving a node's own `header()` from `edit()` — the
 /// engine's `RenderContext` is not passed through `edit()`.
 ///
-/// Width comes off the state's content handle (4f-e-a's replacement for the
-/// `output::term_width()` free function): a real geometry source, not a
+/// Width comes off the state's content handle: a real geometry source, not a
 /// process-wide read, so a caller's width and the frames it paints share one
 /// watch.
 pub(crate) fn header_ctx(app_state: &AppState) -> RenderContext {

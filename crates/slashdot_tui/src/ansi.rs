@@ -9,7 +9,7 @@
 //! to whatever writer sits beneath them, and the *policy* of when to stack
 //! which — the boundary rule, the hold accounting — stays with that caller.
 //!
-//! Mechanical extraction from `output.rs` (output-drawing refactor step 1).
+//! Extracted from `output.rs`.
 
 use std::io;
 
@@ -371,7 +371,7 @@ impl<W: io::Write + ?Sized> io::Write for HoldTrailing<'_, W> {
 /// Visible width of `s`, ignoring ANSI SGR escapes (so styled cells size
 /// correctly). Falls back to width 1 for control/ambiguous chars.
 ///
-/// Moved here from `slashdot_menu::table` with the crate split (4h-a): the
+/// Moved here from `slashdot_menu::table`: the
 /// frame layers measure rows with it (`pad_row`, `el_if_short`) and the menu
 /// measures cells with it — one answer, below both.
 pub fn display_width(s: &str) -> usize {

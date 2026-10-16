@@ -61,11 +61,10 @@ pub struct AgentConfig {
     pub provider: String,
     pub model: String,
     /// The frame + input seam — `set_status` / `frame_size` / `paint` /
-    /// `confirm_default` and, in the REPL, `get_user_input`. Step 4 moves it to
-    /// `RenderManager`; the target `AgentConfig` (impl doc §4) drops it. Content
-    /// calls live on [`Self::content`] as of step 3d.
+    /// `confirm_default` and, in the REPL, `get_user_input`. The drawing
+    /// refactor drops it; content calls live on [`Self::content`].
     pub output: Arc<dyn Output>,
-    /// The content handle (step 3d): every `display_*` / `stream_*` /
+    /// The content handle: every `display_*` / `stream_*` /
     /// `begin|end_response` call goes here. In production it is the same
     /// `Content` `ConsoleOutput` holds; in tests and `--quiet` it is a
     /// `Content` whose verbs short-circuit through [`Self::output`] — see
@@ -153,8 +152,8 @@ impl AgentConfig {
     /// Content verbs short-circuit through that same handle, so
     /// `RecordingOutput` still records the source strings an assertion
     /// compares and `QuietOutput` / `NoOutput` still discard — the content
-    /// seam (impl doc §4) without a render stack behind it. `ConsoleOutput`
-    /// passes its own tap-less `Content`; that is the one case where content
+    /// seam without a render stack behind it. `ConsoleOutput` passes its own
+    /// tap-less `Content`; that is the one case where content
     /// renders for real.
     pub fn content_for(output: &Arc<dyn Output>) -> Arc<crate::content::Content> {
         Arc::new(crate::content::Content::with_tap(output.clone()))
@@ -560,7 +559,7 @@ pub fn load_agents_md() -> Option<String> {
 
 #[derive(Clone)]
 pub(crate) struct LoggingHook {
-    /// Content only: this hook's every verb is a `display_*` (step 3d).
+    /// Content only: this hook's every verb is a `display_*`.
     pub(crate) content: Arc<crate::content::Content>,
     pub(crate) user_cancel: Arc<AtomicBool>,
     pub(crate) message_logger: Option<Arc<MessageLogger>>,

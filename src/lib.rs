@@ -11,7 +11,7 @@ pub mod persona;
 pub mod platform;
 pub mod tools;
 pub use slashdot_menu;
-// The drawing stack lives in its own crate (4h-a); re-exported so every
+// The drawing stack lives in its own crate; re-exported so every
 // `crate::{ansi,draw,render,termio}::…` path and the out-of-crate consumers
 // (`confirm_probe`, examples) keep their names.
 pub use slashdot_tui::{ansi, draw, render, termio};

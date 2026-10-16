@@ -11,19 +11,19 @@
 //! * [`render`] produces a [`Frame`] — a flat byte buffer with per-row
 //!   extents and element spans.
 //!
-//! [`RenderManager`] (steps 4b/4c) is the hub that runs those phases and
+//! [`RenderManager`] is the hub that runs those phases and
 //! owns the [`Draw`] it applies through. The pure phases themselves stay
 //! pure and callable directly; the manager touches the terminal only
 //! through its `Draw`. A frame's rows are self-contained: each carries the
 //! escapes needed to repaint itself in place (trailing `EL` or padding to
 //! `term_w`), so `apply` may rewrite any subset of rows unconditionally.
 //!
-//! Since 4d the manager is also content's only way onto the screen: the
+//! The manager is also content's only way onto the screen: the
 //! content path hands each formatted block over as a [`ContentWrite`]
 //! (`render_content` / `render_batch`), and nothing above the manager
-//! writes bytes of its own; 4e made it batching's and reposition's home
-//! too (the guard, and the element stack reposition re-composes). 4h-g
-//! completed the design's shape: [`RenderManager::configure`] is the
+//! writes bytes of its own. It is batching's and reposition's home
+//! (the guard, and the element stack reposition re-composes), with the
+//! design's shape complete: [`RenderManager::configure`] is the
 //! membership verb — the owner of what is on screen installs the element
 //! stack on each state transition — and [`RenderManager::render`] takes
 //! only the optional [`ContentWrite`], composing the *configured* stack for
@@ -39,10 +39,10 @@ use crate::draw::{el_if_short, plan_consume, plan_reposition, ApplyPolicy, Draw}
 use crate::termio::{CaretEvent, TermHandles, TermIO, TermSize};
 use tokio::sync::watch;
 
-/// The size watch handle (design §3): what the manager reads its geometry
-/// from once the frame verbs re-home (step 4f). Today `render` paints at the
-/// caller's `dims` — their *belief* about the terminal, which resize
-/// detection compares against what was painted (ui_draw_v2 §9 #3).
+/// The size watch handle (design §3): the manager reads its geometry from it,
+/// so `render` composes and paints at the watched size — no caller-supplied
+/// dims. Resize detection compares the watched size against what was painted
+/// (ui_draw_v2 §9 #3).
 pub type SizeWatch = watch::Receiver<TermSize>;
 
 /// The fraction of the terminal height the frame area may occupy — the value
@@ -59,7 +59,7 @@ pub const FRAME_MAX_ROW_RATIO: f64 = 2.0 / 3.0;
 /// guaranteed scrollback (plan §2). Matches the pop-up cap used throughout
 /// v2.5 (`⌈2/3·term_h⌉`, at least 1).
 ///
-/// The test twin's answer only (4h-b): production budgets through
+/// The test twin's answer only: production budgets through
 /// [`RenderManager::budget`], so that a ratio becomes a frame row count in
 /// exactly one place — [`live_budget_ratio`], the resolver itself, is
 /// private to this module for the same reason.
@@ -70,7 +70,7 @@ pub fn live_budget(term_h: usize) -> usize {
 
 /// The budget at an arbitrary ratio — [`RenderManager`]'s configured one.
 ///
-/// Private since 4h-b: the manager is the only caller, which is what rules
+/// Private: the manager is the only caller, which is what rules
 /// out two computations of the frame's row count — the configured ratio
 /// resolving one way here and another way in a caller that re-derived it.
 fn live_budget_ratio(term_h: usize, ratio: f64) -> usize {
@@ -91,7 +91,7 @@ pub enum RowSpec {
     /// header/content split). No element asks for one today; the variant
     /// exists so one can without reopening the allocator.
     ///
-    /// Approximate by design (4h-b): an in-frame ratio is a *preference about
+    /// Approximate by design: an in-frame ratio is a *preference about
     /// a share*, resolved into integral rows either way, so the design
     /// sketch's `f32` is precision enough — and there is nothing for it to
     /// agree *with*: the frame's row count comes from the configured ratio
@@ -164,7 +164,7 @@ pub struct Extent {
 
 /// One drawable piece of a frame (plan §3.2, design §Render).
 ///
-/// The sizing declaration is the *trait's*, not this struct's: since 4h-b
+/// The sizing declaration is the *trait's*, not this struct's:
 /// [`Element`] carries only the impl, and [`Self::ask`] reads the element's
 /// own floor and want — which is what §3.1's two passes require (every ask
 /// read before any of them is rendered), and what lets an element answer in
@@ -184,7 +184,7 @@ pub struct Extent {
 pub struct Element {
     /// The element's own squeeze policy and painting, told what it got.
     ///
-    /// `Arc`, not `Box`: since 4h-e an element set is minted once by the
+    /// `Arc`, not `Box`: an element set is minted once by the
     /// panel that owns it (an open menu) and *cloned into* every
     /// composition — the paint moves a copy, the set stays live and is
     /// updated in place. The shared ownership is the point. `Send + Sync`
@@ -198,7 +198,7 @@ pub struct Element {
 /// `width` is a *parameter*, not a dependency, so §3.1's "no terminal
 /// dependency" holds: an impl can be unit-tested at any width with no terminal
 /// anywhere in sight. Every element answers its own height — the
-/// construction-time `must`/`might` fields [`Element`] carried died with 4h-b,
+/// construction-time `must`/`might` fields [`Element`] used to carry are gone,
 /// because only the element knows what it wants *at this width*.
 pub trait RenderElement {
     /// Min/max rows of this element at `width` (design §Render). Resolved
@@ -266,7 +266,7 @@ impl Element {
     }
 
     /// The [`RowAsk`] this element contributes to [`allocate`] at `width` —
-    /// read from the element itself since 4h-b, which is what lets it answer
+    /// read from the element itself, which is what lets it answer
     /// in rows-at-this-width rather than in whatever it was built from.
     pub fn ask(&self, width: usize) -> RowAsk {
         self.render.height(width)
@@ -348,7 +348,7 @@ impl RenderElement for LinesItem {
 ///   round (max-min fairness).
 ///
 /// All-`FixedNum` — every element today — resolves to the same `(must,
-/// might)` pairs the pre-4h-b `Element` fields carried, so the split is the
+/// might)` pairs the element's asks resolve to, so the split is the
 /// even one the `allocate_*` tests pin.
 pub fn allocate(asks: &[RowAsk], term_h: usize, budget: usize) -> Vec<usize> {
     if asks.is_empty() {
@@ -530,7 +530,7 @@ pub fn pad_row(row: &str, term_w: usize) -> String {
 ///
 /// Content-specific classification stops *above* this type: the only
 /// vocabulary the design sends down with a write is `Stream` (main/meta),
-/// which rides with every write since 4f-f. `Main` is every write through
+/// which rides with every write. `Main` is every write through
 /// the boundary chain — screen content, choreography included. `Meta` is
 /// the reasoning hand-off when content routed reasoning to the meta sink
 /// at setup — straight to `TermIO`, no choreography, byte-identical to
@@ -551,27 +551,25 @@ pub struct ContentWrite {
     pub stream: crate::termio::Stream,
 }
 
-// --- the frame hub (step 4b) -------------------------------------------------
+// --- the frame hub -------------------------------------------------
 
 /// The frame hub (design §Render layer): where a composition comes to be
-/// budgeted, rendered, applied and remembered. Step 4b moved the pipeline
-/// here — what was `Output::draw_elements`' default body — 4c moved the
-/// drawing edge (`Draw`) under this roof, 4d made this the content
-/// path's only door onto the screen (the `ContentWrite` hand-off below),
-/// and 4e moved batching and reposition here. Since 4h-b the composition
-/// budgets each element's own [`RowAsk`] — resolved here against the frame
-/// height — rather than a construction-time `(must, might)` pair. **4h-g
-/// completed the shape**: the element stack is the *configured* one
+/// budgeted, rendered, applied and remembered. It owns the drawing edge
+/// (`Draw`) and is the content path's only door onto the screen (the
+/// `ContentWrite` hand-off below), batching's and reposition's home. The
+/// composition budgets each element's own [`RowAsk`] — resolved here against
+/// the frame height — rather than a construction-time `(must, might)` pair.
+/// The element stack is the *configured* one
 /// ([`Self::configure`], membership changed by the repl on state
 /// transitions) and [`Self::render`] composes it with no stack handed in —
 /// paint renders whatever is configured, and the content write is the
 /// other half of the same verb.
 pub struct RenderManager {
-    /// The drawing edge (step 4c): the byte sink and its live-screen
+    /// The drawing edge: the byte sink and its live-screen
     /// bookkeeping, owned — the design's `Draw { … }` under this roof. Plain
     /// fields inside; this manager's `Mutex` is what serializes them.
     draw: Draw,
-    /// The capture tap (step 4d, design §Content): while open, each
+    /// The capture tap (design §Content): while open, each
     /// [`ContentWrite`]'s bytes stop here instead of reaching the screen.
     /// Content bytes only — frame bytes can never be caught, which is the
     /// deliberate narrowing over the old writer swap.
@@ -587,7 +585,7 @@ pub struct RenderManager {
     /// whatever the status said at the moment of compose).
     ///
     /// Membership changes only on a state transition — the repl calls
-    /// [`Self::configure`] there (4h-g), never at paint. A direct
+    /// [`Self::configure`] there, never at paint. A direct
     /// [`Self::draw_frame`] leaves it intact: it describes the frame the
     /// *next* [`Self::render`] builds, not the last composition a content
     /// write consumed.
@@ -597,15 +595,12 @@ pub struct RenderManager {
     /// height on every call.
     frame_max_row_ratio: f64,
     /// The watched geometry — the handle `TermIO` hands out at setup (design
-    /// §3), cloned here so the manager owns it from the start. `render`
-    /// paints at the caller's `dims` (their belief, §9 #3); the frame-size
-    /// reads went elsewhere in 4f-c — `Content::frame_size` carries the same
-    /// channel, and [`Self::painted_size`] reads through `draw`'s own clone —
-    /// so nothing reads this field itself yet.
-    #[allow(dead_code)]
+    /// §3). `render` composes and paints at this size; `Content::frame_size`
+    /// carries the same channel, and [`Self::painted_size`] reads through
+    /// `draw`'s own clone.
     size: SizeWatch,
     /// The reader's caret-invalidation queue — the receiver half is this
-    /// manager's alone since 4g-c (design §3: `caret` → "RenderManager
+    /// manager's alone (design §3: `caret` → "RenderManager
     /// only"). `Interactive::new` hands it over from the one `handles()`
     /// distribution; `None` until then (Plain never spawns a reader).
     caret: Option<tokio::sync::mpsc::UnboundedReceiver<CaretEvent>>,
@@ -639,8 +634,7 @@ impl RenderManager {
     /// Drain the caret channel; a pending invalidation (SIGCONT / resume —
     /// the shell may have repainted, so the cached frame rows can no longer
     /// be trusted, plan §4.2) re-anchors the live-screen cache via DSR.
-    /// Called at the prompt loop's top, where the reader-independent
-    /// `RESUMED_REANCHOR` flag check used to be (4g-c killed the flag): the
+    /// Called at the prompt loop's top: the
     /// reader produces the event only after its own raw-mode re-entry, so
     /// raw mode is back by the time the DSR runs — and since the same
     /// reader thread sends the caret event *before* it forwards any later
@@ -660,7 +654,7 @@ impl RenderManager {
         }
     }
 
-    /// The channel handles, once at setup (design §3 step 1–2): where the
+    /// The channel handles, once at setup (design §3): where the
     /// entry-DSR window in `Interactive::new` takes the input receiver for
     /// the repl. Reached through here so the setup never names `TermIO`,
     /// which by then lives inside [`Self::draw`].
@@ -670,8 +664,7 @@ impl RenderManager {
 
     /// Whether this terminal flips raw mode at all (TermIO's Tty, not Plain)
     /// — what `$EDITOR` and the window pump ask before expecting a mode
-    /// turnover. The predicate the 4f-d `mode_guard: Option<…>` field
-    /// answered; since 4f-e the enum itself is the answer.
+    /// turnover.
     pub fn is_tty(&self) -> bool {
         self.draw.is_tty()
     }
@@ -679,29 +672,27 @@ impl RenderManager {
     /// Raw mode off — the front door (design §Render: "suspend() stops the
     /// reader and drops raw mode ($EDITOR, Ctrl-Z)"), pass-through to
     /// `Draw`/`TermIO` — the only real implementation is `TermIO::suspend`,
-    /// complete since 4f-e-c: the reader-stop rides with the raw-mode drop.
+    /// The reader-stop rides with the raw-mode drop.
     /// Idempotent; a no-op on Plain.
     pub fn suspend(&self) {
         self.draw.suspend();
     }
 
     /// Raw mode on — the reverse of [`Self::suspend`], and also the initial
-    /// entry at prompt-loop startup. The design makes resume implicit in
-    /// the next render; until the DSR answers inside `TermIO` (4g) callers
-    /// re-enter explicitly. A no-op on Plain.
+    /// entry at prompt-loop startup. A no-op on Plain.
     pub fn resume(&self) {
         self.draw.resume();
     }
 
     /// Publish a settled size on the geometry watch (parked-key drains and
     /// the prompt loop's defensive `Resize` arms), through the `TermIO`
-    /// that owns the channel since 4f-e-a.
+    /// that owns the channel.
     pub fn set_size(&self, size: TermSize) {
         self.draw.set_size(size);
     }
 
     /// Probe the terminal for its live size and publish it — the prompt
-    /// loop's loop-top refresh, under `TermIO`'s roof since 4f-e-a. Returns
+    /// loop's loop-top refresh, under `TermIO`'s roof. Returns
     /// the probed size so the caller can compare it against
     /// [`Self::painted_size`] without a second read.
     pub fn probe_size(&self) -> TermSize {
@@ -709,12 +700,11 @@ impl RenderManager {
     }
 
     /// The drawing edge, for the test seams that read *past* this manager
-    /// (`cache.applied`, and `term_io.recorded` for the byte edge since
-    /// 4f-e-b). Production reaches the edge through this manager's own
-    /// verbs — `render`, `cursor_row`, `painted_size`, `draw_frame`
-    /// (content writes go through `render_content`); the last production
-    /// forwarder was `Output::painted_size`, which 4f-c took. Test-only
-    /// since (the host's row-accounting and byte-edge tests reach through it).
+    /// (`cache.applied`, and `term_io.recorded` for the byte edge). Production
+    /// reaches the edge through this manager's own verbs — `render`,
+    /// `cursor_row`, `painted_size`, `draw_frame` (content writes go through
+    /// `render_content`). Test-only: the host's row-accounting and byte-edge
+    /// tests reach through it.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn draw(&mut self) -> &mut Draw {
         &mut self.draw
@@ -723,7 +713,7 @@ impl RenderManager {
     /// Set the frame's max-height ratio **and** install the element stack
     /// (design §Render `configure(frame_max_row_ratio, frame_elements)`).
     ///
-    /// The membership verb since 4h-g: the ratio is the one knob the budget
+    /// The membership verb: the ratio is the one knob the budget
     /// resolves from, and the elements are the frame's whole membership —
     /// bar, input, blank row, plus the overlay/confirm when one is open. The
     /// **repl** calls this on every state transition that changes what is on
@@ -743,7 +733,7 @@ impl RenderManager {
     /// rows"). A caller that needs the number the next [`Self::render`] will
     /// budget with — the page grant, which has to pre-compute the same
     /// allocation — takes it from here rather than re-deriving the ratio, so
-    /// the grant and the paint cannot disagree. `pub` since 4h-b for exactly
+    /// the grant and the paint cannot disagree. `pub` for exactly
     /// those callers; [`live_budget_ratio`], the resolver, is this module's
     /// alone.
     pub fn budget(&self, term_h: usize) -> usize {
@@ -758,11 +748,9 @@ impl RenderManager {
         self.budget(self.size.borrow().height.max(1))
     }
 
-    /// Allocate → render → apply: the pipeline that was
-    /// `Output::draw_elements`' default body (step 4b), painting through the
-    /// [`Draw`] this manager has owned since 4c.
+    /// Allocate → render → apply, painting through the manager's [`Draw`].
     ///
-    /// No dims, no stack, no return (design §Render, complete since 4h-g):
+    /// No dims, no stack, no return (design §Render):
     /// both halves read the watched size and the configured [`Self::stack`],
     /// so a resize applies lazily at the next `render` and a caller keys off
     /// the resize event plus [`Self::painted_size`], never off a size this
@@ -801,11 +789,9 @@ impl RenderManager {
     }
 
     /// Re-anchor the live-screen cache to the real cursor (DSR): the query
-    /// goes through `termio` — the sole stdin owner pauses around the reply
-    /// (step 2 commit C), so it is answered *inside* the terminal layer as
-    /// the design's §TermIO asks — and the answer syncs the draw cache.
-    /// The frame verb's home since 4f-b; the `Output::cursor_row` forward
-    /// that used to reach it died with the verb in 4g-a.
+    /// goes through `termio` — the sole stdin owner pauses around the reply,
+    /// so it is answered *inside* the terminal layer as the design's §TermIO
+    /// asks — and the answer syncs the draw cache.
     pub fn cursor_row(&mut self) -> usize {
         let row = crate::termio::query_cursor_row();
         self.draw.reanchor_to_cursor(row)
@@ -816,8 +802,7 @@ impl RenderManager {
     /// §9 #3), read from the applied dims `render`/`draw_frame` record. Before
     /// anything has been applied: the watched geometry (floored) — a caller
     /// that has not painted yet starts from what the terminal is, not from a
-    /// size nobody drew at. `painted_size`'s home since 4f-c (what
-    /// `Output::painted_size` forwarded); distinct from the dims a paint is
+    /// size nobody drew at. Distinct from the dims a paint is
     /// *composed* for (`Content::frame_size`, the current size — what a
     /// dialog wants when it opens): that is a belief, this is a memory.
     pub fn painted_size(&self) -> (usize, usize) {
@@ -829,7 +814,7 @@ impl RenderManager {
     /// tests. Unlike the old recipe-clearing version, the configured `stack`
     /// survives: it describes the frame the *next* [`Self::render`] builds,
     /// not the last composition a content write consumed, so a raw apply
-    /// leaves it intact (sub-split 4h-g part 1).
+    /// leaves it intact.
     pub fn draw_frame(
         &mut self,
         frame: &Frame,
@@ -839,7 +824,7 @@ impl RenderManager {
         self.draw.draw_frame(frame, policy, dims)
     }
 
-    // --- the content hand-off (step 4d, design §Content/§Render) -----------
+    // --- the content hand-off (design §Content/§Render) -----------
 
     /// The content round trip — the design's `render(Some(w))` (§Render)
     /// content half, now folded into one verb. Every content write (streaming
@@ -874,8 +859,8 @@ impl RenderManager {
     }
 
     /// Raise the batch flag if none is open; `true` means the caller's guard
-    /// owns the batch (and must [`Self::end_batch`] on drop). The hub's
-    /// since 4e — batching defers *reposition*, and reposition is the hub's.
+    /// owns the batch (and must [`Self::end_batch`] on drop). Batching defers
+    /// *reposition*, and reposition is the hub's.
     ///
     /// Flat, not recursive: a nested open adds no state, because the outer
     /// batch already covers everything written inside it. So it collapses to
@@ -928,7 +913,7 @@ impl RenderManager {
     /// hub instead of reaching the screen. Content bytes only — frame
     /// bytes (`draw_frame`, the reposition) can never be caught, which is
     /// the deliberate narrowing over the old writer swap; byte-edge tests
-    /// read `TermIO::recording()`, which took that seam wholesale (4f-e-b).
+    /// read `TermIO::recording()`.
     pub fn begin_capture(&mut self) {
         self.captured = Some(Vec::new());
     }
@@ -941,8 +926,8 @@ impl RenderManager {
     }
 
     /// The area's re-emit: re-render the configured stack (§5.1.1) and walk
-    /// it to where the content write left off. Moved here from `Draw` in 4e —
-    /// the hub owns reposition, and the configured stack is the hub's.
+    /// it to where the content write left off. The hub owns reposition, and
+    /// the configured stack is the hub's.
     ///
     /// Re-render rather than replay `taken`: a `Frame` is a snapshot of the
     /// status as of the last compose, and the bar moves without the REPL
@@ -972,7 +957,7 @@ impl RenderManager {
         } else {
             let heights = {
                 let asks: Vec<RowAsk> = self.stack.iter().map(|e| e.ask(tw)).collect();
-                // The hub's own budget (step 4e): the stack re-renders at
+                // The hub's own budget: the stack re-renders at
                 // the same knob `render` composes under, so a configured
                 // ratio cannot make the two disagree.
                 allocate(&asks, th, self.budget(th))
@@ -996,20 +981,20 @@ impl RenderManager {
         plan_reposition(&mut self.draw.cache, &frame, old_h, tw, th)
     }
 
-    /// The choreography every `Main`-stream content write takes (moved from
-    /// `Content::with_content_writer` in 4d): consume the live frame, put
+    /// The choreography every `Main`-stream content write takes: consume the
+    /// live frame, put
     /// the block down at the fold, advance the tracked cursor by its
     /// measured rows, and bring the frame back below — deferred while a
     /// batch is open, whose guard's drop emits it once (ui_draw_v2 R5).
     /// A `Meta` write takes the other route inside: `TermIO`'s meta sink,
-    /// no choreography (4f-f).
+    /// no choreography.
     fn put_content(&mut self, content: ContentWrite) {
         let ContentWrite {
             bytes,
             rows,
             stream,
         } = content;
-        // The meta route (4f-f): the meta sink, no choreography — no
+        // The meta route: the meta sink, no choreography — no
         // consume, no cursor advance, no reposition, and no capture
         // interception (a capture taps *screen* content; diverted reasoning
         // was never in one — `reasoning_is_routed_by_the_output_layer`
@@ -1087,9 +1072,9 @@ impl RenderManager {
 }
 
 /// Ends a content batch when dropped — see [`RenderManager::begin_batch`].
-/// The hub's since 4e: batching defers *reposition*, and reposition is the
-/// hub's, so the guard names the hub rather than a `Content` (its step-3d
-/// shape) or an `Output` ([`crate::output::BatchGuard`]). Both exist so that
+/// Batching defers *reposition*, and reposition is the hub's, so the guard
+/// names the hub rather than a `Content` or an `Output`
+/// ([`crate::output::BatchGuard`]). Both exist so that
 /// forgetting to end a batch — which would suppress a reposition forever,
 /// stranding a consumed area on screen — is unreachable rather than merely
 /// documented.
@@ -1136,11 +1121,10 @@ mod tests {
         assert_eq!(live_budget(2), 2);
     }
 
-    // ---- the manager (step 4b) ----
+    // ---- the manager ----
 
     /// The manager's default budget *is* the old `live_budget` answer, and
-    /// `configure` is what moves it: same numbers, one knob (step 4b moved
-    /// the hard-coded 2/3 into `configure`).
+    /// `configure` is what moves it: same numbers, one knob.
     #[test]
     fn the_managers_default_budget_is_the_old_one_and_configure_moves_it() {
         let size = crate::termio::fixed(TermSize {
@@ -1157,12 +1141,10 @@ mod tests {
         assert_eq!(small.budget(1), 1, "never below one row");
     }
 
-    /// `render` is the pipeline that left `Output::draw_elements`: it applies
-    /// through the `Draw` it has owned since 4c and remembers the composition
-    /// there (recipe + applied size, where the content path reads it).
-    /// Frame bytes read from a recording `TermIO` (4f-e-b: `recording()`
-    /// took the byte edge wholesale) — the manager's own capture taps the
-    /// *content* hand-off only (4d), so a frame-byte assertion reads the
+    /// `render` applies through the manager's `Draw` and remembers the
+    /// composition there (the applied size, where the content path reads it).
+    /// Frame bytes read from a recording `TermIO` — the manager's own capture
+    /// taps the *content* hand-off only, so a frame-byte assertion reads the
     /// byte edge.
     #[test]
     fn manager_render_paints_its_own_draw_and_remembers() {
@@ -1176,7 +1158,7 @@ mod tests {
             Element::lines(vec!["hello".to_string()]),
             Element::divider(),
         ];
-        // The configured stack is what `render` composes (4h-g): install it,
+        // The configured stack is what `render` composes: install it,
         // then apply with no stack handed in.
         manager.configure(crate::render::FRAME_MAX_ROW_RATIO, stack);
         manager.render(None);
@@ -1205,7 +1187,7 @@ mod tests {
 
     // ---- allocate ----
     //
-    // The parity pins (design §6): these asked in `Extent`s before 4h-b and
+    // The parity pins (design §6): these asked in `Extent`s before, and
     // ask in `RowAsk::fixed` now — all-`FixedNum` resolves to the same pairs
     // the `Element` fields used to carry, so the split is byte-identical.
     // `term_h` is inert for a fixed ask; it is what a ratio resolves against.
@@ -1323,7 +1305,7 @@ mod tests {
     /// `live_budget_ratio` is private and `live_budget` is test-only, so a
     /// production caller that wants the number has to ask
     /// [`RenderManager::budget`] for it. The point is by-construction, not
-    /// by-agreement (4h-b): there is one computation of the frame row count
+    /// by-agreement: there is one computation of the frame row count
     /// and one of an element's share, and no test has to keep them honest.
     #[test]
     fn a_ratio_ask_allocates_through_the_ordinary_split() {

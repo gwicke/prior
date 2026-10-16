@@ -163,9 +163,9 @@ struct Interactive {
     app_state: Arc<AppState>,
     last_attempted_target: Option<RebuildFingerprint>,
     prompt_session: Option<PromptSession>,
-    /// The persistent reader's input queue (step 2 commit B) — the one
-    /// receiver of the `TermIO::handles()` distribution this struct keeps
-    /// since 4g-c (design §3: distributed once at setup). `read_input`
+    /// The persistent reader's input queue — the one receiver of the
+    /// `TermIO::handles()` distribution this struct keeps (design §3:
+    /// distributed once at setup). `read_input`
     /// consumes it at the prompt, each turn borrows it as `InTurnInput::keys`
     /// — one channel for the process, so a key typed at the end of a turn
     /// lands in the next prompt instead of dying with a per-turn queue.
@@ -234,7 +234,7 @@ impl Interactive {
         if use_repl {
             config.confirm_port = Some(confirm_bridge.port.clone());
         }
-        // The terminal backend was constructed first, in `main` (4f-e-a):
+        // The terminal backend was constructed first, in `main`:
         // Tty iff `use_repl`, already seeded into `Content` (caps, size
         // watch) and moved under `Draw` on the way in. Nothing here names
         // `TermIO` — the manager's front door is the whole surface
@@ -331,7 +331,7 @@ impl Interactive {
         // un-retried until the target changes — one error per distinct target,
         // not one per cycle while the user navigates back to the menu.
         let last_attempted_target: Option<RebuildFingerprint> = None;
-        // The persistent stdin reader (step 2 commit B): one thread, spawned
+        // The persistent stdin reader: one thread, spawned
         // once by `TermIO::handles` — reached through the manager, which has
         // owned the backend since construction (raw mode is already on),
         // owning stdin for the process lifetime. It forwards keys/paste on
@@ -347,7 +347,7 @@ impl Interactive {
         // lowering the gate — and the reader takes over for the prompt.
         // Without this ordering the reader's first poll would swallow the
         // terminal's cursor-position report before `cursor_row` could read it.
-        // The guard (4g-b) is the front door for this window: nesting-safe,
+        // The guard is the front door for this window: nesting-safe,
         // and it lowers on drop, so an early return can no longer leak the
         // gate up. The reader isn't running yet when it is raised (the thread
         // starts inside `handles()` below), so the raise is instant.
@@ -672,7 +672,7 @@ impl Interactive {
         // cycle view is written before this message is persisted, so the branch
         // is still empty then. Record the text being sent as the stand-in (the
         // `first_user_text(prior).or(input)` fallback, relocated here from the
-        // turn — 4h-g4 part 2); the next cycle's branch write supersedes it.
+        // turn); the next cycle's branch write supersedes it.
         self.app_state.set_first_message_if_unset(&input);
         // Reprint the submitted prompt via the `Output` impl so the
         // session (and cursor tracking) stays correct; `read_input`
@@ -787,7 +787,7 @@ impl Interactive {
         // U4.2/U4.3: edit keys typed while the turn runs come from the **one
         // process-lifetime channel** the persistent reader feeds
         // (`self.input`,
-        // step 2 commit B) — no per-turn reader, no per-turn queue. The
+        // — a process-lifetime channel, no per-turn reader, no per-turn queue. The
         // receiver is borrowed for the whole turn and handed into `prompt()` as
         // `InTurnInput::keys`; because the channel is never dropped between
         // turns, a key typed at the very end of a turn lands in the next
@@ -1005,7 +1005,7 @@ impl Interactive {
             outcome
         };
         // No reader teardown here: the stdin reader is process-lifetime now
-        // (step 2 commit B) — it keeps feeding the one channel across turns
+        // — it keeps feeding the one channel across turns
         // and into the next prompt.
         match response {
             Ok(_) => {}

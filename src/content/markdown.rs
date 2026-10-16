@@ -1,6 +1,5 @@
 //! Markdown rendering: block rendering, syntax highlighting, language
-//! detection, and the answer renderer's theme (step 3b of the
-//! output-drawing refactor).
+//! detection, and the answer renderer's theme.
 
 use markdown_terminal::Theme;
 

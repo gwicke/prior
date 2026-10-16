@@ -311,12 +311,12 @@ pub fn paint(
     confirm: &ConfirmPrompt,
     manager: &std::sync::Arc<std::sync::Mutex<crate::render::RenderManager>>,
 ) {
-    // No compose head (step 4f-b): a probe's dialog is the whole area — the
+    // No compose head: a probe's dialog is the whole area — the
     // stack below is the same divider-then-elements the session's own paint
     // layers under its bar and input, so the two cannot drift.
     //
     // A probe has no session to own membership, so it configures the manager
-    // directly (4h-g: `configure` is the membership verb) and then applies it.
+    // directly (`configure` is the membership verb) and then applies it.
     let mut stack = Vec::new();
     let elements = confirm.elements();
     if !elements.is_empty() {
@@ -340,7 +340,7 @@ pub fn paint(
 /// own paint (it still owns the prompt and any menu underneath); the probe
 /// passes the empty stack.
 ///
-/// Takes content for the decision line (step 4f-b): `display_plain` is a
+/// Takes content for the decision line: `display_plain` is a
 /// content verb — boundary rules and the tap seam included — and the line
 /// stays inside this function because the repaint-then-decide order is the
 /// invariant, not something each caller may remember.

@@ -329,7 +329,7 @@ pub(crate) fn replay_units(content: &Content, units: &[ReplayUnit], start: usize
     // Ctrl-Z restore — arrive here, so this is the one place the batching has
     // to be declared.
     //
-    // The guard names the hub, not the content (step 4e): batching defers
+    // The guard names the hub, not the content: batching defers
     // *reposition*, and reposition is the hub's. The manager handle comes
     // from beside `Content` — the handle its own layer holds down to
     // (design §Content: content holds `Arc<Mutex<RenderManager>>`).
@@ -727,7 +727,7 @@ mod tests {
         let turn = two_segment_turn();
         let reasoning = crate::settings::default_show_reasoning_handle();
         *reasoning.lock().unwrap() = crate::settings::ShowReasoning::Content;
-        // Both sides on the same private size watch (step 2 commit A): the
+        // Both sides on the same private size watch: the
         // byte comparison must not depend on the runner's terminal, and the
         // width is per-instance state now, so no serialization either.
         let size = crate::termio::TermSize {

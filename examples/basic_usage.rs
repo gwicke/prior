@@ -5,13 +5,13 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Setup the output handler (ConsoleOutput provides pretty terminal printing)
-    //    The terminal backend is constructed first (4f-e) — it moves into the
+    //    The terminal backend is constructed first — it moves into the
     //    console and owns the size watch and caps from there.
     let output = Arc::new(ConsoleOutput::new(
         TermIO::plain(),
         picocode::settings::default_show_reasoning_handle(),
     ));
-    // The content handle shares the console's own `Content` (step 3d).
+    // The content handle shares the console's own `Content`.
     let content = output.content();
 
     // 2. Create the agent with a simple config struct

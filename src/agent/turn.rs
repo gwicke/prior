@@ -103,7 +103,7 @@ impl CodeAgent {
         // number for exactly the turn a new session is most likely to be
         // watched. The estimate `/tree compact` already uses is computable from
         // the messages in hand — `prior` plus this turn's prompt — so record it
-        // as an *estimate* (4h-g4 part 3); the provider's own count replaces it
+        // as an *estimate*; the provider's own count replaces it
         // through `context_figure` from the second turn on, with nothing
         // impersonating a report.
         let estimated_ctx = estimate_ctx_with(&prior, input);

@@ -54,16 +54,16 @@ and link a doc/ and/or commit hash
   - [x] Step 3: `Interactive` struct, in the new `interactive.rs` (§3)
   - [x] Deferred: `CodeAgent::prompt` — deliberately, not cleanup (§4)
 - [ ] audit output, repl
-- [ ] output.rs drawing refactor — 261003_output_drawing_refactor.md (+ impl companion)
+- [ ] output.rs drawing refactor — 261003_output_drawing_refactor.md
   - [x] Step 1: extract `render.rs` / `draw.rs` / `ansi.rs` mechanically; Output facade kept (§8.1)
   - [ ] Step 2: `TermIO` — reader, raw mode, DSR, size watch; un-`#[serial]` width tests (§8.2) —
     moves landed (`74e987c`); the type fold landed in 4a (`8cc955d`); the size-query
     fallbacks landed in 4g (`c21be0e`)
   - [x] Step 3: split `content/`; `AgentConfig.content` + `Content` tap seam; content consumers on
     `&Content` (§8.3) — landed 3a–3d (`47122b4`…`cf7b6a8`); frame/input rides `AgentConfig.output`
-    until step 4 (follow-ups recorded in the impl doc)
+    until step 4
   - [x] Step 4: fold in `RenderManager` + UI; elements → `Arc<Mutex<…>>`, shared editor (§8.4) —
-    sub-commit plan 4a–4h recorded in the impl doc — 4a (`8cc955d`), 4b (`38d9513`), 4c
+    4a (`8cc955d`), 4b (`38d9513`), 4c
     (`33dc92c`), 4d (`98bcb85`), 4e (`bce38e7`) landed; 4f landed whole — 4f-a
     (`529f278`, bar formats itself from raw data), 4f-b (`cb01977`, frame path leaves
     `&dyn Output`), 4f-c (`fad8f76`, dims → the watch/manager, the size verbs leave the trait),
@@ -90,5 +90,5 @@ and link a doc/ and/or commit hash
   - [x] 4i: engine memoizes child `data()` responses so the no-rebuild carry holds on the
     production menu path — `same_content` fallback in `refresh_data` (4i-a, `237d9ab`), engine-path
     carry test (4i-b, `48e5e96`), and the large-row producer audit + `/session` memo on an
-    mtime-driven listing generation (4i-c, `bff9c63`); detail in the impl doc.
+    mtime-driven listing generation (4i-c, `bff9c63`)
   - [ ] Step 5: delete `output.rs` — sinks, dead taps, trait; prune `lib.rs` re-exports (§8.5)

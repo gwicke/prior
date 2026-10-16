@@ -75,7 +75,7 @@ pub(crate) async fn dispatch_in_turn_event(
     sess: Option<&mut crate::repl::PromptSession>,
     history: Option<&mut crate::repl::History>,
     label: &str,
-    // Content is the one handle (4f-d): the frame dims, the paint path, and —
+    // Content is the one handle: the frame dims, the paint path, and —
     // through its manager — the `$EDITOR` turnover the guard/output pair used
     // to carry.
     content: &crate::content::Content,
@@ -133,7 +133,7 @@ pub(crate) async fn dispatch_in_turn_event(
             }
             let opts_len = sess.opts_len();
             // The frame's budget, from the one place a ratio resolves to a row
-            // count (4h-b): `budget_now` reads the watched height — the same
+            // count: `budget_now` reads the watched height — the same
             // geometry the settle and paint below compose at — so the grant
             // and the frame cannot disagree.
             let budget = content.manager.lock().unwrap().budget_now();
@@ -173,8 +173,8 @@ pub(crate) struct TurnPump<'a> {
     session: &'a mut crate::repl::PromptSession,
     history: &'a mut crate::repl::History,
     label: &'a str,
-    /// The one handle (4f-d): paints and settles go through content's manager
-    /// (step 4f-b), the frame dims read content's watch (4f-c), and the
+    /// The one handle: paints and settles go through content's manager, the
+    /// frame dims read content's watch, and the
     /// `$EDITOR` turnover reaches the manager's front door through it too —
     /// the guard/output pair this pump used to carry is gone.
     content: &'a crate::content::Content,
@@ -398,7 +398,7 @@ mod tests {
     use crate::settings::SettingsStore;
     use serial_test::serial;
 
-    /// The content half of the same idea (step 3d): `retry_summarization`
+    /// The content half of the same idea: `retry_summarization`
     /// reaches content, and a `Content` tapped through `NoOutput` discards it.
     fn null_content() -> std::sync::Arc<Content> {
         std::sync::Arc::new(Content::with_tap(std::sync::Arc::new(
@@ -422,7 +422,7 @@ mod tests {
         }
     }
     /// The pieces a back-off pump needs: a prompt session over the test app
-    /// state and a history (4f-d: no guard — the pump no longer carries one,
+    /// state and a history (no guard — the pump does not carry one,
     /// and the root-Esc path returns before any terminal call anyway).
     fn backoff_pump_parts(
         app_state: &std::sync::Arc<crate::app_state::AppState>,
@@ -738,7 +738,7 @@ mod tests {
         assert!(app_state.poll_key().is_none(), "inactive must not read");
         app_state.park_key(char_event('a'));
         app_state.park_key(char_event('b'));
-        // The park converts to the input channel's vocabulary (step 4a) —
+        // The park converts to the input channel's vocabulary —
         // that queue is what `read_input` drains, and it speaks `InputEvent`.
         let expect = |c: char| {
             Some(InputEvent::Key(crossterm::event::KeyEvent::new(
