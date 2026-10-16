@@ -702,18 +702,36 @@ most runway to expand into separate sub-commits.
    `Arc<ViewRows>` directly after the crate's `Arc` swap (**4h-d** — landed), preserving the
    no-copy row iterator for filtered and unfiltered views alike.
 
-  Deferred beyond 4h — surfaced by **4h-f**, owned by no remaining sub-step:
+  - **4i — the engine memoizes `data()` responses; the carry holds on the production path.**
+  *(planned — lands before step 5; surfaced by **4h-f**, promoted from the deferred list.)*
+  **4h-e**'s no-rebuild ideal holds only in the crate's tests, where a hand-built plan carries a
+  stable `Arc<ViewRows>`; on the real menu path every cursor eval rebuilds the element set.
+  Measured: `refresh_data` (`node_entry.rs:851`) gates "changed" on `Arc::ptr_eq(prev, &response)`,
+  so a node minting a fresh `DataResponse` per call always reports change → `slots_dirty` (`:908`)
+  → `ensure_rows` (`:923`) mints a fresh `Arc<ViewRows>` → `RenderPlan.view` is new →
+  `ElementSet::update`/`same_panel` (`elements.rs:463`) sees a new handle → `Update::Rebuilt`.
+  Only `ModelNode` (`v25_model.rs:194`) memoizes; `StaticListingNode` (`node_impl.rs:469`) and the
+  other v25 nodes mint per call, and a parent's `changed` ORs every child, so one such child
+  rebuilds the whole level — at the root that is nearly every node. Pixels are right either way;
+  what is lost is the flicker-free carry.
 
-  - **Engine re-mines its view handle per cursor eval.** `StaticListingNode::data()` mints a fresh
-    `DataResponse` on every call, so `refresh_data` always reports change, `slots_dirty` stays
-    set, and `ensure_rows` hands back a fresh `ViewRows` each eval. `ElementSet::update`'s
-    `same_panel` then sees a new handle and rebuilds instead of moving figures in place — so
-    **4h-e**'s no-rebuild ideal holds in the crate's tests (where a plan carries a stable
-    `Arc<ViewRows>`) but not on the production path. Pixels are right either way; what is lost is
-    the flicker-free carry. Fixing it means memoizing the child `data()` response (return the same
-    `Arc` when unchanged), which is engine-side and cuts across nodes — not a rendering-step
-    concern. A repl-level test asserting the carry was dropped in **4h-f** because it encoded
-    this memoization as fact before it is one; it should return once the engine memoizes.
+  **Approach: one engine-side content-equality fallback, not per-node memoization.** In
+  `refresh_data`, when `ptr_eq` fails, compare content and reuse the stored `Arc` when equal —
+  `changed` stays false, and the reused `Arc` is written into this slot so a sibling's change
+  cannot churn it. `DataResponse` gains `same_content`: `rows` compared directly (order is the
+  display order), `active_ids` as a *set* (`StaticListingNode` drains a `HashSet`; consumers only
+  insert into sets). Central by choice: it covers every node and the `value_forwarding` enrichment
+  (`node_entry.rs:263`) forever, and a new node cannot silently regress the carry. `ptr_eq` stays
+  the fast path, so large memoizing lists (`/model`) pay nothing; only small non-memoizing nodes
+  do an O(rows) compare, and genuinely dynamic lists (`/session`, `/tree`, `/sandbox`)
+  compare-unequal as they should.
+
+  Sub-commits:
+  - **4i-a** — `same_content` + the `refresh_data` fallback; crate test: equal-but-fresh responses
+    leave `slots_dirty` clear and reuse the handle across evals.
+  - **4i-b** — restore the repl-level carry assertion dropped in **4h-f**: a production `/`-menu
+    cursor move yields `Update::Moved` through the real `StaticListingNode`-backed tree (not a
+    hand-built plan).
 
 Follow-ups step 3 leaves here — each claimed by a commit above unless noted:
 
