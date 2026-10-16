@@ -71,9 +71,9 @@ the agent holds a `Content` handle (never the hub); confirmation keeps its own `
   continuation; where Draw's entry `EL` cannot be trusted, it pads a short row to `term_w` as a
   fallback. A new width applies from the next block on; the width-change replay stays the repl's, at
   its next size check — content never initiates it.
-- Capture (`begin_capture`/`end_capture`) taps the `ContentWrite` as handed to `render()` —
-  pre width-recheck, content only, never frame bytes — so `/replay Nl` and content-path tests
-  compare what Content produced. Byte-edge tests use `TermIO::recording()`.
+- Capture is Content's: `begin_capture`/`end_capture` tap the block's bytes at the output, and a
+  capturing write never reaches `render()` — content only, never frame bytes — so `/replay Nl` and
+  content-path tests compare what Content produced. Byte-edge tests use `TermIO::recording()`.
 - No direct agent → output path remains: every write enters through render().
 
 ## UI layer
@@ -158,9 +158,8 @@ pub enum Stream { Main, Meta }
 
 pub struct RenderManager {
     stack: Vec<Element>,
-    draw: Draw,               // fully owned drawing + output path
-    captured: Option<Vec<u8>>, // the capture tap (content bytes only)
-    size: SizeWatch,          // = watch::Receiver<TermSize>, cloned handle
+    draw: Draw,      // fully owned drawing + output path
+    size: SizeWatch, // = watch::Receiver<TermSize>, cloned handle
 }
 
 impl RenderManager {
