@@ -66,11 +66,16 @@ Open before landing:
 - **`--quiet` is unaffected** — it drops the hub hand-off entirely; keep it that way.
 - **Churn:** `Stream`'s variants are a `termio` re-export, so `ContentWrite.stream`, `repair_main`,
   `Draw::draw`, `write_stdio`, and a large block of `Stream::Main`/`Meta` test assertions move.
-- **`TermGuard`** (the first bullet above) is the same "TermIO owns output" finding and folds in
-  here.
+  Accepted: a one-off cost, not a reason to keep the sink vocabulary.
+- **`TermGuard`** (the first bullet above) folds in here: it is a TermIO concern already (`TtyIo`
+  owns it), but the fix keys on the **target** cap, not the backend kind — an interactive stdin can
+  have a piped primary (`picocode > out.txt`), which is exactly the leak. Route the guard's CSI
+  (bracketed paste, kitty keyboard, cursor) through the same degradation edge, gated on
+  `caps.primary`.
 - **Non-tty width (CLI)** is independent geometry — the `term_w` hard requirement exists only so a
-  wrapped row cannot defeat the per-row entry `EL`, and a pipe has no screen, so a non-tty width can
-  be a configured value (default 80) or unlimited. Do it separately or accept the 80 fallback.
+  wrapped row cannot defeat the per-row entry `EL`, and a pipe has no screen. Accepted: keep the
+  80 fallback (`TermSize::default` via `probe`'s `Err` arm) for now; make it configurable later if
+  wanted.
 
 ### Follow-up — track the repairs back into content
 
