@@ -299,7 +299,10 @@ impl TermIO {
   cursor into view first, a timer cannot (repl.rs:1761).
 - caret invalidation (SIGCONT, resume) → the `caret` channel to RenderManager only
 - keys / paste → the `input` channel (repl pumps: `read_input` at the prompt, the turn's select
-  during a turn)
+  during a turn). One exception, still at the edge: while an LLM window is open (the compaction
+  summarization) the reader *diverts* forwarded events to the window's own inbox — a registered
+  sink, not a second stdin reader — and the window parks what it cannot use back into the queue
+  `read_input` drains. The reader never pauses for it.
 - Ctrl-C / Ctrl-Z handled here — process lifecycle, never queued
 - DSR cursor queries answered internally — **by the reader itself, between polls**: the main task
   posts a request to the reader's inbox and waits on the reply channel (bounded wait; an expired

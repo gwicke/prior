@@ -861,21 +861,15 @@ impl Draw {
     }
 
     /// The full `TermIO::suspend` — reader parked, raw mode off.
-    /// Idempotent; a no-op on Plain.
-    pub fn suspend(&self) {
-        let _ = self.term_io.suspend();
+    /// Idempotent. Plain reports `Unsupported` (no tty to hand over) — the
+    /// editor propagates it; teardown-style callers discard it.
+    pub fn suspend(&self) -> std::io::Result<()> {
+        self.term_io.suspend()
     }
 
     /// Raw mode on — the reverse of [`Self::suspend`].
-    pub fn resume(&self) {
-        let _ = self.term_io.resume();
-    }
-
-    /// Whether this terminal flips raw mode at all (TermIO's Tty, not Plain)
-    /// — what `$EDITOR` and the window pump ask before expecting a mode
-    /// turnover.
-    pub fn is_tty(&self) -> bool {
-        self.term_io.is_tty()
+    pub fn resume(&self) -> std::io::Result<()> {
+        self.term_io.resume()
     }
 
     /// Publish a settled size on the instance's watch (parked-key drains,

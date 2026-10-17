@@ -114,3 +114,8 @@ and link a doc/ and/or commit hash
     pruned) — landed `9b0ce5c`…`bbc77aa`
   - [x] 5f: the non-tty edge strip (`StripAnsi` per stream from caps) and the frame drop, both real
     streams only; the recording/null doubles observe composed bytes — landed `HEAD`
+  - [ ] sole-ownership: TermIO owns all IO, in and out — DSR answer sealed in the edge (`11536d3`),
+    reader answers DSR, entry pause dies (`ea2f381`); stdin reads done — the window pump consumes
+    the reader's divert (`WindowKeySource`/`is_tty`/`ReaderPauseGuard` die, `Plain::suspend`
+    reports `Unsupported`); remaining: output byte rides (line-tails, editor error, `\x1b[0J`),
+    quiet-error always-meta kind, batch `read_line` — impl doc

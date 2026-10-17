@@ -10,8 +10,13 @@
 //!
 //! Both are absolute-deadline waits. A dispatched or parked key must not extend
 //! the delay.
+//!
+//! Neither wait touches stdin (design §TermIO): the turn's back-off consumes
+//! the reader's channel directly, and the window pump consumes the reader's
+//! *divert* ([`crate::app_state::WindowPump`]) — the sole stdin owner stays
+//! the sole stdin owner.
 
-use crate::app_state::WindowKeySource;
+use crate::app_state::WindowPump;
 use crate::repl::paint_prompt;
 use crate::termio::InputEvent;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -304,42 +309,27 @@ pub(crate) async fn cancellable_sleep_pumped(
     }
 }
 
-/// Next event for a window pump, paced: polls the source without blocking
-/// and yields between tries, so an idle window costs one `poll(0)` per tick
-/// instead of a reader thread. `None` source, or an inactive window
-/// (piped/batch — the script owns stdin): never completes, exactly like the
-/// turn pump's missing-queue arm.
-pub(crate) async fn next_window_key(
-    src: Option<&dyn WindowKeySource>,
-) -> Option<crossterm::event::Event> {
-    let Some(src) = src else {
-        return std::future::pending().await;
-    };
-    if !src.window_active() {
-        return std::future::pending().await;
-    }
-    loop {
-        if let Some(ev) = src.poll_key() {
-            return Some(ev);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
-
-/// Route one window-pump event: a root `Esc` fires the cancel signal — the
-/// same flag + notify + tool watchdogs the turn's dispatcher raises, which
-/// is the whole point of the window — and reports it; anything else is
-/// parked for `read_input`. Returns whether the cancel signal fired.
-pub(crate) fn pump_window_key(
-    ev: Option<crossterm::event::Event>,
-    src: &dyn WindowKeySource,
+/// One window-pump step: wait for the next diverted event and route it — a
+/// root `Esc` fires the cancel signal (the same flag + notify + tool
+/// watchdogs the turn's dispatcher raises, which is the whole point of the
+/// window) and reports it; anything else is parked for `read_input`.
+/// Returns whether the cancel signal fired.
+///
+/// `window: None`, or a window whose channel closed (its registration
+/// replaced or cleared): never completes — the old missing/inactive-source
+/// arm, now keyed on the channel itself.
+pub(crate) async fn pump_window_step(
+    window: &mut Option<WindowPump<'_>>,
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
 ) -> bool {
-    let Some(ev) = ev else {
-        return false;
+    let Some(w) = window.as_mut() else {
+        return std::future::pending().await;
     };
-    if let crossterm::event::Event::Key(key) = &ev {
+    let Some(ev) = w.recv().await else {
+        return std::future::pending().await;
+    };
+    if let InputEvent::Key(key) = &ev {
         if key.code == crossterm::event::KeyCode::Esc {
             user_cancel.store(true, Ordering::SeqCst);
             cancel_notify.notify_one();
@@ -352,20 +342,20 @@ pub(crate) fn pump_window_key(
             return true;
         }
     }
-    src.defer_event(ev);
+    w.park(ev);
     false
 }
 
 /// The back-off wait with the window pump live: the wait is part of the
 /// operation, so an `Esc` typed during it ends the wait immediately
 /// (`false`) and every other key is parked for `read_input`. The deadline
-/// stays absolute — parked keys never extend the delay. `keys: None`, or an
-/// inactive window, degrades to the plain signal-only wait.
+/// stays absolute — parked keys never extend the delay. `window: None`
+/// degrades to the plain signal-only wait.
 pub(crate) async fn cancellable_sleep_windowed(
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
     ms: u64,
-    keys: Option<&dyn WindowKeySource>,
+    window: &mut Option<WindowPump<'_>>,
 ) -> bool {
     if ms == 0 {
         return true;
@@ -375,11 +365,9 @@ pub(crate) async fn cancellable_sleep_windowed(
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return true,
             _ = cancel_observed(user_cancel, cancel_notify) => return false,
-            ev = next_window_key(keys) => {
-                if let Some(src) = keys {
-                    if pump_window_key(ev, src, user_cancel, cancel_notify) {
-                        return false;
-                    }
+            fired = pump_window_step(window, user_cancel, cancel_notify) => {
+                if fired {
+                    return false;
                 }
                 // Parked: keep waiting out the rest of the deadline.
             }
@@ -436,11 +424,11 @@ mod tests {
     /// attempts the Esc sat unread until the next `prompt()` started, so the
     /// full delay always ran — the reported "the session only aborts once the
     /// timeout has elapsed".
-    // `#[serial]`: an `Esc` pumped through the window reaches
-    // `pump_window_key`, which broadcasts on the process-global
-    // `TOOL_CANCEL_SENDERS` registry — killing the child of *every*
-    // in-flight command in this process, including one another test's.
-    // These must not overlap a test running a real sandboxed command.
+    // `#[serial]`: the dispatched Esc reaches `dispatch_in_turn_event`,
+    // which broadcasts on the process-global `TOOL_CANCEL_SENDERS`
+    // registry — killing the child of *every* in-flight command in this
+    // process, including one another test's. These must not overlap a test
+    // running a real sandboxed command.
     #[tokio::test]
     #[serial]
     async fn backoff_pump_cancels_promptly_on_queued_esc() {
@@ -523,65 +511,15 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
-    /// Fake window source for the compaction pump: events waiting to be
-    /// read, and the park where keys the window cannot act on land.
-    struct FakeWindow {
-        ready: std::sync::Mutex<std::collections::VecDeque<crossterm::event::Event>>,
-        parked: std::sync::Mutex<std::collections::VecDeque<crossterm::event::Event>>,
-        active: bool,
-    }
-
-    impl FakeWindow {
-        fn new() -> Self {
-            Self {
-                ready: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                parked: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                active: true,
-            }
-        }
-
-        /// Piped/batch shape: stdin belongs to the script.
-        fn inactive() -> Self {
-            Self {
-                active: false,
-                ..Self::new()
-            }
-        }
-
-        fn push(&self, ev: crossterm::event::Event) {
-            self.ready.lock().unwrap().push_back(ev);
-        }
-
-        fn ready_len(&self) -> usize {
-            self.ready.lock().unwrap().len()
-        }
-
-        fn parked_len(&self) -> usize {
-            self.parked.lock().unwrap().len()
-        }
-    }
-
-    impl WindowKeySource for FakeWindow {
-        fn window_active(&self) -> bool {
-            self.active
-        }
-        fn poll_key(&self) -> Option<crossterm::event::Event> {
-            self.ready.lock().unwrap().pop_front()
-        }
-        fn defer_event(&self, ev: crossterm::event::Event) {
-            self.parked.lock().unwrap().push_back(ev);
-        }
-    }
-
-    fn esc_event() -> crossterm::event::Event {
-        crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+    fn esc_event() -> InputEvent {
+        InputEvent::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Esc,
             crossterm::event::KeyModifiers::NONE,
         ))
     }
 
-    fn char_event(c: char) -> crossterm::event::Event {
-        crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+    fn char_event(c: char) -> InputEvent {
+        InputEvent::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char(c),
             crossterm::event::KeyModifiers::NONE,
         ))
@@ -592,15 +530,16 @@ mod tests {
     /// nothing read stdin during the window and the attempt always ran to
     /// completion.
     // `#[serial]`: an `Esc` pumped through the window reaches
-    // `pump_window_key`, which broadcasts on the process-global
+    // `pump_window_step`, which broadcasts on the process-global
     // `TOOL_CANCEL_SENDERS` registry — killing the child of *every*
     // in-flight command in this process, including one another test's.
     // These must not overlap a test running a real sandboxed command.
     #[tokio::test]
     #[serial]
     async fn window_pump_esc_cancels_the_inflight_attempt() {
-        let keys = FakeWindow::new();
-        keys.push(esc_event());
+        let app_state = crate::app_state::AppState::for_test(test_settings());
+        let (window, tx) = crate::app_state::WindowPump::with_channel(&app_state);
+        tx.send(esc_event()).unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
         let content = null_content();
@@ -609,7 +548,7 @@ mod tests {
             content.as_ref(),
             &cancel,
             &notify,
-            Some(&keys),
+            Some(window),
             &mut || async {
                 std::future::pending::<std::result::Result<String, crate::PicocodeError>>().await
             },
@@ -626,18 +565,18 @@ mod tests {
     /// The reported bug shape: an `Esc` during a *retry back-off* cuts the
     /// wait instead of letting the provider-hint floor (10s) run out.
     // `#[serial]`: an `Esc` pumped through the window reaches
-    // `pump_window_key`, which broadcasts on the process-global
+    // `pump_window_step`, which broadcasts on the process-global
     // `TOOL_CANCEL_SENDERS` registry — killing the child of *every*
     // in-flight command in this process, including one another test's.
     // These must not overlap a test running a real sandboxed command.
     #[tokio::test]
     #[serial]
     async fn window_pump_esc_cuts_the_retry_backoff() {
-        let keys = std::sync::Arc::new(FakeWindow::new());
-        let keys2 = keys.clone();
+        let app_state = crate::app_state::AppState::for_test(test_settings());
+        let (window, tx) = crate::app_state::WindowPump::with_channel(&app_state);
         let handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            keys2.push(esc_event());
+            tx.send(esc_event()).unwrap();
         });
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -648,7 +587,7 @@ mod tests {
             content.as_ref(),
             &cancel,
             &notify,
-            Some(keys.as_ref()),
+            Some(window),
             &mut || {
                 calls += 1;
                 async {
@@ -666,15 +605,20 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "the 10s back-off ran its course instead of yielding to the Esc"
         );
-        assert_eq!(keys.parked_len(), 0, "an Esc is consumed, not parked");
+        assert_eq!(
+            app_state.take_parked_key(),
+            None,
+            "an Esc is consumed, not parked"
+        );
     }
 
     /// A plain key during the window must NOT cancel: it is parked for
     /// `read_input` and the operation completes normally.
     #[tokio::test]
     async fn window_pump_plain_key_is_parked_and_not_cancelled() {
-        let keys = FakeWindow::new();
-        keys.push(char_event('x'));
+        let app_state = crate::app_state::AppState::for_test(test_settings());
+        let (window, tx) = crate::app_state::WindowPump::with_channel(&app_state);
+        tx.send(char_event('x')).unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
         let content = null_content();
@@ -682,7 +626,7 @@ mod tests {
             content.as_ref(),
             &cancel,
             &notify,
-            Some(&keys),
+            Some(window),
             &mut || async {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 Ok("done".to_string())
@@ -690,54 +634,39 @@ mod tests {
         )
         .await;
         assert_eq!(r.unwrap(), "done");
+        // The park lands in the real queue `read_input` drains, in the
+        // input channel's vocabulary — not a fake side queue.
         assert_eq!(
-            keys.parked_len(),
-            1,
+            app_state.take_parked_key(),
+            Some(char_event('x')),
             "the key must wait parked for read_input's drain"
         );
         assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// An inactive window (piped/batch — no REPL) must not touch its source
-    /// at all: the arms stay pending, the ready event is never consumed.
+    /// `window: None` (piped/batch — no reader to divert; tests) leaves the
+    /// pump arm pending and never touches a source — there is no source to
+    /// touch: stdin ownership stays where it was, untouched.
     #[tokio::test]
-    async fn window_pump_inactive_never_polls() {
-        let keys = FakeWindow::inactive();
-        keys.push(esc_event());
+    async fn window_pump_none_is_inert() {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
         let content = null_content();
-        let r = retry_summarization(
-            content.as_ref(),
-            &cancel,
-            &notify,
-            Some(&keys),
-            &mut || async { Ok("fine".to_string()) },
-        )
+        let r = retry_summarization(content.as_ref(), &cancel, &notify, None, &mut || async {
+            Ok("fine".to_string())
+        })
         .await;
         assert_eq!(r.unwrap(), "fine");
-        assert_eq!(
-            keys.ready_len(),
-            1,
-            "an inactive window must never read its source"
-        );
-        assert_eq!(keys.parked_len(), 0);
         assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// The real source on a test state: its manager carries no mode guard
-    /// (test states never install one), so the window is inactive (poll
-    /// yields nothing — stdin untouched), and the park round-trips in order:
-    /// that queue is what `read_input` drains.
+    /// The park round-trips in order through the queue `read_input` drains,
+    /// in the input channel's vocabulary.
     #[test]
-    fn appstate_window_gate_and_park_roundtrip() {
+    fn appstate_park_roundtrip() {
         let app_state = crate::app_state::AppState::for_test(test_settings());
-        assert!(!app_state.window_pump_active());
-        assert!(app_state.poll_key().is_none(), "inactive must not read");
         app_state.park_key(char_event('a'));
         app_state.park_key(char_event('b'));
-        // The park converts to the input channel's vocabulary —
-        // that queue is what `read_input` drains, and it speaks `InputEvent`.
         let expect = |c: char| {
             Some(InputEvent::Key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Char(c),

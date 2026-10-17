@@ -1645,13 +1645,13 @@ impl Repl {
                 session.prose.poll_timeout()
             };
             let ev: Option<InputEvent> = loop {
-                // Keys a window pump parked while nobody could read stdin
-                // (the compaction LLM window — `WindowKeySource`) dispatch
-                // exactly as if they arrived just now: same Resize
-                // handling, same Ctrl-C/Z below, one per iteration so the
-                // settle cadence is the typing cadence. Drain before
-                // blocking — parked events are older than anything still
-                // waiting in the tty.
+                // Keys a window pump parked while the REPL loop was
+                // suspended inside an LLM window (the compaction
+                // summarization — `WindowPump`) dispatch exactly as if they
+                // arrived just now: same Resize handling, same Ctrl-C/Z
+                // below, one per iteration so the settle cadence is the
+                // typing cadence. Drain before blocking — parked events are
+                // older than anything still waiting on the channel.
                 if let Some(parked) = app_state.take_parked_key() {
                     match parked {
                         InputEvent::Resize(size) => {
@@ -1693,7 +1693,7 @@ impl Repl {
                     // Ctrl-C: restore terminal, hard exit.
                     if let KeyCode::Char('c') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            content.manager.lock().unwrap().suspend();
+                            let _ = content.manager.lock().unwrap().suspend();
                             std::process::exit(1);
                         }
                     }
@@ -1703,7 +1703,7 @@ impl Repl {
                     // handled as a key event rather than relying on the kernel.
                     if let KeyCode::Char('z') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            content.manager.lock().unwrap().suspend();
+                            let _ = content.manager.lock().unwrap().suspend();
                             unsafe {
                                 libc::killpg(libc::getpgrp(), libc::SIGTSTP);
                             }
@@ -1711,7 +1711,7 @@ impl Repl {
                             // resumes here (in the main thread, a safe context)
                             // once the shell sends `SIGCONT`. Re-enter raw mode so
                             // the next keystroke is read correctly.
-                            content.manager.lock().unwrap().resume();
+                            let _ = content.manager.lock().unwrap().resume();
                         }
                     }
                     // The dispatcher. It answers with what *should* happen on

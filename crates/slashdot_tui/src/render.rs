@@ -715,26 +715,20 @@ impl RenderManager {
         self.draw.handles()
     }
 
-    /// Whether this terminal flips raw mode at all (TermIO's Tty, not Plain)
-    /// — what `$EDITOR` and the window pump ask before expecting a mode
-    /// turnover.
-    pub fn is_tty(&self) -> bool {
-        self.draw.is_tty()
-    }
-
     /// Raw mode off — the front door (design §Render: "suspend() stops the
     /// reader and drops raw mode ($EDITOR, Ctrl-Z)"), pass-through to
     /// `Draw`/`TermIO` — the only real implementation is `TermIO::suspend`,
     /// The reader-stop rides with the raw-mode drop.
-    /// Idempotent; a no-op on Plain.
-    pub fn suspend(&self) {
-        self.draw.suspend();
+    /// Idempotent. Plain reports `Unsupported` (no tty to hand over) — the
+    /// editor propagates it; teardown-style callers discard it.
+    pub fn suspend(&self) -> std::io::Result<()> {
+        self.draw.suspend()
     }
 
     /// Raw mode on — the reverse of [`Self::suspend`], and also the initial
     /// entry at prompt-loop startup. A no-op on Plain.
-    pub fn resume(&self) {
-        self.draw.resume();
+    pub fn resume(&self) -> std::io::Result<()> {
+        self.draw.resume()
     }
 
     /// Publish a settled size on the geometry watch (parked-key drains and

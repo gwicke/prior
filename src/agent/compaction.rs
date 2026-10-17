@@ -19,8 +19,8 @@
 //! Both write pi-format summary messages, so what lands in the session is
 //! what a pi session would have written.
 
-use super::pumps::{cancel_observed, cancellable_sleep_windowed, next_window_key, pump_window_key};
-use crate::app_state::{AppState, WindowKeySource};
+use super::pumps::{cancel_observed, cancellable_sleep_windowed, pump_window_step};
+use crate::app_state::{AppState, WindowPump};
 use crate::content::Content;
 use crate::session::Session;
 use std::path::Path;
@@ -291,7 +291,7 @@ async fn draft_at_pivot(
                 content.as_ref(),
                 &user_cancel,
                 &cancel_notify,
-                Some(app_state),
+                Some(WindowPump::open(app_state)),
                 &mut || a.summarize_with_session_context(session, &instruction),
             )
             .await
@@ -612,7 +612,7 @@ pub(crate) async fn generate_branch_summary(
                 content.as_ref(),
                 &user_cancel,
                 &cancel_notify,
-                Some(app_state),
+                Some(WindowPump::open(app_state)),
                 &mut || a.summarize(&prompt),
             )
             .await
@@ -756,16 +756,17 @@ pub(crate) async fn apply_branch_summary(
 /// cancel behaviour as a regular user prompt (`prompt()`'s retry loop in
 /// `run_interactive`).
 ///
-/// `keys` is the window pump's source (see [`WindowKeySource`]): while the
-/// caller awaits this future, the REPL loop is suspended inside `settle` and
-/// this future owns stdin — the persistent reader is paused
-/// for the window (`ReaderPauseGuard`), so *only* this future's pump reads it.
-/// The pump runs beside both phases: a root `Esc` cancels the in-flight
-/// attempt (the select arm fires the signal; the rig hook and this loop's
-/// `cancel_observed` both watch it) *and* any back-off
-/// (`cancellable_sleep_windowed`); other keys are parked for `read_input`'s
-/// next iteration. `None` (tests) and inactive windows (piped/batch) leave
-/// the arms pending — the signal-only behaviour, stdin untouched.
+/// `window` is the window pump (see [`WindowPump`]): while the caller awaits
+/// this future, the REPL loop is suspended inside `settle`, and the pump
+/// consumes the persistent reader's *divert* — the reader keeps sole
+/// ownership of stdin and forwards events to the window instead of the REPL
+/// channel for the window's lifetime. The pump runs beside both phases: a
+/// root `Esc` cancels the in-flight attempt (the select arm fires the
+/// signal; the rig hook and this loop's `cancel_observed` both watch it)
+/// *and* any back-off (`cancellable_sleep_windowed`); other keys are parked
+/// for `read_input`'s next iteration. `None` (tests, piped/batch — no
+/// reader to divert) leaves the arms pending — the signal-only behaviour,
+/// stdin untouched.
 ///
 /// `build` produces the summarization request and returns the model's reply
 /// (or a classified `PicocodeError`). On a retryable failure it is re-invoked
@@ -782,7 +783,7 @@ pub(crate) async fn retry_summarization<F, Fut>(
     content: &Content,
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
-    keys: Option<&dyn WindowKeySource>,
+    mut window: Option<WindowPump<'_>>,
     build: &mut F,
 ) -> std::result::Result<String, crate::PicocodeError>
 where
@@ -794,12 +795,9 @@ where
     // the same fresh-request rule; nothing else clears the flag on this
     // path (compaction runs between turns).
     user_cancel.store(false, Ordering::SeqCst);
-    // The compaction window reads stdin directly (via `WindowKeySource`), so
-    // the persistent reader must stand down for the whole
-    // window or the two would race for the same bytes — the reader would
-    // forward a key to the prompt queue the window cannot see. `keys: None`
-    // (tests, piped/batch) means nothing reads stdin, so no pause is needed.
-    let _reader_pause = keys.map(|_| crate::termio::ReaderPauseGuard::raise());
+    // No reader pause: the window does not read stdin — it consumes the
+    // reader's *divert* ([`WindowPump`]), so the two can never race. `window:
+    // None` (tests, piped/batch) is the plain signal-only wait.
     let mut consecutive_failures: u8 = 0;
     loop {
         // One attempt with the pump live beside it. The attempt future is
@@ -811,11 +809,9 @@ where
             tokio::select! {
                 r = &mut attempt => break Some(r),
                 _ = cancel_observed(user_cancel, cancel_notify) => break None,
-                ev = next_window_key(keys) => {
-                    if let Some(src) = keys {
-                        if pump_window_key(ev, src, user_cancel, cancel_notify) {
-                            break None;
-                        }
+                fired = pump_window_step(&mut window, user_cancel, cancel_notify) => {
+                    if fired {
+                        break None;
                     }
                 }
             }
@@ -833,7 +829,8 @@ where
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 let ms = retry_delay_ms(&e, consecutive_failures);
                 content.display_text(&format!("Error: {}. Retrying in {}s...", e, ms / 1000));
-                let slept = cancellable_sleep_windowed(user_cancel, cancel_notify, ms, keys).await;
+                let slept =
+                    cancellable_sleep_windowed(user_cancel, cancel_notify, ms, &mut window).await;
                 if !slept {
                     return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
                 }
