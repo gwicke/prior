@@ -525,8 +525,8 @@ impl TermIO {
     /// pause gate, waiting out its last poll — then drop raw mode, the
     /// order `$EDITOR`'s hand-off used to run by hand before folding into
     /// here. Idempotent; a no-op on Plain. Nested against an outer holder
-    /// (the compaction window, a DSR query): only the raise *this* call
-    /// made is remembered to lower — [`Self::resume`] releases exactly that.
+    /// (the compaction window): only the raise *this* call made is
+    /// remembered to lower — [`Self::resume`] releases exactly that.
     pub fn suspend(&self) -> io::Result<()> {
         match self {
             TermIO::Tty(t) => {
@@ -783,9 +783,10 @@ fn write_stdio(meta: bool, bytes: &[u8]) -> io::Result<()> {
 /// runs for the process lifetime — it, and only it, calls
 /// `event::poll`/`event::read`. The prompt loop and every in-flight turn
 /// consume the events it forwards instead of touching stdin, which is what
-/// removes the three-way race between the prompt's blocking reads, the turn's
-/// reader, and the DSR query (the last of which is answered by pausing this
-/// reader — see [`query_cursor_row`]).
+/// removes the three-way race between the prompt's reads, the turn's
+/// consumption, and the DSR query — the last of which this thread answers
+/// itself between polls (see [`TermIO::query_cursor_row`]), so no second
+/// reader ever exists to swallow a reply.
 ///
 /// In raw mode `event::read` is blocking, so a background thread is what sees
 /// `Ctrl-C`/`Ctrl-Z` arriving while the main task is parked on a turn. `Esc`
@@ -794,18 +795,24 @@ fn write_stdio(meta: bool, bytes: &[u8]) -> io::Result<()> {
 ///
 /// `guard` is `Arc` and `stop()` is process-wide, so calling it from this
 /// thread is safe. The process-wide pause gate ([`PAUSE_GATE`]) is raised
-/// by the main task whenever *it* owns stdin — `$EDITOR`'s takeover, a DSR
-/// query, or the compaction window — and while it is `true` this reader backs
-/// off (sleeps, does not read) so it cannot swallow the bytes the main task is
-/// waiting for; [`READER_PARKED`] signals that it has genuinely parked.
+/// by the main task whenever *it* owns stdin — `$EDITOR`'s takeover or the
+/// compaction window — and while it is `true` this reader backs off (sleeps,
+/// does not read) so it cannot swallow the bytes the main task is waiting
+/// for; [`READER_PARKED`] signals that it has genuinely parked. DSR queries
+/// need no pause: this thread answers them itself between polls.
 pub fn spawn_stdin_reader(
     guard: Arc<TermGuard>,
     input: UnboundedSender<InputEvent>,
     caret: UnboundedSender<CaretEvent>,
     size: watch::Sender<TermSize>,
 ) {
+    // Inbox first, then the running flag: a query that sees the flag must
+    // find the inbox (they are paired — the flag *is* "requests are
+    // serviceable here").
+    let (dsr_tx, dsr_rx) = std::sync::mpsc::channel::<DsrRequest>();
+    *DSR_INBOX.lock().unwrap_or_else(|e| e.into_inner()) = Some(dsr_tx);
     // A gate-raiser only waits for a park when a reader exists to park; set it
-    // before the thread starts so the entry-DSR's pause below sees it.
+    // before the thread starts so the first pause sees it.
     READER_RUNNING.store(true, Ordering::SeqCst);
     let _ = thread::spawn(move || loop {
         if RESUMED.swap(false, Ordering::SeqCst) {
@@ -819,16 +826,27 @@ pub fn spawn_stdin_reader(
             // post-resume key with the event still queued.
             let _ = caret.send(CaretEvent::Invalidated);
         }
-        // The main task owns stdin right now ($EDITOR, a DSR query, or the
-        // compaction window); back off so we don't consume the bytes it is
-        // waiting for. `READER_PARKED` tells a gate-raiser that we have
-        // left any in-flight poll and are genuinely not reading.
+        // The main task owns stdin right now ($EDITOR or the compaction
+        // window); back off so we don't consume the bytes it is waiting
+        // for. `READER_PARKED` tells a gate-raiser that we have left any
+        // in-flight poll and are genuinely not reading.
         if PAUSE_GATE.load(Ordering::SeqCst) {
             READER_PARKED.store(true, Ordering::SeqCst);
             thread::sleep(Duration::from_millis(10));
             continue;
         }
         READER_PARKED.store(false, Ordering::SeqCst);
+        // Service pending DSR requests: the sole stdin owner answers its own
+        // queries inline, between polls — no pause, no second reader. A
+        // request past its TTL is dropped unasked: the caller stopped
+        // waiting ([`TermIO::query_cursor_row`]'s budget), and answering
+        // now would only monopolize stdin for nobody.
+        while let Ok(req) = dsr_rx.try_recv() {
+            if req.created.elapsed() < DSR_REQUEST_TTL {
+                let row = query_real_cursor_row();
+                let _ = req.reply.send(row);
+            }
+        }
         if let Ok(true) = event::poll(Duration::from_millis(50)) {
             if let Ok(ev) = event::read() {
                 // Resize: *both* edges (design §TermIO). The
@@ -1041,13 +1059,14 @@ fn enable_output_processing() {
     }
 }
 
-// --- stdin ownership: the pause handshake + DSR -----------------------------
+// --- stdin ownership: the pause handshake -----------------------------------
 //
 // The persistent reader (the sole stdin owner) must stand down whenever the
-// *main* task reads stdin itself: a DSR reply, `$EDITOR`'s keystrokes, or the
-// compaction window's key pump. There is exactly one reader and one gate, so
-// the gate is process-wide — this is a mutual-exclusion flag, not per-instance
-// configuration like the size watch.
+// *main* task reads stdin itself: `$EDITOR`'s keystrokes or the compaction
+// window's key pump. DSR replies need no handshake — the reader answers its
+// own queries inline between polls. There is exactly one reader and one gate,
+// so the gate is process-wide — this is a mutual-exclusion flag, not
+// per-instance configuration like the size watch.
 
 /// Raised while the main task owns stdin; the persistent reader backs off
 /// (does not call `event::poll`/`read`) for as long as it is `true`.
@@ -1065,9 +1084,10 @@ pub static READER_PARKED: AtomicBool = AtomicBool::new(false);
 pub static READER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Pauses the persistent reader for a window in which the main task owns stdin
-/// and reads it directly — a DSR query, `$EDITOR`'s
-/// takeover, or the compaction window's key pump. Raising waits for the reader
-/// to actually park ([`READER_PARKED`]); dropping lowers the gate again.
+/// and reads it directly — `$EDITOR`'s takeover or the compaction window's
+/// key pump. (DSR needs no pause: the reader answers its own queries inline.)
+/// Raising waits for the reader to actually park ([`READER_PARKED`]);
+/// dropping lowers the gate again.
 ///
 /// Nesting-safe: if the gate is already up, this neither waits nor lowers — the
 /// outer holder owns the pause.
@@ -1110,14 +1130,78 @@ impl Drop for ReaderPauseGuard {
     }
 }
 
-/// The cursor row from a DSR query, answered with the reader paused so the
-/// reply cannot be swallowed. This is the *whole* of the
-/// terminal-I/O-layer DSR: pause dispatch, write the query, match the reply.
-/// Edge-internal (design §TermIO): the answer syncs the draw cache and never
-/// travels beyond it.
-pub(crate) fn query_cursor_row() -> Option<usize> {
-    let _pause = ReaderPauseGuard::raise();
-    query_real_cursor_row()
+/// How long a DSR request may sit before the reader must not service it
+/// anymore: the caller's [`Self::query_cursor_row`] gives up by then, so a
+/// late round-trip would only monopolize stdin for nobody.
+const DSR_REQUEST_TTL: Duration = Duration::from_millis(150);
+
+/// The caller's wait budget — one reader poll (50 ms) plus one scan
+/// (60 ms) plus slack. Generous over [`DSR_REQUEST_TTL`] so an expired
+/// request is always discarded before or as the caller stops caring.
+const DSR_REPLY_WAIT: Duration = Duration::from_millis(220);
+
+/// A pending DSR request from the main task. The reader services it inline
+/// between polls (design §TermIO: the sole stdin owner answers its own
+/// queries), discarding it if [`DSR_REQUEST_TTL`] has run out — the caller
+/// has stopped waiting by then.
+struct DsrRequest {
+    created: Instant,
+    reply: std::sync::mpsc::Sender<Option<usize>>,
+}
+
+/// The reader thread's DSR inbox, registered by [`spawn_stdin_reader`].
+/// Process-wide because the reader is: one reader, one inbox.
+static DSR_INBOX: std::sync::Mutex<Option<std::sync::mpsc::Sender<DsrRequest>>> =
+    std::sync::Mutex::new(None);
+
+impl TermIO {
+    /// The cursor row from a DSR query — edge-internal (design §TermIO):
+    /// the answer syncs the draw cache and never travels beyond it.
+    ///
+    /// Two shapes, and which one runs is the sole-ownership invariant:
+    ///
+    /// - **Reader running (the normal interactive case):** a request into
+    ///   the reader's [`DSR_INBOX`]; the reader writes the query and reads
+    ///   its own reply between polls, so no second stdin reader exists to
+    ///   swallow the answer. The main task just waits on the channel.
+    /// - **No reader** — Plain, a recording double, a test state, or the
+    ///   entry window before [`Self::handles`] spawns the thread: Plain and
+    ///   the doubles answer `None` (no terminal behind this edge, and a
+    ///   pipe must never receive a stray `ESC[6n`); Tty scans directly, the
+    ///   main task being the one and only stdin reader until the spawn.
+    ///
+    /// A gated reader (an `$EDITOR` takeover or a compaction window owns
+    /// stdin) does not service requests — it cannot read them — so the
+    /// caller times out to `None`, the same "no new information" a silent
+    /// terminal produces.
+    pub(crate) fn query_cursor_row(&self) -> Option<usize> {
+        match self {
+            TermIO::Plain(_) => None,
+            TermIO::Tty(_) => {
+                if !READER_RUNNING.load(Ordering::SeqCst) {
+                    return query_real_cursor_row();
+                }
+                let (tx, rx) = std::sync::mpsc::channel();
+                let queued = DSR_INBOX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|inbox| {
+                        inbox
+                            .send(DsrRequest {
+                                created: Instant::now(),
+                                reply: tx,
+                            })
+                            .ok()
+                    })
+                    .is_some();
+                if !queued {
+                    return None;
+                }
+                rx.recv_timeout(DSR_REPLY_WAIT).ok().flatten()
+            }
+        }
+    }
 }
 
 /// Whether the persistent stdin reader is currently paused (the main task owns
@@ -1130,8 +1214,10 @@ pub fn reader_paused() -> bool {
 /// Non-blocking Device Status Report: ask the terminal for the real cursor
 /// row, timing out fast so we never hang on a terminal that does not answer
 /// (e.g. a headless test pty). Returns a 1-indexed row. Reads the reply raw
-/// (bypassing crossterm's event parser). Callers should already hold the pause
-/// ([`query_cursor_row`]) — this is the raw read.
+/// (bypassing crossterm's event parser). The caller must be the sole stdin
+/// reader for the duration: the reader thread itself (between polls — no
+/// pause exists or is needed), or the main task in the pre-spawn entry
+/// window, when no reader exists yet.
 fn query_real_cursor_row() -> Option<usize> {
     let stdin = io::stdin();
     let fd = stdin.as_raw_fd();

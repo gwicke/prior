@@ -843,16 +843,12 @@ impl RenderManager {
         render(&self.stack, &heights, tw)
     }
 
-    /// Re-anchor the live-screen cache to the real cursor (DSR): the query
-    /// goes through `termio` — the sole stdin owner pauses around the reply,
-    /// so it is answered *inside* the terminal layer as the design's §TermIO
-    /// asks — and the answer syncs the draw cache.
-    ///
-    /// The answer is consumed here — the row does not travel beyond the edge
-    /// (design §TermIO), so this returns nothing.
+    /// Re-anchor the live-screen cache to the real cursor (DSR): the whole
+    /// round-trip is Draw/TermIO's (the sole stdin owner answers the query),
+    /// so this is a pure front-door pass-through — the answer never leaves
+    /// the edge (design §TermIO).
     pub fn reanchor(&mut self) {
-        let row = crate::termio::query_cursor_row();
-        self.draw.reanchor_to_cursor(row)
+        self.draw.reanchor()
     }
 
     /// The size the **last frame applied through this hub** took — the one

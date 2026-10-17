@@ -689,8 +689,8 @@ fn erase_down(s: &mut String, h: usize) {
     }
 }
 
-// The DSR query lives in `crate::termio` (the sole stdin owner): it pauses
-// the reader around the query so the reply cannot be swallowed.
+// The DSR query lives in `crate::termio` (the sole stdin owner answers it
+// inline between polls, or no reader exists yet to race).
 // `Draw::reanchor_to_cursor` takes the answer as a parameter.
 
 // --- the live screen --------------------------------------------------------
@@ -934,14 +934,19 @@ impl Draw {
     }
 
     /// Sync the tracked row with the terminal's real cursor and write any
-    /// re-anchor bytes. The DSR answer is consumed here: it does not travel
-    /// beyond the edge.
-    ///
-    /// `row` is the DSR answer the caller already obtained (via
-    /// `termio::query_cursor_row`, which pauses the sole stdin owner around the
-    /// query). Passing `None` (a terminal that did not answer)
-    /// is "no new information": `reanchor` invalidates only on disagreement (a
-    /// foreign cursor, a reflow), never on a silent terminal (ui_draw_261001).
+    /// re-anchor bytes — the DSR round-trip lives entirely at the edge: the
+    /// query goes to [`TermIO`](crate::termio::TermIO) (the sole stdin owner
+    /// answers it, or no reader exists to race), and the answer is consumed
+    /// by the cache here. It never travels beyond this type.
+    pub fn reanchor(&mut self) {
+        let row = self.term_io.query_cursor_row();
+        self.reanchor_to_cursor(row);
+    }
+
+    /// Apply a DSR answer to the cache and write the re-anchor bytes.
+    /// `None` (a terminal that did not answer) is "no new information":
+    /// `reanchor` invalidates only on disagreement (a foreign cursor, a
+    /// reflow), never on a silent terminal (ui_draw_261001).
     ///
     /// The re-anchor erases the live frame's rows, which is why it writes
     /// bytes: a resize or a foreign writer can leave the cursor outside the
@@ -951,7 +956,7 @@ impl Draw {
     /// is live — every streamed block, and every commit — because the bytes
     /// are then just the cursor park. So it lives here, with the sink: every
     /// caller treats it as a side-effecting re-anchor, and none of them writes.
-    pub fn reanchor_to_cursor(&mut self, row: Option<usize>) {
+    fn reanchor_to_cursor(&mut self, row: Option<usize>) {
         let (_, bytes) = {
             // Same floors the `output::term_width` free function applies: the
             // 20-column floor is load-bearing for `plan_apply` when the

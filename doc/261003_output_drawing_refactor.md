@@ -301,10 +301,13 @@ impl TermIO {
 - keys / paste → the `input` channel (repl pumps: `read_input` at the prompt, the turn's select
   during a turn)
 - Ctrl-C / Ctrl-Z handled here — process lifecycle, never queued
-- DSR cursor queries answered internally: pause dispatch, write the query, match the reply. Only for
-  exceptional events (startup, resume, reflow) — never per render. This replaces `confirm_gate` /
-  `reader_paused` entirely (including `$EDITOR`'s hand-off); all five `Output::cursor_row()`
-  re-anchor sites (repl ×4, editor ×1) dissolve into it.
+- DSR cursor queries answered internally — **by the reader itself, between polls**: the main task
+  posts a request to the reader's inbox and waits on the reply channel (bounded wait; an expired
+  request is dropped unasked), so no second stdin reader ever exists to swallow the answer and the
+  query needs no pause. Before the reader is spawned (the entry window) the main task is the sole
+  reader and scans directly; Plain answers `None` without touching stdin. Only for exceptional
+  events (startup, resume, reflow) — never per render. All `RenderManager::reanchor` sites
+  (repl ×4, editor ×1, caret invalidation) are front-door calls whose answer never leaves Draw.
 - `suspend()` stops the reader and drops raw mode ($EDITOR, Ctrl-Z); `resume()` reverses it. Upper
   layers reach it only through the RenderManager / Draw pass-throughs. The mode guard's own escapes
   (bracketed paste, kitty keyboard, cursor) are primary-stream writes: emitted only when the primary

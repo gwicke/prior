@@ -344,25 +344,19 @@ impl Interactive {
         // owning stdin for the process lifetime. It forwards keys/paste on
         // this channel; the prompt loop and every turn consume the receiver
         // half. The reader backs off whenever the main task owns stdin —
-        // `$EDITOR`, a DSR query, or the compaction window — via the pause
-        // gate (`termio::PAUSE_GATE`), the one flag `ReaderPauseGuard` and
-        // `TermIO::suspend` raise.
+        // `$EDITOR` or the compaction window — via the pause gate
+        // (`termio::PAUSE_GATE`), the one flag `ReaderPauseGuard` and
+        // `TermIO::suspend` raise. DSR needs no gate: from here on the reader
+        // answers those itself.
         //
-        // The guard is raised *before* `handles()` so the reader starts parked
-        // and cannot consume the entry DSR's reply: the draw cache is anchored
-        // (`run_entry_dsr`) while nothing reads stdin, then the guard drops —
-        // lowering the gate — and the reader takes over for the prompt.
-        // Without this ordering the reader's first poll would swallow the
-        // terminal's cursor-position report before `reanchor` could read it.
-        // The guard is the front door for this window: nesting-safe,
-        // and it lowers on drop, so an early return can no longer leak the
-        // gate up. The reader isn't running yet when it is raised (the thread
-        // starts inside `handles()` below), so the raise is instant.
+        // The entry DSR runs *before* `handles()` spawns the reader, so the
+        // main task is then the one and only stdin reader — the reply cannot
+        // be swallowed and no pause is needed (the old raise-before-spawn
+        // dance, gone). Ordering with raw mode is still resume → banner →
+        // DSR: the reply is not echoed and the terminal can answer.
         let handles = if use_repl {
-            let _pause = crate::termio::ReaderPauseGuard::raise();
-            let handles = config.content.manager.lock().unwrap().handles();
             crate::repl::run_entry_dsr(config.content.as_ref());
-            handles
+            config.content.manager.lock().unwrap().handles()
         } else {
             // Plain (piped/quiet): no reader, and `handles()`' input channel
             // arrives closed — the shape piped mode had when it dropped the
