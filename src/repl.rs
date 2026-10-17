@@ -29,7 +29,6 @@ use crate::termio::InputEvent;
 use crossterm::event::{self, KeyCode, KeyModifiers};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1075,9 +1074,7 @@ impl PromptSession {
         let current = self.editor.lock().unwrap().text();
         match run_editor(content, &current, EditorMode::Edit) {
             Ok(new_text) => self.editor.lock().unwrap().set(&new_text),
-            Err(e) => {
-                let _ = io::stdout().write_all(format!("\r\neditor error: {}\r\n", e).as_bytes());
-            }
+            Err(e) => content.display_error(&format!("editor: {}", e)),
         }
     }
 
@@ -1592,18 +1589,16 @@ impl Repl {
                 // change makes a reflowing terminal (wezterm) re-wrap the
                 // painted frame, stacking wrapped copies of the input and
                 // overlay that no clear can locate precisely. Instead:
-                // wipe everything from the cursor down (the reflow leaves
-                // it at the end of the content — the best possible
-                // starting point), replay the last turn through the normal
-                // scrollback (pushing any corruption above the fold), then
-                // re-anchor; `settle`'s paint below repaints the input.
-                // Skipped without a session — nothing to replay and usually
-                // nothing to clear up. Height-only changes don't re-wrap,
-                // so they keep the cheap re-anchor path.
+                // replay the last turn through the normal scrollback — the
+                // hub merge consumes the (fictional) live frame and pushes
+                // any reflow corruption above the fold — then re-anchor;
+                // `settle`'s paint below repaints the input. No wipe of
+                // its own: that erase is frame choreography and the frame
+                // path owns it. Skipped without a session — nothing to
+                // replay. Height-only changes don't re-wrap, so they keep
+                // the cheap re-anchor path.
                 if cur_w != painted_w {
                     if let Some(s) = app_state.session() {
-                        let _ = io::stdout().write_all(b"\x1b[0J");
-                        let _ = io::stdout().flush();
                         crate::agent::replay::replay_last_turn_silent(&s, content).await;
                     }
                 }

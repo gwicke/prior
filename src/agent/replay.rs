@@ -409,6 +409,37 @@ pub(crate) fn replay_last_turns(content: &Content, units: &[ReplayUnit], n: usiz
     replay_units(content, units, start);
 }
 
+/// Replay all of `units` into a capture and display the last `n` lines —
+/// the `Nl` replay shape (`/ll`, resume). The captured bytes are
+/// post-chain (already wrapped and boundary-processed), so they must not
+/// re-enter the content chain: they go straight to the hub as one block,
+/// where the strip edge (a pipe) and the frame choreography (a tty) both
+/// apply (design §TermIO: every byte to the sink rides the edge).
+pub(crate) fn replay_tail_lines(content: &Content, units: &[ReplayUnit], n: usize) {
+    content.begin_capture();
+    replay_units(content, units, 0);
+    let bytes = content.end_capture();
+    let captured = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = captured.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    if start >= lines.len() {
+        return;
+    }
+    let mut tail = Vec::new();
+    for line in &lines[start..] {
+        tail.extend_from_slice(line.as_bytes());
+        tail.push(b'\n');
+    }
+    content
+        .manager
+        .lock()
+        .unwrap()
+        .render_content(crate::render::ContentWrite {
+            bytes: tail,
+            stream: crate::termio::Stream::Content,
+        });
+}
+
 /// Parse a replay-length argument: plain number `N`, `Nt` (turns), or `Nl`
 /// (lines).  Returns `(count, is_lines)`.  An empty/whitespace input returns
 /// `(default, false)`.
@@ -445,19 +476,7 @@ pub(crate) async fn handle_replay(arg: &str, session: &crate::session::Session, 
             if total == 0 {
                 content.display_text("Session is empty");
             } else {
-                content.begin_capture();
-                replay_units(content, &units, 0);
-                let bytes = content.end_capture();
-                let captured = String::from_utf8_lossy(&bytes);
-                let lines: Vec<&str> = captured.lines().collect();
-                let start = lines.len().saturating_sub(n);
-                use std::io::Write as _;
-                let stdout = std::io::stdout();
-                let mut handle = stdout.lock();
-                for line in &lines[start..] {
-                    let _ = writeln!(handle, "{}", line);
-                }
-                let _ = handle.flush();
+                replay_tail_lines(content, &units, n);
             }
         } else {
             replay_units(content, &units, 0);
