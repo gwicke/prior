@@ -58,9 +58,6 @@ pub struct Content {
     /// the content path's width reads and the frame path's geometry cannot
     /// disagree. In tests, a private seeded one.
     pub(crate) size: watch::Receiver<TermSize>,
-    /// Per-stream capabilities, probed once at `TermIO` construction: colour
-    /// reads this instead of calling `is_terminal()` per site.
-    pub(crate) caps: crate::termio::Caps,
     /// Incremental GFM markdown parser for the current response (TTY only).
     pub(crate) parser: Mutex<StreamParser>,
     /// Incremental terminal renderer (TTY only) for the answer.
@@ -131,11 +128,12 @@ enum InputSource {
 
 impl Content {
     /// Build the content half from its per-process inputs: the terminal
-    /// backend (constructed first at setup, so *it* seeds both facts content
-    /// used to gather itself: the caps it probed, and the size watch
-    /// it owns). The frame hub is built from the same watch and takes the
-    /// `TermIO` under `Draw` — one wiring point, one geometry source; the
-    /// renderers start blank at a placeholder width.
+    /// backend (constructed first at setup, so *it* owns the size watch this
+    /// handle subscribes to). The frame hub is built from the same watch and
+    /// takes the `TermIO` under `Draw` — one wiring point, one geometry
+    /// source; the renderers start blank at a placeholder width. Caps never
+    /// reach this layer: content always renders styled, and `TermIO` strips
+    /// per stream at the edge.
     pub fn new(term_io: TermIO, show_reasoning: ShowReasoningHandle) -> Self {
         let size = term_io.subscribe_size();
         Self::new_from(term_io, size, show_reasoning)
@@ -176,7 +174,6 @@ impl Content {
         size: watch::Receiver<TermSize>,
         show_reasoning: ShowReasoningHandle,
     ) -> Self {
-        let caps = term_io.caps();
         // The hub is born with its geometry and its budget ratio:
         // `configure` is the ratio's home, and this is the one wiring point.
         let manager = Arc::new(Mutex::new(crate::render::RenderManager::new(
@@ -195,11 +192,10 @@ impl Content {
         Self {
             manager,
             size,
-            caps,
             parser: Mutex::new(StreamParser::new_gfm_stream()),
-            renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
+            renderer: Mutex::new(Renderer::new(answer_theme(), 80)),
             thinking_parser: Mutex::new(StreamParser::new_gfm_stream()),
-            thinking_renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
+            thinking_renderer: Mutex::new(Renderer::new(Theme::dimmed(), 80)),
             show_reasoning,
             last_tool: Mutex::new(None),
             boundary: ContentBoundary::new(),
@@ -758,7 +754,7 @@ impl Content {
     pub(crate) fn reset_renderer_gaps(&self) {
         let width = self.width();
         let mut renderer = self.renderer.lock().unwrap();
-        *renderer = Renderer::new(answer_theme(self.caps.primary), width);
+        *renderer = Renderer::new(answer_theme(), width);
         let mut trenderer = self.thinking_renderer.lock().unwrap();
         *trenderer = Renderer::new(Theme::dimmed(), width);
     }
@@ -912,8 +908,7 @@ impl Content {
         // reads as a distinct block. The command itself is syntax-highlighted
         // through the same formatter the answer/result path uses (flushed per
         // block via a fresh fenced code render).
-        let color = self.caps.primary;
-        let label_styled = highlight_code_fg(&label, command_lang(name), color, self.width());
+        let label_styled = highlight_code_fg(&label, command_lang(name), self.width());
         self.paint_panel(&label_styled, false);
         for line in &extra {
             self.tool_panel(line, false, true);
@@ -1043,10 +1038,9 @@ impl Content {
                     v.get("lines").and_then(|x| x.as_u64()),
                 ) {
                     // Show the path as a header with line count
-                    let color = self.caps.primary;
                     let lang = guess_lang(path);
                     let header = format!("write {} [{} lines]", path, total_lines);
-                    let header_styled = highlight_code_fg(&header, "bash", color, self.width());
+                    let header_styled = highlight_code_fg(&header, "bash", self.width());
                     self.paint_panel(&header_styled, true);
 
                     // Render the content with syntax highlighting (like read_file)
@@ -1059,7 +1053,7 @@ impl Content {
                             break;
                         }
                         for wline in wrap(line, inner) {
-                            let styled = highlight_code_fg(&wline, lang, color, self.width());
+                            let styled = highlight_code_fg(&wline, lang, self.width());
                             self.paint_panel(&styled, true);
                         }
                     }
@@ -1082,7 +1076,6 @@ impl Content {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let color = self.caps.primary;
         // Error output is shown verbatim (red). Everything else is highlighted:
         // `read_file` output is colored by the file's guessed language, bash
         // command output gets token highlighting, and other tools' output is
@@ -1126,7 +1119,7 @@ impl Content {
                 } else {
                     // Syntax-highlight through the result-path formatter, then
                     // layer the grey tool panel on top (flushed per line).
-                    let styled = highlight_code_fg(&wline, lang, color, self.width());
+                    let styled = highlight_code_fg(&wline, lang, self.width());
                     self.paint_panel(&styled, true);
                 }
             }
@@ -1169,8 +1162,7 @@ impl Content {
     }
 
     pub(crate) fn display_markdown(&self, text: &str) {
-        let color = self.caps.primary;
-        let rendered = render_markdown(text, self.width(), color);
+        let rendered = render_markdown(text, self.width());
         let mut block = String::with_capacity(rendered.len() + 1);
         block.push_str(&rendered);
         block.push('\n');
@@ -1235,7 +1227,7 @@ impl Content {
         // incremental renderer, where the separator bugs live, went untested.
         // Colour still follows the terminal: that is a property of the bytes,
         // not of the render path.
-        let theme = answer_theme(self.caps.primary);
+        let theme = answer_theme();
         let current_width = self.width();
         let mut parser = self.parser.lock().unwrap();
         *parser = StreamParser::new_gfm_stream();
@@ -1479,10 +1471,8 @@ impl Content {
         // call half, and so the diff, is gone, but the report is still per
         // file and still needs its path to attribute a failure.
         if let Some(files) = blockedit::parse_file_results(result) {
-            let color = self.caps.primary;
             for fr in files {
-                let label =
-                    highlight_code_fg(&format!("edit {}", fr.path), "bash", color, self.width());
+                let label = highlight_code_fg(&format!("edit {}", fr.path), "bash", self.width());
                 self.paint_panel(&label, true);
                 let single = match &fr.result {
                     Value::String(s) => s.clone(),
@@ -2242,7 +2232,7 @@ mod tests {
         events.extend(parser.flush());
         // The same theme production builds the answer renderer with, or its
         // styling would look like host contribution.
-        let mut r = Renderer::new(answer_theme(false), 80);
+        let mut r = Renderer::new(answer_theme(), 80);
         let mut out: Vec<u8> = Vec::new();
         let _ = r.feed(&events, &mut out);
         String::from_utf8_lossy(&out).into_owned()
@@ -3109,13 +3099,12 @@ mod tests {
     }
 
     #[test]
-    fn render_markdown_gfm_table_is_ansi_free_and_boxed() {
-        let out = render_markdown("| a | b |\n|---|---|\n| 1 | 2 |\n", 80, false);
-        assert!(!out.contains('\x1b'), "no_color output must be ANSI-free");
+    fn render_markdown_gfm_table_is_boxed() {
+        let out = render_markdown("| a | b |\n|---|---|\n| 1 | 2 |\n", 80);
         assert!(out.contains('│'), "table needs column separators");
         assert!(out.contains('├'), "table needs a header rule");
         assert!(out.contains('┤'));
-        assert!(out.contains('1') && out.contains('2'));
+        assert!(strip_ansi(&out).contains('1') && strip_ansi(&out).contains('2'));
     }
 
     /// Strip ANSI SGR sequences so we can assert the *highlighted* output still
@@ -3149,36 +3138,25 @@ mod tests {
     }
 
     #[test]
-    fn render_markdown_code_is_syntax_highlighted_when_colored() {
+    fn render_markdown_code_is_syntax_highlighted() {
         let src = "```rust\nfn main() {}\n```\n";
-        let colored = render_markdown(src, 80, true);
-        // Highlighting enabled on the terminal path: SGR codes wrap the tokens.
+        let out = render_markdown(src, 80);
+        // SGR codes wrap the tokens: content always renders for a terminal.
         assert!(
-            colored.contains('\x1b'),
-            "color path must enable syntax highlighting (ANSI present)"
+            out.contains('\x1b'),
+            "rendering must enable syntax highlighting (ANSI present)"
         );
-        // Stripping ANSI must recover the source text (no content lost).
+        // Stripping ANSI must recover the source text (no content lost) — the
+        // edge's contract once `TermIO` strips for a pipe.
         assert!(
-            strip_ansi(&colored).contains("fn main()"),
+            strip_ansi(&out).contains("fn main()"),
             "highlighting must preserve the source code"
         );
     }
 
     #[test]
-    fn render_markdown_code_has_no_ansi_when_plain() {
-        let src = "```rust\nfn main() {}\n```\n";
-        let plain = render_markdown(src, 80, false);
-        assert!(
-            !plain.contains('\x1b'),
-            "non-terminal path must stay ANSI-free"
-        );
-        assert!(plain.contains("fn main()"));
-    }
-
-    #[test]
     fn render_markdown_heading_and_blockquote_keep_text() {
-        let out = render_markdown("# Title\n> quoted", 80, false);
-        assert!(!out.contains('\x1b'));
+        let out = strip_ansi(&render_markdown("# Title\n> quoted", 80));
         assert!(out.contains("Title"));
         assert!(out.contains('│') && out.contains("quoted"));
     }
@@ -3234,20 +3212,15 @@ mod tests {
     }
 
     #[test]
-    fn render_markdown_emits_osc8_links_only_when_colored() {
-        // `color` is `is_terminal()` in callers, so OSC 8 clickable links must
-        // appear on a TTY (color = true) and stay absent for pipes/CI.
-        let tty = render_markdown("[text](https://example.com/a)", 80, true);
+    fn render_markdown_emits_osc8_links() {
+        // Content always renders clickable links; the edge strips them per
+        // stream when the target is not a terminal (`TermIO::write`).
+        let out = render_markdown("[text](https://example.com/a)", 80);
         assert!(
-            tty.contains("\x1b]8;;https://example.com/a\x1b\\"),
-            "TTY render must wrap link in OSC 8"
+            out.contains("\x1b]8;;https://example.com/a\x1b\\"),
+            "render must wrap link in OSC 8"
         );
-        assert!(tty.contains("text"));
-        let piped = render_markdown("[text](https://example.com/a)", 80, false);
-        assert!(
-            !piped.contains("\x1b]8;;"),
-            "non-TTY render must not emit OSC 8 hyperlink sequences"
-        );
+        assert!(out.contains("text"));
     }
 
     #[test]
@@ -3946,20 +3919,15 @@ mod tests {
         assert_eq!(guess_lang("src/output.rs"), "rust");
         assert_eq!(guess_lang("a/b.py"), "python");
         assert_eq!(guess_lang("x.unknown"), "text");
-        // highlighting: colored path keeps the source text and emits ANSI
-        let colored = highlight_code_fg("let x = 1;", "rust", true, 80);
+        // highlighting: keeps the source text and emits ANSI
+        let colored = highlight_code_fg("let x = 1;", "rust", 80);
         // ANSI escapes break the literal substring, so strip them first
         let plain = strip_ansi(&colored);
         assert!(
             plain.contains("let x = 1;"),
             "highlighting must not drop content; got plain={plain:?} from colored={colored:?}"
         );
-        assert!(colored.contains('\x1b'), "color path must emit ANSI");
-        // non-color path returns the line untouched
-        assert_eq!(
-            highlight_code_fg("let x = 1;", "rust", false, 80),
-            "let x = 1;"
-        );
+        assert!(colored.contains('\x1b'), "highlighting must emit ANSI");
     }
 
     #[test]
