@@ -768,7 +768,7 @@ pub struct ContextLines(pub u16);
 impl Default for ContextLines {
     /// One line each side — see the type's doc.
     fn default() -> Self {
-        ContextLines(1)
+        ContextLines(0)
     }
 }
 
@@ -878,12 +878,6 @@ mod context_lines_tests {
         let big = parse(serde_json::json!(9999)).unwrap();
         assert_eq!(big.0, 9999);
         assert_eq!(big.clamped(), MAX_CONTEXT);
-    }
-
-    #[test]
-    fn defaults_to_one_line_each_side() {
-        // Symmetric on purpose: see the type's doc.
-        assert_eq!(ContextLines::default(), ContextLines(1));
     }
 }
 

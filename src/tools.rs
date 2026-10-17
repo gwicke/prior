@@ -599,8 +599,8 @@ returns ONE batch, cut at a file boundary and saying so: when the summary says `
 apply the batch, then run the same call again for the rest. Re-running is how a wide \
 refactor finishes, and it costs nothing to re-run on a tree that is already \
 done — you get `no lines matched` back. \
-**Syntax**: One expression per line, GNU sed syntax (s///, d, a, i, c, \
-y///, addresses, ranges) — `c` works over an address range, replacing it with one copy of the \
+**Syntax**: One expression per line, GNU `sed -f` syntax without shell escapes: s///, d, a, i, c, \
+y///, addresses, ranges — `c` works over an address range, replacing it with one copy of the \
 text. `w`, `e` and `q` are refused: use the `edit` or (very carefully) `bash` tools for those.",
     required(path, expressions)
 )]
