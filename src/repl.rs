@@ -54,11 +54,11 @@ static ENTRY_DSR_DONE: AtomicBool = AtomicBool::new(false);
 /// terminal's reply (or a test harness's pre-written one) is not swallowed by
 /// the reader's first poll. Idempotent via [`ENTRY_DSR_DONE`], so
 /// `read_input`'s own entry check becomes a no-op. The caller side takes the
-/// content handle (the query is the manager's `cursor_row`); the *answer*
+/// content handle (the query is the manager's `reanchor`); the *answer*
 /// lives inside `TermIO`.
 pub(crate) fn run_entry_dsr(content: &Content) {
     if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
-        let _ = content.manager.lock().unwrap().cursor_row();
+        content.manager.lock().unwrap().reanchor();
     }
 }
 
@@ -1151,7 +1151,7 @@ impl PromptSession {
                 // bare membership; this just applies it.
                 paint_prompt(content);
                 content.display_text(&message);
-                let _ = content.manager.lock().unwrap().cursor_row();
+                content.manager.lock().unwrap().reanchor();
             }
         }
         self.sync_selection();
@@ -1492,7 +1492,7 @@ impl Repl {
         // First prompt of the process only — every later prompt's tracked row
         // is measured from the bytes it wrote (see `ENTRY_DSR_DONE`).
         if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
-            let _ = content.manager.lock().unwrap().cursor_row();
+            content.manager.lock().unwrap().reanchor();
         }
         // Refresh the menu-facing view from this cycle's context. The loop
         // is the sole writer of these display fields (one acquisition);
@@ -1607,7 +1607,7 @@ impl Repl {
                         crate::agent::replay::replay_last_turn_silent(&s, content).await;
                     }
                 }
-                let _ = content.manager.lock().unwrap().cursor_row();
+                content.manager.lock().unwrap().reanchor();
             }
             // (The watch is already in sync — `probe_size` published as it
             // answered; the explicit `set_size` call this used to carry

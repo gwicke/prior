@@ -13,7 +13,7 @@
 //! writes, `Error` from the error path — `TermIO` routes kind → sink, so
 //! nothing above it forks on where the bytes land.
 //! Of the frame *verbs*, `frame_size` lives here (the watch this handle
-//! carries *is* the dims source), `painted_size` and `cursor_row` are the
+//! carries *is* the dims source), `painted_size` and `reanchor` are the
 //! manager's, and `draw_frame` — the test drivers' edge — is the manager's too.
 
 use std::io;

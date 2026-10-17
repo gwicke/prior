@@ -933,8 +933,9 @@ impl Draw {
         self.cache.note_lines(n, h);
     }
 
-    /// Sync the tracked row with the terminal's real cursor, write any
-    /// re-anchor bytes, and return the row to use.
+    /// Sync the tracked row with the terminal's real cursor and write any
+    /// re-anchor bytes. The DSR answer is consumed here: it does not travel
+    /// beyond the edge.
     ///
     /// `row` is the DSR answer the caller already obtained (via
     /// `termio::query_cursor_row`, which pauses the sole stdin owner around the
@@ -942,7 +943,7 @@ impl Draw {
     /// is "no new information": `reanchor` invalidates only on disagreement (a
     /// foreign cursor, a reflow), never on a silent terminal (ui_draw_261001).
     ///
-    /// The re-anchor erases the live frame's rows, which is why it returns
+    /// The re-anchor erases the live frame's rows, which is why it writes
     /// bytes: a resize or a foreign writer can leave the cursor outside the
     /// block, and the relative walks the frame path uses cannot reach rows
     /// above the cursor from there. This is the one absolute address in a
@@ -950,8 +951,8 @@ impl Draw {
     /// is live — every streamed block, and every commit — because the bytes
     /// are then just the cursor park. So it lives here, with the sink: every
     /// caller treats it as a side-effecting re-anchor, and none of them writes.
-    pub fn reanchor_to_cursor(&mut self, row: Option<usize>) -> usize {
-        let (row, bytes) = {
+    pub fn reanchor_to_cursor(&mut self, row: Option<usize>) {
+        let (_, bytes) = {
             // Same floors the `output::term_width` free function applies: the
             // 20-column floor is load-bearing for `plan_apply` when the
             // geometry is still uninitialized.
@@ -960,7 +961,6 @@ impl Draw {
                 .reanchor(row, size.width.max(20), size.height.max(1))
         };
         self.write_bytes(bytes.as_bytes());
-        row
     }
 
     /// The size of the last frame actually applied — what a painter compares
@@ -1133,7 +1133,7 @@ mod apply_tests {
         // Erase the block's rows where they are, then park on the new row.
         assert_eq!(cups(&clear), vec!["5;1", "6;1", "9;1"], "{clear:?}");
         // And with no frame live it is only the cursor park — which is why it is
-        // safe to run on every `cursor_row()` call, including mid-stream.
+        // safe to run on every `reanchor()` call, including mid-stream.
         let mut idle = DrawCache::new(24);
         let (_, park) = idle.reanchor(Some(7), 20, 24);
         assert_eq!(cups(&park), vec!["7;1"], "{park:?}");

@@ -703,7 +703,7 @@ impl RenderManager {
             }
         }
         if invalidated {
-            let _ = self.cursor_row();
+            self.reanchor();
         }
     }
 
@@ -755,7 +755,7 @@ impl RenderManager {
     /// The drawing edge, for the test seams that read *past* this manager
     /// (`cache.applied`, and `term_io.recorded` for the byte edge). Production
     /// reaches the edge through this manager's own verbs — `render`,
-    /// `cursor_row`, `painted_size`, `draw_frame` (content writes go through
+    /// `reanchor`, `painted_size`, `draw_frame` (content writes go through
     /// `render_content`). Test-only: the host's row-accounting and byte-edge
     /// tests reach through it.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -847,7 +847,10 @@ impl RenderManager {
     /// goes through `termio` — the sole stdin owner pauses around the reply,
     /// so it is answered *inside* the terminal layer as the design's §TermIO
     /// asks — and the answer syncs the draw cache.
-    pub fn cursor_row(&mut self) -> usize {
+    ///
+    /// The answer is consumed here — the row does not travel beyond the edge
+    /// (design §TermIO), so this returns nothing.
+    pub fn reanchor(&mut self) {
         let row = crate::termio::query_cursor_row();
         self.draw.reanchor_to_cursor(row)
     }

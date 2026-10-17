@@ -353,7 +353,7 @@ impl Interactive {
         // (`run_entry_dsr`) while nothing reads stdin, then the guard drops —
         // lowering the gate — and the reader takes over for the prompt.
         // Without this ordering the reader's first poll would swallow the
-        // terminal's cursor-position report before `cursor_row` could read it.
+        // terminal's cursor-position report before `reanchor` could read it.
         // The guard is the front door for this window: nesting-safe,
         // and it lowers on drop, so an early return can no longer leak the
         // gate up. The reader isn't running yet when it is raised (the thread

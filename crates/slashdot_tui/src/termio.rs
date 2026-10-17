@@ -1113,7 +1113,9 @@ impl Drop for ReaderPauseGuard {
 /// The cursor row from a DSR query, answered with the reader paused so the
 /// reply cannot be swallowed. This is the *whole* of the
 /// terminal-I/O-layer DSR: pause dispatch, write the query, match the reply.
-pub fn query_cursor_row() -> Option<usize> {
+/// Edge-internal (design §TermIO): the answer syncs the draw cache and never
+/// travels beyond it.
+pub(crate) fn query_cursor_row() -> Option<usize> {
     let _pause = ReaderPauseGuard::raise();
     query_real_cursor_row()
 }

@@ -40,7 +40,7 @@ pub enum EditorMode {
 /// 3. Re-anchor the draw cache (DSR): the editor was a foreign screen writer,
 ///    so the frame region can no longer be trusted (plan §4.2). Unconditional
 ///    — even a failed launch may have touched the screen. The query carries
-///    its own pause ([`crate::termio::query_cursor_row`]), so its reply is
+///    its own pause (inside `TermIO`, the sole stdin owner), so its reply is
 ///    safe even though the window's pause lifted with the resume.
 ///
 /// Blocking by design: while the editor owns the tty nothing else may write
@@ -48,7 +48,7 @@ pub enum EditorMode {
 pub(crate) fn run_editor(content: &Content, current: &str, mode: EditorMode) -> io::Result<String> {
     // One handle: the content handle's manager is the design's
     // front door for suspend/resume (§Render) and the owner of the DSR
-    // re-anchor (`cursor_row`). Without a mode guard — Plain, quiet, test
+    // re-anchor (`reanchor`). Without a mode guard — Plain, quiet, test
     // states — there is no tty to hand over, so this reports `Unsupported`,
     // the answer the caller-side missing-guard check used to give. The locks
     // are taken only for the flips themselves: holding the manager across a
@@ -65,7 +65,7 @@ pub(crate) fn run_editor(content: &Content, current: &str, mode: EditorMode) -> 
     {
         let mut m = manager.lock().unwrap();
         m.resume();
-        let _ = m.cursor_row();
+        m.reanchor();
     }
     edited
 }
