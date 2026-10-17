@@ -731,12 +731,10 @@ mod tests {
             height: 24,
         };
 
-        // The live path, exactly as the streaming loop drives it. Reasoning is
-        // asked onto the captured stream so the comparison sees it (a test's
-        // stdout is not a terminal, and without this it would be routed to
-        // stderr by both sides and the test would prove nothing).
+        // The live path, exactly as the streaming loop drives it. Reasoning
+        // is chained like any other block and lands in the capture with the
+        // rest, so the comparison sees it.
         let live = Content::with_size(reasoning.clone(), size);
-        live.set_reasoning_on_stderr(false);
         live.begin_capture();
         live.begin_response();
         for thinking in &turn.segments[0].thinking {
@@ -759,7 +757,6 @@ mod tests {
         // (bracketed) and then the response, so the live output should be the
         // *tail* of what replay paints — byte for byte, reasoning included.
         let replay = Content::with_size(reasoning, size);
-        replay.set_reasoning_on_stderr(false);
         replay.begin_capture();
         render_turn(&replay, &turn);
         let replay_bytes = replay.end_capture();

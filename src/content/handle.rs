@@ -8,9 +8,10 @@
 //! pipeline and owns the `Draw` sink. Every write
 //! this layer produces leaves as a `ContentWrite` handed to that hub
 //! (`with_content_writer` → `render_content`/`render_batch`) — the sink is
-//! never named here. Every hand-off also carries its stream:
-//! `Main` from the boundary chain, `Meta` from `commit_reasoning` when the
-//! setup decision diverts reasoning — the hub routes on the token.
+//! never named here. Every hand-off also carries its **kind**:
+//! `Content` from the boundary chain, `Reasoning` from the reasoning
+//! writes, `Error` from the error path — `TermIO` routes kind → sink, so
+//! nothing above it forks on where the bytes land.
 //! Of the frame *verbs*, `frame_size` lives here (the watch this handle
 //! carries *is* the dims source), `painted_size` and `cursor_row` are the
 //! manager's, and `draw_frame` — the test drivers' edge — is the manager's too.
@@ -58,21 +59,8 @@ pub struct Content {
     /// disagree. In tests, a private seeded one.
     pub(crate) size: watch::Receiver<TermSize>,
     /// Per-stream capabilities, probed once at `TermIO` construction: colour
-    /// and the reasoning routing read this instead of calling `is_terminal()`
-    /// per site.
+    /// reads this instead of calling `is_terminal()` per site.
     pub(crate) caps: crate::termio::Caps,
-    /// Which *route* reasoning takes — `true` hands the rendered bytes off raw
-    /// (no boundary chain, no choreography), `false` runs them through the
-    /// chain like any on-screen block. The pick is content's (it decides
-    /// whether reasoning is on screen); the *sink* is `TermIO`'s alone — a raw
-    /// reasoning write carries `Stream::Reasoning` and lands on stderr (the
-    /// real backends') when the primary is not a terminal, so a consumer of
-    /// `picocode "q" | cat` can drop it (`2>/dev/null`) or merge it (`2>&1`)
-    /// without touching stdout. Picked once, in [`Self::new`] from the caps;
-    /// `AtomicBool` rather than `bool` only because the handle is shared behind
-    /// an `Arc` and a test pins it to the screen for a byte comparison — see
-    /// [`Self::set_reasoning_on_stderr`].
-    pub(crate) reasoning_on_stderr: AtomicBool,
     /// Incremental GFM markdown parser for the current response (TTY only).
     pub(crate) parser: Mutex<StreamParser>,
     /// Incremental terminal renderer (TTY only) for the answer.
@@ -208,7 +196,6 @@ impl Content {
             manager,
             size,
             caps,
-            reasoning_on_stderr: AtomicBool::new(!caps.primary),
             parser: Mutex::new(StreamParser::new_gfm_stream()),
             renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
             thinking_parser: Mutex::new(StreamParser::new_gfm_stream()),
@@ -260,15 +247,6 @@ impl Content {
     #[cfg(test)]
     pub(crate) fn set_input_script(&self, script: Arc<Mutex<std::collections::VecDeque<String>>>) {
         *self.input.lock().unwrap() = InputSource::Script(script);
-    }
-
-    /// Test knob: pin where reasoning goes, so a capture harness sees it on
-    /// the captured stream (a test's stdout is not a terminal, and the default
-    /// would route it to stderr). Production decides once in [`Self::new`].
-    #[cfg(test)]
-    pub(crate) fn set_reasoning_on_stderr(&self, on: bool) {
-        self.reasoning_on_stderr
-            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A `Content` on a privately seeded size watch — the test harness's
@@ -712,8 +690,8 @@ impl Content {
         let write = ContentWrite {
             bytes: buf,
             // The kind the caller declared: `Content` for the chain (the
-            // screen's path), `Error` for the error path. The diverting route
-            // hands off beside this one, raw — `commit_reasoning`.
+            // screen's path), `Reasoning` from the reasoning writes,
+            // `Error` for the error path — `TermIO` routes kind → sink.
             stream,
         };
         // One choreography, two design verbs (§Render): the replay path
@@ -812,14 +790,26 @@ impl Content {
                 });
             }
             (true, false) => {
-                self.with_content_writer(width, Some(ResponseReasoning), true, |out| {
-                    let _ = out.write_all(&thinking);
-                });
+                self.with_content_writer_stream(
+                    width,
+                    Some(ResponseReasoning),
+                    true,
+                    crate::termio::Stream::Reasoning,
+                    |out| {
+                        let _ = out.write_all(&thinking);
+                    },
+                );
             }
             (false, false) => {
-                self.with_content_writer(width, Some(ResponseReasoning), false, |out| {
-                    let _ = out.write_all(&thinking);
-                });
+                self.with_content_writer_stream(
+                    width,
+                    Some(ResponseReasoning),
+                    false,
+                    crate::termio::Stream::Reasoning,
+                    |out| {
+                        let _ = out.write_all(&thinking);
+                    },
+                );
                 self.with_content_writer(width, Some(ResponseText), true, |out| {
                     let _ = out.write_all(&answer);
                 });
@@ -1305,9 +1295,11 @@ impl Content {
         let mut thinking: Vec<u8> = Vec::new();
         self.commit_thinking(&mut thinking);
         if !thinking.is_empty() {
-            self.write_content_kinded(
+            self.write_content_block_as(
                 &at_line_start(&thinking),
                 Some(ContentDisplayKind::ResponseReasoning),
+                true,
+                crate::termio::Stream::Reasoning,
             );
         }
         self.with_content_writer(
@@ -1342,9 +1334,9 @@ impl Content {
         // fading is a property of a row, not a mode the stream has to be put
         // into and taken out of, so this writer emits no escapes of its own and
         // the boundary after the reasoning has nothing to close. The rendered
-        // bytes are buffered like the sink's was; `commit_reasoning` lands
-        // them on the stream the setup decision picked (the parser/renderer
-        // locks are still held through the landing, as the sink's commit was).
+        // bytes are buffered; `commit_reasoning` lands them through the chain
+        // marked `Stream::Reasoning`, and `TermIO` picks the sink (the
+        // parser/renderer locks are still held through the landing).
         let mut rendered: Vec<u8> = Vec::new();
         let mut parser = self.thinking_parser.lock().unwrap();
         let events = parser.write(delta.as_bytes());
@@ -1353,38 +1345,29 @@ impl Content {
         self.commit_reasoning(rendered);
     }
 
-    /// Land a rendered reasoning block — the route decision, made once at
-    /// setup (cap `reasoning_on_stderr`: `true` when the primary is not a
-    /// terminal), picks between two routes. Raw: the bytes hand off as a
-    /// `ContentWrite` of kind `Reasoning`, no boundary chain, no line clear, no
-    /// counter — byte-for-byte the stderr bypass it replaced, and no
-    /// choreography because it lands on stderr, which never moves the screen's
-    /// cursor. Chained: the block runs the chain like any other block, so the
-    /// boundary after it is drawn as its own.
+    /// Land a rendered reasoning block: the chain like any other block, its
+    /// write marked `Stream::Reasoning` so `TermIO` routes it — the primary
+    /// when it is a terminal (the reasoning is on screen, choreographed with
+    /// everything around it), meta otherwise (a pipe consumer drops it with
+    /// `2>/dev/null` or merges it with `2>&1`, without stdout ever seeing
+    /// it). Content states the kind; the sink is the edge's alone.
     ///
     /// Empty means the delta rendered nothing: no write at all — even a
-    /// zero-byte hand-off would open a block on the chained route.
+    /// zero-byte hand-off would open a block.
     fn commit_reasoning(&self, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
         }
-        // Quiet suppresses the meta hand-off too — nothing reaches either
-        // stream.
+        // Quiet suppresses the hand-off too — nothing reaches either stream.
         if self.quiet {
             return;
         }
-        if self
-            .reasoning_on_stderr
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            let mut mgr = self.manager.lock().unwrap();
-            mgr.render_content(ContentWrite {
-                bytes,
-                stream: crate::termio::Stream::Reasoning,
-            });
-        } else {
-            self.write_content_kinded(&bytes, Some(ContentDisplayKind::ResponseReasoning));
-        }
+        self.write_content_block_as(
+            &bytes,
+            Some(ContentDisplayKind::ResponseReasoning),
+            true,
+            crate::termio::Stream::Reasoning,
+        );
     }
 
     pub(crate) fn end_response_segment(&self) {
@@ -1856,10 +1839,6 @@ mod tests {
                 height: 24,
             },
         );
-        // Pinned rather than probed: the routing is not this suite's subject,
-        // and a capture harness should capture everything the code might
-        // write (the doc on this helper says why in full).
-        out.set_reasoning_on_stderr(false);
         (out, reasoning)
     }
 
@@ -2237,13 +2216,10 @@ mod tests {
     fn run_script(steps: &[Step], chunk: Chunking) -> Vec<u8> {
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        // Reasoning on the captured stream. `capturing_output` already pins
-        // this, so the line is redundant — kept because a replay test that
-        // silently stopped seeing reasoning would look like a spacing bug, and
-        // the pin is exactly the kind of thing a future edit drops as
-        // "obviously already handled". The routing itself is the subject of
-        // `reasoning_is_routed_by_the_output_layer`, which names both values.
-        out.set_reasoning_on_stderr(false);
+        // Reasoning rides the captured stream because it is chained like any
+        // other block now (`commit_reasoning`); a replay test that silently
+        // stopped seeing it would look like a spacing bug, hence the explicit
+        // level rather than the handle default.
         out.begin_capture();
         out.begin_response();
         for step in steps {
@@ -2391,69 +2367,69 @@ mod tests {
         }
     }
 
-    /// §4.1 of the plan: reasoning is routed at the output layer, so a
-    /// consumer of `picocode "q" | cat` can drop it, and the render path does
-    /// not fork on whether there is a terminal.
-    ///
-    /// Both halves set `reasoning_on_stderr` **explicitly**, because that flag is
-    /// the routing and inheriting it would make the test assert the *runner's*
-    /// terminal rather than the code. It did exactly that: a test binary's stdout
-    /// is usually a pipe, so "no terminal" was taken to be ambiently true, and
-    /// under a runner that hands the binary a tty the first half failed with
-    /// "reasoning must not reach stdout without a terminal" — the flag had been
-    /// `false` because there *was* a terminal, exactly as the flag is supposed to
-    /// say. The harness now pins the flag for every other test in the file
-    /// (`capturing_output`); the two values are named here because they are this
-    /// test's subject.
+    /// Reasoning is a `Stream::Reasoning` write all the way down, and the sink
+    /// is the edge's answer from the backend's caps — never content's. Pinned
+    /// on the recording double with *both* cap sets, so neither half can
+    /// inherit the runner's terminal the way the old `reasoning_on_stderr`
+    /// flag once did: a terminal primary keeps the reasoning on the primary
+    /// edge (it is on screen, choreographed), a piped primary diverts it to
+    /// meta (stderr through the real backends, which is what makes
+    /// `2>/dev/null` work for a consumer of `picocode "q" | cat`).
     #[test]
-    fn reasoning_is_routed_by_the_output_layer() {
+    fn reasoning_is_marked_reasoning_and_the_edge_routes_it() {
         let script = [Step::Think("Weighing the options.\n\n"), Step::ResponseEnd];
 
-        // Diverted: reasoning leaves stdout — it rides the meta stream
-        // instead (stderr through the real backends, which is what makes
-        // `2>/dev/null` work for a consumer; this harness's sinkhole
-        // backend drops it, so the pin here is what the capture does *not*
-        // contain). The meta edge itself is `reasoning_to_meta_lands_on_…`.
+        // On the screen: a terminal primary keeps reasoning on the primary edge.
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.set_reasoning_on_stderr(true);
-        out.begin_capture();
+        let recording = record_bytes_with(
+            &out,
+            crate::termio::Caps {
+                primary: true,
+                meta: true,
+            },
+        );
         out.begin_response();
         feed(&out, script[0], Chunking::Whole);
         feed(&out, script[1], Chunking::Whole);
-        let piped = out.end_capture();
+        let primary = String::from_utf8_lossy(&recording.bytes()).into_owned();
         assert!(
-            !String::from_utf8_lossy(&piped).contains("Weighing the options"),
-            "reasoning must not reach stdout when it is routed to stderr"
+            primary.contains("Weighing the options"),
+            "a terminal primary keeps reasoning on the primary edge: {primary:?}"
         );
 
-        // On the screen: the other side of the same decision.
+        // Piped: the same write diverts to meta — content marked the kind,
+        // the edge picked the sink.
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.set_reasoning_on_stderr(false);
-        out.begin_capture();
+        let recording = record_bytes_with(
+            &out,
+            crate::termio::Caps {
+                primary: false,
+                meta: true,
+            },
+        );
         out.begin_response();
         feed(&out, script[0], Chunking::Whole);
         feed(&out, script[1], Chunking::Whole);
-        let tty = out.end_capture();
+        let meta = String::from_utf8_lossy(&recording.meta()).into_owned();
         assert!(
-            String::from_utf8_lossy(&tty).contains("Weighing the options"),
-            "reasoning belongs on the screen when there is one"
+            meta.contains("Weighing the options"),
+            "a piped primary diverts reasoning to meta: {meta:?}"
         );
     }
 
-    /// The meta sink under the hub: a diverted reasoning block rides
-    /// the stream token down to `TermIO` — recorded on the meta edge,
-    /// absent from main. Main's emptiness is the choreography pin: the
-    /// consume walk and reposition of the main route would put
-    /// bytes there, so none ran. The bytes themselves are the renderer's,
-    /// fed untransformed — the bypass `ReasoningSink` died with, now
-    /// routed by the token.
+    /// The meta sink under the hub: a reasoning block — chained like any
+    /// other, marked `Stream::Reasoning` — rides the kind token down to
+    /// `TermIO`, which routes it to the meta edge under a piped primary.
+    /// Recorded on the meta edge, absent from main. Main's emptiness is the
+    /// choreography pin: the consume walk and reposition of a *primary* write
+    /// would put bytes there, so none ran. The bytes themselves are the
+    /// renderer's, fed untransformed.
     #[test]
     fn reasoning_to_meta_lands_on_the_meta_edge() {
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.set_reasoning_on_stderr(true);
         out.begin_response();
         // A piped primary: the reasoning kind diverts to the meta bucket.
         let recording = record_bytes_with(
@@ -2529,7 +2505,6 @@ mod tests {
     fn an_empty_segment_puts_no_blank_between_retries() {
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.set_reasoning_on_stderr(false);
         out.begin_capture();
         // Three failed attempts, each an empty turn: `begin_response` then a
         // stream that errors before a single delta reaches the parser.
@@ -2573,7 +2548,6 @@ mod tests {
     fn a_segment_that_streamed_still_closes_for_the_notice_after_it() {
         let (out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
-        out.set_reasoning_on_stderr(false);
         out.begin_capture();
         // The answer streams and is emitted as it arrives; the paragraph is
         // closed by its own trailing blank, so the flush below is genuinely
