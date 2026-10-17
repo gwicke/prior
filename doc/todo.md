@@ -45,16 +45,11 @@ and link a doc/ and/or commit hash
       doc/261013_multi_file_edit_id_continuity.md.
 - [ ] Fix "text only" compaction strategy to a) include last summary, and b) only add text context
   added since.
-- [ ] OpenRouter provider selection support, e.g. `@only:deepinfra/fp8/flex` suffix translating to
-
-  ```json
-  provider: {
-    "only": [
-      "deepinfra/fp8/flex"
-    ],
-    "allow_fallbacks": false
-  }
-  ```
+- [x] OpenRouter provider selection via per-model `routing` settings key
+      (implemented: doc/261017_openrouter_provider_selection.md; `@only:` suffix
+      evaluated and rejected, §9). Per-model, e.g. `routing = { only =
+      ["deepinfra/fp8/flex"], allow_fallbacks = false }`; the old built-in
+      anthropic provider pin is gone — nothing is sent unless set.
 
 ## Cleanup
 

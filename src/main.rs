@@ -346,6 +346,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Filled from the resolved catalog once `AppState` exists; there is no
         // store to read here, and one-shot commands draw no status bar.
         context_limit: None,
+        // One-shot runs never activate a model, so no per-model record is
+        // consulted — the same reason `params` here is the resolved global
+        // rather than the model's stored defaults.
+        routing: None,
         system_message_extension,
         persona_prompt,
         persona_name,

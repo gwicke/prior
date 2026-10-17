@@ -15,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         yolo: true,         // Auto-confirm everything since there's no output
         confirm_port: None, // No REPL to ask, so nothing drives a confirm dialog
         context_limit: None,
+        routing: None,
         tool_call_limit: 5,
         quiet: false,
         params: Default::default(),

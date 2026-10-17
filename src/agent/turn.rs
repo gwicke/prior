@@ -134,7 +134,12 @@ impl CodeAgent {
             Some(t) => request.temperature(t),
             None => request.without_temperature(),
         };
-        let request = match request_additional_params(&self.provider, &self.model, params) {
+        let request = match request_additional_params(
+            &self.provider,
+            &self.model,
+            params,
+            self.routing.as_ref(),
+        ) {
             Some(v) => request.replace_additional_params(v),
             None => request.without_additional_params(),
         };

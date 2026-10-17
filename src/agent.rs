@@ -202,6 +202,11 @@ pub struct CodeAgent {
     /// The live params this agent was built with: the default for a turn with
     /// no per-turn override, and the status bar's reasoning level.
     live_params: crate::params::ModelParams,
+    /// OpenRouter provider preferences this agent was built with. A snapshot
+    /// like `live_params`: the per-turn path recomposes the request from
+    /// these, so an override turn keeps the same provider routing the bake
+    /// used (doc/261017_openrouter_provider_selection.md §2).
+    routing: Option<crate::model_settings::Routing>,
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
@@ -692,6 +697,7 @@ impl CodeAgent {
         provider: String,
         model: String,
         live_params: crate::params::ModelParams,
+        routing: Option<crate::model_settings::Routing>,
         yolo: bool,
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
@@ -707,6 +713,7 @@ impl CodeAgent {
             provider,
             model,
             live_params,
+            routing,
             yolo,
             persona_name,
             user_cancel,

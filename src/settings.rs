@@ -913,6 +913,7 @@ mod tests {
             confirm_port: None,
             quiet: true,
             params: Default::default(),
+            routing: None,
             context_limit: None,
             tool_call_limit: 50,
             system_message_extension: None,
@@ -1355,6 +1356,48 @@ mod tests {
         assert!(content.contains("batch job"), "comment kept: {content}");
     }
 
+    /// A `routing` table survives the real load/save path (`Config::parse`,
+    /// which runs both the fragment validator and a serde pass over the same
+    /// file) and stays multi-line on disk.
+    /// (doc/261017_openrouter_provider_selection.md §1)
+    #[test]
+    fn a_routing_table_loads_and_saves_through_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "[models.\"openrouter:anthropic/claude\"]\n\
+             routing = {\n  only = [\"deepinfra/fp8/flex\"],\n  allow_fallbacks = false,\n}\n",
+        )
+        .unwrap();
+        let mut s = SettingsStore::load(&path).unwrap();
+        let record = s
+            .model_settings("openrouter:anthropic/claude")
+            .expect("table must load");
+        let original = record.routing.clone();
+        assert_eq!(
+            original,
+            Some(crate::model_settings::Routing {
+                only: Some(vec!["deepinfra/fp8/flex".into()]),
+                allow_fallbacks: Some(false),
+                ..Default::default()
+            })
+        );
+
+        // An unrelated save rewrites the table from the record; the block must
+        // still be multi-line and parse back to the same value.
+        s.set_value(SettingKey::ToolCallLimit, "42").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("routing = {\n"), "{content}");
+        let reloaded = SettingsStore::load(&path).unwrap();
+        assert_eq!(
+            reloaded
+                .model_settings("openrouter:anthropic/claude")
+                .and_then(|r| r.routing.clone()),
+            original
+        );
+    }
+
     /// A typo in a per-model table fails the load loudly, naming the key.
     #[test]
     fn a_typo_in_a_per_model_table_is_a_load_error() {
@@ -1448,6 +1491,7 @@ mod tests {
             confirm_port: None,
             quiet: true,
             params: Default::default(),
+            routing: None,
             context_limit: None,
             tool_call_limit: 10,
             system_message_extension: None,

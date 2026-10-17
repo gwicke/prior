@@ -96,6 +96,9 @@ pub fn summarize(settings: &ModelSettings) -> String {
     if let Some(p) = settings.top_p {
         parts.push(format!("top_p {}", crate::v25_number_param::fmt_value(p)));
     }
+    if let Some(r) = settings.routing() {
+        parts.push(format!("routing {}", summarize_routing(r)));
+    }
     // Metadata overrides are counted, not named — the record is settings, not
     // a catalogue, and listing nine indices would bury the three knobs the
     // user came to change.
@@ -120,6 +123,31 @@ pub fn summarize(settings: &ModelSettings) -> String {
         parts.push(format!("+{overrides} metadata"));
     }
     parts.join(", ")
+}
+
+/// The routing table's set preferences, compactly: `only=a,b allow_fallbacks=false`.
+/// A request-shaping fact, so it ranks with reasoning/temperature rather than
+/// with the counted metadata overrides.
+fn summarize_routing(r: &crate::model_settings::Routing) -> String {
+    let mut fields = Vec::new();
+    for (name, list) in [
+        ("only", &r.only),
+        ("order", &r.order),
+        ("ignore", &r.ignore),
+    ] {
+        if let Some(v) = list {
+            fields.push(format!("{name}={}", v.join(",")));
+        }
+    }
+    for (name, flag) in [
+        ("allow_fallbacks", r.allow_fallbacks),
+        ("require_parameters", r.require_parameters),
+    ] {
+        if let Some(v) = flag {
+            fields.push(format!("{name}={v}"));
+        }
+    }
+    fields.join(" ")
 }
 
 #[cfg(test)]
@@ -148,6 +176,21 @@ mod tests {
     #[test]
     fn an_empty_record_says_not_configured() {
         assert_eq!(summarize(&ModelSettings::default()), "not configured");
+    }
+
+    /// Routing is named, not counted: it shapes the request, so it belongs
+    /// beside reasoning/temperature.
+    #[test]
+    fn routing_is_named_in_the_summary() {
+        let s = summarize(&ModelSettings {
+            routing: Some(crate::model_settings::Routing {
+                only: Some(vec!["deepinfra/fp8/flex".into()]),
+                allow_fallbacks: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(s, "routing only=deepinfra/fp8/flex allow_fallbacks=false");
     }
 
     #[test]

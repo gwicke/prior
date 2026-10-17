@@ -94,6 +94,10 @@ fn save_recent_models(models: &[String]) {
 pub(crate) struct RebuildFingerprint {
     pub model: String,
     pub params: params::ModelParams,
+    /// OpenRouter provider preferences. Part of the identity for the same
+    /// reason `context_limit` is: a Ctrl-E that adds or changes `routing` is a
+    /// new target, and a rebuild is how it reaches the wire.
+    pub routing: Option<crate::model_settings::Routing>,
     pub persona: Option<String>,
     /// Part of the identity, not just the comparison: a Ctrl-E that changes the
     /// context window is a new target, so a *previous* failed attempt must not
@@ -126,6 +130,9 @@ pub(crate) fn plan_rebuild(
 ) -> Option<RebuildFingerprint> {
     let changed = applied.qualified_model_id() != target.qualified_model_id()
         || applied.params != target.params
+        // `routing` shapes requests and is baked into the agent, so a Ctrl-E
+        // of it is a rebuild like a param edit — the design's "exactly one".
+        || applied.routing != target.routing
         || applied.persona_name != target.persona_name
         // The window is compared because it reaches the mid-turn status bar
         // only through a rebuild, and a per-model `context_length` override
@@ -137,6 +144,7 @@ pub(crate) fn plan_rebuild(
     let attempt = RebuildFingerprint {
         model: target.qualified_model_id(),
         params: target.params,
+        routing: target.routing.clone(),
         persona: target.persona_name.clone(),
         context_limit: target.context_limit,
     };
@@ -488,6 +496,10 @@ impl Interactive {
             // and also when the user Ctrl-E's a `context_length` override and
             // then switches away and back.
             new_cfg.context_limit = resolved_context_limit(&self.app_state);
+            // Unlike the params, routing has no runtime mutation path: the
+            // target already holds the record's value, so copy it whenever the
+            // agent is rebuilt (a no-op when it did not change).
+            new_cfg.routing = target.routing.clone();
             if persona_changed {
                 new_cfg.persona_name = target.persona_name.clone();
                 new_cfg.persona_prompt = target
@@ -1169,6 +1181,7 @@ mod tests {
             confirm_port: None,
             quiet: true,
             params,
+            routing: None,
             context_limit: None,
             tool_call_limit: 10,
             system_message_extension: None,
@@ -1202,6 +1215,7 @@ mod tests {
             Some(&super::RebuildFingerprint {
                 model: "openai:gpt-4o".into(),
                 params: p,
+                routing: None,
                 persona: None,
                 context_limit: None,
             })
@@ -1380,6 +1394,49 @@ mod tests {
         assert_ne!(after, before, "so a rebuild is armed, not suppressed");
     }
 
+    /// A Ctrl-E of `routing` must arm exactly one rebuild: the target moves,
+    /// the gate fires once, and the applied side then agrees.
+    /// (doc/261017_openrouter_provider_selection.md §2)
+    #[test]
+    fn a_routing_edit_arms_exactly_one_rebuild() {
+        let mut store =
+            crate::settings::SettingsStore::from_config(&crate::Config::default(), None);
+        store.default_model = "openrouter:anthropic/claude".into();
+        let applied = gate_cfg(
+            "openrouter",
+            "anthropic/claude",
+            crate::params::ModelParams::default(),
+        );
+        let app = crate::app_state::AppState::new(applied.clone(), store, None);
+
+        app.update_settings(|s| {
+            s.apply_model_settings(
+                "openrouter:anthropic/claude",
+                &crate::model_settings::ModelSettings {
+                    routing: Some(crate::model_settings::Routing {
+                        only: Some(vec!["deepinfra/fp8/flex".into()]),
+                        allow_fallbacks: Some(false),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let mut target = app.config_snapshot();
+        let attempt = plan_rebuild(&applied, &target, None)
+            .expect("a routing edit shapes the request, so it must rebuild");
+        assert!(
+            plan_rebuild(&applied, &target, Some(&attempt)).is_none(),
+            "the same target must not re-arm"
+        );
+        // Once applied, the two sides agree and the gate is quiet.
+        target.routing = attempt.routing.clone();
+        assert!(plan_rebuild(&target, &target, None).is_none());
+    }
+
     // Regression test for the `!`/`!!` sandbox bug: user-initiated shell
     // commands must run inside the same bwrap sandbox as the agent's `bash`
     // tool, *even when the agent has not been created yet*. The sandbox config
@@ -1468,6 +1525,7 @@ mod tests {
             confirm_port: None,
             quiet: true,
             params: Default::default(),
+            routing: None,
             context_limit: None,
             tool_call_limit: 10,
             system_message_extension: None,
@@ -1541,6 +1599,7 @@ mod tests {
             confirm_port: None,
             quiet: true,
             params: Default::default(),
+            routing: None,
             context_limit: None,
             tool_call_limit: 10,
             system_message_extension: None,

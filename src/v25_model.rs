@@ -358,6 +358,21 @@ impl SlashDotNode for ModelNode {
             }
             lines.push(format!("{indent}ctrl-e to edit these settings"));
         }
+
+        // A `routing` table is carried but inert on providers other than
+        // openrouter. That is not a validation error — the record may be for a
+        // model used under two providers — but a silent no-op setting is a
+        // footgun, so the detail view says so. The editor fragment stays
+        // neutral: it is provider-agnostic by design (design doc §5, §8.1).
+        let inert_routing = stored.as_ref().is_some_and(|s| s.routing().is_some())
+            && !model
+                .split_once(':')
+                .is_some_and(|(provider, _)| provider.eq_ignore_ascii_case("openrouter"));
+        if inert_routing {
+            lines.push(format!(
+                "{indent}note: routing only applies to openrouter models — ignored here"
+            ));
+        }
         lines
     }
 
@@ -1730,6 +1745,54 @@ mod tests {
         ));
         let joined = lines.join("\n");
         assert!(joined.contains("defaults: not configured"), "{joined}");
+    }
+
+    /// A `routing` table on a provider that ignores it is inert, not invalid:
+    /// the detail view says so rather than letting the setting look live
+    /// (doc/261017_openrouter_provider_selection.md §5 / §8.1). An openrouter
+    /// model gets no note — there the table is the point.
+    #[test]
+    fn the_header_flags_routing_on_a_non_openrouter_model() {
+        let app_state = test_app_state();
+        let routing = crate::model_settings::Routing {
+            only: Some(vec!["deepinfra/fp8/flex".into()]),
+            ..Default::default()
+        };
+        let record = crate::model_settings::ModelSettings {
+            routing: Some(routing),
+            ..Default::default()
+        };
+        app_state
+            .update_settings(|s| {
+                s.models.insert(TEST_MODEL.to_string(), record.clone());
+                s.models
+                    .insert("openrouter:anthropic/claude".to_string(), record);
+                Ok(())
+            })
+            .unwrap();
+        let reader = app_state.clone();
+        let mut node = ModelNode::new(
+            Box::new(move || reader.model()),
+            Box::new(|_| Ok(())),
+            Some(app_state.clone()),
+        );
+        let header = |node: &mut ModelNode, model: &str| {
+            futures::executor::block_on(node.header(
+                &PathArgs::new(vec!["model".into(), model.into()], " "),
+                &RenderContext { term_width: 80 },
+            ))
+            .join("\n")
+        };
+        let non_openrouter = header(&mut node, TEST_MODEL);
+        assert!(
+            non_openrouter.contains("routing only applies to openrouter"),
+            "{non_openrouter}"
+        );
+        let openrouter = header(&mut node, "openrouter:anthropic/claude");
+        assert!(
+            !openrouter.contains("only applies to openrouter"),
+            "a note where the setting works: {openrouter}"
+        );
     }
 
     /// Without a tty the editor cannot run, and that must be an error on the

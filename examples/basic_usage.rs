@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         yolo: false,
         confirm_port: None,
         context_limit: None,
+        routing: None,
         tool_call_limit: 10,
         quiet: false,
         params: Default::default(),

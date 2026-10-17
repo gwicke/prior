@@ -374,6 +374,17 @@ impl AppState {
             return;
         }
         let mut st = self.state.lock();
+        // Routing is *stored settings*, not runtime state: nothing mutates it
+        // mid-session (`/reasoning` has no counterpart here), so unlike the
+        // params it has no session memory and is read fresh from the record on
+        // every activation — including a re-visit. A model with no record
+        // clears it, the same per-field "no opinion" rule the params follow.
+        //
+        // Doc: doc/261017_openrouter_provider_selection.md §2.
+        st.config.routing = st
+            .settings
+            .model_settings(id)
+            .and_then(|record| record.routing.clone());
         // First visit this session: the runtime values win, per A.6. A record
         // edited while the model sits in the map is deliberately NOT re-read.
         if let Some(memory) = st.model_param_map.get(id).copied() {
@@ -500,12 +511,21 @@ impl AppState {
             // moves. Resolved for the one model rather than via
             // `resolved_models`, which would deadlock on the lock already held.
             let qualified = st.config.qualified_model_id();
-            st.config.context_limit = crate::model_catalog::resolved_entry(
-                &qualified,
-                st.settings.models.get(&qualified),
-            )
-            .and_then(|e| e.context_length)
-            .filter(|max| *max > 0);
+            let record = st.settings.models.get(&qualified);
+            // Resolved before either assignment: the record borrows the
+            // settings out of the guard, and the writes below borrow it
+            // mutably.
+            let limit = crate::model_catalog::resolved_entry(&qualified, record)
+                .and_then(|e| e.context_length)
+                .filter(|max| *max > 0);
+            // Routing is a request-shaping fact like the params, so an edit
+            // of the *active* model's record must reach the running config —
+            // `plan_rebuild` then fingerprints it and rebuilds exactly once.
+            // Editing another model's record leaves this untouched; that
+            // record is read on its next activation.
+            let routing = record.and_then(|r| r.routing.clone());
+            st.config.context_limit = limit;
+            st.config.routing = routing;
             st.settings.clone()
         };
         snapshot.save().map_err(|e| e.to_string())
@@ -807,6 +827,7 @@ impl AppState {
             confirm_port: None,
             quiet: true,
             params: Default::default(),
+            routing: None,
             context_limit: None,
             tool_call_limit: 10,
             system_message_extension: None,
@@ -1082,6 +1103,85 @@ mod tests {
         let app = seeded_app(crate::model_settings::ModelSettings::default());
         app.activate_model_params("");
         assert!(app.state.lock().model_param_map.is_empty());
+    }
+
+    // ---- routing seeding (doc/261017_openrouter_provider_selection.md §2) ----
+
+    fn routing() -> crate::model_settings::Routing {
+        crate::model_settings::Routing {
+            only: Some(vec!["deepinfra/fp8/flex".into()]),
+            allow_fallbacks: Some(false),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn activating_a_model_seeds_its_routing() {
+        let app = seeded_app(crate::model_settings::ModelSettings {
+            routing: Some(routing()),
+            ..Default::default()
+        });
+        app.activate_model_params("test:model");
+        assert_eq!(app.with_config(|c| c.routing.clone()), Some(routing()));
+    }
+
+    /// Routing has no session memory: it is stored settings, read fresh per
+    /// activation. A model with no record clears it rather than inheriting the
+    /// outgoing model's.
+    #[test]
+    fn a_model_with_no_record_clears_the_routing() {
+        let app = seeded_app(crate::model_settings::ModelSettings {
+            routing: Some(routing()),
+            ..Default::default()
+        });
+        app.activate_model_params("test:model");
+        app.set_model("test:other");
+        app.activate_model_params("test:other");
+        assert_eq!(app.with_config(|c| c.routing.clone()), None);
+        // ...and back again re-reads the record.
+        app.set_model("test:model");
+        app.activate_model_params("test:model");
+        assert_eq!(app.with_config(|c| c.routing.clone()), Some(routing()));
+    }
+
+    /// A Ctrl-E of the *active* model's record reaches the running config, so
+    /// `plan_rebuild` can fingerprint it. (`update_settings` is the path the
+    /// editor's accept arm takes.)
+    #[test]
+    fn editing_the_active_models_record_moves_the_live_routing() {
+        let app = AppState::for_test(test_settings());
+        assert_eq!(app.model(), "test:model");
+        app.update_settings(|s| {
+            s.models.insert(
+                "test:model".to_string(),
+                crate::model_settings::ModelSettings {
+                    routing: Some(routing()),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(app.with_config(|c| c.routing.clone()), Some(routing()));
+    }
+
+    /// Editing an *inactive* model's record leaves the live config alone: the
+    /// record is consulted on that model's next activation.
+    #[test]
+    fn editing_an_inactive_models_record_leaves_the_live_routing_alone() {
+        let app = AppState::for_test(test_settings());
+        app.update_settings(|s| {
+            s.models.insert(
+                "test:other".to_string(),
+                crate::model_settings::ModelSettings {
+                    routing: Some(routing()),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(app.with_config(|c| c.routing.clone()), None);
     }
 
     /// `peek_model_reasoning` is a *preview* of `activate_model_params`, so the

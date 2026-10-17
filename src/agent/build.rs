@@ -4,11 +4,12 @@
 //!
 //! `create_agent` is the public entry point — the one place a `CodeAgent` is
 //! constructed from a config. It resolves the model catalog, bakes the
-//! provider's reasoning params, wires the completion client (pinned for
-//! OpenRouter so server-side prompt cache survives), registers the tools each
-//! with its approval `Guard`, and hands rig the agent. `build_rig_agent` is the
-//! pure "given a client, assemble the agent" half; `create_agent` adds the
-//! credential and tool-availability discovery around it.
+//! provider's reasoning params, wires the completion client (OpenRouter with
+//! prompt caching on; provider routing only when the model's settings say so),
+//! registers the tools each with its approval `Guard`, and hands rig the
+//! agent. `build_rig_agent` is the pure "given a client, assemble the agent"
+//! half; `create_agent` adds the credential and tool-availability discovery
+//! around it.
 //!
 //! `effective_params` is the per-turn variant: it takes the live params and any
 //! user overrides (`/reasoning`) and reports a note when a requested level is
@@ -82,6 +83,16 @@ pub struct AgentConfig {
     /// (doc/model_settings_v2.md A.2); `PartialEq` here is what the rebuild
     /// gate compares.
     pub params: crate::params::ModelParams,
+    /// OpenRouter provider preferences for this model, typed (not JSON) so the
+    /// merge step can serialize once and a test can inspect the value the
+    /// rebuild gate compares. Seeded from the per-model settings record on
+    /// activation and refreshed by a Ctrl-E of the active model; `None` means
+    /// no opinion — no `provider` preferences go out at all, so upstream
+    /// choice is OpenRouter's.
+    ///
+    /// Carried but unused on every provider but `openrouter`
+    /// (doc/261017_openrouter_provider_selection.md §1).
+    pub routing: Option<crate::model_settings::Routing>,
     /// The target model's context window, *resolved* — the catalog overlaid
     /// with any stored per-model override.
     ///
@@ -195,28 +206,38 @@ pub(crate) fn request_additional_params(
     provider: &str,
     model: &str,
     params: &crate::params::ModelParams,
+    routing: Option<&crate::model_settings::Routing>,
 ) -> Option<serde_json::Value> {
     let support = crate::model_catalog::reasoning_support(provider, model);
     let base = params::additional_params(&provider.to_lowercase(), params, &support);
     if provider.eq_ignore_ascii_case("openrouter") {
-        // The openrouter branch in `create_agent` pins a provider preference
-        // into the same object; an override turn must keep it.
-        merge_openrouter_params(base)
+        // The openrouter branch in `create_agent` carries the same value, so
+        // an override turn cannot lose the provider preference.
+        merge_openrouter_params(base, routing)
     } else {
         base
     }
 }
 
 /// Merge OpenRouter `ProviderPreferences` into the existing additional_params
-/// (typically thinking config). Pins requests to a preferred upstream provider
-/// so that server-side cache state accumulates across turns instead of being
-/// invalidated by load-balancing between multiple upstreams for the same model.
-fn merge_openrouter_params(existing: Option<serde_json::Value>) -> Option<serde_json::Value> {
-    use rig_core::providers::openrouter::ProviderPreferences;
-    let prefs = ProviderPreferences::new()
-        .order(["anthropic"])
-        .allow_fallbacks(true);
-    let prefs_json = prefs.to_json();
+/// (typically thinking config).
+///
+/// Only an explicit `routing` table contributes. With none, picocode sends no
+/// provider preferences at all — there is deliberately no built-in upstream
+/// pin, because a hidden default that silently narrows where requests may go
+/// is worse than OpenRouter's own load balancing. A model that wants that
+/// affinity says so in its settings:
+/// `routing = { only = ["anthropic"], allow_fallbacks = true }`.
+fn merge_openrouter_params(
+    existing: Option<serde_json::Value>,
+    routing: Option<&crate::model_settings::Routing>,
+) -> Option<serde_json::Value> {
+    // An empty table is no opinion — the same as an absent key (the record
+    // normalizes it away; this is the belt to that).
+    let Some(routing) = routing.filter(|r| !r.is_empty()) else {
+        return existing;
+    };
+    let prefs_json = serde_json::json!({ "provider": routing });
     match existing {
         Some(mut base) => {
             // Merge provider preferences into the existing params manually.
@@ -247,7 +268,12 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
     // of sent and rejected. One shared composition, so the per-request path
     // (a `/reasoning` override) cannot produce a different shape than a normal
     // turn.
-    let reasoning_json = request_additional_params(&config.provider, &model, &config.params);
+    let reasoning_json = request_additional_params(
+        &config.provider,
+        &model,
+        &config.params,
+        config.routing.as_ref(),
+    );
 
     // OAuth credentials live in a `token` sub-directory of the settings dir
     // (see `platform::app_config_dir`), kept private so refresh tokens aren't
@@ -271,17 +297,16 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
         }};
         // OpenRouter: enable prompt caching so the system-prompt prefix is
         // marked with `cache_control: {"type": "ephemeral"}` and billed at the
-        // cache-hit rate on subsequent turns. Also pins to a preferred upstream
-        // provider so cache state accumulates across turns instead of being
-        // invalidated by load-balancing between multiple providers for the same
-        // model slug (e.g. `anthropic/claude-sonnet-4` routed to different
-        // upstreams on different turns).
+        // cache-hit rate on subsequent turns. Any provider preference — only
+        // ever the model's own `routing` table — arrives already merged in
+        // `reasoning_json`, because `request_additional_params` owns that
+        // merge for the bake and the per-turn path alike; merging again here
+        // would only duplicate it.
         (openrouter $client:expr) => {{
             let cached_model = $client
                 .completion_model(&model)
                 .with_prompt_caching();
-            let merged = merge_openrouter_params(reasoning_json.clone());
-            build!(@builder_with_params AgentBuilder::new(cached_model), merged)
+            build!(@builder_with_params AgentBuilder::new(cached_model), reasoning_json.clone())
         }};
         ($client:expr) => {{
             build!(@builder $client.agent(&model))
@@ -316,6 +341,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
                 config.provider,
                 model,
                 config.params,
+                config.routing.clone(),
                 config.yolo,
                 config.persona_name,
                 config.user_cancel.clone(),
@@ -984,28 +1010,110 @@ mod tests {
             top_p: Some(0.9),
         };
         // What `create_agent` bakes...
-        let baked = request_additional_params("openai", "gpt-4o", &params);
+        let baked = request_additional_params("openai", "gpt-4o", &params, None);
         // ...and what the per-request path computes for the same params.
-        let per_request = request_additional_params("openai", "gpt-4o", &params);
+        let per_request = request_additional_params("openai", "gpt-4o", &params, None);
         assert_eq!(baked, per_request);
     }
 
-    /// The same identity for openrouter, whose branch pins a provider
-    /// preference into the same object. Recomputing without that step would
-    /// drop the preference on every override turn.
+    /// OpenRouter with no routing adds no `provider` object at all: the old
+    /// built-in anthropic pin is gone, so the reasoning block is all that
+    /// goes out.
     #[test]
-    fn the_openrouter_branch_keeps_its_provider_preference() {
+    fn the_openrouter_branch_adds_no_preference_without_routing() {
         let params = crate::params::ModelParams {
             reasoning: Some(crate::params::ReasoningLevel::High),
             ..Default::default()
         };
-        let v = request_additional_params("openrouter", "anthropic/claude", &params)
-            .expect("openrouter always has preferences");
+        let v = request_additional_params("openrouter", "anthropic/claude", &params, None)
+            .expect("the reasoning block still goes out");
         let obj = v.as_object().expect("an object");
         assert!(
-            obj.contains_key("provider"),
-            "the preference must survive recomposition: {obj:?}"
+            !obj.contains_key("provider"),
+            "no routing means no provider preferences: {obj:?}"
         );
+    }
+
+    // ---- user routing (doc/261017_openrouter_provider_selection.md §2) ----
+
+    fn routing() -> crate::model_settings::Routing {
+        crate::model_settings::Routing {
+            only: Some(vec!["deepinfra/fp8/flex".into()]),
+            allow_fallbacks: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// An explicit routing table reaches the wire as `provider`, verbatim —
+    /// nothing is merged into it.
+    #[test]
+    fn explicit_routing_reaches_the_wire() {
+        let params = crate::params::ModelParams {
+            reasoning: Some(crate::params::ReasoningLevel::High),
+            ..Default::default()
+        };
+        let r = routing();
+        let v = request_additional_params("openrouter", "anthropic/claude", &params, Some(&r))
+            .expect("routing is a preference");
+        let provider = &v["provider"];
+        assert_eq!(provider["only"][0], "deepinfra/fp8/flex");
+        assert_eq!(provider["allow_fallbacks"], false);
+        assert!(
+            provider.get("order").is_none(),
+            "nothing may be added on top of explicit routing: {provider:?}"
+        );
+    }
+
+    /// No routing and no params to send: nothing at all goes on the wire, so
+    /// no hidden upstream pin can reach the request.
+    #[test]
+    fn absent_routing_sends_no_provider_preferences() {
+        let params = crate::params::ModelParams::default();
+        assert_eq!(
+            request_additional_params("openrouter", "anthropic/claude", &params, None),
+            None
+        );
+    }
+
+    /// An empty table is no opinion: identical to an absent key (the settings
+    /// record normalizes it away before it can get here).
+    #[test]
+    fn an_empty_routing_table_behaves_like_an_absent_one() {
+        let params = crate::params::ModelParams::default();
+        let empty = crate::model_settings::Routing::default();
+        let with_empty =
+            request_additional_params("openrouter", "anthropic/claude", &params, Some(&empty));
+        let without = request_additional_params("openrouter", "anthropic/claude", &params, None);
+        assert_eq!(with_empty, without);
+    }
+
+    /// Routing is carried but unused off openrouter: the request must be
+    /// byte-identical to one with no routing at all.
+    #[test]
+    fn routing_is_inert_off_openrouter() {
+        let params = crate::params::ModelParams::default();
+        let r = routing();
+        assert_eq!(
+            request_additional_params("openai", "gpt-4o", &params, Some(&r)),
+            request_additional_params("openai", "gpt-4o", &params, None)
+        );
+    }
+
+    /// The bake/per-turn parity invariant with routing present: both paths
+    /// recompose from the same typed routing, so an override turn cannot lose
+    /// the user's preference.
+    #[test]
+    fn routing_survives_recomposition_on_an_override_turn() {
+        let params = crate::params::ModelParams {
+            reasoning: Some(crate::params::ReasoningLevel::High),
+            ..Default::default()
+        };
+        let r = routing();
+        let baked = request_additional_params("openrouter", "anthropic/claude", &params, Some(&r));
+        let per_request =
+            request_additional_params("openrouter", "anthropic/claude", &params, Some(&r));
+        assert_eq!(baked, per_request);
+        assert_eq!(baked.unwrap()["provider"]["only"][0], "deepinfra/fp8/flex");
     }
 
     /// An override replaces rather than merges: the reason key must carry the
@@ -1025,8 +1133,8 @@ mod tests {
             effective.reasoning,
             Some(crate::params::ReasoningLevel::High)
         );
-        let with_override = request_additional_params("openai", "gpt-4o", &effective);
-        let without = request_additional_params("openai", "gpt-4o", &live);
+        let with_override = request_additional_params("openai", "gpt-4o", &effective, None);
+        let without = request_additional_params("openai", "gpt-4o", &live, None);
         assert_ne!(
             with_override, without,
             "the override must actually change what goes on the wire"

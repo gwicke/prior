@@ -4,9 +4,10 @@
 //! One record per model, holding two kinds of fact:
 //!
 //! * **params** — the reasoning level, temperature and top_p to apply when
-//!   the model is first activated in a session. A field that is *absent* is
-//!   not "off" and not "0": it means "no opinion here", and the seeding rule
-//!   (A.6) falls through to the global default or the built-in.
+//!   the model is first activated in a session, plus the OpenRouter
+//!   `routing` table that shapes where its requests go. A field that is
+//!   *absent* is not "off" and not "0": it means "no opinion here", and the
+//!   seeding rule (A.6) falls through to the global default or the built-in.
 //! * **metadata overrides** — context length, prices, indices, the
 //!   description, the supported effort list. Used only where set; the catalog
 //!   fills whatever is left, so a partial table is the normal case. These
@@ -25,6 +26,53 @@ use crate::params::ReasoningLevel;
 /// contain `/` and `:` (`[models."openrouter:tencent/hy3:free"]`).
 pub const MODELS_TABLE: &str = "models";
 
+/// OpenRouter's `ProviderPreferences`, as a subset
+/// (doc/261017_openrouter_provider_selection.md §1).
+///
+/// Mirrored in our own type rather than reusing rig's: this is *stored
+/// settings*, so it must serialize into `settings.toml`, survive the fragment
+/// round-trip, and compare for the rebuild gate without dragging a provider
+/// crate into the settings layer. Field names are OpenRouter's own, so its
+/// API docs translate directly.
+///
+/// Only the `openrouter` provider consumes this today. On any other provider
+/// the table is carried but inert — it is a note about how *this model*
+/// should be requested, not a validation error.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Routing {
+    /// Upstreams to pin to, e.g. `["deepinfra/fp8/flex"]`. Must be non-empty
+    /// when set: an empty pin is a typo, not a preference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only: Option<Vec<String>>,
+    /// The order upstreams are tried in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<String>>,
+    /// Upstreams never to route to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<Vec<String>>,
+    /// Whether OpenRouter may fall back to another upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_fallbacks: Option<bool>,
+    /// Only route to upstreams that support every parameter the request
+    /// carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_parameters: Option<bool>,
+}
+
+impl Routing {
+    /// True when the table says nothing — every preference unset. Such a
+    /// table is the same as an absent key: it serializes nothing to the wire
+    /// and drops from the file.
+    pub fn is_empty(&self) -> bool {
+        self.only.is_none()
+            && self.order.is_none()
+            && self.ignore.is_none()
+            && self.allow_fallbacks.is_none()
+            && self.require_parameters.is_none()
+    }
+}
+
 /// One model's stored defaults and metadata overrides.
 ///
 /// `deny_unknown_fields` is deliberate: a typo in a hand-edited settings file
@@ -42,6 +90,11 @@ pub struct ModelSettings {
     pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
+    /// OpenRouter provider preferences for this model: which upstream to
+    /// route to. A params-half fact — it shapes the request rather than
+    /// describing the model — so it stays out of [`Self::apply_to_entry`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<Routing>,
 
     // --- metadata overrides: used only where set ---
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,6 +138,12 @@ impl ModelSettings {
         }
     }
 
+    /// The routing table, or `None` when absent *or* empty. An empty table is
+    /// no opinion, so it reads exactly like an unset key everywhere.
+    pub fn routing(&self) -> Option<&Routing> {
+        self.routing.as_ref().filter(|r| !r.is_empty())
+    }
+
     /// Overlay the metadata half onto a catalog entry. `None` fields keep the
     /// catalog's value, so a partial table is normal and expected.
     pub fn apply_to_entry(&self, e: &mut crate::model_catalog::ModelEntry) {
@@ -117,6 +176,7 @@ impl ModelSettings {
         "reasoning",
         "temperature",
         "top_p",
+        "routing",
         "context_length",
         "prompt_cost",
         "completion_cost",
@@ -135,6 +195,10 @@ impl ModelSettings {
             "reasoning" => "off | low | med | high | max",
             "temperature" => "0.0 - 2.0 (omit to use the provider's own default)",
             "top_p" => "0.0 - 1.0 (omit to use the provider's own default)",
+            "routing" => {
+                "OpenRouter provider preferences: only / order / ignore / allow_fallbacks \
+                 / require_parameters"
+            }
             "context_length" => "context window in tokens",
             "prompt_cost" => "USD per million input tokens",
             "completion_cost" => "USD per million output tokens",
@@ -154,6 +218,7 @@ impl ModelSettings {
         self.reasoning.is_none()
             && self.temperature.is_none()
             && self.top_p.is_none()
+            && self.routing().is_none()
             && self.context_length.is_none()
             && self.prompt_cost.is_none()
             && self.completion_cost.is_none()
@@ -200,13 +265,13 @@ fn edit_distance(a: &str, b: &str, max: usize) -> Option<usize> {
     }
 }
 
-/// The closest known key to `typo`, if one is close enough to be a likely
+/// The closest key in `keys` to `typo`, if one is close enough to be a likely
 /// intent. Returns the *name*; the caller words the message.
-pub fn suggest_key(typo: &str) -> Option<&'static str> {
+fn closest(typo: &str, keys: &'static [&'static str]) -> Option<&'static str> {
     // A distance of 3 covers every plausible transposition ("tomperature") and
     // abbreviation without waving at unrelated keys.
     let mut best: Option<(usize, &'static str)> = None;
-    for key in KNOWN_KEYS {
+    for key in keys {
         if let Some(d) = edit_distance(typo, key, 3) {
             if best.map(|(bd, _)| d < bd).unwrap_or(true) {
                 best = Some((d, key));
@@ -214,6 +279,55 @@ pub fn suggest_key(typo: &str) -> Option<&'static str> {
         }
     }
     best.map(|(_, key)| key)
+}
+
+/// The closest top-level key to `typo`, if one is close enough to be a likely
+/// intent.
+pub fn suggest_key(typo: &str) -> Option<&'static str> {
+    closest(typo, KNOWN_KEYS)
+}
+
+/// The keys a `routing` inline table accepts, in the order they are offered.
+const ROUTING_KEYS: &[&str] = &[
+    "only",
+    "order",
+    "ignore",
+    "allow_fallbacks",
+    "require_parameters",
+];
+
+/// The wire keys of [`Routing`] whose value is a single boolean.
+const ROUTING_BOOLS: &[&str] = &["allow_fallbacks", "require_parameters"];
+
+/// A key's validation failure.
+///
+/// `anchor` names a key *inside* the value — a `routing` sub-key, which sits
+/// on its own line — whose line is the useful place to point at; `None`
+/// anchors on the key itself.
+struct CoerceError {
+    msg: String,
+    anchor: Option<String>,
+}
+
+impl CoerceError {
+    /// A failure about the key itself, not about anything inside its value.
+    fn at_key(msg: String) -> Self {
+        CoerceError { msg, anchor: None }
+    }
+
+    /// A failure about `anchor`, a key inside the value.
+    fn at_inner(anchor: &str, msg: String) -> Self {
+        CoerceError {
+            msg,
+            anchor: Some(anchor.to_string()),
+        }
+    }
+}
+
+impl From<String> for CoerceError {
+    fn from(msg: String) -> Self {
+        CoerceError::at_key(msg)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,7 +377,18 @@ pub fn parse_fragment(text: &str) -> Result<ModelSettings, String> {
         }
         match coerce(key, item) {
             Ok(()) => {}
-            Err(e) => errors.push(at(e)),
+            // A `routing` error can name a sub-key, which sits on its own line
+            // inside the block — point there rather than at `routing = {`.
+            Err(CoerceError { msg, anchor }) => {
+                let line = anchor
+                    .as_deref()
+                    .and_then(|k| line_of_key(text, k))
+                    .or(line);
+                errors.push(match line {
+                    Some(l) => format!("line {l}: {msg}"),
+                    None => msg,
+                });
+            }
         }
         apply_one(&mut out, key, item);
     }
@@ -324,7 +449,18 @@ fn comment_prefix(table: &dyn toml_edit::TableLike, key: &str) -> Option<String>
 
 /// Validate one key's value. Type errors are caught here rather than by serde
 /// so the message can say what was found and what was wanted.
-fn coerce(key: &str, item: &toml_edit::Item) -> Result<(), String> {
+fn coerce(key: &str, item: &toml_edit::Item) -> Result<(), CoerceError> {
+    // `routing` is the one key whose value has structure of its own, so its
+    // errors can point at a key inside the table rather than at the table.
+    if key == "routing" {
+        return coerce_routing(item);
+    }
+    coerce_value(key, item).map_err(CoerceError::at_key)
+}
+
+/// The flat-key half of [`coerce`]: every key whose value is a single scalar
+/// or list. Errors are plain messages; they anchor on the key's own line.
+fn coerce_value(key: &str, item: &toml_edit::Item) -> Result<(), String> {
     let Some(value) = item.as_value() else {
         return Err(format!("'{key}' must be a single value, not a table"));
     };
@@ -376,6 +512,78 @@ fn coerce(key: &str, item: &toml_edit::Item) -> Result<(), String> {
         }
         _ => Ok(()),
     }
+}
+
+/// Validate a `routing = { … }` inline table against OpenRouter's provider
+/// preferences vocabulary (§1 of the design doc).
+///
+/// The table is an *inline* table on purpose: a `[models."id".routing]` header
+/// would need a table-vs-value branch through the whole parse/write path, and
+/// picocode is the only consumer of this file.
+fn coerce_routing(item: &toml_edit::Item) -> Result<(), CoerceError> {
+    let Some(value) = item.as_value() else {
+        return Err(CoerceError::at_key(
+            "'routing' must be an inline table on one key: routing = { only = [...] }".to_string(),
+        ));
+    };
+    let Some(table) = value.as_inline_table() else {
+        return Err(CoerceError::at_key(format!(
+            "'routing' must be an inline table, found {}",
+            type_of(value)
+        )));
+    };
+    for (k, v) in table.iter() {
+        if !ROUTING_KEYS.contains(&k) {
+            let hint = match closest(k, ROUTING_KEYS) {
+                Some(known) => format!(" (did you mean '{known}'?)"),
+                None => String::new(),
+            };
+            return Err(CoerceError::at_inner(
+                k,
+                format!(
+                    "unknown routing key '{k}'{hint}; routing keys: {}",
+                    ROUTING_KEYS.join(", ")
+                ),
+            ));
+        }
+        if ROUTING_BOOLS.contains(&k) {
+            if v.as_bool().is_none() {
+                return Err(CoerceError::at_inner(
+                    k,
+                    format!("'routing.{k}' must be true or false, found {}", type_of(v)),
+                ));
+            }
+            continue;
+        }
+        let Some(arr) = v.as_array() else {
+            return Err(CoerceError::at_inner(
+                k,
+                format!(
+                    "'routing.{k}' must be an array of strings, found {}",
+                    type_of(v)
+                ),
+            ));
+        };
+        // An empty pin excludes nothing, so it is a typo rather than a wish.
+        if k == "only" && arr.is_empty() {
+            return Err(CoerceError::at_inner(
+                k,
+                "'routing.only' must not be empty — remove the key instead".to_string(),
+            ));
+        }
+        for (i, x) in arr.iter().enumerate() {
+            if x.as_str().is_none() {
+                return Err(CoerceError::at_inner(
+                    k,
+                    format!(
+                        "'routing.{k}[{i}]' must be a quoted string, found {}",
+                        type_of(x)
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn in_range(key: &str, value: &toml_edit::Value, lo: f64, hi: f64) -> Result<(), String> {
@@ -435,6 +643,15 @@ fn apply_one(out: &mut ModelSettings, key: &str, item: &toml_edit::Item) {
         "reasoning" => out.reasoning = v.as_str().and_then(|s| s.parse().ok()),
         "temperature" => out.temperature = num(v),
         "top_p" => out.top_p = num(v),
+        "routing" => {
+            // An empty table is no opinion, and normalizing it away here keeps
+            // the record's own identity honest: `routing = {}` and a missing
+            // key mean the same thing everywhere downstream.
+            out.routing = v
+                .as_inline_table()
+                .map(routing_from_table)
+                .filter(|r| !r.is_empty());
+        }
         "context_length" => out.context_length = v.as_integer().and_then(|i| u64::try_from(i).ok()),
         "prompt_cost" => out.prompt_cost = num(v),
         "completion_cost" => out.completion_cost = num(v),
@@ -455,9 +672,35 @@ fn apply_one(out: &mut ModelSettings, key: &str, item: &toml_edit::Item) {
     }
 }
 
+/// Read an inline table into a [`Routing`]. Only reached for a table that
+/// passed [`coerce_routing`], so every key is known and correctly typed.
+fn routing_from_table(t: &toml_edit::InlineTable) -> Routing {
+    let list = |k: &str| {
+        t.get(k).and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+    };
+    Routing {
+        only: list("only"),
+        order: list("order"),
+        ignore: list("ignore"),
+        allow_fallbacks: t.get("allow_fallbacks").and_then(|v| v.as_bool()),
+        require_parameters: t.get("require_parameters").and_then(|v| v.as_bool()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rendering the fragment the editor shows
 // ---------------------------------------------------------------------------
+
+/// The commented-out `routing` block offered when the key is unset. The
+/// multi-line inline-table form is TOML 1.1; showing it is how a user learns
+/// it exists.
+const ROUTING_TEMPLATE: &str =
+    "routing = {\n  only = [\"provider/slug\"],\n  allow_fallbacks = false,\n}";
 
 /// Render a record as a commented TOML fragment for `$EDITOR`.
 ///
@@ -480,7 +723,10 @@ pub fn render_fragment(model_id: &str, current: &ModelSettings, hints: &ModelSet
          #\n\
          # reasoning / temperature / top_p are defaults applied when this model is\n\
          # first activated in a session. A `/model <id> save` copies your live\n\
-         # values here.\n\n"
+         # values here.\n\
+         #\n\
+         # routing is OpenRouter's provider preferences for this model. Other\n\
+         # providers ignore it.\n\n"
     ));
 
     for key in ModelSettings::KEYS {
@@ -496,6 +742,19 @@ pub fn render_fragment(model_id: &str, current: &ModelSettings, hints: &ModelSet
         }
         match present {
             Some(v) => out.push_str(&format!("{key} = {v}\n")),
+            // `routing` renders across lines, so every line of the suggestion
+            // has to be commented: the tail of a single-line `# routing = {…}`
+            // would otherwise parse as real top-level keys. The multi-line
+            // shape is not something a user should have to guess at, so an
+            // unset routing offers the shape itself.
+            None if *key == "routing" => {
+                let shape = hints
+                    .value_of(key)
+                    .unwrap_or_else(|| ROUTING_TEMPLATE.to_string());
+                for line in shape.lines() {
+                    out.push_str(&format!("# {line}\n"));
+                }
+            }
             None => {
                 if let Some(suggested) = hints.value_of(key) {
                     out.push_str(&format!("# {key} = {suggested}\n"));
@@ -521,6 +780,7 @@ impl ModelSettings {
             "reasoning" => quote(self.reasoning?.as_str()),
             "temperature" => num(self.temperature?),
             "top_p" => num(self.top_p?),
+            "routing" => format_routing(self.routing()?),
             "context_length" => self.context_length?.to_string(),
             "prompt_cost" => num(self.prompt_cost?),
             "completion_cost" => num(self.completion_cost?),
@@ -529,15 +789,7 @@ impl ModelSettings {
             "agentic_index" => num(self.agentic_index? as f64),
             "description" => quote(self.description.as_ref()?),
             "supports_reasoning" => self.supports_reasoning?.to_string(),
-            "reasoning_levels" => {
-                let items: Vec<String> = self
-                    .reasoning_levels
-                    .as_ref()?
-                    .iter()
-                    .map(|s| quote(s))
-                    .collect();
-                format!("[{}]", items.join(", "))
-            }
+            "reasoning_levels" => string_array(self.reasoning_levels.as_ref()?),
             _ => return None,
         })
     }
@@ -564,6 +816,37 @@ fn quote(s: &str) -> String {
         .replace('\t', "\\t")
         .replace('\r', "\\r");
     format!("\"{escaped}\"")
+}
+
+/// A single-line TOML array of basic strings.
+fn string_array(items: &[String]) -> String {
+    let rendered: Vec<String> = items.iter().map(|s| quote(s)).collect();
+    format!("[{}]", rendered.join(", "))
+}
+
+/// A [`Routing`] rendered as a multi-line inline table: one preference per
+/// line, which is the form the file and the editor fragment both carry. The
+/// full vocabulary never fits on one line readably, and TOML 1.1 (which
+/// `toml_edit` implements) allows newlines inside an inline table.
+fn format_routing(r: &Routing) -> String {
+    let mut out = String::from("{\n");
+    if let Some(v) = &r.only {
+        out.push_str(&format!("  only = {},\n", string_array(v)));
+    }
+    if let Some(v) = &r.order {
+        out.push_str(&format!("  order = {},\n", string_array(v)));
+    }
+    if let Some(v) = &r.ignore {
+        out.push_str(&format!("  ignore = {},\n", string_array(v)));
+    }
+    if let Some(v) = r.allow_fallbacks {
+        out.push_str(&format!("  allow_fallbacks = {v},\n"));
+    }
+    if let Some(v) = r.require_parameters {
+        out.push_str(&format!("  require_parameters = {v},\n"));
+    }
+    out.push('}');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +1037,11 @@ mod tests {
             reasoning: Some(ReasoningLevel::High),
             temperature: Some(0.8),
             top_p: Some(0.95),
+            routing: Some(Routing {
+                only: Some(vec!["deepinfra/fp8/flex".into()]),
+                allow_fallbacks: Some(false),
+                ..Default::default()
+            }),
             context_length: Some(1_048_576),
             coding_index: Some(61.5),
             description: Some("Tencent HY 3, \"fast\"".into()),
@@ -767,11 +1055,146 @@ mod tests {
         let back = read.get(id).expect("record must come back");
         // `comments` is file-derived, not part of the record's identity.
         assert_eq!(back.params(), original.params());
+        assert_eq!(back.routing, original.routing);
         assert_eq!(back.context_length, original.context_length);
         assert_eq!(back.coding_index, original.coding_index);
         assert_eq!(back.description, original.description);
         assert_eq!(back.reasoning_levels, original.reasoning_levels);
         assert_eq!(back.supports_reasoning, original.supports_reasoning);
+    }
+
+    // ---- routing (doc/261017_openrouter_provider_selection.md) ----
+
+    fn routing() -> Routing {
+        Routing {
+            only: Some(vec!["deepinfra/fp8/flex".into()]),
+            allow_fallbacks: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// The table is stored multi-line (it is the readable form), and the
+    /// file round-trip must survive it.
+    #[test]
+    fn a_routing_table_is_stored_multi_line_and_round_trips() {
+        let id = "openrouter:p:m";
+        let mut d = doc("");
+        let record = ModelSettings {
+            routing: Some(routing()),
+            ..Default::default()
+        };
+        write_to_doc(&mut d, id, &record).unwrap();
+        let text = d.to_string();
+        assert!(text.contains("routing = {\n"), "multi-line: {text}");
+        assert!(
+            text.contains("\n  only = [\"deepinfra/fp8/flex\"],\n"),
+            "{text}"
+        );
+        assert_eq!(
+            read_from_doc(&d).unwrap().get(id).unwrap().routing,
+            record.routing
+        );
+    }
+
+    /// The same table through the editor fragment: rendered, re-parsed, equal.
+    #[test]
+    fn a_routing_table_round_trips_through_the_fragment() {
+        let current = ModelSettings {
+            routing: Some(routing()),
+            ..Default::default()
+        };
+        let text = render_fragment("openrouter:p:m", &current, &ModelSettings::default());
+        assert!(text.contains("\nrouting = {\n"), "{text}");
+        let parsed = parse_fragment(&text).unwrap_or_else(|e| panic!("{e}\n---\n{text}"));
+        assert_eq!(parsed.routing, current.routing);
+    }
+
+    /// An unset routing offers the commented shape — all of it commented, or
+    /// the template would parse as real keys.
+    #[test]
+    fn the_fragment_offers_a_commented_routing_shape() {
+        let text = render_fragment(
+            "openrouter:p:m",
+            &ModelSettings::default(),
+            &Default::default(),
+        );
+        assert!(text.contains("# routing = {"), "{text}");
+        for line in text.lines().filter(|l| l.contains("only =")) {
+            assert!(line.trim_start().starts_with('#'), "uncommented: {line}");
+        }
+        let parsed = parse_fragment(&text).unwrap();
+        assert_eq!(parsed.routing, None);
+    }
+
+    #[test]
+    fn an_unknown_routing_key_is_loud_with_a_suggestion() {
+        let err =
+            parse_fragment("routing = { ony = [\"x\"], allow_fallbacks = false }\n").unwrap_err();
+        assert!(err.contains("unknown routing key 'ony'"), "{err}");
+        assert!(err.contains("did you mean 'only'"), "{err}");
+        assert!(err.contains("allow_fallbacks"), "the vocabulary: {err}");
+    }
+
+    #[test]
+    fn routing_type_errors_say_what_was_found() {
+        let err = parse_fragment("routing = { only = \"x\" }\n").unwrap_err();
+        assert!(err.contains("must be an array of strings"), "{err}");
+        assert!(err.contains("a string"), "what was found: {err}");
+
+        let err = parse_fragment("routing = { allow_fallbacks = 1 }\n").unwrap_err();
+        assert!(err.contains("true or false"), "{err}");
+
+        let err = parse_fragment("routing = { only = [1] }\n").unwrap_err();
+        assert!(err.contains("quoted string"), "{err}");
+
+        let err = parse_fragment("routing = \"deepinfra\"\n").unwrap_err();
+        assert!(err.contains("inline table"), "{err}");
+    }
+
+    /// `only = []` pins to nothing, which is a typo rather than a preference.
+    #[test]
+    fn an_empty_only_list_is_an_error() {
+        let err = parse_fragment("routing = { only = [] }\n").unwrap_err();
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    /// A multi-line block's error points at the offending sub-key's own line,
+    /// not at `routing = {`.
+    #[test]
+    fn routing_errors_point_at_the_offending_line() {
+        let err =
+            parse_fragment("reasoning = \"high\"\nrouting = {\n  only = \"x\",\n}\n").unwrap_err();
+        assert!(err.contains("line 3"), "{err}");
+    }
+
+    /// An empty table is no opinion: it parses to nothing, keeps the record
+    /// empty, and drops from the file.
+    #[test]
+    fn an_empty_routing_table_is_no_opinion() {
+        let parsed = parse_fragment("routing = {}\n").unwrap();
+        assert_eq!(parsed.routing, None);
+        assert!(parsed.is_empty());
+
+        let mut d = doc("");
+        write_to_doc(&mut d, "p:m", &parsed).unwrap();
+        assert!(!d.to_string().contains("models"), "{}", d);
+    }
+
+    /// A record that holds *only* routing still writes its table, and an
+    /// emptied one removes it (routing counts as content, not noise).
+    #[test]
+    fn a_routing_only_record_writes_and_then_removes_its_table() {
+        let id = "openrouter:p:m";
+        let mut d = doc("");
+        let record = ModelSettings {
+            routing: Some(routing()),
+            ..Default::default()
+        };
+        write_to_doc(&mut d, id, &record).unwrap();
+        assert!(d.to_string().contains(&format!("[models.\"{id}\"]")));
+
+        write_to_doc(&mut d, id, &ModelSettings::default()).unwrap();
+        assert!(!d.to_string().contains("models"), "{}", d);
     }
 
     /// An empty record leaves no table: "not configured" and "configured to
@@ -950,6 +1373,13 @@ mod tests {
         let current = ModelSettings {
             reasoning: Some(ReasoningLevel::Med),
             temperature: Some(0.25),
+            routing: Some(Routing {
+                only: Some(vec!["deepinfra/fp8/flex".into()]),
+                order: Some(vec!["deepinfra".into()]),
+                ignore: Some(vec!["together".into()]),
+                allow_fallbacks: Some(false),
+                require_parameters: Some(true),
+            }),
             context_length: Some(200_000),
             description: Some("a \"quoted\" description\nwith a newline".into()),
             reasoning_levels: Some(vec!["low".into(), "max".into()]),
