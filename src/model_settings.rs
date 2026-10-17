@@ -355,7 +355,7 @@ pub fn parse_fragment(text: &str) -> Result<ModelSettings, String> {
             // Keep only what the user wrote: the rendered header and hint are
             // generated on every edit, and storing them as a key's comment is
             // what made the next render print them twice.
-            let user = user_comment(key, &prefix);
+            let user = user_comment(&prefix);
             if !user.trim().is_empty() {
                 out.comments.insert(key.to_string(), user);
             }
@@ -448,33 +448,71 @@ fn comment_prefix(table: &dyn toml_edit::TableLike, key: &str) -> Option<String>
     Some(decor.prefix()?.as_str()?.to_string())
 }
 
+/// The text of a comment line with any run of leading `#` markers removed.
+///
+/// A rendered comment can pick up an extra `#` each time a previously stored
+/// copy is re-rendered, so matching the body rather than the raw line also
+/// cleans fragments already carrying `## …`.
+fn comment_body(line: &str) -> &str {
+    line.trim_start().trim_start_matches('#').trim_start()
+}
+
+/// True for a comment line [`render_fragment`] generates: a per-key hint or a
+/// commented-out value suggestion.
+fn is_generated_comment(body: &str) -> bool {
+    ModelSettings::KEYS.iter().any(|key| {
+        let hint = ModelSettings::key_hint(key);
+        (!hint.is_empty() && body == hint) || body.starts_with(&format!("{key} ="))
+    })
+}
+
 /// Keep the user's own comment lines, dropping the ones [`render_fragment`]
 /// generates.
 ///
-/// The header sits above the first key and the hint above every key, so both
-/// are indistinguishable from user comments once the fragment has been parsed.
-/// Carrying them into `comments` and then into the file is what made the next
-/// edit print the header and hint twice (the second time with an extra `#`).
-/// Removing them here means the file only ever stores what the user actually
-/// wrote; the renderer puts its own scaffolding back.
-fn user_comment(key: &str, raw: &str) -> String {
-    let hint = format!("# {}", ModelSettings::key_hint(key));
+/// Everything unset is rendered as comments, so the comments for several keys
+/// can end up bundled into the prefix of the next *set* key. Handling only the
+/// key's own hint was not enough: temperature and top_p suggestions would ride
+/// along with `routing`, be saved, and then render with an extra `#`.
+/// Removing every generated line here means the file only stores what the user
+/// actually wrote; the renderer puts its scaffolding back.
+fn user_comment(raw: &str) -> String {
     let mut lines: Vec<&str> = raw.lines().collect();
     if let Some(start) = lines
         .iter()
-        .position(|l| l.trim_start().starts_with("# Settings for "))
+        .position(|l| comment_body(l).starts_with("Settings for "))
     {
         if let Some(end) = lines[start..]
             .iter()
-            .position(|l| l.trim_end() == "# providers ignore it.")
+            .position(|l| comment_body(l) == "providers ignore it.")
         {
             lines.drain(start..=start + end);
         }
     }
-    lines.retain(|l| l.trim_start() != hint);
+
+    let mut kept = Vec::new();
+    let mut in_routing_shape = false;
+    for line in lines {
+        let body = comment_body(line);
+        if in_routing_shape {
+            // The commented routing template spans lines; its tail is not
+            // recognisable as a key suggestion on its own.
+            if body == "}" {
+                in_routing_shape = false;
+            }
+            continue;
+        }
+        if body == "routing = {" {
+            in_routing_shape = true;
+            continue;
+        }
+        if is_generated_comment(body) {
+            continue;
+        }
+        kept.push(line);
+    }
     // The blank lines around the generated block are scaffolding too; keeping
     // them would leave bare `#` separators in the next fragment.
-    lines.join("\n").trim_matches('\n').to_string()
+    kept.join("\n").trim_matches('\n').to_string()
 }
 
 /// Validate one key's value. Type errors are caught here rather than by serde
@@ -918,7 +956,7 @@ pub fn read_from_doc(
                 // file; losing them on a plain load would be its own bug.
                 for (key, _) in table.iter() {
                     if let Some(prefix) = comment_prefix(table, key) {
-                        let user = user_comment(key, &prefix);
+                        let user = user_comment(&prefix);
                         if !user.trim().is_empty() {
                             settings.comments.insert(key.to_string(), user);
                         }
@@ -1003,13 +1041,13 @@ pub fn write_to_doc(
             let carried = existing
                 .as_ref()
                 .and_then(|t| t.key(key).and_then(|k| k.leaf_decor().prefix().cloned()))
-                .map(|p| user_comment(key, p.as_str().unwrap_or_default()))
+                .map(|p| user_comment(p.as_str().unwrap_or_default()))
                 .filter(|c| !c.is_empty())
                 .or_else(|| {
                     settings
                         .comments
                         .get(*key)
-                        .map(|c| user_comment(key, c))
+                        .map(|c| user_comment(c))
                         .filter(|c| !c.is_empty())
                 });
             table.insert(key, item);
@@ -1359,6 +1397,59 @@ mod tests {
             !again.contains("## Settings for"),
             "doubled header:\n{again}"
         );
+    }
+
+    /// Everything unset is rendered as comments, so suggestions for
+    /// temperature and top_p can sit directly above a set `routing`. They must
+    /// not be captured as routing's own comment and re-rendered with `##`.
+    #[test]
+    fn unset_key_suggestions_do_not_ride_on_the_next_setting() {
+        let current = ModelSettings {
+            routing: Some(routing()),
+            ..Default::default()
+        };
+        let text = render_fragment("openrouter:p:m", &current, &ModelSettings::default());
+        assert!(text.contains("# temperature ="), "{text}");
+        assert!(text.contains("# top_p ="), "{text}");
+
+        let parsed = parse_fragment(&text).unwrap();
+        let comment = parsed
+            .comments
+            .get("routing")
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(!comment.contains("temperature"), "captured: {comment:?}");
+        assert!(!comment.contains("top_p"), "captured: {comment:?}");
+        assert!(
+            !comment.contains("OpenRouter provider"),
+            "routing hint captured: {comment:?}"
+        );
+
+        // A save/reload/render cycle must not introduce `##` lines.
+        let id = "openrouter:p:m";
+        let mut d = doc("");
+        write_to_doc(&mut d, id, &parsed).unwrap();
+        let reloaded = read_from_doc(&d).unwrap().remove(id).unwrap();
+        let again = render_fragment(id, &reloaded, &ModelSettings::default());
+        assert!(!again.contains("## "), "doubled comments:\n{again}");
+
+        // An already-polluted file carries the suggestions with an extra `#`;
+        // those must be recognised and dropped too.
+        let polluted = "## 0.0 - 2.0 (omit to use the provider's own default)\n\
+                        ## temperature =\n\
+                        #\n\
+                        ## 0.0 - 1.0 (omit to use the provider's own default)\n\
+                        ## top_p =\n\
+                        # OpenRouter provider preferences\n\
+                        routing = { only = [\"deepinfra/fp8\"] }\n";
+        let reparsed = parse_fragment(polluted).unwrap();
+        let comment = reparsed
+            .comments
+            .get("routing")
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(!comment.contains("temperature"), "captured: {comment:?}");
+        assert!(!comment.contains("top_p"), "captured: {comment:?}");
     }
 
     /// A comment on a key the record no longer sets is dropped with the key —
