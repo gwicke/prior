@@ -45,7 +45,9 @@ and link a doc/ and/or commit hash
       doc/261013_multi_file_edit_id_continuity.md.
 - [x] More robust anchoring in crates/blockedit/src/diagnose.rs diagnose(). Currently uses longest
       common sub-string.
-- [ ] doc/261015_sed_parsing_bug.md
+- [x] doc/261015_sed_parsing_bug.md — bracket-expression bug fixed (sed-rs `93309fa`, lock bumped,
+  GNU round-trip cases in `crates/bsed/src/lib.rs`); the `sed -f` docs TODO and tool wording stay
+  open in the doc for a manual pass.
 
 ## Cleanup
 

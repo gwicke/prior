@@ -610,6 +610,19 @@ mod tests {
             // deletion leaves a blank line too.
             "6,7d",
             "2d",
+            // A raw delimiter inside a bracket expression is an ordinary
+            // member, not the end of the pattern (doc/261015_sed_parsing_bug.md).
+            // The sed-rs scanner used to cut the pattern at that delimiter and
+            // re-read the tail as commands, so these failed to parse outright
+            // instead of previewing. The first is the report's own script: a
+            // no-op against this fixture, but it has to parse.
+            "s|a[/]b|X|g",
+            "s/[/]//g",
+            "s/[0-9/]//g",
+            "/[/]/d",
+            // The `]` that ends [:digit:] must not end the class — the raw
+            // `/` after it is still inside.
+            "s/[[:digit:]/]/Q/g",
         ];
         for script in cases {
             // GNU sed is the reference; skip the case if it is not GNU or the
