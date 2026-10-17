@@ -704,9 +704,10 @@ fn erase_down(s: &mut String, h: usize) {
 /// `&mut self`.
 pub struct Draw {
     /// The terminal backend — the design's `Draw { term_io, cache }`. Every
-    /// byte leaves through [`Self::write_bytes`]: the mode guard, the size
-    /// watch, the caps *and* the sink all reach the layers above through this
-    /// one field. Content bytes never name it directly — they arrive through
+    /// byte leaves through [`Self::write_bytes`]: the mode guard and the
+    /// size watch reach the layers above through this one field; the caps
+    /// stop *inside* it (strip and frame-drop are the edge's decisions).
+    /// Content bytes never name it directly — they arrive through
     /// the manager's `ContentWrite` hand-off.
     pub term_io: TermIO,
     /// The size watch: the latest `TermSize`, without a

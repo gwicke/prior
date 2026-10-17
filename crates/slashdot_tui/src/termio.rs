@@ -10,7 +10,8 @@
 //! shape piped mode had when it simply dropped the sender.
 //!
 //! Constructed first at setup (in `main`), before `Content`: it probes
-//! the caps once at construction ([`TermIO::caps`]) and owns the size watch —
+//! the caps once at construction (they stay **inside** this layer — strip
+//! and frame-drop decisions only) and owns the size watch —
 //! one channel per instance. Its receivers feed
 //! content (format width) and the render manager (frame dims) through
 //! [`TermIO::subscribe_size`]; those who publish ([`TermIO::set_size`],
@@ -311,8 +312,8 @@ pub fn register_sigcont() {
 /// §TermIO). The variant picks the input / lifecycle side; caps adjust output
 /// fidelity separately (see [`Caps`]).
 ///
-/// Wiring (design doc §3): build `TermIO` first (`main`), take its
-/// caps and a size-watch receiver for `Content::new`, move the enum itself
+/// Wiring (design doc §3): build `TermIO` first (`main`), take a
+/// size-watch receiver for `Content::new`, move the enum itself
 /// under `Draw`, and call [`handles`](Self::handles) once through the render
 /// manager — the one hand-out, at the pause-gated entry-DSR window. No layer
 /// holds a reference into another.
@@ -344,8 +345,9 @@ pub struct TtyIo {
     /// resizes here, and [`TermIO::set_size`] / [`TermIO::probe_size`] write
     /// through it. Receivers clone off it ([`TermIO::subscribe_size`]).
     size_tx: watch::Sender<TermSize>,
-    /// Probed once at construction ([`Caps::probe`]) — the caps `Content` is
-    /// seeded from, so the probe site lives here and not above.
+    /// Probed once at construction ([`Caps::probe`]) — edge-internal: the
+    /// strip and frame-drop decisions read them here, and the probe site
+    /// lives here so nothing above has to ask.
     caps: Caps,
     /// Sender half of [`TermHandles::input`], moved into the reader thread
     /// by [`TermIO::handles`].
@@ -507,9 +509,11 @@ impl TermIO {
         })
     }
 
-    /// The caps probed at construction — what `Content::new` is seeded from
-    /// (design §Draw: the probe site lives here, not above).
-    pub fn caps(&self) -> Caps {
+    /// The caps probed at construction — **edge-internal**: strip and
+    /// frame-drop decisions read them here, and nothing above `TermIO` may
+    /// (design §TermIO: fidelity is the edge's alone; content always renders
+    /// styled and the kind → sink map is this layer's).
+    fn caps(&self) -> Caps {
         match self {
             TermIO::Tty(t) => t.caps,
             TermIO::Plain(p) => p.caps,

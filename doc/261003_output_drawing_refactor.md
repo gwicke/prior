@@ -238,12 +238,15 @@ impl Draw {
   (`last_content_display_kind`, `last_content_closes_segment`) move up to the Content layer —
   boundary bookkeeping is content's, not the screen's. Writer + cache become this layer's fields,
   so the lock order is encapsulated once.
-- Caps are cached here per stream from `TermIO::caps()` at construction — collapses the 7
-  `is_terminal()` sites (1950…3779 in output.rs) into one `Caps { primary, meta }`.
+- Caps never reach Content (or Render/Draw): content always renders as for a terminal — colours,
+  OSC 8 links, syntax highlighting — at the watched width, and fidelity is the edge's decision
+  (`TermIO` strips escapes per stream at the write, drops frames on a non-terminal primary). The
+  probing and the `Caps { primary, meta }` value live inside TermIO alone.
 - Kinds: `ContentWrite.stream` is the write's *kind*; `TermIO` owns the kind → sink map from caps
   (Content → primary; Reasoning/Error → primary when it is a terminal, else meta). Content decides
-  only the *route* (through the boundary chain, or the raw reasoned hand-off). Frame bytes are a
-  separate TermIO target (`write_frame`) and target the TTY primary only — no UI-on-stderr case.
+  no routing at all: every write — reasoning included — runs the boundary chain, carrying its kind,
+  and the edge picks the sink. Frame bytes are a separate TermIO target (`write_frame`) and target
+  the TTY primary only — no UI-on-stderr case.
 - `output.rs` dissolves: content verbs enter through render(), drawing verbs are Draw's, interactive
   verbs are repl dialogs / TermIO's. The five no-op drawing stubs and their dummy `(w, h)` returns
   disappear with the verbs.
@@ -276,8 +279,8 @@ pub enum TermIO {
 
 impl TermIO {
     fn handles(&mut self) -> TermHandles;
-    // Primary (stdout) and meta (stderr) can disagree.
-    fn caps(&self) -> Caps;
+    // `caps()` is edge-internal (strip / frame-drop / kind → sink);
+    // nothing above TermIO reads it.
     // Kind → sink from caps; the strip is per *target*.
     fn write(&mut self, s: Stream, bytes: &[u8]) -> io::Result<()>;
     // Frame bytes: the primary, dropped on a real non-terminal primary.

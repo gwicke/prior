@@ -241,8 +241,9 @@ impl Interactive {
             config.confirm_port = Some(confirm_bridge.port.clone());
         }
         // The terminal backend was constructed first, in `main`:
-        // Tty iff `use_repl`, already seeded into `Content` (caps, size
-        // watch) and moved under `Draw` on the way in. Nothing here names
+        // Tty iff `use_repl`, already seeded into `Content` (size watch)
+        // and moved under `Draw` on the way in — its caps stay inside it.
+        // Nothing here names
         // `TermIO` — the manager's front door is the whole surface
         // (`resume`/`suspend`/`is_tty`/`handles`/`probe_size`).
         let repl = use_repl.then_some(Repl);

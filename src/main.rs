@@ -294,8 +294,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(picocode::Content::quiet())
     } else {
         // The terminal backend is constructed **first**: it probes
-        // the caps, owns the size watch, and moves into `Content::new` →
-        // `Draw`. Tty iff the input is an interactive terminal — the same
+        // the caps (which stay inside it — strip and frame-drop are the
+        // edge's decisions), owns the size watch, and moves into
+        // `Content::new` → `Draw`. Tty iff the input is an interactive
+        // terminal — the same
         // condition `Interactive::new` derives `repl` from (a Tty whose
         // handles are never taken simply never starts the reader, which is
         // the one-shot recipe/input path).
