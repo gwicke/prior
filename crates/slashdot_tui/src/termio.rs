@@ -31,7 +31,7 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -539,6 +539,25 @@ impl TermIO {
             TermIO::Plain(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "no interactive terminal to suspend",
+            )),
+        }
+    }
+
+    /// One line of non-REPL input — the piped/batch driver's read, the
+    /// `else` arm of the interactive loop (design §Content). Plain reads
+    /// stdin through the edge, so nothing outside this layer touches the
+    /// fd; `Tty` reports `Unsupported` — its stdin belongs to the sole
+    /// reader and the REPL reads keys through the channel, not lines.
+    pub fn read_line(&self) -> io::Result<String> {
+        match self {
+            TermIO::Plain(_) => {
+                let mut line = String::new();
+                io::stdin().lock().read_line(&mut line)?;
+                Ok(line)
+            }
+            TermIO::Tty(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "line input is the piped/batch driver's read",
             )),
         }
     }

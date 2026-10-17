@@ -1205,8 +1205,10 @@ impl Content {
             InputSource::Empty => String::new(),
             InputSource::Stdin => {
                 self.write_content(format!("{} ", style("❯").bold().blue()).as_bytes());
-                let mut input = String::new();
-                let _ = io::stdin().read_line(&mut input);
+                // The read itself is the edge's (design §TermIO: all IO under
+                // one roof) — `TermIO::read_line`, through the hub's front
+                // door like every other edge verb.
+                let input = self.manager.lock().unwrap().read_line().unwrap_or_default();
                 input.trim().to_string()
             }
             #[cfg(test)]

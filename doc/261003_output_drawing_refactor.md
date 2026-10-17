@@ -79,7 +79,8 @@ the agent holds a `Content` handle (never the hub); confirmation keeps its own `
   and drops the hub hand-off (the bytes are still built), with `Stream::Error` the one kind that
   survives — it keeps the edge's routing (meta on a pipe, the primary when it is a terminal).
   Making the error kind always-meta inside `TermIO` is a deferred refinement. The non-REPL input
-  read (the piped/batch driver) is a small `InputSource` on the handle — stdin in production, a
+  read (the piped/batch driver) is `TermIO::read_line` (Plain answers; `Tty` reports `Unsupported`);
+  the handle's `InputSource` picks the source — the edge in production, nothing under quiet, a
   script in tests.
 - No direct agent → output path remains: every write enters through render().
 

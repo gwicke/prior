@@ -872,6 +872,13 @@ impl Draw {
         self.term_io.resume()
     }
 
+    /// One line of non-REPL input — the forward to
+    /// [`TermIO::read_line`](crate::termio::TermIO::read_line), so the
+    /// piped/batch driver's read stays under the edge's roof.
+    pub fn read_line(&self) -> std::io::Result<String> {
+        self.term_io.read_line()
+    }
+
     /// Publish a settled size on the instance's watch (parked-key drains,
     /// defensive `Resize` arms).
     pub fn set_size(&self, size: TermSize) {

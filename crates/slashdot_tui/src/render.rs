@@ -731,6 +731,14 @@ impl RenderManager {
         self.draw.resume()
     }
 
+    /// One line of non-REPL input — the front door to
+    /// [`TermIO::read_line`](crate::termio::TermIO::read_line) for the
+    /// piped/batch driver (design §Content). Plain answers; `Tty` reports
+    /// `Unsupported` (its stdin belongs to the reader).
+    pub fn read_line(&self) -> std::io::Result<String> {
+        self.draw.read_line()
+    }
+
     /// Publish a settled size on the geometry watch (parked-key drains and
     /// the prompt loop's defensive `Resize` arms), through the `TermIO`
     /// that owns the channel.
