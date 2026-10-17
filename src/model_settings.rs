@@ -352,11 +352,12 @@ pub fn parse_fragment(text: &str) -> Result<ModelSettings, String> {
         // A comment above the key is data we want back, not a setting. It
         // lives on the key's decor, so it needs the table to reach.
         if let Some(prefix) = comment_prefix(doc.as_table(), key) {
-            // Verbatim, trailing newline included: that newline is the
-            // separator between the comment and its key, and trimming it
-            // welds them together on the way back out.
-            if !prefix.trim().is_empty() {
-                out.comments.insert(key.to_string(), prefix);
+            // Keep only what the user wrote: the rendered header and hint are
+            // generated on every edit, and storing them as a key's comment is
+            // what made the next render print them twice.
+            let user = user_comment(key, &prefix);
+            if !user.trim().is_empty() {
+                out.comments.insert(key.to_string(), user);
             }
         }
         let line = line_of_key(text, key);
@@ -445,6 +446,35 @@ fn comment_prefix(table: &dyn toml_edit::TableLike, key: &str) -> Option<String>
     // value's decor holds only the whitespace after the `=`.
     let decor = table.key(key)?.leaf_decor();
     Some(decor.prefix()?.as_str()?.to_string())
+}
+
+/// Keep the user's own comment lines, dropping the ones [`render_fragment`]
+/// generates.
+///
+/// The header sits above the first key and the hint above every key, so both
+/// are indistinguishable from user comments once the fragment has been parsed.
+/// Carrying them into `comments` and then into the file is what made the next
+/// edit print the header and hint twice (the second time with an extra `#`).
+/// Removing them here means the file only ever stores what the user actually
+/// wrote; the renderer puts its own scaffolding back.
+fn user_comment(key: &str, raw: &str) -> String {
+    let hint = format!("# {}", ModelSettings::key_hint(key));
+    let mut lines: Vec<&str> = raw.lines().collect();
+    if let Some(start) = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("# Settings for "))
+    {
+        if let Some(end) = lines[start..]
+            .iter()
+            .position(|l| l.trim_end() == "# providers ignore it.")
+        {
+            lines.drain(start..=start + end);
+        }
+    }
+    lines.retain(|l| l.trim_start() != hint);
+    // The blank lines around the generated block are scaffolding too; keeping
+    // them would leave bare `#` separators in the next fragment.
+    lines.join("\n").trim_matches('\n').to_string()
 }
 
 /// Validate one key's value. Type errors are caught here rather than by serde
@@ -888,8 +918,9 @@ pub fn read_from_doc(
                 // file; losing them on a plain load would be its own bug.
                 for (key, _) in table.iter() {
                     if let Some(prefix) = comment_prefix(table, key) {
-                        if !prefix.trim().is_empty() {
-                            settings.comments.insert(key.to_string(), prefix);
+                        let user = user_comment(key, &prefix);
+                        if !user.trim().is_empty() {
+                            settings.comments.insert(key.to_string(), user);
                         }
                     }
                 }
@@ -972,14 +1003,22 @@ pub fn write_to_doc(
             let carried = existing
                 .as_ref()
                 .and_then(|t| t.key(key).and_then(|k| k.leaf_decor().prefix().cloned()))
-                .or_else(|| settings.comments.get(*key).map(|c| c.clone().into()));
+                .map(|p| user_comment(key, p.as_str().unwrap_or_default()))
+                .filter(|c| !c.is_empty())
+                .or_else(|| {
+                    settings
+                        .comments
+                        .get(*key)
+                        .map(|c| user_comment(key, c))
+                        .filter(|c| !c.is_empty())
+                });
             table.insert(key, item);
             // The comment goes on the KEY. Putting it on the value instead
             // writes `reasoning = # note"max"` — the note lands inside the
             // value and the line stops being valid TOML.
             if let (Some(prefix), Some(mut new_key)) = (carried, table.key_mut(key)) {
                 let mut decor = new_key.leaf_decor().clone();
-                decor.set_prefix(comment_prefix_text(prefix.as_str().unwrap_or_default()));
+                decor.set_prefix(comment_prefix_text(&prefix));
                 *new_key.leaf_decor_mut() = decor;
             }
         }
@@ -1260,6 +1299,65 @@ mod tests {
             out.to_string().contains("nightly batch"),
             "comment dropped on write: {}",
             out
+        );
+    }
+
+    /// The generated header and per-key hint must not be captured as the
+    /// first key's comment: doing so made the next render print them twice,
+    /// the second copy with an extra `#`.
+    #[test]
+    fn the_generated_header_and_hint_are_not_stored_as_comments() {
+        let current = ModelSettings {
+            reasoning: Some(ReasoningLevel::Low),
+            ..Default::default()
+        };
+        let text = render_fragment("openrouter:p:m", &current, &ModelSettings::default());
+        let parsed = parse_fragment(&text).unwrap();
+        let comment = parsed
+            .comments
+            .get("reasoning")
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(
+            !comment.contains("Settings for"),
+            "header captured: {comment:?}"
+        );
+        assert!(
+            !comment.contains("# off | low"),
+            "hint captured: {comment:?}"
+        );
+    }
+
+    /// A file already carrying the generated header (written by the old
+    /// behaviour) is cleaned on the next write: the header appears once, not
+    /// once per save.
+    #[test]
+    fn a_header_already_in_the_file_is_cleaned_up() {
+        let id = "p:m";
+        let current = ModelSettings {
+            reasoning: Some(ReasoningLevel::Low),
+            ..Default::default()
+        };
+        let rendered = render_fragment(id, &current, &ModelSettings::default());
+        // Store it verbatim as decor, as the old buggy save did.
+        let source = format!("[models.\"{id}\"]\n{rendered}");
+        let d = doc(&source);
+        let record = read_from_doc(&d).unwrap().remove(id).unwrap();
+        let mut out = doc(&source);
+        write_to_doc(&mut out, id, &record).unwrap();
+        let written = out.to_string();
+        assert_eq!(
+            written.matches("# Settings for").count(),
+            0,
+            "header should not be persisted in the file:\n{written}"
+        );
+        // Re-reading and rendering must show exactly one header.
+        let reloaded = read_from_doc(&out).unwrap().remove(id).unwrap();
+        let again = render_fragment(id, &reloaded, &ModelSettings::default());
+        assert_eq!(again.matches("# Settings for").count(), 1, "{again}");
+        assert!(
+            !again.contains("## Settings for"),
+            "doubled header:\n{again}"
         );
     }
 
