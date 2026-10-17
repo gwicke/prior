@@ -91,8 +91,11 @@ impl CodeAgent {
             {
                 Ok(m) => m,
                 Err(e) => {
-                    // Session index may be stale; log and fall back to empty.
-                    eprintln!("Warning: session build_context failed: {}", e);
+                    // Session index may be stale; report and fall back to
+                    // empty. Rides the error kind (§Content: no warning verb
+                    // of its own).
+                    self.content
+                        .display_error(&format!("session build_context failed: {}", e));
                     Vec::new()
                 }
             },

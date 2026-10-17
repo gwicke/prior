@@ -84,6 +84,9 @@ impl MessageLogger {
         });
 
         if let Err(e) = self.write_line(&entry).await {
+            // A process diagnostic, not content: `MessageLogger` predates and
+            // holds no `Content` handle, so there is no kind to ride (design
+            // §TermIO: stderr is the diagnostic sink).
             eprintln!("Warning: failed to write to message log: {}", e);
         }
     }

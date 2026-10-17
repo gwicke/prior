@@ -4,27 +4,25 @@ Ephemeral companion to [`261003_output_drawing_refactor.md`](./261003_output_dra
 (the authoritative design). `git log` and `doc/todo.md` record what is done; this file tracks only
 what remains and the decisions worth keeping. Do not refer to this document from code comments.
 
-## Remaining — sole-ownership enforcement (stdin done; output next)
+## Remaining — sole-ownership enforcement (stdin + interactive output done; batch paths next)
 
 "TermIO owns all IO, in and out." Stdin reads are done (DSR `11536d3`+`ea2f381`; the window pump's
-divert); what remains, in order:
+divert). Interactive-output escapes are done (`5949de0`): the `/ll`+resume line-tails now hand
+post-chain bytes to the hub (`replay_tail_lines`), the editor error rides `display_error`, the bare
+`\x1b[0J` died (the hub merge owns that choreography). What remains, in order:
 
-1. **Every output byte rides TermIO.** Violations found: `/ll` and session-resume line-tails
-   (`agent/replay.rs:455`, `agent.rs:640` — `writeln!` to stdout, bypassing the strip edge: a pipe
-   consumer gets raw ANSI today); the editor error line (`repl.rs:1079`); the bare `\x1b[0J` before
-   width-change replay (`repl.rs:1605` — frame choreography outside the frame path). Needs an edge
-   route for raw content lines; decide whether these go through `write_content` or a new verb.
-2. **Quiet's error + diagnostics.** `display_error`'s quiet arm eprintlns (`content/handle.rs:1494`)
+1. **Quiet's error + diagnostics.** `display_error`'s quiet arm eprintlns (`content/handle.rs:1494`)
    — design §Content wants always-stderr, but `Stream::Error` only diverts when `!caps.primary`;
    needs an always-meta kind decided inside TermIO. Session warnings (`msglog.rs:87`,
    `turn.rs:95`) have no Content handle — route where one exists, document the rest as process
    diagnostics. Panic hook and `main`'s exit error stay direct (must not lock while unwinding).
-3. **Batch stdin read** (`get_user_input`, `content/handle.rs:1205` — `io::stdin().read_line`)
+2. **Batch stdin read** (`get_user_input`, `content/handle.rs:1205` — `io::stdin().read_line`)
    moves into `TermIO::Plain`; amend the design's "Content holds the input handle" line.
-4. *Deferred:* Ctrl-C/Ctrl-Z handling into the reader thread (forwarding a key is not reading stdin
+3. *Deferred:* Ctrl-C/Ctrl-Z handling into the reader thread (forwarding a key is not reading stdin
    off-turn — cleanup, not correctness). Same for construction-time `is_terminal()` probes
    (`main.rs:304`, `interactive.rs:228`) — environment facts feeding construction, arguably
-   outside the rule.
+   outside the rule. Same for `confirm_probe` — a diagnostic binary that reads a key off a pty by
+   design, outside the main process.
 
 ## Follow-ups
 
