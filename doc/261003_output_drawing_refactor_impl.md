@@ -4,24 +4,24 @@ Ephemeral companion to [`261003_output_drawing_refactor.md`](./261003_output_dra
 (the authoritative design). `git log` and `doc/todo.md` record what is done; this file tracks only
 what remains and the decisions worth keeping. Do not refer to this document from code comments.
 
-## Remaining — sole-ownership enforcement (stdin + output done; batch paths next)
+## Sole-ownership enforcement: done
 
-"TermIO owns all IO, in and out." Done: stdin reads (DSR `11536d3`+`ea2f381`; the window pump's
-divert), interactive-output escapes (`5949de0`: `/ll`+resume line-tails hand post-chain bytes to
-the hub via `replay_tail_lines`, the editor error rides `display_error`, the bare `\x1b[0J` died —
-the hub merge owns that choreography), and error routing (`c0b3840`: `Stream::Error` is the one
-kind quiet spares; the session build_context warning rides `display_error`; the message-log
-warning is a documented process diagnostic). What remains:
+"TermIO owns all IO, in and out." Complete across five commits: DSR (`11536d3`+`ea2f381`), the
+window pump's divert (`8778fc7`), interactive-output escapes (`5949de0`), error routing
+(`c0b3840`), and the batch stdin read (`cdf64a2` — `TermIO::read_line`; Plain answers, Tty reports
+`Unsupported`; the design's "Content holds the input handle" line amended to "the InputSource picks
+the source, the edge does the read").
 
-1. **Batch stdin read** (`get_user_input`, `content/handle.rs:1205` — `io::stdin().read_line`)
-   moves into `TermIO::Plain`; amend the design's "Content holds the input handle" line.
-2. *Deferred:* an always-meta error kind inside TermIO (errors currently ride `Stream::Error`'s
-   existing routing — meta on a pipe, the primary on a tty; the mode is not important, the
-   vocabulary is). Also deferred: Ctrl-C/Ctrl-Z handling into the reader thread (forwarding a key
-   is not reading stdin off-turn — cleanup, not correctness). Same for construction-time
-   `is_terminal()` probes (`main.rs:304`, `interactive.rs:228`) — environment facts feeding
-   construction, arguably outside the rule. Same for `confirm_probe` — a diagnostic binary that
-   reads a key off a pty by design, outside the main process.
+### Deferred (by decision, revisit when a driver appears)
+
+- An always-meta error kind inside TermIO: errors ride `Stream::Error`'s existing routing (meta on
+  a pipe, the primary on a tty); the mode is not important, the vocabulary is.
+- Ctrl-C/Ctrl-Z handling into the reader thread: forwarding a key is not reading stdin off-turn —
+  cleanup, not correctness.
+- Construction-time `is_terminal()` probes (`main.rs:304`, `interactive.rs:228`): environment
+  facts feeding construction, arguably outside the rule.
+- `confirm_probe`: a diagnostic binary that reads a key off a pty by design, outside the main
+  process.
 
 ## Follow-ups
 
