@@ -256,14 +256,20 @@ async fn draft_at_pivot(
         .ok()
         .as_ref()
         .and_then(crate::session::Session::extract_seed_from_context);
+    // The deterministic modes only cover the span since the active compaction,
+    // exactly like the pivoted runtime context. This keeps their drafts
+    // incremental: the previous summary is the seed, and only messages/files
+    // after its boundary are re-rendered.
+    let since = crate::session::entries_since_last_compaction(dropped);
     match mode {
         CompactSummaryMode::Manual => Ok(crate::session::build_manual_template(
-            dropped,
+            &since,
             seed_text.as_deref(),
             session_dir,
         )),
         CompactSummaryMode::TextOnly => Ok(crate::session::build_text_only_summary(
-            dropped,
+            &since,
+            seed_text.as_deref(),
             session_dir,
         )),
         CompactSummaryMode::Llm => {
@@ -582,7 +588,7 @@ pub(crate) async fn generate_branch_summary(
             crate::session::build_manual_template(&spur, None, &session_dir)
         }
         CompactSummaryMode::TextOnly => {
-            crate::session::build_text_only_summary(&spur, &session_dir)
+            crate::session::build_text_only_summary(&spur, None, &session_dir)
         }
         CompactSummaryMode::Llm => {
             let conversation = serialize_spur(&spur);
@@ -1759,6 +1765,84 @@ mod tests {
             }
             other => panic!("expected Compaction entry, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn generate_text_only_is_incremental_since_last_compaction() {
+        // Branch: [u0, a0(read thinned.rs), C1{firstKept:u2}, u2, a2(read
+        // new.rs), u3]. Compacting at u3 must start from C1's summary and
+        // only cover messages/files since C1's firstKept boundary; a file
+        // the user thinned from C1's summary must not reappear from the
+        // pre-compaction span.
+        let _g = tempfile::tempdir().unwrap();
+        let mut a0 = message_entry("a0", Some("u0"), "assistant", "old answer");
+        if let crate::session::SessionEntryContent::Message { message } = &mut a0.content {
+            message["content"] = serde_json::json!([
+                {"type": "text", "text": "old answer"},
+                {"type": "toolCall", "name": "read",
+                 "arguments": {"path": "thinned.rs"}},
+            ]);
+        }
+        let mut a2 = message_entry("a2", Some("u2"), "assistant", "new answer");
+        if let crate::session::SessionEntryContent::Message { message } = &mut a2.content {
+            message["content"] = serde_json::json!([
+                {"type": "text", "text": "new answer"},
+                {"type": "toolCall", "name": "read",
+                 "arguments": {"path": "new.rs"}},
+            ]);
+        }
+        let previous = "# Prior summary\n\nold notes\n\n---\n# [Files]\n- read: kept.rs\n";
+        let s = std::sync::Arc::new(
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u0", None, "user", "old prompt"),
+                    a0,
+                    compaction_entry("c1", Some("a0"), previous, "u2", 20),
+                    message_entry("u2", Some("c1"), "user", "new prompt"),
+                    a2,
+                    message_entry("u3", Some("a2"), "user", "next prompt"),
+                ],
+            )
+            .await,
+        );
+        let app_state = compaction_app_state(s.clone());
+        let draft = generate_compaction(&app_state, "u3", CompactSummaryMode::TextOnly, "")
+            .await
+            .expect("text-only generate");
+
+        assert!(
+            draft.summary.starts_with("# Prior summary\n\nold notes"),
+            "previous summary leads: {:?}",
+            draft.summary
+        );
+        assert!(
+            draft.summary.contains("# Messages since last compaction"),
+            "{:?}",
+            draft.summary
+        );
+        assert!(draft.summary.contains("new prompt"), "{:?}", draft.summary);
+        assert!(draft.summary.contains("new answer"), "{:?}", draft.summary);
+        assert!(
+            !draft.summary.contains("old prompt") && !draft.summary.contains("old answer"),
+            "pre-compaction messages must not be re-rendered: {:?}",
+            draft.summary
+        );
+        assert!(
+            draft.summary.contains("- read: kept.rs"),
+            "previous files carried forward: {:?}",
+            draft.summary
+        );
+        assert!(
+            draft.summary.contains("- read: new.rs"),
+            "new file appended: {:?}",
+            draft.summary
+        );
+        assert!(
+            !draft.summary.contains("thinned.rs"),
+            "a thinned pre-compaction file must not reappear: {:?}",
+            draft.summary
+        );
     }
 
     #[tokio::test]

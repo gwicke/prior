@@ -382,25 +382,139 @@ pub(crate) fn collect_touched_files(
     }
 }
 
-/// Like `collect_touched_files` but skips paths already in `seen_paths`.
-/// entries a compaction drops (everything before `firstKeptEntryId`).
+/// The normalized label of a markdown heading line, if it is one.
+/// Mirrors the heading detection already used in `split_sections`: any
+/// level 1–6 heading whose first non-`#` character is `[` or alphabetic.
+fn heading_label(line: &str) -> Option<String> {
+    let rest = line.strip_prefix('#')?;
+    let rest_stripped = rest.trim_start_matches('#').trim_start();
+    if rest_stripped.is_empty() {
+        return None;
+    }
+    let first = rest_stripped.chars().next()?;
+    if !(rest_stripped.starts_with('[') || first.is_alphabetic()) {
+        return None;
+    }
+    let label_raw = rest_stripped.trim_start_matches('[').trim_end_matches(']');
+    Some(label_raw.to_lowercase())
+}
+
+/// The previous summary with its file sections removed, everything else
+/// (headings, prose, earlier message blocks) kept verbatim. The caller
+/// re-renders the file list from the merged set, so leaving the old sections
+/// in would duplicate them.
+fn previous_text_without_file_sections(summary: &str) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut in_file_section = false;
+    for line in summary.lines() {
+        if let Some(label) = heading_label(line) {
+            if label == "files" || label == "documents" {
+                // Drop the separator that introduced the file section too.
+                while lines.last().is_some_and(|l| l.trim().is_empty()) {
+                    lines.pop();
+                }
+                if lines
+                    .last()
+                    .is_some_and(|l| matches!(l.trim(), "---" | "***"))
+                {
+                    lines.pop();
+                }
+                in_file_section = true;
+            } else {
+                in_file_section = false;
+                lines.push(line);
+            }
+            continue;
+        }
+        if !in_file_section {
+            lines.push(line);
+        }
+    }
+    lines.join("\n").trim().to_string()
+}
+
+/// Build the merged touched-file list for a compaction draft: files carried
+/// forward from `previous_summary` first (original order, custom descriptors
+/// preserved), then files newly touched in `entries` (chronological), with
+/// read→modified promotion in place. Returns the files plus the previous
+/// summary's non-file notes (used by manual mode).
+fn merge_files_with_previous(
+    previous_summary: Option<&str>,
+    entries: &[SessionEntry],
+    session_dir: &std::path::Path,
+) -> (Vec<TouchedFile>, Vec<String>) {
+    let mut files: Vec<TouchedFile> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+
+    if let Some(summary) = previous_summary {
+        let (parsed_files, parsed_notes) =
+            parse_summary_into_sections(summary, &["files", "documents"]);
+        files.extend(parsed_files);
+        notes = parsed_notes;
+    }
+
+    let mut seen_paths: std::collections::HashSet<String> =
+        files.iter().map(|f| f.path.clone()).collect();
+
+    let mut new_files: Vec<TouchedFile> = Vec::new();
+    for entry in entries {
+        if let SessionEntryContent::Message { message } = &entry.content {
+            if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                collect_touched_files(message, &mut new_files, session_dir);
+            }
+        }
+    }
+
+    for new_file in new_files {
+        if let Some(existing) = files.iter_mut().find(|f| f.path == new_file.path) {
+            if new_file.modified {
+                existing.modified = true;
+                if existing.descriptor.as_deref() == Some("read") {
+                    existing.descriptor = Some("modified".to_string());
+                }
+            }
+        } else if seen_paths.insert(new_file.path.clone()) {
+            files.push(new_file);
+        }
+    }
+
+    (files, notes)
+}
+
+/// Build the deterministic "text only" summary for a compaction draft.
 ///
-/// Contains, in chronological order:
-/// - every **user prompt** (full text),
-/// - the assistant's **text responses** for that turn (one block per turn;
-///   reasoning and tool-call syntax are skipped),
-/// - and ends with a **touched-files list** (`read` / `write` / `edit` paths,
-///   modified files marked) — but no reasoning content, no tool calls, and no
-///   tool output.
+/// Contains, in order:
+/// - the previous compaction summary text (if any), with its old file
+///   sections removed,
+/// - a `# Messages since last compaction` section with every user prompt and
+///   assistant text response from `entries` (no reasoning, tool calls, or
+///   tool output),
+/// - the merged `Documents` / `Files` list (same carry-forward rules as the
+///   manual template).
+///
+/// The caller passes entries already scoped to the active compaction (see
+/// `entries_since_last_compaction`); for branch summarization there is no
+/// previous summary and the spur itself is the whole input.
 ///
 /// Deterministic (no LLM). Used as the `summary` of a `Compaction` entry
-/// ("text only" mode). Empty when the dropped span has no renderable text.
+/// ("text only" mode). Empty when there is nothing renderable.
 pub(crate) fn build_text_only_summary(
-    dropped: &[SessionEntry],
+    entries: &[SessionEntry],
+    previous_summary: Option<&str>,
     session_dir: &std::path::Path,
 ) -> String {
+    let (files, _notes) = merge_files_with_previous(previous_summary, entries, session_dir);
+
     let mut out = String::new();
-    let mut files: Vec<TouchedFile> = Vec::new();
+    if let Some(summary) = previous_summary {
+        let previous = previous_text_without_file_sections(summary);
+        if !previous.is_empty() {
+            out.push_str(&previous);
+            out.push('\n');
+        }
+    }
+
+    let mut messages = String::new();
     // Assistant text accumulates until the next user prompt closes the turn.
     let mut turn_assistant: Vec<String> = Vec::new();
 
@@ -423,20 +537,19 @@ pub(crate) fn build_text_only_summary(
         assistant.clear();
     };
 
-    for entry in dropped {
+    for entry in entries {
         if let SessionEntryContent::Message { message } = &entry.content {
             if let Some(role) = message.get("role").and_then(|r| r.as_str()) {
                 match role {
                     "user" => {
                         // A new user prompt closes the previous turn.
-                        flush_turn(&mut out, &mut turn_assistant);
+                        flush_turn(&mut messages, &mut turn_assistant);
                         if let Some(text) = summary_message_text(message) {
-                            out.push_str("\n---\n# [user]\n");
-                            out.push_str(&text);
+                            messages.push_str("\n---\n# [user]\n");
+                            messages.push_str(&text);
                         }
                     }
                     "assistant" => {
-                        collect_touched_files(message, &mut files, session_dir);
                         if let Some(text) = summary_message_text(message) {
                             turn_assistant.push(text);
                         }
@@ -450,13 +563,17 @@ pub(crate) fn build_text_only_summary(
             // labels, …): excluded from the text-only summary.
         }
     }
-    flush_turn(&mut out, &mut turn_assistant);
+    flush_turn(&mut messages, &mut turn_assistant);
+
+    if !messages.is_empty() {
+        out.push_str("\n\n# Messages since last compaction\n");
+        out.push_str(&messages);
+    }
 
     if !files.is_empty() {
         // Split into Documents (markdown) and Files (everything else) so the
-        // reader can quickly find narrative context vs. code/config. Within
-        // each group, modified first then reads; both groups alphabetical
-        // for stability across runs. A group that is empty is omitted.
+        // reader can quickly find narrative context vs. code/config. A group
+        // that is empty is omitted.
         render_files_section(&mut out, &files, "Documents");
         render_files_section(&mut out, &files, "Files");
     }
@@ -504,49 +621,10 @@ pub(crate) fn build_manual_template(
     session_dir: &std::path::Path,
 ) -> String {
     // Build the file list: previous-summary files first (in their original
-    // order), then newly-touched files from the dropped span (in chronological
+    // order), then newly-touched files from the scoped span (in chronological
     // session order), de-duplicated. De-dup promotes read→modified in-place at
     // the original position; new paths are appended at the end.
-    let mut files: Vec<TouchedFile> = Vec::new();
-    let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut seed_text: Vec<String> = Vec::new();
-
-    // Carry-forward files from the previous summary first (preserve their order).
-    if let Some(summary) = previous_summary {
-        let (parsed_files, notes) = parse_summary_into_sections(summary, &["files", "documents"]);
-        for pf in parsed_files {
-            seen_paths.insert(pf.path.clone());
-            files.push(pf);
-        }
-        seed_text = notes;
-    }
-
-    // Collect newly-touched files from the dropped span in chronological order.
-    let mut new_files: Vec<TouchedFile> = Vec::new();
-    for entry in dropped {
-        if let SessionEntryContent::Message { message } = &entry.content {
-            if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                collect_touched_files(message, &mut new_files, session_dir);
-            }
-        }
-    }
-
-    // Merge: iterate new_files in chronological order, deduplicate against seen_paths.
-    // If path exists, promote read→modified in-place at original position.
-    // If new, append at end (preserving chronological order of first appearance).
-    for new_file in new_files {
-        if let Some(existing_idx) = files.iter().position(|f| f.path == new_file.path) {
-            if new_file.modified {
-                files[existing_idx].modified = true;
-                if files[existing_idx].descriptor.as_deref() == Some("read") {
-                    files[existing_idx].descriptor = Some("modified".to_string());
-                }
-            }
-        } else {
-            seen_paths.insert(new_file.path.clone());
-            files.push(new_file);
-        }
-    }
+    let (files, mut seed_text) = merge_files_with_previous(previous_summary, dropped, session_dir);
 
     // No previous summary: seed with the first user prompt.
     if seed_text.is_empty() {
@@ -1585,7 +1663,12 @@ pub(crate) fn extract_messages(entries: &[SessionEntry]) -> Vec<Message> {
 /// `compactionSummary` user message) to avoid confusing redundant
 /// compaction content mid-turn. See `doc/nested_compactions.md` for the
 /// rationale.
-pub(crate) fn apply_compaction_transforms(entries: Vec<SessionEntry>) -> Vec<SessionEntry> {
+/// Scope `entries` to the latest compaction on the branch: return its summary
+/// (if non-empty) plus the kept entries from `first_kept_entry_id` onward,
+/// with every `Compaction` entry removed. This is the shared core behind both
+/// the runtime context transform and [`entries_since_last_compaction`], so the
+/// boundary resolution cannot drift between them.
+fn scope_entries(entries: Vec<SessionEntry>) -> (Option<String>, Vec<SessionEntry>) {
     // Find the most recent compaction entry (closest to leaf) — pi keeps
     // the latest compaction on the path active.
     let compaction = entries.iter().rev().find_map(|entry| match &entry.content {
@@ -1593,50 +1676,64 @@ pub(crate) fn apply_compaction_transforms(entries: Vec<SessionEntry>) -> Vec<Ses
             summary,
             first_kept_entry_id,
             ..
-        } => Some((
-            entry.id.clone(),
-            summary.clone(),
-            first_kept_entry_id.clone(),
-        )),
+        } => Some((summary.clone(), first_kept_entry_id.clone())),
         _ => None,
     });
 
-    let Some((_compaction_id, summary, first_kept_id)) = compaction else {
-        return entries; // no compaction → full branch
+    let Some((summary, first_kept_id)) = compaction else {
+        return (None, entries); // no compaction → full branch
     };
 
     // Find the index of the first kept entry.
     let keep_idx = match entries.iter().position(|e| e.id == first_kept_id) {
         Some(i) => i,
-        None => return entries, // defensive fallback: full branch
+        None => return (None, entries), // defensive fallback: full branch
     };
 
-    let mut result: Vec<SessionEntry> = Vec::new();
+    // Kept range: firstKeptEntryId .. end, with **every** compaction
+    // entry dropped silently — the latest (represented by the summary) and
+    // any nested ones in the kept range. Nested compactions represent
+    // superseded boundaries; their summary text is intentionally invisible to
+    // the runtime LLM context to avoid mid-turn redundancy.
+    let kept = entries[keep_idx..]
+        .iter()
+        .filter(|entry| !matches!(entry.content, SessionEntryContent::Compaction { .. }))
+        .cloned()
+        .collect();
 
+    ((!summary.is_empty()).then_some(summary), kept)
+}
+
+/// The raw entries the active compaction keeps for this branch prefix — i.e.
+/// the context a session resumed at this point would send, minus the synthetic
+/// summary message. Callers that need raw pi entries (to inspect tool calls,
+/// collect touched files, or render deterministic text) use this instead of
+/// re-deriving the latest-compaction boundary.
+pub(crate) fn entries_since_last_compaction(entries: &[SessionEntry]) -> Vec<SessionEntry> {
+    scope_entries(entries.to_vec()).1
+}
+
+/// Compaction scoping core (pi `buildContextEntries` parity). Exposed as a
+/// free function so tests can exercise it without a `Session` instance.
+///
+/// Latest compaction on the branch (closest to leaf) scopes the context to:
+/// `[summary (if non-empty)] + [firstKeptEntryId .. compaction) +
+/// [post-compaction]`. The compaction entry itself is never included;
+/// **all** other `Compaction` entries in the kept range are stepped over
+/// silently (no summary message emitted for them either). This deliberately
+/// diverges from pi (which emits each older compaction's summary as its own
+/// `compactionSummary` user message) to avoid confusing redundant
+/// compaction content mid-turn. See `doc/nested_compactions.md` for the
+/// rationale.
+pub(crate) fn apply_compaction_transforms(entries: Vec<SessionEntry>) -> Vec<SessionEntry> {
+    let (summary, kept) = scope_entries(entries);
+    let mut result = Vec::with_capacity(kept.len() + usize::from(summary.is_some()));
     // The latest compaction's summary goes FIRST (pi: contextEntries =
     // [compaction] + …). Empty summary → emit nothing ("if available").
-    if !summary.is_empty() {
+    if let Some(summary) = summary {
         result.push(compaction_summary_message(&summary));
     }
-
-    // Kept range: firstKeptEntryId .. end, with **every** compaction
-    // entry dropped silently — the latest (already represented by the
-    // summary message at the front), and any nested ones in the kept
-    // range. Nested compactions represent superseded boundaries; their
-    // summary text is intentionally invisible to the runtime LLM context
-    // to avoid mid-turn redundancy. Information from them is preserved
-    // via the new compaction's own `previousSummary`-injected
-    // summarization step (see `generate_compaction`).
-    for entry in &entries[keep_idx..] {
-        match &entry.content {
-            SessionEntryContent::Compaction { .. } => {
-                // Skip the latest compaction (already represented above)
-                // and any older nested compactions (step over silently).
-            }
-            _ => result.push(entry.clone()),
-        }
-    }
-
+    result.extend(kept);
     result
 }
 
@@ -4160,7 +4257,7 @@ mod tests {
                 ]),
             ),
         ];
-        let s = build_text_only_summary(&dropped, &session_dir);
+        let s = build_text_only_summary(&dropped, None, &session_dir);
         assert!(s.contains("# [user]\nfirst prompt"));
         assert!(s.contains("# [assistant]\nfirst answer"));
         assert!(s.contains("# [user]\nsecond prompt"));
@@ -4180,7 +4277,7 @@ mod tests {
         // group here). (The very first separator has its leading newline
         // trimmed off.)
         assert_eq!(s.matches("---\n# [").count(), 5);
-        assert!(s.starts_with("---\n# [user]\nfirst prompt"));
+        assert!(s.starts_with("# Messages since last compaction\n\n---\n# [user]\nfirst prompt"));
     }
 
     #[test]
@@ -4204,7 +4301,7 @@ mod tests {
                 ]),
             ),
         ];
-        let s = build_text_only_summary(&dropped, &session_dir);
+        let s = build_text_only_summary(&dropped, None, &session_dir);
         // No .md files in this span, so only the "Files" section appears.
         assert!(s.contains("# [Files]"));
         assert!(!s.contains("# [Documents]"));
@@ -4226,7 +4323,7 @@ mod tests {
     #[test]
     fn text_only_summary_empty_for_empty_span() {
         let session_dir = std::path::PathBuf::from("/test");
-        assert_eq!(build_text_only_summary(&[], &session_dir), "");
+        assert_eq!(build_text_only_summary(&[], None, &session_dir), "");
         // Tool results only → still empty.
         let dropped = vec![SessionEntry {
             id: "t".into(),
@@ -4239,7 +4336,7 @@ mod tests {
                 }),
             },
         }];
-        assert_eq!(build_text_only_summary(&dropped, &session_dir), "");
+        assert_eq!(build_text_only_summary(&dropped, None, &session_dir), "");
     }
 
     #[test]
@@ -4260,7 +4357,7 @@ mod tests {
                 ]),
             ),
         ];
-        let summary = build_text_only_summary(&dropped, &session_dir);
+        let summary = build_text_only_summary(&dropped, None, &session_dir);
         assert!(!summary.is_empty());
         assert!(summary.contains("- modified: src/lib.rs"));
 
@@ -4363,7 +4460,7 @@ mod tests {
                 ]),
             ),
         ];
-        let s = build_text_only_summary(&dropped, &session_dir);
+        let s = build_text_only_summary(&dropped, None, &session_dir);
         // Both headers present.
         assert!(
             s.contains("# [Documents]"),
@@ -4407,7 +4504,7 @@ mod tests {
                 ]),
             ),
         ];
-        let s = build_text_only_summary(&only_md, &session_dir);
+        let s = build_text_only_summary(&only_md, None, &session_dir);
         assert!(s.contains("# [Documents]"));
         assert!(!s.contains("# [Files]"));
 
@@ -4422,9 +4519,67 @@ mod tests {
                 ]),
             ),
         ];
-        let s = build_text_only_summary(&only_rs, &session_dir);
+        let s = build_text_only_summary(&only_rs, None, &session_dir);
         assert!(s.contains("# [Files]"));
         assert!(!s.contains("# [Documents]"));
+    }
+
+    #[test]
+    fn entries_since_last_compaction_starts_at_first_kept() {
+        let entries = vec![
+            sum_user("u0", None, "old prompt"),
+            sum_assistant(
+                "a0",
+                Some("u0"),
+                serde_json::json!([{"type": "text", "text": "old answer"}]),
+            ),
+            compaction_entry("c1", "previous summary", "u1", 10, Some("a0")),
+            sum_user("u1", Some("c1"), "new prompt"),
+            sum_assistant(
+                "a1",
+                Some("u1"),
+                serde_json::json!([{"type": "text", "text": "new answer"}]),
+            ),
+        ];
+        let since = entries_since_last_compaction(&entries);
+        let ids: Vec<&str> = since.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["u1", "a1"]);
+    }
+
+    #[test]
+    fn text_only_summary_starts_with_previous_and_merges_files() {
+        let session_dir = std::path::PathBuf::from("/test");
+        let previous = "# Prior summary\n\nkept prose\n\n---\n# [Documents]\n- read: old.md\n\n---\n# [Files]\n- Design doc: keep.rs\n";
+        let dropped = vec![
+            sum_user("u1", None, "new prompt"),
+            sum_assistant(
+                "a1",
+                Some("u1"),
+                serde_json::json!([
+                    {"type": "text", "text": "new answer"},
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": "old.md"}},
+                    {"type": "toolCall", "name": "write",
+                     "arguments": {"path": "new.rs", "content": "x"}},
+                ]),
+            ),
+        ];
+        let s = build_text_only_summary(&dropped, Some(previous), &session_dir);
+        // Previous text is verbatim; its old file sections are gone.
+        assert!(
+            s.starts_with("# Prior summary\n\nkept prose"),
+            "previous text must lead: {s}"
+        );
+        assert_eq!(s.matches("# [Documents]").count(), 1, "{s}");
+        assert_eq!(s.matches("# [Files]").count(), 1, "{s}");
+        // New-message section only covers the scoped span.
+        assert!(s.contains("# Messages since last compaction"), "{s}");
+        assert!(s.contains("new prompt"), "{s}");
+        assert!(s.contains("new answer"), "{s}");
+        // Previous file order and custom descriptor survive; new path appended.
+        assert!(s.contains("- read: old.md"), "{s}");
+        assert!(s.contains("- Design doc: keep.rs"), "{s}");
+        assert!(s.contains("- modified: new.rs"), "{s}");
     }
 
     #[test]

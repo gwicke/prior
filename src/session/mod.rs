@@ -20,6 +20,7 @@ pub use repo::{JsonlSessionRepo, SessionRepo};
 pub(crate) use session::build_manual_template;
 pub(crate) use session::build_text_only_summary;
 pub(crate) use session::collect_touched_files;
+pub(crate) use session::entries_since_last_compaction;
 pub use session::Session;
 pub(crate) use session::TouchedFile;
 pub(crate) use session::{

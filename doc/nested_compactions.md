@@ -116,17 +116,18 @@ whose `first_kept_entry_id` equals the leaf's structure — matching pi
 - **Truncate**: appends an empty-summary compaction; never examines the
   dropped span, so nested compaction entries are irrelevant. Works when the
   leaf is already a compaction.
-- **TextOnly**: `build_text_only_summary` renders only `Message` entries and
-  skips `Compaction` entries in the dropped span (session.rs), so a nested
-  compaction's summary text never leaks into a new text-only summary.
+- **TextOnly**: `build_text_only_summary` scopes its input to
+  `entries_since_last_compaction` (the same kept range the pivoted runtime
+  context uses), so it starts from the previous summary and only renders
+  `Message` entries after that boundary. Nested compaction entries are
+  skipped, so a superseded summary never leaks into the new text-only summary.
 - **Llm**: unaffected by the guard removal; still errors on an empty dropped
   span and (Phase B) injects `previousSummary` into the summarizer prompt.
 
-`previousSummary` injection (Phase B) applies only to the **LLM** mode.
-Truncate and text-only are deterministic / non-generative: truncate writes no
-summary, and text-only re-derives its summary from the raw `Message` entries
-in the dropped span (which still physically exist in the session file), so
-neither needs to thread a prior compaction's summary forward.
+`previousSummary` injection (Phase B) applies only to the **LLM** mode;
+text-only instead seeds its deterministic draft with the previous summary and
+scopes the raw `Message` entries to the same compaction boundary. Truncate
+still writes no summary.
 
 ### D. Documentation updates (done)
 

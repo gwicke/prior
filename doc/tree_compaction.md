@@ -41,11 +41,14 @@ paragraphs below describe the design as first specced; see
 particular: pi parents the summary at the **switch target**, and `fromId` is
 the branch-from position, not the common ancestor).
 
-**Text-only mode** (`/tree <entry-id> compact text-only`) builds a summary
-from the dropped span containing every **user prompt**, the assistant's
-**text responses per turn**, and a trailing **files-touched list**
-(`read`/`write`/`edit` paths, modified files marked) — no reasoning, no tool
-calls, no tool output. Built deterministically by
+**Text-only mode** (`/tree <entry-id> compact text-only`) builds an
+incremental summary: it starts with the previous compaction summary (if any),
+then a `# Messages since last compaction` section containing every **user
+prompt** and the assistant's **text responses per turn** from the active
+compaction scope (no reasoning, no tool calls, no tool output), and finally a
+merged **files-touched list** (`read`/`write`/`edit` paths, modified files
+marked) that carries forward the previous list and appends only files touched
+since that boundary. Built deterministically by
 `crate::session::build_text_only_summary` (no LLM), written as the
 `Compaction` entry's `summary`, rendered as markdown right after the
 compaction, and replayed at the compaction marker in `/replay`. Per the pi

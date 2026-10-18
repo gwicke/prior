@@ -43,7 +43,7 @@ and link a doc/ and/or commit hash
   tool messages following tool_calls message)
       - 0ef960188195b9cf02c38ba011fc5662a82c2391 was not successful. Drop it, and instead implement
       doc/261013_multi_file_edit_id_continuity.md.
-- [ ] Fix "text only" compaction strategy to a) include last summary, and b) only add text context
+- [x] Fix "text only" compaction strategy to a) include last summary, and b) only add text context
   added since.
 - [x] OpenRouter provider selection via per-model `routing` settings key
       (implemented: doc/261017_openrouter_provider_selection.md; `@only:` suffix
