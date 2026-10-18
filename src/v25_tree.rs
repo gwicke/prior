@@ -149,27 +149,42 @@ fn truncate_chars(s: &str, max: usize) -> String {
 // ---------------------------------------------------------------------------
 
 /// Walk from `leaf_id` up through the tree to collect the set of entry
-/// IDs on the active branch.
-fn collect_active_path(nodes: &[SessionTreeNode], leaf_id: &str, out: &mut HashSet<String>) {
-    // Iterative DFS: walk the tree to find leaf_id, then record the
-    // path from root to leaf.  Uses an explicit stack so deep linear
-    // sessions (1000s of entries) don't overflow the call stack.
-    let mut stack: Vec<(&[SessionTreeNode], Vec<String>)> = Vec::new();
-    stack.push((nodes, Vec::new()));
-    while let Some((current, mut path)) = stack.pop() {
-        for node in current {
-            if node.entry.id == leaf_id {
-                path.push(node.entry.id.clone());
-                for id in &path {
-                    out.insert(id.clone());
-                }
-                return;
-            }
-            let mut child_path = path.clone();
-            child_path.push(node.entry.id.clone());
-            stack.push((&node.children, child_path));
+/// IDs on the active branch. Returns whether `leaf_id` was present in
+/// the tree.
+///
+/// One DFS builds a parent map, then the branch is walked leaf → root.
+/// (The old per-branch path cloning was O(n · depth) — quadratic on the
+/// deep linear sessions this is hot for.)
+fn collect_active_path(
+    nodes: &[SessionTreeNode],
+    leaf_id: &str,
+    out: &mut HashSet<String>,
+) -> bool {
+    // Iterative DFS: build id → parent for the whole tree (a leaf can be
+    // anywhere). Explicit stack so deep linear sessions don't overflow.
+    let mut parent: HashMap<&str, &str> = HashMap::new();
+    let mut found = false;
+    let mut stack: Vec<&SessionTreeNode> = nodes.iter().rev().collect();
+    while let Some(node) = stack.pop() {
+        let id = node.entry.id.as_str();
+        if id == leaf_id {
+            found = true;
+        }
+        for child in node.children.iter().rev() {
+            parent.insert(child.entry.id.as_str(), id);
+            stack.push(child);
         }
     }
+    if !found {
+        return false;
+    }
+    let mut cur = leaf_id;
+    out.insert(cur.to_string());
+    while let Some(p) = parent.get(cur) {
+        out.insert((*p).to_string());
+        cur = p;
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -181,21 +196,6 @@ fn is_assistant(entry: &SessionEntry) -> bool {
     matches!(&entry.content,
         SessionEntryContent::Message { message }
         if message.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-}
-
-/// Find a node by entry ID. Iterative DFS to avoid stack overflow.
-fn find_entry<'a>(nodes: &'a [SessionTreeNode], id: &str) -> Option<&'a SessionTreeNode> {
-    let mut stack: Vec<&'a [SessionTreeNode]> = Vec::new();
-    stack.push(nodes);
-    while let Some(current) = stack.pop() {
-        for n in current {
-            if n.entry.id == id {
-                return Some(n);
-            }
-            stack.push(&n.children);
-        }
-    }
-    None
 }
 
 /// One row in the flattened tree. The row *is* the data: listing
@@ -301,74 +301,41 @@ fn entry_role(entry: &SessionEntry) -> String {
     }
 }
 
-/// Ids of visible entries with no visible entries anywhere below them —
-/// the branch endpoints shown in the listing. Invisible meta entries
-/// (tool results, session info) don't count as descendants, so a
-/// visible message above a dead-end tool result is the endpoint you
-/// actually see.
+/// Everything the row emitter needs about the tree's shape, computed in
+/// one post-order pass:
 ///
-/// Iterative post-order (deep linear sessions overflow recursion):
-/// `(node, expanded)` state stack; `has_vis` = "some visible entry
-/// exists in this node's subtree".
-fn visible_terminals(
-    nodes: &[SessionTreeNode],
-    labels: &HashMap<String, String>,
-) -> HashSet<String> {
-    let visible = |n: &SessionTreeNode| -> bool {
-        !entry_display_label_ext(&n.entry, n.label.as_deref(), labels).is_empty()
-    };
-    let mut terminals = HashSet::new();
-    let mut has_vis: HashMap<String, bool> = HashMap::new();
-    let mut stack: Vec<(&SessionTreeNode, bool)> = Vec::new();
-    for n in nodes.iter().rev() {
-        stack.push((n, false));
-    }
-    while let Some((node, expanded)) = stack.pop() {
-        if !expanded {
-            stack.push((node, true));
-            for child in node.children.iter().rev() {
-                stack.push((child, false));
-            }
-            continue;
-        }
-        let mut has = false;
-        for child in &node.children {
-            if visible(child) || has_vis.get(&child.entry.id).copied().unwrap_or(false) {
-                has = true;
-                break;
-            }
-        }
-        if visible(node) && !has {
-            terminals.insert(node.entry.id.clone());
-        }
-        has_vis.insert(node.entry.id.clone(), has);
-    }
-    terminals
+/// - `ranked` — each node's children ranked `(height, write order)`,
+///   deepest first. `ranked[node][0]` is the **spine** (the child that
+///   continues the parent's line); the rest are spurs, tallest first,
+///   which is the order hues are handed out in (§6.1). A purely linear
+///   tree ranks every child first, so every child is a spine. Write
+///   positions are distinct, so the ranking is a total order and the
+///   layout is a pure function of the tree.
+/// - `terminals` — visible entries with no visible entry anywhere below
+///   them: the branch endpoints shown in the listing. Invisible meta
+///   entries don't count as descendants, so a visible message above a
+///   dead-end tool result is the endpoint you actually see.
+///
+/// Visibility is `labels.contains_key(id)` — the label map already
+/// records exactly the entries with a non-empty display label, so the
+/// per-node `entry_display_label_ext` recomputation the old separate
+/// passes did (twice each) is gone.
+///
+/// Iterative post-order: deep linear sessions (1000s of entries) overflow
+/// recursion, so the walk uses an explicit `(node, expanded)` stack.
+struct TreeAnalysis<'a> {
+    ranked: HashMap<&'a str, Vec<&'a str>>,
+    terminals: HashSet<&'a str>,
 }
 
-/// Each node's children ranked by `(height, write order)`, deepest first.
-///
-/// `ranked[node][0]` is therefore the **spine** — the child that continues
-/// the parent's line — and the rest are spurs, tallest first, which is the
-/// order hues are handed out in (§6.1). Heights are measured over the
-/// *visible* projection: invisible entries (tool results, tool-call-only
-/// assistant segments) must not make a spur look deep.
-///
-/// A purely linear tree ranks every child first, so every child is a spine.
-///
-/// Iterative post-order — a 1000-entry linear session overflows recursion
-/// (same constraint as `visible_terminals`). Write positions are distinct,
-/// so the ranking is a total order and the layout is a pure function of the
-/// tree.
-fn ranked_children<'a>(
+fn analyze_tree<'a>(
     nodes: &'a [SessionTreeNode],
     labels: &HashMap<String, String>,
-) -> HashMap<&'a str, Vec<&'a str>> {
-    let visible = |n: &SessionTreeNode| -> bool {
-        !entry_display_label_ext(&n.entry, n.label.as_deref(), labels).is_empty()
-    };
+) -> TreeAnalysis<'a> {
+    let visible = |n: &SessionTreeNode| -> bool { labels.contains_key(&n.entry.id) };
     let mut height: HashMap<&'a str, usize> = HashMap::new();
     let mut ranked: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
+    let mut terminals: HashSet<&'a str> = HashSet::new();
 
     let mut stack: Vec<(&'a SessionTreeNode, bool)> = Vec::new();
     for n in nodes.iter().rev() {
@@ -382,25 +349,34 @@ fn ranked_children<'a>(
             }
             continue;
         }
+        let id = node.entry.id.as_str();
         let vis = usize::from(visible(node));
         let mut h = vis;
+        let mut has_vis_desc = false;
         let mut children: Vec<(usize, usize, &'a str)> = Vec::with_capacity(node.children.len());
         for (i, child) in node.children.iter().enumerate() {
-            let id = child.entry.id.as_str();
-            let ch = height.get(id).copied().unwrap_or(0);
+            let cid = child.entry.id.as_str();
+            let ch = height.get(cid).copied().unwrap_or(0);
+            // `ch > 0` iff the child's subtree holds any visible entry,
+            // which is exactly "this child is (or contains) a visible
+            // descendant".
+            if ch > 0 {
+                has_vis_desc = true;
+            }
             h = h.max(vis + ch);
-            children.push((ch, i, id));
+            children.push((ch, i, cid));
+        }
+        if vis > 0 && !has_vis_desc {
+            terminals.insert(id);
         }
         // Descending, so index 0 is the spine; ties in height go to the
         // newer (later-written) branch, as in the spine rule.
         children.sort_by(|a, b| b.cmp(a));
-        height.insert(node.entry.id.as_str(), h);
-        ranked.insert(
-            node.entry.id.as_str(),
-            children.into_iter().map(|(_, _, id)| id).collect(),
-        );
+        height.insert(id, h);
+        ranked.insert(id, children.into_iter().map(|(_, _, c)| c).collect());
     }
-    ranked
+
+    TreeAnalysis { ranked, terminals }
 }
 
 // ---------------------------------------------------------------------------
@@ -575,16 +551,18 @@ fn row_prefix(depth: usize, branch: u8, bar: Bar, assistant: bool) -> String {
     out
 }
 
-/// Recursively flatten the tree into rows.
+/// Flatten the tree into rows, reusing the shape computed by
+/// [`analyze_tree`] rather than re-walking the tree here.
 fn flatten_turns(
     nodes: &[SessionTreeNode],
     leaf_id: Option<&str>,
     active_path: &HashSet<String>,
     labels: &HashMap<String, String>,
-    terminals: &HashSet<String>,
+    analysis: &TreeAnalysis,
     out: &mut Vec<FlatRow>,
 ) {
-    let ranked = ranked_children(nodes, labels);
+    let ranked = &analysis.ranked;
+    let terminals = &analysis.terminals;
     // Global spur counter: hues are handed out once per spur, tallest
     // first within each fork, so two different level-1 excursions get
     // different colours (a per-parent ordinal would make every single-spur
@@ -606,8 +584,6 @@ fn flatten_turns(
     }
 
     while let Some((node, depth, branch, spur_start)) = stack.pop() {
-        let label = entry_display_label_ext(&node.entry, node.label.as_deref(), labels);
-
         let mut child_frames = |pending: bool| -> Vec<Frame> {
             // Hand out hues in the node's ranked order: rank 0 is the spine
             // (branch 0), the rest take the next colours.
@@ -648,7 +624,7 @@ fn flatten_turns(
             frames
         };
 
-        if label.is_empty() {
+        if !labels.contains_key(&node.entry.id) {
             // Meta entry: skip visual row but descend into children. The
             // spine rule applies here too — a meta entry can be a fork
             // point even though it has no row of its own.
@@ -662,7 +638,7 @@ fn flatten_turns(
         // at the end of each turn.
         let bar = if spur_start {
             Bar::SpurStart
-        } else if terminals.contains(&node.entry.id) {
+        } else if terminals.contains(node.entry.id.as_str()) {
             if assistant {
                 Bar::ReplyEnd
             } else {
@@ -685,7 +661,7 @@ fn flatten_turns(
             is_current: leaf_id == Some(node.entry.id.as_str()),
             role: entry_role(&node.entry),
             timestamp: node.entry.timestamp.clone(),
-            is_terminal: terminals.contains(&node.entry.id),
+            is_terminal: terminals.contains(node.entry.id.as_str()),
         });
 
         // Push children in reverse so first child is processed first.
@@ -915,25 +891,25 @@ impl SlashDotNode for TreeListNode {
             }
         }
 
-        // Build the rows from the raw tree.
-        let active_path: HashSet<String> = leaf
-            .as_deref()
-            .map(|lid| {
-                let mut p = HashSet::new();
-                collect_active_path(&tree_rc, lid, &mut p);
-                p
-            })
-            .unwrap_or_default();
+        // Build the rows from the raw tree. Three passes total, down from
+        // five: the active-path/parent walk, the label map, and one combined
+        // post-order shape analysis (height + ranking + terminals) that the
+        // row emitter then reuses.
+        let mut active_path = HashSet::new();
+        let leaf_found = match leaf.as_deref() {
+            Some(lid) => collect_active_path(&tree_rc, lid, &mut active_path),
+            None => false,
+        };
 
         let labels = build_label_map(&tree_rc);
-        let terminals = visible_terminals(&tree_rc, &labels);
+        let analysis = analyze_tree(&tree_rc, &labels);
         let mut flat = Vec::new();
         flatten_turns(
             &tree_rc,
             leaf.as_deref(),
             &active_path,
             &labels,
-            &terminals,
+            &analysis,
             &mut flat,
         );
 
@@ -970,12 +946,11 @@ impl SlashDotNode for TreeListNode {
             })
             .collect();
 
-        let active_ids = leaf
-            .as_ref()
-            .filter(|l| find_entry(&tree_rc, l).is_some())
-            .cloned()
-            .map(|l| vec![l])
-            .unwrap_or_default();
+        let active_ids = if leaf_found {
+            leaf.clone().map(|l| vec![l]).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let response = Arc::new(DataResponse { rows, active_ids });
 
