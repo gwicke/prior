@@ -34,7 +34,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::ansi::{display_width, display_width_ansi, split_at_width};
-use crate::draw::{el_if_short, ApplyPolicy, Draw};
+use crate::draw::{el_if_short, Draw};
 use crate::termio::{CaretEvent, TermHandles, TermIO, TermSize};
 use tokio::sync::watch;
 
@@ -639,8 +639,8 @@ pub struct RenderManager {
     /// whatever the status said at the moment of compose).
     ///
     /// Membership changes only on a state transition — the repl calls
-    /// [`Self::configure`] there, never at paint. A direct
-    /// [`Self::draw_frame`] leaves it intact: it describes the frame the
+    /// [`Self::configure`] there, never at paint. A raw apply through the
+    /// draw edge (the test seam) leaves it intact: it describes the frame the
     /// *next* [`Self::render`] builds, not the last composition a content
     /// write consumed.
     stack: Vec<Element>,
@@ -757,9 +757,12 @@ impl RenderManager {
     /// The drawing edge, for the test seams that read *past* this manager
     /// (`cache.applied`, and `term_io.recorded` for the byte edge). Production
     /// reaches the edge through this manager's own verbs — `render`,
-    /// `reanchor`, `painted_size`, `draw_frame` (content writes go through
-    /// `render_content`). Test-only: the host's row-accounting and byte-edge
-    /// tests reach through it.
+    /// `reanchor`, `painted_size` (content writes go through
+    /// `render_content`); nothing in production applies a frame except
+    /// `render`. Test-only: the host's row-accounting, byte-edge and
+    /// frame-vs-pipeline tests reach through it — including the apply half
+    /// directly (`Draw::draw`), which is no longer reachable around the
+    /// manager.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn draw(&mut self) -> &mut Draw {
         &mut self.draw
@@ -814,10 +817,17 @@ impl RenderManager {
     /// `render` and a caller keys off the resize event plus
     /// [`Self::painted_size`], never off a size this verb returns.
     pub fn render(&mut self, content: Option<ContentWrite>) {
-        // Nothing configured and nothing to write: no frame to compose, no
-        // area to paint. (A content write with an empty stack still runs: it
-        // has bytes to place.)
-        if self.stack.is_empty() && content.is_none() {
+        // Nothing to paint and nothing to clear: no frame to compose, no area
+        // to touch. An empty configured stack is two different facts —
+        // membership has not arrived yet (construction, before the first real
+        // `configure`) or the area was deliberately emptied (a cleared
+        // overlay) — and the live frame is what tells them apart: with one
+        // intact on screen the empty composition is the clear
+        // (`plan_apply`'s h==0 path erases the old region and parks the
+        // cursor where it was), and with none there is nothing to erase, so
+        // the call stays a no-op. (A content write with an empty stack still
+        // runs: it has bytes to place.)
+        if self.stack.is_empty() && content.is_none() && !self.draw.has_live_frame() {
             return;
         }
         let frame = self.compose();
@@ -855,7 +865,7 @@ impl RenderManager {
 
     /// The size the **last frame applied through this hub** took — the one
     /// number resize detection compares the terminal against (ui_draw_v2
-    /// §9 #3), read from the applied dims `render`/`draw_frame` record. Before
+    /// §9 #3), read from the applied dims `render` records. Before
     /// anything has been applied: the watched geometry (floored) — a caller
     /// that has not painted yet starts from what the terminal is, not from a
     /// size nobody drew at. Distinct from the dims a paint is
@@ -863,21 +873,6 @@ impl RenderManager {
     /// dialog wants when it opens): that is a belief, this is a memory.
     pub fn painted_size(&self) -> (usize, usize) {
         self.draw.painted_size()
-    }
-
-    /// Apply a frame that no composition produced *through this hub* —
-    /// `ui::resolve`'s empty frame, the direct `Output::draw_frame` paths,
-    /// tests. Unlike the old recipe-clearing version, the configured `stack`
-    /// survives: it describes the frame the *next* [`Self::render`] builds,
-    /// not the last composition a content write consumed, so a raw apply
-    /// leaves it intact.
-    pub fn draw_frame(
-        &mut self,
-        frame: &Frame,
-        policy: ApplyPolicy,
-        dims: (usize, usize),
-    ) -> (usize, usize) {
-        self.draw.draw_frame(frame, policy, dims)
     }
 
     // --- the content hand-off (design §Content/§Render) -----------
@@ -1081,6 +1076,78 @@ mod tests {
             manager.stack.len(),
             2,
             "the configured stack is kept on the hub, where reposition reads it"
+        );
+    }
+
+    /// An empty stack before the first real membership is a **no-op**: nothing
+    /// configured, nothing live, nothing to clear and no bytes to write. This
+    /// is the construction state — `configure` has only ever seeded the
+    /// ratio — and it must stay byte-silent, whatever calls `render` on the
+    /// way up.
+    #[test]
+    fn render_before_any_membership_is_a_noop() {
+        let size = crate::termio::fixed(TermSize {
+            width: 40,
+            height: 24,
+        });
+        let mut manager = RenderManager::new(size, crate::termio::TermIO::recording());
+        manager.configure(crate::render::FRAME_MAX_ROW_RATIO, Vec::new());
+        manager.render(None);
+        assert!(
+            manager
+                .draw
+                .term_io
+                .recorded(crate::termio::Stream::Content)
+                .is_empty(),
+            "no membership and no live frame: render must write nothing"
+        );
+        assert_eq!(
+            manager.draw.cache.applied, None,
+            "and nothing was applied, so nothing is remembered as applied"
+        );
+    }
+
+    /// An empty stack **after** a real paint is the clear: the live frame's
+    /// region is erased and the cursor parked where the frame was
+    /// (`plan_apply`'s h==0 path). Same configured value as the no-op above —
+    /// the live frame is what tells the two readings apart.
+    #[test]
+    fn an_emptied_stack_clears_the_live_frame() {
+        let size = crate::termio::fixed(TermSize {
+            width: 40,
+            height: 24,
+        });
+        let mut manager = RenderManager::new(size, crate::termio::TermIO::recording());
+        manager.configure(
+            crate::render::FRAME_MAX_ROW_RATIO,
+            vec![Element::lines(vec!["hello".to_string()])],
+        );
+        manager.render(None);
+        let painted = manager
+            .draw
+            .term_io
+            .recorded(crate::termio::Stream::Content)
+            .to_vec();
+        assert!(
+            String::from_utf8_lossy(&painted).contains("hello"),
+            "the fixture paints before it clears"
+        );
+
+        manager.configure(crate::render::FRAME_MAX_ROW_RATIO, Vec::new());
+        manager.render(None);
+        let after = manager
+            .draw
+            .term_io
+            .recorded(crate::termio::Stream::Content);
+        let clear_bytes = &after[painted.len()..];
+        assert!(
+            String::from_utf8_lossy(clear_bytes).contains("\x1b[K"),
+            "the emptied stack must erase the live frame's rows: {clear_bytes:?}"
+        );
+        assert_eq!(
+            manager.draw.cache.applied,
+            Some((40, 24)),
+            "the clear is an apply like any other: the dims are remembered"
         );
     }
 

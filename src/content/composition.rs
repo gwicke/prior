@@ -91,7 +91,7 @@ pub(crate) struct ContentBoundary {
     /// means the last write was not classified. Read and written only by the
     /// content writers: `with_content_writer` records on every write and rolls
     /// an empty one back; `display_committed_prompt` reads it to decide whether
-    /// it shares the previous block's rule. `draw_frame` never touches it — an
+    /// it shares the previous block's rule. A frame apply never touches it — an
     /// area apply is not transcript content, and treating it as such would let
     /// a frame's last row decide what a later commit may collapse against.
     last: Mutex<(Option<ContentDisplayKind>, bool)>,

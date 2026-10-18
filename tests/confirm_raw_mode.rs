@@ -245,33 +245,52 @@ fn confirm_arrow_up_then_enter_selects_yes() {
     assert_eq!(run_confirm(b"\x1b[A\r").0, "Yes");
 }
 
-/// ui_draw_v2 P4: the dialog is drawn through the frame pipeline (divider +
-/// header + options at the cursor row) and, on resolve, its whole region is
-/// cleared through the same pipeline — leaving only the synthetic decision
-/// line where the dialog was.
+/// ui_draw_v2 P4 + doc §9's positional pin: the dialog is drawn through the
+/// frame pipeline as an **overlay below the standing head** — head, divider,
+/// header, options, in that order — and on resolve the area returns to the
+/// standing stack with only the synthetic decision line where the dialog was.
+///
+/// The ordering is the assertion, not just existence: a dialog painted as the
+/// whole area would satisfy per-row "is it on screen" checks while violating
+/// the composition the REPL actually produces.
 #[test]
 fn confirm_dialog_paints_then_clears_with_decision_line() {
     let (result, mid, final_bytes) = run_confirm(b"y");
     assert_eq!(result, "Yes");
 
-    // While up: divider, header and the option rows are on screen.
+    // While up: the overlay composition, top-down — standing head row,
+    // divider, header, options.
     let mid_rows = screen_rows(&mid);
+    let divider = mid_rows
+        .iter()
+        .position(|r| !r.is_empty() && r.chars().all(|c| c == '─'))
+        .unwrap_or_else(|| panic!("dialog divider missing: {mid_rows:?}"));
+    let header = mid_rows
+        .iter()
+        .position(|r| r.contains("tool BASH call?"))
+        .unwrap_or_else(|| panic!("dialog header missing: {mid_rows:?}"));
+    let options = mid_rows
+        .iter()
+        .position(|r| r.contains("Always (session)"))
+        .unwrap_or_else(|| panic!("dialog options missing: {mid_rows:?}"));
     assert!(
-        mid_rows
-            .iter()
-            .any(|r| !r.is_empty() && r.chars().all(|c| c == '─')),
-        "dialog divider missing: {mid_rows:?}"
+        divider > 0 && mid_rows[divider - 1].is_empty(),
+        "no standing head row above the dialog: {mid_rows:?}"
     );
     assert!(
-        mid_rows.iter().any(|r| r.contains("tool BASH call?")),
-        "dialog header missing: {mid_rows:?}"
+        divider < header,
+        "the divider should sit above the header: {mid_rows:?}"
     );
     assert!(
-        mid_rows.iter().any(|r| r.contains("Always (session)")),
-        "dialog options missing: {mid_rows:?}"
+        header < options,
+        "the header should sit above the option rows: {mid_rows:?}"
     );
 
-    // After resolve: options and divider cleared, decision line recorded.
+    // After resolve: back to the standing stack — decision line recorded and
+    // no dialog row survives. The head is a blank row, so its presence is not
+    // directly observable here (its position above the dialog is pinned
+    // mid-frame); what is observable is that the area holds *only* the
+    // decision line, the probe's trailing report lines, and blank rows.
     let rows = screen_rows(&final_bytes);
     assert!(
         rows.iter().any(|r| r == "accepted tool BASH"),
@@ -282,7 +301,7 @@ fn confirm_dialog_paints_then_clears_with_decision_line() {
         "dialog residue after resolve: {rows:?}"
     );
     assert!(
-        !rows.iter().any(|r| r == "tool BASH call?"),
+        !rows.iter().any(|r| r.contains("tool BASH call?")),
         "header residue after resolve: {rows:?}"
     );
     assert!(
@@ -290,5 +309,26 @@ fn confirm_dialog_paints_then_clears_with_decision_line() {
             .iter()
             .any(|r| !r.is_empty() && r.chars().all(|c| c == '─')),
         "divider residue after resolve: {rows:?}"
+    );
+    // Closed world: any row that is not the decision line, one of the probe's
+    // own post-resolve report lines (see confirm_probe.rs), or blank is
+    // residue the targeted checks above did not name.
+    let expected = |r: &String| {
+        let t = r.trim();
+        t.is_empty()
+            || t == "accepted tool BASH"
+            || [
+                "MISMATCH=",
+                "RESULT=",
+                "APPROVED=",
+                "GATE_WHILE_UP=",
+                "GATE_AFTER=",
+            ]
+            .iter()
+            .any(|m| t.starts_with(m))
+    };
+    assert!(
+        rows.iter().all(expected),
+        "unexpected rows after resolve: {rows:?}"
     );
 }

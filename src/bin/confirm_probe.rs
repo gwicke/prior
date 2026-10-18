@@ -100,21 +100,13 @@ async fn main() {
     // unblocks the tool call, and a probe whose own copy disagreed with it
     // would pin the copy.
     let answered = ask.await.unwrap_or(ConfirmDecision::Deny);
-    // Same resolve the REPL's dispatcher runs: repaint without the dialog,
-    // then write the decision line where it was.
+    // Same resolve the REPL's dispatcher runs: repaint without the dialog —
+    // the same standing stack, dialog element dropped (`confirm::clear`, the
+    // twin of the `confirm::paint` above), then write the decision line where
+    // it was.
     picocode::confirm::resolve(
         &out,
-        || {
-            // The empty membership: with nothing configured the area is
-            // nothing, and applying it is the erase (dropping the element is
-            // the clear). Configure-then-apply, the same two-step
-            // `confirm::paint` above runs — `configure` is the membership
-            // verb, so a paint composes nothing.
-            let hub = out.hub();
-            let mut hub = hub.lock().unwrap();
-            hub.configure(picocode::render::FRAME_MAX_ROW_RATIO, Vec::new());
-            hub.render(None);
-        },
+        || picocode::confirm::clear(&out.hub()),
         confirm.subject(),
         answered,
     );
