@@ -870,6 +870,20 @@ pub fn session_stats_lines(
         num(live.top_p),
     ));
 
+    // The stored provider routing, when there is one. A non-openrouter model
+    // can carry the table (the record is keyed by model, not provider), but
+    // it is inert there — say so rather than letting it look applied.
+    if let Some(r) = stored.and_then(|s| s.routing()) {
+        let mut line = format!(
+            "  routing: {}",
+            crate::settings_editor::summarize_routing(r)
+        );
+        if !provider.eq_ignore_ascii_case("openrouter") {
+            line.push_str(" (ignored: not an OpenRouter model)");
+        }
+        lines.push(line);
+    }
+
     // Context window limit.
     match ctx_len {
         Some(max) => lines.push(format!("  context window limit: {} tokens", max)),
@@ -1004,6 +1018,55 @@ mod stat_tests {
         assert!(model_idx >= 6, "model section must follow session section");
         assert!(lines[model_idx].contains("openrouter:minimax/minimax-m3:free"));
         assert!(lines.iter().any(|l| l.contains("context window limit")));
+    }
+
+    /// The stored provider routing is part of what `/stat` is for: it shapes
+    /// the request as much as temperature does, and an inert table on a
+    /// non-openrouter model must not look applied.
+    #[test]
+    fn session_stats_lines_shows_routing_and_flags_an_inert_one() {
+        use super::super::SessionUsage;
+        use super::session_stats_lines;
+
+        let stored = crate::model_settings::ModelSettings {
+            routing: Some(crate::model_settings::Routing {
+                only: Some(vec!["deepinfra/fp8".into()]),
+                allow_fallbacks: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lines = session_stats_lines(
+            "openrouter",
+            "some/model",
+            SessionUsage::default(),
+            None,
+            0,
+            Some(&stored),
+            &Default::default(),
+        );
+        let routing = lines
+            .iter()
+            .find(|l| l.contains("routing:"))
+            .expect("routing line");
+        assert!(routing.contains("only=deepinfra/fp8"), "{routing}");
+        assert!(routing.contains("allow_fallbacks=false"), "{routing}");
+        assert!(!routing.contains("ignored"), "{routing}");
+
+        let lines = session_stats_lines(
+            "anthropic",
+            "some/model",
+            SessionUsage::default(),
+            None,
+            0,
+            Some(&stored),
+            &Default::default(),
+        );
+        let routing = lines
+            .iter()
+            .find(|l| l.contains("routing:"))
+            .expect("routing line");
+        assert!(routing.contains("ignored"), "{routing}");
     }
 
     /// A session with no recorded cwd drops the line. `cwd` is a required

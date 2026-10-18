@@ -18,6 +18,7 @@
 //! the only part that needs a tty.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 
 use crate::params::ReasoningLevel;
@@ -781,8 +782,32 @@ const ROUTING_TEMPLATE: &str =
 /// The suggestions come from the catalog where we have it, so the fragment
 /// shows real values (`# context_length = 1048576`) rather than placeholders.
 pub fn render_fragment(model_id: &str, current: &ModelSettings, hints: &ModelSettings) -> String {
+    render_fragment_with_generated(model_id, current, hints).text
+}
+
+/// A rendered fragment and the exact comment lines its renderer inserted.
+///
+/// The editor hands the whole fragment back, comments included, and the save
+/// path parses it as the user's own text. Knowing which lines were ours lets
+/// the edit round-trip drop them by identity instead of guessing from their
+/// shape — the suggestion above an unset key is otherwise indistinguishable
+/// from a comment the user wrote.
+pub struct RenderedFragment {
+    pub text: String,
+    /// Comment lines exactly as emitted, leading `#` included.
+    pub generated_comments: BTreeSet<String>,
+}
+
+/// [`render_fragment`], keeping the generated comment lines for later removal.
+pub fn render_fragment_with_generated(
+    model_id: &str,
+    current: &ModelSettings,
+    hints: &ModelSettings,
+) -> RenderedFragment {
     let mut out = String::new();
-    out.push_str(&format!(
+    let mut generated_comments = BTreeSet::new();
+
+    let header = format!(
         "# Settings for {model_id}\n\
          #\n\
          # Delete a line to clear it. Lines that are not set are shown commented\n\
@@ -795,7 +820,14 @@ pub fn render_fragment(model_id: &str, current: &ModelSettings, hints: &ModelSet
          #\n\
          # routing is OpenRouter's provider preferences for this model. Other\n\
          # providers ignore it.\n\n"
-    ));
+    );
+    generated_comments.extend(
+        header
+            .lines()
+            .filter(|line| line.starts_with('#'))
+            .map(str::to_string),
+    );
+    out.push_str(&header);
 
     for key in ModelSettings::KEYS {
         let present = current.value_of(key);
@@ -806,7 +838,10 @@ pub fn render_fragment(model_id: &str, current: &ModelSettings, hints: &ModelSet
         }
         let hint = ModelSettings::key_hint(key);
         if !hint.is_empty() {
-            out.push_str(&format!("# {hint}\n"));
+            let line = format!("# {hint}");
+            generated_comments.insert(line.clone());
+            out.push_str(&line);
+            out.push('\n');
         }
         match present {
             Some(v) => out.push_str(&format!("{key} = {v}\n")),
@@ -820,20 +855,44 @@ pub fn render_fragment(model_id: &str, current: &ModelSettings, hints: &ModelSet
                     .value_of(key)
                     .unwrap_or_else(|| ROUTING_TEMPLATE.to_string());
                 for line in shape.lines() {
-                    out.push_str(&format!("# {line}\n"));
+                    let line = format!("# {line}");
+                    generated_comments.insert(line.clone());
+                    out.push_str(&line);
+                    out.push('\n');
                 }
             }
             None => {
-                if let Some(suggested) = hints.value_of(key) {
-                    out.push_str(&format!("# {key} = {suggested}\n"));
-                } else {
-                    out.push_str(&format!("# {key} =\n"));
-                }
+                let line = match hints.value_of(key) {
+                    Some(suggested) => format!("# {key} = {suggested}"),
+                    None => format!("# {key} ="),
+                };
+                generated_comments.insert(line.clone());
+                out.push_str(&line);
+                out.push('\n');
             }
         }
         out.push('\n');
     }
-    out
+    RenderedFragment {
+        text: out,
+        generated_comments,
+    }
+}
+
+/// Drop the renderer's own comment lines from a record's captured comments.
+///
+/// Matching is by exact line, so only text the renderer actually emitted is
+/// removed; anything the user typed or edited stays. An emptied comment is
+/// dropped rather than left as a blank note.
+pub fn strip_generated_comments(settings: &mut ModelSettings, generated: &BTreeSet<String>) {
+    for comment in settings.comments.values_mut() {
+        let kept: Vec<&str> = comment
+            .lines()
+            .filter(|line| !generated.contains(line.trim_end()))
+            .collect();
+        *comment = kept.join("\n").trim_matches('\n').to_string();
+    }
+    settings.comments.retain(|_, c| !c.trim().is_empty());
 }
 
 impl ModelSettings {
@@ -1450,6 +1509,32 @@ mod tests {
             .unwrap_or("");
         assert!(!comment.contains("temperature"), "captured: {comment:?}");
         assert!(!comment.contains("top_p"), "captured: {comment:?}");
+    }
+
+    /// The render knows exactly which comment lines it emitted, so the edit
+    /// round-trip can remove them by identity and leave a user's note alone.
+    #[test]
+    fn strip_generated_comments_removes_only_emitted_lines() {
+        let current = ModelSettings {
+            routing: Some(routing()),
+            ..Default::default()
+        };
+        let rendered =
+            render_fragment_with_generated("openrouter:p:m", &current, &ModelSettings::default());
+        let hint = format!("# {}", ModelSettings::key_hint("routing"));
+        assert!(rendered.generated_comments.contains(&hint));
+
+        let mut polluted = ModelSettings {
+            routing: current.routing.clone(),
+            ..Default::default()
+        };
+        polluted
+            .comments
+            .insert("routing".into(), format!("{hint}\n# my own note"));
+        strip_generated_comments(&mut polluted, &rendered.generated_comments);
+        let comment = polluted.comments.get("routing").unwrap();
+        assert!(!comment.contains("OpenRouter provider"), "{comment:?}");
+        assert!(comment.contains("my own note"), "{comment:?}");
     }
 
     /// A comment on a key the record no longer sets is dropped with the key —

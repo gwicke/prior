@@ -48,7 +48,8 @@ pub fn edit_fragment(
     current: &ModelSettings,
     hints: &ModelSettings,
 ) -> EditOutcome {
-    let offered = model_settings::render_fragment(model_id, current, hints);
+    let rendered = model_settings::render_fragment_with_generated(model_id, current, hints);
+    let offered = rendered.text;
     let edited = match app_state.edit_text(&offered, EditorMode::Edit) {
         Ok(text) => text,
         // No interactive tty (quiet mode, a pipe, a test): we cannot ask, so
@@ -74,6 +75,11 @@ pub fn edit_fragment(
                     .entry(key.clone())
                     .or_insert_with(|| comment.clone());
             }
+            // The fragment we offered carried comments of our own (the header,
+            // hints, commented suggestions). Parse them away by identity: the
+            // user may leave them untouched, and they must not become part of
+            // the stored record.
+            model_settings::strip_generated_comments(&mut parsed, &rendered.generated_comments);
             EditOutcome::Updated(parsed)
         }
     }
@@ -128,7 +134,7 @@ pub fn summarize(settings: &ModelSettings) -> String {
 /// The routing table's set preferences, compactly: `only=a,b allow_fallbacks=false`.
 /// A request-shaping fact, so it ranks with reasoning/temperature rather than
 /// with the counted metadata overrides.
-fn summarize_routing(r: &crate::model_settings::Routing) -> String {
+pub fn summarize_routing(r: &crate::model_settings::Routing) -> String {
     let mut fields = Vec::new();
     for (name, list) in [
         ("only", &r.only),

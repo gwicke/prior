@@ -342,6 +342,20 @@ impl SlashDotNode for ModelNode {
                     first.insert_str(indent.len(), "now ");
                 }
                 lines.extend(packed);
+                // `routing` is stored, not live: it shapes where OpenRouter
+                // sends the request rather than what this session has changed,
+                // so it gets its own line instead of joining the `now` row.
+                if let Some(r) = stored.as_ref().and_then(|s| s.routing()) {
+                    let text = format!("routing: {}", crate::settings_editor::summarize_routing(r));
+                    lines.extend(
+                        crate::content::text::wrap(
+                            &text,
+                            width.saturating_sub(indent.len()).max(20),
+                        )
+                        .into_iter()
+                        .map(|l| format!("{indent}{l}")),
+                    );
+                }
             } else {
                 let summary = stored
                     .as_ref()
@@ -1793,6 +1807,45 @@ mod tests {
             !openrouter.contains("only applies to openrouter"),
             "a note where the setting works: {openrouter}"
         );
+    }
+
+    /// The active model's header shows the stored routing on its own line: it
+    /// is not a live param like temperature, but it shapes the request just as
+    /// directly, so it belongs in the detail view.
+    #[test]
+    fn the_header_shows_stored_routing_for_the_active_model() {
+        let app_state = test_app_state();
+        let model = "openrouter:anthropic/claude";
+        app_state.set_model(model);
+        app_state
+            .update_settings(|s| {
+                s.models.insert(
+                    model.to_string(),
+                    crate::model_settings::ModelSettings {
+                        routing: Some(crate::model_settings::Routing {
+                            only: Some(vec!["deepinfra/fp8".into()]),
+                            allow_fallbacks: Some(false),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let reader = app_state.clone();
+        let mut node = ModelNode::new(
+            Box::new(move || reader.model()),
+            Box::new(|_| Ok(())),
+            Some(app_state.clone()),
+        );
+        let lines = futures::executor::block_on(node.header(
+            &PathArgs::new(vec!["model".into(), model.into()], " "),
+            &RenderContext { term_width: 80 },
+        ));
+        let joined = lines.join("\n");
+        assert!(joined.contains("routing: only=deepinfra/fp8"), "{joined}");
+        assert!(joined.contains("allow_fallbacks=false"), "{joined}");
     }
 
     /// Without a tty the editor cannot run, and that must be an error on the
