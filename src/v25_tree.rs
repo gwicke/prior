@@ -768,41 +768,46 @@ pub fn tree_fields() -> Vec<FieldSpec> {
     ]
 }
 
-/// Split `line` into chunks of at most `max` display columns, breaking at a
-/// space where one is available and hard-splitting a word too long to fit on
-/// its own. Returns slices of `line`, so every chunk is valid UTF-8 by
-/// construction — `line` is arbitrary user/model text and may carry
-/// multi-byte chars at any offset, so a byte-indexed cut can land inside one.
-fn split_to_width(line: &str, max: usize) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0; // byte offset where the current chunk begins
-    let mut col = 0; // display columns occupied by line[start..i]
+/// Cut the first chunk of `line` at at most `max` display columns, breaking
+/// at a space where one is available and hard-splitting a word too long to
+/// fit on its own. Returns `(chunk, rest)`: `rest` starts just after the
+/// consumed break space, and is empty when `line` fits in `max`. Slices of
+/// `line`, so every piece is valid UTF-8 by construction — `line` is
+/// arbitrary user/model text and may carry multi-byte chars at any offset,
+/// so a byte-indexed cut can land inside one.
+fn split_first_chunk(line: &str, max: usize) -> (&str, &str) {
+    let mut col = 0; // display columns occupied so far
     let mut last_space = None; // byte offset of the last breakable space
     for (i, ch) in line.char_indices() {
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if col + w > max && i > start {
+        if col + w > max && i > 0 {
             let at = match last_space {
-                Some(s) if s > start => s,
+                Some(s) if s > 0 => s,
                 _ => i,
             };
-            out.push(&line[start..at]);
-            start = if at == i { i } else { at + 1 }; // consume the break space
-            col = UnicodeWidthStr::width(&line[start..i]);
-            last_space = None;
+            // Consume the break space: `rest` starts just after it. When the
+            // boundary lands exactly on a space, that space is a wrap
+            // artifact — consume it too, so a continuation never opens with
+            // a stray blank.
+            let rest = match (at == i, ch) {
+                (true, ' ') => &line[i + 1..],
+                (true, _) => &line[i..],
+                (false, _) => &line[at + 1..],
+            };
+            return (&line[..at], rest);
         }
         if ch == ' ' {
             last_space = Some(i);
         }
         col += w;
     }
-    if start < line.len() {
-        out.push(&line[start..]);
-    }
-    out
+    (line, "")
 }
 
 /// Wrap `text` to `width` columns, prefixing the first line with `prefix`.
-/// Subsequent continuation lines are indented to align with the text start.
+/// Continuation lines — the wrapped remainder of the first line and any
+/// hard newlines in the body — are raw: left-aligned, no indent, and never
+/// a repeat of the prefix.
 ///
 /// `width` is a budget in display *columns*, not bytes, and the text is
 /// whatever the session contains — so both the measurement and the cut are
@@ -816,21 +821,32 @@ fn wrap_with_prefix(prefix: &str, text: &str, width: usize) -> Vec<String> {
     // timestamp in the prefix is 32 columns, so any terminal narrower than
     // that would starve the first line of its budget entirely.
     let first_width = width.saturating_sub(prefix.width()).max(1);
-    let cont_width = width.saturating_sub(2).max(1); // 2-space indent
-    let mut result = Vec::new();
+    let cont_width = width.max(1);
+    let mut result: Vec<String> = Vec::new();
+    let mut first = true; // the one line that carries `prefix`
 
-    for (i, line) in text.split('\n').enumerate() {
-        let (pfx, eff_width) = if i == 0 {
-            (prefix, first_width)
-        } else {
-            ("  ", cont_width)
-        };
-        if line.is_empty() {
-            result.push(pfx.to_string());
-            continue;
-        }
-        for chunk in split_to_width(line, eff_width) {
+    for line in text.split('\n') {
+        let mut rest = line;
+        loop {
+            let (pfx, budget) = if first {
+                (prefix, first_width)
+            } else {
+                ("", cont_width)
+            };
+            if rest.is_empty() {
+                // Blank source line: keep the line break (and the paragraph
+                // shape of the body) without inventing content.
+                result.push(pfx.to_string());
+                first = false;
+                break;
+            }
+            let (chunk, tail) = split_first_chunk(rest, budget);
             result.push(format!("{pfx}{chunk}"));
+            first = false;
+            if tail.is_empty() {
+                break;
+            }
+            rest = tail;
         }
     }
     result
@@ -2223,6 +2239,14 @@ mod tests {
         assert!(
             joined.contains("USER"),
             "header should contain role: {}",
+            joined
+        );
+        // The role/timestamp tag is stamped once — on the first line — not
+        // repeated per output line.
+        assert_eq!(
+            joined.matches("[USER").count(),
+            1,
+            "role tag stamped more than once: {}",
             joined
         );
     }
@@ -4470,5 +4494,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The detail view used to stamp `[ROLE ts]` on every wrap chunk of the
+    /// first source line — each chunk was treated as a fresh "first line" —
+    /// and to indent continuations by two spaces. The contract now: the
+    /// prefix is stamped exactly once, on the first output line, and every
+    /// continuation is raw — left-aligned, no indent.
+    #[test]
+    fn wrap_stamps_the_prefix_once_and_leaves_continuations_raw() {
+        const PREFIX: &str = "[ASSISTANT 2026-10-16T23:57:11.106Z] ";
+        // One long unbroken paragraph: everything past the first output line
+        // is a wrap chunk of the same source line — the path that used to
+        // repeat the prefix.
+        let text = "All three cases reproduced exactly as documented. Now let me \
+nail down the correct GNU semantics and look at how the regex crate \
+consumes the pattern.";
+        for width in 40..=100usize {
+            let out = wrap_with_prefix(PREFIX, text, width);
+            assert!(
+                out[0].starts_with(PREFIX),
+                "first line carries the prefix: {out:?}"
+            );
+            let stamped = out.iter().filter(|l| l.contains(PREFIX)).count();
+            assert_eq!(stamped, 1, "prefix repeated @{width}: {out:?}");
+            for line in &out[1..] {
+                assert!(
+                    !line.starts_with(' '),
+                    "continuation indented @{width}: {line:?}"
+                );
+            }
+        }
+        // A hard newline in the body keeps its shape — and any leading
+        // spaces are the body's own, never added indent.
+        let out = wrap_with_prefix(PREFIX, "first line\n  second line", 80);
+        assert_eq!(
+            out,
+            vec![format!("{PREFIX}first line"), "  second line".to_string()]
+        );
     }
 }
