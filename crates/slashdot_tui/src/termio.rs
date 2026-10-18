@@ -1029,8 +1029,8 @@ impl TermGuard {
             } else {
                 Self::csi("?2004l")?;
             }
-            // The status line hides the cursor while a turn streams, and
-            // `draw_frame` shows it again when the prompt returns. If the turn is
+            // The status line hides the cursor while a turn streams, and the
+            // prompt's frame apply shows it again when the prompt returns. If the turn is
             // interrupted instead — a tool error, a confirm, a panic — nothing shows
             // it again, and an invisible cursor follows the user into their shell.
             // Unconditional and idempotent: showing a cursor that was never hidden

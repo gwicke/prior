@@ -34,7 +34,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::ansi::{display_width, display_width_ansi, split_at_width};
-use crate::draw::{el_if_short, ApplyPolicy, Draw};
+use crate::draw::{el_if_short, Draw};
 use crate::termio::{CaretEvent, TermHandles, TermIO, TermSize};
 use tokio::sync::watch;
 
@@ -639,8 +639,8 @@ pub struct RenderManager {
     /// whatever the status said at the moment of compose).
     ///
     /// Membership changes only on a state transition — the repl calls
-    /// [`Self::configure`] there, never at paint. A direct
-    /// [`Self::draw_frame`] leaves it intact: it describes the frame the
+    /// [`Self::configure`] there, never at paint. A raw apply through the
+    /// draw edge (the test seam) leaves it intact: it describes the frame the
     /// *next* [`Self::render`] builds, not the last composition a content
     /// write consumed.
     stack: Vec<Element>,
@@ -757,9 +757,12 @@ impl RenderManager {
     /// The drawing edge, for the test seams that read *past* this manager
     /// (`cache.applied`, and `term_io.recorded` for the byte edge). Production
     /// reaches the edge through this manager's own verbs — `render`,
-    /// `reanchor`, `painted_size`, `draw_frame` (content writes go through
-    /// `render_content`). Test-only: the host's row-accounting and byte-edge
-    /// tests reach through it.
+    /// `reanchor`, `painted_size` (content writes go through
+    /// `render_content`); nothing in production applies a frame except
+    /// `render`. Test-only: the host's row-accounting, byte-edge and
+    /// frame-vs-pipeline tests reach through it — including the apply half
+    /// directly (`Draw::draw`), which is no longer reachable around the
+    /// manager.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn draw(&mut self) -> &mut Draw {
         &mut self.draw
@@ -862,7 +865,7 @@ impl RenderManager {
 
     /// The size the **last frame applied through this hub** took — the one
     /// number resize detection compares the terminal against (ui_draw_v2
-    /// §9 #3), read from the applied dims `render`/`draw_frame` record. Before
+    /// §9 #3), read from the applied dims `render` records. Before
     /// anything has been applied: the watched geometry (floored) — a caller
     /// that has not painted yet starts from what the terminal is, not from a
     /// size nobody drew at. Distinct from the dims a paint is
@@ -870,21 +873,6 @@ impl RenderManager {
     /// dialog wants when it opens): that is a belief, this is a memory.
     pub fn painted_size(&self) -> (usize, usize) {
         self.draw.painted_size()
-    }
-
-    /// Apply a frame that no composition produced *through this hub* —
-    /// `ui::resolve`'s empty frame, the direct `Output::draw_frame` paths,
-    /// tests. Unlike the old recipe-clearing version, the configured `stack`
-    /// survives: it describes the frame the *next* [`Self::render`] builds,
-    /// not the last composition a content write consumed, so a raw apply
-    /// leaves it intact.
-    pub fn draw_frame(
-        &mut self,
-        frame: &Frame,
-        policy: ApplyPolicy,
-        dims: (usize, usize),
-    ) -> (usize, usize) {
-        self.draw.draw_frame(frame, policy, dims)
     }
 
     // --- the content hand-off (design §Content/§Render) -----------

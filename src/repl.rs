@@ -1544,7 +1544,7 @@ impl Repl {
         // `plan_apply`. Content *above* the frame (greeter / status / session)
         // is never touched. The closure keeps no state of its own: compose and
         // apply both receive the same `dims`, so they cannot disagree on the
-        // frame's size (ui_draw_v2 §9 #3), and the applied pair `draw_frame`
+        // frame's size (ui_draw_v2 §9 #3), and the applied pair the apply
         // reports is recorded by the output itself — the repaint bookkeeping is
         // the engine's fact, not a secondhand read and not a number this loop
         // has to carry between calls.

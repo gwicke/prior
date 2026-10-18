@@ -97,11 +97,10 @@ pub struct DrawCache {
     /// ends.
     ///
     /// Needed because [`Draw::reposition`] falls back to `taken` when
-    /// no element stack is configured — reachable in production by a direct
-    /// `draw_frame` (`ui::resolve`'s empty frame), which applies a frame with
-    /// no composition behind it. Without this stash a batch would consume
-    /// that area and its final reposition would find no stack to re-render and
-    /// render nothing, so the area would never return.
+    /// the composed frame has no rows — an emptied element stack whose
+    /// clear lands inside an open batch. Without this stash a batch would
+    /// consume that area and its final reposition would find no stack to
+    /// re-render and render nothing, so the area would never return.
     pub deferred: Option<Frame>,
 }
 
@@ -830,9 +829,10 @@ impl Draw {
     /// is the height of the frame the consume took, so `paint_forward` clears
     /// the rows nothing overwrote.
     ///
-    /// A frame with no rows has nothing to put back: `ui::resolve` clears a
-    /// dialog by applying `Frame::empty()`, and a content write right after it
-    /// consumes a zero-height area. Returning early — and clearing the
+    /// A frame with no rows has nothing to put back: an emptied element stack
+    /// clears the region by applying a zero-height frame (the render manager's
+    /// empty-composition path), and a content write right after it consumes a
+    /// zero-height area. Returning early — and clearing the
     /// accumulator, so a stale count cannot misplace the next reposition's
     /// below-frame clear — is the honest answer.
     pub fn reposition(&mut self, frame: &Frame, old_h: usize) {

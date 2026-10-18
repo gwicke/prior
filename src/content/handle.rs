@@ -14,7 +14,8 @@
 //! nothing above it forks on where the bytes land.
 //! Of the frame *verbs*, `frame_size` lives here (the watch this handle
 //! carries *is* the dims source), `painted_size` and `reanchor` are the
-//! manager's, and `draw_frame` — the test drivers' edge — is the manager's too.
+//! manager's, and the test drivers' edge to the apply phase is
+//! `RenderManager::draw()` — Draw itself, not a verb around it.
 
 use std::io;
 use std::sync::atomic::AtomicBool;
@@ -1604,7 +1605,6 @@ mod tests {
     use crate::content::preview::{
         edit_preview, refined_diff_lines, truncate, wrap_with_diff_markers,
     };
-    use crate::draw::ApplyPolicy;
 
     // --- Row accounting: the tracked cursor vs. the real one (phase B) ---
     //
@@ -3542,7 +3542,7 @@ mod tests {
     }
 
     /// Capture is Content's and a frame paint is screen-side (design §Content):
-    /// an explicit `draw_frame` reaches the screen and is never caught, while a
+    /// an explicit frame apply reaches the screen and is never caught, while a
     /// captured content write stops at Content's output — content bytes only,
     /// never frame bytes.
     #[test]
@@ -3552,10 +3552,7 @@ mod tests {
         let frame =
             crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, Vec::new(), 40, 10);
         out.begin_capture();
-        out.manager
-            .lock()
-            .unwrap()
-            .draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
+        out.manager.lock().unwrap().draw().draw(&frame, None);
         out.display_text("content only");
         let cap = out.end_capture();
         let cap = String::from_utf8_lossy(&cap).into_owned();
@@ -3583,7 +3580,8 @@ mod tests {
 
     /// The paint path's pipeline (compose + `manager.render`) is the
     /// hand-rolled path, not a new one: it must paint **byte-identically** to
-    /// `draw_frame` fed exactly what it composes.
+    /// the apply edge (`Draw::draw`, through the manager's test seam) fed
+    /// exactly what it composes.
     ///
     /// Two paths that are meant to be the same are usually asserted against a
     /// transcript, which pins each independently and lets them drift together.
@@ -3645,19 +3643,19 @@ mod tests {
                 height: dims.1,
             },
         );
-        // Feed `draw_frame` exactly what the paint path composes — same
-        // composer, same status, same dims — so the apply half is all that
-        // differs.
+        // Feed the apply edge (`Draw::draw`, through the manager's test seam)
+        // exactly what the paint path composes — same composer, same status,
+        // same dims — so the apply half is all that differs.
         let stack = compose_area(&hand, pieces().0, pieces().1);
         let asks: Vec<RowAsk> = stack.iter().map(|e| e.ask(dims.0)).collect();
         let heights = allocate(&asks, dims.1, live_budget(dims.1));
         let frame = render(&stack, &heights, dims.0);
         let hand_sink = record_bytes(&hand);
-        let b = hand
-            .manager
-            .lock()
-            .unwrap()
-            .draw_frame(&frame, ApplyPolicy::Frame, dims);
+        let b = {
+            let mut hand_manager = hand.manager.lock().unwrap();
+            hand_manager.draw().draw(&frame, None);
+            hand_manager.painted_size()
+        };
         let via_hand = hand_sink.bytes();
 
         assert_eq!(a, b, "the same painted dims either way");
@@ -3694,10 +3692,7 @@ mod tests {
         );
         let frame =
             crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, overlay, 40, 10);
-        out.manager
-            .lock()
-            .unwrap()
-            .draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
+        out.manager.lock().unwrap().draw().draw(&frame, None);
         out.display_text("Cannot start agent: Missing API key for provider.");
         let bytes = sink.bytes();
 
@@ -3847,10 +3842,7 @@ mod tests {
         );
         let frame =
             crate::repl::Repl::compose_frame(&shared_editor(|_| {}), "", None, overlay, 40, 10);
-        out.manager
-            .lock()
-            .unwrap()
-            .draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
+        out.manager.lock().unwrap().draw().draw(&frame, None);
         {
             let _batch = crate::render::ContentBatchGuard::open(&out.manager);
             out.display_text("first line");
