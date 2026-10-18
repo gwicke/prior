@@ -1220,6 +1220,7 @@ impl Session {
                         .or_default()
                         .push(pi_entry.id.clone());
                 }
+                index.order.push(pi_entry.id.clone());
                 index
                     .entries
                     .insert(pi_entry.id.clone(), Arc::new(pi_entry));
@@ -1255,6 +1256,7 @@ impl Session {
 
         {
             let mut index = self.index.lock().await;
+            index.order.push(entry.id.clone());
             index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index
@@ -1285,6 +1287,7 @@ impl Session {
 
         {
             let mut index = self.index.lock().await;
+            index.order.push(entry.id.clone());
             index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index
@@ -1335,6 +1338,7 @@ impl Session {
             // `/clear <name>` handlers in `agent.rs`).
             index.session_name = Some(name.to_string());
             index.header.name = Some(name.to_string());
+            index.order.push(entry.id.clone());
             index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index
@@ -1519,6 +1523,7 @@ impl Session {
         storage.append_entry(&leaf).await?;
         {
             let mut index = self.index.lock().await;
+            index.order.push(entry.id.clone());
             index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index
@@ -1554,6 +1559,7 @@ impl Session {
         storage.append_entry(&leaf).await?;
         {
             let mut index = self.index.lock().await;
+            index.order.push(entry.id.clone());
             index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index
@@ -1582,6 +1588,7 @@ impl Session {
         storage.append_entry(&entry).await?;
         {
             let mut index = self.index.lock().await;
+            index.order.push(entry.id.clone());
             index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index

@@ -317,6 +317,10 @@ pub struct SessionMetadata {
 pub struct SessionIndex {
     /// Parsed session header.
     pub header: SessionHeader,
+    /// Entry IDs in file/append order. `entries` is a `HashMap`, so this is
+    /// the only record of the chronological order the JSONL was written in;
+    /// the `/tree` listing emits rows from it.
+    pub order: Vec<String>,
     /// All entries keyed by ID. Entries are immutable once inserted, so they
     /// are shared via `Arc` — tree building and path walks clone the pointer,
     /// never the (potentially large) message payload.
@@ -341,6 +345,9 @@ pub struct SessionTreeNode {
     pub children: Vec<SessionTreeNode>,
     /// Resolved label text, if any Label entry targets this node.
     pub label: Option<String>,
+    /// Position in the session's file/append order. The tree supplies the
+    /// structure (depth/branch); this supplies the row order.
+    pub order: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +480,14 @@ impl SessionIndex {
     /// - `labels` is a pre-computed `target_id → label` map to avoid O(n²)
     /// - `active_path` is built once via `get_path_to_root`
     pub fn build_tree(&self, preferred_id: Option<&str>) -> Vec<SessionTreeNode> {
+        // File/append order → rank. Entries absent from `order` (synthetic
+        // tests) share rank 0, so the layout's stable sort keeps tree order.
+        let order: std::collections::HashMap<&str, usize> = self
+            .order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
         // Precompute label map: target_id -> label
         let mut labels: std::collections::HashMap<&str, Option<&str>> =
             std::collections::HashMap::new();
@@ -507,7 +522,7 @@ impl SessionIndex {
 
         let mut out: Vec<SessionTreeNode> = roots
             .iter()
-            .filter_map(|id| self.build_subtree(id, &active_path, &labels))
+            .filter_map(|id| self.build_subtree(id, &active_path, &labels, &order))
             .collect();
 
         // Sort: subtree containing preferred_id first
@@ -540,6 +555,7 @@ impl SessionIndex {
         root_entry_id: &str,
         _active_path: &std::collections::HashSet<String>,
         labels: &std::collections::HashMap<&str, Option<&str>>,
+        order: &std::collections::HashMap<&str, usize>,
     ) -> Option<SessionTreeNode> {
         // Stack frames for iterative post-order traversal.
         // Each frame: (entry_id, state)
@@ -597,6 +613,7 @@ impl SessionIndex {
                         None
                     } else {
                         Some(SessionTreeNode {
+                            order: order.get(entry.id.as_str()).copied().unwrap_or(0),
                             entry,
                             children,
                             label: None,
@@ -609,6 +626,7 @@ impl SessionIndex {
                         .flatten()
                         .map(String::from);
                     Some(SessionTreeNode {
+                        order: order.get(entry.id.as_str()).copied().unwrap_or(0),
                         entry,
                         children,
                         label,
@@ -851,6 +869,7 @@ mod tests {
     fn session_index_path_to_root() {
         let mut index = SessionIndex {
             header: SessionHeader::new(Path::new("/test")),
+            order: Vec::new(),
             entries: HashMap::new(),
             leaf_id: Some("entry-3".into()),
             children: HashMap::new(),
@@ -914,6 +933,7 @@ mod tests {
     fn session_index_path_to_root_empty_for_missing_leaf() {
         let index = SessionIndex {
             header: SessionHeader::new(Path::new("/test")),
+            order: Vec::new(),
             entries: HashMap::new(),
             leaf_id: None,
             children: HashMap::new(),

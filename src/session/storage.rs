@@ -366,6 +366,7 @@ impl SessionStorage for JsonlSessionStorage {
     async fn build_index(&self) -> crate::Result<SessionIndex> {
         let content = self.read_all().await?;
         let mut entries: HashMap<String, Arc<SessionEntry>> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
         let mut leaf_id: Option<String> = None;
         let mut session_name: Option<String> = None;
@@ -401,6 +402,10 @@ impl SessionStorage for JsonlSessionStorage {
                     // at the storage boundary (JSONL -> in-memory) so there is
                     // exactly one obvious place for the transformation.
                     normalize_entry_in_place(&mut entry);
+
+                    // Chronological position: the file is append-only, so the
+                    // scan order is the display order.
+                    order.push(entry.id.clone());
 
                     // Track parent-child relationships.
                     if let Some(ref pid) = entry.parent_id {
@@ -454,6 +459,7 @@ impl SessionStorage for JsonlSessionStorage {
 
         Ok(SessionIndex {
             header,
+            order,
             entries,
             leaf_id,
             children,
