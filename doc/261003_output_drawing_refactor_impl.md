@@ -16,8 +16,6 @@ the source, the edge does the read").
 
 - An always-meta error kind inside TermIO: errors ride `Stream::Error`'s existing routing (meta on
   a pipe, the primary on a tty); the mode is not important, the vocabulary is.
-- Ctrl-C/Ctrl-Z handling into the reader thread: forwarding a key is not reading stdin off-turn —
-  cleanup, not correctness.
 - Construction-time `is_terminal()` probes (`main.rs:304`, `interactive.rs:228`): environment
   facts feeding construction, arguably outside the rule.
 - `confirm_probe`: a diagnostic binary that reads a key off a pty by design, outside the main
