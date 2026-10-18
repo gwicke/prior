@@ -9,6 +9,7 @@ use console::style;
 use unicode_width::UnicodeWidthStr;
 
 use crate::content::preview::wrap_with_diff_markers;
+use crate::content::text::expand_tabs;
 
 /// One full-width dark-grey panel row around pre-styled `content`, without a
 /// trailing newline.
@@ -61,6 +62,13 @@ pub(crate) fn tool_row_contents(
     } else {
         width.max(1)
     };
+    // Expand tabs before any width math: this path carries raw tool output
+    // (sed previews, error envelopes) whose program-indented lines must be
+    // measured in the columns the terminal will draw them, or the row pads
+    // over-full and wraps. Both `wrap` and `panel_row` measure with
+    // unicode-width, where a tab is zero columns.
+    let text = expand_tabs(text);
+    let text = text.as_ref();
     let lines = if text.is_empty() {
         vec![String::new()]
     } else {
@@ -82,4 +90,53 @@ pub(crate) fn tool_row_contents(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::text::wrap;
+
+    /// Display width of a panel row as the terminal draws it: ANSI stripped,
+    /// and any tab that somehow survived expanded to its stop. This mirrors
+    /// what a real terminal computes before deciding the row wrapped.
+    fn drawn_width(row: &str) -> usize {
+        UnicodeWidthStr::width(expand_tabs(strip_ansi(row).as_ref()).as_ref())
+    }
+
+    /// The exact bug: a tab-indented result line used to be padded on the
+    /// assumption its leading tab was zero columns, so the row came out wider
+    /// than the panel and natural-wrapped in the terminal (bleeding the frame
+    /// through, since `LineClear` never armed on the continuation). Every
+    /// production path hands `panel_row` tab-expanded text now, so the drawn
+    /// row is exactly `width` — no wrap.
+    #[test]
+    fn a_tab_indented_line_pads_to_exactly_the_panel_width() {
+        let width = 60;
+        let expanded = expand_tabs("\t\t\tconst x = 1;");
+        for line in wrap(expanded.as_ref(), width - 1) {
+            let styled = style(line.clone()).dim().to_string();
+            let row = panel_row(&styled, true, width);
+            assert_eq!(drawn_width(&row), width, "row wrapped: {row:?}");
+        }
+    }
+
+    /// The plain-tool path (`tool_row_contents`) is the choke the sed-preview
+    /// body and error envelopes flow through, and it carries **raw** program
+    /// output — tabs intact, never pre-expanded by the caller. It must expand
+    /// them itself or the row pads over-full and wraps. Here the input is a
+    /// literal tab-bearing blob; the drawn row must land exactly at `width`.
+    #[test]
+    fn tool_row_contents_expands_raw_tab_bearing_blobs() {
+        let width = 60;
+        let raw = "\t\tinterface Foo {\n\t\t\tbar(): void;\n\t\tbaz: string;\n\t}";
+        for content in tool_row_contents(raw, false, true, width) {
+            let row = panel_row(&content, true, width);
+            assert!(
+                !strip_ansi(&row).contains('\t'),
+                "tab reached the panel: {row:?}"
+            );
+            assert_eq!(drawn_width(&row), width, "row wrapped: {row:?}");
+        }
+    }
 }

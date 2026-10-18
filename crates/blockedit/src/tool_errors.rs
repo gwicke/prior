@@ -37,17 +37,25 @@ const EDIT_ARG_PREFIX: &str = "Invalid edit tool arguments: ";
 /// Only these two exact prefixes are removed, and only from the front. Any
 /// other message (a real execution failure, a provider error) is returned
 /// unchanged — this never swallows content, only two known decorations.
+///
+/// The leading whitespace before each matched prefix is dropped (a wrapped
+/// re-render indents it), but whitespace is trimmed *only* as part of a
+/// prefix match. An unconditional `trim_start` used to eat the first line's
+/// indent of **every** tool result, indent or not — which read as broken
+/// code indentation in the panel.
 pub fn strip_arg_error_prefixes(msg: &str) -> &str {
-    let mut out = msg.trim_start();
+    let mut out = msg;
     // Order matters only for robustness; the two prefixes do not overlap in
     // practice, and looping lets a doubled wrapper (e.g. a future re-wrap)
     // still collapse to the useful text.
     loop {
         let before = out.len();
-        if let Some(rest) = out.strip_prefix(RIG_ARG_PARSE_PREFIX) {
+        // Only trim as far as a known prefix justifies; otherwise `out` is
+        // returned with its indent intact.
+        let candidate = out.trim_start();
+        if let Some(rest) = candidate.strip_prefix(RIG_ARG_PARSE_PREFIX) {
             out = rest.trim_start();
-        }
-        if let Some(rest) = out.strip_prefix(EDIT_ARG_PREFIX) {
+        } else if let Some(rest) = candidate.strip_prefix(EDIT_ARG_PREFIX) {
             out = rest.trim_start();
         }
         if out.len() == before {
@@ -88,6 +96,22 @@ mod tests {
             "error: failed to parse tool arguments: was not ours to strip",
         ] {
             assert_eq!(strip_arg_error_prefixes(msg), msg, "{msg}");
+        }
+    }
+
+    #[test]
+    fn keeps_the_indent_of_a_message_with_no_prefix() {
+        // The panel feeds every tool result through this; a plain result must
+        // come back byte-for-byte, indent included. An unconditional
+        // `trim_start` used to eat the first line's leading whitespace, so a
+        // tab-indented `sed`/`cat` block rendered its first row flush-left.
+        for msg in [
+            "\treturn {",
+            "\t\tmessages,",
+            "    indented()",
+            "  \t mixed",
+        ] {
+            assert_eq!(strip_arg_error_prefixes(msg), msg, "{msg:?}");
         }
     }
 }

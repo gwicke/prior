@@ -22,21 +22,56 @@ pub(crate) fn render_markdown(src: &str, width: usize) -> String {
 /// markdown code-block formatter the answer/result path uses
 /// (`markdown_terminal` driven by `markdown_stream` via `render_markdown`).
 ///
+/// `text` is already wrapped to `width` by the caller (see
+/// [`crate::content::text::wrap`]); this styles it, it does not reflow it. The
+/// renderer indents a fenced code block by two spaces and, if a line plus that
+/// indent no longer fits `width`, wraps it — so a line handed in at full
+/// `width` would come back as two. Two guards against that:
+///
+/// * the fenced block is rendered two columns **wider** than the panel row, so
+///   the renderer's two-space indent eats the slack and a line already at
+///   `width` still fits on one physical line;
+/// * every *physical* line of the renderer's output has its leading code
+///   indent stripped (the renderer indents continuations too), so no embedded
+///   newline reaches [`crate::content::panel::panel_row`] — which pads its
+///   argument as a single row, and a multi-line blob there came out one long
+///   row that wrapped in the terminal and leaked the frame behind it.
+///
 /// Returns **foreground-only** ANSI (no background) so the caller can layer the
-/// dark-grey tool panel on top via `paint_panel`. The renderer's 2-space code
-/// indent and trailing newline are stripped, leaving one line of styled text.
-/// Each call builds a fresh fenced block, so the formatter is fully
-/// isolated/flushed per line.
+/// dark-grey tool panel on top via `paint_panel`. Each call builds a fresh
+/// fenced block, so the formatter is fully isolated/flushed per line.
 pub(crate) fn highlight_code_fg(text: &str, lang: &str, width: usize) -> String {
     if text.is_empty() {
         return text.to_string();
     }
     let md = format!("```{lang}\n{text}\n```\n");
-    let rendered = render_markdown(&md, width);
-    let body = rendered
-        .strip_prefix("  ")
-        .unwrap_or_else(|| rendered.strip_prefix(' ').unwrap_or(&rendered));
-    body.trim_end_matches('\n').to_string()
+    // +2: the renderer's per-line code indent. Keeps a `width`-wide line on
+    // one physical line instead of letting the indent push it into a re-wrap.
+    let rendered = render_markdown(&md, width.saturating_add(2));
+    // Strip by position, not by leading-space count: the renderer indents the
+    // first code line by two and each wrap-continuation by four, but a code
+    // line's *own* leading whitespace can sit on the first line and must
+    // survive. Line 0 loses the two-space code indent; every later line is a
+    // wrap continuation and loses the four-space one. What remains is
+    // foreground-only ANSI with no embedded newline for `panel_row` to
+    // mis-pad as part of one row.
+    let body: Vec<&str> = rendered
+        .trim_end_matches('\n')
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                line.strip_prefix("  ")
+                    .or_else(|| line.strip_prefix(' '))
+                    .unwrap_or(line)
+            } else {
+                line.strip_prefix("    ")
+                    .or_else(|| line.strip_prefix("  "))
+                    .unwrap_or(line)
+            }
+        })
+        .collect();
+    body.join("\n")
 }
 
 /// Language id used to colorize a tool *command* label (e.g. `read …`,
@@ -91,5 +126,76 @@ pub(crate) fn answer_theme() -> Theme {
     Theme {
         clickable_links: true,
         ..Theme::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::highlight_code_fg;
+    use slashdot_tui::ansi::strip_ansi;
+
+    /// The highlighter must not reflow its input: a line already wrapped to
+    /// the panel row's budget comes back as exactly one physical line, or the
+    /// caller pads a multi-line blob into one over-wide row that wraps in the
+    /// terminal and leaks the frame behind it.
+    #[test]
+    fn a_line_at_the_budget_stays_one_physical_line() {
+        for width in [20usize, 40, 79] {
+            let line = "x".repeat(width);
+            let out = highlight_code_fg(&line, "bash", width);
+            assert_eq!(out.lines().count(), 1, "wrapped at width {width}: {out:?}");
+            let plain = strip_ansi(&out);
+            assert_eq!(plain, line, "content altered at width {width}");
+        }
+    }
+
+    /// The renderer indents each wrap-continuation by four spaces (so a wrapped
+    /// block reads as one level). Those must be stripped so `panel_row` never
+    /// sees an embedded newline whose continuation is still indented. A code
+    /// line's *own* leading whitespace is a different thing and must survive.
+    #[test]
+    fn rewrapped_continuations_are_unindented() {
+        // Deliberately over-wide for its budget: the renderer will wrap it.
+        // No leading whitespace of its own, so every leading space on a
+        // physical line is the renderer's continuation indent.
+        let line = "word ".repeat(20);
+        let line = line.trim_end();
+        let out = highlight_code_fg(line, "bash", 12);
+        assert!(out.lines().count() > 1, "fixture must wrap: {out:?}");
+        for physical in out.lines().skip(1) {
+            assert!(
+                !physical.starts_with("  "),
+                "continuation indent survived: {physical:?}"
+            );
+        }
+        // The words themselves survive the round-trip, spaces collapsed at
+        // wrap points only.
+        let plain = strip_ansi(&out);
+        assert_eq!(
+            plain.split_whitespace().collect::<Vec<_>>(),
+            line.split_whitespace().collect::<Vec<_>>()
+        );
+    }
+
+    /// A code line's own leading whitespace is content, not the renderer's
+    /// indent: it must survive on the first physical line. Stripping by
+    /// leading-space *count* would eat a deeply-indented source line here.
+    #[test]
+    fn a_lines_own_indentation_survives() {
+        let out = highlight_code_fg("        deep();", "bash", 40);
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        let plain = strip_ansi(&out);
+        assert_eq!(plain, "        deep();", "own indent eaten: {plain:?}");
+    }
+
+    #[test]
+    fn empty_input_renders_empty_and_ansi_is_foreground_only() {
+        assert_eq!(highlight_code_fg("", "bash", 40), "");
+        let out = highlight_code_fg("let x = 1;", "rust", 40);
+        assert!(out.contains('\x1b'), "no styling emitted: {out:?}");
+        assert!(
+            !out.contains("\x1b[48;"),
+            "highlighter must not paint a background: {out:?}"
+        );
     }
 }

@@ -30,7 +30,7 @@ use crate::content::markdown::{
     answer_theme, command_lang, guess_lang, highlight_code_fg, render_markdown,
 };
 use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno};
-use crate::content::text::wrap;
+use crate::content::text::{expand_tabs, wrap};
 use crate::render::ContentWrite;
 
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
@@ -1043,21 +1043,26 @@ impl Content {
                 ) {
                     // Show the path as a header with line count
                     let lang = guess_lang(path);
+                    // The indented panel row reserves one column for its lead,
+                    // so every width budget below is `inner`, not `width`.
+                    let width = self.width();
+                    let inner = width.saturating_sub(1).max(1);
                     let header = format!("write {} [{} lines]", path, total_lines);
-                    let header_styled = highlight_code_fg(&header, "bash", self.width());
+                    let header_styled = highlight_code_fg(&header, "bash", inner);
                     self.paint_panel(&header_styled, true);
 
                     // Render the content with syntax highlighting (like read_file)
                     let show_max = 10; // Limit preview to 10 lines (match read_file)
-                    let width = self.width();
-                    let inner = width.saturating_sub(1).max(1);
                     let content_lines: Vec<_> = content.lines().collect();
                     for (printed, line) in content_lines.iter().enumerate() {
                         if printed >= show_max {
                             break;
                         }
-                        for wline in wrap(line, inner) {
-                            let styled = highlight_code_fg(&wline, lang, self.width());
+                        // Expand tabs (tabstop 4) so the drawn indentation is
+                        // measured in columns, not counted as zero-width.
+                        let line = expand_tabs(line);
+                        for wline in wrap(line.as_ref(), inner) {
+                            let styled = highlight_code_fg(&wline, lang, inner);
                             self.paint_panel(&styled, true);
                         }
                     }
@@ -1117,13 +1122,21 @@ impl Content {
             } else {
                 line
             };
-            for wline in wrap(visible, inner) {
+            // Expand tabs up front (tabstop 4): the terminal draws a tab as a
+            // run of spaces but every measure here counts it as zero columns,
+            // so an indented source line used to be padded to full width on
+            // top of its drawn indentation — one row too wide, which wrapped
+            // and leaked the frame behind it.
+            let visible = expand_tabs(visible);
+            for wline in wrap(visible.as_ref(), inner) {
                 if is_error {
                     self.tool_panel(&wline, true, true);
                 } else {
-                    // Syntax-highlight through the result-path formatter, then
+                    // Syntax-highlight through the result-path formatter at the
+                    // *inner* budget the panel reserves (not the full width —
+                    // the indented row leaves one column for its lead), then
                     // layer the grey tool panel on top (flushed per line).
-                    let styled = highlight_code_fg(&wline, lang, self.width());
+                    let styled = highlight_code_fg(&wline, lang, inner);
                     self.paint_panel(&styled, true);
                 }
             }
@@ -2099,6 +2112,34 @@ mod tests {
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
     }
 
+    /// A tab-indented bash result must not overflow the panel row.
+    ///
+    /// Regression (the wrapping-indented-result artifact): `wrap` counted a
+    /// leading tab as one *character* and `panel_row`'s display-width measure
+    /// counted it as *zero columns*, while the terminal draws it as a run of
+    /// spaces to the next tab stop (four here). The row came out
+    /// `indent - 1` columns too wide, natural-wrapped in the terminal with no
+    /// newline between the physical rows, and `LineClear` never armed its
+    /// erase on the continuation — so the frame beneath (the status bar)
+    /// bled through. `expand_tabs` now expands the tab before any measure, so
+    /// every emitted row is exactly the panel width and stays one physical
+    /// line. The vt100 replay is the proof: an over-wide row wraps without a
+    /// `\n`, so the cursor would land past the tracked row count.
+    #[test]
+    fn a_tab_indented_bash_result_fills_the_panel_width_and_stays_one_row() {
+        let (out, _reasoning) = capturing_output(40);
+        let sink = record_bytes(&out);
+        out.begin_response();
+        out.display_tool_call("bash", &serde_json::json!({"command": "cat types.ts"}));
+        out.display_tool_result("\t\tinterface Foo {}");
+        let bytes = sink.bytes();
+        assert_eq!(
+            tracked_row(&out),
+            screen_row(&bytes, 40),
+            "a tab-indented row overflowed and natural-wrapped (leaking the frame)"
+        );
+    }
+
     #[test]
     fn markdown_and_error_and_plain_are_counted() {
         let (out, _reasoning) = capturing_output(40);
@@ -2688,21 +2729,21 @@ mod tests {
     }
 
     #[test]
-    fn wrap_long_word_first_chunk_keeps_indent_subsequent_chunks_plain() {
-        // A word longer than the available content width is hard-split. The
-        // FIRST chunk keeps the indent (it's the first visual line of that
-        // word); the renderer will prepend its own marker to subsequent
-        // chunks, so emitting them plain keeps continuation lines aligned.
+    fn wrap_long_word_keeps_indent_on_every_chunk() {
+        // A word wider than the available content width is hard-split. Every
+        // chunk keeps the indent — not just the first — so no continuation
+        // row lands flush-left of the block it belongs to (the panel draws
+        // these rows one column in; a bare chunk read as new top-level text).
         let text = "  abcdefghij";
-        // Width 5 - 2 (indent) = 3 chars content per chunk.
+        // Width 5 - 2 (indent) = 3 columns of content per chunk.
         let r = wrap(text, 5);
         assert_eq!(
             r,
             vec![
                 "  abc".to_string(),
-                "def".to_string(),
-                "ghi".to_string(),
-                "j".to_string(),
+                "  def".to_string(),
+                "  ghi".to_string(),
+                "  j".to_string(),
             ]
         );
     }
