@@ -1029,7 +1029,9 @@ impl SlashDotNode for TreeListNode {
             .or_else(|| row.description.clone())
             .unwrap_or_default();
         let body = body.as_str();
-        let tw = render_ctx.term_width.max(1).saturating_sub(2);
+        // The detail view paints flush left at the full terminal width (no
+        // cursor-column reservation), so wrap to that full width.
+        let tw = render_ctx.term_width.max(1);
         match role.as_str() {
             "compaction" => {
                 let text = body.strip_prefix("[COMPACT] ").unwrap_or(body);

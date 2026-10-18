@@ -348,6 +348,24 @@ mod tests {
         assert_eq!(s.height(), s.rows.len());
     }
 
+    /// Detail carries no cursor column, so it must be flush left: no marker,
+    /// no reserved `MARKER` gap, and it splits at the *full* terminal width.
+    /// The 2-column reservation belongs to the data rows' `>`/`*` cursor
+    /// column below; a detail line has no cursor, so reserving it only pushed
+    /// the preview off the left edge and cost two columns of wrap width.
+    #[test]
+    fn detail_is_flush_left_with_no_marker_indent() {
+        // Exactly terminal-width content fits on one row — it would only fit
+        // on two if the painter still split at `tw - MARKER`.
+        let content = "x".repeat(60);
+        let s = paint_detail(&[LogicalLine::new(&content)], 60);
+        assert_eq!(s.heights, vec![1], "splits at full width, not tw - MARKER");
+        // Every row ends in the reset escape; strip it to compare the text.
+        let text = s.rows[0].trim_end_matches("\x1b[0m");
+        assert_eq!(text, content, "no leading indent, all content kept");
+        assert!(text.starts_with('x'), "row starts at column 0");
+    }
+
     // --- window_heights ----------------------------------------------------
     //
     // The rows element's windowing primitive (`ui::RowsItem`). Heights, not row
@@ -437,8 +455,10 @@ pub(crate) const MARKER: usize = 2;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RowStyle {
     /// Detail lines (the node's `header()` output): plain text, no
-    /// background, no marker — but still indented by [`MARKER`] so the
-    /// sections line up.
+    /// background, no marker, and no reserved cursor column — flush left at
+    /// the full terminal width. The [`MARKER`] gap exists so the data rows'
+    /// `>`/`*` cursor column lines up; a detail line has no cursor, so
+    /// reserving the gap only indented the preview away from the left edge.
     Detail,
     /// Column headings: the header background, no marker.
     TableHeader,
@@ -453,8 +473,11 @@ pub enum RowStyle {
 ///
 /// The painter, not the caller, is what makes content *fit*: `content` is
 /// split at the width with every character preserved (see
-/// [`split_to_width`]), the style's marker goes on the first visual row and
-/// two spaces on its continuations, and every visual row is padded to `tw`.
+/// [`split_to_width`]), and every visual row is padded to `tw`. A marker
+/// style (table header, data) splits at `tw - MARKER`, leads its first
+/// visual row with the marker and its continuations with two spaces — so the
+/// cursor column lines up. A marker-less style (detail) splits at the full
+/// `tw` and carries no marker or indent at all.
 /// Splitting rather than reflowing is deliberate — a table row's column gaps
 /// and an engine help header's alignment (`"  10      last 10 turns"`) must
 /// survive, which word wrapping would collapse; the engine, which knows its
@@ -466,8 +489,11 @@ pub enum RowStyle {
 /// could go stale (ui_draw_v2 §9 #11).
 pub fn paint_row(content: &str, style: RowStyle, tw: usize) -> String {
     let tw = tw.max(1);
+    // Detail is flush left: it reserves no cursor column, so it splits at the
+    // full width and carries no marker. The other sections split at
+    // `tw - MARKER` and lead with their marker (table header: two spaces).
     let (bg, fg, marker) = match style {
-        RowStyle::Detail => ("", "", "  "),
+        RowStyle::Detail => ("", "", ""),
         RowStyle::TableHeader => ("\x1b[48;5;237m", "", "  "),
         RowStyle::Data { selected, active } => (
             if selected {
@@ -485,10 +511,19 @@ pub fn paint_row(content: &str, style: RowStyle, tw: usize) -> String {
             },
         ),
     };
-    let content_w = tw.saturating_sub(MARKER).max(1);
+    let content_w = tw.saturating_sub(marker.len()).max(1);
     let mut out: Vec<String> = Vec::new();
     for (i, piece) in split_to_width(content, content_w).iter().enumerate() {
-        let text = format!("{}{}", if i == 0 { marker } else { "  " }, piece);
+        // A marker-less (detail) row carries no lead at all — nothing to line
+        // up under — so it is neither marked nor indented.
+        let lead = if marker.is_empty() {
+            ""
+        } else if i == 0 {
+            marker
+        } else {
+            "  "
+        };
+        let text = format!("{}{}", lead, piece);
         let pad = tw.saturating_sub(display_width(&text));
         out.push(format!("{bg}{fg}{text}{}\x1b[0m", " ".repeat(pad)));
     }
@@ -638,7 +673,9 @@ fn paint_section(
 }
 
 /// Paint the **detail** section — the node's `header()` output: plain text, no
-/// background, indented to line up with the data rows.
+/// background, flush left at the full terminal width. No cursor column is
+/// reserved: the `MARKER` gap belongs to the data rows' `>`/`*` marker, and
+/// a detail line has none.
 ///
 /// Nothing is dropped here. A detail line wider than the terminal is *split*
 /// (so the section can be cut at a line boundary); deciding *how many* detail
