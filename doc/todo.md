@@ -34,10 +34,10 @@ and link a doc/ and/or commit hash
 ## Token efficiency
 
 - [ ] Minimize tool context
-  - Strip failed edits / replace with placeholder
   - Minimize successful edits: Minimal context (only changed lines), all line anchored to actual
     resolved lines.
   - More aggressive truncation for long `read` / `bash` outputs
+  - Strip failed edits from previous (before last) completion turns
 - [ ] Strip reasoning content for older aborted / failed turns once a newer turn completes
       successfully with a final answer.
 - [ ] Multi-file edits - Error: Provider rejected the request (HTTP 400); An assistant message with
