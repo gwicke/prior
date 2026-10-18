@@ -557,95 +557,76 @@ impl SessionIndex {
         labels: &std::collections::HashMap<&str, Option<&str>>,
         order: &std::collections::HashMap<&str, usize>,
     ) -> Option<SessionTreeNode> {
-        // Stack frames for iterative post-order traversal.
-        // Each frame: (entry_id, state)
-        // state = 0: visiting, state = 1: processing children results
-        #[derive(Debug)]
-        struct Frame {
-            entry_id: String,
-            state: u8,
-            entry: Arc<SessionEntry>,
-            children_results: Vec<SessionTreeNode>,
-        }
+        // Iterative post-order. The previous version attached each completed
+        // child to `stack.last_mut()`, which is the *next sibling* when a
+        // node has more than one child — mis-nesting every fork. Completed
+        // nodes now go into `built` keyed by entry id, and a parent collects
+        // its own children by id when its post-order frame is reached.
+        let mut built: std::collections::HashMap<String, Option<SessionTreeNode>> =
+            std::collections::HashMap::new();
+        let mut stack: Vec<(String, bool)> = vec![(root_entry_id.to_string(), false)];
 
-        let root_entry = Arc::clone(self.entries.get(root_entry_id)?);
-        let mut stack = vec![Frame {
-            entry_id: root_entry_id.to_string(),
-            state: 0,
-            entry: root_entry,
-            children_results: Vec::new(),
-        }];
-
-        while let Some(frame) = stack.last_mut() {
-            if frame.state == 0 {
-                frame.state = 1;
-                // Push children onto stack for post-order processing
-                if let Some(child_ids) = self.children.get(&frame.entry_id) {
+        while let Some((entry_id, expanded)) = stack.pop() {
+            if !expanded {
+                stack.push((entry_id.clone(), true));
+                if let Some(child_ids) = self.children.get(&entry_id) {
                     for cid in child_ids.iter().rev() {
-                        if let Some(child_entry) = self.entries.get(cid) {
-                            stack.push(Frame {
-                                entry_id: cid.clone(),
-                                state: 0,
-                                entry: Arc::clone(child_entry),
-                                children_results: Vec::new(),
-                            });
+                        if self.entries.contains_key(cid) {
+                            stack.push((cid.clone(), false));
                         }
                     }
                 }
-            } else {
-                // Pop the frame and build its node
-                let frame = stack.pop().unwrap();
-                let entry = frame.entry;
-                let children = frame.children_results;
+                continue;
+            }
 
-                // Meta entries (Leaf, SessionInfo) — the entry itself is
-                // invisible in the list, but its children must still be
-                // reachable. If the meta node has visible descendants,
-                // return them wrapped under the meta entry so the tree
-                // shape mirrors the JSONL exactly. The flat list filters
-                // these out via `entry_display_label`, so the user never
-                // sees the SessionInfo row.
-                let node = if matches!(
-                    entry.content,
-                    SessionEntryContent::Leaf { .. } | SessionEntryContent::SessionInfo { .. }
-                ) {
-                    if children.is_empty() {
-                        None
-                    } else {
-                        Some(SessionTreeNode {
-                            order: order.get(entry.id.as_str()).copied().unwrap_or(0),
-                            entry,
-                            children,
-                            label: None,
-                        })
+            let entry = Arc::clone(self.entries.get(&entry_id)?);
+            let mut children = Vec::new();
+            if let Some(child_ids) = self.children.get(&entry_id) {
+                for cid in child_ids {
+                    if let Some(Some(node)) = built.remove(cid) {
+                        children.push(node);
                     }
+                }
+            }
+
+            // Meta entries (Leaf, SessionInfo) — the entry itself is
+            // invisible in the list, but its children must still be
+            // reachable. If the meta node has visible descendants,
+            // return them wrapped under the meta entry so the tree
+            // shape mirrors the JSONL exactly. The flat list filters
+            // these out via `entry_display_label`, so the user never
+            // sees the SessionInfo row.
+            let node = if matches!(
+                entry.content,
+                SessionEntryContent::Leaf { .. } | SessionEntryContent::SessionInfo { .. }
+            ) {
+                if children.is_empty() {
+                    None
                 } else {
-                    let label = labels
-                        .get(entry.id.as_str())
-                        .copied()
-                        .flatten()
-                        .map(String::from);
                     Some(SessionTreeNode {
                         order: order.get(entry.id.as_str()).copied().unwrap_or(0),
                         entry,
                         children,
-                        label,
+                        label: None,
                     })
-                };
-
-                // If there's a parent frame, pass the result up
-                if let Some(parent_frame) = stack.last_mut() {
-                    if let Some(node) = node {
-                        parent_frame.children_results.push(node);
-                    }
-                } else {
-                    // This was the root frame
-                    return node;
                 }
-            }
+            } else {
+                let label = labels
+                    .get(entry.id.as_str())
+                    .copied()
+                    .flatten()
+                    .map(String::from);
+                Some(SessionTreeNode {
+                    order: order.get(entry.id.as_str()).copied().unwrap_or(0),
+                    entry,
+                    children,
+                    label,
+                })
+            };
+            built.insert(entry_id, node);
         }
 
-        None
+        built.remove(root_entry_id).flatten()
     }
 }
 
@@ -927,6 +908,51 @@ mod tests {
         assert_eq!(path[1].id, "entry-1");
         assert_eq!(path[2].id, "entry-2");
         assert_eq!(path[3].id, "entry-3");
+    }
+
+    #[test]
+    fn build_tree_keeps_siblings_under_their_parent() {
+        // Regression: the iterative post-order used to attach a completed
+        // child to `stack.last_mut()`, which is the next sibling whenever a
+        // node has more than one child — so forks were mis-nested.
+        let mut index = SessionIndex {
+            header: SessionHeader::new(Path::new("/test")),
+            order: vec!["u1".into(), "a1".into(), "a2".into(), "c1".into()],
+            entries: HashMap::new(),
+            leaf_id: Some("a2".into()),
+            children: HashMap::new(),
+            session_name: None,
+        };
+        let mk = |id: &str, parent: Option<&str>, text: &str| SessionEntry {
+            id: id.into(),
+            parent_id: parent.map(str::to_string),
+            timestamp: "t".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({"role":"user","content":[{"type":"text","text":text}]}),
+            },
+        };
+        for e in [
+            mk("u1", None, "root"),
+            mk("a1", Some("u1"), "first child"),
+            mk("a2", Some("a1"), "grandchild"),
+            mk("c1", Some("u1"), "second child"),
+        ] {
+            let pid = e.parent_id.clone();
+            let id = e.id.clone();
+            index.entries.insert(id.clone(), Arc::new(e));
+            if let Some(pid) = pid {
+                index.children.entry(pid).or_default().push(id);
+            }
+        }
+        let tree = index.build_tree(Some("a2"));
+        assert_eq!(tree.len(), 1);
+        let root = &tree[0];
+        assert_eq!(root.entry.id, "u1");
+        let kids: Vec<&str> = root.children.iter().map(|n| n.entry.id.as_str()).collect();
+        assert_eq!(kids, ["a1", "c1"], "siblings stay under u1");
+        assert_eq!(root.children[0].children.len(), 1);
+        assert_eq!(root.children[0].children[0].entry.id, "a2");
+        assert_eq!(root.children[1].children.len(), 0, "c1 is a leaf");
     }
 
     #[test]

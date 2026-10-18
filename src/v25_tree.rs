@@ -437,7 +437,17 @@ fn bar_col(depth: usize) -> usize {
 /// Heavy box-drawing throughout — over a saturated wash the thin strokes
 /// (U+2502 and friends) read as too faint, so the bar is carried by the
 /// stroke rather than by the colour behind it.
-fn bar_glyph(up: bool, down: bool, assistant: bool) -> char {
+fn bar_glyph(up: bool, down: bool, assistant: bool, left: bool) -> char {
+    // A connector run arrives from the left, so its bar cell keeps the left
+    // arm: `┓` for a user row, `┳` for an assistant row (which also keeps the
+    // rightward reply arm, so the run stays gap-less through the cell).
+    if left {
+        return if assistant {
+            '\u{2533}' // ┳
+        } else {
+            '\u{2513}' // ┓
+        };
+    }
     match (up, down, assistant) {
         (true, true, false) => '\u{2503}',  // ┃
         (true, true, true) => '\u{2523}',   // ┣
@@ -549,7 +559,7 @@ fn row_prefix(
 
     // The bar cell: wash (hue faded by depth) with black ink, so the wash
     // recedes while the line stays legible.
-    let glyph = bar_glyph(up, down, assistant);
+    let glyph = bar_glyph(up, down, assistant, connector);
     let wash = blend(branch_rgb(branch), fade_at(depth));
     out.push_str(&format!(
         "\x1b[48;2;{};{};{}m\x1b[38;2;0;0;0m{}\x1b[0m",
@@ -3628,7 +3638,7 @@ mod tests {
                     "┃",    // u2
                     "┣╸",   // a2
                     "╹",    // mc1, a non-reply marker on the main line
-                    "┗━━╻", // mc2, spur
+                    "┗━━┓", // mc2, spur
                     "   ╻", // mc3, spur (parent not adjacent above)
                     " ",    // mc4, the spine: isolated between spur rows
                 ];
@@ -4043,10 +4053,10 @@ mod tests {
         for (id, want) in [
             ("u1", "╻"),
             ("a1", "┗╸"),
-            ("x1", "┗━━╻"),   // spur: connector from the bar above
+            ("x1", "┗━━┓"),   // spur: connector from the bar above
             ("x2a", "   ┗╸"), // …its reply turns the ladder off
             ("u2", " "),      // isolated mainline row between two spurs
-            ("y1", "┗━━╻"),
+            ("y1", "┗━━┓"),
             ("y2", "   ┗╸"),
             ("a2", "┏╸"),
             ("u3", "┃"),
@@ -4133,7 +4143,7 @@ mod tests {
         );
         assert_eq!(
             prefix_of(&plain_of(&rows, "w1")),
-            "┗━━╻",
+            "┗━━┓",
             "its spur opens downwards"
         );
         assert_eq!(
@@ -4143,7 +4153,7 @@ mod tests {
         );
         assert_eq!(
             prefix_of(&plain_of(&rows, "u2")),
-            "┗━━╻",
+            "┗━━┓",
             "older equal-depth branch is a spur"
         );
         assert_eq!(
@@ -4376,7 +4386,7 @@ mod tests {
             is_spur_start(&resp, "x1"),
             "the connector must land on the first visible spur row: {rows:?}"
         );
-        assert_eq!(prefix_of(&plain_of(&rows, "x1")), "┗━━╻");
+        assert_eq!(prefix_of(&plain_of(&rows, "x1")), "┗━━┓");
     }
 
     #[test]
@@ -4404,7 +4414,33 @@ mod tests {
             is_spur_start(&resp, "x1"),
             "connector must reach the first visible row of the spur: {rows:?}"
         );
-        assert_eq!(prefix_of(&plain_of(&rows, "x1")), "┗━━╻");
+        assert_eq!(prefix_of(&plain_of(&rows, "x1")), "┗━━┓");
+    }
+
+    #[test]
+    fn assistant_spur_start_uses_a_t_junction() {
+        // The connector run must meet the bar cell: an assistant spur start
+        // keeps both its left arm (to the run) and its right arm (the reply
+        // cue), i.e. a T junction rather than an elbow.
+        let tree = vec![node(
+            make_entry("u1", None, "user", "parent"),
+            vec![
+                node(
+                    make_entry("a1", Some("u1"), "assistant", "spur reply"),
+                    vec![],
+                ),
+                node(
+                    make_entry("u2", Some("u1"), "user", "main"),
+                    vec![node(
+                        make_entry("a2", Some("u2"), "assistant", "main reply"),
+                        vec![node(make_entry("u3", Some("a2"), "user", "more"), vec![])],
+                    )],
+                ),
+            ],
+        )];
+        let resp = data_for(tree, Some("u3"));
+        let rows = plain_rows(&resp);
+        assert_eq!(prefix_of(&plain_of(&rows, "a1")), "┗━━┳╸");
     }
 
     #[test]
@@ -4453,7 +4489,7 @@ mod tests {
             crate::slashdot_menu::table::display_width(&prefix[..at])
         };
         assert_eq!(col_of('\u{2517}'), bar_col(0), "elbow column");
-        assert_eq!(col_of('\u{257b}'), bar_col(1), "bar column");
+        assert_eq!(col_of('\u{2513}'), bar_col(1), "bar column");
     }
 
     #[test]
@@ -4478,10 +4514,10 @@ mod tests {
         let want = vec![
             "╻",
             "┗╸",
-            "┗━━╻",
+            "┗━━┓",
             "   ┗╸",
             " ",
-            "┗━━╻",
+            "┗━━┓",
             "   ┗╸",
             "┏╸",
             "┃",
