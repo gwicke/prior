@@ -724,7 +724,11 @@ impl<'a> Extractor<'a> {
                 // Accept when the "rest" portion contains a file extension.
                 // Path may be bare or absolute.
                 let path = rest.trim();
-                if path.contains('.') && !path.starts_with('.') {
+                // A dotfile / dot-directory (`.github/workflows/ci.yml`) is
+                // still a path. Rejecting every leading dot made the whole
+                // line look like the path, so each round-trip prefixed another
+                // `read: ` onto it.
+                if path.contains('.') && !path.trim_matches('.').is_empty() {
                     (Some(desc.trim()), path)
                 } else {
                     (None, stripped.trim())
@@ -743,6 +747,7 @@ impl<'a> Extractor<'a> {
             || path.starts_with("http")
             || path.starts_with('<')  // email / markup
             || !path.contains('.')     // no extension → not a file
+            || path.trim_matches('.').is_empty() // ".", "..", … not a file
             || path.ends_with('.')     // trailing dot
             || path.contains("://")
         // URL
@@ -759,9 +764,7 @@ impl<'a> Extractor<'a> {
         // - "modified" → descriptor=Some("modified"), modified=true
         // - anything else → descriptor=Some(custom), modified=false (custom is preserved verbatim)
         let descriptor = match descriptor {
-            Some("read") => Some("read".to_string()),
-            Some("modified") => Some("modified".to_string()),
-            Some(d) => Some(d.to_string()),
+            Some(d) => Some(normalize_descriptor(d)),
             None => Some("read".to_string()),
         };
 
@@ -775,6 +778,24 @@ impl<'a> Extractor<'a> {
 
     fn take_unparsed(&mut self) -> Vec<&'a str> {
         std::mem::take(&mut self.unparsed)
+    }
+}
+
+/// Collapse a chain of status words into the last one. Older summaries could
+/// accumulate `read: read: …: modified` descriptors when a dot-path was not
+/// split from its status; re-parsing one should repair it rather than carry
+/// the chain forward. Custom titles (anything not made solely of `read` /
+/// `modified`) are preserved verbatim.
+fn normalize_descriptor(desc: &str) -> String {
+    let parts: Vec<&str> = desc.split(": ").map(str::trim).collect();
+    if parts.len() > 1
+        && parts
+            .iter()
+            .all(|part| *part == "read" || *part == "modified")
+    {
+        parts.last().unwrap().to_string()
+    } else {
+        desc.trim().to_string()
     }
 }
 
@@ -4583,6 +4604,75 @@ mod tests {
     }
 
     #[test]
+    fn manual_round_trip_is_stable_for_dotfile_paths() {
+        let session_dir = std::path::PathBuf::from("/test");
+        let dropped = vec![
+            sum_user("u1", None, "do work"),
+            sum_assistant(
+                "a1",
+                Some("u1"),
+                serde_json::json!([
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": ".github/workflows/ci.yml"}},
+                ]),
+            ),
+        ];
+        let mut summary = build_manual_template(&dropped, None, &session_dir);
+        assert!(
+            summary.contains("- read: .github/workflows/ci.yml"),
+            "{summary}"
+        );
+        for _ in 0..4 {
+            summary = build_manual_template(&[], Some(&summary), &session_dir);
+        }
+        assert!(
+            summary.contains("- read: .github/workflows/ci.yml"),
+            "dot-directory path must survive round-trips: {summary}"
+        );
+        assert!(!summary.contains("read: read:"), "{summary}");
+        assert_eq!(
+            summary.matches(".github/workflows/ci.yml").count(),
+            1,
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn text_only_round_trip_is_stable_for_dotfile_paths() {
+        let session_dir = std::path::PathBuf::from("/test");
+        let dropped = vec![
+            sum_user("u1", None, "do work"),
+            sum_assistant(
+                "a1",
+                Some("u1"),
+                serde_json::json!([
+                    {"type": "text", "text": "answer"},
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": ".github/workflows/ci.yml"}},
+                ]),
+            ),
+        ];
+        let mut summary = build_text_only_summary(&dropped, None, &session_dir);
+        assert!(
+            summary.contains("- read: .github/workflows/ci.yml"),
+            "{summary}"
+        );
+        for _ in 0..4 {
+            summary = build_text_only_summary(&[], Some(&summary), &session_dir);
+        }
+        assert!(
+            summary.contains("- read: .github/workflows/ci.yml"),
+            "dot-directory path must survive round-trips: {summary}"
+        );
+        assert!(!summary.contains("read: read:"), "{summary}");
+        assert_eq!(
+            summary.matches(".github/workflows/ci.yml").count(),
+            1,
+            "{summary}"
+        );
+    }
+
+    #[test]
     fn build_manual_template_is_empty_when_no_files_touched() {
         let session_dir = std::path::PathBuf::from("/test");
         // No file-touching tool calls in the dropped span → no file section,
@@ -4755,6 +4845,39 @@ mod tests {
         // ": " part before the path is the descriptor; ".js" is the extension → file
         assert!(ex.files[1].1.as_deref() != Some("read"));
         assert!(ex.files[1].1.as_deref() != Some("modified"));
+    }
+
+    #[test]
+    fn extractor_splits_status_from_dotfile_paths() {
+        // Dotfiles / dot-directories must not swallow the whole line as the
+        // path. This is what used to accumulate `read: read: …` prefixes.
+        let input = "- read: .github/workflows/ci.yml\n- modified: .gitignore\n- Design doc: .config/tool.toml";
+        let mut ex = Extractor::new();
+        for line in input.lines() {
+            ex.ingest(line);
+        }
+        assert_eq!(ex.files.len(), 3);
+        assert_eq!(ex.files[0].0, ".github/workflows/ci.yml");
+        assert_eq!(ex.files[0].1.as_deref(), Some("read"));
+        assert_eq!(ex.files[1].0, ".gitignore");
+        assert_eq!(ex.files[1].1.as_deref(), Some("modified"));
+        assert_eq!(ex.files[2].0, ".config/tool.toml");
+        assert_eq!(ex.files[2].1.as_deref(), Some("Design doc"));
+    }
+
+    #[test]
+    fn extractor_repairs_corrupted_status_chains() {
+        // Summaries written by the buggy parser can contain a chain of status
+        // words before a dot-path. Re-parsing must recover the path and the
+        // last real status instead of preserving the chain.
+        let input = "- read: read: read: modified: .github/workflows/ci.yml";
+        let mut ex = Extractor::new();
+        for line in input.lines() {
+            ex.ingest(line);
+        }
+        assert_eq!(ex.files.len(), 1);
+        assert_eq!(ex.files[0].0, ".github/workflows/ci.yml");
+        assert_eq!(ex.files[0].1.as_deref(), Some("modified"));
     }
 
     #[test]
