@@ -12,8 +12,11 @@ use crate::content::preview::wrap_with_diff_markers;
 use crate::content::text::expand_tabs;
 
 /// How far a *result* row is indented, in columns, on top of the content's own
-/// indentation. A command label (tool name + arguments) is never indented;
-/// everything under it is output.
+/// indentation. A command label's (tool name + arguments) *first* line is
+/// never indented; a multi-line input's later lines carry this same indent
+/// (pre-pended before rendering, in
+/// [`crate::content::markdown::highlight_label_fg`]), and everything under
+/// the label is output.
 ///
 /// Plain result rows get this many leading spaces from [`panel_row`].
 /// Fence-rendered results get it from the renderer's code-fence gutter instead

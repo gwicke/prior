@@ -906,10 +906,13 @@ impl Content {
         // block a tool" flag: a text segment leaves the renderer's own trailing
         // blank behind, a tool panel does not, and the stream knows which.
         let (label, extra) = get_preview(name, args);
-        // Dark-grey panel box (no `⏺`, no tree line-art). The command label —
-        // tool name and arguments — sits flush at the panel's left edge;
-        // everything under it (the trailing diff/preview lines here, the
-        // result panel that follows) is output and carries the result indent.
+        // Dark-grey panel box (no `⏺`, no tree line-art). The command label's
+        // first line — tool name and arguments — sits flush at the panel's
+        // left edge; a multi-line input's later lines carry the result indent
+        // (pre-pended before rendering, so e.g. bash lines align under `$ `).
+        // Everything under the label (the trailing diff/preview lines here,
+        // the result panel that follows) is output and carries the result
+        // indent.
         // The label is syntax-highlighted through the same formatter the
         // result path uses, rendered without the code-fence gutter: that
         // gutter *is* the result indent, and a label is not a result.
@@ -2180,6 +2183,37 @@ mod tests {
         assert!(
             result.starts_with("  total 0"),
             "result not indented by the fence gutter: {result:?}"
+        );
+    }
+
+    /// A multi-line bash input keeps only its first line flush: the later
+    /// command lines carry the result indent pre-wrap, which aligns them
+    /// under the `$ ` prompt (two columns, same as the indent).
+    #[test]
+    fn a_multiline_bash_label_indents_under_the_prompt() {
+        let (out, _reasoning) = capturing_output(80);
+        let sink = record_bytes(&out);
+        out.begin_response();
+        out.display_tool_call(
+            "bash",
+            &serde_json::json!({"command": "cat <<'EOF'\none\ntwo\nEOF"}),
+        );
+        let text = strip_ansi(&String::from_utf8_lossy(&sink.bytes()));
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("$ cat") || l.contains("one") || l.contains("two"))
+            .collect();
+        assert!(
+            rows[0].starts_with("$ cat"),
+            "first line not flush: {rows:?}"
+        );
+        assert!(
+            rows[1].starts_with("  one"),
+            "second command line not indented: {rows:?}"
+        );
+        assert!(
+            rows[2].starts_with("  two"),
+            "third command line not indented: {rows:?}"
         );
     }
 
