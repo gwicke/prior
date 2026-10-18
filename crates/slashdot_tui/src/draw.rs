@@ -969,6 +969,15 @@ impl Draw {
         self.write_bytes(bytes.as_bytes());
     }
 
+    /// Is a frame still intact on screen (plan §4.1)? The read side of
+    /// [`DrawCache::live`] for callers outside this module — the render
+    /// manager's empty-stack guard, which must tell "membership has not
+    /// arrived yet" (no live frame: a no-op) apart from "the area was
+    /// deliberately emptied" (live frame: the clear).
+    pub fn has_live_frame(&self) -> bool {
+        self.cache.live.is_some()
+    }
+
     /// The size of the last frame actually applied — what a painter compares
     /// the terminal against to notice a change made since, including one that
     /// happened while someone else (a turn) held the screen. Before the first

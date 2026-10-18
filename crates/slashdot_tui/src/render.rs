@@ -814,10 +814,17 @@ impl RenderManager {
     /// `render` and a caller keys off the resize event plus
     /// [`Self::painted_size`], never off a size this verb returns.
     pub fn render(&mut self, content: Option<ContentWrite>) {
-        // Nothing configured and nothing to write: no frame to compose, no
-        // area to paint. (A content write with an empty stack still runs: it
-        // has bytes to place.)
-        if self.stack.is_empty() && content.is_none() {
+        // Nothing to paint and nothing to clear: no frame to compose, no area
+        // to touch. An empty configured stack is two different facts —
+        // membership has not arrived yet (construction, before the first real
+        // `configure`) or the area was deliberately emptied (a cleared
+        // overlay) — and the live frame is what tells them apart: with one
+        // intact on screen the empty composition is the clear
+        // (`plan_apply`'s h==0 path erases the old region and parks the
+        // cursor where it was), and with none there is nothing to erase, so
+        // the call stays a no-op. (A content write with an empty stack still
+        // runs: it has bytes to place.)
+        if self.stack.is_empty() && content.is_none() && !self.draw.has_live_frame() {
             return;
         }
         let frame = self.compose();
@@ -1081,6 +1088,78 @@ mod tests {
             manager.stack.len(),
             2,
             "the configured stack is kept on the hub, where reposition reads it"
+        );
+    }
+
+    /// An empty stack before the first real membership is a **no-op**: nothing
+    /// configured, nothing live, nothing to clear and no bytes to write. This
+    /// is the construction state — `configure` has only ever seeded the
+    /// ratio — and it must stay byte-silent, whatever calls `render` on the
+    /// way up.
+    #[test]
+    fn render_before_any_membership_is_a_noop() {
+        let size = crate::termio::fixed(TermSize {
+            width: 40,
+            height: 24,
+        });
+        let mut manager = RenderManager::new(size, crate::termio::TermIO::recording());
+        manager.configure(crate::render::FRAME_MAX_ROW_RATIO, Vec::new());
+        manager.render(None);
+        assert!(
+            manager
+                .draw
+                .term_io
+                .recorded(crate::termio::Stream::Content)
+                .is_empty(),
+            "no membership and no live frame: render must write nothing"
+        );
+        assert_eq!(
+            manager.draw.cache.applied, None,
+            "and nothing was applied, so nothing is remembered as applied"
+        );
+    }
+
+    /// An empty stack **after** a real paint is the clear: the live frame's
+    /// region is erased and the cursor parked where the frame was
+    /// (`plan_apply`'s h==0 path). Same configured value as the no-op above —
+    /// the live frame is what tells the two readings apart.
+    #[test]
+    fn an_emptied_stack_clears_the_live_frame() {
+        let size = crate::termio::fixed(TermSize {
+            width: 40,
+            height: 24,
+        });
+        let mut manager = RenderManager::new(size, crate::termio::TermIO::recording());
+        manager.configure(
+            crate::render::FRAME_MAX_ROW_RATIO,
+            vec![Element::lines(vec!["hello".to_string()])],
+        );
+        manager.render(None);
+        let painted = manager
+            .draw
+            .term_io
+            .recorded(crate::termio::Stream::Content)
+            .to_vec();
+        assert!(
+            String::from_utf8_lossy(&painted).contains("hello"),
+            "the fixture paints before it clears"
+        );
+
+        manager.configure(crate::render::FRAME_MAX_ROW_RATIO, Vec::new());
+        manager.render(None);
+        let after = manager
+            .draw
+            .term_io
+            .recorded(crate::termio::Stream::Content);
+        let clear_bytes = &after[painted.len()..];
+        assert!(
+            String::from_utf8_lossy(clear_bytes).contains("\x1b[K"),
+            "the emptied stack must erase the live frame's rows: {clear_bytes:?}"
+        );
+        assert_eq!(
+            manager.draw.cache.applied,
+            Some((40, 24)),
+            "the clear is an apply like any other: the dims are remembered"
         );
     }
 
