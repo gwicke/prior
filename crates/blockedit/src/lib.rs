@@ -39,7 +39,9 @@ pub use blob::{
     ParsedEdit, DIVIDER, REPLACE_MARKER, SEARCH_MARKER,
 };
 pub use diagnose::{parse_file_results, render_file_results, FileResult};
-pub use minimize::{minimize_edit, minimize_ops};
+pub use minimize::{
+    minimize_edit, minimize_ops, split_and_minimize, split_and_minimize_ops, SPLIT_GAP,
+};
 pub use tool_errors::strip_arg_error_prefixes;
 pub use types::{EditOp, EditStartLine};
 pub use wire::{EditArgs, FileEdit};

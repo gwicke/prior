@@ -14,7 +14,7 @@
 //! diff itself -- Myers via `similar`, and a line split that keeps carriage
 //! returns where they are content -- and nothing else.
 
-use similar::TextDiff;
+use similar::{DiffTag, TextDiff};
 
 /// Unchanged lines shown on each side of a change.
 ///
@@ -49,6 +49,65 @@ pub fn unified(old: &str, new: &str, label: &str, context: usize) -> String {
     // `to_string` leaves a trailing newline, and the caller decides the
     // separator between files, so it is trimmed here.
     u.to_string().trim_end_matches('\n').to_string()
+}
+
+/// One changed region of a diff: a run of changed lines, extended to swallow a
+/// separating unchanged run when that run is short enough to keep in the same
+/// block. Ranges index the slices passed to [`hunks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    pub old_range: std::ops::Range<usize>,
+    pub new_range: std::ops::Range<usize>,
+}
+
+/// Split `old -> new` into changed regions, merging across unchanged gaps of at
+/// most `split_gap` lines.
+///
+/// This is the diff behind `blockedit::minimize::split_and_minimize`. It diffs
+/// *line slices*, so the caller controls what a "line" is; the minimizer passes
+/// slices that keep their terminators (`split_inclusive('\n')`) so a group's
+/// slices concatenate back byte-exactly. Same `from_slices` rule as [`unified`]:
+/// never `from_lines`, which breaks on a bare `\r`.
+///
+/// Leading and trailing unchanged runs are not part of any hunk, so dropping
+/// them is implicit. A hunk's ranges are empty on one side for a pure insertion
+/// (`old_range`) or a pure deletion (`new_range`).
+pub fn hunks(old: &[&str], new: &[&str], split_gap: usize) -> Vec<Hunk> {
+    let diff = TextDiff::from_slices(old, new);
+    let mut out: Vec<Hunk> = Vec::new();
+    let mut current: Option<Hunk> = None;
+    let mut gap = 0usize;
+
+    for op in diff.ops() {
+        if op.tag() == DiffTag::Equal {
+            gap = op.old_range().len();
+            continue;
+        }
+        current = match current.take() {
+            // A short unchanged run stays inside the block.
+            Some(mut h) if gap <= split_gap => {
+                h.old_range.end = op.old_range().end;
+                h.new_range.end = op.new_range().end;
+                Some(h)
+            }
+            Some(h) => {
+                out.push(h);
+                Some(Hunk {
+                    old_range: op.old_range(),
+                    new_range: op.new_range(),
+                })
+            }
+            None => Some(Hunk {
+                old_range: op.old_range(),
+                new_range: op.new_range(),
+            }),
+        };
+        gap = 0;
+    }
+    if let Some(h) = current {
+        out.push(h);
+    }
+    out
 }
 
 #[cfg(test)]

@@ -289,9 +289,11 @@ fn minimized_edit_args(
                 file.edits
                     .iter()
                     .zip(&r.matched_lines)
-                    .map(|(edit, line)| {
+                    .flat_map(|(edit, line)| {
                         let base = edit.start_line.map(|s| s.0 as usize).unwrap_or(*line);
-                        blockedit::minimize_edit(edit, base)
+                        // One input edit may split into several anchored
+                        // sub-edits at long internal unchanged runs.
+                        blockedit::split_and_minimize(edit, base)
                     })
                     .collect()
             }
@@ -895,6 +897,47 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             .unwrap()
             .to_string();
         assert_eq!(blocks, "a.rs:41\n@@@OLD\nold\n@@@NEW\nnew\n@@@END");
+    }
+
+    #[test]
+    fn a_long_internal_gap_splits_into_anchored_sub_blocks() {
+        use crate::tools::{EditResolutions, FileResolution};
+        let call = Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: ToolCallId::new("e1").unwrap(),
+                provider: None,
+                function: ToolFunction::new(
+                    "edit".into(),
+                    serde_json::json!({
+                        "blocks": "a.rs\n@@@OLD\na\nX\nb\nc\nd\nY\ne\n\
+                                   @@@NEW\na\nA\nb\nc\nd\nB\ne\n@@@END"
+                    }),
+                ),
+                signature: None,
+                additional_params: None,
+            })],
+        };
+        let mut ledger = EditAnchorLedger::default();
+        ledger.insert(
+            "e1".into(),
+            EditResolutions {
+                files: vec![FileResolution {
+                    path: "a.rs".into(),
+                    matched_lines: vec![10],
+                }],
+            },
+        );
+        let out = minimize_edit_tool_calls(vec![call], &ledger);
+        let blocks = tool_calls_of(&out[0])[0].function.arguments["blocks"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            blocks,
+            "a.rs:11\n@@@OLD\nX\n@@@NEW\nA\n@@@END\n\n\
+             a.rs:15\n@@@OLD\nY\n@@@NEW\nB\n@@@END"
+        );
     }
 
     #[test]

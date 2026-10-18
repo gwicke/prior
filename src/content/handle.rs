@@ -4074,7 +4074,9 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
         assert!(text.contains("edit src/x.rs"), "no label:\n{text}");
-        assert!(text.contains("@@ -1 +1 @@"), "no hunk header:\n{text}");
+        // The block is anchored (`src/x.rs:5`), so the header carries the real
+        // file line, not a buffer-relative `1`.
+        assert!(text.contains("@@ -5,1 +5,1 @@"), "no hunk header:\n{text}");
         assert!(text.contains("-     run();"), "no removed line:\n{text}");
         assert!(text.contains("+     walk();"), "no added line:\n{text}");
     }

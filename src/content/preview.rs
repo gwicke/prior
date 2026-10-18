@@ -254,16 +254,18 @@ pub(crate) fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
 
 /// Best-effort line range + diff preview for an edit tool call.
 ///
-/// The refined unified diff for **every** edit in the batch is derived from
-/// each edit's `old_text` vs `new_text`, so all diffs render even when the file
-/// can't be read or `old_text` has drifted (e.g. session replay after the edit
-/// already applied). Each unioned `@@` hunk header already conveys the change
-/// regions, so small batches concatenate their diffs directly with no
-/// separators or labels; very large batches are truncated so the preview
-/// doesn't flood the scrollback. The 1-based line *range* in the label
-/// reflects the first edit and requires reading the file and finding its
-/// `old_text`; otherwise the range is omitted but the diffs are still shown.
-/// Empty edits yield `(None, [])`.
+/// An **anchored** edit (`startLine` set, e.g. a minimized/replayed block) is
+/// rendered straight from its own lines by [`hunk_lines`], numbered from the
+/// anchor — no diff, because it is already minimal and re-diffing would only
+/// number it from 1. An **unanchored** edit (the model's own live call) is
+/// diffed via [`refined_diff_lines`], which derives the change from `old_text`
+/// vs `new_text` and so renders even when the file can't be read or the text has
+/// drifted (replay after the edit already applied). Each `@@` hunk header
+/// conveys the change regions, so small batches concatenate their diffs with no
+/// separators; very large batches are truncated. The label's line *range* comes
+/// from the anchor when present, otherwise from reading the file and finding
+/// `old_text`; absent both, it is omitted but the diff still shows. Empty edits
+/// yield `(None, [])`.
 pub(crate) fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec<String>) {
     let first = match edits.first() {
         Some(e) => e,
@@ -285,7 +287,14 @@ pub(crate) fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec
             truncated = true;
             break;
         }
-        for line in refined_diff_lines(&edit.old_text, &edit.new_text) {
+        // An anchored block is already minimal: re-diffing it could only echo
+        // it with wrong (buffer-relative) numbers. Render it directly, with
+        // real file line numbers. Unanchored edits keep the honest diff.
+        let lines = match edit.start_line {
+            Some(anchor) => hunk_lines(anchor.0, &edit.old_text, &edit.new_text),
+            None => refined_diff_lines(&edit.old_text, &edit.new_text),
+        };
+        for line in lines {
             if diff.len() >= MAX_OUT {
                 truncated = true;
                 break;
@@ -302,6 +311,17 @@ pub(crate) fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec
     }
 
     let range = (|| {
+        // An anchored edit states its own location: no file read, and the
+        // label agrees with the hunk header.
+        if let Some(anchor) = first.start_line {
+            let start = anchor.0;
+            let end = start + first.old_text.matches('\n').count() as u64;
+            return Some(if start == end {
+                format!("{start}")
+            } else {
+                format!("{start}..{end}")
+            });
+        }
         let Ok(content) = std::fs::read_to_string(path) else {
             return None;
         };
@@ -369,16 +389,11 @@ pub(crate) fn sed_preview_body(result: &str) -> Option<Vec<String>> {
     }
 
     for e in &parsed.edits {
-        let old_n = e.old_text.lines().count().max(1) as u64;
-        let new_n = e.new_text.lines().count().max(1) as u64;
-        let at = e.start_line.unwrap_or(0);
-        out.push(format!("@@ -{at},{old_n} +{at},{new_n} @@"));
-        for line in e.old_text.lines() {
-            out.push(format!("- {line}"));
-        }
-        for line in e.new_text.lines() {
-            out.push(format!("+ {line}"));
-        }
+        out.extend(hunk_lines(
+            e.start_line.unwrap_or(0),
+            &e.old_text,
+            &e.new_text,
+        ));
     }
 
     if !summary.is_empty() {
@@ -386,6 +401,26 @@ pub(crate) fn sed_preview_body(result: &str) -> Option<Vec<String>> {
         out.push(summary);
     }
     Some(out)
+}
+
+/// One anchored edit as unified-diff hunk lines, numbering from `start_line`.
+///
+/// Shared by the `sed` preview body and [`edit_preview`] so the two display
+/// paths cannot drift: both emit `@@ -a,n +a,m @@` with `a = start_line`, then
+/// `- `/`+ ` lines (`tool_panel` keys its diff rendering off those markers).
+/// An empty NEW (a deletion) simply has no `+` lines.
+pub(crate) fn hunk_lines(start_line: u64, old_text: &str, new_text: &str) -> Vec<String> {
+    let old_n = old_text.lines().count().max(1) as u64;
+    let new_n = new_text.lines().count().max(1) as u64;
+    let mut out = Vec::with_capacity(1 + old_n as usize + new_n as usize);
+    out.push(format!("@@ -{start_line},{old_n} +{start_line},{new_n} @@"));
+    for line in old_text.lines() {
+        out.push(format!("- {line}"));
+    }
+    for line in new_text.lines() {
+        out.push(format!("+ {line}"));
+    }
+    out
 }
 
 /// Condense the model-facing banner into one line for a human.
@@ -592,6 +627,20 @@ src/x.rs:9
         let (label, _) = get_preview("sed", &args);
         assert!(label.ends_with("..."), "{label}");
         assert!(label.lines().count() == 1, "{label}");
+    }
+
+    #[test]
+    fn an_anchored_edit_previews_real_line_numbers_without_a_diff() {
+        // A minimized/replayed block carries `startLine`; the preview must show
+        // the real file line directly instead of re-diffing the (already
+        // minimal) block and numbering it from 1.
+        let args = serde_json::json!({
+            "path": "src/x.rs",
+            "edits": [{"oldText": "run();", "newText": "walk();", "startLine": 142}]
+        });
+        let (label, diff) = get_preview("edit", &args);
+        assert_eq!(label, "edit src/x.rs [142]");
+        assert_eq!(diff, vec!["@@ -142,1 +142,1 @@", "- run();", "+ walk();"]);
     }
 
     #[test]

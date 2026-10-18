@@ -49,6 +49,9 @@ Algorithm, per edit:
 - never trim inside a line; leave partial-line edits intact;
 - set `EditOp.start_line = Some(anchor)`.
 
+A block trimmed this far can shrink further by splitting at long internal unchanged runs; see
+"Further minimization" below.
+
 Safe because all edits resolve against the original text, so `matched_lines[i]` is the exact
 original apply line. Trimmed spans stay non-overlapping.
 
@@ -98,6 +101,86 @@ The existing split then runs unchanged, but `per_file_blocks` must preserve anch
 per-file blobs. `render_blob` emits `some/path.rs:142` when `start_line` is set;
 `array_to_blob_value` (`:553`) reads `startLine` back into `ParsedEdit.start_line`.
 
+## Further minimization: split across long unchanged runs
+
+*Status: implemented.*
+
+Prefix/suffix trimming only helps at a block's edges. A block touching two distant regions still
+carries every unchanged line between them, twice (OLD and NEW). Split it per changed region when
+the gap pays for the extra block.
+
+### Algorithm — diff first, minimize each hunk
+
+Diff the **whole** block; prefix/suffix trimming then falls out of the diff instead of being a
+separate pass:
+
+- `similar`-diff OLD against NEW into hunks; a hunk is a run of changed lines between unchanged
+  runs.
+- Drop the leading and trailing unchanged runs (that *is* the prefix/suffix trim), then merge hunks
+  whose separating unchanged run is `<= SPLIT_GAP` (`2`: split only above two shared lines).
+- Each group is a candidate OLD/NEW, anchored at `base + group_first_old_line`. A pure-insertion
+  group borrows one unchanged line from the adjacent gap as OLD context (the parser rejects only an
+  empty `@@@OLD`; an empty NEW is a valid deletion).
+- Run the existing `minimize_edit` on each candidate, so one function still decides what context
+  survives.
+
+### Reuse the existing diff
+
+`blockedit` already depends on `similar`, and `udiff::unified` (`crates/blockedit/src/udiff.rs`)
+already diffs with `TextDiff::from_slices` rather than `from_lines` because `from_lines` breaks on
+a bare `\r`. Keep that rule. The splitter differs in one way: a hunk's ranges index line slices
+that keep their terminators (`split_inclusive('\n')`, already in `minimize.rs`), so a group's slices
+concatenate back to the original text exactly, CRLF and missing final newline included. Put the hunk
+iterator in `udiff.rs` (`hunks(old, new)`), called from `minimize.rs`: one engine, one line rule,
+two callers.
+
+### Break-even
+
+An extra block costs its `path:LINE` header, three markers and a separator — roughly 20–25 tokens.
+A removed shared line saves twice its own tokens (OLD and NEW), so for ordinary code (~8–10
+tokens/line) break-even is about one shared line and a gap of three clears it with margin, including
+a split insertion's borrowed context. Hence `SPLIT_GAP = 2`, a named constant.
+
+### Shape and safety
+
+`minimize.rs` has `split_and_minimize(edit, base) -> Vec<EditOp>` (plus a batch form); the only
+caller that changed is `minimized_edit_args` (`transcript.rs`), mapping one input `EditOp` to `N`
+`ParsedEdit`s. The hunk iterator is `udiff::hunks(old, new, split_gap)`, beside `udiff::unified` —
+one diff engine, one line rule, two callers. Nothing else moves: the ledger stays indexed by *input* edit (each sub-block's anchor
+is `base + offset` inside that edit), `per_file_blocks`/`split_by_file` do not care how many blocks
+a file has, and `render_blob` already emits a header per block. Idempotent: sub-blocks are anchored
+and `<= SPLIT_GAP` apart, so a second pass trims each to itself and splits nothing. Sub-block OLD
+ranges are disjoint and exactly anchored (`d1 = 0`, always accepted), and their union is the
+original edit, so a split, reloaded history still describes the same change.
+
+### Open question
+
+`Replaced N block(s)` counts the *submitted* blocks, so a split can show more blocks than `N`.
+Recommendation: keep it; the anchor, not the count, is the location truth.
+
+### Tests
+
+- Split only above `SPLIT_GAP`; anchors equal `base + offset`; insertion borrows context, deletion
+  has empty NEW.
+- Applying the pieces reproduces applying the whole edit (anchored, disjoint sub-blocks); CRLF and
+  no-final-newline inputs survive; a repeat run is a fixed point; multi-file split still pairs
+  calls and results.
+
+## Edit preview: real line numbers
+
+*Status: implemented.*
+
+`content/preview.rs::refined_diff_lines` emits `hunk.header()`, which numbers lines *within the
+buffer*, not the file. After minimization a block is already minimal, so re-diffing can only echo
+it with wrong numbers.
+
+- **Anchored block** (`start_line` present): do not diff. Emit the hunk directly in the shape
+  `sed_preview_body` already uses — `@@ -{a},{old_n} +{a},{new_n} @@` with `a = start_line`, then
+  `- `/`+ ` lines. Real file numbers by construction; extract one shared formatter so the two
+  previews cannot drift. The `[range]` label can then come from the anchor instead of a file scan.
+- **Unanchored** (legacy `old`/`new`, replay, headerless blob): keep `refined_diff_lines`; its
+  per-buffer numbers are the honest ones without an anchor.
+
 ## Rewrite points to keep in sync
 
 Anchors pass through the same representation boundaries multi-file editing already owns
@@ -109,7 +192,8 @@ Ingress / display:
 - `LoggingHook::on_tool_call` canonicalizes before `display_tool_call`. Do **not** minimize there
   (no result exists yet), but the canonicalizer must retain `startLine` so replay and display render
   it.
-- `get_preview` canonicalizes its input and must tolerate `startLine`.
+- `get_preview` canonicalizes its input and must tolerate `startLine`; it and
+  `refined_diff_lines` are the display half of "real line numbers" above.
 - `EditArgs::from_wire` and `normalize_args_in_place` (`src/session/storage.rs`) must accept and
   preserve `startLine` in every input form: blob header, canonical array, legacy `old`/`new`.
 

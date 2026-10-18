@@ -36,6 +36,8 @@ and link a doc/ and/or commit hash
 - [ ] Minimize tool context
   - [x] Minimize successful edits: Minimal context (only changed lines), all line anchored to actual
     resolved lines — doc/261018_minimal_edit_context_anchors.md
+  - [x] Split large successful edits at long internal unchanged runs; real line numbers in the edit
+    preview — doc/261018_minimal_edit_context_anchors.md
   - More aggressive truncation for long `read` / `bash` outputs
   - Strip failed edits from previous (before last) completion turns
 - [ ] Strip reasoning content for older aborted / failed turns once a newer turn completes
