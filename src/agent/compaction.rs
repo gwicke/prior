@@ -23,6 +23,7 @@ use super::pumps::{cancel_observed, cancellable_sleep_windowed, pump_window_step
 use crate::app_state::{AppState, WindowPump};
 use crate::content::Content;
 use crate::session::Session;
+use std::borrow::Borrow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -94,12 +95,15 @@ pub(crate) async fn session_context_messages(
 /// Find the predecessor of `target_id` on an arbitrary branch (root→leaf order).
 /// Returns the ID of the entry immediately before `target_id`, or `None` if
 /// `target_id` is not on the branch or is the first entry.
-fn find_predecessor(branch: &[crate::session::SessionEntry], target_id: &str) -> Option<String> {
-    let pos = branch.iter().position(|e| e.id == target_id)?;
+fn find_predecessor<T: Borrow<crate::session::SessionEntry>>(
+    branch: &[T],
+    target_id: &str,
+) -> Option<String> {
+    let pos = branch.iter().position(|e| e.borrow().id == target_id)?;
     if pos == 0 {
         None
     } else {
-        Some(branch[pos - 1].id.clone())
+        Some(branch[pos - 1].borrow().id.clone())
     }
 }
 
@@ -243,7 +247,7 @@ pub(crate) async fn generate_compaction(
 /// compactions are accounted for exactly once, on one path.
 async fn draft_at_pivot(
     session: &Session,
-    dropped: &[crate::session::SessionEntry],
+    dropped: &[Arc<crate::session::SessionEntry>],
     session_dir: &std::path::Path,
     mode: CompactSummaryMode,
     llm_payload: &str,
@@ -373,7 +377,7 @@ pub(crate) fn abandoned_spur(
     index: &crate::session::SessionIndex,
     old_leaf: &str,
     target: &str,
-) -> Vec<crate::session::SessionEntry> {
+) -> Vec<Arc<crate::session::SessionEntry>> {
     let old_path = index.get_path_to_root(old_leaf);
     let target_path = index.get_path_to_root(target);
     let target_ids: std::collections::HashSet<&str> =
@@ -407,11 +411,11 @@ pub(crate) fn abandoned_spur(
 /// `Compaction` / `BranchSummary` entries inside the spur are serialized as
 /// the user message pi's conversion would produce, so a nested summary
 /// survives into the outer summary.
-fn serialize_spur(entries: &[crate::session::SessionEntry]) -> String {
+fn serialize_spur<T: Borrow<crate::session::SessionEntry>>(entries: &[T]) -> String {
     use crate::session::SessionEntryContent as C;
     let mut parts: Vec<String> = Vec::new();
     for entry in entries {
-        match &entry.content {
+        match &entry.borrow().content {
             C::Message { message } => {
                 let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
                 let content = message.get("content").and_then(|c| c.as_array());
@@ -500,13 +504,13 @@ fn serialize_spur(entries: &[crate::session::SessionEntry]) -> String {
 /// summary (its `formatFileOperations`), built from the same collector the
 /// text-only summary uses. `None` when the spur touched no files — nothing to
 /// append.
-fn spur_files_section(
-    entries: &[crate::session::SessionEntry],
+fn spur_files_section<T: Borrow<crate::session::SessionEntry>>(
+    entries: &[T],
     session_dir: &Path,
 ) -> Option<String> {
     let mut files: Vec<crate::session::TouchedFile> = Vec::new();
     for entry in entries {
-        if let crate::session::SessionEntryContent::Message { message } = &entry.content {
+        if let crate::session::SessionEntryContent::Message { message } = &entry.borrow().content {
             crate::session::collect_touched_files(message, &mut files, session_dir);
         }
     }
@@ -557,7 +561,7 @@ pub(crate) async fn generate_branch_summary(
     }
     // One index lock, one collection — the spur is a snapshot; nothing below
     // mutates the index (the LLM request is the only await).
-    let spur: Vec<crate::session::SessionEntry> = {
+    let spur: Vec<Arc<crate::session::SessionEntry>> = {
         let index = session.index().lock().await;
         abandoned_spur(&index, &old_leaf, target_id)
     };
@@ -1139,7 +1143,7 @@ mod tests {
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
         let new_entry = s.get_entry(&new_leaf).await.expect("entry");
-        match new_entry.content {
+        match new_entry.content.clone() {
             crate::session::SessionEntryContent::Compaction {
                 summary,
                 first_kept_entry_id,
@@ -1182,7 +1186,7 @@ mod tests {
             .expect("apply");
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
-        match s.get_entry(&new_leaf).await.expect("entry").content {
+        match s.get_entry(&new_leaf).await.expect("entry").content.clone() {
             crate::session::SessionEntryContent::Compaction {
                 summary,
                 first_kept_entry_id,
@@ -1253,8 +1257,8 @@ mod tests {
         s
     }
 
-    fn spur_ids(entries: &[crate::session::SessionEntry]) -> Vec<String> {
-        entries.iter().map(|e| e.id.clone()).collect()
+    fn spur_ids<T: Borrow<crate::session::SessionEntry>>(entries: &[T]) -> Vec<String> {
+        entries.iter().map(|e| e.borrow().id.clone()).collect()
     }
 
     #[tokio::test]
@@ -1342,7 +1346,7 @@ mod tests {
         // conversation continues on.
         let leaf = s.get_leaf_id().await.expect("leaf");
         let entry = s.get_entry(&leaf).await.expect("entry");
-        match entry.content {
+        match entry.content.clone() {
             crate::session::SessionEntryContent::BranchSummary { from_id, summary } => {
                 assert_eq!(from_id, "u1", "fromId is the branch-from position");
                 assert_eq!(summary, draft.summary);
@@ -1638,7 +1642,7 @@ mod tests {
             .expect("apply");
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
-        match s.get_entry(&new_leaf).await.expect("entry").content {
+        match s.get_entry(&new_leaf).await.expect("entry").content.clone() {
             crate::session::SessionEntryContent::Compaction {
                 summary,
                 first_kept_entry_id,
@@ -1691,7 +1695,7 @@ mod tests {
             .expect("apply");
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
         assert_ne!(new_leaf, "c1", "a new compaction entry must be appended");
-        match s.get_entry(&new_leaf).await.expect("entry").content {
+        match s.get_entry(&new_leaf).await.expect("entry").content.clone() {
             crate::session::SessionEntryContent::Compaction {
                 summary,
                 first_kept_entry_id,
@@ -1745,7 +1749,7 @@ mod tests {
             .expect("apply");
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
-        match s.get_entry(&new_leaf).await.expect("entry").content {
+        match s.get_entry(&new_leaf).await.expect("entry").content.clone() {
             crate::session::SessionEntryContent::Compaction {
                 summary,
                 first_kept_entry_id,
@@ -1876,7 +1880,7 @@ mod tests {
             .expect("apply");
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
-        match s.get_entry(&new_leaf).await.expect("entry").content {
+        match s.get_entry(&new_leaf).await.expect("entry").content.clone() {
             crate::session::SessionEntryContent::Compaction {
                 summary,
                 first_kept_entry_id,

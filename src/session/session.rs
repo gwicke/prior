@@ -12,6 +12,7 @@
 //! Messages are stored as raw `serde_json::Value` in pi's `AgentMessage` format.
 //! The conversion to rig's `Message` happens only in `build_context()`.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -438,9 +439,9 @@ fn previous_text_without_file_sections(summary: &str) -> String {
 /// preserved), then files newly touched in `entries` (chronological), with
 /// read→modified promotion in place. Returns the files plus the previous
 /// summary's non-file notes (used by manual mode).
-fn merge_files_with_previous(
+fn merge_files_with_previous<T: Borrow<SessionEntry>>(
     previous_summary: Option<&str>,
-    entries: &[SessionEntry],
+    entries: &[T],
     session_dir: &std::path::Path,
 ) -> (Vec<TouchedFile>, Vec<String>) {
     let mut files: Vec<TouchedFile> = Vec::new();
@@ -458,7 +459,7 @@ fn merge_files_with_previous(
 
     let mut new_files: Vec<TouchedFile> = Vec::new();
     for entry in entries {
-        if let SessionEntryContent::Message { message } = &entry.content {
+        if let SessionEntryContent::Message { message } = &entry.borrow().content {
             if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
                 collect_touched_files(message, &mut new_files, session_dir);
             }
@@ -498,8 +499,8 @@ fn merge_files_with_previous(
 ///
 /// Deterministic (no LLM). Used as the `summary` of a `Compaction` entry
 /// ("text only" mode). Empty when there is nothing renderable.
-pub(crate) fn build_text_only_summary(
-    entries: &[SessionEntry],
+pub(crate) fn build_text_only_summary<T: Borrow<SessionEntry>>(
+    entries: &[T],
     previous_summary: Option<&str>,
     session_dir: &std::path::Path,
 ) -> String {
@@ -538,7 +539,7 @@ pub(crate) fn build_text_only_summary(
     };
 
     for entry in entries {
-        if let SessionEntryContent::Message { message } = &entry.content {
+        if let SessionEntryContent::Message { message } = &entry.borrow().content {
             if let Some(role) = message.get("role").and_then(|r| r.as_str()) {
                 match role {
                     "user" => {
@@ -615,8 +616,8 @@ pub(crate) fn build_text_only_summary(
 /// Empty groups (no `.md` files or no other files) are omitted. A span
 /// that touches no files returns the empty string — i.e. manual-mode
 /// compaction remains a no-op when there is nothing to point at.
-pub(crate) fn build_manual_template(
-    dropped: &[SessionEntry],
+pub(crate) fn build_manual_template<T: Borrow<SessionEntry>>(
+    dropped: &[T],
     previous_summary: Option<&str>,
     session_dir: &std::path::Path,
 ) -> String {
@@ -937,9 +938,9 @@ fn parse_summary_into_sections(
 /// entries). This is used to seed the manual template when there is no
 /// previous compaction summary — the first prompt usually establishes a
 /// significant amount of context.
-fn first_user_prompt(entries: &[SessionEntry]) -> Option<String> {
+fn first_user_prompt<T: Borrow<SessionEntry>>(entries: &[T]) -> Option<String> {
     for entry in entries.iter() {
-        if let SessionEntryContent::Message { message } = &entry.content {
+        if let SessionEntryContent::Message { message } = &entry.borrow().content {
             if message.get("role").and_then(|r| r.as_str()) == Some("user") {
                 if let Some(text) = summary_message_text(message) {
                     return Some(text.trim().to_string());
@@ -1079,7 +1080,7 @@ impl Session {
     // ------------------------------------------------------------------
 
     /// Walk from leaf to root, collecting entries in root→leaf order.
-    pub async fn get_branch(&self) -> Vec<SessionEntry> {
+    pub async fn get_branch(&self) -> Vec<Arc<SessionEntry>> {
         let index = self.index.lock().await;
         let leaf_id = match &index.leaf_id {
             Some(id) => id.clone(),
@@ -1131,7 +1132,7 @@ impl Session {
     ///
     /// An empty summary scopes the context to simply
     /// `<first message>…<last message>`.
-    fn apply_transforms(&self, entries: Vec<SessionEntry>) -> Vec<SessionEntry> {
+    fn apply_transforms(&self, entries: Vec<Arc<SessionEntry>>) -> Vec<Arc<SessionEntry>> {
         apply_compaction_transforms(entries)
     }
 
@@ -1211,8 +1212,7 @@ impl Session {
         // subsequent turn would see an empty conversation history.
         {
             let mut index = self.index.lock().await;
-            for pi_entry in &pi_entries {
-                index.entries.insert(pi_entry.id.clone(), pi_entry.clone());
+            for pi_entry in pi_entries {
                 if let Some(ref pid) = pi_entry.parent_id {
                     index
                         .children
@@ -1220,6 +1220,9 @@ impl Session {
                         .or_default()
                         .push(pi_entry.id.clone());
                 }
+                index
+                    .entries
+                    .insert(pi_entry.id.clone(), Arc::new(pi_entry));
             }
             index.leaf_id = last_id.clone();
         }
@@ -1252,7 +1255,7 @@ impl Session {
 
         {
             let mut index = self.index.lock().await;
-            index.entries.insert(entry.id.clone(), entry);
+            index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index
                     .children
@@ -1282,7 +1285,7 @@ impl Session {
 
         {
             let mut index = self.index.lock().await;
-            index.entries.insert(entry.id.clone(), entry);
+            index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index
                     .children
@@ -1332,7 +1335,7 @@ impl Session {
             // `/clear <name>` handlers in `agent.rs`).
             index.session_name = Some(name.to_string());
             index.header.name = Some(name.to_string());
-            index.entries.insert(entry.id.clone(), entry);
+            index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index
                     .children
@@ -1350,7 +1353,7 @@ impl Session {
     // ------------------------------------------------------------------
 
     /// Look up a single entry by ID.
-    pub async fn get_entry(&self, id: &str) -> Option<SessionEntry> {
+    pub async fn get_entry(&self, id: &str) -> Option<Arc<SessionEntry>> {
         let index = self.index.lock().await;
         index.entries.get(id).cloned()
     }
@@ -1516,7 +1519,7 @@ impl Session {
         storage.append_entry(&leaf).await?;
         {
             let mut index = self.index.lock().await;
-            index.entries.insert(entry.id.clone(), entry);
+            index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index
                     .children
@@ -1551,7 +1554,7 @@ impl Session {
         storage.append_entry(&leaf).await?;
         {
             let mut index = self.index.lock().await;
-            index.entries.insert(entry.id.clone(), entry);
+            index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index
                     .children
@@ -1579,7 +1582,7 @@ impl Session {
         storage.append_entry(&entry).await?;
         {
             let mut index = self.index.lock().await;
-            index.entries.insert(entry.id.clone(), entry);
+            index.entries.insert(entry.id.clone(), Arc::new(entry));
             if let Some(ref pid) = parent_id {
                 index
                     .children
@@ -1620,7 +1623,7 @@ impl Session {
 /// spur contributes nothing here; that is exactly right, because
 /// `branchWithSummary` parents the entry to the switch target, putting it
 /// inline on the branch the conversation continues on.
-pub(crate) fn extract_messages(entries: &[SessionEntry]) -> Vec<Message> {
+pub(crate) fn extract_messages<T: Borrow<SessionEntry>>(entries: &[T]) -> Vec<Message> {
     let mut messages: Vec<Message> = Vec::new();
     let mut tool_results: Vec<serde_json::Value> = Vec::new();
 
@@ -1635,7 +1638,7 @@ pub(crate) fn extract_messages(entries: &[SessionEntry]) -> Vec<Message> {
     };
 
     for entry in entries {
-        let content = match &entry.content {
+        let content = match &entry.borrow().content {
             SessionEntryContent::Message { message } => message,
             SessionEntryContent::BranchSummary { summary, .. } if !summary.is_empty() => {
                 flush_tool_results(&mut messages, &mut tool_results);
@@ -1689,7 +1692,7 @@ pub(crate) fn extract_messages(entries: &[SessionEntry]) -> Vec<Message> {
 /// with every `Compaction` entry removed. This is the shared core behind both
 /// the runtime context transform and [`entries_since_last_compaction`], so the
 /// boundary resolution cannot drift between them.
-fn scope_entries(entries: Vec<SessionEntry>) -> (Option<String>, Vec<SessionEntry>) {
+fn scope_entries(entries: Vec<Arc<SessionEntry>>) -> (Option<String>, Vec<Arc<SessionEntry>>) {
     // Find the most recent compaction entry (closest to leaf) — pi keeps
     // the latest compaction on the path active.
     let compaction = entries.iter().rev().find_map(|entry| match &entry.content {
@@ -1730,7 +1733,9 @@ fn scope_entries(entries: Vec<SessionEntry>) -> (Option<String>, Vec<SessionEntr
 /// summary message. Callers that need raw pi entries (to inspect tool calls,
 /// collect touched files, or render deterministic text) use this instead of
 /// re-deriving the latest-compaction boundary.
-pub(crate) fn entries_since_last_compaction(entries: &[SessionEntry]) -> Vec<SessionEntry> {
+pub(crate) fn entries_since_last_compaction(
+    entries: &[Arc<SessionEntry>],
+) -> Vec<Arc<SessionEntry>> {
     scope_entries(entries.to_vec()).1
 }
 
@@ -1746,13 +1751,15 @@ pub(crate) fn entries_since_last_compaction(entries: &[SessionEntry]) -> Vec<Ses
 /// `compactionSummary` user message) to avoid confusing redundant
 /// compaction content mid-turn. See `doc/nested_compactions.md` for the
 /// rationale.
-pub(crate) fn apply_compaction_transforms(entries: Vec<SessionEntry>) -> Vec<SessionEntry> {
+pub(crate) fn apply_compaction_transforms(
+    entries: Vec<Arc<SessionEntry>>,
+) -> Vec<Arc<SessionEntry>> {
     let (summary, kept) = scope_entries(entries);
     let mut result = Vec::with_capacity(kept.len() + usize::from(summary.is_some()));
     // The latest compaction's summary goes FIRST (pi: contextEntries =
     // [compaction] + …). Empty summary → emit nothing ("if available").
     if let Some(summary) = summary {
-        result.push(compaction_summary_message(&summary));
+        result.push(Arc::new(compaction_summary_message(&summary)));
     }
     result.extend(kept);
     result
@@ -2060,9 +2067,9 @@ pub(crate) fn rig_message_to_pi_entries(
 // ---------------------------------------------------------------------------
 
 /// Find the most recent `ThinkingLevelChange` on the branch (closest to leaf).
-pub(crate) fn derive_thinking_level(entries: &[SessionEntry]) -> Option<String> {
+pub(crate) fn derive_thinking_level<T: Borrow<SessionEntry>>(entries: &[T]) -> Option<String> {
     entries.iter().rev().find_map(|e| {
-        if let SessionEntryContent::ThinkingLevelChange { thinking_level } = &e.content {
+        if let SessionEntryContent::ThinkingLevelChange { thinking_level } = &e.borrow().content {
             Some(thinking_level.clone())
         } else {
             None
@@ -2071,9 +2078,9 @@ pub(crate) fn derive_thinking_level(entries: &[SessionEntry]) -> Option<String> 
 }
 
 /// Find the most recent `ModelChange` on the branch (closest to leaf).
-fn derive_model(entries: &[SessionEntry]) -> Option<String> {
+fn derive_model<T: Borrow<SessionEntry>>(entries: &[T]) -> Option<String> {
     entries.iter().rev().find_map(|e| {
-        if let SessionEntryContent::ModelChange { model_id, .. } = &e.content {
+        if let SessionEntryContent::ModelChange { model_id, .. } = &e.borrow().content {
             Some(model_id.clone())
         } else {
             None
@@ -2085,9 +2092,11 @@ fn derive_model(entries: &[SessionEntry]) -> Option<String> {
 /// returning both the provider and the model id. Used by the resume
 /// prefill, which formats `provider:model_id` so the `/model` overlay's
 /// fuzzy filter matches a single catalog entry directly.
-pub(crate) fn derive_model_change(entries: &[SessionEntry]) -> Option<(String, String)> {
+pub(crate) fn derive_model_change<T: Borrow<SessionEntry>>(
+    entries: &[T],
+) -> Option<(String, String)> {
     entries.iter().rev().find_map(|e| {
-        if let SessionEntryContent::ModelChange { provider, model_id } = &e.content {
+        if let SessionEntryContent::ModelChange { provider, model_id } = &e.borrow().content {
             Some((provider.clone(), model_id.clone()))
         } else {
             None
@@ -2106,6 +2115,12 @@ mod tests {
     use crate::session::types::session_filename;
     use std::path::Path;
     use std::path::PathBuf;
+
+    /// Wrap a `Vec<SessionEntry>` in `Arc`s for the transform helpers, which
+    /// now operate on `Arc<SessionEntry>`.
+    fn arc_entries(entries: Vec<SessionEntry>) -> Vec<Arc<SessionEntry>> {
+        entries.into_iter().map(Arc::new).collect()
+    }
 
     /// Write entries to a temp session file, then open it read-only and build
     /// a Session for context-building tests.
@@ -2547,7 +2562,10 @@ mod tests {
         };
         // The compaction wrapper reaches the context via the *transform*
         // (it replaces the entry), the branch one via `extract_messages`.
-        let scoped = apply_compaction_transforms(vec![compaction_entry, user_msg("m1", "x", None)]);
+        let scoped = apply_compaction_transforms(arc_entries(vec![
+            compaction_entry,
+            user_msg("m1", "x", None),
+        ]));
         let msgs = extract_messages(&scoped);
         let Message::User { content } = &msgs[0] else {
             panic!("expected the compaction summary as a User message");
@@ -2613,7 +2631,7 @@ mod tests {
             compaction_entry("c1", "compacted", "m1", 10, Some("m1")),
             user_msg("m2", "after", Some("c1")),
         ];
-        let out = apply_compaction_transforms(entries);
+        let out = apply_compaction_transforms(arc_entries(entries));
         let msgs = extract_messages(&out);
         let joined: Vec<String> = msgs
             .iter()
@@ -3502,7 +3520,7 @@ mod tests {
             compaction_entry("c1", "", "m1", 128, Some("m2")),
             user_msg("m3", "after", Some("c1")),
         ];
-        let out = apply_compaction_transforms(entries);
+        let out = apply_compaction_transforms(arc_entries(entries));
         let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
         // Empty summary → no summary message; m0 dropped; compaction entry never included.
         assert_eq!(ids, ["m1", "m2", "m3"]);
@@ -3518,7 +3536,7 @@ mod tests {
             compaction_entry("c1", "S", "m1", 128, Some("m2")),
             user_msg("m3", "after", Some("c1")),
         ];
-        let out = apply_compaction_transforms(entries);
+        let out = apply_compaction_transforms(arc_entries(entries));
         let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids.len(), 4);
         // First is the pi-wrapped summary user message (fresh uuid, not m0/m1/m2/m3/c1).
@@ -3536,7 +3554,7 @@ mod tests {
             user_msg("m1", "kept-a", Some("m0")),
             user_msg("m2", "kept-b", Some("m1")),
         ];
-        let out = apply_compaction_transforms(entries.clone());
+        let out = apply_compaction_transforms(arc_entries(entries.clone()));
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].id, "m0");
         assert_eq!(out[1].id, "m1");
@@ -3571,7 +3589,7 @@ mod tests {
             compaction_entry("c2", "", "m3", 96, Some("m4")),
             user_msg("m5", "f", Some("c2")),
         ];
-        let out = apply_compaction_transforms(entries);
+        let out = apply_compaction_transforms(arc_entries(entries));
         let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
         // Only the kept-range messages; both compaction entries (c1, c2)
         // are absent.
@@ -3618,7 +3636,7 @@ mod tests {
             compaction_entry("c3", "s3", "m5", 96, Some("m5")),
             user_msg("m6", "g", Some("c3")),
         ];
-        let out = apply_compaction_transforms(entries);
+        let out = apply_compaction_transforms(arc_entries(entries));
         let msgs = extract_messages(&out);
         assert_eq!(msgs.len(), 3, "summary(s3) + m5 + m6");
         // First message is the c3 summary wrapper.
@@ -3637,7 +3655,7 @@ mod tests {
             compaction_entry("c1", "", "missing-id", 128, Some("m1")),
             user_msg("m2", "after", Some("c1")),
         ];
-        let out = apply_compaction_transforms(entries.clone());
+        let out = apply_compaction_transforms(arc_entries(entries.clone()));
         assert_eq!(out.len(), 4);
         assert_eq!(out[0].id, "m0");
         assert_eq!(out[3].id, "m2");
@@ -4344,7 +4362,10 @@ mod tests {
     #[test]
     fn text_only_summary_empty_for_empty_span() {
         let session_dir = std::path::PathBuf::from("/test");
-        assert_eq!(build_text_only_summary(&[], None, &session_dir), "");
+        assert_eq!(
+            build_text_only_summary(&[] as &[SessionEntry], None, &session_dir),
+            ""
+        );
         // Tool results only → still empty.
         let dropped = vec![SessionEntry {
             id: "t".into(),
@@ -4404,7 +4425,7 @@ mod tests {
             },
             sum_user("m1", Some("cmp"), "kept prompt"),
         ];
-        let transformed = apply_compaction_transforms(branch);
+        let transformed = apply_compaction_transforms(arc_entries(branch));
         // [summary user message, kept user message]
         assert_eq!(transformed.len(), 2);
         let first = &transformed[0];
@@ -4562,7 +4583,7 @@ mod tests {
                 serde_json::json!([{"type": "text", "text": "new answer"}]),
             ),
         ];
-        let since = entries_since_last_compaction(&entries);
+        let since = entries_since_last_compaction(&arc_entries(entries));
         let ids: Vec<&str> = since.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["u1", "a1"]);
     }
@@ -4623,7 +4644,7 @@ mod tests {
             "{summary}"
         );
         for _ in 0..4 {
-            summary = build_manual_template(&[], Some(&summary), &session_dir);
+            summary = build_manual_template(&[] as &[SessionEntry], Some(&summary), &session_dir);
         }
         assert!(
             summary.contains("- read: .github/workflows/ci.yml"),
@@ -4658,7 +4679,7 @@ mod tests {
             "{summary}"
         );
         for _ in 0..4 {
-            summary = build_text_only_summary(&[], Some(&summary), &session_dir);
+            summary = build_text_only_summary(&[] as &[SessionEntry], Some(&summary), &session_dir);
         }
         assert!(
             summary.contains("- read: .github/workflows/ci.yml"),

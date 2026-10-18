@@ -17,6 +17,7 @@ use crate::content::Content;
 use rig_core::message::{
     AssistantContent, Message, ReasoningContent, ToolResultContent, UserContent,
 };
+use std::borrow::Borrow;
 
 // ---------------------------------------------------------------------------
 // Session replay helpers
@@ -93,7 +94,9 @@ pub(crate) enum ReplayUnit {
 /// compaction scope. Tool-result entries are batched into the preceding
 /// assistant segment exactly like `extract_messages`/`group_into_turns`, so an
 /// uncompacted branch produces the same turns as the old context-based path.
-pub(crate) fn build_replay_units(branch: &[crate::session::SessionEntry]) -> Vec<ReplayUnit> {
+pub(crate) fn build_replay_units<T: Borrow<crate::session::SessionEntry>>(
+    branch: &[T],
+) -> Vec<ReplayUnit> {
     use crate::session::SessionEntryContent;
 
     let mut units: Vec<ReplayUnit> = Vec::new();
@@ -140,6 +143,7 @@ pub(crate) fn build_replay_units(branch: &[crate::session::SessionEntry]) -> Vec
     }
 
     for entry in branch {
+        let entry = entry.borrow();
         match &entry.content {
             SessionEntryContent::Message { message } => {
                 let role = message.get("role").and_then(|r| r.as_str());

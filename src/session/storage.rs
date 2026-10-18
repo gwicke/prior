@@ -10,6 +10,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::session::types::*;
@@ -130,7 +131,7 @@ pub trait SessionStorage: Send + Sync {
 
     /// Walk the `parent_id` chain from `leaf_id` to root, returning entries in
     /// root→leaf order.
-    fn get_path_to_root(&self, index: &SessionIndex, leaf_id: &str) -> Vec<SessionEntry>;
+    fn get_path_to_root(&self, index: &SessionIndex, leaf_id: &str) -> Vec<Arc<SessionEntry>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +365,7 @@ impl SessionStorage for JsonlSessionStorage {
 
     async fn build_index(&self) -> crate::Result<SessionIndex> {
         let content = self.read_all().await?;
-        let mut entries: HashMap<String, SessionEntry> = HashMap::new();
+        let mut entries: HashMap<String, Arc<SessionEntry>> = HashMap::new();
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
         let mut leaf_id: Option<String> = None;
         let mut session_name: Option<String> = None;
@@ -425,7 +426,7 @@ impl SessionStorage for JsonlSessionStorage {
                     if let SessionEntryContent::SessionInfo { name } = &entry.content {
                         session_name = name.clone();
                     }
-                    entries.insert(entry.id.clone(), entry);
+                    entries.insert(entry.id.clone(), Arc::new(entry));
                 }
                 Err(e) => {
                     if is_last {
@@ -475,7 +476,7 @@ impl SessionStorage for JsonlSessionStorage {
         Ok(())
     }
 
-    fn get_path_to_root(&self, index: &SessionIndex, leaf_id: &str) -> Vec<SessionEntry> {
+    fn get_path_to_root(&self, index: &SessionIndex, leaf_id: &str) -> Vec<Arc<SessionEntry>> {
         index.get_path_to_root(leaf_id)
     }
 }

@@ -1989,7 +1989,7 @@ mod tests {
 
     fn node(entry: SessionEntry, children: Vec<SessionTreeNode>) -> SessionTreeNode {
         SessionTreeNode {
-            entry,
+            entry: Arc::new(entry),
             children,
             label: None,
         }
@@ -2805,7 +2805,7 @@ mod tests {
     #[test]
     fn tree_model_change_shows_prefix() {
         let tree = vec![SessionTreeNode {
-            entry: SessionEntry {
+            entry: Arc::new(SessionEntry {
                 id: "mc1".into(),
                 parent_id: None,
                 timestamp: "2025-01-01T00:00:00.000Z".into(),
@@ -2813,7 +2813,7 @@ mod tests {
                     provider: "openai".into(),
                     model_id: "gpt-4o".into(),
                 },
-            },
+            }),
             children: vec![],
             label: None,
         }];
@@ -2846,7 +2846,7 @@ mod tests {
     fn tree_empty_entry_hidden() {
         // A tool-call-only assistant segment should produce no row.
         let tree = vec![SessionTreeNode {
-            entry: SessionEntry {
+            entry: Arc::new(SessionEntry {
                 id: "tc1".into(),
                 parent_id: None,
                 timestamp: "2025-01-01T00:00:00.000Z".into(),
@@ -2856,7 +2856,7 @@ mod tests {
                         "content": [{"type": "tool_use", "name": "bash", "input": {}}]
                     }),
                 },
-            },
+            }),
             children: vec![],
             label: None,
         }];
@@ -3453,7 +3453,7 @@ mod tests {
         // Realistic tree: user/assistant turns with model changes at the end.
         // u1 → a1 → u2 → a2 → mc1 → mc2, mc3, mc4
         let mc2 = SessionTreeNode {
-            entry: SessionEntry {
+            entry: Arc::new(SessionEntry {
                 id: "mc2".into(),
                 parent_id: Some("mc1".into()),
                 timestamp: "2025-01-01T00:00:01.000Z".into(),
@@ -3461,12 +3461,12 @@ mod tests {
                     provider: "openai".into(),
                     model_id: "gpt-4o".into(),
                 },
-            },
+            }),
             children: vec![],
             label: None,
         };
         let mc3 = SessionTreeNode {
-            entry: SessionEntry {
+            entry: Arc::new(SessionEntry {
                 id: "mc3".into(),
                 parent_id: Some("mc1".into()),
                 timestamp: "2025-01-01T00:00:02.000Z".into(),
@@ -3474,12 +3474,12 @@ mod tests {
                     provider: "anthropic".into(),
                     model_id: "claude-3".into(),
                 },
-            },
+            }),
             children: vec![],
             label: None,
         };
         let mc4 = SessionTreeNode {
-            entry: SessionEntry {
+            entry: Arc::new(SessionEntry {
                 id: "mc4".into(),
                 parent_id: Some("mc1".into()),
                 timestamp: "2025-01-01T00:00:03.000Z".into(),
@@ -3487,7 +3487,7 @@ mod tests {
                     provider: "openai".into(),
                     model_id: "gpt-4o".into(),
                 },
-            },
+            }),
             children: vec![],
             label: None,
         };
@@ -3500,7 +3500,7 @@ mod tests {
                     vec![node(
                         make_entry("a2", Some("u2"), "assistant", "reply2"),
                         vec![SessionTreeNode {
-                            entry: SessionEntry {
+                            entry: Arc::new(SessionEntry {
                                 id: "mc1".into(),
                                 parent_id: Some("a2".into()),
                                 timestamp: "2025-01-01T00:00:00.000Z".into(),
@@ -3508,7 +3508,7 @@ mod tests {
                                     provider: "openai".into(),
                                     model_id: "gpt-4o".into(),
                                 },
-                            },
+                            }),
                             children: vec![mc2, mc3, mc4],
                             label: None,
                         }],
@@ -3566,7 +3566,7 @@ mod tests {
             vec![node(
                 make_entry("a1", Some("u1"), "assistant", "reply 1"),
                 vec![SessionTreeNode {
-                    entry: SessionEntry {
+                    entry: Arc::new(SessionEntry {
                         id: "mc1".into(),
                         parent_id: Some("a1".into()),
                         timestamp: "2025-01-01T00:00:00.000Z".into(),
@@ -3574,7 +3574,7 @@ mod tests {
                             provider: "openai".into(),
                             model_id: "gpt-4o".into(),
                         },
-                    },
+                    }),
                     children: vec![node(
                         make_entry("u2", Some("mc1"), "user", "second"),
                         vec![node(
@@ -3614,11 +3614,11 @@ mod tests {
         // The invisible entries must NOT break the turn grouping so the
         // visible assistant gets +2 indent.
         let tree = vec![SessionTreeNode {
-            entry: make_entry("u1", None, "user", "Please critique"),
+            entry: Arc::new(make_entry("u1", None, "user", "Please critique")),
             children: vec![
                 // First assistant segment: tool-call-only (invisible)
                 SessionTreeNode {
-                    entry: SessionEntry {
+                    entry: Arc::new(SessionEntry {
                         id: "a_tool1".into(),
                         parent_id: Some("u1".into()),
                         timestamp: "2025-01-01T00:00:00.000Z".into(),
@@ -3628,11 +3628,11 @@ mod tests {
                                 "content": [{"type": "tool_use", "name": "bash", "input": {}}]
                             }),
                         },
-                    },
+                    }),
                     children: vec![
                         // Tool result (invisible)
                         SessionTreeNode {
-                            entry: SessionEntry {
+                            entry: Arc::new(SessionEntry {
                                 id: "tr1".into(),
                                 parent_id: Some("a_tool1".into()),
                                 timestamp: "2025-01-01T00:00:00.000Z".into(),
@@ -3642,11 +3642,11 @@ mod tests {
                                         "content": [{"type": "text", "text": "result1"}]
                                     }),
                                 },
-                            },
+                            }),
                             children: vec![
                                 // Second assistant segment: tool-call-only (invisible)
                                 SessionTreeNode {
-                                    entry: SessionEntry {
+                                    entry: Arc::new(SessionEntry {
                                         id: "a_tool2".into(),
                                         parent_id: Some("tr1".into()),
                                         timestamp: "2025-01-01T00:00:00.000Z".into(),
@@ -3656,11 +3656,11 @@ mod tests {
                                                 "content": [{"type": "tool_use", "name": "bash", "input": {}}]
                                             }),
                                         },
-                                    },
+                                    }),
                                     children: vec![
                                         // Tool result (invisible)
                                         SessionTreeNode {
-                                            entry: SessionEntry {
+                                            entry: Arc::new(SessionEntry {
                                                 id: "tr2".into(),
                                                 parent_id: Some("a_tool2".into()),
                                                 timestamp: "2025-01-01T00:00:00.000Z".into(),
@@ -3670,16 +3670,16 @@ mod tests {
                                                         "content": [{"type": "text", "text": "result2"}]
                                                     }),
                                                 },
-                                            },
+                                            }),
                                             children: vec![
                                                 // Final assistant text (VISIBLE)
                                                 SessionTreeNode {
-                                                    entry: make_entry(
+                                                    entry: Arc::new(make_entry(
                                                         "a_text",
                                                         Some("tr2"),
                                                         "assistant",
                                                         "Now I have a comprehensive understanding",
-                                                    ),
+                                                    )),
                                                     children: vec![],
                                                     label: None,
                                                 },

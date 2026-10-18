@@ -7,6 +7,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -316,8 +317,10 @@ pub struct SessionMetadata {
 pub struct SessionIndex {
     /// Parsed session header.
     pub header: SessionHeader,
-    /// All entries keyed by ID.
-    pub entries: HashMap<String, SessionEntry>,
+    /// All entries keyed by ID. Entries are immutable once inserted, so they
+    /// are shared via `Arc` — tree building and path walks clone the pointer,
+    /// never the (potentially large) message payload.
+    pub entries: HashMap<String, Arc<SessionEntry>>,
     /// Current leaf pointer (the `targetId` of the most recent `Leaf` entry).
     pub leaf_id: Option<String>,
     /// Child entries keyed by parent ID. `parent_id -> [child_id, ...]`.
@@ -333,7 +336,8 @@ pub struct SessionIndex {
 /// A node in the session entry tree, used for the `/tree` overlay.
 #[derive(Debug, Clone)]
 pub struct SessionTreeNode {
-    pub entry: SessionEntry,
+    /// Shared, immutable entry — an `Arc` bump, never a payload deep-clone.
+    pub entry: Arc<SessionEntry>,
     pub children: Vec<SessionTreeNode>,
     /// Resolved label text, if any Label entry targets this node.
     pub label: Option<String>,
@@ -445,11 +449,13 @@ impl SessionIndex {
     /// root→leaf order (suitable for LLM context building).
     ///
     /// Returns an empty vec if `leaf_id` is `None` or not found.
-    pub fn get_path_to_root(&self, leaf_id: &str) -> Vec<SessionEntry> {
-        let mut path: Vec<SessionEntry> = Vec::new();
+    pub fn get_path_to_root(&self, leaf_id: &str) -> Vec<Arc<SessionEntry>> {
+        let mut path: Vec<Arc<SessionEntry>> = Vec::new();
         let mut current_id = leaf_id.to_string();
         while let Some(entry) = self.entries.get(&current_id) {
-            path.push(entry.clone());
+            // `entry` is `&Arc<SessionEntry>` — clone the pointer, not the
+            // payload.
+            path.push(Arc::clone(entry));
             match &entry.parent_id {
                 Some(pid) => current_id = pid.clone(),
                 None => break,
@@ -542,11 +548,11 @@ impl SessionIndex {
         struct Frame {
             entry_id: String,
             state: u8,
-            entry: SessionEntry,
+            entry: Arc<SessionEntry>,
             children_results: Vec<SessionTreeNode>,
         }
 
-        let root_entry = self.entries.get(root_entry_id)?.clone();
+        let root_entry = Arc::clone(self.entries.get(root_entry_id)?);
         let mut stack = vec![Frame {
             entry_id: root_entry_id.to_string(),
             state: 0,
@@ -564,7 +570,7 @@ impl SessionIndex {
                             stack.push(Frame {
                                 entry_id: cid.clone(),
                                 state: 0,
-                                entry: child_entry.clone(),
+                                entry: Arc::clone(child_entry),
                                 children_results: Vec::new(),
                             });
                         }
@@ -888,7 +894,9 @@ mod tests {
         for e in [root, e1, e2, e3] {
             let pid = e.parent_id.clone();
             let entry_id = e.id.clone();
-            index.entries.insert(entry_id.clone(), e);
+            index
+                .entries
+                .insert(entry_id.clone(), std::sync::Arc::new(e));
             if let Some(pid) = pid {
                 index.children.entry(pid).or_default().push(entry_id);
             }
