@@ -147,8 +147,8 @@ a split insertion's borrowed context. Hence `SPLIT_GAP = 2`, a named constant.
 
 Trimming can leave a block whose OLD is just `}`, `end`, `);`. The line anchor resolves it exactly,
 but models are biassed against trusting anchor line numbers and, seeing nothing recognisable, re-read
-the edited region to check — which costs far more tokens than the trim saved. So keep one context
-line whenever the trimmed OLD is a *weak locator*: fewer than `MIN_LOCATOR_CHARS` (8)
+the edited region to check — which costs far more tokens than the trim saved. So keep adding context
+lines until the trimmed OLD is no longer a *weak locator*: fewer than `MIN_LOCATOR_CHARS` (12)
 **non-whitespace** characters. Whitespace is excluded because indentation is precisely the part the
 model cannot distinguish; `    }` is no more informative than `}`.
 
@@ -159,16 +159,19 @@ correctness — this is purely about the model trusting the result.
 The floor lives in `minimize_edit`, right after the prefix/suffix trim (and after the
 keep-one-line rule for insertions):
 
-- if the kept OLD is weak, un-trim one common line: the preceding line when `prefix > 0`, the
-  following line when `suffix > 0`, otherwise nothing;
-- when both are available, prefer the one with more non-whitespace characters (ties go to the
+- while the kept OLD is weak, un-trim one more common line: the preceding line when `prefix > 0`,
+  the following line when `suffix > 0`, otherwise nothing;
+- when both are available, take the one with more non-whitespace characters (ties go to the
   preceding line, usually the construct being closed).
 
-The restored line is common to OLD and NEW, so the edit still applies identically and the anchor
-moves back with it. It is persisted with the block, so the next pass trims it again and restores the
-same side: idempotency holds. `split_and_minimize` widens each weak hunk by one unchanged neighbour
-on either side before minimizing, because a candidate built from the hunk alone has no neighbour to
-restore; `minimize_edit` re-trims that for a strong hunk, so only weak hunks pay for it.
+Expansion is greedy and stops as soon as the combined non-whitespace content clears the threshold,
+or when no trimmed lines remain. Biasing toward nearby longer lines spends the extra context where
+it best reassures the model. The restored lines are common to OLD and NEW, so the edit still applies
+identically and the anchor moves back with them. They are persisted with the block, so the next pass
+trims them again and restores the same set: idempotency holds. `split_and_minimize` widens each weak
+hunk the same way from the unchanged runs on either side before minimizing, because a candidate
+built from the hunk alone has no neighbour to restore; `minimize_edit` re-trims that for a strong
+hunk, so only weak hunks pay for it.
 
 Limitation: an op already reduced to a bare `}` in an earlier turn cannot be expanded, because the
 context line is gone and there is no file read. New model-authored edits and their persisted form
@@ -195,8 +198,9 @@ Recommendation: keep it; the anchor, not the count, is the location truth.
 
 - Split only above `SPLIT_GAP`; anchors equal `base + offset`; insertion borrows context, deletion
   has empty NEW.
-- A weak OLD keeps one neighbour (preferring the longer, ties preceding), the floor is a fixed
-  point, a strong OLD is not padded, and a weak split hunk borrows a neighbouring unchanged line.
+- A weak OLD keeps expanding into neighbours until strong (preferring the longer line at each step,
+  ties preceding), the floor is a fixed point, a strong OLD is not padded, and a weak split hunk
+  borrows neighbouring unchanged lines until strong.
 - Applying the pieces reproduces applying the whole edit (anchored, disjoint sub-blocks); CRLF and
   no-final-newline inputs survive; a repeat run is a fixed point; multi-file split still pairs
   calls and results.
