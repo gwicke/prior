@@ -39,8 +39,8 @@ and link a doc/ and/or commit hash
     resolved lines — doc/261018_minimal_edit_context_anchors.md
   - [x] Split large successful edits at long internal unchanged runs; real line numbers in the edit
     preview — doc/261018_minimal_edit_context_anchors.md
-  - [x] Keep one context line for a weak locator (a bare `}` / `end`) so the model trusts the edit
-    instead of re-reading — doc/261018_minimal_edit_context_anchors.md
+  - [x] Expand a weak locator (a bare `}` / `end`) with nearby lines until it is recognisable, so
+    the model trusts the edit instead of re-reading — doc/261018_minimal_edit_context_anchors.md
   - More aggressive truncation for long `read` / `bash` outputs
   - Strip failed edits from previous (before last) completion turns
 - [ ] Strip reasoning content for older aborted / failed turns once a newer turn completes

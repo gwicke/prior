@@ -914,9 +914,11 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                 function: ToolFunction::new(
                     "edit".into(),
                     serde_json::json!({
-                        "blocks": "a.rs\n@@@OLD\nalpha_line\nold_x_line\nbravo_line\ncharlie_line\n\
-                                   delta_line\nold_y_line\necho_line\n@@@NEW\nalpha_line\nnew_x_line\n\
-                                   bravo_line\ncharlie_line\ndelta_line\nnew_y_line\necho_line\n@@@END"
+                        "blocks": "a.rs\n@@@OLD\nalpha_context_line\nold_x_context_line\n\
+                                   bravo_context_line\ncharlie_line\ndelta_context_line\n\
+                                   old_y_context_line\necho_context_line\n@@@NEW\nalpha_context_line\n\
+                                   new_x_context_line\nbravo_context_line\ncharlie_line\n\
+                                   delta_context_line\nnew_y_context_line\necho_context_line\n@@@END"
                     }),
                 ),
                 signature: None,
@@ -940,8 +942,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             .to_string();
         assert_eq!(
             blocks,
-            "a.rs:11\n@@@OLD\nold_x_line\n@@@NEW\nnew_x_line\n@@@END\n\n\
-             a.rs:15\n@@@OLD\nold_y_line\n@@@NEW\nnew_y_line\n@@@END"
+            "a.rs:11\n@@@OLD\nold_x_context_line\n@@@NEW\nnew_x_context_line\n@@@END\n\n\
+             a.rs:15\n@@@OLD\nold_y_context_line\n@@@NEW\nnew_y_context_line\n@@@END"
         );
     }
 
