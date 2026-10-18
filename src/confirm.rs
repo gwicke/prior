@@ -296,36 +296,65 @@ pub fn decision_line(subject: &str, decision: ConfirmDecision) -> String {
     format!("{verb} {subject}")
 }
 
-/// Paint one confirmation through the frame pipeline, as the session does when
-/// no menu is open beneath it.
+/// The probe's stack for one confirm paint: the standing head, with the
+/// dialog appended below it while it is open.
+///
+/// A miniature of the shape `PromptSession::sync_stack` builds for the REPL —
+/// its always-present first element (`Element::lines(vec![String::new()])`,
+/// the blank row before the bar), then `divider + confirm.elements()` under
+/// it. A probe has no `AppState` to build a real bar and input, but the
+/// composition is the pinned part (doc/confirm_as_menu_261002.md §9): the
+/// dialog is an overlay **below** the standing rows, never the whole area —
+/// and the erase is the same operation on both sides: drop the dialog
+/// element, apply this same stack again.
+fn probe_stack(confirm: Option<&ConfirmPrompt>) -> Vec<crate::render::Element> {
+    let mut stack = vec![crate::render::Element::lines(vec![String::new()])];
+    if let Some(confirm) = confirm {
+        let elements = confirm.elements();
+        if !elements.is_empty() {
+            stack.push(crate::render::Element::divider());
+            stack.extend(elements);
+        }
+    }
+    stack
+}
+
+/// Paint one confirmation through the frame pipeline: an overlay appended
+/// **below** the probe's standing head, as the session paints it.
 ///
 /// **Test/probe support.** Production composes from
-/// `PromptSession::paint`, which *appends* these elements after the open
-/// overlay's — that append is pinned by a session-level test, because it needs
-/// an `AppState` to build a session and a probe cannot have one. What a probe
-/// *can* do is drive the real reducer ([`ConfirmPrompt::handle_key`]) and the
-/// real bytes ([`ConfirmPrompt::elements`] → the manager's `configure` +
-/// `render`), which is
-/// what this exposes; the only thing it re-states is the tail the session also
-/// ends in.
+/// `PromptSession::sync_stack`, which appends these elements after the
+/// always-present head and any open overlay's — that append is pinned by a
+/// session-level test, because it needs an `AppState` to build a session and
+/// a probe cannot have one. What a probe *can* do is drive the real reducer
+/// ([`ConfirmPrompt::handle_key`]) and the real bytes
+/// ([`ConfirmPrompt::elements`] → the manager's `configure` + `render`);
+/// the stack it composes is [`probe_stack`], shared with [`clear`], so the
+/// paint and the erase cannot drift apart.
 pub fn paint(
     confirm: &ConfirmPrompt,
     manager: &std::sync::Arc<std::sync::Mutex<crate::render::RenderManager>>,
 ) {
-    // No compose head: a probe's dialog is the whole area — the
-    // stack below is the same divider-then-elements the session's own paint
-    // layers under its bar and input, so the two cannot drift.
-    //
-    // A probe has no session to own membership, so it configures the manager
-    // directly (`configure` is the membership verb) and then applies it.
-    let mut stack = Vec::new();
-    let elements = confirm.elements();
-    if !elements.is_empty() {
-        stack.push(crate::render::Element::divider());
-        stack.extend(elements);
-    }
     let mut manager = manager.lock().unwrap();
-    manager.configure(crate::render::FRAME_MAX_ROW_RATIO, stack);
+    manager.configure(
+        crate::render::FRAME_MAX_ROW_RATIO,
+        probe_stack(Some(confirm)),
+    );
+    manager.render(None);
+}
+
+/// Repaint the probe's area **without** the dialog — the probe's half of
+/// [`resolve`]'s erase.
+///
+/// The same operation the REPL runs on resolve (`sync_stack` +
+/// `paint_prompt`): the dialog element is gone, the standing stack is applied
+/// again through the front door, and the frame apply's union clear takes the
+/// dialog's rows. Deliberately *not* an empty membership — an empty stack
+/// means "nothing configured yet", not "clear the screen"; see
+/// `RenderManager::render`'s two readings.
+pub fn clear(manager: &std::sync::Arc<std::sync::Mutex<crate::render::RenderManager>>) {
+    let mut manager = manager.lock().unwrap();
+    manager.configure(crate::render::FRAME_MAX_ROW_RATIO, probe_stack(None));
     manager.render(None);
 }
 
@@ -339,7 +368,7 @@ pub fn paint(
 ///
 /// `redraw` repaints the area without the dialog. The REPL passes the session's
 /// own paint (it still owns the prompt and any menu underneath); the probe
-/// passes the empty stack.
+/// passes [`clear`].
 ///
 /// Takes content for the decision line: `display_plain` is a content verb —
 /// boundary rules included — and the line stays inside this function because
