@@ -310,6 +310,10 @@ fn minimized_edit_args(
                 header: None,
                 rejected_header: None,
                 raw_header: None,
+                // `render_blob` emits the canonical `@@@OLD`-first order
+                // regardless of how the call arrived, so the re-rendered block
+                // is always old-first.
+                order: blockedit::BlockOrder::OldFirst,
             })
             .collect();
         blobs.push(blockedit::render_blob(&file.path, &edits));

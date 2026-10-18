@@ -239,6 +239,15 @@ within the repo) rather than inventing a local one. If the normalized forms are 
 - Leading/trailing ```` ``` ```` fences around the whole blob are stripped (models habitually emit
   fences).
 - Multiple blocks are applied in text order.
+- **Marker order is not fixed on ingress.** A block opens with `@@@OLD` (canonical) *or* with
+  `@@@NEW` (switched — new text first); whichever marker comes first fixes which region is the
+  original and which is the replacement, so there is no guessing and no case where a switched block
+  is silently applied backwards. The header a `path:LINE` anchor rides on is the line above that
+  **opening** marker, not above `@@@OLD`. This is an *ingress tolerance* for models that list the new
+  text first: everything the crate **emits** — `render_blob`, `canonicalize_edit_value`, the stored
+  array — stays canonical old-first, so a re-rendered or replayed block is always `@@@OLD`-first. The
+  empty-`@@@OLD` rule is likewise keyed to the OLD **role**, not to position: a block whose original
+  text is empty is refused in either order.
 
 Shared parser API (one parser, shared by every site that consumes a blob):
 
@@ -257,9 +266,13 @@ pub struct ParsedEdit {
     pub new_text: String,
     pub start_line: Option<u64>,  // from a `path:LINE` header
     pub header: Option<String>,   // this block's own file, if it named one
-    /// The line above `@@@OLD` that was *not* taken as a header, when there
-    /// was one. Lets the multi-file error quote back what the model wrote.
+    /// The line above the opening marker that was *not* taken as a header,
+    /// when there was one. Lets the multi-file error quote back what the
+    /// model wrote.
     pub rejected_header: Option<String>,
+    /// Which marker opened the block: `@@@OLD` (canonical) or `@@@NEW`
+    /// (switched). Lets a failure name the block's real opener. Not persisted.
+    pub order: BlockOrder,
 }
 pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError>;
 ```

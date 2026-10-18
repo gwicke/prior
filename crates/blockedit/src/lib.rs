@@ -35,8 +35,8 @@ pub mod wire;
 pub use apply::{apply_to_file, apply_to_text, success_note, ApplyOutcome};
 pub use blob::{
     array_to_blob_value, blob_text, canonicalize_edit_value, group_by_file, parse_blocks,
-    render_blob, split_by_file, split_line_anchor, to_ops, FileBatch, ParseError, ParsedBlocks,
-    ParsedEdit, DIVIDER, REPLACE_MARKER, SEARCH_MARKER,
+    render_blob, split_by_file, split_line_anchor, to_ops, BlockOrder, FileBatch, ParseError,
+    ParsedBlocks, ParsedEdit, DIVIDER, REPLACE_MARKER, SEARCH_MARKER,
 };
 pub use diagnose::{parse_file_results, render_file_results, FileResult};
 pub use minimize::{

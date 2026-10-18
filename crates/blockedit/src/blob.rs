@@ -10,6 +10,12 @@
 //! - **Legacy** — `oldText`/`newText` (single) and `old`/`new` (very old
 //!   picocode). Accepted on ingress / replay only.
 //!
+//! A block's markers may arrive in either order — the canonical `@@@OLD` …
+//! `@@@NEW` … `@@@END`, or the switched `@@@NEW` … `@@@OLD` … `@@@END` (new
+//! text first). The opening marker fixes the region roles, so there is no
+//! guessing; everything this module *emits* (rendering, canonicalization) is
+//! the canonical order.
+//!
 //! This module is pure: it operates on `&str` and [`serde_json::Value`] and
 //! knows nothing about rig types (the `Message`-level rewrite loops live at
 //! the call sites).
@@ -44,14 +50,79 @@ pub fn blob_text(args: &Value) -> Option<&str> {
         .or_else(|| obj.get(LEGACY_BLOCKS_FIELD).and_then(Value::as_str))
 }
 
-/// Opening marker of an OLD region (`@@@OLD`).
+/// The OLD-region marker (`@@@OLD`): opens a block in the canonical order, and
+/// closes the second region of a new-first one.
 pub const SEARCH_MARKER: &str = "@@@OLD";
-/// Divider between the OLD and NEW regions (`@@@NEW`).
+/// The NEW-region marker (`@@@NEW`): the divider of a canonical block, and the
+/// opener of a new-first one.
 pub const DIVIDER: &str = "@@@NEW";
-/// Closing marker of a NEW region (`@@@END`).
+/// Closing marker of a block (`@@@END`), in either order.
 pub const REPLACE_MARKER: &str = "@@@END";
 
-/// One parsed `@@@OLD`/`@@@NEW`/`@@@END` block.
+/// The marker order a block was written in.
+///
+/// The canonical order opens with [`SEARCH_MARKER`]; the switched order opens
+/// with [`DIVIDER`] and lists the new text first. Both parse to the same
+/// `(old_text, new_text)` pair — the order is kept only so a failure can name
+/// the block's *actual* opening marker instead of assuming the canonical one.
+/// Not persisted; rendering always re-emits the canonical order.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum BlockOrder {
+    /// `@@@OLD` … old text … `@@@NEW` … new text … `@@@END`
+    OldFirst,
+    /// `@@@NEW` … new text … `@@@OLD` … old text … `@@@END`
+    NewFirst,
+}
+
+impl BlockOrder {
+    /// The marker that opens a block in this order — also the line a
+    /// `path:LINE` header must sit above.
+    pub fn opener(self) -> &'static str {
+        match self {
+            BlockOrder::OldFirst => SEARCH_MARKER,
+            BlockOrder::NewFirst => DIVIDER,
+        }
+    }
+
+    /// `(name of the first region, the marker that closes it)`.
+    fn first_region(self) -> (&'static str, &'static str) {
+        match self {
+            BlockOrder::OldFirst => (SEARCH_MARKER, DIVIDER),
+            BlockOrder::NewFirst => (DIVIDER, SEARCH_MARKER),
+        }
+    }
+
+    /// The name of the second region (always closed by [`REPLACE_MARKER`]).
+    fn second_region(self) -> &'static str {
+        match self {
+            BlockOrder::OldFirst => DIVIDER,
+            BlockOrder::NewFirst => SEARCH_MARKER,
+        }
+    }
+
+    /// Map the two physical regions onto `(old, new)` by role.
+    fn split_regions<'a>(
+        self,
+        first: Vec<&'a str>,
+        second: Vec<&'a str>,
+    ) -> (Vec<&'a str>, Vec<&'a str>) {
+        match self {
+            BlockOrder::OldFirst => (first, second),
+            BlockOrder::NewFirst => (second, first),
+        }
+    }
+}
+
+/// The article a marker name takes in a message: `an @@@OLD`, `a @@@NEW`.
+fn article(marker: &str) -> &'static str {
+    if marker == SEARCH_MARKER {
+        "an"
+    } else {
+        "a"
+    }
+}
+
+/// One parsed `@@@OLD`/`@@@NEW`/`@@@END` block, in either marker order.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ParsedEdit {
     pub old_text: String,
@@ -67,8 +138,8 @@ pub struct ParsedEdit {
     /// in [`parse_blocks`] only *validates* headers, it does not keep them. The
     /// anchor is split off `header`; this is the path part. Not persisted.
     pub header: Option<String>,
-    /// The line directly above this block's `@@@OLD` that was **not** taken
-    /// as a header, when there was one and it was not empty.
+    /// The line directly above this block's opening marker that was **not**
+    /// taken as a header, when there was one and it was not empty.
     ///
     /// A header must be a single whitespace-free token, so a model that wrote
     /// prose, or a real path containing a space, silently produces a
@@ -88,6 +159,10 @@ pub struct ParsedEdit {
     /// purpose: it holds the path part only. `None` when the block carried no
     /// header. Not persisted.
     pub raw_header: Option<String>,
+    /// The marker order this block was written in. Kept so a failure can name
+    /// the block's real opening marker; rendering always re-emits the
+    /// canonical order. Not persisted.
+    pub order: BlockOrder,
 }
 
 /// Result of parsing a blob.
@@ -243,8 +318,11 @@ pub fn split_line_anchor(token: &str) -> (String, Option<u64>) {
 
 /// Parse a blob into [`ParsedEdit`] blocks plus the inferred path.
 ///
-/// Recognizes blocks whose markers each occupy their own (trimmed) line. The
-/// line immediately preceding an `@@@OLD` is treated as an optional
+/// Recognizes blocks whose markers each occupy their own (trimmed) line, in
+/// either marker order: the canonical `@@@OLD` … `@@@NEW` … `@@@END`, and the
+/// switched `@@@NEW` … `@@@OLD` … `@@@END` (new text first). The opening
+/// marker fixes which region is which — there is no guessing. The line
+/// immediately preceding the *opening* marker is treated as an optional
 /// filename header when it is a single whitespace-free token; a trailing
 /// `:LINE` on that header supplies the block's line anchor.
 pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
@@ -254,11 +332,36 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
     let mut saw_any_header = false;
 
     let mut i = 0usize;
+    // Start of the text not yet consumed by a block. A new-first block's
+    // failures scan back to here for a near-miss marker: a garbled `@@@OLD>`
+    // opener is exactly what makes the parser fall through to a later
+    // `@@@NEW` and open a phantom new-first block, so blaming only the
+    // region would name a consequence rather than the mistake.
+    let mut scan_from = 0usize;
     while i < lines.len() {
-        if marker_of(&lines[i]) != Some(SEARCH_MARKER) {
+        let Some(opener) = marker_of(&lines[i]) else {
             i += 1;
             continue;
-        }
+        };
+        let order = match opener {
+            SEARCH_MARKER => BlockOrder::OldFirst,
+            DIVIDER => BlockOrder::NewFirst,
+            // `@@@END` closes a block; it never opens one.
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let (first_name, first_expected) = order.first_region();
+        let second_name = order.second_region();
+        // Where the near-miss scan for this block's first-region failures
+        // starts (see `scan_from`): back to the previous block for a
+        // new-first one, the block's own first region otherwise.
+        let near_from = if order == BlockOrder::NewFirst {
+            scan_from
+        } else {
+            i + 1
+        };
 
         // Optional header = the immediately preceding line, if it is a path.
         // A `path:LINE` suffix supplies this block's anchor; the path part is
@@ -294,44 +397,47 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
             }
         }
 
-        // Collect OLD content up to the divider.
+        // Collect the first region's content up to its closing marker (the
+        // divider in the canonical order, `@@@OLD` in the switched one).
         // Fail fast if any unexpected delimiter is encountered.
         let mut j = i + 1;
-        let mut search_lines: Vec<&str> = Vec::new();
+        let mut first_lines: Vec<&str> = Vec::new();
         while j < lines.len() {
             if let Some(m) = marker_of(&lines[j]) {
-                if m == DIVIDER {
-                    break; // found the expected divider
+                if m == first_expected {
+                    break; // found the expected marker
                 }
-                // Any other delimiter (@@@OLD or @@@END) is invalid in OLD
-                // section. Prefer a garbled marker from the region just
-                // scanned — that is what cost us the structure.
-                if let Some((mk, bad)) = near_miss_in(&lines[i + 1..j]) {
+                // Any other delimiter is invalid here (e.g. `@@@END` before
+                // the second region, or a repeated opener). Prefer a garbled
+                // marker from the region just scanned — that is what cost us
+                // the structure.
+                if let Some((mk, bad)) = near_miss_in(&lines[near_from..j]) {
                     return Err(malformed_marker_error(mk, bad));
                 }
                 return Err(ParseError(format!(
-                    "unexpected delimiter `{m}` in @@@OLD section; expected `@@@NEW`"
+                    "unexpected delimiter `{m}` in {first_name} section; \
+                     expected `{first_expected}`"
                 )));
             }
-            search_lines.push(&lines[j]);
+            first_lines.push(&lines[j]);
             j += 1;
         }
         if j >= lines.len() {
             // The block is being rejected either way, so naming a near-miss in
             // the region we just scanned costs nothing and beats a bare
-            // "missing @@@NEW" — there is no content here to protect.
-            if let Some((mk, bad)) = near_miss_in(&lines[i + 1..j]) {
+            // "missing {first_expected}" — there is no content here to protect.
+            if let Some((mk, bad)) = near_miss_in(&lines[near_from..j]) {
                 return Err(malformed_marker_error(mk, bad));
             }
-            return Err(ParseError(
-                "an edit block is missing its `@@@NEW` section".to_string(),
-            ));
+            return Err(ParseError(format!(
+                "an edit block is missing its `{first_expected}` section"
+            )));
         }
 
-        // Collect NEW content up to the closing marker.
+        // Collect the second region's content up to the closing marker.
         // Fail fast if any unexpected delimiter is encountered.
         let mut k = j + 1;
-        let mut replace_lines: Vec<&str> = Vec::new();
+        let mut second_lines: Vec<&str> = Vec::new();
         while k < lines.len() {
             if let Some(m) = marker_of(&lines[k]) {
                 if m == REPLACE_MARKER {
@@ -342,30 +448,38 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
                     return Err(malformed_marker_error(mk, bad));
                 }
                 return Err(ParseError(format!(
-                    "unexpected delimiter `{m}` in @@@NEW section; expected `@@@END`"
+                    "unexpected delimiter `{m}` in {second_name} section; \
+                     expected `{REPLACE_MARKER}`"
                 )));
             }
-            replace_lines.push(&lines[k]);
+            second_lines.push(&lines[k]);
             k += 1;
         }
         if k >= lines.len() {
             // As above: the block is already rejected, so a near-miss in the
-            // NEW region is worth naming.
+            // second region is worth naming.
             if let Some((mk, bad)) = near_miss_in(&lines[j + 1..k]) {
                 return Err(malformed_marker_error(mk, bad));
             }
-            return Err(ParseError(
-                "a `@@@NEW` section is missing its `@@@END` marker".to_string(),
-            ));
+            return Err(ParseError(format!(
+                "{} `{second_name}` section is missing its `{REPLACE_MARKER}` marker",
+                article(second_name)
+            )));
         }
 
-        let old_text = search_lines.join("\n");
+        // Map the two physical regions onto (old, new) by the block's order.
+        let (old_lines, new_lines) = order.split_regions(first_lines, second_lines);
+        let old_text = old_lines.join("\n");
         if old_text.is_empty() {
+            // The empty-old rule is about the OLD *role*, not about position:
+            // an insert with nothing to search for cannot be located, in
+            // either order.
             return Err(ParseError(
-                "an `@@@OLD` block has empty OLD text".to_string(),
+                "an edit block has an empty `@@@OLD` section; the OLD text must be non-empty"
+                    .to_string(),
             ));
         }
-        let new_text = replace_lines.join("\n");
+        let new_text = new_lines.join("\n");
         edits.push(ParsedEdit {
             old_text,
             new_text,
@@ -373,9 +487,11 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
             header: header_path,
             rejected_header,
             raw_header,
+            order,
         });
 
         i = k + 1;
+        scan_from = k + 1;
     }
 
     if edits.is_empty() {
@@ -613,6 +729,8 @@ pub fn array_to_blob_value(args: &Value) -> Value {
             header: None,
             rejected_header: None,
             raw_header: None,
+            // The array is order-less; rendering is canonical anyway.
+            order: BlockOrder::OldFirst,
         })
         .collect();
     let blob = render_blob(path, &parsed);
@@ -645,6 +763,25 @@ mod tests {
             header: None,
             rejected_header: None,
             raw_header: None,
+            order: BlockOrder::OldFirst,
+        }
+    }
+
+    /// A NEW-first (switched) block as it comes back from parsing: the same
+    /// pair as [`plain`], recorded in the switched order.
+    fn switched(old: &str, new: &str) -> ParsedEdit {
+        ParsedEdit {
+            order: BlockOrder::NewFirst,
+            ..plain(old, new)
+        }
+    }
+
+    /// A NEW-first block that carried a header, like [`headed`].
+    fn switched_headed(path: &str, old: &str, new: &str) -> ParsedEdit {
+        ParsedEdit {
+            header: Some(path.to_string()),
+            raw_header: Some(path.to_string()),
+            ..switched(old, new)
         }
     }
 
@@ -1175,6 +1312,123 @@ mod tests {
         assert_eq!(parsed.edits[0].old_text, "old");
         assert_eq!(parsed.edits[0].new_text, "new");
     }
+
+    // -- switched order: `@@@NEW` … `@@@OLD` … `@@@END` --------------------
+
+    #[test]
+    fn parses_a_new_first_block_to_the_same_pair() {
+        let text = "src/foo.py\n@@@NEW\nnew text\n@@@OLD\nold text\n@@@END";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.path.as_deref(), Some("src/foo.py"));
+        assert_eq!(
+            p.edits,
+            vec![switched_headed("src/foo.py", "old text", "new text")]
+        );
+        assert_eq!(p.edits[0].order, BlockOrder::NewFirst);
+    }
+
+    #[test]
+    fn the_header_sits_above_the_opening_marker_in_a_switched_block() {
+        // The header is the line above the *first* marker, whichever it is;
+        // a `:LINE` anchor comes along the same way.
+        let text = "a.rs:3\n@@@NEW\nnew\n@@@OLD\nold\n@@@END\n\n\
+                    b.rs:9\n@@@OLD\nx\n@@@NEW\nX\n@@@END";
+        let p = parse_blocks(text).unwrap();
+        assert!(p.multi_file);
+        assert_eq!(p.edits[0].start_line, Some(3));
+        assert_eq!(p.edits[1].start_line, Some(9));
+    }
+
+    #[test]
+    fn canonical_and_switched_blocks_mix_in_one_blob() {
+        let text = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\na.rs\n@@@NEW\nY\n@@@OLD\ny\n@@@END";
+        let p = parse_blocks(text).unwrap();
+        assert!(!p.multi_file);
+        assert_eq!(
+            p.edits,
+            vec![headed("a.rs", "x", "X"), switched_headed("a.rs", "y", "Y")]
+        );
+    }
+
+    #[test]
+    fn a_switched_delete_block_parses_with_empty_new_text() {
+        // Empty NEW is a delete in either order — only empty OLD is refused.
+        let text = "@@@NEW\n@@@OLD\nbye\n@@@END";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.edits, vec![switched("bye", "")]);
+    }
+
+    #[test]
+    fn a_switched_block_with_empty_old_text_is_rejected() {
+        // The empty-old rule is about the OLD *role*, not about position.
+        let text = "@@@NEW\nhi\n@@@OLD\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(err.0.contains("empty `@@@OLD` section"), "{err}");
+    }
+
+    #[test]
+    fn a_new_first_block_missing_its_old_section_names_the_expected_marker() {
+        let text = "@@@NEW\nhi\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(
+            err.0
+                .contains("unexpected delimiter `@@@END` in @@@NEW section; expected `@@@OLD`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_new_first_block_missing_its_end_names_the_old_section() {
+        let text = "@@@NEW\nhi\n@@@OLD\nold";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(
+            err.0
+                .contains("an `@@@OLD` section is missing its `@@@END` marker"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_stray_old_inside_a_new_first_block_is_reported() {
+        let text = "@@@NEW\nhi\n@@@OLD\n@@@OLD\nold\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(
+            err.0
+                .contains("unexpected delimiter `@@@OLD` in @@@OLD section; expected `@@@END`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_bare_end_marker_never_opens_a_block() {
+        let err = parse_blocks("@@@END").unwrap_err();
+        assert!(
+            err.0
+                .contains("no `@@@OLD` / `@@@NEW` / `@@@END` blocks found"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_a_switched_blob_maps_regions_by_role() {
+        // Persistence is canonical, but it must read a switched block by role,
+        // not by position: newText comes from the first region here.
+        let v = json!({"path": "src/x.rs", "blocks": "src/x.rs\n@@@NEW\nb\n@@@OLD\na\n@@@END"});
+        assert_eq!(
+            canonicalize_edit_value(&v),
+            json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]})
+        );
+    }
+
+    #[test]
+    fn a_switched_block_re_renders_in_the_canonical_order() {
+        // Rendering is canonical-only, so a switched block survives a
+        // parse → render → parse round trip as the same pair.
+        let p = parse_blocks("src/x.rs\n@@@NEW\nb\n@@@OLD\na\n@@@END").unwrap();
+        let blob = render_blob("src/x.rs", &p.edits);
+        let again = parse_blocks(&blob).unwrap();
+        assert_eq!(again.edits, vec![headed("src/x.rs", "a", "b")]);
+    }
 }
 
 /// One file's worth of blocks, in blob order.
@@ -1210,7 +1464,7 @@ pub fn group_by_file(
             _ => {
                 return Err(format!(
                     "block {idx} names no file: set the `path` argument, or put a filename line \
-                     above every `@@@OLD`",
+                     above every block",
                     idx = idx + 1
                 ))
             }
@@ -1301,7 +1555,13 @@ pub fn split_by_file(parsed: ParsedBlocks) -> Result<Vec<FileBatch>, String> {
     for (i, edit) in parsed.edits.into_iter().enumerate() {
         let spelled = match edit.header.as_deref() {
             Some(h) if !h.is_empty() => h.to_string(),
-            _ => return Err(no_file_error(i + 1, edit.rejected_header.as_deref())),
+            _ => {
+                return Err(no_file_error(
+                    i + 1,
+                    edit.rejected_header.as_deref(),
+                    edit.order,
+                ))
+            }
         };
         // Key on the normalized form; report and store the first spelling.
         let key = normalized_key(&spelled);
@@ -1341,27 +1601,31 @@ fn normalized_key(path: &str) -> String {
 /// argument is deliberately *not* offered as a fix: this blob already spans
 /// files, so a single `path` cannot name the missing block's file, and
 /// defaulting it is the wrong-file write this policy exists to prevent.
-fn no_file_error(idx: usize, rejected: Option<&str>) -> String {
+fn no_file_error(idx: usize, rejected: Option<&str>, order: BlockOrder) -> String {
+    // The header sits above the block's *opening* marker — `@@@OLD` in the
+    // canonical order, `@@@NEW` in the switched one — so the message names
+    // the marker this block actually opened with.
+    let marker = order.opener();
     let shape = "\n  src/foo.rs:12\n  @@@OLD\n  ...\n  @@@NEW\n  ...\n  @@@END";
     let msg = match rejected {
         // Quoting the line back is the whole point: a bare "names no file"
         // tells the model to add a line it may already have added. The two
         // causes need different fixes, so they are named separately.
         Some(line) if line.split_whitespace().count() > 1 => format!(
-            "block {idx} of a multi-file edit names no file: the line above its `@@@OLD` \
+            "block {idx} of a multi-file edit names no file: the line above its `{marker}` \
              marker is `{line}`, which is not a header. A header is one path token with no \
              spaces. If that is a real filename containing a space, this block form cannot \
              address it — edit that file with the single-edit fields (path + oldText + \
              newText) instead.{shape}"
         ),
         Some(line) => format!(
-            "block {idx} of a multi-file edit names no file: the line above its `@@@OLD` \
+            "block {idx} of a multi-file edit names no file: the line above its `{marker}` \
              marker is `{line}`, which is not a path. Replace it with a path to the file this \
              block edits, like the other blocks.{shape}"
         ),
         None => format!(
             "block {idx} of a multi-file edit names no file. Put a filename line above its \
-             `@@@OLD` marker, like the other blocks:{shape}"
+             `{marker}` marker, like the other blocks:{shape}"
         ),
     };
     msg
@@ -1508,7 +1772,7 @@ mod split_tests {
     fn the_missing_file_error_never_offers_the_path_argument() {
         // `path` cannot name the missing block's file in a blob that spans
         // files, so suggesting it would send the model in a circle.
-        let err = no_file_error(3, None);
+        let err = no_file_error(3, None, BlockOrder::OldFirst);
         assert!(err.contains("block 3"), "{err}");
         assert!(!err.contains("`path` argument"), "{err}");
     }
@@ -1518,10 +1782,10 @@ mod split_tests {
         // The model wrote *something* in the header slot. Saying only "names
         // no file" tells it to add a line it already added; quoting the line
         // is what makes the error actionable.
-        let err = no_file_error(2, Some("Update the parser."));
+        let err = no_file_error(2, Some("Update the parser."), BlockOrder::OldFirst);
         assert!(err.contains("`Update the parser.`"), "{err}");
         // A single whitespace-free token is a *wrong path*, not a spaced one.
-        let err = no_file_error(2, Some("src/typo.rs"));
+        let err = no_file_error(2, Some("src/typo.rs"), BlockOrder::OldFirst);
         assert!(err.contains("which is not a path"), "{err}");
         assert!(!err.contains("no spaces"), "{err}");
     }
@@ -1531,7 +1795,7 @@ mod split_tests {
         // Ambiguous by nature — prose and a spaced filename look the same —
         // so the message covers both and routes the unrepresentable case to
         // the form that can express it.
-        let err = no_file_error(1, Some("my notes.rs:4"));
+        let err = no_file_error(1, Some("my notes.rs:4"), BlockOrder::OldFirst);
         assert!(err.contains("no spaces"), "{err}");
         assert!(err.contains("oldText"), "{err}");
     }
@@ -1622,5 +1886,32 @@ mod split_tests {
         // two batches. Here it is one error, and no file is implied.
         let text = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
         assert!(split_by_file(parse(text)).is_err());
+    }
+
+    // -- switched order -----------------------------------------------------
+
+    #[test]
+    fn a_switched_block_groups_by_its_own_header() {
+        // A `@@@NEW`-first block names its file above the `@@@NEW`, and the
+        // splitter reads it exactly as it reads a canonical block's header.
+        let text = "a.rs\n@@@NEW\nX\n@@@OLD\nx\n@@@END\n\nb.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
+        let g = split_by_file(parse(text)).unwrap();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].path, "a.rs");
+        assert_eq!(g[0].edits[0].old_text, "x");
+        assert_eq!(g[0].edits[0].new_text, "X");
+        assert_eq!(g[1].path, "b.rs");
+    }
+
+    #[test]
+    fn the_missing_file_error_names_a_switched_blocks_real_opener() {
+        // The header sits above `@@@NEW` in a new-first block, so the error
+        // must point there — naming `@@@OLD` would send the model to the
+        // wrong line.
+        let text = "a.rs\n@@@NEW\nX\n@@@OLD\nx\n@@@END\n\n\
+                    @@@NEW\nY\n@@@OLD\ny\n@@@END";
+        let err = split_by_file(parse(text)).unwrap_err();
+        assert!(err.contains("block 2"), "{err}");
+        assert!(err.contains("above its `@@@NEW` marker"), "{err}");
     }
 }
