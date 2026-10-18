@@ -6,8 +6,11 @@
 //! escapes per stream at the write, so nothing above it asks whether there
 //! is a terminal on the other end.
 
+use std::borrow::Cow;
+
 use markdown_terminal::Theme;
 
+use crate::content::panel::RESULT_INDENT;
 use crate::content::text::expand_tabs;
 
 /// Render `src` as a styled terminal string via `codewandler-markdown-terminal`.
@@ -53,9 +56,9 @@ pub(crate) fn highlight_code_fg(text: &str, lang: &str, width: usize) -> String 
 }
 
 /// Highlight a command *label* — the tool name and its arguments (e.g.
-/// `$ cd ~/src && sed …`, `read src/x.rs`) — with **no** fence gutter: a
-/// label sits flush at the panel's left edge, unlike results, whose indent is
-/// the gutter of [`highlight_code_fg`].
+/// `$ cd ~/src && sed …`, `read src/x.rs`) — with **no** fence gutter: the
+/// label's *first* line sits flush at the panel's left edge, unlike results,
+/// whose indent is the gutter of [`highlight_code_fg`].
 ///
 /// Each source line is rendered as its own fence block and its gutter removed
 /// positionally — row 0 carries two leading spaces, each wrap continuation
@@ -63,6 +66,12 @@ pub(crate) fn highlight_code_fg(text: &str, lang: &str, width: usize) -> String 
 /// before rendering: a multi-line block cannot be stripped after the fact (a
 /// continuation row and a later line's own two-space indentation are the same
 /// flat text).
+///
+/// A multi-line input keeps only its first line flush: every later logical
+/// line is pre-pended [`RESULT_INDENT`] spaces *before* rendering, so the
+/// indent is baked in and its wrapping respects it. For bash, whose label
+/// prefix `$ ` is exactly [`RESULT_INDENT`] columns wide, that aligns the
+/// actual command lines vertically under the first line's command text.
 ///
 /// Same contract as [`highlight_code_fg`] otherwise, except that tabs are
 /// expanded *here*: a label is raw tool-argument text (a command, a path), so
@@ -75,8 +84,16 @@ pub(crate) fn highlight_label_fg(text: &str, lang: &str, width: usize) -> String
     const GUTTER_FIRST: usize = 2;
     const GUTTER_WRAP: usize = 4;
     text.split('\n')
-        .map(|line| {
+        .enumerate()
+        .map(|(i, line)| {
             let line = expand_tabs(line);
+            // Only the first line of a multi-line input sits flush; later
+            // lines carry the result indent, pre-wrap.
+            let line = if i == 0 {
+                line
+            } else {
+                Cow::Owned(format!("{:width$}{line}", "", width = RESULT_INDENT))
+            };
             let rendered = highlight_code_fg(line.as_ref(), lang, width);
             rendered
                 .split('\n')
@@ -244,17 +261,56 @@ mod tests {
         }
     }
 
-    /// A label can itself span lines (a multi-line bash command). Each source
-    /// line is rendered and stripped on its own, so each stays flush.
+    /// A label can itself span lines (a multi-line bash command). Only the
+    /// first line sits flush; later logical lines are pre-pended the result
+    /// indent before rendering, so — for bash, whose `$ ` prompt is exactly
+    /// [`RESULT_INDENT`] wide — the command lines align vertically.
     #[test]
-    fn a_multiline_label_is_flush_per_line() {
-        let out = highlight_label_fg("echo one\necho two", "bash", 40);
+    fn a_multiline_label_aligns_under_the_prompt() {
+        let out = highlight_label_fg("$ echo one\necho two", "bash", 40);
         let plain = strip_ansi(&out);
-        assert!(plain.starts_with("echo one"), "first line lost: {plain:?}");
-        assert!(plain.contains("echo two"), "second line lost: {plain:?}");
-        for row in plain.lines() {
-            assert!(!row.starts_with(' '), "label row not flush: {row:?}");
-        }
+        let rows: Vec<&str> = plain.lines().collect();
+        assert!(
+            rows.first().is_some_and(|r| r.starts_with("$ echo one")),
+            "first line lost or indented: {plain:?}"
+        );
+        assert!(
+            rows.get(1).is_some_and(|r| r.starts_with("  echo two")),
+            "second line not indented by RESULT_INDENT: {plain:?}"
+        );
+        // Both command texts start at the same column: `$ ` on the first line
+        // is two columns, the baked-in indent on the second is two columns.
+        let col = |r: &str, c: char| r.find(c);
+        assert_eq!(
+            col(rows[0], 'e'),
+            col(rows[1], 'e'),
+            "command lines not vertically aligned: {plain:?}"
+        );
+    }
+
+    /// A blank logical line after the first keeps its own row — vertical
+    /// structure survives (the indent itself is invisible on a blank row:
+    /// the renderer folds a whitespace-only line into a gutter-only row).
+    #[test]
+    fn a_blank_line_after_the_first_keeps_its_row() {
+        let out = highlight_label_fg("one\n\ntwo", "bash", 40);
+        let plain = strip_ansi(&out);
+        let rows: Vec<&str> = plain.lines().collect();
+        assert_eq!(rows.len(), 3, "blank row lost: {plain:?}");
+        assert!(rows[1].trim().is_empty(), "row not blank: {plain:?}");
+        assert!(rows[2].ends_with("two"), "third line lost: {plain:?}");
+    }
+
+    /// An indented later line keeps its own indentation *on top of* the
+    /// result indent (content indent is never eaten).
+    #[test]
+    fn a_later_lines_own_indent_survives_on_top() {
+        let out = highlight_label_fg("one\n    indented();", "bash", 40);
+        let plain = strip_ansi(&out);
+        assert!(
+            plain.contains("      indented();"),
+            "own indent lost: {plain:?}"
+        );
     }
 
     /// A tab in a label (raw argument text) must not survive to the panel: a
