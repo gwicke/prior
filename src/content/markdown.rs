@@ -8,6 +8,8 @@
 
 use markdown_terminal::Theme;
 
+use crate::content::text::expand_tabs;
+
 /// Render `src` as a styled terminal string via `codewandler-markdown-terminal`.
 ///
 /// Uses GFM (`parse_gfm`) so tables / task-lists / strikethrough render as users
@@ -24,13 +26,15 @@ pub(crate) fn render_markdown(src: &str, width: usize) -> String {
 ///
 /// The renderer wraps code at the source: each line's first row carries a
 /// two-space fence gutter and each wrap continuation four, hard-splitting any
-/// token wider than the budget. That gutter is **kept**, not stripped — the
-/// caller's uniform panel background renders it as seamless margin, and with
-/// nothing to strip a whole block renders correctly in one call (a stripped
-/// gutter would have to distinguish a continuation from a later line's own
-/// indentation, which the flat output does not carry). `width` is the row
-/// budget *including* the gutter, so every returned row is at most `width`
-/// visible columns and the caller pads each to the panel edge.
+/// token wider than the budget. That gutter is **kept**, not stripped — for
+/// *results* the gutter is the row's indent (painted flush, the panel
+/// background rendering it as seamless margin), and with nothing to strip a
+/// whole block renders correctly in one call (a stripped gutter would have to
+/// distinguish a continuation from a later line's own indentation, which the
+/// flat output does not carry). Use [`highlight_label_fg`] instead for
+/// labels, which sit flush. `width` is the row budget *including* the gutter,
+/// so every returned row is at most `width` visible columns and the caller
+/// pads each to the panel edge.
 ///
 /// Returns one row per physical line, joined by `\n` with no trailing newline,
 /// **foreground-only** ANSI so the caller can layer the grey panel on top via
@@ -46,6 +50,46 @@ pub(crate) fn highlight_code_fg(text: &str, lang: &str, width: usize) -> String 
     render_markdown(&md, width)
         .trim_end_matches('\n')
         .to_string()
+}
+
+/// Highlight a command *label* — the tool name and its arguments (e.g.
+/// `$ cd ~/src && sed …`, `read src/x.rs`) — with **no** fence gutter: a
+/// label sits flush at the panel's left edge, unlike results, whose indent is
+/// the gutter of [`highlight_code_fg`].
+///
+/// Each source line is rendered as its own fence block and its gutter removed
+/// positionally — row 0 carries two leading spaces, each wrap continuation
+/// four. That is exact *per source line*, which is why the split happens
+/// before rendering: a multi-line block cannot be stripped after the fact (a
+/// continuation row and a later line's own two-space indentation are the same
+/// flat text).
+///
+/// Same contract as [`highlight_code_fg`] otherwise, except that tabs are
+/// expanded *here*: a label is raw tool-argument text (a command, a path), so
+/// any tab in it must not be measured at zero columns the way the terminal
+/// draws it. `width` is the row budget; rows are foreground-only ANSI joined
+/// by `\n` with no trailing newline.
+pub(crate) fn highlight_label_fg(text: &str, lang: &str, width: usize) -> String {
+    // The renderer's per-row code indent: two columns on a line's first row,
+    // four on each wrap continuation.
+    const GUTTER_FIRST: usize = 2;
+    const GUTTER_WRAP: usize = 4;
+    text.split('\n')
+        .map(|line| {
+            let line = expand_tabs(line);
+            let rendered = highlight_code_fg(line.as_ref(), lang, width);
+            rendered
+                .split('\n')
+                .enumerate()
+                .map(|(i, row)| {
+                    let gutter = if i == 0 { GUTTER_FIRST } else { GUTTER_WRAP };
+                    row.strip_prefix(&" ".repeat(gutter)).unwrap_or(row)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Longest run of consecutive backticks in `s` — used to size a code fence that
@@ -120,7 +164,7 @@ pub(crate) fn answer_theme() -> Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::highlight_code_fg;
+    use super::{highlight_code_fg, highlight_label_fg};
     use slashdot_tui::ansi::strip_ansi;
     use unicode_width::UnicodeWidthStr;
 
@@ -177,6 +221,51 @@ mod tests {
             plain.contains("rm -rf /"),
             "later line re-flowed: {plain:?}"
         );
+    }
+
+    /// A command label sits flush at the panel edge — the fence gutter the
+    /// result path keeps (and uses as the row's indent) is stripped here, on
+    /// the first row and on every wrap continuation, so even a long command
+    /// that wraps starts at column zero.
+    #[test]
+    fn a_label_renders_flush_without_the_fence_gutter() {
+        let label = "$ cd ~/src/pi && sed -n '550,640p' packages/agent/src/agent-loop.ts";
+        let out = highlight_label_fg(label, "bash", 40);
+        let plain = strip_ansi(&out);
+        assert!(plain.starts_with("$ cd"), "label lost: {plain:?}");
+        for row in plain.lines() {
+            assert!(!row.starts_with(' '), "label row not flush: {row:?}");
+            assert!(vis(row) <= 40, "row over budget ({}): {row:?}", vis(row));
+        }
+        // Wrapping preserved the content: no characters dropped by the strip.
+        let joined = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+        for word in ["cd", "~/src/pi", "sed", "packages/agent/src/agent-loop.ts"] {
+            assert!(joined.contains(word), "{word:?} lost: {plain:?}");
+        }
+    }
+
+    /// A label can itself span lines (a multi-line bash command). Each source
+    /// line is rendered and stripped on its own, so each stays flush.
+    #[test]
+    fn a_multiline_label_is_flush_per_line() {
+        let out = highlight_label_fg("echo one\necho two", "bash", 40);
+        let plain = strip_ansi(&out);
+        assert!(plain.starts_with("echo one"), "first line lost: {plain:?}");
+        assert!(plain.contains("echo two"), "second line lost: {plain:?}");
+        for row in plain.lines() {
+            assert!(!row.starts_with(' '), "label row not flush: {row:?}");
+        }
+    }
+
+    /// A tab in a label (raw argument text) must not survive to the panel: a
+    /// terminal draws it as spaces to the next stop, which would overflow the
+    /// padded row the same way an un-expanded result tab does.
+    #[test]
+    fn a_tab_in_a_label_is_expanded() {
+        let out = highlight_label_fg("$ printf\ta", "bash", 40);
+        let plain = strip_ansi(&out);
+        assert!(!plain.contains('\t'), "tab survived: {plain:?}");
+        assert!(plain.contains("printf"), "content lost: {plain:?}");
     }
 
     #[test]

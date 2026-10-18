@@ -11,16 +11,28 @@ use unicode_width::UnicodeWidthStr;
 use crate::content::preview::wrap_with_diff_markers;
 use crate::content::text::expand_tabs;
 
+/// How far a *result* row is indented, in columns, on top of the content's own
+/// indentation. A command label (tool name + arguments) is never indented;
+/// everything under it is output.
+///
+/// Plain result rows get this many leading spaces from [`panel_row`].
+/// Fence-rendered results get it from the renderer's code-fence gutter instead
+/// — those rows are painted flush (`indent = false`), because the gutter *is*
+/// their indent. The gutter is a fixed two columns, so this constant matches
+/// it and the two result paths line up column for column; change one, change
+/// both.
+pub(crate) const RESULT_INDENT: usize = 2;
+
 /// One full-width dark-grey panel row around pre-styled `content`, without a
 /// trailing newline.
 ///
 /// `content` carries any *foreground* ANSI it needs — dim text, red/green diff
-/// markers, or syntax-highlight tokens from `highlight_code_fg`. The
-/// background is re-applied after every internal `\x1b[0m` the highlighter
+/// markers, or syntax-highlight tokens from [`crate::content::markdown::highlight_code_fg`].
+/// The background is re-applied after every internal `\x1b[0m` the highlighter
 /// emitted, so the grey stays solid across a whole line even when the content
-/// changes foreground color several times. `indent` leaves one leading column
-/// so the line reads as a command's *output*; padding uses display-column
-/// width so wide/CJK characters keep the panel edge aligned.
+/// changes foreground color several times. `indent` leaves [`RESULT_INDENT`]
+/// leading columns so the line reads as a command's *output*; padding uses
+/// display-column width so wide/CJK characters keep the panel edge aligned.
 pub(crate) fn panel_row(content: &str, indent: bool, width: usize) -> String {
     const BG: &str = "\x1b[48;2;22;22;26m";
     const RESET: &str = "\x1b[0m";
@@ -28,15 +40,14 @@ pub(crate) fn panel_row(content: &str, indent: bool, width: usize) -> String {
     // own `\x1b[0m` cannot drop the grey behind the rest of the line.
     let painted = format!("{BG}{}", content.replace(RESET, &format!("{RESET}{BG}")));
     let vis = UnicodeWidthStr::width(strip_ansi(&painted).as_str());
+    let lead_len = if indent { RESULT_INDENT } else { 0 };
     let pad = if width == 0 {
         0
-    } else if indent {
-        width.saturating_sub(vis + 1)
     } else {
-        width.saturating_sub(vis)
+        width.saturating_sub(vis + lead_len)
     };
     let lead = if indent {
-        format!("{BG} ")
+        format!("{BG}{}", " ".repeat(RESULT_INDENT))
     } else {
         String::new()
     };
@@ -55,10 +66,10 @@ pub(crate) fn tool_row_contents(
     indent: bool,
     width: usize,
 ) -> Vec<String> {
-    // When indented, leave one column for the indent; keep the background
-    // full-width in both cases.
+    // When indented, leave the [`RESULT_INDENT`] columns for the lead; keep
+    // the background full-width in both cases.
     let inner = if indent {
-        width.saturating_sub(1).max(1)
+        width.saturating_sub(RESULT_INDENT).max(1)
     } else {
         width.max(1)
     };
@@ -102,6 +113,23 @@ mod tests {
     /// what a real terminal computes before deciding the row wrapped.
     fn drawn_width(row: &str) -> usize {
         UnicodeWidthStr::width(expand_tabs(strip_ansi(row).as_ref()).as_ref())
+    }
+
+    /// An indented plain row leads with exactly `RESULT_INDENT` spaces — the
+    /// same depth the code-fence gutter gives a rendered result row — and
+    /// still pads out to the full panel width.
+    #[test]
+    fn an_indented_plain_row_leads_with_the_result_indent() {
+        let width = 20;
+        let row = panel_row("x", true, width);
+        let plain = strip_ansi(&row);
+        let expected = format!(
+            "{}x{}",
+            " ".repeat(RESULT_INDENT),
+            " ".repeat(width - RESULT_INDENT - 1)
+        );
+        assert_eq!(plain, expected, "lead is not RESULT_INDENT deep");
+        assert_eq!(drawn_width(&row), width);
     }
 
     /// The exact bug: a tab-indented result line used to be padded on the

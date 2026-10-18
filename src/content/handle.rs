@@ -27,7 +27,7 @@ use tokio::sync::watch;
 use crate::ansi::{at_line_start, EscState, HoldTrailing, LineClear, StripLeading, WrapLines};
 use crate::content;
 use crate::content::markdown::{
-    answer_theme, command_lang, guess_lang, highlight_code_fg, render_markdown,
+    answer_theme, command_lang, guess_lang, highlight_code_fg, highlight_label_fg, render_markdown,
 };
 use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno};
 use crate::content::text::expand_tabs;
@@ -906,14 +906,15 @@ impl Content {
         // block a tool" flag: a text segment leaves the renderer's own trailing
         // blank behind, a tool panel does not, and the stream knows which.
         let (label, extra) = get_preview(name, args);
-        // Dark-grey panel box (no `⏺`, no tree line-art). The command label is
-        // the first line and is left flush; its output — the trailing
-        // diff/preview lines — is indented one column so the command's output
-        // reads as a distinct block. The command itself is syntax-highlighted
-        // through the same formatter the answer/result path uses (flushed per
-        // block via a fresh fenced code render).
+        // Dark-grey panel box (no `⏺`, no tree line-art). The command label —
+        // tool name and arguments — sits flush at the panel's left edge;
+        // everything under it (the trailing diff/preview lines here, the
+        // result panel that follows) is output and carries the result indent.
+        // The label is syntax-highlighted through the same formatter the
+        // result path uses, rendered without the code-fence gutter: that
+        // gutter *is* the result indent, and a label is not a result.
         // A label can wrap to several rows (long command); paint each.
-        let label_styled = highlight_code_fg(&label, command_lang(name), self.width());
+        let label_styled = highlight_label_fg(&label, command_lang(name), self.width());
         for row in label_styled.split('\n') {
             self.paint_panel(row, false);
         }
@@ -1006,7 +1007,7 @@ impl Content {
         // spaces that alignment depends on.
         {
             let width = self.width();
-            let avail = width.saturating_sub(1).max(1);
+            let avail = width.saturating_sub(content::panel::RESULT_INDENT).max(1);
             if let Some(table) = blockedit::arg_error_view::render_arg_error_table(cleaned, avail) {
                 for line in &table {
                     self.paint_panel(&style(line.clone()).dim().to_string(), true);
@@ -1044,21 +1045,22 @@ impl Content {
                     v.get("content").and_then(|x| x.as_str()),
                     v.get("lines").and_then(|x| x.as_u64()),
                 ) {
-                    // Show the path as a header with line count
+                    // Show the path as a header with line count. Like any
+                    // command label it sits flush; the content below is the
+                    // result, indented by the fence gutter.
                     let lang = guess_lang(path);
-                    // The indented panel row reserves one column for its lead,
-                    // so every width budget below is `inner`, not `width`.
                     let width = self.width();
-                    let inner = width.saturating_sub(1).max(1);
                     let header = format!("write {} [{} lines]", path, total_lines);
-                    for row in highlight_code_fg(&header, "bash", inner).split('\n') {
-                        self.paint_panel(row, true);
+                    for row in highlight_label_fg(&header, "bash", width).split('\n') {
+                        self.paint_panel(row, false);
                     }
 
                     // Render the content with syntax highlighting (like
                     // read_file): a whole block in one fenced render, wrapped
                     // by the formatter. Tab-expanded up front so indentation is
-                    // measured in the columns the terminal will draw.
+                    // measured in the columns the terminal will draw. The
+                    // fence gutter *is* the row's indent, so the rows are
+                    // painted flush.
                     let show_max = 10; // Limit preview to 10 lines (match read_file)
                     let content_lines: Vec<_> = content.lines().collect();
                     let shown: Vec<String> = content_lines
@@ -1067,8 +1069,8 @@ impl Content {
                         .map(|l| expand_tabs(l).into_owned())
                         .collect();
                     let block = shown.join("\n");
-                    for row in highlight_code_fg(&block, lang, inner).split('\n') {
-                        self.paint_panel(row, true);
+                    for row in highlight_code_fg(&block, lang, width).split('\n') {
+                        self.paint_panel(row, false);
                     }
                     if content_lines.len() > show_max {
                         self.tool_panel(
@@ -1114,7 +1116,6 @@ impl Content {
         };
 
         let width = self.width();
-        let inner = width.saturating_sub(1).max(1);
         // `read_file` renders `NNNN| content`; drop the gutter for display (the
         // model still gets the numbers in the raw tool result). Expand tabs
         // (tabstop 4) so indentation is measured in the columns the terminal
@@ -1140,11 +1141,12 @@ impl Content {
             }
         } else {
             // Non-error results: one fenced render of the whole visible block
-            // at the *inner* budget the indented row reserves, wrapped by the
-            // formatter, then one grey panel row per returned line.
+            // at the full width — the fence gutter *is* the row's indent, so
+            // the rows are painted flush — then one grey panel row per
+            // returned line.
             let block = visible.join("\n");
-            for row in highlight_code_fg(&block, lang, inner).split('\n') {
-                self.paint_panel(row, true);
+            for row in highlight_code_fg(&block, lang, width).split('\n') {
+                self.paint_panel(row, false);
             }
         }
 
@@ -1497,8 +1499,10 @@ impl Content {
         // file and still needs its path to attribute a failure.
         if let Some(files) = blockedit::parse_file_results(result) {
             for fr in files {
-                let label = highlight_code_fg(&format!("edit {}", fr.path), "bash", self.width());
-                self.paint_panel(&label, true);
+                let label = highlight_label_fg(&format!("edit {}", fr.path), "bash", self.width());
+                for row in label.split('\n') {
+                    self.paint_panel(row, false);
+                }
                 let single = match &fr.result {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
@@ -2146,6 +2150,36 @@ mod tests {
             tracked_row(&out),
             screen_row(&bytes, 40),
             "a tab-indented row overflowed and natural-wrapped (leaking the frame)"
+        );
+    }
+
+    /// The label/result indent contract: the command label (tool name and
+    /// arguments) sits flush at the panel edge, and the result below it is
+    /// indented — for a fenced render by the code-fence gutter, which *is*
+    /// the result indent (rows are painted flush).
+    #[test]
+    fn a_tool_label_is_flush_and_its_result_is_indented() {
+        let (out, _reasoning) = capturing_output(80);
+        let sink = record_bytes(&out);
+        out.begin_response();
+        out.display_tool_call("bash", &serde_json::json!({"command": "ls -la"}));
+        out.display_tool_result("total 0");
+        let text = strip_ansi(&String::from_utf8_lossy(&sink.bytes()));
+        let label = text
+            .lines()
+            .find(|l| l.contains("$ ls -la"))
+            .expect("label row");
+        assert!(
+            label.starts_with("$ ls -la"),
+            "command label is indented: {label:?}"
+        );
+        let result = text
+            .lines()
+            .find(|l| l.contains("total 0"))
+            .expect("result row");
+        assert!(
+            result.starts_with("  total 0"),
+            "result not indented by the fence gutter: {result:?}"
         );
     }
 
