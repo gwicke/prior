@@ -4161,8 +4161,8 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         assert_eq!(singles.len(), 2);
 
         let notes = [
-            "Replaced 1 block(s) in ./a.rs (matched at ./a.rs:1)",
-            "Replaced 1 block(s) in ./b.rs (matched at ./b.rs:1)",
+            "Replaced 1 block(s) in ./a.rs",
+            "Replaced 1 block(s) in ./b.rs",
         ];
         let array = blockedit::render_file_results(
             &["a.rs", "b.rs"]

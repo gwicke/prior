@@ -597,11 +597,10 @@ The new text
 
 ### Teaching the syntax
 
-When the model did *not* anchor, the success string echoes where each block matched —
-`Replaced 1 block(s) in ./src/foo.rs (matched at ./src/foo.rs:132)` — so the `path:LINE` idiom
-appears in the very transcript it imitates. It is a picocode-authored string (deterministic,
-stored), never a rewrite of the model's own arguments. The ambiguity error teaches the same syntax
-more pointedly.
+> Superseded: the success string no longer echoes a match location. Successful history now carries
+> the resolved anchor in the block header (`path:LINE`), which is the single source of truth; a
+> second line in the message only disagreed with it — see
+> `261018_minimal_edit_context_anchors.md`. The ambiguity error still teaches the same syntax.
 
 ### No `endLine`
 
@@ -1356,9 +1355,9 @@ file if it were wrong.
   before path resolution. It is an anchor only for the single edit (alias of `startLine`, must
   agree); in the blob form it is stripped and ignored.
 - **Tolerance**: `(context_lines / 3).min(4)`; unique matches ignore it.
-- **Success-string hint**: when no edit anchored, the result echoes each match location
-  (`Replaced N block(s) in ./f (matched at ./f:LINE)`) to teach the syntax by example — a
-  picocode-authored, deterministic string, never a rewrite of the model's own args.
+- **Success string**: just `Replaced N block(s) in ./f`; it carries no match location. The resolved
+  anchor lives in the rewritten block header (`path:LINE`), which is the single source of truth.
+  Superseded by `261018_minimal_edit_context_anchors.md`.
 
 ## Implementation status (W1 — the multi-file path policy — done)
 

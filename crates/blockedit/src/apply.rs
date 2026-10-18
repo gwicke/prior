@@ -93,35 +93,13 @@ pub fn apply_to_text(text: &str, edits: &[EditOp]) -> ApplyOutcome {
 
 /// How a caller should describe a successful apply. `shown` is the path the
 /// caller wants in the message (usually cwd-relative).
-pub fn success_note(edits: &[EditOp], matched_lines: &[usize], shown: &str) -> String {
-    // When no anchor was supplied, echo where each block actually matched. The
-    // `path:LINE` idiom shown here is the same anchor syntax the blob form
-    // accepts, so the model learns it from its own transcript. Only shown when
-    // *no* edit anchored (`matched_lines` then lines up with `edits`); if the
-    // model already anchored, it needs no reminder.
-    let matched_note = if edits.iter().any(|e| e.start_line.is_some()) {
-        String::new()
-    } else {
-        match matched_lines {
-            [] => String::new(),
-            [l] => format!(" (matched at {shown}:{l})"),
-            lines if lines.len() <= 3 => {
-                let list = lines
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(" (matched lines {list})")
-            }
-            lines => format!(" (matched {} lines)", lines.len()),
-        }
-    };
-    format!(
-        "Replaced {} block(s) in {}{}",
-        edits.len(),
-        shown,
-        matched_note
-    )
+///
+/// No match location is reported: successful history now carries the resolved
+/// line anchor in the block header (`path:LINE`), which is the single source of
+/// truth for where a block applied. Echoing a second, pre-trim line here used to
+/// disagree with that anchor and confuse the model, so it was dropped.
+pub fn success_note(edits: &[EditOp], shown: &str) -> String {
+    format!("Replaced {} block(s) in {}", edits.len(), shown)
 }
 
 /// Apply `edits` to the file at `path`, or write nothing and return the failure

@@ -517,10 +517,7 @@ async fn edit_file_inner(
     let sandbox_path = get_sandbox_path(&path)?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| sandbox_path.clone());
     let shown = relativize_path(&sandbox_path, &cwd);
-    Ok((
-        blockedit::success_note(&edits, &matched_lines, &shown),
-        Some(matched_lines),
-    ))
+    Ok((blockedit::success_note(&edits, &shown), Some(matched_lines)))
 }
 
 /// Budget for a `sed` preview's block payload, in bytes.
@@ -3520,11 +3517,11 @@ mod edit_args_wire_tests {
         );
     }
 
-    // ---- Success-string match location (imitation hint) ----
+    // ---- Success string carries no match location ----
 
     #[tokio::test]
     #[serial]
-    async fn success_string_reports_match_location_when_unanchored() {
+    async fn success_string_omits_location_when_unanchored() {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("m.txt", "a\nb\nc\n").await.unwrap();
         let result = execute_edit(serde_json::json!({
@@ -3532,10 +3529,11 @@ mod edit_args_wire_tests {
         }))
         .await;
         assert!(result.is_success(), "got: {result:?}");
-        // The match sits on line 2; the result teaches the `path:LINE` idiom.
+        // The resolved anchor lives in the block header of the rewritten
+        // history, not in this message, so the result stays location-free.
         assert!(
-            result.output().render().contains("(matched at ./m.txt:2)"),
-            "got: {}",
+            !result.output().render().contains("matched"),
+            "result must not echo a match location: {}",
             result.output().render()
         );
     }
