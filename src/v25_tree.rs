@@ -328,6 +328,10 @@ struct TreeAnalysis<'a> {
     terminals: HashSet<&'a str>,
     /// Visible height of each node's subtree (self + deepest descendant).
     heights: HashMap<&'a str, usize>,
+    /// First *visible* entry in each subtree, in write order. A spur's
+    /// connector must land on this row even when the spur root and its early
+    /// children are invisible.
+    first_visible: HashMap<&'a str, Option<&'a str>>,
 }
 
 fn analyze_tree<'a>(
@@ -338,6 +342,7 @@ fn analyze_tree<'a>(
     let mut height: HashMap<&'a str, usize> = HashMap::new();
     let mut ranked: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
     let mut terminals: HashSet<&'a str> = HashSet::new();
+    let mut first_visible: HashMap<&'a str, Option<&'a str>> = HashMap::new();
 
     let mut stack: Vec<(&'a SessionTreeNode, bool)> = Vec::new();
     for n in nodes.iter().rev() {
@@ -371,6 +376,14 @@ fn analyze_tree<'a>(
         if vis > 0 && !has_vis_desc {
             terminals.insert(id);
         }
+        let first = if vis > 0 {
+            Some(id)
+        } else {
+            node.children
+                .iter()
+                .find_map(|c| first_visible.get(c.entry.id.as_str()).copied().flatten())
+        };
+        first_visible.insert(id, first);
         // Descending, so index 0 is the spine; ties in height go to the
         // newer (later-written) branch, as in the spine rule.
         children.sort_by(|a, b| b.cmp(a));
@@ -382,6 +395,7 @@ fn analyze_tree<'a>(
         ranked,
         terminals,
         heights: height,
+        first_visible,
     }
 }
 
@@ -609,10 +623,13 @@ fn flatten_turns<'a>(
     });
 
     // A frame carries the structural state of the row it will emit:
-    // `(node, depth, branch, spur_start, visible_parent)`. `spur_start` is
-    // set on a spur's first child and *propagated* through invisible nodes to
-    // the first visible row of that spur.
-    type Frame<'a> = (&'a SessionTreeNode, usize, u8, bool, Option<&'a str>);
+    // `(node, depth, branch, visible_parent)`. Whether the row starts a spur
+    // is derived from `branch_starts`, keyed on the spur subtree's first
+    // visible entry — so an invisible spur root (or invisible early children)
+    // cannot lose the connector.
+    type Frame<'a> = (&'a SessionTreeNode, usize, u8, Option<&'a str>);
+
+    let mut branch_starts: HashSet<&'a str> = HashSet::new();
 
     let mut root_frames: Vec<Frame> = Vec::with_capacity(roots.len());
     for (rank, node) in roots.iter().enumerate() {
@@ -623,7 +640,7 @@ fn flatten_turns<'a>(
             next_spur = next_spur.saturating_add(1);
             n
         };
-        root_frames.push((node, 0, branch, false, None));
+        root_frames.push((node, 0, branch, None));
     }
 
     // Iterative DFS to avoid stack overflow on deep linear sessions.
@@ -633,10 +650,13 @@ fn flatten_turns<'a>(
     let mut pending: Vec<PendingRow> = Vec::new();
     let mut seq: usize = 0;
 
-    while let Some((node, depth, branch, spur_start, visible_parent)) = stack.pop() {
+    while let Some((node, depth, branch, visible_parent)) = stack.pop() {
         let visible = labels.contains_key(&node.entry.id);
+        // Read the marker before the child-frame closure takes a mutable
+        // borrow of `branch_starts` to register nested spurs.
+        let spur_start = visible && branch_starts.contains(node.entry.id.as_str());
 
-        let mut child_frames = |pending: bool, child_parent: Option<&'a str>| -> Vec<Frame<'a>> {
+        let mut child_frames = |child_parent: Option<&'a str>| -> Vec<Frame<'a>> {
             // Hand out hues in the node's ranked order: rank 0 is the spine
             // and inherits the current branch; the rest take the next colour
             // and step right.
@@ -655,19 +675,19 @@ fn flatten_turns<'a>(
                 }
             };
             let mut frames: Vec<Frame<'a>> = Vec::with_capacity(node.children.len());
-            for (i, child) in node.children.iter().enumerate() {
+            for child in &node.children {
                 let (b, spur) = branch_of(child);
-                // A spur's own first row is its start. `pending` only exists
-                // because this node is invisible and emitted nothing; it
-                // travels to the *first* child — the only one whose subtree
-                // can emit the next row.
-                frames.push((
-                    child,
-                    if spur { depth + 1 } else { depth },
-                    b,
-                    spur || (pending && i == 0),
-                    child_parent,
-                ));
+                if spur {
+                    if let Some(first) = analysis
+                        .first_visible
+                        .get(child.entry.id.as_str())
+                        .copied()
+                        .flatten()
+                    {
+                        branch_starts.insert(first);
+                    }
+                }
+                frames.push((child, if spur { depth + 1 } else { depth }, b, child_parent));
             }
             frames
         };
@@ -676,7 +696,7 @@ fn flatten_turns<'a>(
             // Meta entry: skip visual row but descend into children. The
             // spine rule applies here too — a meta entry can be a fork point
             // even though it has no row of its own.
-            stack.extend(child_frames(spur_start, visible_parent).into_iter().rev());
+            stack.extend(child_frames(visible_parent).into_iter().rev());
             continue;
         }
 
@@ -692,7 +712,7 @@ fn flatten_turns<'a>(
 
         // This row is now the nearest visible ancestor for its children.
         let vp = Some(node.entry.id.as_str());
-        stack.extend(child_frames(false, vp).into_iter().rev());
+        stack.extend(child_frames(vp).into_iter().rev());
     }
 
     // Chronological emission. Stable, so order-less synthetic trees keep the
@@ -4355,6 +4375,34 @@ mod tests {
         assert!(
             is_spur_start(&resp, "x1"),
             "the connector must land on the first visible spur row: {rows:?}"
+        );
+        assert_eq!(prefix_of(&plain_of(&rows, "x1")), "┗━━╻");
+    }
+
+    #[test]
+    fn spur_connector_survives_an_invisible_leading_child() {
+        // The spur root and its first child are both invisible (tool-call
+        // segments), and the first visible row is a later child. The
+        // connector must still land on that row — not be lost because only
+        // child index 0 inherited the pending marker.
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first"),
+            vec![
+                node(
+                    tool_call_entry("t1", Some("u1")),
+                    vec![
+                        node(tool_call_entry("tr", Some("t1")), vec![]),
+                        node(make_entry("x1", Some("tr"), "user", "spur row"), vec![]),
+                    ],
+                ),
+                node(make_entry("u2", Some("u1"), "user", "main line"), vec![]),
+            ],
+        )];
+        let resp = data_for(tree, Some("x1"));
+        let rows = plain_rows(&resp);
+        assert!(
+            is_spur_start(&resp, "x1"),
+            "connector must reach the first visible row of the spur: {rows:?}"
         );
         assert_eq!(prefix_of(&plain_of(&rows, "x1")), "┗━━╻");
     }
