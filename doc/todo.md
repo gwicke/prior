@@ -25,38 +25,10 @@ and link a doc/ and/or commit hash
       (`edit` done; `read`/`write`/`glob`/`grep`/`list`/`sed` open)
 - [ ] Status bar context usage stale after compaction - check if fixed after drawing refactor.
 
-## Rendering / drawing
-
-- [x] `/tree` multiple roots / chronological rows / root hues —
-      doc/261017_tree_robustness.md (write-side anchor still deferred)
-- [x] padded full-width diff lines from edit tool render wrap & cause rendering artifacts —
-      fixed by expand_tabs (tabstop 4) before panel width math; see content/text.rs
-
 ## Token efficiency
 
 - [ ] Minimize tool context
-  - [x] Minimize successful edits: Minimal context (only changed lines), all line anchored to actual
-    resolved lines — doc/261018_minimal_edit_context_anchors.md
-  - [x] Split large successful edits at long internal unchanged runs; real line numbers in the edit
-    preview — doc/261018_minimal_edit_context_anchors.md
-  - [x] Expand a weak locator (a bare `}` / `end`) with nearby lines until it is recognisable, so
-    the model trusts the edit instead of re-reading — doc/261018_minimal_edit_context_anchors.md
-  - More aggressive truncation for long `read` / `bash` outputs
-  - Strip failed edits from previous (before last) completion turns
+  - [ ] More aggressive truncation for long `read` / `bash` outputs
+  - [ ] Strip failed edits from previous (before last) completion turns
 - [ ] Strip reasoning content for older aborted / failed turns once a newer turn completes
       successfully with a final answer.
-- [ ] Multi-file edits - Error: Provider rejected the request (HTTP 400); An assistant message with
-  'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. (insufficient
-  tool messages following tool_calls message)
-      - 0ef960188195b9cf02c38ba011fc5662a82c2391 was not successful. Drop it, and instead implement
-      doc/261013_multi_file_edit_id_continuity.md.
-- [x] Fix "text only" compaction strategy to a) include last summary, and b) only add text context
-  added since.
-
-## Cleanup
-
-- `src/agent.rs` refactor — 261002_agent_refactor.md
-  - [ ] deferred: pad a short row to `term_w` only where draw's per-row entry `EL` proves unreliable
-    (design §Content; impl doc)
-  - [ ] follow-up: track the line-terminator / width repairs back into content — Render's
-        enforcement is a net, not the plan (impl doc)
