@@ -18,60 +18,49 @@ pub(crate) fn render_markdown(src: &str, width: usize) -> String {
     markdown_terminal::render_with(&markdown_stream::parse_gfm(src), &theme, width)
 }
 
-/// Highlight a single physical line of `text` as `lang` using the *same*
-/// markdown code-block formatter the answer/result path uses
-/// (`markdown_terminal` driven by `markdown_stream` via `render_markdown`).
+/// Highlight `text` (a whole code block, possibly multi-line, tab-expanded by
+/// the caller) as `lang` using the *same* markdown code-block formatter the
+/// answer/result path uses (`markdown_terminal` via [`render_markdown`]).
 ///
-/// `text` is already wrapped to `width` by the caller (see
-/// [`crate::content::text::wrap`]); this styles it, it does not reflow it. The
-/// renderer indents a fenced code block by two spaces and, if a line plus that
-/// indent no longer fits `width`, wraps it — so a line handed in at full
-/// `width` would come back as two. Two guards against that:
+/// The renderer wraps code at the source: each line's first row carries a
+/// two-space fence gutter and each wrap continuation four, hard-splitting any
+/// token wider than the budget. That gutter is **kept**, not stripped — the
+/// caller's uniform panel background renders it as seamless margin, and with
+/// nothing to strip a whole block renders correctly in one call (a stripped
+/// gutter would have to distinguish a continuation from a later line's own
+/// indentation, which the flat output does not carry). `width` is the row
+/// budget *including* the gutter, so every returned row is at most `width`
+/// visible columns and the caller pads each to the panel edge.
 ///
-/// * the fenced block is rendered two columns **wider** than the panel row, so
-///   the renderer's two-space indent eats the slack and a line already at
-///   `width` still fits on one physical line;
-/// * every *physical* line of the renderer's output has its leading code
-///   indent stripped (the renderer indents continuations too), so no embedded
-///   newline reaches [`crate::content::panel::panel_row`] — which pads its
-///   argument as a single row, and a multi-line blob there came out one long
-///   row that wrapped in the terminal and leaked the frame behind it.
-///
-/// Returns **foreground-only** ANSI (no background) so the caller can layer the
-/// dark-grey tool panel on top via `paint_panel`. Each call builds a fresh
-/// fenced block, so the formatter is fully isolated/flushed per line.
+/// Returns one row per physical line, joined by `\n` with no trailing newline,
+/// **foreground-only** ANSI so the caller can layer the grey panel on top via
+/// `paint_panel`. The fence is as long as the content's longest backtick run
+/// plus one, so a ``` in tool output (markdown, heredocs) stays literal content
+/// instead of closing the block and letting the rest re-flow as prose.
 pub(crate) fn highlight_code_fg(text: &str, lang: &str, width: usize) -> String {
     if text.is_empty() {
         return text.to_string();
     }
-    let md = format!("```{lang}\n{text}\n```\n");
-    // +2: the renderer's per-line code indent. Keeps a `width`-wide line on
-    // one physical line instead of letting the indent push it into a re-wrap.
-    let rendered = render_markdown(&md, width.saturating_add(2));
-    // Strip by position, not by leading-space count: the renderer indents the
-    // first code line by two and each wrap-continuation by four, but a code
-    // line's *own* leading whitespace can sit on the first line and must
-    // survive. Line 0 loses the two-space code indent; every later line is a
-    // wrap continuation and loses the four-space one. What remains is
-    // foreground-only ANSI with no embedded newline for `panel_row` to
-    // mis-pad as part of one row.
-    let body: Vec<&str> = rendered
+    let fence = "`".repeat(longest_backtick_run(text).max(2) + 1);
+    let md = format!("{fence}{lang}\n{text}\n{fence}\n");
+    render_markdown(&md, width)
         .trim_end_matches('\n')
-        .split('\n')
-        .enumerate()
-        .map(|(i, line)| {
-            if i == 0 {
-                line.strip_prefix("  ")
-                    .or_else(|| line.strip_prefix(' '))
-                    .unwrap_or(line)
-            } else {
-                line.strip_prefix("    ")
-                    .or_else(|| line.strip_prefix("  "))
-                    .unwrap_or(line)
-            }
-        })
-        .collect();
-    body.join("\n")
+        .to_string()
+}
+
+/// Longest run of consecutive backticks in `s` — used to size a code fence that
+/// cannot be closed early by backticks inside the content.
+fn longest_backtick_run(s: &str) -> usize {
+    let (mut best, mut cur) = (0usize, 0usize);
+    for c in s.chars() {
+        if c == '`' {
+            cur += 1;
+            best = best.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    best
 }
 
 /// Language id used to colorize a tool *command* label (e.g. `read …`,
@@ -133,59 +122,61 @@ pub(crate) fn answer_theme() -> Theme {
 mod tests {
     use super::highlight_code_fg;
     use slashdot_tui::ansi::strip_ansi;
+    use unicode_width::UnicodeWidthStr;
 
-    /// The highlighter must not reflow its input: a line already wrapped to
-    /// the panel row's budget comes back as exactly one physical line, or the
-    /// caller pads a multi-line blob into one over-wide row that wraps in the
-    /// terminal and leaks the frame behind it.
-    #[test]
-    fn a_line_at_the_budget_stays_one_physical_line() {
-        for width in [20usize, 40, 79] {
-            let line = "x".repeat(width);
-            let out = highlight_code_fg(&line, "bash", width);
-            assert_eq!(out.lines().count(), 1, "wrapped at width {width}: {out:?}");
-            let plain = strip_ansi(&out);
-            assert_eq!(plain, line, "content altered at width {width}");
-        }
+    /// Visible width of a rendered row, as the terminal draws it.
+    fn vis(row: &str) -> usize {
+        UnicodeWidthStr::width(strip_ansi(row).as_str())
     }
 
-    /// The renderer indents each wrap-continuation by four spaces (so a wrapped
-    /// block reads as one level). Those must be stripped so `panel_row` never
-    /// sees an embedded newline whose continuation is still indented. A code
-    /// line's *own* leading whitespace is a different thing and must survive.
+    /// A whole block is handed over at once (no per-line wrapping by the
+    /// caller): every returned row must fit the budget including the fence
+    /// gutter, and a line's own indentation must survive behind that gutter.
     #[test]
-    fn rewrapped_continuations_are_unindented() {
-        // Deliberately over-wide for its budget: the renderer will wrap it.
-        // No leading whitespace of its own, so every leading space on a
-        // physical line is the renderer's continuation indent.
-        let line = "word ".repeat(20);
-        let line = line.trim_end();
-        let out = highlight_code_fg(line, "bash", 12);
-        assert!(out.lines().count() > 1, "fixture must wrap: {out:?}");
-        for physical in out.lines().skip(1) {
-            assert!(
-                !physical.starts_with("  "),
-                "continuation indent survived: {physical:?}"
-            );
+    fn a_block_fits_the_budget_and_keeps_own_indent() {
+        let width = 40;
+        let block = "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr\n    indented();";
+        let out = highlight_code_fg(block, "bash", width);
+        for row in out.lines() {
+            assert!(vis(row) <= width, "row over budget ({}): {row:?}", vis(row));
         }
-        // The words themselves survive the round-trip, spaces collapsed at
-        // wrap points only.
+        // The indented line keeps its four-space indent, behind the two-space
+        // fence gutter (2 + 4 = 6 leading spaces).
         let plain = strip_ansi(&out);
-        assert_eq!(
-            plain.split_whitespace().collect::<Vec<_>>(),
-            line.split_whitespace().collect::<Vec<_>>()
+        assert!(
+            plain.lines().any(|r| r == "      indented();"),
+            "own indent lost: {plain:?}"
         );
     }
 
-    /// A code line's own leading whitespace is content, not the renderer's
-    /// indent: it must survive on the first physical line. Stripping by
-    /// leading-space *count* would eat a deeply-indented source line here.
+    /// A blank line in the block keeps its own row (gutter-only), so vertical
+    /// structure survives rather than collapsing.
     #[test]
-    fn a_lines_own_indentation_survives() {
-        let out = highlight_code_fg("        deep();", "bash", 40);
-        assert_eq!(out.lines().count(), 1, "{out:?}");
+    fn blank_lines_keep_their_row() {
+        let out = highlight_code_fg("first\n\nlast", "bash", 40);
+        let rows: Vec<&str> = out.lines().collect();
+        assert_eq!(rows.len(), 3, "blank line lost: {out:?}");
+        assert!(
+            vis(rows[1]) <= 2,
+            "blank row not gutter-only: {:?}",
+            strip_ansi(rows[1])
+        );
+    }
+
+    /// A ``` line in tool output must stay literal content, not close the
+    /// fence and let everything after it re-flow as prose. The dynamic-length
+    /// fence guarantees this.
+    #[test]
+    fn a_backtick_line_does_not_close_the_block() {
+        let block = "echo hi\n```\nrm -rf /\necho bye";
+        let out = highlight_code_fg(block, "bash", 40);
+        assert_eq!(out.lines().count(), 4, "block broke at backticks: {out:?}");
         let plain = strip_ansi(&out);
-        assert_eq!(plain, "        deep();", "own indent eaten: {plain:?}");
+        assert!(plain.contains("```"), "backtick line lost: {plain:?}");
+        assert!(
+            plain.contains("rm -rf /"),
+            "later line re-flowed: {plain:?}"
+        );
     }
 
     #[test]

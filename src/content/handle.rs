@@ -30,7 +30,7 @@ use crate::content::markdown::{
     answer_theme, command_lang, guess_lang, highlight_code_fg, render_markdown,
 };
 use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno};
-use crate::content::text::{expand_tabs, wrap};
+use crate::content::text::expand_tabs;
 use crate::render::ContentWrite;
 
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
@@ -912,8 +912,11 @@ impl Content {
         // reads as a distinct block. The command itself is syntax-highlighted
         // through the same formatter the answer/result path uses (flushed per
         // block via a fresh fenced code render).
+        // A label can wrap to several rows (long command); paint each.
         let label_styled = highlight_code_fg(&label, command_lang(name), self.width());
-        self.paint_panel(&label_styled, false);
+        for row in label_styled.split('\n') {
+            self.paint_panel(row, false);
+        }
         for line in &extra {
             self.tool_panel(line, false, true);
         }
@@ -1048,23 +1051,24 @@ impl Content {
                     let width = self.width();
                     let inner = width.saturating_sub(1).max(1);
                     let header = format!("write {} [{} lines]", path, total_lines);
-                    let header_styled = highlight_code_fg(&header, "bash", inner);
-                    self.paint_panel(&header_styled, true);
+                    for row in highlight_code_fg(&header, "bash", inner).split('\n') {
+                        self.paint_panel(row, true);
+                    }
 
-                    // Render the content with syntax highlighting (like read_file)
+                    // Render the content with syntax highlighting (like
+                    // read_file): a whole block in one fenced render, wrapped
+                    // by the formatter. Tab-expanded up front so indentation is
+                    // measured in the columns the terminal will draw.
                     let show_max = 10; // Limit preview to 10 lines (match read_file)
                     let content_lines: Vec<_> = content.lines().collect();
-                    for (printed, line) in content_lines.iter().enumerate() {
-                        if printed >= show_max {
-                            break;
-                        }
-                        // Expand tabs (tabstop 4) so the drawn indentation is
-                        // measured in columns, not counted as zero-width.
-                        let line = expand_tabs(line);
-                        for wline in wrap(line.as_ref(), inner) {
-                            let styled = highlight_code_fg(&wline, lang, inner);
-                            self.paint_panel(&styled, true);
-                        }
+                    let shown: Vec<String> = content_lines
+                        .iter()
+                        .take(show_max)
+                        .map(|l| expand_tabs(l).into_owned())
+                        .collect();
+                    let block = shown.join("\n");
+                    for row in highlight_code_fg(&block, lang, inner).split('\n') {
+                        self.paint_panel(row, true);
                     }
                     if content_lines.len() > show_max {
                         self.tool_panel(
@@ -1111,34 +1115,36 @@ impl Content {
 
         let width = self.width();
         let inner = width.saturating_sub(1).max(1);
-        for (printed, line) in lines.iter().enumerate() {
-            if printed >= show_max {
-                break;
-            }
-            // `read_file` renders `NNNN| content`; drop the gutter for display
-            // (the model still gets the numbers in the raw tool result).
-            let visible = if is_read {
-                strip_read_lineno(line)
-            } else {
-                line
-            };
-            // Expand tabs up front (tabstop 4): the terminal draws a tab as a
-            // run of spaces but every measure here counts it as zero columns,
-            // so an indented source line used to be padded to full width on
-            // top of its drawn indentation — one row too wide, which wrapped
-            // and leaked the frame behind it.
-            let visible = expand_tabs(visible);
-            for wline in wrap(visible.as_ref(), inner) {
-                if is_error {
-                    self.tool_panel(&wline, true, true);
+        // `read_file` renders `NNNN| content`; drop the gutter for display (the
+        // model still gets the numbers in the raw tool result). Expand tabs
+        // (tabstop 4) so indentation is measured in the columns the terminal
+        // will draw, not counted as zero-width.
+        let visible: Vec<String> = lines
+            .iter()
+            .take(show_max)
+            .map(|line| {
+                let v = if is_read {
+                    strip_read_lineno(line)
                 } else {
-                    // Syntax-highlight through the result-path formatter at the
-                    // *inner* budget the panel reserves (not the full width —
-                    // the indented row leaves one column for its lead), then
-                    // layer the grey tool panel on top (flushed per line).
-                    let styled = highlight_code_fg(&wline, lang, inner);
-                    self.paint_panel(&styled, true);
-                }
+                    *line
+                };
+                expand_tabs(v).into_owned()
+            })
+            .collect();
+
+        if is_error {
+            // Errors are shown verbatim (red); `tool_panel` wraps and styles
+            // each line.
+            for line in &visible {
+                self.tool_panel(line, true, true);
+            }
+        } else {
+            // Non-error results: one fenced render of the whole visible block
+            // at the *inner* budget the indented row reserves, wrapped by the
+            // formatter, then one grey panel row per returned line.
+            let block = visible.join("\n");
+            for row in highlight_code_fg(&block, lang, inner).split('\n') {
+                self.paint_panel(row, true);
             }
         }
 
@@ -1580,6 +1586,9 @@ mod tests {
     use crate::app_state::AppState;
     // The test-local `strip_ansi` helper below needs the lead-byte table.
     use crate::ansi::utf8_len;
+    // `wrap` is unit-tested here but no longer imported in production (the
+    // highlight path defers wrapping to the markdown formatter).
+    use crate::content::text::wrap;
     // The pure pipeline the manager's render runs (and the composer tests
     // re-run).
     use crate::render::{allocate, live_budget, render, Element, RowAsk};
