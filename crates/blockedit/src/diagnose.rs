@@ -151,7 +151,7 @@ impl BatchEditFailure {
         let failed = items.len();
         let mut model_view = String::new();
         model_view.push_str(&format!(
-            "{failed} of {total} edit(s) failed. No edits applied.\n",
+            "{failed} of {total} edit(s) failed validation. No edits applied for this file.\n",
         ));
         for item in &items {
             // Per-edit body has no header of its own; we add the
@@ -175,8 +175,8 @@ impl BatchEditFailure {
             format!("edit failed:\n  {}", items[0].failure.ui_view)
         } else {
             format!(
-                "edit failed: {failed} of {total} edit(s) had problems. \
-                 No edits applied. See model tool message for details.",
+                "{failed} of {total} edit(s) failed validation. \
+                 No edits applied for this file. See model tool message for details.",
             )
         };
         BatchEditFailure {
@@ -1599,7 +1599,7 @@ mod tests {
     #[test]
     fn batch_with_single_failure_does_not_double_header() {
         // Regression: the previous format produced
-        //   "edit failed: 1 of 1 edit(s) had problems.
+        //   "edit failed: 1 of 1 edit(s) failed validation.
         //    edit #1 oldText not found.
         //    edit failed: oldText not found. Closest match at file lines..."
         // The compact form should be a single per-edit line under a
@@ -1657,7 +1657,7 @@ mod tests {
             },
         }];
         let b = BatchEditFailure::build(1, items);
-        // Envelope: "1 of 1 edit(s) failed. No edits applied."
+        // Envelope: "1 of 1 edit(s) failed validation. No edits applied for this file."
         assert!(b.model_view.starts_with("1 of 1 edit(s) failed"));
         assert!(b.model_view.contains("--- edit #1 ---"));
         // Body preserved.

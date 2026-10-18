@@ -3586,7 +3586,7 @@ mod edit_file_tests {
 
         // The UI view should be a count summary, not contain file
         // content (only one line range per failure, no diff excerpts).
-        assert!(ui.contains("2 of 3 edit(s) had problems"));
+        assert!(ui.contains("2 of 3 edit(s) failed validation"));
         assert!(!ui.contains("--- edit #"));
 
         // The file must be unchanged.
