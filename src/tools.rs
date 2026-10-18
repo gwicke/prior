@@ -1194,12 +1194,24 @@ pub(crate) async fn run_sandboxed_ro_status(
 }
 
 /// Trim combined output and normalize empty results.
+///
+/// Characters are trimmed only at the *end* (trailing newlines/spaces are
+/// invisible). At the start, whole blank lines are dropped instead: a
+/// character `.trim()` would eat the first line's indentation — `git status
+/// --short` marks worktree-modified files with a leading space (` M f`) —
+/// misaligning it against the lines below.
 fn trim_output(out: Vec<u8>) -> String {
-    let s = String::from_utf8_lossy(&out).trim().to_string();
-    if s.is_empty() {
+    let s = String::from_utf8_lossy(&out);
+    let body = s.trim_end();
+    let trimmed = body
+        .lines()
+        .skip_while(|l| l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if trimmed.is_empty() {
         "(empty)".into()
     } else {
-        s
+        trimmed
     }
 }
 
@@ -1798,6 +1810,31 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::path::Path;
+
+    /// A result's first-line indentation is content, not padding: only whole
+    /// blank lines at the edges go. `git status --short` marks worktree-
+    /// modified files with a leading space (` M f`), and a character trim of
+    /// the whole output used to eat exactly that one space, misaligning the
+    /// first line against the rest.
+    #[test]
+    fn trim_output_keeps_first_line_indent() {
+        let out = b" M a\n M b\n M c\n".to_vec();
+        assert_eq!(trim_output(out), " M a\n M b\n M c");
+    }
+
+    /// Blank lines at either edge are dropped; internal blank lines survive.
+    #[test]
+    fn trim_output_drops_edge_blank_lines_only() {
+        let out = b"\n\n  indented\n\n  more\n\n\n".to_vec();
+        assert_eq!(trim_output(out), "  indented\n\n  more");
+    }
+
+    /// Whitespace-only output normalizes to the empty marker.
+    #[test]
+    fn trim_output_whitespace_only_is_empty() {
+        assert_eq!(trim_output(b" \n \t \n".to_vec()), "(empty)");
+        assert_eq!(trim_output(Vec::new()), "(empty)");
+    }
 
     #[test]
     fn test_validate_path_normal() {
