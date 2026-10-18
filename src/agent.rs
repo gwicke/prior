@@ -523,6 +523,7 @@ pub(crate) async fn ensure_session(
                     .build_index()
                     .await
                     .unwrap_or_else(|_| crate::session::SessionIndex {
+                        order: Vec::new(),
                         header: crate::session::SessionHeader::with_model_context(
                             &cwd,
                             provider,
@@ -557,6 +558,7 @@ pub(crate) async fn fork_session_at(
             let index = new_storage.build_index().await.unwrap_or_else(|_| {
                 let header = crate::session::SessionHeader::new(&cwd);
                 crate::session::SessionIndex {
+                    order: Vec::new(),
                     header,
                     entries: std::collections::HashMap::new(),
                     leaf_id: None,
@@ -1195,6 +1197,7 @@ mod tests {
             .build_index()
             .await
             .unwrap_or_else(|_| crate::session::SessionIndex {
+                order: Vec::new(),
                 header: crate::session::SessionHeader::with_model_context(
                     cwd,
                     Some("anthropic".into()),
@@ -1373,6 +1376,7 @@ mod tests {
                 .build_index()
                 .await
                 .unwrap_or_else(|_| crate::session::SessionIndex {
+                    order: Vec::new(),
                     header: header1,
                     entries: std::collections::HashMap::new(),
                     leaf_id: None,
@@ -1400,6 +1404,7 @@ mod tests {
                 .build_index()
                 .await
                 .unwrap_or_else(|_| crate::session::SessionIndex {
+                    order: Vec::new(),
                     header: header2,
                     entries: std::collections::HashMap::new(),
                     leaf_id: None,
@@ -1481,6 +1486,7 @@ mod tests {
                 .build_index()
                 .await
                 .unwrap_or_else(|_| crate::session::SessionIndex {
+                    order: Vec::new(),
                     header: h0,
                     entries: std::collections::HashMap::new(),
                     leaf_id: None,
@@ -1510,6 +1516,7 @@ mod tests {
                 .build_index()
                 .await
                 .unwrap_or_else(|_| crate::session::SessionIndex {
+                    order: Vec::new(),
                     header: h1,
                     entries: std::collections::HashMap::new(),
                     leaf_id: None,

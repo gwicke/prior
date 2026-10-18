@@ -27,6 +27,8 @@ and link a doc/ and/or commit hash
 
 ## Rendering / drawing
 
+- [x] `/tree` multiple roots / chronological rows / root hues —
+      doc/261017_tree_robustness.md (write-side anchor still deferred)
 - [ ] padded full-width diff lines from edit tool render wrap & cause rendering artifacts
 
 ## Token efficiency

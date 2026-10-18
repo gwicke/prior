@@ -326,6 +326,8 @@ fn entry_role(entry: &SessionEntry) -> String {
 struct TreeAnalysis<'a> {
     ranked: HashMap<&'a str, Vec<&'a str>>,
     terminals: HashSet<&'a str>,
+    /// Visible height of each node's subtree (self + deepest descendant).
+    heights: HashMap<&'a str, usize>,
 }
 
 fn analyze_tree<'a>(
@@ -376,7 +378,11 @@ fn analyze_tree<'a>(
         ranked.insert(id, children.into_iter().map(|(_, _, c)| c).collect());
     }
 
-    TreeAnalysis { ranked, terminals }
+    TreeAnalysis {
+        ranked,
+        terminals,
+        heights: height,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -404,37 +410,29 @@ fn bar_col(depth: usize) -> usize {
     }
 }
 
-/// What the bar cell draws. The vertical is per *branch*: it runs through
-/// the branch's rows and stops at its end, so a spur that forks in a new
-/// turn still shows one continuous pipe.
+/// The bar cell glyph.
+///
+/// `up` / `down` say whether the neighbouring *emitted* row shares this
+/// row's `(branch, depth)`. Rows are emitted chronologically, so unrelated
+/// sequences can meet; the tick glyphs stop the ink short there and leave a
+/// visible gap instead of drawing a false pipe between two trees.
+///
+/// Assistant rows keep the rightward arm (the reply cue); user rows use bare
+/// ticks. There are no horizontal caps: a run simply ends with an up tick.
 ///
 /// Heavy box-drawing throughout — over a saturated wash the thin strokes
 /// (U+2502 and friends) read as too faint, so the bar is carried by the
 /// stroke rather than by the colour behind it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Bar {
-    /// `┃` — the branch continues below.
-    Line,
-    /// `┣` — a reply whose branch continues below (the arm points at it).
-    Reply,
-    /// `┗` — a reply on the branch's last row: the ladder turns off.
-    ReplyEnd,
-    /// `┻` — a non-reply on the branch's last row: the pipe ends.
-    End,
-    /// `┓` — a spur's first visible row: the connector arrives from the
-    /// left and turns down into this branch.
-    SpurStart,
-}
-
-impl Bar {
-    fn glyph(self) -> char {
-        match self {
-            Bar::Line => '\u{2503}',      // ┃ HEAVY VERTICAL
-            Bar::Reply => '\u{2523}',     // ┣ HEAVY VERTICAL AND RIGHT
-            Bar::ReplyEnd => '\u{2517}',  // ┗ HEAVY UP AND RIGHT
-            Bar::End => '\u{253b}',       // ┻ HEAVY UP AND HORIZONTAL
-            Bar::SpurStart => '\u{2513}', // ┓ HEAVY DOWN AND LEFT
-        }
+fn bar_glyph(up: bool, down: bool, assistant: bool) -> char {
+    match (up, down, assistant) {
+        (true, true, false) => '\u{2503}',  // ┃
+        (true, true, true) => '\u{2523}',   // ┣
+        (false, true, false) => '\u{257b}', // ╻ (opening tick)
+        (false, true, true) => '\u{250f}',  // ┏ (opening elbow)
+        (true, false, false) => '\u{2579}', // ╹ (closing tick)
+        (true, false, true) => '\u{2517}',  // ┗ (closing elbow)
+        (false, false, false) => ' ',
+        (false, false, true) => '\u{2578}', // ╸ (the lone reply mark)
     }
 }
 
@@ -498,20 +496,29 @@ fn branch_rgb(branch: u8) -> (u8, u8, u8) {
 }
 
 /// Build the prefix for one row: the connector (on a spur's first visible
-/// row), the bar cell, and the assistant step.
+/// row, when its parent is the adjacent emitted row), the bar cell, and the
+/// assistant step.
 ///
-/// The spur connector is not decorative: pre-order DFS guarantees a node's
-/// first child is emitted on the row immediately below it, so the row above
-/// a spur's first row *is* its parent.
-fn row_prefix(depth: usize, branch: u8, bar: Bar, assistant: bool) -> String {
+/// `up` / `down` are the join state supplied by the emitted neighbours;
+/// `connector` is only set when the parent row is the one immediately above.
+fn row_prefix(
+    depth: usize,
+    branch: u8,
+    up: bool,
+    down: bool,
+    assistant: bool,
+    connector: bool,
+) -> String {
     let bar_at = bar_col(depth);
     let mut out = String::new();
 
     // Connector: a heavy elbow in the parent's bar column, then a heavy run
     // to our bar. The block has no heavy *arc* (`╰` is a light-arc only), so
     // the connector is told apart from the bar by its neutral ink rather
-    // than by its weight.
-    if bar == Bar::SpurStart {
+    // than by its weight. A break in chronological order means the parent
+    // row is not adjacent, so the run is omitted rather than crossing an
+    // unrelated sequence.
+    if connector {
         let parent_at = bar_col(depth.saturating_sub(1));
         out.push_str(&" ".repeat(parent_at));
         let run = bar_at.saturating_sub(parent_at + 1);
@@ -528,21 +535,19 @@ fn row_prefix(depth: usize, branch: u8, bar: Bar, assistant: bool) -> String {
 
     // The bar cell: wash (hue faded by depth) with black ink, so the wash
     // recedes while the line stays legible.
+    let glyph = bar_glyph(up, down, assistant);
     let wash = blend(branch_rgb(branch), fade_at(depth));
     out.push_str(&format!(
         "\x1b[48;2;{};{};{}m\x1b[38;2;0;0;0m{}\x1b[0m",
-        wash.0,
-        wash.1,
-        wash.2,
-        bar.glyph()
+        wash.0, wash.1, wash.2, glyph
     ));
 
     // A reply sits one column right of the bar. The junction's arm already
     // points right, so the step carries a grey `╸` that continues that
     // horizontal into the text and hooks up to the row above: with the
     // reply indent down to a single column, the mark is what keeps replies
-    // scannable.
-    if assistant {
+    // scannable. The lone-reply glyph is already `╸`, so it is not doubled.
+    if assistant && glyph != '\u{2578}' {
         out.push_str(&format!(
             "\x1b[38;2;{};{};{}m\u{2578}\x1b[0m",
             CONNECTOR_RGB.0, CONNECTOR_RGB.1, CONNECTOR_RGB.2,
@@ -551,54 +556,96 @@ fn row_prefix(depth: usize, branch: u8, bar: Bar, assistant: bool) -> String {
     out
 }
 
-/// Flatten the tree into rows, reusing the shape computed by
-/// [`analyze_tree`] rather than re-walking the tree here.
-fn flatten_turns(
-    nodes: &[SessionTreeNode],
+/// Pending visible row: its structural shape plus the file-order key used to
+/// place it in the chronological sequence.
+struct PendingRow<'a> {
+    node: &'a SessionTreeNode,
+    /// DFS visit index — the stable tie-break when `order` is absent.
+    seq: usize,
+    depth: usize,
+    branch: u8,
+    spur_start: bool,
+    /// Nearest visible ancestor, for deciding whether the connector's parent
+    /// row is actually adjacent in the emitted sequence.
+    visible_parent: Option<&'a str>,
+}
+
+/// Flatten the tree into rows.
+///
+/// Structure (depth, branch, spur_start) comes from the ranked tree; **row
+/// order** comes from `SessionTreeNode::order` (file/append order). Rows are
+/// therefore chronological even when trees interleave or a session has more
+/// than one root. Ties fall back to DFS visit order, which keeps synthetic
+/// trees (all order 0) in the order they were built.
+fn flatten_turns<'a>(
+    nodes: &'a [SessionTreeNode],
     leaf_id: Option<&str>,
     active_path: &HashSet<String>,
     labels: &HashMap<String, String>,
-    analysis: &TreeAnalysis,
+    analysis: &TreeAnalysis<'a>,
     out: &mut Vec<FlatRow>,
 ) {
     let ranked = &analysis.ranked;
-    let terminals = &analysis.terminals;
-    // Global spur counter: hues are handed out once per spur, tallest
-    // first within each fork, so two different level-1 excursions get
-    // different colours (a per-parent ordinal would make every single-spur
-    // branch the same colour, which says nothing about identity). Starts at
-    // 1 — 0 is the spine/anchor.
+    // Global spur counter: hues are handed out once per spur, tallest first
+    // within each fork. Starts at 1 — 0 is the spine/anchor.
     let mut next_spur: u8 = 1;
 
-    // A frame carries the branch state of the row it will emit:
-    // `(node, depth, branch, spur_start)`. `spur_start` is set on a spur's
-    // first child and *propagated* through invisible nodes to the first
-    // visible row of that spur, so a marker never lands on a hidden entry.
-    type Frame<'a> = (&'a SessionTreeNode, usize, u8, bool);
+    // Root ranking: tallest root is the mainline and always keeps branch 0,
+    // so the anchor colour never moves. The rest take spur hues, deepest
+    // first. Depth stays 0 (a root is not indented) — the hue is the marker.
+    let mut roots: Vec<&SessionTreeNode> = nodes.iter().collect();
+    roots.sort_by(|a, b| {
+        let ha = analysis
+            .heights
+            .get(a.entry.id.as_str())
+            .copied()
+            .unwrap_or(0);
+        let hb = analysis
+            .heights
+            .get(b.entry.id.as_str())
+            .copied()
+            .unwrap_or(0);
+        hb.cmp(&ha).then(a.order.cmp(&b.order))
+    });
 
-    // Iterative DFS to avoid stack overflow on deep linear sessions.
-    // Push root nodes in reverse so the first sibling is processed first.
-    let mut stack: Vec<Frame> = Vec::new();
-    for node in nodes.iter().rev() {
-        stack.push((node, 0, 0, false));
+    // A frame carries the structural state of the row it will emit:
+    // `(node, depth, branch, spur_start, visible_parent)`. `spur_start` is
+    // set on a spur's first child and *propagated* through invisible nodes to
+    // the first visible row of that spur.
+    type Frame<'a> = (&'a SessionTreeNode, usize, u8, bool, Option<&'a str>);
+
+    let mut root_frames: Vec<Frame> = Vec::with_capacity(roots.len());
+    for (rank, node) in roots.iter().enumerate() {
+        let branch = if rank == 0 {
+            0
+        } else {
+            let n = next_spur;
+            next_spur = next_spur.saturating_add(1);
+            n
+        };
+        root_frames.push((node, 0, branch, false, None));
     }
 
-    while let Some((node, depth, branch, spur_start)) = stack.pop() {
-        let mut child_frames = |pending: bool| -> Vec<Frame> {
+    // Iterative DFS to avoid stack overflow on deep linear sessions.
+    let mut stack: Vec<Frame> = Vec::new();
+    stack.extend(root_frames.into_iter().rev());
+
+    let mut pending: Vec<PendingRow> = Vec::new();
+    let mut seq: usize = 0;
+
+    while let Some((node, depth, branch, spur_start, visible_parent)) = stack.pop() {
+        let visible = labels.contains_key(&node.entry.id);
+
+        let mut child_frames = |pending: bool, child_parent: Option<&'a str>| -> Vec<Frame<'a>> {
             // Hand out hues in the node's ranked order: rank 0 is the spine
-            // (branch 0), the rest take the next colours.
+            // and inherits the current branch; the rest take the next colour
+            // and step right.
             let order = ranked
                 .get(node.entry.id.as_str())
                 .map(|ids| ids.as_slice())
                 .unwrap_or(&[]);
-            // Returns (branch, is_spur). "Spur" is a *rank*, not a colour:
-            // a spine inside a spur inherits a non-zero branch but does not
-            // step right and does not open a new connector.
             let mut branch_of = |child: &SessionTreeNode| -> (u8, bool) {
                 match order.iter().position(|id| *id == child.entry.id.as_str()) {
-                    // The spine continues the current branch, so it
-                    // inherits its hue — a spur's replies are the same
-                    // colour as the spur's first row.
                     None | Some(0) => (branch, false),
                     Some(_) => {
                         let n = next_spur;
@@ -607,65 +654,79 @@ fn flatten_turns(
                     }
                 }
             };
-            let mut frames: Vec<Frame> = Vec::with_capacity(node.children.len());
+            let mut frames: Vec<Frame<'a>> = Vec::with_capacity(node.children.len());
             for (i, child) in node.children.iter().enumerate() {
                 let (b, spur) = branch_of(child);
-                // A spur's own first row is its start. `pending` (this
-                // node's flag) is only alive because the node is invisible
-                // and emitted nothing, and it travels to the *first* child
-                // — the only one whose subtree can emit the next row.
+                // A spur's own first row is its start. `pending` only exists
+                // because this node is invisible and emitted nothing; it
+                // travels to the *first* child — the only one whose subtree
+                // can emit the next row.
                 frames.push((
                     child,
                     if spur { depth + 1 } else { depth },
                     b,
                     spur || (pending && i == 0),
+                    child_parent,
                 ));
             }
             frames
         };
 
-        if !labels.contains_key(&node.entry.id) {
+        if !visible {
             // Meta entry: skip visual row but descend into children. The
-            // spine rule applies here too — a meta entry can be a fork
-            // point even though it has no row of its own.
-            stack.extend(child_frames(spur_start).into_iter().rev());
+            // spine rule applies here too — a meta entry can be a fork point
+            // even though it has no row of its own.
+            stack.extend(child_frames(spur_start, visible_parent).into_iter().rev());
             continue;
         }
 
-        let assistant = is_assistant(&node.entry);
-        // The bar glyph (§5.1): the vertical runs per branch, so the
-        // ladder turns off / the pipe ends on the branch's last row, not
-        // at the end of each turn.
-        let bar = if spur_start {
-            Bar::SpurStart
-        } else if terminals.contains(node.entry.id.as_str()) {
-            if assistant {
-                Bar::ReplyEnd
-            } else {
-                Bar::End
-            }
-        } else if assistant {
-            Bar::Reply
-        } else {
-            Bar::Line
-        };
-
-        out.push(FlatRow {
-            prefix: row_prefix(depth, branch, bar, assistant),
+        pending.push(PendingRow {
+            node,
+            seq,
             depth,
             branch,
             spur_start,
-            desc: entry_row_desc(&node.entry, node.label.as_deref(), labels),
-            entry_id: node.entry.id.clone(),
-            on_active_path: active_path.contains(&node.entry.id),
-            is_current: leaf_id == Some(node.entry.id.as_str()),
-            role: entry_role(&node.entry),
-            timestamp: node.entry.timestamp.clone(),
-            is_terminal: terminals.contains(node.entry.id.as_str()),
+            visible_parent,
         });
+        seq += 1;
 
-        // Push children in reverse so first child is processed first.
-        stack.extend(child_frames(false).into_iter().rev());
+        // This row is now the nearest visible ancestor for its children.
+        let vp = Some(node.entry.id.as_str());
+        stack.extend(child_frames(false, vp).into_iter().rev());
+    }
+
+    // Chronological emission. Stable, so order-less synthetic trees keep the
+    // DFS order they were built in.
+    pending.sort_by_key(|p| (p.node.order, p.seq));
+
+    let count = pending.len();
+    out.reserve(count);
+    for i in 0..count {
+        let p = &pending[i];
+        let same = |other: &PendingRow| other.branch == p.branch && other.depth == p.depth;
+        let up = i > 0 && same(&pending[i - 1]);
+        // A spur start always opens downwards — the connector (or its hue
+        // marker when the parent is not adjacent) has to land on a tick, not
+        // on a blank cell, even when the spur is a single row.
+        let down = (i + 1 < count && same(&pending[i + 1])) || p.spur_start;
+        let connector = p.spur_start
+            && i > 0
+            && (p.visible_parent == Some(pending[i - 1].node.entry.id.as_str()));
+        let assistant = is_assistant(&p.node.entry);
+
+        out.push(FlatRow {
+            prefix: row_prefix(p.depth, p.branch, up, down, assistant, connector),
+            depth: p.depth,
+            branch: p.branch,
+            spur_start: p.spur_start,
+            desc: entry_row_desc(&p.node.entry, p.node.label.as_deref(), labels),
+            entry_id: p.node.entry.id.clone(),
+            on_active_path: active_path.contains(&p.node.entry.id),
+            is_current: leaf_id == Some(p.node.entry.id.as_str()),
+            role: entry_role(&p.node.entry),
+            timestamp: p.node.entry.timestamp.clone(),
+            is_terminal: analysis.terminals.contains(p.node.entry.id.as_str()),
+        });
     }
 }
 
@@ -1980,6 +2041,7 @@ mod tests {
 
     fn node(entry: SessionEntry, children: Vec<SessionTreeNode>) -> SessionTreeNode {
         SessionTreeNode {
+            order: 0,
             entry: Arc::new(entry),
             children,
             label: None,
@@ -2804,6 +2866,7 @@ mod tests {
     #[test]
     fn tree_model_change_shows_prefix() {
         let tree = vec![SessionTreeNode {
+            order: 0,
             entry: Arc::new(SessionEntry {
                 id: "mc1".into(),
                 parent_id: None,
@@ -2845,6 +2908,7 @@ mod tests {
     fn tree_empty_entry_hidden() {
         // A tool-call-only assistant segment should produce no row.
         let tree = vec![SessionTreeNode {
+            order: 0,
             entry: Arc::new(SessionEntry {
                 id: "tc1".into(),
                 parent_id: None,
@@ -3297,7 +3361,7 @@ mod tests {
         );
         let rows = plain_rows(&resp);
         for (id, want) in [
-            ("u1", "┃"),
+            ("u1", "╻"),
             ("a1", "┣╸"),
             ("u2", "┃"),
             ("a2", "┣╸"),
@@ -3326,7 +3390,7 @@ mod tests {
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 2);
-                assert_eq!(prefix_of(&strip_sgr(&plan.rows[0].0)), "┃");
+                assert_eq!(prefix_of(&strip_sgr(&plan.rows[0].0)), "╻");
                 assert_eq!(prefix_of(&strip_sgr(&plan.rows[1].0)), "┗╸");
             }
             other => panic!(
@@ -3367,7 +3431,7 @@ mod tests {
                 assert_eq!(plan.rows.len(), 6);
                 // Main line all the way: the bar is at column 0 for every
                 // row, and only the final reply turns the ladder off.
-                let expected = ["┃", "┣╸", "┃", "┣╸", "┃", "┗╸"];
+                let expected = ["╻", "┣╸", "┃", "┣╸", "┃", "┗╸"];
                 for (i, want) in expected.iter().enumerate() {
                     let got = prefix_of(&strip_sgr(&plan.rows[i].0));
                     assert_eq!(got, *want, "row {} prefix: {got:?}", i);
@@ -3452,6 +3516,7 @@ mod tests {
         // Realistic tree: user/assistant turns with model changes at the end.
         // u1 → a1 → u2 → a2 → mc1 → mc2, mc3, mc4
         let mc2 = SessionTreeNode {
+            order: 0,
             entry: Arc::new(SessionEntry {
                 id: "mc2".into(),
                 parent_id: Some("mc1".into()),
@@ -3465,6 +3530,7 @@ mod tests {
             label: None,
         };
         let mc3 = SessionTreeNode {
+            order: 0,
             entry: Arc::new(SessionEntry {
                 id: "mc3".into(),
                 parent_id: Some("mc1".into()),
@@ -3478,6 +3544,7 @@ mod tests {
             label: None,
         };
         let mc4 = SessionTreeNode {
+            order: 0,
             entry: Arc::new(SessionEntry {
                 id: "mc4".into(),
                 parent_id: Some("mc1".into()),
@@ -3499,6 +3566,7 @@ mod tests {
                     vec![node(
                         make_entry("a2", Some("u2"), "assistant", "reply2"),
                         vec![SessionTreeNode {
+                            order: 0,
                             entry: Arc::new(SessionEntry {
                                 id: "mc1".into(),
                                 parent_id: Some("a2".into()),
@@ -3533,14 +3601,14 @@ mod tests {
                 // tie-break picks the newest (mc4) for the margin; mc2/mc3
                 // open connectors and step right.
                 let expected = [
-                    "┃",    // u1
+                    "╻",    // u1
                     "┣╸",   // a1
                     "┃",    // u2
                     "┣╸",   // a2
-                    "┃",    // mc1, a non-reply marker on the main line
-                    "┗━━┓", // mc2, spur
-                    "┗━━┓", // mc3, spur
-                    "┻",    // mc4, the spine, and the branch's last row
+                    "╹",    // mc1, a non-reply marker on the main line
+                    "┗━━╻", // mc2, spur
+                    "   ╻", // mc3, spur (parent not adjacent above)
+                    " ",    // mc4, the spine: isolated between spur rows
                 ];
                 for (i, want) in expected.iter().enumerate() {
                     let got = prefix_of(&strip_sgr(&plan.rows[i].0));
@@ -3565,6 +3633,7 @@ mod tests {
             vec![node(
                 make_entry("a1", Some("u1"), "assistant", "reply 1"),
                 vec![SessionTreeNode {
+                    order: 0,
                     entry: Arc::new(SessionEntry {
                         id: "mc1".into(),
                         parent_id: Some("a1".into()),
@@ -3597,7 +3666,7 @@ mod tests {
         // A model-change marker is a non-reply row: it keeps the bar on the
         // main line, and the reply after it still gets its junction.
         for (id, want) in [
-            ("u1", "┃"),
+            ("u1", "╻"),
             ("a1", "┣╸"),
             ("mc1", "┃"),
             ("u2", "┃"),
@@ -3613,10 +3682,12 @@ mod tests {
         // The invisible entries must NOT break the turn grouping so the
         // visible assistant gets +2 indent.
         let tree = vec![SessionTreeNode {
+            order: 0,
             entry: Arc::new(make_entry("u1", None, "user", "Please critique")),
             children: vec![
                 // First assistant segment: tool-call-only (invisible)
                 SessionTreeNode {
+                    order: 0,
                     entry: Arc::new(SessionEntry {
                         id: "a_tool1".into(),
                         parent_id: Some("u1".into()),
@@ -3631,6 +3702,7 @@ mod tests {
                     children: vec![
                         // Tool result (invisible)
                         SessionTreeNode {
+                            order: 0,
                             entry: Arc::new(SessionEntry {
                                 id: "tr1".into(),
                                 parent_id: Some("a_tool1".into()),
@@ -3645,6 +3717,7 @@ mod tests {
                             children: vec![
                                 // Second assistant segment: tool-call-only (invisible)
                                 SessionTreeNode {
+                                    order: 0,
                                     entry: Arc::new(SessionEntry {
                                         id: "a_tool2".into(),
                                         parent_id: Some("tr1".into()),
@@ -3659,6 +3732,7 @@ mod tests {
                                     children: vec![
                                         // Tool result (invisible)
                                         SessionTreeNode {
+                                            order: 0,
                                             entry: Arc::new(SessionEntry {
                                                 id: "tr2".into(),
                                                 parent_id: Some("a_tool2".into()),
@@ -3673,6 +3747,7 @@ mod tests {
                                             children: vec![
                                                 // Final assistant text (VISIBLE)
                                                 SessionTreeNode {
+                                                    order: 0,
                                                     entry: Arc::new(make_entry(
                                                         "a_text",
                                                         Some("tr2"),
@@ -3711,7 +3786,7 @@ mod tests {
         // The invisible tool-call/tool-result chain must not break the turn:
         // both rows are still the main line, and the reply still gets the
         // junction arm.
-        assert_eq!(prefix_of(&plain_of(&rows, "u1")), "┃");
+        assert_eq!(prefix_of(&plain_of(&rows, "u1")), "╻");
         assert_eq!(prefix_of(&plain_of(&rows, "a_text")), "┗╸");
     }
 
@@ -3944,14 +4019,14 @@ mod tests {
         }
         let rows = plain_rows(&resp);
         for (id, want) in [
-            ("u1", "┃"),
-            ("a1", "┣╸"),
-            ("x1", "┗━━┓"),   // spur: connector from the bar above
+            ("u1", "╻"),
+            ("a1", "┗╸"),
+            ("x1", "┗━━╻"),   // spur: connector from the bar above
             ("x2a", "   ┗╸"), // …its reply turns the ladder off
-            ("u2", "┃"),
-            ("y1", "┗━━┓"),
+            ("u2", " "),      // isolated mainline row between two spurs
+            ("y1", "┗━━╻"),
             ("y2", "   ┗╸"),
-            ("a2", "┣╸"),
+            ("a2", "┏╸"),
             ("u3", "┃"),
             ("a3", "┗╸"),
         ] {
@@ -3997,7 +4072,7 @@ mod tests {
         // Still the main line: the bar is at column 0 and no connector is
         // drawn. `╵` because it is the branch's last visible row.
         assert_eq!(depth_of(&depths, "u2"), 0, "{rows:?}");
-        assert_eq!(prefix_of(&plain_of(&rows, "u2")), "┻", "{rows:?}");
+        assert_eq!(prefix_of(&plain_of(&rows, "u2")), "╹", "{rows:?}");
     }
 
     #[test]
@@ -4031,22 +4106,22 @@ mod tests {
         let rows = plain_rows(&resp);
         assert_eq!(
             prefix_of(&plain_of(&rows, "v1")),
-            "┃",
-            "newest tie-winner keeps the margin"
+            " ",
+            "isolated mainline row between spur rows"
         );
         assert_eq!(
             prefix_of(&plain_of(&rows, "w1")),
-            "┗━━┓",
-            "its spur connects from the bar above and steps right"
+            "┗━━╻",
+            "its spur opens downwards"
         );
         assert_eq!(
             prefix_of(&plain_of(&rows, "x1")),
-            "┻",
-            "its own spine stays on the line, and it is the branch's last row"
+            " ",
+            "spine row isolated from the spur that precedes it"
         );
         assert_eq!(
             prefix_of(&plain_of(&rows, "u2")),
-            "┗━━┓",
+            "┗━━╻",
             "older equal-depth branch is a spur"
         );
         assert_eq!(
@@ -4147,8 +4222,8 @@ mod tests {
         // of its own three children are spurs of *it* (a third level).
         assert_eq!(
             prefix_of(&plain_of(&rows, "v1")),
-            "┗━━┓",
-            "bush steps right"
+            "   ╻",
+            "bush opens a spur (parent not adjacent above)"
         );
         for id in ["d1", "d2"] {
             assert_eq!(depth_of(&depths, id), 1, "bush spine {id}");
@@ -4158,6 +4233,58 @@ mod tests {
         }
         // The chain is the deeper branch, which is why it won the margin.
         assert_eq!(depth_of(&depths, "u4"), 0);
+    }
+
+    #[test]
+    fn multiple_roots_are_chronological_and_hued_by_height() {
+        // Two real roots (the re-asked-first-prompt split). The orphan was
+        // written first but is shallow; the active root is taller. Rows must
+        // be chronological (orphan first), the taller root must keep branch 0,
+        // and the orphan must not be painted as mainline.
+        let tree = vec![
+            SessionTreeNode {
+                order: 0,
+                entry: Arc::new(make_entry("old1", None, "user", "old orphan prompt")),
+                children: vec![],
+                label: None,
+            },
+            SessionTreeNode {
+                order: 10,
+                entry: Arc::new(make_entry("u1", None, "user", "active prompt")),
+                children: vec![SessionTreeNode {
+                    order: 11,
+                    entry: Arc::new(make_entry("a1", Some("u1"), "assistant", "reply")),
+                    children: vec![SessionTreeNode {
+                        order: 12,
+                        entry: Arc::new(make_entry("u2", Some("a1"), "user", "active follow-up")),
+                        children: vec![],
+                        label: None,
+                    }],
+                    label: None,
+                }],
+                label: None,
+            },
+        ];
+        let resp = data_for(tree, Some("u2"));
+        let ids: Vec<String> = resp.rows.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(
+            ids,
+            ["old1", "u1", "a1", "u2"],
+            "file order wins over tree order"
+        );
+        assert_eq!(branch_of(&resp, "u1"), 0, "tallest root is the mainline");
+        assert_eq!(branch_of(&resp, "a1"), 0);
+        assert_eq!(branch_of(&resp, "old1"), 1, "orphan root gets a spur hue");
+        assert!(!is_spur_start(&resp, "old1"), "a root has no parent row");
+        assert_eq!(
+            row_depths(&resp)
+                .iter()
+                .find(|(id, _)| id == "old1")
+                .unwrap()
+                .1,
+            0,
+            "roots are not indented"
+        );
     }
 
     #[test]
@@ -4227,15 +4354,15 @@ mod tests {
             is_spur_start(&resp, "x1"),
             "the connector must land on the first visible spur row: {rows:?}"
         );
-        assert_eq!(prefix_of(&plain_of(&rows, "x1")), "┗━━┓");
+        assert_eq!(prefix_of(&plain_of(&rows, "x1")), "┗━━╻");
     }
 
     #[test]
     fn wash_fades_with_depth_and_ink_stays_black() {
         // Saturation is depth; the glyph is always black, so the lines stay
         // crisp however far out a branch is.
-        let row = |depth: usize, branch: u8, bar: Bar| row_prefix(depth, branch, bar, false);
-        let (deep, shallow) = (row(3, 1, Bar::Line), row(1, 1, Bar::Line));
+        let row = |depth: usize, branch: u8| row_prefix(depth, branch, true, true, false, false);
+        let (deep, shallow) = (row(3, 1), row(1, 1));
         assert_ne!(
             deep, shallow,
             "a deeper spur must fade relative to its parent"
@@ -4244,7 +4371,7 @@ mod tests {
             assert!(r.contains("38;2;0;0;0m"), "ink must stay black: {r:?}");
         }
         // Main line: the anchor, unfaded.
-        assert!(row(0, 0, Bar::Line).contains(&format!(
+        assert!(row(0, 0).contains(&format!(
             "48;2;{};{};{}m",
             ANCHOR_RGB.0, ANCHOR_RGB.1, ANCHOR_RGB.2
         )));
@@ -4256,7 +4383,7 @@ mod tests {
         // heavy box-drawing in a neutral ink, never a branch hue, and it
         // carries no wash of its own — the ink is now the only thing that
         // separates a connector from the bar it runs into.
-        let prefix = row_prefix(1, 1, Bar::SpurStart, false);
+        let prefix = row_prefix(1, 1, false, true, false, true);
         assert!(prefix.contains('\u{2517}'), "heavy elbow: {prefix:?}");
         assert!(prefix.contains('\u{2501}'), "heavy run: {prefix:?}");
         assert_eq!(
@@ -4276,7 +4403,7 @@ mod tests {
             crate::slashdot_menu::table::display_width(&prefix[..at])
         };
         assert_eq!(col_of('\u{2517}'), bar_col(0), "elbow column");
-        assert_eq!(col_of('\u{2513}'), bar_col(1), "bar column");
+        assert_eq!(col_of('\u{257b}'), bar_col(1), "bar column");
     }
 
     #[test]
@@ -4299,14 +4426,14 @@ mod tests {
             .map(|r| prefix_of(&strip_sgr(&r.0)))
             .collect();
         let want = vec![
-            "┃",
-            "┣╸",
-            "┗━━┓",
+            "╻",
+            "┗╸",
+            "┗━━╻",
             "   ┗╸",
-            "┃",
-            "┗━━┓",
+            " ",
+            "┗━━╻",
             "   ┗╸",
-            "┣╸",
+            "┏╸",
             "┃",
             "┗╸",
         ];
