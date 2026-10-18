@@ -45,77 +45,11 @@ and link a doc/ and/or commit hash
       doc/261013_multi_file_edit_id_continuity.md.
 - [x] Fix "text only" compaction strategy to a) include last summary, and b) only add text context
   added since.
-- [x] OpenRouter provider selection via per-model `routing` settings key
-      (implemented: doc/261017_openrouter_provider_selection.md; `@only:` suffix
-      evaluated and rejected, §9). Per-model, e.g. `routing = { only =
-      ["deepinfra/fp8/flex"], allow_fallbacks = false }`; the old built-in
-      anthropic provider pin is gone — nothing is sent unless set.
 
 ## Cleanup
 
-- [x] `src/agent.rs` refactor — 261002_agent_refactor.md
-  - [x] Step 1: move `run_interactive` out to `src/interactive.rs` (§3)
-  - [x] Read all of `mod tests`, produce a placement table to review (§6)
-  - [x] Step 2: split `agent.rs` into `agent/` — 9 files, one commit each (§3)
-  - [x] Step 3: `Interactive` struct, in the new `interactive.rs` (§3)
-  - [x] Deferred: `CodeAgent::prompt` — deliberately, not cleanup (§4)
-- [ ] audit output, repl
-- [ ] output.rs drawing refactor — 261003_output_drawing_refactor.md
-  - [x] Step 1: extract `render.rs` / `draw.rs` / `ansi.rs` mechanically; Output facade kept (§8.1)
-  - [ ] Step 2: `TermIO` — reader, raw mode, DSR, size watch; un-`#[serial]` width tests (§8.2) —
-        moves landed (`74e987c`); the type fold landed in 4a (`8cc955d`); the size-query fallbacks
-        landed in 4g (`c21be0e`)
-  - [x] Step 3: split `content/`; `AgentConfig.content` + `Content` tap seam; content consumers on
-        `&Content` (§8.3) — landed 3a–3d (`47122b4`…`cf7b6a8`); frame/input rides
-        `AgentConfig.output` until step 4
-  - [x] Step 4: fold in `RenderManager` + UI; elements → `Arc<Mutex<…>>`, shared editor (§8.4) — 4a
-        (`8cc955d`), 4b (`38d9513`), 4c (`33dc92c`), 4d (`98bcb85`), 4e (`bce38e7`) landed; 4f
-        landed whole — 4f-a (`529f278`, bar formats itself from raw data), 4f-b (`cb01977`, frame
-        path leaves `&dyn Output`), 4f-c (`fad8f76`, dims → the watch/manager, the size verbs leave
-        the trait), 4f-d (`348f7ed`, input collapses to one handle; `TermGuard` holders convert),
-        4f-e (`8733d09`+`c7ef4fe`+`786009e`+`2906fb1`, TermIO into Draw: setup rework, writer dies,
-        reader-stop suspend, resize both edges), 4f-f (`cbeceed`+`044c7f9`, Stream + the meta sink;
-        the formatting span unlocks), 4g (`c21be0e`+`6961d0b`+`e7b17ad`, cursor_row verb dies,
-        entry-DSR on the front-door guard, the caret channel reaches the manager); 4h-a (`ba8d6be`,
-        `slashdot_tui` crate extraction), 4h-b (`ddf5522`+`8f80640`, `height(width)` on the trait,
-        one place computes the frame row count), 4h-c (`280f654`+`2651b19`, the bar moves into
-        `ui/`), 4h-d (`a2ebeff`+`063d993`+`8daa008`, menu views mint their own elements: `Arc`
-        handle chain, `RenderElement` impls in `slashdot_menu`, the repl appends the element set),
-        4h-e (`14542025`+`744a8dfe`+`25730624`, selection figures live behind a shared handle; a
-        cursor move updates in place, changed rows re-mint), 4h-f (`08ed747`+`be0e7b4`, the editor
-        goes behind `Arc<Mutex<LineEditor>>` and the input element pulls it; `Layout` comes home to
-        repl), 4h-g (`ac92095`+`72a3ac7`+`fb3a793`, the flip: `render` composes from the configured
-        stack, membership reconfigured on transitions; the bar is always present and pulls usage
-        live); 4h-h (`243890e`, confirm dialog selection state + its place in the configured stack,
-        out-of-crate callers, cleanup); 4h-g4 (the bar pulls every fact live: identity + model
-        fields off `AppState`, one shared estimate fallback read by the bar and `/stat`)
-  - [x] 4i: engine memoizes child `data()` responses so the no-rebuild carry holds on the production
-        menu path — `same_content` fallback in `refresh_data` (4i-a, `237d9ab`), engine-path carry
-        test (4i-b, `48e5e96`), and the large-row producer audit + `/session` memo on an
-        mtime-driven listing generation (4i-c, `bff9c63`)
-  - [x] deltas before step 5: `f32` ratio `c3a2c13`; `Draw::draw` merge `da6025d`; the OSC-aware
-        width move into `slashdot_tui` (`c515a5e`); `ContentWrite { bytes, stream }` + Render width
-        enforcement (`0761231`)
+- `src/agent.rs` refactor — 261002_agent_refactor.md
   - [ ] deferred: pad a short row to `term_w` only where draw's per-row entry `EL` proves unreliable
     (design §Content; impl doc)
   - [ ] follow-up: track the line-terminator / width repairs back into content — Render's
         enforcement is a net, not the plan (impl doc)
-  - [ ] `tests/confirm_raw_mode.rs` confirm-dialog paint test (refactor fallout)
-  - [x] Step 6: output kinds + backend-owned routing — 6a kind vocabulary
-        (`Stream { Content, Reasoning, Error }`) + TermIO kind → sink (`68c78eb`); 6b `Frame` as a
-        `TermIO::write_frame` target, the `paints_frames` gate leaves Draw (`812cc11`); 6c the mode
-        guard's escapes gate on the primary + the recording doubles converge (`dc50205`)
-  - [x] Step 5: delete `output.rs` (§8.5) — 5a/5b/5c (drawing verbs retire; the confirm half
-        retires, no-port path denies; capture moves to Content and a capturing write never reaches
-        render()); 5d (5d-i quiet + input source; 5d-ii the tap seam and `ConsoleOutput` go;
-        `AgentConfig.output` drops); 5e (the render test modules move to content, the `Output`
-        trait + the module go, `lib.rs` pruned) — landed `9b0ce5c`…`bbc77aa`
-  - [x] 5f: the non-tty edge strip (`StripAnsi` per stream from caps) and the frame drop, both real
-    streams only; the recording/null doubles observe composed bytes — landed `HEAD`
-  - [x] sole-ownership: TermIO owns all IO, in and out — DSR answer sealed in the edge (`11536d3`),
-    reader answers DSR, entry pause dies (`ea2f381`); window pump consumes the reader's divert
-    (`WindowKeySource`/`is_tty`/`ReaderPauseGuard` die, `Plain::suspend` reports `Unsupported`)
-    (`8778fc7`); output bytes ride the edge — line-tails via `replay_tail_lines`, editor error
-    via `display_error`, the bare `\x1b[0J` dies (`5949de0`); errors ride `Stream::Error`
-    everywhere, quiet spares the kind (`c0b3840`); batch read is `TermIO::read_line` (`cdf64a2`)
-    — deferred refinements in the impl doc
