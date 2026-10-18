@@ -738,7 +738,15 @@ fn flatten_turns<'a>(
         // A spur start always opens downwards — the connector (or its hue
         // marker when the parent is not adjacent) has to land on a tick, not
         // on a blank cell, even when the spur is a single row.
-        let down = (i + 1 < count && same(&pending[i + 1])) || p.spur_start;
+        //
+        // The row above a drawn connector must also keep its downward stroke:
+        // the connector elbow starts at that row's bar column, so cutting the
+        // bar short here would leave a gap. Tick separation is only for
+        // unrelated rows at the same level, not for a parent/child elbow.
+        let next_attaches = i + 1 < count
+            && pending[i + 1].spur_start
+            && pending[i + 1].visible_parent == Some(p.node.entry.id.as_str());
+        let down = (i + 1 < count && same(&pending[i + 1])) || p.spur_start || next_attaches;
         let connector = p.spur_start
             && i > 0
             && (p.visible_parent == Some(pending[i - 1].node.entry.id.as_str()));
@@ -3637,7 +3645,7 @@ mod tests {
                     "┣╸",   // a1
                     "┃",    // u2
                     "┣╸",   // a2
-                    "╹",    // mc1, a non-reply marker on the main line
+                    "┃",    // mc1, runs down into the spur connector
                     "┗━━┓", // mc2, spur
                     "   ╻", // mc3, spur (parent not adjacent above)
                     " ",    // mc4, the spine: isolated between spur rows
@@ -4052,10 +4060,10 @@ mod tests {
         let rows = plain_rows(&resp);
         for (id, want) in [
             ("u1", "╻"),
-            ("a1", "┗╸"),
+            ("a1", "┣╸"),
             ("x1", "┗━━┓"),   // spur: connector from the bar above
             ("x2a", "   ┗╸"), // …its reply turns the ladder off
-            ("u2", " "),      // isolated mainline row between two spurs
+            ("u2", "╻"),      // opens down into the next spur's connector
             ("y1", "┗━━┓"),
             ("y2", "   ┗╸"),
             ("a2", "┏╸"),
@@ -4138,8 +4146,8 @@ mod tests {
         let rows = plain_rows(&resp);
         assert_eq!(
             prefix_of(&plain_of(&rows, "v1")),
-            " ",
-            "isolated mainline row between spur rows"
+            "╻",
+            "opens down into the spur connector"
         );
         assert_eq!(
             prefix_of(&plain_of(&rows, "w1")),
@@ -4418,6 +4426,41 @@ mod tests {
     }
 
     #[test]
+    fn parent_bar_runs_into_the_spur_connector() {
+        // The connector's elbow starts at the parent's bar column, so the
+        // parent row must keep its downward stroke even though the next row
+        // is on a different (branch, depth). Tick separation is only for
+        // unrelated rows at the same level.
+        let tree = vec![node(
+            make_entry("u0", None, "user", "root"),
+            vec![node(
+                make_entry("a0", Some("u0"), "assistant", "reply"),
+                vec![node(
+                    make_entry("u1", Some("a0"), "user", "parent"),
+                    vec![
+                        node(make_entry("x1", Some("u1"), "user", "spur"), vec![]),
+                        node(
+                            make_entry("u2", Some("u1"), "user", "main"),
+                            vec![node(
+                                make_entry("a2", Some("u2"), "assistant", "main reply"),
+                                vec![],
+                            )],
+                        ),
+                    ],
+                )],
+            )],
+        )];
+        let resp = data_for(tree, Some("a2"));
+        let rows = plain_rows(&resp);
+        assert_eq!(
+            prefix_of(&plain_of(&rows, "u1")),
+            "┃",
+            "parent bar continues down"
+        );
+        assert_eq!(prefix_of(&plain_of(&rows, "x1")), "┗━━┓");
+    }
+
+    #[test]
     fn assistant_spur_start_uses_a_t_junction() {
         // The connector run must meet the bar cell: an assistant spur start
         // keeps both its left arm (to the run) and its right arm (the reply
@@ -4513,10 +4556,10 @@ mod tests {
             .collect();
         let want = vec![
             "╻",
-            "┗╸",
+            "┣╸",
             "┗━━┓",
             "   ┗╸",
-            " ",
+            "╻",
             "┗━━┓",
             "   ┗╸",
             "┏╸",
