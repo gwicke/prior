@@ -808,8 +808,7 @@ impl AppState {
     /// Park a key event the window pump could not act on (see
     /// [`WindowPump`]). `read_input` drains the queue on its next iteration
     /// through the normal dispatch, so the event lands exactly as if it had
-    /// arrived a moment later: same Ctrl-C/Z, same Resize handling, same
-    /// dispatcher.
+    /// arrived a moment later: same Resize handling, same dispatcher.
     pub fn park_key(&self, ev: InputEvent) {
         self.state.lock().parked_keys.push_back(ev);
     }

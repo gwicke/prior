@@ -1224,8 +1224,8 @@ impl PromptSession {
     /// [`Repl::edit_key`].
     ///
     /// `Ctrl-C` and `Ctrl-Z` are *not* here: they are process and terminal
-    /// operations that must not queue behind edit keys, so the caller handles
-    /// them before this runs.
+    /// operations that must not queue behind edit keys, so the reader handles
+    /// them inline before they could reach this channel.
     pub(crate) fn handle_key(
         &mut self,
         key: crossterm::event::KeyEvent,
@@ -1436,7 +1436,8 @@ impl Repl {
     /// Returns `Some(InputAction::Submit(text))` with the submitted prompt,
     /// `Some(InputAction::MenuDone)` when a v2.5 menu commit wrote shared
     /// state (no text is treated as a prompt), or `None` only on a read
-    /// error. `Ctrl-C` restores the terminal and exits the process.
+    /// error. `Ctrl-C`/`Ctrl-Z` never reach here: the reader handles them
+    /// inline.
     ///
     /// `history` backs `Up`/`Down` navigation and is persisted to disk.
     ///
@@ -1643,9 +1644,9 @@ impl Repl {
                 // Keys a window pump parked while the REPL loop was
                 // suspended inside an LLM window (the compaction
                 // summarization — `WindowPump`) dispatch exactly as if they
-                // arrived just now: same Resize handling, same Ctrl-C/Z
-                // below, one per iteration so the settle cadence is the
-                // typing cadence. Drain before blocking — parked events are
+                // arrived just now: same Resize handling, same dispatcher,
+                // one per iteration so the settle cadence is the typing
+                // cadence. Drain before blocking — parked events are
                 // older than anything still waiting on the channel.
                 if let Some(parked) = app_state.take_parked_key() {
                     match parked {
@@ -1685,30 +1686,10 @@ impl Repl {
             // --- Dispatch one key. ---
             match ev {
                 Some(InputEvent::Key(key)) => {
-                    // Ctrl-C: restore terminal, hard exit.
-                    if let KeyCode::Char('c') = key.code {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            let _ = content.manager.lock().unwrap().suspend();
-                            std::process::exit(1);
-                        }
-                    }
-                    // Ctrl-Z: suspend the process group to the shell (SIGTSTP).
-                    // On resume (fg), the `RESUMED` check at the top of the loop
-                    // re-enters raw mode. Raw mode clears `ISIG`, so this must be
-                    // handled as a key event rather than relying on the kernel.
-                    if let KeyCode::Char('z') = key.code {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            let _ = content.manager.lock().unwrap().suspend();
-                            unsafe {
-                                libc::killpg(libc::getpgrp(), libc::SIGTSTP);
-                            }
-                            // `killpg(SIGTSTP)` stops the process group; execution
-                            // resumes here (in the main thread, a safe context)
-                            // once the shell sends `SIGCONT`. Re-enter raw mode so
-                            // the next keystroke is read correctly.
-                            let _ = content.manager.lock().unwrap().resume();
-                        }
-                    }
+                    // Ctrl-C/Ctrl-Z never reach this channel: the reader routes
+                    // them `Inline` (`route_event`) and acts on them where they
+                    // land, so a process/terminal action cannot queue behind
+                    // edit keys.
                     // The dispatcher. It answers with what *should* happen on
                     // screen; this loop is the one that actually does it, so
                     // the same function can serve the turn's `select!` branch
@@ -2107,10 +2088,10 @@ impl Repl {
     }
 
     /// Apply a normal editing key to the line editor. Returns `Some(action)`
-    /// only for terminal actions (Enter submits, Esc cancels the line,
-    /// Ctrl-C exits). All other keys mutate `editor` and return `None`. History
-    /// navigation is handled here too. `Ctrl-C` is *not* handled here (the
-    /// caller checks it before delegating, so it can stop the terminal).
+    /// only for terminal actions (Enter submits, Esc cancels the line). All
+    /// other keys mutate `editor` and return `None`. History navigation is
+    /// handled here too. `Ctrl-C`/`Ctrl-Z` are *not* handled here: the reader
+    /// acts on them inline, before they could reach the editor.
     fn edit_key(
         key: event::KeyEvent,
         editor: &mut LineEditor,
