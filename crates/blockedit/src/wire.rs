@@ -1389,6 +1389,22 @@ mod tests {
     }
 
     #[test]
+    fn a_new_first_block_is_accepted_with_regions_mapped_by_role() {
+        // The switched order is accepted on ingress: the first region is the
+        // new text, the second the old. The `path:LINE` header above the
+        // `@@@NEW` opener still supplies the file and the anchor.
+        let a = EditArgs::from_wire(&json!({
+            "blocks": "src/x.rs:7\n@@@NEW\nnew text\n@@@OLD\nold text\n@@@END"
+        }))
+        .unwrap();
+        assert_eq!(a.files.len(), 1);
+        assert_eq!(a.files[0].path, "src/x.rs");
+        assert_eq!(a.files[0].edits[0].old_text, "old text");
+        assert_eq!(a.files[0].edits[0].new_text, "new text");
+        assert_eq!(a.files[0].edits[0].start_line, Some(EditStartLine(7)));
+    }
+
+    #[test]
     fn a_single_file_blob_without_a_header_is_rejected() {
         // The old lax rule: a `path` argument with a header-less blob. Now that
         // every block must name its own file, `path` cannot supply one — the

@@ -1042,13 +1042,13 @@ impl EditFailure {
         let model_view = format!(
             "@@@OLD lines appear {count} times{excluded_note}, so it is ambiguous. \
              Free occurrences at lines: {line_list}. To pick one, put a `path:LINE` \
-             header line just above that block's `{marker}` marker — e.g. use \
+            header line just above that block's first marker (its `@@@OLD`; in a \
+            new-first block, the `@@@NEW`) — e.g. use \
              `...:{first}` to target the first free occurrence — which anchors the \
              block to the nearest occurrence (line numbers come from `read`). \
              Alternatively, include more surrounding context in @@@OLD (the \
              line(s) immediately before/after) so only one occurrence matches. \
             ",
-            marker = crate::blob::SEARCH_MARKER,
             first = line_numbers.first().copied().unwrap_or(0),
         );
         EditFailure {
