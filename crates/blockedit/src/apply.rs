@@ -98,8 +98,17 @@ pub fn apply_to_text(text: &str, edits: &[EditOp]) -> ApplyOutcome {
 /// line anchor in the block header (`path:LINE`), which is the single source of
 /// truth for where a block applied. Echoing a second, pre-trim line here used to
 /// disagree with that anchor and confuse the model, so it was dropped.
-pub fn success_note(edits: &[EditOp], shown: &str) -> String {
-    format!("Replaced {} block(s) in {}", edits.len(), shown)
+///
+/// The block count is the *post-split* count, not the number of submitted
+/// blocks. The model only ever sees the rewritten call — one block may become
+/// several when [`crate::minimize::split_and_minimize`] splits at a long
+/// internal unchanged run — so counting the submitted edits here would report a
+/// number that contradicts the visible call. Counting through the same
+/// transform is the only way to keep the two in sync; if the split rule changes,
+/// this message follows it for free.
+pub fn success_note(edits: &[EditOp], matched_lines: &[usize], shown: &str) -> String {
+    let blocks = crate::minimize::split_and_minimize_ops(edits, matched_lines).len();
+    format!("Replaced {blocks} block(s) in {shown}")
 }
 
 /// Apply `edits` to the file at `path`, or write nothing and return the failure
@@ -118,4 +127,62 @@ pub fn matched_spans(text: &str, edits: &[EditOp], resolved: &[usize]) -> Vec<(u
         .zip(resolved.iter())
         .map(|(e, &off)| span_line_range(text, off, off + e.old_text.len()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(old: &str, new: &str) -> EditOp {
+        EditOp {
+            old_text: old.into(),
+            new_text: new.into(),
+            start_line: None,
+            origin: None,
+        }
+    }
+
+    /// Apply a batch and describe success exactly as the tool does.
+    fn note(text: &str, edits: &[EditOp]) -> String {
+        match apply_to_text(text, edits) {
+            ApplyOutcome::Applied {
+                text: _,
+                matched_lines,
+            } => success_note(edits, &matched_lines, "f.rs"),
+            ApplyOutcome::Failed { report, .. } => panic!("{report}"),
+        }
+    }
+
+    #[test]
+    fn counts_one_block_when_nothing_splits() {
+        let text = "alpha_context_line\nold_x_context_line\ndelta_context_line\n";
+        let edits = [op(
+            "alpha_context_line\nold_x_context_line\ndelta_context_line\n",
+            "alpha_context_line\nnew_x_context_line\ndelta_context_line\n",
+        )];
+        assert_eq!(note(text, &edits), "Replaced 1 block(s) in f.rs");
+    }
+
+    #[test]
+    fn counts_post_split_blocks_not_submitted_blocks() {
+        // One submitted block becomes two: the changes are three shared lines
+        // apart, above `SPLIT_GAP`.
+        let text = "alpha_context_line\nold_x_context_line\nbravo_context_line\ncharlie_line\ndelta_context_line\nold_y_context_line\necho_context_line\n";
+        let edits = [op(
+            text,
+            "alpha_context_line\nnew_x_context_line\nbravo_context_line\ncharlie_line\ndelta_context_line\nnew_y_context_line\necho_context_line\n",
+        )];
+        assert_eq!(note(text, &edits), "Replaced 2 block(s) in f.rs");
+    }
+
+    #[test]
+    fn a_length_mismatch_falls_back_to_the_submitted_count() {
+        // `split_and_minimize_ops` treats a mismatch as "no resolutions": the
+        // count is then the submitted blocks, never zero or a panic.
+        let edits = [op("a", "b")];
+        assert_eq!(
+            success_note(&edits, &[], "f.rs"),
+            "Replaced 1 block(s) in f.rs"
+        );
+    }
 }

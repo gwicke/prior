@@ -189,10 +189,13 @@ and `<= SPLIT_GAP` apart, so a second pass trims each to itself and splits nothi
 ranges are disjoint and exactly anchored (`d1 = 0`, always accepted), and their union is the
 original edit, so a split, reloaded history still describes the same change.
 
-### Open question
+### Success count (resolved)
 
-`Replaced N block(s)` counts the *submitted* blocks, so a split can show more blocks than `N`.
-Recommendation: keep it; the anchor, not the count, is the location truth.
+`Replaced N block(s)` used to count the *submitted* blocks, so a split showed more blocks in the
+history than `N`, which reads as a contradiction. It now counts the *post-split* blocks: the note is
+built with `split_and_minimize_ops`, the same transform that renders the history, so the number
+cannot drift from the visible call. Splitting depends only on the block's own text (not the anchor),
+so the count is identical whether computed at execution time or during the history rewrite.
 
 ### Tests
 

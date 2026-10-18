@@ -517,7 +517,10 @@ async fn edit_file_inner(
     let sandbox_path = get_sandbox_path(&path)?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| sandbox_path.clone());
     let shown = relativize_path(&sandbox_path, &cwd);
-    Ok((blockedit::success_note(&edits, &shown), Some(matched_lines)))
+    Ok((
+        blockedit::success_note(&edits, &matched_lines, &shown),
+        Some(matched_lines),
+    ))
 }
 
 /// Budget for a `sed` preview's block payload, in bytes.

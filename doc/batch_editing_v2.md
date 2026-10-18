@@ -1357,7 +1357,7 @@ file if it were wrong.
 - **Tolerance**: `(context_lines / 3).min(4)`; unique matches ignore it.
 - **Success string**: just `Replaced N block(s) in ./f`; it carries no match location. The resolved
   anchor lives in the rewritten block header (`path:LINE`), which is the single source of truth.
-  Superseded by `261018_minimal_edit_context_anchors.md`.
+  Superseded by `261018_minimal_edit_context_anchors.md`; `N` is now the post-split block count.
 
 ## Implementation status (W1 — the multi-file path policy — done)
 
