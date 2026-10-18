@@ -703,7 +703,7 @@ impl RenderManager {
             }
         }
         if invalidated {
-            let _ = self.cursor_row();
+            self.reanchor();
         }
     }
 
@@ -715,26 +715,28 @@ impl RenderManager {
         self.draw.handles()
     }
 
-    /// Whether this terminal flips raw mode at all (TermIO's Tty, not Plain)
-    /// — what `$EDITOR` and the window pump ask before expecting a mode
-    /// turnover.
-    pub fn is_tty(&self) -> bool {
-        self.draw.is_tty()
-    }
-
     /// Raw mode off — the front door (design §Render: "suspend() stops the
     /// reader and drops raw mode ($EDITOR, Ctrl-Z)"), pass-through to
     /// `Draw`/`TermIO` — the only real implementation is `TermIO::suspend`,
     /// The reader-stop rides with the raw-mode drop.
-    /// Idempotent; a no-op on Plain.
-    pub fn suspend(&self) {
-        self.draw.suspend();
+    /// Idempotent. Plain reports `Unsupported` (no tty to hand over) — the
+    /// editor propagates it; teardown-style callers discard it.
+    pub fn suspend(&self) -> std::io::Result<()> {
+        self.draw.suspend()
     }
 
     /// Raw mode on — the reverse of [`Self::suspend`], and also the initial
     /// entry at prompt-loop startup. A no-op on Plain.
-    pub fn resume(&self) {
-        self.draw.resume();
+    pub fn resume(&self) -> std::io::Result<()> {
+        self.draw.resume()
+    }
+
+    /// One line of non-REPL input — the front door to
+    /// [`TermIO::read_line`](crate::termio::TermIO::read_line) for the
+    /// piped/batch driver (design §Content). Plain answers; `Tty` reports
+    /// `Unsupported` (its stdin belongs to the reader).
+    pub fn read_line(&self) -> std::io::Result<String> {
+        self.draw.read_line()
     }
 
     /// Publish a settled size on the geometry watch (parked-key drains and
@@ -755,7 +757,7 @@ impl RenderManager {
     /// The drawing edge, for the test seams that read *past* this manager
     /// (`cache.applied`, and `term_io.recorded` for the byte edge). Production
     /// reaches the edge through this manager's own verbs — `render`,
-    /// `cursor_row`, `painted_size`, `draw_frame` (content writes go through
+    /// `reanchor`, `painted_size`, `draw_frame` (content writes go through
     /// `render_content`). Test-only: the host's row-accounting and byte-edge
     /// tests reach through it.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -843,13 +845,12 @@ impl RenderManager {
         render(&self.stack, &heights, tw)
     }
 
-    /// Re-anchor the live-screen cache to the real cursor (DSR): the query
-    /// goes through `termio` — the sole stdin owner pauses around the reply,
-    /// so it is answered *inside* the terminal layer as the design's §TermIO
-    /// asks — and the answer syncs the draw cache.
-    pub fn cursor_row(&mut self) -> usize {
-        let row = crate::termio::query_cursor_row();
-        self.draw.reanchor_to_cursor(row)
+    /// Re-anchor the live-screen cache to the real cursor (DSR): the whole
+    /// round-trip is Draw/TermIO's (the sole stdin owner answers the query),
+    /// so this is a pure front-door pass-through — the answer never leaves
+    /// the edge (design §TermIO).
+    pub fn reanchor(&mut self) {
+        self.draw.reanchor()
     }
 
     /// The size the **last frame applied through this hub** took — the one

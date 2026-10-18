@@ -200,8 +200,9 @@ pub async fn run_interactive(
     // Teardown: the loop's exits (`/quit`, an error mid-turn) leave raw mode
     // on, and the `TermGuard` drop backstop can never fire — the persistent
     // stdin reader holds an `Arc` clone for the process lifetime. The front
-    // door is idempotent and a no-op on Plain, so this is unconditional.
-    interactive.config.content.manager.lock().unwrap().suspend();
+    // door is idempotent (Plain's `Unsupported` is a no-op here), so this
+    // is unconditional.
+    let _ = interactive.config.content.manager.lock().unwrap().suspend();
     result
 }
 
@@ -257,7 +258,7 @@ impl Interactive {
         let repl = use_repl.then_some(Repl);
         if repl.is_some() {
             // Raw-mode entry (idempotent), where `Repl::start` used to do it.
-            config.content.manager.lock().unwrap().resume();
+            let _ = config.content.manager.lock().unwrap().resume();
             // First screen: a one-line hint
             let content = &config.content;
             content.display_text("Welcome to picocode - type `/` for details.");
@@ -351,26 +352,20 @@ impl Interactive {
         // owned the backend since construction (raw mode is already on),
         // owning stdin for the process lifetime. It forwards keys/paste on
         // this channel; the prompt loop and every turn consume the receiver
-        // half. The reader backs off whenever the main task owns stdin —
-        // `$EDITOR`, a DSR query, or the compaction window — via the pause
-        // gate (`termio::PAUSE_GATE`), the one flag `ReaderPauseGuard` and
-        // `TermIO::suspend` raise.
+        // half. The reader backs off when the main task takes stdin over for
+        // `$EDITOR` — via the pause gate (`termio::PAUSE_GATE`, raised by
+        // `TermIO::suspend`). It never stands down for an LLM window: the
+        // compaction pump consumes the reader's *divert* instead.
+        // DSR needs no gate: from here on the reader answers those itself.
         //
-        // The guard is raised *before* `handles()` so the reader starts parked
-        // and cannot consume the entry DSR's reply: the draw cache is anchored
-        // (`run_entry_dsr`) while nothing reads stdin, then the guard drops —
-        // lowering the gate — and the reader takes over for the prompt.
-        // Without this ordering the reader's first poll would swallow the
-        // terminal's cursor-position report before `cursor_row` could read it.
-        // The guard is the front door for this window: nesting-safe,
-        // and it lowers on drop, so an early return can no longer leak the
-        // gate up. The reader isn't running yet when it is raised (the thread
-        // starts inside `handles()` below), so the raise is instant.
+        // The entry DSR runs *before* `handles()` spawns the reader, so the
+        // main task is then the one and only stdin reader — the reply cannot
+        // be swallowed and no pause is needed (the old raise-before-spawn
+        // dance, gone). Ordering with raw mode is still resume → banner →
+        // DSR: the reply is not echoed and the terminal can answer.
         let handles = if use_repl {
-            let _pause = crate::termio::ReaderPauseGuard::raise();
-            let handles = config.content.manager.lock().unwrap().handles();
             crate::repl::run_entry_dsr(config.content.as_ref());
-            handles
+            config.content.manager.lock().unwrap().handles()
         } else {
             // Plain (piped/quiet): no reader, and `handles()`' input channel
             // arrives closed — the shape piped mode had when it dropped the

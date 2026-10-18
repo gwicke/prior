@@ -29,7 +29,6 @@ use crate::termio::InputEvent;
 use crossterm::event::{self, KeyCode, KeyModifiers};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -54,11 +53,11 @@ static ENTRY_DSR_DONE: AtomicBool = AtomicBool::new(false);
 /// terminal's reply (or a test harness's pre-written one) is not swallowed by
 /// the reader's first poll. Idempotent via [`ENTRY_DSR_DONE`], so
 /// `read_input`'s own entry check becomes a no-op. The caller side takes the
-/// content handle (the query is the manager's `cursor_row`); the *answer*
+/// content handle (the query is the manager's `reanchor`); the *answer*
 /// lives inside `TermIO`.
 pub(crate) fn run_entry_dsr(content: &Content) {
     if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
-        let _ = content.manager.lock().unwrap().cursor_row();
+        content.manager.lock().unwrap().reanchor();
     }
 }
 
@@ -1075,9 +1074,7 @@ impl PromptSession {
         let current = self.editor.lock().unwrap().text();
         match run_editor(content, &current, EditorMode::Edit) {
             Ok(new_text) => self.editor.lock().unwrap().set(&new_text),
-            Err(e) => {
-                let _ = io::stdout().write_all(format!("\r\neditor error: {}\r\n", e).as_bytes());
-            }
+            Err(e) => content.display_error(&format!("editor: {}", e)),
         }
     }
 
@@ -1151,7 +1148,7 @@ impl PromptSession {
                 // bare membership; this just applies it.
                 paint_prompt(content);
                 content.display_text(&message);
-                let _ = content.manager.lock().unwrap().cursor_row();
+                content.manager.lock().unwrap().reanchor();
             }
         }
         self.sync_selection();
@@ -1492,7 +1489,7 @@ impl Repl {
         // First prompt of the process only — every later prompt's tracked row
         // is measured from the bytes it wrote (see `ENTRY_DSR_DONE`).
         if !ENTRY_DSR_DONE.swap(true, Ordering::SeqCst) {
-            let _ = content.manager.lock().unwrap().cursor_row();
+            content.manager.lock().unwrap().reanchor();
         }
         // Refresh the menu-facing view from this cycle's context. The loop
         // is the sole writer of these display fields (one acquisition);
@@ -1592,22 +1589,20 @@ impl Repl {
                 // change makes a reflowing terminal (wezterm) re-wrap the
                 // painted frame, stacking wrapped copies of the input and
                 // overlay that no clear can locate precisely. Instead:
-                // wipe everything from the cursor down (the reflow leaves
-                // it at the end of the content — the best possible
-                // starting point), replay the last turn through the normal
-                // scrollback (pushing any corruption above the fold), then
-                // re-anchor; `settle`'s paint below repaints the input.
-                // Skipped without a session — nothing to replay and usually
-                // nothing to clear up. Height-only changes don't re-wrap,
-                // so they keep the cheap re-anchor path.
+                // replay the last turn through the normal scrollback — the
+                // hub merge consumes the (fictional) live frame and pushes
+                // any reflow corruption above the fold — then re-anchor;
+                // `settle`'s paint below repaints the input. No wipe of
+                // its own: that erase is frame choreography and the frame
+                // path owns it. Skipped without a session — nothing to
+                // replay. Height-only changes don't re-wrap, so they keep
+                // the cheap re-anchor path.
                 if cur_w != painted_w {
                     if let Some(s) = app_state.session() {
-                        let _ = io::stdout().write_all(b"\x1b[0J");
-                        let _ = io::stdout().flush();
                         crate::agent::replay::replay_last_turn_silent(&s, content).await;
                     }
                 }
-                let _ = content.manager.lock().unwrap().cursor_row();
+                content.manager.lock().unwrap().reanchor();
             }
             // (The watch is already in sync — `probe_size` published as it
             // answered; the explicit `set_size` call this used to carry
@@ -1645,13 +1640,13 @@ impl Repl {
                 session.prose.poll_timeout()
             };
             let ev: Option<InputEvent> = loop {
-                // Keys a window pump parked while nobody could read stdin
-                // (the compaction LLM window — `WindowKeySource`) dispatch
-                // exactly as if they arrived just now: same Resize
-                // handling, same Ctrl-C/Z below, one per iteration so the
-                // settle cadence is the typing cadence. Drain before
-                // blocking — parked events are older than anything still
-                // waiting in the tty.
+                // Keys a window pump parked while the REPL loop was
+                // suspended inside an LLM window (the compaction
+                // summarization — `WindowPump`) dispatch exactly as if they
+                // arrived just now: same Resize handling, same Ctrl-C/Z
+                // below, one per iteration so the settle cadence is the
+                // typing cadence. Drain before blocking — parked events are
+                // older than anything still waiting on the channel.
                 if let Some(parked) = app_state.take_parked_key() {
                     match parked {
                         InputEvent::Resize(size) => {
@@ -1693,7 +1688,7 @@ impl Repl {
                     // Ctrl-C: restore terminal, hard exit.
                     if let KeyCode::Char('c') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            content.manager.lock().unwrap().suspend();
+                            let _ = content.manager.lock().unwrap().suspend();
                             std::process::exit(1);
                         }
                     }
@@ -1703,7 +1698,7 @@ impl Repl {
                     // handled as a key event rather than relying on the kernel.
                     if let KeyCode::Char('z') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            content.manager.lock().unwrap().suspend();
+                            let _ = content.manager.lock().unwrap().suspend();
                             unsafe {
                                 libc::killpg(libc::getpgrp(), libc::SIGTSTP);
                             }
@@ -1711,7 +1706,7 @@ impl Repl {
                             // resumes here (in the main thread, a safe context)
                             // once the shell sends `SIGCONT`. Re-enter raw mode so
                             // the next keystroke is read correctly.
-                            content.manager.lock().unwrap().resume();
+                            let _ = content.manager.lock().unwrap().resume();
                         }
                     }
                     // The dispatcher. It answers with what *should* happen on

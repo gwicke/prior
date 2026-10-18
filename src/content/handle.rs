@@ -13,7 +13,7 @@
 //! writes, `Error` from the error path — `TermIO` routes kind → sink, so
 //! nothing above it forks on where the bytes land.
 //! Of the frame *verbs*, `frame_size` lives here (the watch this handle
-//! carries *is* the dims source), `painted_size` and `cursor_row` are the
+//! carries *is* the dims source), `painted_size` and `reanchor` are the
 //! manager's, and `draw_frame` — the test drivers' edge — is the manager's too.
 
 use std::io;
@@ -208,10 +208,12 @@ impl Content {
         }
     }
 
-    /// The `--quiet` content: no output, no input, errors to stderr (design
-    /// §Content: quiet is a flag on the content, not a backend). Content code
-    /// runs unchanged — the bytes are built and then dropped at the hub
-    /// hand-off, so nothing reaches the screen.
+    /// The `--quiet` content: no output, no input; errors survive and ride
+    /// `Stream::Error`'s routing — meta on a pipe, the primary when it is a
+    /// terminal (design §Content: quiet is a flag on the content, not a
+    /// backend; moving the always-meta decision into `TermIO` is deferred).
+    /// Content code runs unchanged — the bytes are built and then dropped at
+    /// the hub hand-off, so nothing else reaches the screen.
     ///
     /// Also the content for tests that build a config whose display is never
     /// asserted: [`Self::new`] would reach a real terminal, and there is
@@ -661,8 +663,10 @@ impl Content {
         // Quiet drops the hand-off, not the work: the bytes were built through
         // the chain above — the boundary state advanced with them — and are
         // discarded here, so nothing reaches the screen (design §Content:
-        // quiet is a flag on the content, not a backend).
-        if self.quiet {
+        // quiet is a flag on the content, not a backend). Errors are the one
+        // kind that survive: they keep going and ride `Stream::Error`'s
+        // routing (meta on a pipe, the primary when it is a terminal).
+        if self.quiet && stream != crate::termio::Stream::Error {
             return r;
         }
         // A capturing write is Content's to keep (design §Content): append the
@@ -1201,8 +1205,10 @@ impl Content {
             InputSource::Empty => String::new(),
             InputSource::Stdin => {
                 self.write_content(format!("{} ", style("❯").bold().blue()).as_bytes());
-                let mut input = String::new();
-                let _ = io::stdin().read_line(&mut input);
+                // The read itself is the edge's (design §TermIO: all IO under
+                // one roof) — `TermIO::read_line`, through the hub's front
+                // door like every other edge verb.
+                let input = self.manager.lock().unwrap().read_line().unwrap_or_default();
                 input.trim().to_string()
             }
             #[cfg(test)]
@@ -1487,15 +1493,12 @@ impl Content {
     }
 
     pub(crate) fn display_error(&self, error: &str) {
-        // Quiet's one surviving verb: the screen is suppressed, but a consumer
-        // piping the answer still wants the error, and it goes to stderr
-        // (design §Content).
-        if self.quiet {
-            eprintln!("Error: {}", error);
-            return;
-        }
-        // Measured: a long error wraps, and the message carries a 2-column
-        // prefix the row count has to include.
+        // Quiet's one surviving verb, no longer special-cased here: the write
+        // rides `Stream::Error` and the edge picks the sink (meta on a pipe,
+        // the primary when it is a terminal), while the quiet drop above
+        // spares the kind (design §Content). Measured: a long error wraps,
+        // and the message carries a 2-column prefix the row count has to
+        // include.
         let block = format!("{} Error: {}\n", style("⏺").red(), error);
         self.write_content_block_as(
             &at_line_start(block.as_bytes()),

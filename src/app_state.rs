@@ -44,6 +44,7 @@ use crate::agent::CodeAgent;
 use crate::session::repo::JsonlSessionRepo;
 use crate::session::{Session, SessionTreeNode};
 use crate::settings::{SettingKey, SettingsStore};
+use crate::termio::InputEvent;
 use crate::AgentConfig;
 
 // ---------------------------------------------------------------------------
@@ -213,46 +214,91 @@ pub struct AppState {
 // Window key pump — the input side of an LLM window nobody else can read
 // ---------------------------------------------------------------------------
 
-/// Who feeds a key pump while an LLM operation runs *outside* a turn — the
-/// compaction summarization, whose await spans requests and back-offs with
-/// the REPL loop suspended inside `settle` (no `read_input`, no in-flight
-/// reader). Implemented by [`AppState`] (polls stdin — nobody else can while
-/// the window lasts — and parks what it cannot act on) and by tests' fakes.
+/// The source a window pump consumes while an LLM operation runs *outside* a
+/// turn — the compaction summarization, whose await spans requests and
+/// back-offs with the REPL loop suspended inside `settle` (no `read_input`,
+/// no in-flight reader).
+///
+/// It never touches stdin (design §TermIO: the reader is the sole stdin
+/// owner): while the pump lives, the reader *diverts* forwarded events into
+/// this receiver ([`crate::termio::divert_window`]) instead of the REPL
+/// channel, and the pump parks what it cannot act on back into
+/// [`AppState::parked_keys`] — the queue `read_input` drains through the
+/// normal dispatch. With no reader (Plain, quiet, a test state) nothing ever
+/// feeds the receiver: the window is inert, which is the old
+/// `window_active() == false` shape with no stdin read anywhere.
 ///
 /// A root `Esc` is *not* dispatched through the session here: the engine is
 /// mid-`prepare()` and cannot evaluate a key, and the node's own two-phase
 /// contract makes `Esc` mean "abort" the moment `prepare()` returns — so the
 /// pump turns it straight into the cancel signal (the same flag + notify
 /// `prompt()`'s dispatcher raises). Everything else is parked for
-/// `read_input`, which drains the queue through the normal dispatch.
-pub trait WindowKeySource: Sync {
-    /// May this window read keys at all? `false` for piped/batch stdin (the
-    /// script owns it) and for states with no REPL — those never touch
-    /// stdin.
-    fn window_active(&self) -> bool;
-    /// The next event ready right now — must not block.
-    fn poll_key(&self) -> Option<crossterm::event::Event>;
-    /// Park an event the window cannot act on for later dispatch.
-    fn defer_event(&self, ev: crossterm::event::Event);
+/// `read_input`.
+pub struct WindowPump<'a> {
+    rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    /// The divert registration; taken and cleared first in `Drop` so the
+    /// reader stops diverting *before* the drain below — after which every
+    /// event either already sits in `rx` (sent under the registration lock)
+    /// or went to the REPL channel. Neither can be lost.
+    _divert: Option<crate::termio::WindowDivert>,
+    park: &'a AppState,
 }
 
-impl WindowKeySource for AppState {
-    fn window_active(&self) -> bool {
-        self.window_pump_active()
-    }
-    fn poll_key(&self) -> Option<crossterm::event::Event> {
-        // Belt and braces: `window_active` is the caller's gate; this keeps
-        // a stray live reference in piped mode off stdin entirely.
-        if !self.window_pump_active() {
-            return None;
-        }
-        match crossterm::event::poll(std::time::Duration::ZERO) {
-            Ok(true) => crossterm::event::read().ok(),
-            _ => None,
+impl<'a> WindowPump<'a> {
+    /// Open the process window: register the divert with the reader's edge
+    /// and return the pump feeding off it. Production's only constructor —
+    /// on a non-reader backend the registration is inert (nothing sends to
+    /// it), which is exactly the piped/batch degradation.
+    pub fn open(park: &'a AppState) -> Self {
+        let (rx, divert) = crate::termio::divert_window();
+        Self {
+            rx,
+            _divert: Some(divert),
+            park,
         }
     }
-    fn defer_event(&self, ev: crossterm::event::Event) {
-        self.park_key(ev);
+
+    /// A pump over a caller-owned channel, with the sender handed back —
+    /// the test seam (no reader runs in unit tests, so the registration
+    /// this would make is meaningless anyway).
+    #[cfg(test)]
+    pub fn with_channel(
+        park: &'a AppState,
+    ) -> (Self, tokio::sync::mpsc::UnboundedSender<InputEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                rx,
+                _divert: None,
+                park,
+            },
+            tx,
+        )
+    }
+
+    /// Next diverted event, or `None` once the channel is closed — the
+    /// window pump's wait ([`crate::agent::pumps::pump_window_step`]).
+    pub async fn recv(&mut self) -> Option<InputEvent> {
+        self.rx.recv().await
+    }
+
+    /// Park an event the window cannot act on for later dispatch.
+    pub fn park(&self, ev: InputEvent) {
+        self.park.park_key(ev);
+    }
+}
+
+impl Drop for WindowPump<'_> {
+    fn drop(&mut self) {
+        // Unregister first (all divert sends hold the registration lock and
+        // have completed by the time this clear returns), then rescue what
+        // the reader already diverted but this pump never consumed — those
+        // keys were typed *during* the window and `read_input` must see
+        // them.
+        drop(self._divert.take());
+        while let Ok(ev) = self.rx.try_recv() {
+            self.park.park_key(ev);
+        }
     }
 }
 
@@ -759,34 +805,18 @@ impl AppState {
         self.state.lock().prefill.take()
     }
 
-    /// Park a key event captured while nobody could read stdin (a window
-    /// pump — see [`WindowKeySource`]). `read_input` drains the queue on
-    /// its next iteration through the normal dispatch, so the event lands
-    /// exactly as if it had arrived a moment later: same Ctrl-C/Z, same
-    /// Resize handling, same dispatcher — and *after* any `$EDITOR` the
-    /// window opened, instead of leaking into its stdin.
-    pub fn park_key(&self, ev: crossterm::event::Event) {
-        if let Some(ev) = crate::termio::InputEvent::from_event(ev) {
-            self.state.lock().parked_keys.push_back(ev);
-        }
+    /// Park a key event the window pump could not act on (see
+    /// [`WindowPump`]). `read_input` drains the queue on its next iteration
+    /// through the normal dispatch, so the event lands exactly as if it had
+    /// arrived a moment later: same Ctrl-C/Z, same Resize handling, same
+    /// dispatcher.
+    pub fn park_key(&self, ev: InputEvent) {
+        self.state.lock().parked_keys.push_back(ev);
     }
 
     /// Oldest parked key, if any — one per `read_input` iteration.
     pub fn take_parked_key(&self) -> Option<crate::termio::InputEvent> {
         self.state.lock().parked_keys.pop_front()
-    }
-
-    /// Is stdin owned by the interactive REPL? True iff the config's manager
-    /// carries the mode guard (interactive tty, non-quiet — the same
-    /// published-at-setup fact the term-guard slot used to answer) — a
-    /// window pump may read keys only then: piped/batch stdin belongs to the
-    /// script, and test states have no guard at all.
-    pub fn window_pump_active(&self) -> bool {
-        let content = self.with_config(|c| c.content.clone());
-        // Bound: the lock guard must drop before `content` (a tail-expression
-        // temporary would outlive the borrow).
-        let is_tty = content.manager.lock().unwrap().is_tty();
-        is_tty
     }
 
     /// Run the external editor over `current` through the single wrapper

@@ -76,9 +76,12 @@ the agent holds a `Content` handle (never the hub); confirmation keeps its own `
   capturing write never reaches `render()` — content only, never frame bytes — so `/replay Nl` and
   content-path tests compare what Content produced. Byte-edge tests use `TermIO::recording()`.
 - Quiet is Content's too, a flag rather than a backend: `Content::quiet` builds the same `Content`
-  and drops the hub hand-off (the bytes are still built), with `display_error` the one verb that
-  survives, to stderr. The non-REPL input read (the piped/batch driver) is a small `InputSource` on
-  the handle — stdin in production, a script in tests.
+  and drops the hub hand-off (the bytes are still built), with `Stream::Error` the one kind that
+  survives — it keeps the edge's routing (meta on a pipe, the primary when it is a terminal).
+  Making the error kind always-meta inside `TermIO` is a deferred refinement. The non-REPL input
+  read (the piped/batch driver) is `TermIO::read_line` (Plain answers; `Tty` reports `Unsupported`);
+  the handle's `InputSource` picks the source — the edge in production, nothing under quiet, a
+  script in tests.
 - No direct agent → output path remains: every write enters through render().
 
 ## UI layer
@@ -299,12 +302,18 @@ impl TermIO {
   cursor into view first, a timer cannot (repl.rs:1761).
 - caret invalidation (SIGCONT, resume) → the `caret` channel to RenderManager only
 - keys / paste → the `input` channel (repl pumps: `read_input` at the prompt, the turn's select
-  during a turn)
+  during a turn). One exception, still at the edge: while an LLM window is open (the compaction
+  summarization) the reader *diverts* forwarded events to the window's own inbox — a registered
+  sink, not a second stdin reader — and the window parks what it cannot use back into the queue
+  `read_input` drains. The reader never pauses for it.
 - Ctrl-C / Ctrl-Z handled here — process lifecycle, never queued
-- DSR cursor queries answered internally: pause dispatch, write the query, match the reply. Only for
-  exceptional events (startup, resume, reflow) — never per render. This replaces `confirm_gate` /
-  `reader_paused` entirely (including `$EDITOR`'s hand-off); all five `Output::cursor_row()`
-  re-anchor sites (repl ×4, editor ×1) dissolve into it.
+- DSR cursor queries answered internally — **by the reader itself, between polls**: the main task
+  posts a request to the reader's inbox and waits on the reply channel (bounded wait; an expired
+  request is dropped unasked), so no second stdin reader ever exists to swallow the answer and the
+  query needs no pause. Before the reader is spawned (the entry window) the main task is the sole
+  reader and scans directly; Plain answers `None` without touching stdin. Only for exceptional
+  events (startup, resume, reflow) — never per render. All `RenderManager::reanchor` sites
+  (repl ×4, editor ×1, caret invalidation) are front-door calls whose answer never leaves Draw.
 - `suspend()` stops the reader and drops raw mode ($EDITOR, Ctrl-Z); `resume()` reverses it. Upper
   layers reach it only through the RenderManager / Draw pass-throughs. The mode guard's own escapes
   (bracketed paste, kitty keyboard, cursor) are primary-stream writes: emitted only when the primary

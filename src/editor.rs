@@ -32,15 +32,13 @@ pub enum EditorMode {
 ///
 /// 1. Suspend (§Render → `TermIO::suspend`): park the sole stdin owner —
 ///    the editor child's keystrokes arrive on stdin, so an unpaused reader
-///    would swallow them — and drop raw mode. Nesting-safe inside TermIO
-///    (an outer holder's pause — the
-///    compaction window — outlives it).
+///    would swallow them — and drop raw mode.
 /// 2. Run `$EDITOR` on a tempfile (foreground child with inherited stdio),
 ///    then resume: raw mode back, reader released.
 /// 3. Re-anchor the draw cache (DSR): the editor was a foreign screen writer,
 ///    so the frame region can no longer be trusted (plan §4.2). Unconditional
 ///    — even a failed launch may have touched the screen. The query carries
-///    its own pause ([`crate::termio::query_cursor_row`]), so its reply is
+///    its own pause (inside `TermIO`, the sole stdin owner), so its reply is
 ///    safe even though the window's pause lifted with the resume.
 ///
 /// Blocking by design: while the editor owns the tty nothing else may write
@@ -48,24 +46,18 @@ pub enum EditorMode {
 pub(crate) fn run_editor(content: &Content, current: &str, mode: EditorMode) -> io::Result<String> {
     // One handle: the content handle's manager is the design's
     // front door for suspend/resume (§Render) and the owner of the DSR
-    // re-anchor (`cursor_row`). Without a mode guard — Plain, quiet, test
-    // states — there is no tty to hand over, so this reports `Unsupported`,
-    // the answer the caller-side missing-guard check used to give. The locks
-    // are taken only for the flips themselves: holding the manager across a
-    // human edit would freeze every render behind it.
+    // re-anchor (`reanchor`). Without a tty to hand over — Plain, quiet,
+    // test states — `suspend` reports `Unsupported`, asked once at the edge
+    // rather than by a caller-side guard. The locks are taken only for the
+    // flips themselves: holding the manager across a human edit would freeze
+    // every render behind it.
     let manager = content.manager.clone();
-    if !manager.lock().unwrap().is_tty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "editor requires an interactive terminal",
-        ));
-    }
-    manager.lock().unwrap().suspend();
+    manager.lock().unwrap().suspend()?;
     let edited = edit_in_editor(current, mode);
     {
         let mut m = manager.lock().unwrap();
-        m.resume();
-        let _ = m.cursor_row();
+        let _ = m.resume();
+        m.reanchor();
     }
     edited
 }

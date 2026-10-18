@@ -4,6 +4,25 @@ Ephemeral companion to [`261003_output_drawing_refactor.md`](./261003_output_dra
 (the authoritative design). `git log` and `doc/todo.md` record what is done; this file tracks only
 what remains and the decisions worth keeping. Do not refer to this document from code comments.
 
+## Sole-ownership enforcement: done
+
+"TermIO owns all IO, in and out." Complete across five commits: DSR (`11536d3`+`ea2f381`), the
+window pump's divert (`8778fc7`), interactive-output escapes (`5949de0`), error routing
+(`c0b3840`), and the batch stdin read (`cdf64a2` — `TermIO::read_line`; Plain answers, Tty reports
+`Unsupported`; the design's "Content holds the input handle" line amended to "the InputSource picks
+the source, the edge does the read").
+
+### Deferred (by decision, revisit when a driver appears)
+
+- An always-meta error kind inside TermIO: errors ride `Stream::Error`'s existing routing (meta on
+  a pipe, the primary on a tty); the mode is not important, the vocabulary is.
+- Ctrl-C/Ctrl-Z handling into the reader thread: forwarding a key is not reading stdin off-turn —
+  cleanup, not correctness.
+- Construction-time `is_terminal()` probes (`main.rs:304`, `interactive.rs:228`): environment
+  facts feeding construction, arguably outside the rule.
+- `confirm_probe`: a diagnostic binary that reads a key off a pty by design, outside the main
+  process.
+
 ## Follow-ups
 
 - **`tests/confirm_raw_mode.rs::confirm_dialog_paints_then_clears_with_decision_line` fails.**
@@ -38,6 +57,17 @@ unreliable, **not** a second half of the width requirement. Add it only if such 
 
 Decisions not obvious from the code or the design.
 
+- **The window pump consumes a *divert*, not the REPL's receiver.** The obvious design — have
+  `retry_summarization` select on the same `UnboundedReceiver` the prompt loop owns — does not
+  survive the call path: compaction runs deep inside `eval` → slashdot_menu's `NodeEntry::prepare`,
+  and threading `&mut receiver` across that crate boundary would make the menu crate depend on
+  input types it has no business naming. The alternative, moving the receiver into a shared slot
+  both the loop and the pump check out, turns every `recv()` into a lock acquisition. The divert
+  keeps the ownership story the design already tells: the reader is the sole stdin owner and
+  forwards; a registered window is simply the *other* destination for forwarded events, so nothing
+  above the edge reads stdin and the REPL receiver stays exactly where it was. It also collapses the
+  pause handshake: the old design paused the reader for the window (two readers on one fd); the
+  divert never lets two consumers exist, so `ReaderPauseGuard`'s last raiser died with it.
 - **Terminal teardown is owned by `run_interactive`'s exit, not `TermGuard`'s `Drop`.** The drop
   backstop is unreachable at process exit: the persistent stdin reader holds an `Arc` clone for the
   process lifetime, and `main` returning kills the thread without unwinding it. The prompt loop's

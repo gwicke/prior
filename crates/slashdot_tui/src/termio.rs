@@ -31,9 +31,9 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -102,8 +102,9 @@ pub fn fixed(size: TermSize) -> watch::Receiver<TermSize> {
 /// One event on `TermIO`'s input channel — what the repl consumes
 /// (design doc §TermIO). The reader converts at the send edge
 /// ([`InputEvent::from_event`]); crossterm stays an input-side detail, below
-/// this channel and in the window pump that reads stdin directly while the
-/// reader is paused.
+/// this channel. The window pump consumes this channel too — diverted at the
+/// reader while a window is open ([`divert_window`]) — so nothing above the
+/// edge ever reads stdin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputEvent {
     /// A key press. Still a `crossterm` type "for now" (design doc §TermIO):
@@ -524,9 +525,9 @@ impl TermIO {
     /// mode"): park the sole stdin owner — raise the
     /// pause gate, waiting out its last poll — then drop raw mode, the
     /// order `$EDITOR`'s hand-off used to run by hand before folding into
-    /// here. Idempotent; a no-op on Plain. Nested against an outer holder
-    /// (the compaction window, a DSR query): only the raise *this* call
-    /// made is remembered to lower — [`Self::resume`] releases exactly that.
+    /// here. Idempotent. Plain has no tty to hand over, so it reports
+    /// `Unsupported` — the answer the editor gate's caller-side `is_tty`
+    /// check used to give, now asked once at the edge.
     pub fn suspend(&self) -> io::Result<()> {
         match self {
             TermIO::Tty(t) => {
@@ -535,7 +536,29 @@ impl TermIO {
                 }
                 t.guard.stop()
             }
-            TermIO::Plain(_) => Ok(()),
+            TermIO::Plain(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no interactive terminal to suspend",
+            )),
+        }
+    }
+
+    /// One line of non-REPL input — the piped/batch driver's read, the
+    /// `else` arm of the interactive loop (design §Content). Plain reads
+    /// stdin through the edge, so nothing outside this layer touches the
+    /// fd; `Tty` reports `Unsupported` — its stdin belongs to the sole
+    /// reader and the REPL reads keys through the channel, not lines.
+    pub fn read_line(&self) -> io::Result<String> {
+        match self {
+            TermIO::Plain(_) => {
+                let mut line = String::new();
+                io::stdin().lock().read_line(&mut line)?;
+                Ok(line)
+            }
+            TermIO::Tty(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "line input is the piped/batch driver's read",
+            )),
         }
     }
 
@@ -783,9 +806,10 @@ fn write_stdio(meta: bool, bytes: &[u8]) -> io::Result<()> {
 /// runs for the process lifetime — it, and only it, calls
 /// `event::poll`/`event::read`. The prompt loop and every in-flight turn
 /// consume the events it forwards instead of touching stdin, which is what
-/// removes the three-way race between the prompt's blocking reads, the turn's
-/// reader, and the DSR query (the last of which is answered by pausing this
-/// reader — see [`query_cursor_row`]).
+/// removes the three-way race between the prompt's reads, the turn's
+/// consumption, and the DSR query — the last of which this thread answers
+/// itself between polls (see [`TermIO::query_cursor_row`]), so no second
+/// reader ever exists to swallow a reply.
 ///
 /// In raw mode `event::read` is blocking, so a background thread is what sees
 /// `Ctrl-C`/`Ctrl-Z` arriving while the main task is parked on a turn. `Esc`
@@ -794,18 +818,24 @@ fn write_stdio(meta: bool, bytes: &[u8]) -> io::Result<()> {
 ///
 /// `guard` is `Arc` and `stop()` is process-wide, so calling it from this
 /// thread is safe. The process-wide pause gate ([`PAUSE_GATE`]) is raised
-/// by the main task whenever *it* owns stdin — `$EDITOR`'s takeover, a DSR
-/// query, or the compaction window — and while it is `true` this reader backs
-/// off (sleeps, does not read) so it cannot swallow the bytes the main task is
-/// waiting for; [`READER_PARKED`] signals that it has genuinely parked.
+/// by the main task whenever *it* owns stdin — `$EDITOR`'s takeover or the
+/// compaction window — and while it is `true` this reader backs off (sleeps,
+/// does not read) so it cannot swallow the bytes the main task is waiting
+/// for; [`READER_PARKED`] signals that it has genuinely parked. DSR queries
+/// need no pause: this thread answers them itself between polls.
 pub fn spawn_stdin_reader(
     guard: Arc<TermGuard>,
     input: UnboundedSender<InputEvent>,
     caret: UnboundedSender<CaretEvent>,
     size: watch::Sender<TermSize>,
 ) {
+    // Inbox first, then the running flag: a query that sees the flag must
+    // find the inbox (they are paired — the flag *is* "requests are
+    // serviceable here").
+    let (dsr_tx, dsr_rx) = std::sync::mpsc::channel::<DsrRequest>();
+    *DSR_INBOX.lock().unwrap_or_else(|e| e.into_inner()) = Some(dsr_tx);
     // A gate-raiser only waits for a park when a reader exists to park; set it
-    // before the thread starts so the entry-DSR's pause below sees it.
+    // before the thread starts so the first pause sees it.
     READER_RUNNING.store(true, Ordering::SeqCst);
     let _ = thread::spawn(move || loop {
         if RESUMED.swap(false, Ordering::SeqCst) {
@@ -819,16 +849,27 @@ pub fn spawn_stdin_reader(
             // post-resume key with the event still queued.
             let _ = caret.send(CaretEvent::Invalidated);
         }
-        // The main task owns stdin right now ($EDITOR, a DSR query, or the
-        // compaction window); back off so we don't consume the bytes it is
-        // waiting for. `READER_PARKED` tells a gate-raiser that we have
-        // left any in-flight poll and are genuinely not reading.
+        // The main task owns stdin right now ($EDITOR or the compaction
+        // window); back off so we don't consume the bytes it is waiting
+        // for. `READER_PARKED` tells a gate-raiser that we have left any
+        // in-flight poll and are genuinely not reading.
         if PAUSE_GATE.load(Ordering::SeqCst) {
             READER_PARKED.store(true, Ordering::SeqCst);
             thread::sleep(Duration::from_millis(10));
             continue;
         }
         READER_PARKED.store(false, Ordering::SeqCst);
+        // Service pending DSR requests: the sole stdin owner answers its own
+        // queries inline, between polls — no pause, no second reader. A
+        // request past its TTL is dropped unasked: the caller stopped
+        // waiting ([`TermIO::query_cursor_row`]'s budget), and answering
+        // now would only monopolize stdin for nobody.
+        while let Ok(req) = dsr_rx.try_recv() {
+            if req.created.elapsed() < DSR_REQUEST_TTL {
+                let row = query_real_cursor_row();
+                let _ = req.reply.send(row);
+            }
+        }
         if let Ok(true) = event::poll(Duration::from_millis(50)) {
             if let Ok(ev) = event::read() {
                 // Resize: *both* edges (design §TermIO). The
@@ -854,13 +895,14 @@ pub fn spawn_stdin_reader(
                     });
                 }
                 // U4.2: edit keys this thread used to drop now go to the
-                // prompt loop or the turn. `send` on an unbounded tokio mpsc
-                // never blocks, so this is safe from a plain OS thread — and
-                // being non-blocking is the whole reason the channel is
-                // unbounded (see `route_event`).
+                // prompt loop or the turn — or, while a window is open, to
+                // the window's divert ([`send_input`]). `send` on an unbounded
+                // tokio mpsc never blocks, so this is safe from a plain OS
+                // thread — and being non-blocking is the whole reason the
+                // channel is unbounded (see `route_event`).
                 if route_event(&ev) == ReaderRoute::Forward {
                     if let Some(fwd) = InputEvent::from_event(ev) {
-                        let _ = input.send(fwd);
+                        send_input(&input, fwd);
                     }
                 } else if let Event::Key(key) = ev {
                     if let KeyCode::Char('c') = key.code {
@@ -1041,22 +1083,23 @@ fn enable_output_processing() {
     }
 }
 
-// --- stdin ownership: the pause handshake + DSR -----------------------------
+// --- stdin ownership: the pause handshake -----------------------------------
 //
 // The persistent reader (the sole stdin owner) must stand down whenever the
-// *main* task reads stdin itself: a DSR reply, `$EDITOR`'s keystrokes, or the
-// compaction window's key pump. There is exactly one reader and one gate, so
-// the gate is process-wide — this is a mutual-exclusion flag, not per-instance
-// configuration like the size watch.
+// *main* task reads stdin itself: `$EDITOR`'s keystrokes or the compaction
+// window's key pump. DSR replies need no handshake — the reader answers its
+// own queries inline between polls. There is exactly one reader and one gate,
+// so the gate is process-wide — this is a mutual-exclusion flag, not
+// per-instance configuration like the size watch.
 
 /// Raised while the main task owns stdin; the persistent reader backs off
 /// (does not call `event::poll`/`read`) for as long as it is `true`.
 pub static PAUSE_GATE: AtomicBool = AtomicBool::new(false);
 
 /// Set by the reader while it is backed off, cleared the moment it is about to
-/// read stdin again. A gate-raiser waits on this to know the reader has left
-/// any in-flight 50 ms poll — so the bytes it is about to read cannot be
-/// swallowed. See [`ReaderPauseGuard`].
+/// read stdin again. [`raise_pause_gate`] waits on this to know the reader
+/// has left any in-flight 50 ms poll — so the bytes it is about to read
+/// cannot be swallowed.
 pub static READER_PARKED: AtomicBool = AtomicBool::new(false);
 
 /// Set once the reader thread has started. A gate-raiser only waits on
@@ -1064,30 +1107,79 @@ pub static READER_PARKED: AtomicBool = AtomicBool::new(false);
 /// reader there is nothing to wait for, and the wait would be a wasted timeout.
 pub static READER_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Pauses the persistent reader for a window in which the main task owns stdin
-/// and reads it directly — a DSR query, `$EDITOR`'s
-/// takeover, or the compaction window's key pump. Raising waits for the reader
-/// to actually park ([`READER_PARKED`]); dropping lowers the gate again.
-///
-/// Nesting-safe: if the gate is already up, this neither waits nor lowers — the
-/// outer holder owns the pause.
-pub struct ReaderPauseGuard {
-    /// Did *this* guard raise the gate? Only the raiser lowers it on drop.
-    owned: bool,
-}
+/// The open window's inbox (generation, sender), registered by
+/// [`divert_window`]. While set, the reader diverts forwarded events here
+/// instead of the REPL channel — the window pump's source (design §TermIO:
+/// the reader stays the sole stdin owner; the window consumes its *output*,
+/// not stdin). Process-wide because the reader is: one reader, one divert.
+static WINDOW_DIVERT: std::sync::Mutex<Option<(u64, UnboundedSender<InputEvent>)>> =
+    std::sync::Mutex::new(None);
 
-impl ReaderPauseGuard {
-    pub fn raise() -> Self {
-        Self {
-            owned: raise_pause_gate(),
+/// Next [`WindowDivert`] generation — pairs with [`WINDOW_DIVERT`] so a
+/// dropped guard clears only its own registration, never a newer window's.
+static WINDOW_DIVERT_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// A registered window divert: while alive, forwarded events reach
+/// [`divert_window`]'s receiver instead of the REPL channel. On drop the
+/// registration clears (only if no newer window re-registered) — after which
+/// the reader sends to the REPL channel again. Buffered events a send raced
+/// in before the clear stay on the window side; the pump drains them
+/// ([`Drop`](crate) parks leftovers for `read_input`).
+pub struct WindowDivert(u64);
+
+impl Drop for WindowDivert {
+    fn drop(&mut self) {
+        let mut slot = WINDOW_DIVERT.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().map(|(gen, _)| *gen) == Some(self.0) {
+            *slot = None;
         }
     }
 }
 
+/// Open a window divert: returns the receiver the window pump selects on and
+/// the guard that keeps the diversion registered. While the guard lives the
+/// reader sends every forwarded event ([`route_event::Forward`]) here;
+/// without a reader (Plain, a recording double, the pre-spawn entry window)
+/// nothing ever feeds the receiver — the window is inert, exactly the old
+/// `window_active() == false` shape, and stdin is untouched either way.
+pub fn divert_window() -> (
+    tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    WindowDivert,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let gen = WINDOW_DIVERT_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    *WINDOW_DIVERT.lock().unwrap_or_else(|e| e.into_inner()) = Some((gen, tx));
+    (rx, WindowDivert(gen))
+}
+
+/// Deliver one event: to the open window's divert if there is one, else to
+/// the REPL channel. The send runs *under the registration lock* — an
+/// unbounded send never blocks, and holding the lock across it is what makes
+/// window teardown race-free: the guard's drop takes the same lock, so it
+/// either precedes this send (slot empty → channel) or follows it (event
+/// already buffered → the window's `Drop` drains and parks it).
+fn send_input(input: &UnboundedSender<InputEvent>, ev: InputEvent) {
+    let slot = WINDOW_DIVERT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, tx)) = slot.as_ref() {
+        // Cloned so the fallback below still holds `ev` if the send fails
+        // (receiver died mid-registration — shouldn't happen, the guard
+        // clears the slot first, but losing an event on a shouldn't is not
+        // an option).
+        if tx.send(ev.clone()).is_ok() {
+            return;
+        }
+    }
+    drop(slot);
+    let _ = input.send(ev);
+}
+
 /// Raise the pause gate and wait the reader out; `true` when *this* call
-/// raised it — the raiser owns lowering it ([`ReaderPauseGuard`] drops its
-/// own, [`TermIO::suspend`] remembers its own across the editor window).
+/// raised it — the raiser owns lowering it ([`TermIO::suspend`] remembers
+/// its own across the editor window and lowers it in [`TermIO::resume`]).
 /// Nesting-safe: a call on an already-up gate neither waits nor claims.
+/// The pause's only production raiser is `$EDITOR`'s takeover; the
+/// compaction window no longer pauses (it consumes the reader's
+/// [`divert_window`] instead — the reader never stands down for it).
 fn raise_pause_gate() -> bool {
     let owned = !PAUSE_GATE.swap(true, Ordering::SeqCst);
     if owned && READER_RUNNING.load(Ordering::SeqCst) {
@@ -1102,20 +1194,78 @@ fn raise_pause_gate() -> bool {
     owned
 }
 
-impl Drop for ReaderPauseGuard {
-    fn drop(&mut self) {
-        if self.owned {
-            PAUSE_GATE.store(false, Ordering::SeqCst);
-        }
-    }
+/// How long a DSR request may sit before the reader must not service it
+/// anymore: the caller's [`Self::query_cursor_row`] gives up by then, so a
+/// late round-trip would only monopolize stdin for nobody.
+const DSR_REQUEST_TTL: Duration = Duration::from_millis(150);
+
+/// The caller's wait budget — one reader poll (50 ms) plus one scan
+/// (60 ms) plus slack. Generous over [`DSR_REQUEST_TTL`] so an expired
+/// request is always discarded before or as the caller stops caring.
+const DSR_REPLY_WAIT: Duration = Duration::from_millis(220);
+
+/// A pending DSR request from the main task. The reader services it inline
+/// between polls (design §TermIO: the sole stdin owner answers its own
+/// queries), discarding it if [`DSR_REQUEST_TTL`] has run out — the caller
+/// has stopped waiting by then.
+struct DsrRequest {
+    created: Instant,
+    reply: std::sync::mpsc::Sender<Option<usize>>,
 }
 
-/// The cursor row from a DSR query, answered with the reader paused so the
-/// reply cannot be swallowed. This is the *whole* of the
-/// terminal-I/O-layer DSR: pause dispatch, write the query, match the reply.
-pub fn query_cursor_row() -> Option<usize> {
-    let _pause = ReaderPauseGuard::raise();
-    query_real_cursor_row()
+/// The reader thread's DSR inbox, registered by [`spawn_stdin_reader`].
+/// Process-wide because the reader is: one reader, one inbox.
+static DSR_INBOX: std::sync::Mutex<Option<std::sync::mpsc::Sender<DsrRequest>>> =
+    std::sync::Mutex::new(None);
+
+impl TermIO {
+    /// The cursor row from a DSR query — edge-internal (design §TermIO):
+    /// the answer syncs the draw cache and never travels beyond it.
+    ///
+    /// Two shapes, and which one runs is the sole-ownership invariant:
+    ///
+    /// - **Reader running (the normal interactive case):** a request into
+    ///   the reader's [`DSR_INBOX`]; the reader writes the query and reads
+    ///   its own reply between polls, so no second stdin reader exists to
+    ///   swallow the answer. The main task just waits on the channel.
+    /// - **No reader** — Plain, a recording double, a test state, or the
+    ///   entry window before [`Self::handles`] spawns the thread: Plain and
+    ///   the doubles answer `None` (no terminal behind this edge, and a
+    ///   pipe must never receive a stray `ESC[6n`); Tty scans directly, the
+    ///   main task being the one and only stdin reader until the spawn.
+    ///
+    /// A gated reader (an `$EDITOR` takeover or a compaction window owns
+    /// stdin) does not service requests — it cannot read them — so the
+    /// caller times out to `None`, the same "no new information" a silent
+    /// terminal produces.
+    pub(crate) fn query_cursor_row(&self) -> Option<usize> {
+        match self {
+            TermIO::Plain(_) => None,
+            TermIO::Tty(_) => {
+                if !READER_RUNNING.load(Ordering::SeqCst) {
+                    return query_real_cursor_row();
+                }
+                let (tx, rx) = std::sync::mpsc::channel();
+                let queued = DSR_INBOX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|inbox| {
+                        inbox
+                            .send(DsrRequest {
+                                created: Instant::now(),
+                                reply: tx,
+                            })
+                            .ok()
+                    })
+                    .is_some();
+                if !queued {
+                    return None;
+                }
+                rx.recv_timeout(DSR_REPLY_WAIT).ok().flatten()
+            }
+        }
+    }
 }
 
 /// Whether the persistent stdin reader is currently paused (the main task owns
@@ -1128,8 +1278,10 @@ pub fn reader_paused() -> bool {
 /// Non-blocking Device Status Report: ask the terminal for the real cursor
 /// row, timing out fast so we never hang on a terminal that does not answer
 /// (e.g. a headless test pty). Returns a 1-indexed row. Reads the reply raw
-/// (bypassing crossterm's event parser). Callers should already hold the pause
-/// ([`query_cursor_row`]) — this is the raw read.
+/// (bypassing crossterm's event parser). The caller must be the sole stdin
+/// reader for the duration: the reader thread itself (between polls — no
+/// pause exists or is needed), or the main task in the pre-spawn entry
+/// window, when no reader exists yet.
 fn query_real_cursor_row() -> Option<usize> {
     let stdin = io::stdin();
     let fd = stdin.as_raw_fd();
@@ -1203,41 +1355,16 @@ mod tests {
         assert_eq!(rx.borrow().height, 24);
     }
 
-    /// `ReaderPauseGuard` owns the pause gate for its lifetime and is
-    /// nesting-safe — the replacement for the old `confirm_gate`/`ReaderHold`
-    /// plumbing. No reader runs in a unit test
-    /// (`READER_RUNNING` is false), so `raise` never blocks on a park and the
-    /// assertions are purely about the flag's ownership.
-    #[test]
-    fn a_pause_guard_owns_and_nests_the_gate() {
-        assert!(!reader_paused(), "gate starts clear");
-        {
-            let _outer = ReaderPauseGuard::raise();
-            assert!(reader_paused(), "raised for the guard's lifetime");
-            {
-                let _inner = ReaderPauseGuard::raise();
-                assert!(reader_paused(), "a nested raise keeps it up");
-            }
-            assert!(
-                reader_paused(),
-                "an inner drop must not lower an outer holder's pause"
-            );
-        }
-        assert!(!reader_paused(), "dropped once, clear again");
-    }
-
     /// The reader-stop half of `TermIO::suspend`: suspend parks
     /// the reader before dropping raw mode, a repeated suspend keeps its
-    /// claim, and the matching resume releases exactly that raise — an
-    /// outer holder's pause (the compaction window) outlives a nested
-    /// suspend/resume pair.
+    /// claim, and the matching resume releases exactly that raise.
     ///
     /// Gated on a non-terminal stdin because `resume()` enters raw mode:
     /// flipping the harness's real tty mid-suite (and spraying CSI at the
-    /// log) is what `a_pause_guard…`'s doc means by a unit test not touching
-    /// the terminal — the same escape hatch the bwrap regression uses.
+    /// log) is what a unit test not touching the terminal means — the same
+    /// escape hatch the bwrap regression uses.
     #[test]
-    fn termio_suspend_parks_the_reader_and_resume_releases_only_its_own_pause() {
+    fn termio_suspend_parks_the_reader_and_resume_releases_its_pause() {
         use std::io::IsTerminal;
         if std::io::stdin().is_terminal() {
             return;
@@ -1251,17 +1378,61 @@ mod tests {
         let _ = io.resume(); // raw-mode flip may fail without a tty; the
                              // gate release runs regardless
         assert!(!reader_paused(), "resume lifts the pause suspend raised");
+    }
 
-        // An outer holder: its pause must survive a nested pair.
-        let outer = ReaderPauseGuard::raise();
-        io.suspend().unwrap();
-        let _ = io.resume();
-        assert!(
-            reader_paused(),
-            "an outer holder keeps the gate up across a nested suspend/resume"
+    /// The window divert routes forwarded events to the registered
+    /// receiver while the guard lives, and back to the REPL channel once it
+    /// drops — the window pump's whole source contract, with the reader
+    /// never leaving the read path.
+    #[test]
+    fn window_divert_routes_then_releases() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut win_rx, guard) = divert_window();
+        send_input(
+            &tx,
+            InputEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         );
-        drop(outer);
-        assert!(!reader_paused(), "the outer drop clears it");
+        assert!(
+            rx.try_recv().is_err(),
+            "the REPL channel must not see a diverted event"
+        );
+        let ev = win_rx
+            .blocking_recv()
+            .expect("the window receiver gets the diverted event");
+        assert_eq!(
+            ev,
+            InputEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        );
+
+        drop(guard);
+        send_input(
+            &tx,
+            InputEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(InputEvent::Key(k)) if k.code == KeyCode::Char('x')),
+            "after the guard drops, events flow to the REPL channel again"
+        );
+    }
+
+    /// A newer window's registration survives an older guard's drop — the
+    /// generation check: a dropped guard clears only its own slot, never a
+    /// newer window's.
+    #[test]
+    fn window_divert_generations_clear_only_their_own() {
+        let (rx1, guard1) = divert_window();
+        let (rx2, guard2) = divert_window();
+        drop(guard1);
+        assert!(
+            WINDOW_DIVERT.lock().unwrap().is_some(),
+            "an older guard's drop must not clear the newer registration"
+        );
+        drop(guard2);
+        assert!(
+            WINDOW_DIVERT.lock().unwrap().is_none(),
+            "the newer guard's drop clears the slot"
+        );
+        let _ = (rx1, rx2);
     }
 
     // --- the routing policy ------

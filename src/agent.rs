@@ -26,7 +26,7 @@ pub(crate) mod turn;
 #[cfg(test)]
 use msglog::message_role;
 use msglog::MessageLogger;
-use replay::{build_replay_units, count_turns, replay_last_turns, replay_units};
+use replay::{build_replay_units, count_turns, replay_last_turns, replay_tail_lines};
 use transcript::maybe_strip_reasoning;
 
 /// Token-usage telemetry accumulated by an agent across a session.
@@ -634,20 +634,7 @@ pub(crate) async fn resume_session(
         let units = build_replay_units(&branch);
         let total = count_turns(&units);
         if is_lines {
-            // Line-based: capture full replay via writer, tail lines.
-            content.begin_capture();
-            replay_units(content, &units, 0);
-            let bytes = content.end_capture();
-            let captured = String::from_utf8_lossy(&bytes);
-            let lines: Vec<&str> = captured.lines().collect();
-            let start = lines.len().saturating_sub(count);
-            use std::io::Write as _;
-            let stdout = std::io::stdout();
-            let mut handle = stdout.lock();
-            for line in &lines[start..] {
-                let _ = writeln!(handle, "{}", line);
-            }
-            let _ = handle.flush();
+            replay_tail_lines(content, &units, count);
         } else {
             replay_last_turns(content, &units, count.min(total));
         }
