@@ -5,159 +5,162 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 // Wrapper types that can deserialize from both JSON numbers and strings.
-/// These handle the common case where LLMs send numeric parameters as strings.
+// These handle the common case where LLMs send numeric parameters as strings.
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    schemars::JsonSchema,
-    Default,
-    serde::Serialize,
-)]
-pub struct ReadOffset(pub u64);
+/// Declare a `u64` wrapper for a numeric tool parameter that accepts both JSON
+/// numbers and numeric strings — weak tool-call harnesses stringify numbers
+/// often enough that rejecting `"2"` would cost more than tolerating it.
+///
+/// Every wrapper's `Default` is `0`, which carries no meaning of its own: it
+/// is what an *absent* field deserializes to, and the consuming tool maps it
+/// to that parameter's default (see `ReadLimit::resolved`,
+/// `ByteLimit::resolved`). The `Default` derive is also what lets `#[rig_tool]`
+/// advertise the parameter as optional. Deserialization errors are
+/// model-visible and read `invalid <what>: ...`.
+macro_rules! numeric_param {
+    ($name:ident, $what:literal, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            schemars::JsonSchema,
+            Default,
+            serde::Serialize,
+        )]
+        pub struct $name(pub u64);
 
-impl<'de> serde::Deserialize<'de> for ReadOffset {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct Visitor;
-
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = u64;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a positive integer for read offset (not a string)")
-            }
-
-            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
-                E: serde::de::Error,
+                D: serde::Deserializer<'de>,
             {
-                Ok(value)
-            }
+                struct Visitor;
 
-            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if value < 0 {
-                    return Err(E::custom("invalid read offset: negative value not allowed"));
+                impl<'de> serde::de::Visitor<'de> for Visitor {
+                    type Value = u64;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        formatter.write_str(concat!(
+                            "a positive integer for ",
+                            $what,
+                            " (not a string)"
+                        ))
+                    }
+
+                    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        Ok(value)
+                    }
+
+                    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        if value < 0 {
+                            return Err(E::custom(format!(
+                                "invalid {}: negative value not allowed",
+                                $what
+                            )));
+                        }
+                        Ok(value as u64)
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        if let Ok(parsed) = value.parse::<u64>() {
+                            Ok(parsed)
+                        } else {
+                            Err(E::custom(format!(
+                                "invalid {}: '{}' - must be number",
+                                $what, value
+                            )))
+                        }
+                    }
                 }
-                Ok(value as u64)
-            }
 
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if let Ok(parsed) = value.parse::<u64>() {
-                    Ok(parsed)
-                } else {
-                    Err(E::custom(format!(
-                        "invalid read offset: '{}' - must be number",
-                        value
-                    )))
-                }
+                deserializer.deserialize_any(Visitor).map($name)
             }
         }
 
-        deserializer.deserialize_any(Visitor).map(ReadOffset)
-    }
-}
-
-impl ReadOffset {
-    pub fn map<U, F: FnOnce(u64) -> U>(self, f: F) -> U {
-        f(self.0)
-    }
-}
-
-impl From<ReadOffset> for u64 {
-    fn from(w: ReadOffset) -> u64 {
-        w.0
-    }
-}
-
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    schemars::JsonSchema,
-    Default,
-    serde::Serialize,
-)]
-pub struct ReadLimit(pub u64);
-
-impl<'de> serde::Deserialize<'de> for ReadLimit {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct Visitor;
-
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = u64;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a positive integer for read limit (not a string)")
-            }
-
-            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(value)
-            }
-
-            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if value < 0 {
-                    return Err(E::custom("invalid read limit: negative value not allowed"));
-                }
-                Ok(value as u64)
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if let Ok(parsed) = value.parse::<u64>() {
-                    Ok(parsed)
-                } else {
-                    Err(E::custom(format!(
-                        "invalid read limit: '{}' - must be number",
-                        value
-                    )))
-                }
+        impl $name {
+            pub fn map<U, F: FnOnce(u64) -> U>(self, f: F) -> U {
+                f(self.0)
             }
         }
 
-        deserializer.deserialize_any(Visitor).map(ReadLimit)
-    }
+        impl From<$name> for u64 {
+            fn from(w: $name) -> u64 {
+                w.0
+            }
+        }
+    };
 }
+
+numeric_param!(
+    ReadOffset,
+    "read offset",
+    "0-based line number at which to start reading (0 = top of file)."
+);
+numeric_param!(
+    ReadLimit,
+    "read limit",
+    "Line budget for one read: 0 selects READ_DEFAULT_LINES; larger values \
+     clamp to READ_MAX_LINES. See `ReadLimit::resolved`."
+);
+numeric_param!(
+    ByteOffset,
+    "byte offset",
+    "Absolute byte position at which to start reading — the byte-based \
+     alternative to `offset`, for paging files whose lines are very long. 0 \
+     selects the line-based window; a non-zero value must not be combined \
+     with a non-zero `offset`."
+);
+numeric_param!(
+    ByteLimit,
+    "byte limit",
+    "Byte budget for one read: 0 selects READ_DEFAULT_BYTES; larger values \
+     clamp to READ_MAX_BYTES. See `ByteLimit::resolved`."
+);
+
+/// Default line budget for one `read` call when `limit` is 0.
+pub const READ_DEFAULT_LINES: u64 = 500;
+/// Hard per-read line cap for `read`; a larger `limit` is clamped to it.
+pub const READ_MAX_LINES: u64 = 2000;
+/// Default byte budget for one `read` call when `byte_limit` is 0 (10 KiB).
+pub const READ_DEFAULT_BYTES: u64 = 10 * 1024;
+/// Hard per-read byte cap for `read` (50 KiB); a larger `byte_limit` clamps.
+pub const READ_MAX_BYTES: u64 = 50 * 1024;
 
 impl ReadLimit {
-    pub fn map<U, F: FnOnce(u64) -> U>(self, f: F) -> U {
-        f(self.0)
+    /// The effective line budget: 0 becomes [`READ_DEFAULT_LINES`], a larger
+    /// value is clamped to [`READ_MAX_LINES`]. Never unbounded — that is the
+    /// point of the per-read caps.
+    pub fn resolved(self) -> u64 {
+        match self.0 {
+            0 => READ_DEFAULT_LINES,
+            v => v.min(READ_MAX_LINES),
+        }
     }
 }
 
-impl From<ReadLimit> for u64 {
-    fn from(w: ReadLimit) -> u64 {
-        w.0
+impl ByteLimit {
+    /// The effective byte budget: 0 becomes [`READ_DEFAULT_BYTES`], a larger
+    /// value is clamped to [`READ_MAX_BYTES`].
+    pub fn resolved(self) -> u64 {
+        match self.0 {
+            0 => READ_DEFAULT_BYTES,
+            v => v.min(READ_MAX_BYTES),
+        }
     }
 }
 
@@ -2021,5 +2024,35 @@ model = "claude-3-5-sonnet-20241022"
             cfg.models.values().any(|r| r.context_length.is_some()),
             "a display override should be shown"
         );
+    }
+
+    #[test]
+    fn read_limits_resolve_to_default_or_clamp_to_max() {
+        assert_eq!(ReadLimit(0).resolved(), READ_DEFAULT_LINES);
+        assert_eq!(ReadLimit(1).resolved(), 1);
+        assert_eq!(ReadLimit(99_999).resolved(), READ_MAX_LINES);
+        assert_eq!(ByteLimit(0).resolved(), READ_DEFAULT_BYTES);
+        assert_eq!(ByteLimit(1).resolved(), 1);
+        assert_eq!(ByteLimit(50 * 1024).resolved(), READ_MAX_BYTES);
+        assert_eq!(ByteLimit(50 * 1024 + 1).resolved(), READ_MAX_BYTES);
+    }
+
+    /// The string-tolerant deserialization the wrappers exist for still works,
+    /// and the errors keep their model-visible `invalid <what>: ...` shape
+    /// (they are macro-generated now, one copy instead of four).
+    #[test]
+    fn numeric_param_wrappers_accept_numbers_and_strings_reject_junk() {
+        let n: ReadOffset = serde_json::from_str("7").unwrap();
+        assert_eq!(n.0, 7);
+        let s: ByteLimit = serde_json::from_str("\"1024\"").unwrap();
+        assert_eq!(s.0, 1024);
+
+        let junk = serde_json::from_str::<ReadLimit>("\"ten\"");
+        assert!(junk.unwrap_err().to_string().contains("invalid read limit"),);
+        let neg = serde_json::from_str::<ByteOffset>("-1");
+        assert!(neg
+            .unwrap_err()
+            .to_string()
+            .contains("invalid byte offset: negative value not allowed"),);
     }
 }

@@ -2927,6 +2927,19 @@ mod tests {
             get_preview("read_file", &args).0,
             "read src/content/handle.rs [20..]"
         );
+        // byte mode replaces the line window, with the effective byte range
+        // (byte_limit 0 => the default budget, resolved the same way the
+        // tool resolves it).
+        let args = serde_json::json!({"path": "src/content/handle.rs", "byte_offset": 5000});
+        assert_eq!(
+            get_preview("read_file", &args).0,
+            "read src/content/handle.rs @bytes 5000..15240"
+        );
+        let args = serde_json::json!({"path": "f", "byte_offset": 100, "byte_limit": 50 * 1024});
+        assert_eq!(
+            get_preview("read_file", &args).0,
+            "read f @bytes 100..51300"
+        );
     }
 
     /// A blob that will not canonicalize — here a multi-file one, which is
