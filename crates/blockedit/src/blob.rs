@@ -57,7 +57,8 @@ pub struct ParsedEdit {
     pub old_text: String,
     pub new_text: String,
     /// 1-based line the block's header anchored to (`path:LINE`), if any. Used
-    /// as a nearest-match hint by the backend; never persisted or rendered.
+    /// as a nearest-match hint by the backend, and persisted/rendered once the
+    /// edit has resolved so replay stays both compact and unambiguous.
     pub start_line: Option<u64>,
     /// The file this block's header named, if it had one.
     ///
@@ -425,8 +426,13 @@ fn same_path(a: &str, b: &str) -> bool {
 }
 
 /// Render block pairs as a blob, with the path repeated as a header line above
-/// **every** block (Aider-style). Anchors are a transient matching aid and are
-/// not represented.
+/// **every** block (Aider-style). A block's `start_line`, when present, is
+/// rendered as `path:LINE`.
+///
+/// Anchors are part of the round trip: if you change this, also check
+/// `parse_blocks`, `edits_to_value`, `array_to_blob_value`,
+/// `canonicalize_edit_value`, and `src/edit_blocks::per_file_blocks` — all of
+/// them must preserve `startLine`/`path:LINE` together.
 ///
 /// The path is repeated because the tool *requires* a header on every block —
 /// the model-facing form has to be a form the tool accepts, or the agent is
@@ -441,16 +447,24 @@ pub fn render_blob(path: &str, edits: &[ParsedEdit]) -> String {
         }
         if !path.is_empty() {
             out.push_str(path);
+            if let Some(line) = e.start_line {
+                out.push(':');
+                out.push_str(&line.to_string());
+            }
             out.push('\n');
         }
         out.push_str(SEARCH_MARKER);
         out.push('\n');
         out.push_str(&e.old_text);
-        out.push('\n');
+        if !e.old_text.ends_with('\n') {
+            out.push('\n');
+        }
         out.push_str(DIVIDER);
         out.push('\n');
         out.push_str(&e.new_text);
-        out.push('\n');
+        if !e.new_text.ends_with('\n') {
+            out.push('\n');
+        }
         out.push_str(REPLACE_MARKER);
         out.push('\n');
     }
@@ -461,14 +475,26 @@ pub fn render_blob(path: &str, edits: &[ParsedEdit]) -> String {
     out
 }
 
-/// Build the canonical `edits` array value from parsed blocks. Anchors are
-/// transient and deliberately omitted (the canonical array is the persisted,
-/// pi-compatible form).
+/// Build the canonical `edits` array value from parsed blocks.
+///
+/// Keep the `startLine` round trip in sync with `render_blob`,
+/// `array_to_blob_value`, `canonicalize_edit_value`, `wire::from_wire`, and
+/// `src/session/storage::normalize_args_in_place`.
+///
+/// `startLine` is included when known. pi's schema tolerates the extra field
+/// (it does not set `additionalProperties: false`) and ignores it during
+/// application, so this is both safe and what lets a later turn re-render the
+/// same compact anchored block after the file has changed.
 fn edits_to_value(edits: &[ParsedEdit]) -> Value {
     Value::Array(
         edits
             .iter()
-            .map(|e| json!({ "oldText": e.old_text, "newText": e.new_text }))
+            .map(|e| match e.start_line {
+                Some(line) => {
+                    json!({ "oldText": e.old_text, "newText": e.new_text, "startLine": line })
+                }
+                None => json!({ "oldText": e.old_text, "newText": e.new_text }),
+            })
             .collect(),
     )
 }
@@ -533,14 +559,22 @@ pub fn canonicalize_edit_value(args: &Value) -> Value {
             .get("path")
             .cloned()
             .unwrap_or(Value::String(String::new()));
-        return json!({ "path": path, "edits": [{ "oldText": o, "newText": n }] });
+        let edit = match obj.get("startLine").and_then(Value::as_u64) {
+            Some(line) => json!({ "oldText": o, "newText": n, "startLine": line }),
+            None => json!({ "oldText": o, "newText": n }),
+        };
+        return json!({ "path": path, "edits": [edit] });
     }
 
     // Legacy `old`/`new`.
     if let Some(o) = obj.get("old") {
         let n = obj.get("new").cloned().unwrap_or(Value::Null);
         let path = obj.get("path").cloned().unwrap_or(Value::Null);
-        return json!({ "path": path, "edits": [{ "oldText": o, "newText": n }] });
+        let edit = match obj.get("startLine").and_then(Value::as_u64) {
+            Some(line) => json!({ "oldText": o, "newText": n, "startLine": line }),
+            None => json!({ "oldText": o, "newText": n }),
+        };
+        return json!({ "path": path, "edits": [edit] });
     }
 
     args.clone()
@@ -549,6 +583,10 @@ pub fn canonicalize_edit_value(args: &Value) -> Value {
 /// Inverse of [`canonicalize_edit_value`] for the model-facing form: rewrite a
 /// canonical-array edit call into the blob form, under [`BLOCKS_FIELD`].
 /// **Idempotent** — a value that is not a canonical array is returned unchanged,
+///
+/// `startLine` must survive in both directions; if you touch that mapping, also
+/// touch `edits_to_value`, `render_blob`, `canonicalize_edit_value`, and
+/// `src/agent/transcript.rs::minimize_edit_tool_calls`.
 /// so a value already in blob form passes straight through.
 pub fn array_to_blob_value(args: &Value) -> Value {
     let Some(obj) = args.as_object() else {
@@ -571,7 +609,7 @@ pub fn array_to_blob_value(args: &Value) -> Value {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            start_line: None,
+            start_line: e.get("startLine").and_then(Value::as_u64),
             header: None,
             rejected_header: None,
             raw_header: None,
@@ -971,6 +1009,35 @@ mod tests {
     fn array_to_blob_is_idempotent_on_blob() {
         let v = json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
         assert_eq!(array_to_blob_value(&v), v);
+    }
+
+    #[test]
+    fn anchors_round_trip_through_render_and_canonicalize() {
+        let v = json!({
+            "path": "src/x.rs",
+            "edits": [{"oldText": "b", "newText": "B", "startLine": 12}]
+        });
+        let blob = array_to_blob_value(&v);
+        assert_eq!(
+            blob["blocks"].as_str().unwrap(),
+            "src/x.rs:12\n@@@OLD\nb\n@@@NEW\nB\n@@@END"
+        );
+        assert_eq!(canonicalize_edit_value(&blob), v);
+        assert_eq!(
+            parse_blocks(blob["blocks"].as_str().unwrap())
+                .unwrap()
+                .edits[0]
+                .start_line,
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn render_blob_emits_an_anchor_only_when_present() {
+        let mut edit = plain("b", "B");
+        edit.start_line = Some(12);
+        let blob = render_blob("src/x.rs", &[edit]);
+        assert!(blob.starts_with("src/x.rs:12\n@@@OLD\n"), "{blob}");
     }
 
     #[test]

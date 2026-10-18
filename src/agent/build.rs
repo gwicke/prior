@@ -47,8 +47,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::agent::msglog::MessageLogger;
 use crate::agent::transcript::{
-    blob_edit_tool_calls, is_tool_available, maybe_strip_reasoning, model_facing_tool_text,
-    reasoning_remap_note, split_multi_file_edit_calls, TurnTranscript,
+    blob_edit_tool_calls, is_tool_available, maybe_strip_reasoning, minimize_edit_tool_calls,
+    model_facing_tool_text, reasoning_remap_note, split_multi_file_edit_calls, EditAnchorLedger,
+    TurnTranscript,
 };
 use crate::agent::CodeAgent;
 use crate::tools::{
@@ -578,6 +579,10 @@ pub(crate) struct LoggingHook {
     /// Hooks and the prompt loop both append under this mutex in stream
     /// order, so the transcript mirrors rig's own `new_messages`.
     pub(crate) transcript: Arc<Mutex<TurnTranscript>>,
+    /// Resolved placements of successful edits this run, shared with the
+    /// persist path so model history and disk both use the compact anchored
+    /// form. Keyed by durable tool-call id.
+    pub(crate) edit_anchors: Arc<Mutex<EditAnchorLedger>>,
 }
 
 impl AgentHook for LoggingHook {
@@ -590,8 +595,14 @@ impl AgentHook for LoggingHook {
             return CompletionCallAction::Stop("cancelled by user".into());
         }
         // Build the history to send: strip reasoning when configured, then
-        // render `edit` tool calls in the model-facing block form. The
-        // transcript is stored canonically (a pi-compatible array); the model is
+        // render `edit` tool calls in the model-facing block form and shrink
+        // successful ones to anchored changed lines. The composition order is
+        // `strip -> blob -> minimize -> split`; the persist path in
+        // `src/agent/turn.rs` must apply the same minimizer before
+        // `append_message` canonicalizes/splits. The ledger itself is filled by
+        // `on_tool_result` from the tool's host-only `EditResolutions`.
+        //
+        // The transcript is stored canonically (a pi-compatible array); the model is
         // shown the block form *consistently* so it keeps emitting the reliable
         // shape. This hook is the one place that sees the whole request history,
         // so it covers prior and within-turn messages alike.
@@ -601,7 +612,15 @@ impl AgentHook for LoggingHook {
             &self.provider,
             &self.model,
         );
-        let history = split_multi_file_edit_calls(blob_edit_tool_calls(stripped_history));
+        let anchors = self
+            .edit_anchors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let history = split_multi_file_edit_calls(minimize_edit_tool_calls(
+            blob_edit_tool_calls(stripped_history),
+            &anchors,
+        ));
 
         // `--log-messages`: capture the exact context sent to the model on this
         // call — the (stripped, block-form) history plus the current prompt —
@@ -682,6 +701,9 @@ impl AgentHook for LoggingHook {
         // out of the preview helpers). No-op for other tools / already-canonical
         // args.
         if event.tool_name == "edit" {
+            // Display only: do not minimize (the edit has not run). Keep the
+            // canonical `startLine` here in sync with `get_preview`,
+            // `array_to_blob_value`, and `normalize_args_in_place`.
             args_json = crate::edit_blocks::canonicalize_edit_value(&args_json);
         }
         self.content.display_tool_call(event.tool_name, &args_json);
@@ -732,6 +754,22 @@ impl AgentHook for LoggingHook {
     ) -> ToolResultAction {
         if self.user_cancel.load(Ordering::SeqCst) {
             return ToolResultAction::Stop("cancelled by user".into());
+        }
+        // Capture where this `edit` actually applied before the file changes
+        // again. The persist path in `src/agent/turn.rs` shares this ledger;
+        // without it a successful
+        // unanchored call could not be minimized later. Insert only on
+        // success: the tool attaches `EditResolutions` after a write.
+        if event.tool_name == "edit" {
+            if let (Some(id), Some(res)) = (
+                event.tool_call_id,
+                event.tool_context.result::<crate::tools::EditResolutions>(),
+            ) {
+                self.edit_anchors
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id.to_string(), res.clone());
+            }
         }
         self.content
             .display_tool_result(&event.raw_result.output().render());
@@ -1275,6 +1313,7 @@ mod tests {
                 provider: "test".to_string(),
                 model: "test-model".to_string(),
                 transcript: Arc::new(std::sync::Mutex::new(super::TurnTranscript::default())),
+                edit_anchors: Arc::new(std::sync::Mutex::new(Default::default())),
             })
             .max_turns(1)
             .await;

@@ -301,10 +301,10 @@ impl rig_core::tool::Tool for EditFile {
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        edit_files(args.files).await
+        edit_files_with(args.files, Some(context)).await
     }
 
     /// Keep picocode's own diagnostics out of rig's redaction.
@@ -370,13 +370,64 @@ pub(crate) fn map_tool_error(error: ToolError) -> ToolExecutionError {
 /// `apply_to_text` is pure over text, so that is a change to the write step
 /// only.
 pub async fn edit_files(files: Vec<FileEdit>) -> Result<String, ToolError> {
+    edit_files_with(files, None).await
+}
+
+/// Host-only provenance for one successfully edited file: where each of its
+/// edits resolved in the original text.
+///
+/// The producer is `edit_file_inner`; the consumer is
+/// `LoggingHook::on_tool_result`, which stores it in `EditAnchorLedger` for
+/// `minimize_edit_tool_calls`. If a new apply outcome changes what "resolved"
+/// means, update both ends.
+///
+/// Attached to the tool context via [`ToolContext::insert_result`] so the
+/// history-rewrite hook can anchor a successful call without re-reading a file
+/// that has already changed. Never sent to the model and never persisted.
+#[derive(Clone, Debug)]
+pub struct FileResolution {
+    pub path: String,
+    pub matched_lines: Vec<usize>,
+}
+
+/// The resolutions for every file that actually applied in one `edit` call.
+///
+/// Failed files are absent: there is no resolved line to anchor them to, so
+/// their calls are replayed unchanged.
+#[derive(Clone, Debug, Default)]
+pub struct EditResolutions {
+    pub files: Vec<FileResolution>,
+}
+
+/// The tool entry point. The context is optional so tests and `bsed`-style
+/// callers can use the plain wrapper, while the registered tool records
+/// placements for the model-history minimizer.
+async fn edit_files_with(
+    files: Vec<FileEdit>,
+    mut context: Option<&mut ToolContext>,
+) -> Result<String, ToolError> {
+    let mut resolutions = EditResolutions::default();
+
     // A single-file call is byte-identical to `edit_file` — a bare success note
     // or a bare `{ui_view, model_view}` envelope, never a one-element array, so
     // the overwhelmingly common case is untouched.
     if files.len() == 1 {
         let FileEdit { path, edits } = files.into_iter().next().unwrap();
-        return edit_file(path, edits).await;
+        let (raw, matched_lines) = edit_file_inner(path.clone(), edits).await?;
+        if let Some(matched_lines) = matched_lines {
+            resolutions.files.push(FileResolution {
+                path,
+                matched_lines,
+            });
+        }
+        if let Some(ctx) = context.as_deref_mut() {
+            if !resolutions.files.is_empty() {
+                ctx.insert_result(resolutions);
+            }
+        }
+        return Ok(raw);
     }
+
     let mut results = Vec::with_capacity(files.len());
     for FileEdit { path, edits } in files {
         // A file that could not be resolved, read, or written is *that file's*
@@ -384,7 +435,7 @@ pub async fn edit_files(files: Vec<FileEdit>) -> Result<String, ToolError> {
         // learns every file's outcome in one round trip. Propagating the `Err`
         // would discard the other files' reports and reduce the whole call to
         // a bare "the tool failed".
-        let raw = match edit_file(path.clone(), edits).await {
+        let (raw, matched_lines) = match edit_file_inner(path.clone(), edits).await {
             Ok(r) => r,
             Err(e) => {
                 results.push(blockedit::FileResult {
@@ -394,6 +445,12 @@ pub async fn edit_files(files: Vec<FileEdit>) -> Result<String, ToolError> {
                 continue;
             }
         };
+        if let Some(matched_lines) = matched_lines {
+            resolutions.files.push(FileResolution {
+                path: path.clone(),
+                matched_lines,
+            });
+        }
         // A success note is plain text (not JSON); a failure envelope is
         // already an object. Hold both as a `Value` so the array carries the
         // two shapes verbatim rather than re-encoding them.
@@ -402,6 +459,11 @@ pub async fn edit_files(files: Vec<FileEdit>) -> Result<String, ToolError> {
             Err(_) => serde_json::Value::String(raw),
         };
         results.push(blockedit::FileResult { path, result });
+    }
+    if let Some(ctx) = context.as_deref_mut() {
+        if !resolutions.files.is_empty() {
+            ctx.insert_result(resolutions);
+        }
     }
     Ok(blockedit::render_file_results(&results))
 }
@@ -412,6 +474,15 @@ pub async fn edit_files(files: Vec<FileEdit>) -> Result<String, ToolError> {
 /// with the `bsed` binary); this wrapper is the agent-facing IO: resolve the
 /// path against the sandbox policy, read, apply, write, and report.
 pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolError> {
+    edit_file_inner(path, edits).await.map(|(raw, _)| raw)
+}
+
+/// `edit_file` plus the resolved start line of each edit when the batch
+/// applied. Failures return `None`: there is nothing to anchor.
+async fn edit_file_inner(
+    path: String,
+    edits: Vec<EditOp>,
+) -> Result<(String, Option<Vec<usize>>), ToolError> {
     let p = get_path_with(&path, true)?;
     // The IO errors name the file *as the model spelled it* — the one path the
     // rule at `doc/path_leak_risks.md:22-29` allows into any string a model can
@@ -431,7 +502,7 @@ pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolE
         } => (text, matched_lines),
         // The model is shown the whole report; the per-edit indices are for
         // callers that re-emit only the failures (`bsed apply`).
-        ApplyOutcome::Failed { report, .. } => return Ok(report),
+        ApplyOutcome::Failed { report, .. } => return Ok((report, None)),
     };
 
     fs::write(&p, result)
@@ -446,7 +517,10 @@ pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolE
     let sandbox_path = get_sandbox_path(&path)?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| sandbox_path.clone());
     let shown = relativize_path(&sandbox_path, &cwd);
-    Ok(blockedit::success_note(&edits, &matched_lines, &shown))
+    Ok((
+        blockedit::success_note(&edits, &matched_lines, &shown),
+        Some(matched_lines),
+    ))
 }
 
 /// Budget for a `sed` preview's block payload, in bytes.
@@ -3107,6 +3181,62 @@ mod edit_file_tests {
             ui.contains("Closest match"),
             "expected per-edit ui summary in single-failure batch, got: {ui}",
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_successful_edit_attaches_its_resolved_lines() {
+        let _cwd = CwdGuard::new();
+        tokio::fs::write("anchor.txt", "alpha\nbeta\ngamma\n")
+            .await
+            .unwrap();
+        let mut ctx = ToolContext::default();
+        let raw = edit_files_with(
+            vec![blockedit::FileEdit {
+                path: "anchor.txt".into(),
+                edits: vec![EditOp {
+                    old_text: "beta".into(),
+                    new_text: "BETA".into(),
+                    start_line: None,
+                    origin: None,
+                }],
+            }],
+            Some(&mut ctx),
+        )
+        .await
+        .unwrap();
+        assert!(raw.contains("Replaced 1 block(s)"));
+        let res = ctx
+            .result::<EditResolutions>()
+            .expect("successful edits carry placements");
+        assert_eq!(res.files.len(), 1);
+        assert_eq!(res.files[0].path, "anchor.txt");
+        assert_eq!(res.files[0].matched_lines, vec![2]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_edit_attaches_nothing() {
+        let _cwd = CwdGuard::new();
+        tokio::fs::write("anchor.txt", "alpha\nbeta\ngamma\n")
+            .await
+            .unwrap();
+        let mut ctx = ToolContext::default();
+        edit_files_with(
+            vec![blockedit::FileEdit {
+                path: "anchor.txt".into(),
+                edits: vec![EditOp {
+                    old_text: "does not exist".into(),
+                    new_text: "X".into(),
+                    start_line: None,
+                    origin: None,
+                }],
+            }],
+            Some(&mut ctx),
+        )
+        .await
+        .unwrap();
+        assert!(ctx.result::<EditResolutions>().is_none());
     }
 }
 

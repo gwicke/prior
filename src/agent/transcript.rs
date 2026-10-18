@@ -20,6 +20,8 @@ use rig_core::message::{
 };
 use std::collections::HashMap;
 
+use blockedit::EditOp;
+
 /// Canonical transcript of the in-flight run, mirroring rig's `new_messages`
 /// shape: `[assistant, user(tool-results), assistant, …]` (the user prompt is
 /// added at persist time by `prompt()`, which owns `input`). picocode
@@ -202,6 +204,115 @@ pub(crate) fn blob_edit_tool_calls(messages: Vec<Message>) -> Vec<Message> {
             other => other,
         })
         .collect()
+}
+
+/// Resolved placements for successful `edit` calls in this run, keyed by the
+/// durable tool-call id.
+///
+/// Shared between the hook (which records placements from
+/// [`crate::tools::EditResolutions`]) and the persist path (which applies the
+/// same minimization before `append_message`). In-run only: it holds a file's
+/// line numbers, not its contents, and is never serialized.
+pub(crate) type EditAnchorLedger = HashMap<String, crate::tools::EditResolutions>;
+
+/// Shrink successful `edit` calls in history to their changed lines and anchor
+/// each block at the line it actually applied to.
+///
+/// Only calls present in `ledger` are touched, so failed, skipped and
+/// non-`edit` calls pass through byte-identically. Idempotent: an already
+/// minimal anchored call re-minimizes to itself.
+///
+/// This is the single transform both history egresses use — model-facing
+/// (`on_completion_call`, before the multi-file split) and persisted
+/// (`append_message`, before canonicalization). If you touch the argument
+/// shape here, also check `blob_edit_tool_calls`, `split_multi_file_edit_calls`,
+/// `per_file_blocks`, and `Session::append_message`'s canonicalize/split.
+pub(crate) fn minimize_edit_tool_calls(
+    messages: Vec<Message>,
+    ledger: &EditAnchorLedger,
+) -> Vec<Message> {
+    if ledger.is_empty() {
+        return messages;
+    }
+    messages
+        .into_iter()
+        .map(|m| match m {
+            Message::Assistant { id, content } => {
+                let content = content
+                    .into_iter()
+                    .map(|c| match c {
+                        AssistantContent::ToolCall(tc)
+                            if tc.function.name == "edit"
+                                && ledger.contains_key(tc.id.as_ref()) =>
+                        {
+                            let Some(resolutions) = ledger.get(tc.id.as_ref()) else {
+                                return AssistantContent::ToolCall(tc);
+                            };
+                            let Some(args) =
+                                minimized_edit_args(&tc.function.arguments, resolutions)
+                            else {
+                                return AssistantContent::ToolCall(tc);
+                            };
+                            let mut tc = tc;
+                            tc.function.arguments = args;
+                            AssistantContent::ToolCall(tc)
+                        }
+                        other => other,
+                    })
+                    .collect();
+                Message::Assistant { id, content }
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// Rewrite one successful call's arguments into a compact anchored block blob,
+/// or `None` when the call cannot be parsed or carries no resolved file.
+fn minimized_edit_args(
+    args: &serde_json::Value,
+    resolutions: &crate::tools::EditResolutions,
+) -> Option<serde_json::Value> {
+    let parsed = blockedit::EditArgs::from_wire(args).ok()?;
+    let mut any_resolved = false;
+    let mut blobs = Vec::with_capacity(parsed.files.len());
+    for file in parsed.files {
+        let resolved = resolutions.files.iter().find(|r| r.path == file.path);
+        let minimized: Vec<EditOp> = match resolved {
+            Some(r) if r.matched_lines.len() == file.edits.len() => {
+                any_resolved = true;
+                // An already-anchored edit is already the trimmed form: its
+                // own anchor is the base, so re-minimizing is a no-op. This
+                // matters for history transformed more than once in a turn.
+                // The ledger's resolved line is for edits that arrived
+                // unanchored, where only execution knows the placement.
+                file.edits
+                    .iter()
+                    .zip(&r.matched_lines)
+                    .map(|(edit, line)| {
+                        let base = edit.start_line.map(|s| s.0 as usize).unwrap_or(*line);
+                        blockedit::minimize_edit(edit, base)
+                    })
+                    .collect()
+            }
+            // A mixed multi-file call keeps the unresolved file exactly as it
+            // was: no resolved line means no honest anchor.
+            _ => file.edits,
+        };
+        let edits: Vec<blockedit::ParsedEdit> = minimized
+            .into_iter()
+            .map(|e| blockedit::ParsedEdit {
+                old_text: e.old_text,
+                new_text: e.new_text,
+                start_line: e.start_line.map(|s| s.0),
+                header: None,
+                rejected_header: None,
+                raw_header: None,
+            })
+            .collect();
+        blobs.push(blockedit::render_blob(&file.path, &edits));
+    }
+    any_resolved.then(|| serde_json::json!({ "blocks": blobs.join("\n\n") }))
 }
 
 /// The text of a tool result, as the model sees it.
@@ -749,6 +860,94 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     //     // The note rides inside the results' message, not as its own.
     //     assert_eq!(content[0], UserContent::Text(Text::new(n.to_string())));
     // }
+
+    #[test]
+    fn successful_calls_are_minimized_and_line_anchored() {
+        use crate::tools::{EditResolutions, FileResolution};
+        let call = Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: ToolCallId::new("e1").unwrap(),
+                provider: None,
+                function: ToolFunction::new(
+                    "edit".into(),
+                    serde_json::json!({
+                        "blocks": "a.rs\n@@@OLD\nkeep\nold\nkeep2\n@@@NEW\nkeep\nnew\nkeep2\n@@@END"
+                    }),
+                ),
+                signature: None,
+                additional_params: None,
+            })],
+        };
+        let mut ledger = EditAnchorLedger::default();
+        ledger.insert(
+            "e1".into(),
+            EditResolutions {
+                files: vec![FileResolution {
+                    path: "a.rs".into(),
+                    matched_lines: vec![40],
+                }],
+            },
+        );
+        let out = minimize_edit_tool_calls(vec![call], &ledger);
+        let blocks = tool_calls_of(&out[0])[0].function.arguments["blocks"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(blocks, "a.rs:41\n@@@OLD\nold\n@@@NEW\nnew\n@@@END");
+    }
+
+    #[test]
+    fn minimization_is_idempotent() {
+        use crate::tools::{EditResolutions, FileResolution};
+        let call = Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: ToolCallId::new("e1").unwrap(),
+                provider: None,
+                function: ToolFunction::new(
+                    "edit".into(),
+                    serde_json::json!({
+                        "blocks": "a.rs\n@@@OLD\nkeep\nold\nkeep2\n@@@NEW\nkeep\nnew\nkeep2\n@@@END"
+                    }),
+                ),
+                signature: None,
+                additional_params: None,
+            })],
+        };
+        let mut ledger = EditAnchorLedger::default();
+        ledger.insert(
+            "e1".into(),
+            EditResolutions {
+                files: vec![FileResolution {
+                    path: "a.rs".into(),
+                    matched_lines: vec![40],
+                }],
+            },
+        );
+        let once = minimize_edit_tool_calls(vec![call], &ledger);
+        let twice = minimize_edit_tool_calls(once.clone(), &ledger);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn a_failed_call_without_resolutions_is_untouched() {
+        let call = Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: ToolCallId::new("e1").unwrap(),
+                provider: None,
+                function: ToolFunction::new(
+                    "edit".into(),
+                    serde_json::json!({"blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END"}),
+                ),
+                signature: None,
+                additional_params: None,
+            })],
+        };
+        let out = minimize_edit_tool_calls(vec![call.clone()], &EditAnchorLedger::default());
+        assert_eq!(out, vec![call]);
+    }
 
     #[test]
     fn splitting_twice_changes_nothing() {

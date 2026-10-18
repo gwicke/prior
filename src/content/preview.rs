@@ -167,6 +167,10 @@ pub(crate) fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
             // a phantom diff. A blob that still won't resolve (malformed, or
             // spanning files) yields no edits at all, and the label below then
             // carries no range and no diff — which is the honest rendering.
+            //
+            // Display must also tolerate a persisted `startLine`; the preview
+            // consumes it below. Keep this in sync with
+            // `LoggingHook::on_tool_call` and `canonicalize_edit_value`.
             let canonical = crate::edit_blocks::canonicalize_edit_value(args);
             // Prefer the canonical `path`: resolving a blob can *supply* one
             // from a header line, which the raw args may not carry at all.

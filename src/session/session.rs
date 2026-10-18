@@ -51,6 +51,12 @@ use crate::session::types::*;
 /// see each other. `provider` and `signature` are cleared for the same reason
 /// as in the model-facing half: the provider issued one of each, and N copies
 /// of one provider id would be unmatchable on a wire that keys results on it.
+///
+/// Minimization happens *before* this function, in `src/agent/turn.rs`, so the
+/// blob arriving here is already compact and anchored. Keep the
+/// `startLine`-preserving split in sync with `per_file_blocks`,
+/// `render_blob`, `canonicalize_edit_value`, and
+/// `normalize_args_in_place` (the reload path).
 fn canonicalize_edit_tool_calls(msg: &Message) -> Option<Message> {
     let Message::Assistant { id, content } = msg else {
         return None;
@@ -1148,6 +1154,9 @@ impl Session {
 
         // Canonicalize `edit` tool-call arguments before persisting: the model
         // emits the block-string form, but the on-disk JSONL must be the
+        // canonical array. Successful calls were minimized and anchored by
+        // `src/agent/turn.rs` before this call; do not re-minimize here (there
+        // is no ledger), only split and canonicalize. The result is the pi-
         // canonical array so pi can read the session. A multi-file call is
         // split into N single-file calls first, so the on-disk form never
         // needs to know multi-file editing exists. No-op for other messages.

@@ -1,6 +1,6 @@
 # Minimal edit context and resolved line anchors
 
-*Status: proposed.*
+*Status: implemented.*
 
 ## Goal
 
@@ -51,6 +51,10 @@ Algorithm, per edit:
 
 Safe because all edits resolve against the original text, so `matched_lines[i]` is the exact
 original apply line. Trimmed spans stay non-overlapping.
+
+An edit that already carried an anchor reuses that anchor as the base rather than the ledger line.
+This is what makes re-running the transform idempotent: the trimmed form's anchor is already the
+first kept line. Unanchored edits — the ones this feature exists for — use the resolved line.
 
 ## Host-only metadata
 

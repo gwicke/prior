@@ -15,7 +15,9 @@
 
 use super::errors::{classify_prompt_error, classify_stream_error};
 use super::pumps::dispatch_in_turn_event;
-use super::transcript::{normalize_call_ids, reasoning_text, TurnTranscript};
+use super::transcript::{
+    minimize_edit_tool_calls, normalize_call_ids, reasoning_text, EditAnchorLedger, TurnTranscript,
+};
 use crate::Result;
 use futures::StreamExt;
 use rig_agent::agent::{MultiTurnStreamItem, StreamingError};
@@ -120,6 +122,14 @@ impl CodeAgent {
         // The run-scoped transcript is shared with the hook and the stream
         // loop so a mid-turn failure can persist exactly what completed.
         let transcript = Arc::new(Mutex::new(TurnTranscript::default()));
+        // Resolved edit placements, shared with the hook. Persist applies the
+        // same minimizer as `on_completion_call` so the session and the model
+        // history agree, then `append_message` splits/canonicalizes as usual.
+        //
+        // If you change this order or the ledger shape, also touch
+        // `LoggingHook::on_completion_call`/`on_tool_result`, `minimize_edit_tool_calls`,
+        // and `Session::canonicalize_edit_tool_calls` (persist-side split).
+        let edit_anchors = Arc::new(Mutex::new(EditAnchorLedger::default()));
         // Per-request params, set unconditionally from `params`.
         //
         // `replace_additional_params`, not `merge_`: a `/reasoning` override
@@ -155,6 +165,7 @@ impl CodeAgent {
                 provider: self.provider.clone(),
                 model: self.model.clone(),
                 transcript: transcript.clone(),
+                edit_anchors: edit_anchors.clone(),
             })
             .max_turns(self.tool_call_limit)
             // Allow one in-turn recovery for the model calling a tool that
@@ -470,6 +481,12 @@ impl CodeAgent {
                                 }
                                 if should_persist_progress {
                                     if has_accepted {
+                                        let anchors = edit_anchors
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .clone();
+                                        let transcript_msgs =
+                                            minimize_edit_tool_calls(transcript_msgs, &anchors);
                                         for m in &transcript_msgs {
                                             let _ = s.append_message(m).await;
                                         }
@@ -630,6 +647,11 @@ impl CodeAgent {
             // not at storage time — see doc/session_storage.md §4).
             if let Some(fh) = final_history {
                 let mut to_commit = normalize_call_ids(fh);
+                let anchors = edit_anchors
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                to_commit = minimize_edit_tool_calls(to_commit, &anchors);
                 // De-dup against the session (persistence source of truth).
                 // When the session already holds this turn's fresh dispatch
                 // prompt (`session_user_count >= turn.sent()`, e.g. a prior
@@ -653,7 +675,12 @@ impl CodeAgent {
                     let _ = s.append_message(&msg).await;
                 }
             } else if let Some(ch) = cancelled_history {
-                let to_commit = normalize_call_ids(ch);
+                let mut to_commit = normalize_call_ids(ch);
+                let anchors = edit_anchors
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                to_commit = minimize_edit_tool_calls(to_commit, &anchors);
                 for msg in to_commit {
                     let _ = s.append_message(&msg).await;
                 }

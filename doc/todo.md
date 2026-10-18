@@ -34,7 +34,7 @@ and link a doc/ and/or commit hash
 ## Token efficiency
 
 - [ ] Minimize tool context
-  - Minimize successful edits: Minimal context (only changed lines), all line anchored to actual
+  - [x] Minimize successful edits: Minimal context (only changed lines), all line anchored to actual
     resolved lines — doc/261018_minimal_edit_context_anchors.md
   - More aggressive truncation for long `read` / `bash` outputs
   - Strip failed edits from previous (before last) completion turns

@@ -73,6 +73,11 @@ fn normalize_args_in_place(name: &str, args: &mut serde_json::Value) {
             // model's block form (a string), the legacy single `oldText`/`newText`
             // shape, and the very old `old`/`new` shape all into it. Best-effort:
             // an unparseable blob is left as-is so replay degrades gracefully.
+            //
+            // This is the reload counterpart of `Session::append_message` and
+            // `LoggingHook::on_tool_call`; all three must preserve `startLine`
+            // via `canonicalize_edit_value` so an anchored edit survives a
+            // round trip through disk.
             *args = crate::edit_blocks::canonicalize_edit_value(args);
         }
         _ => {}

@@ -16,6 +16,7 @@
 //! - [`wire`] — the `edit` tool's `arguments` JSON into a resolved batch.
 //! - [`resolve`] — two-pass anchored-then-content match resolution.
 //! - [`apply`] — all-or-nothing application to text (and, thinly, to a file).
+//! - [`minimize`] — shrink a successful edit to its changed lines, anchored.
 //! - [`diagnose`] — fuzzy failure diagnosis for the model-and-UI split.
 //! - [`path`] — lexical path helpers (the blob parser compares paths).
 
@@ -23,6 +24,7 @@ pub mod apply;
 pub mod arg_error_view;
 pub mod blob;
 pub mod diagnose;
+pub mod minimize;
 pub mod path;
 pub mod resolve;
 pub mod tool_errors;
@@ -37,6 +39,7 @@ pub use blob::{
     ParsedEdit, DIVIDER, REPLACE_MARKER, SEARCH_MARKER,
 };
 pub use diagnose::{parse_file_results, render_file_results, FileResult};
+pub use minimize::{minimize_edit, minimize_ops};
 pub use tool_errors::strip_arg_error_prefixes;
 pub use types::{EditOp, EditStartLine};
 pub use wire::{EditArgs, FileEdit};

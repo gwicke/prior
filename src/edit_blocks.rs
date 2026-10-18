@@ -47,6 +47,11 @@ pub fn split_id(
 /// indistinguishable from N real single-file calls; each surface then applies
 /// its own canonicalisation (or leaves the block form) as it would have for a
 /// genuine single-file call.
+///
+/// `render_blob` keeps each block's `path:LINE`, so anchored/minimized calls
+/// must stay anchored through a split. Keep this in sync with
+/// `blockedit::blob::{parse_blocks, render_blob, edits_to_value}` and
+/// `Session::canonicalize_edit_tool_calls` (the persist-side split).
 pub fn per_file_blocks(args: &Value) -> Option<Vec<String>> {
     let parsed = parse_blocks(blob_text(args)?).ok()?;
     let files = split_by_file(parsed).ok()?;
