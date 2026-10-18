@@ -1,6 +1,7 @@
 //! Tool-call previews: command labels, edit diffs, sed previews, and the
 //! banner/diff helpers behind them.
 
+use crate::config::ByteLimit;
 use crate::content::text::wrap;
 use crate::tools::EditOp;
 use serde_json::Value;
@@ -106,11 +107,22 @@ pub(crate) fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
             let path = get_str("path").unwrap_or("");
             let offset = get_u64("offset").unwrap_or(0);
             let limit = get_u64("limit").unwrap_or(0);
+            let byte_offset = get_u64("byte_offset").unwrap_or(0);
+            let byte_limit = get_u64("byte_limit").unwrap_or(0);
             let mut s = format!("read {}", path);
             // `offset` is 0-based; `limit` is a count. Display is 1-based, so the
             // affected window is [offset+1, offset+limit]. A zero `limit` means
-            // "to end of file" -> omit the (optional) range.
-            if limit > 0 {
+            // the default window — the label names the file, not a promise of
+            // its exact extent. Byte mode replaces the line window entirely, so
+            // it takes the label, with the effective byte range.
+            if byte_offset > 0 {
+                let budget = ByteLimit(byte_limit).resolved();
+                s.push_str(&format!(
+                    " @bytes {}..{}",
+                    byte_offset,
+                    byte_offset + budget
+                ));
+            } else if limit > 0 {
                 s.push_str(&format!(" [{}..{}]", offset + 1, offset + limit));
             } else if offset > 0 {
                 s.push_str(&format!(" [{}..]", offset + 1));

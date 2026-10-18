@@ -8,9 +8,9 @@ use tokio::fs;
 
 #[allow(unused_imports)]
 use crate::config::{
-    env_vars_to_keep, resolve_path_policy, resolve_paths, BashTimeout, ContextLines, ReadLimit,
-    ReadOffset, SandboxConfig, SandboxMaxOutputBytes, SandboxMemoryMb, SandboxTimeoutSecs,
-    SandboxTmpSizeMb,
+    env_vars_to_keep, resolve_path_policy, resolve_paths, BashTimeout, ByteLimit, ByteOffset,
+    ContextLines, ReadLimit, ReadOffset, SandboxConfig, SandboxMaxOutputBytes, SandboxMemoryMb,
+    SandboxTimeoutSecs, SandboxTmpSizeMb,
 };
 use crate::path_util::relativize_path;
 
@@ -171,29 +171,226 @@ fn walk_files(base: &std::path::Path) -> impl Iterator<Item = ignore::DirEntry> 
 
 #[rig_tool(
     name = "read",
-    description = "Read file with line numbers",
+    description = "Read file with line numbers. One read returns at most 500 lines \
+(max 2000 via `limit`) and at most 10240 bytes of content (max 51200 via `byte_limit`) — \
+whichever bound is reached first ends the read; 0 means the default for both. A read that \
+stops before the end of the file ends with a footer giving the byte position and the next \
+`offset`/`byte_offset` to continue from. Page by lines with `offset`, or by bytes with \
+`byte_offset` for files with very long lines; they are mutually exclusive.",
     required(path)
 )]
 pub async fn read_file(
     path: String,
+    /// 0-based line to start from (0 = start of file). Must be 0 when `byte_offset` is set.
     offset: ReadOffset,
+    /// Max lines to return: 0 = default 500, clamped to 2000.
     limit: ReadLimit,
+    /// Absolute byte to start from, snapped to a UTF-8 boundary; 0 = use `offset`.
+    /// Byte paging for files with very long lines. Must be 0 when `offset` is set.
+    byte_offset: ByteOffset,
+    /// Max bytes of content: 0 = default 10240, clamped to 51200.
+    byte_limit: ByteLimit,
 ) -> Result<String, ToolError> {
+    let p = get_path(&path)?;
     let offset: u64 = offset.into();
-    let limit: u64 = limit.into();
-    let content = fs::read_to_string(get_path(&path)?).await?;
-    let lines: Vec<_> = content
-        .lines()
-        .enumerate()
-        .skip(offset as usize)
-        .take(if limit == 0 {
-            usize::MAX
+    let byte_offset: u64 = byte_offset.into();
+    if offset > 0 && byte_offset > 0 {
+        return Err(ToolError::Generic(
+            "byte_offset and offset are mutually exclusive: pass offset to page by lines, \
+             byte_offset to page by bytes (one of them must be 0)"
+                .into(),
+        ));
+    }
+    let line_budget = limit.resolved() as usize;
+    let byte_budget = byte_limit.resolved() as usize;
+    let content = fs::read_to_string(p).await?;
+    let out = if byte_offset > 0 {
+        read_byte_window(&content, byte_offset as usize, byte_budget, line_budget)
+    } else {
+        read_line_window(&content, offset as usize, line_budget, byte_budget)
+    };
+    Ok(out)
+}
+
+/// One output line of a `read`: `NNNN| body`, the gutter that
+/// `strip_read_lineno` and the previews strip on the display side. The line
+/// number is always file-absolute — even in a byte window that starts
+/// mid-line — because `edit`'s `path:LINE` anchors are read from these.
+fn numbered_line(lineno: usize, body: &str) -> String {
+    format!("{:4}| {}\n", lineno, body)
+}
+
+/// The footer appended when a read stopped before the end of the file.
+///
+/// It is the model's only hint that what it sees is not the whole story, so
+/// it always carries a byte position (absolute, in-file) and the next move.
+/// A cut *inside* a line offers only `byte_offset`: pointing `offset` at that
+/// same line would re-read the same prefix forever. A cut at a line start
+/// offers both paddings, and `offset = last_shown` resumes at the first
+/// unshown line.
+fn read_footer(
+    last_shown: usize,
+    cut_byte: usize,
+    total_bytes: usize,
+    cut_mid_line: bool,
+) -> String {
+    let at = if cut_mid_line {
+        format!("inside line {last_shown}")
+    } else {
+        format!("after line {last_shown}")
+    };
+    let next = if cut_mid_line {
+        format!("next: byte_offset={cut_byte}")
+    } else {
+        format!("next: offset={last_shown} or byte_offset={cut_byte}")
+    };
+    format!("| ... (truncated {at}, byte {cut_byte}/{total_bytes} — {next})\n")
+}
+
+/// Drop a trailing line ending the way `str::lines` does: `\n`, `\r\n`, or
+/// nothing on the final line. Keeping the display byte-identical to the old
+/// `lines()`-based implementation matters: previews and tests match on it.
+fn strip_eol(line: &str) -> &str {
+    let s = line.strip_suffix('\n').unwrap_or(line);
+    s.strip_suffix('\r').unwrap_or(s)
+}
+
+/// Line-windowed read: skip `offset` lines, then emit whole lines while both
+/// budgets hold — the first one hit ends the read.
+///
+/// Byte cuts are asymmetric on purpose: the *first* line of the window is
+/// cut to the budget when it cannot fit (returning nothing would waste the
+/// read on a minified or log line), but a later line either fits whole or is
+/// dropped whole — a cut line must not look complete to whoever edits from
+/// it. `read_footer` tells the model where to resume either way.
+///
+/// `line_budget` must be non-zero (guaranteed by `ReadLimit::resolved`).
+fn read_line_window(
+    content: &str,
+    offset: usize,
+    line_budget: usize,
+    byte_budget: usize,
+) -> String {
+    let total = content.len();
+    if content.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut pieces = content.split_inclusive('\n');
+    let mut lineno = 1usize;
+    let mut pos = 0usize; // absolute byte start of the current line
+
+    for _ in 0..offset {
+        match pieces.next() {
+            Some(p) => {
+                pos += p.len();
+                lineno += 1;
+            }
+            None => return out, // offset past EOF: empty, as the old read was
+        }
+    }
+
+    let mut shown = 0usize;
+    let mut used = 0usize; // content bytes emitted (line bodies, no endings)
+    let mut last_shown = 0usize;
+
+    for piece in pieces {
+        if shown == line_budget {
+            return out + &read_footer(last_shown, pos, total, false);
+        }
+        let body = strip_eol(piece);
+        let remaining = byte_budget - used;
+        if body.len() <= remaining {
+            out.push_str(&numbered_line(lineno, body));
+            shown += 1;
+            used += body.len();
+            last_shown = lineno;
+            pos += piece.len();
+            lineno += 1;
+        } else if used == 0 {
+            // The first line of the window alone blows the whole byte
+            // budget: emit a budget-sized prefix rather than nothing.
+            let mut cut = pos + byte_budget;
+            while cut > pos && !content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            if cut == pos {
+                // Budget below one char (impossible with the standing
+                // caps; defensive): show the first char whole.
+                cut = pos + content[pos..].chars().next().map_or(0, |c| c.len_utf8());
+            }
+            out.push_str(&numbered_line(lineno, &content[pos..cut]));
+            return out + &read_footer(lineno, cut, total, true);
         } else {
-            limit as usize
-        })
-        .map(|(i, l)| format!("{:4}| {}\n", i + 1, l))
-        .collect();
-    Ok(lines.concat())
+            return out + &read_footer(last_shown, pos, total, false);
+        }
+    }
+    out
+}
+
+/// Byte-windowed read: the raw slice `[byte_offset, byte_offset + budget)`,
+/// snapped to char boundaries at both ends, rendered with file-absolute line
+/// numbers (counted from newlines before the window) so paging by bytes and
+/// paging by lines stay consistent — a later line-mode `offset` read lands
+/// where the footer says it will.
+///
+/// The line budget applies inside the window as well; whichever of the two
+/// bounds the window runs into first ends the read, reported by
+/// [`read_footer`].
+fn read_byte_window(
+    content: &str,
+    byte_offset: usize,
+    byte_budget: usize,
+    line_budget: usize,
+) -> String {
+    let total = content.len();
+    if byte_offset >= total {
+        return String::new();
+    }
+    let mut start = byte_offset;
+    while start < total && !content.is_char_boundary(start) {
+        start += 1; // snap forward: never begin inside a char
+    }
+    if start >= total {
+        return String::new();
+    }
+    let mut end = (start + byte_budget).min(total);
+    while end > start && !content.is_char_boundary(end) {
+        end -= 1; // snap back: never end inside a char
+    }
+    if end == start {
+        // Budget below one char (defensive): show the first char whole.
+        end = start + content[start..].chars().next().map_or(0, |c| c.len_utf8());
+    }
+
+    let mut window = &content[start..end];
+    if window.ends_with('\n') {
+        // The window ends on a line boundary: the empty piece after the
+        // last '\n' would name a line the window does not contain.
+        window = &window[..window.len() - 1];
+    }
+    let first_line = content[..start].matches('\n').count() + 1;
+
+    let lines: Vec<&str> = window.split('\n').collect();
+    let show = lines.len().min(line_budget);
+    let mut out = String::new();
+    for (i, line) in lines[..show].iter().enumerate() {
+        out.push_str(&numbered_line(first_line + i, strip_eol(line)));
+    }
+    let last_shown = first_line + show - 1;
+
+    if show < lines.len() {
+        // The line budget cut inside the window: the cut sits at the start
+        // of the first unshown line (every shown line has a '\n' after it,
+        // because a further line exists).
+        let cut = start + lines[..show].iter().map(|l| l.len() + 1).sum::<usize>();
+        out + &read_footer(last_shown, cut, total, false)
+    } else if end < total {
+        let cut_mid_line = content.as_bytes()[end - 1] != b'\n';
+        out + &read_footer(last_shown, end, total, cut_mid_line)
+    } else {
+        out
+    }
 }
 
 #[rig_tool(
@@ -1980,6 +2177,215 @@ mod tests {
 }
 
 #[cfg(test)]
+mod read_limits_tests {
+    //! The `read` tool's per-read caps: line budget, byte budget, the two
+    //! paging modes, and the truncation footer that ties them together.
+
+    use super::edit_file_tests::CwdGuard;
+    use super::*;
+    use rig_core::tool::Tool;
+    use serial_test::serial;
+
+    async fn read(
+        path: &str,
+        offset: u64,
+        limit: u64,
+        byte_offset: u64,
+        byte_limit: u64,
+    ) -> String {
+        read_file(
+            path.to_string(),
+            ReadOffset(offset),
+            ReadLimit(limit),
+            ByteOffset(byte_offset),
+            ByteLimit(byte_limit),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Default line budget (500) binds before the byte budget on ordinary
+    /// source-like content, and the footer states the exact resume point.
+    #[tokio::test]
+    #[serial]
+    async fn default_read_stops_at_500_lines_with_a_resume_footer() {
+        let _g = CwdGuard::new();
+        let content: String = (1..=600).map(|i| format!("line {i}\n")).collect();
+        tokio::fs::write("big.txt", &content).await.unwrap();
+
+        let out = read("big.txt", 0, 0, 0, 0).await;
+
+        assert_eq!(out.lines().count(), 501, "500 content lines + footer");
+        assert!(out.contains(" 500| line 500\n"));
+        assert!(!out.contains("| line 501"), "501 must not be shown");
+        // Cut at the start of line 501: 4392 bytes in, 5292 in the file.
+        assert!(
+            out.ends_with(
+                "| ... (truncated after line 500, byte 4392/5292 — \
+                 next: offset=500 or byte_offset=4392)\n"
+            ),
+            "footer mismatch: {:?}",
+            &out[out.len().saturating_sub(140)..]
+        );
+    }
+
+    /// An oversized `limit` clamps to the 2000-line cap instead of erroring —
+    /// the footer reports the window that was actually taken.
+    #[tokio::test]
+    #[serial]
+    async fn limit_above_the_max_clamps_to_2000_lines() {
+        let _g = CwdGuard::new();
+        tokio::fs::write("tall.txt", "x\n".repeat(2500))
+            .await
+            .unwrap();
+
+        let out = read("tall.txt", 0, 9999, 0, 0).await;
+
+        assert_eq!(out.lines().count(), 2001, "2000 content lines + footer");
+        assert!(out.contains("2000| x\n"));
+        assert!(
+            out.ends_with(
+                "| ... (truncated after line 2000, byte 4000/5000 — \
+                 next: offset=2000 or byte_offset=4000)\n"
+            ),
+            "footer mismatch: {:?}",
+            &out[out.len().saturating_sub(140)..]
+        );
+    }
+
+    /// One line bigger than the byte budget: the first page is a prefix cut
+    /// (never an empty read), `byte_offset` pages through it, and the final
+    /// page carries no footer because nothing follows it.
+    #[tokio::test]
+    #[serial]
+    async fn giant_line_is_prefix_cut_and_pages_by_byte_offset() {
+        let _g = CwdGuard::new();
+        let line = "abcdefghij".repeat(3000); // 30000 bytes, no newline
+        tokio::fs::write("giant.txt", &line).await.unwrap();
+
+        let p1 = read("giant.txt", 0, 0, 0, 0).await;
+        assert!(p1.starts_with("   1| abcdefghij"));
+        assert_eq!(p1.lines().count(), 2, "prefix line + footer");
+        assert!(
+            p1.ends_with(
+                "| ... (truncated inside line 1, byte 10240/30000 — \
+                 next: byte_offset=10240)\n"
+            ),
+            "footer mismatch: {:?}",
+            &p1[p1.len().saturating_sub(110)..]
+        );
+
+        let p2 = read("giant.txt", 0, 0, 10240, 0).await;
+        assert!(p2.starts_with("   1| ")); // still line 1: no newline in the file
+        assert!(
+            p2.ends_with(
+                "| ... (truncated inside line 1, byte 20480/30000 — \
+                 next: byte_offset=20480)\n"
+            ),
+            "footer mismatch: {:?}",
+            &p2[p2.len().saturating_sub(110)..]
+        );
+
+        let p3 = read("giant.txt", 0, 0, 20480, 0).await;
+        assert!(p3.starts_with("   1| "));
+        assert_eq!(p3.lines().count(), 1, "final page is content only");
+        assert!(!p3.contains("truncated"), "nothing follows the last page");
+    }
+
+    /// Byte cuts snap to UTF-8 boundaries: an odd budget snaps back, a
+    /// mid-char offset snaps forward — never a panic, never split text.
+    #[tokio::test]
+    #[serial]
+    async fn byte_cuts_snap_to_utf8_boundaries() {
+        let _g = CwdGuard::new();
+        tokio::fs::write("uni.txt", "é".repeat(20000))
+            .await
+            .unwrap(); // 40000 bytes, one line
+
+        let cut = read("uni.txt", 0, 0, 0, 10241).await;
+        assert!(cut.starts_with("   1| é"));
+        assert!(
+            cut.ends_with(
+                "| ... (truncated inside line 1, byte 10240/40000 — \
+                 next: byte_offset=10240)\n"
+            ),
+            "footer mismatch: {:?}",
+            &cut[cut.len().saturating_sub(110)..]
+        );
+
+        let resumed = read("uni.txt", 0, 0, 10241, 0).await;
+        assert!(resumed.starts_with("   1| é"));
+        assert!(
+            resumed.ends_with(
+                "| ... (truncated inside line 1, byte 20482/40000 — \
+                 next: byte_offset=20482)\n"
+            ),
+            "footer mismatch: {:?}",
+            &resumed[resumed.len().saturating_sub(110)..]
+        );
+    }
+
+    /// A byte window that starts mid-file renders file-absolute line numbers,
+    /// so the footer's `offset` and `byte_offset` both land where they
+    /// promise and `edit`'s `path:LINE` anchors stay truthful.
+    #[tokio::test]
+    #[serial]
+    async fn byte_window_line_numbers_stay_file_absolute() {
+        let _g = CwdGuard::new();
+        tokio::fs::write("t.txt", "one\ntwo\nthree\nfour\n")
+            .await
+            .unwrap();
+
+        // Byte 9 is the `h` of `three` (file line 3).
+        let out = read("t.txt", 0, 0, 9, 0).await;
+        assert_eq!(out, "   3| hree\n   4| four\n");
+    }
+
+    /// Both offsets set: fail loudly instead of guessing a precedence.
+    #[tokio::test]
+    #[serial]
+    async fn offset_and_byte_offset_are_mutually_exclusive() {
+        let _g = CwdGuard::new();
+        let err = read_file(
+            "a.txt".to_string(),
+            ReadOffset(1),
+            ReadLimit(0),
+            ByteOffset(1),
+            ByteLimit(0),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    /// The numbers the model is told about — tool description plus the
+    /// parameter descriptions schemars emits into the schema — are the
+    /// numbers the code enforces (`ReadLimit::resolved` & co.).
+    #[test]
+    fn read_tool_text_states_the_effective_caps() {
+        use crate::config::{
+            READ_DEFAULT_BYTES, READ_DEFAULT_LINES, READ_MAX_BYTES, READ_MAX_LINES,
+        };
+        let tool = ReadFile;
+        let desc = tool.description();
+        let schema = tool.parameters().to_string();
+        for n in [
+            READ_DEFAULT_LINES,
+            READ_MAX_LINES,
+            READ_DEFAULT_BYTES,
+            READ_MAX_BYTES,
+        ] {
+            let s = n.to_string();
+            assert!(desc.contains(&s), "description missing {s}: {desc}");
+            assert!(schema.contains(&s), "schema missing {s}: {schema}");
+        }
+        // The byte paging params must be advertised, as optional fields.
+        assert!(schema.contains("\"byte_offset\""), "{schema}");
+        assert!(schema.contains("\"byte_limit\""), "{schema}");
+    }
+}
+
+#[cfg(test)]
 mod sandbox_tests {
     use super::*;
     use crate::config::{BindPath, EnvMode, EnvPolicy, SandboxConfig};
@@ -2366,6 +2772,8 @@ mod sandbox_tests {
             "/tmp/x2.txt".to_string(),
             crate::config::ReadOffset(0),
             crate::config::ReadLimit(0),
+            crate::config::ByteOffset(0),
+            crate::config::ByteLimit(0),
         )
         .await
         .unwrap();
