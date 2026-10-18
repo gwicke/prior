@@ -18,6 +18,18 @@ use crate::udiff;
 /// it with margin, and a gap of one or two is left in place.
 pub const SPLIT_GAP: usize = 2;
 
+/// A kept OLD fragment with fewer non-whitespace characters than this is a
+/// *weak locator*: `}`, `end`, `);` and the like. The line anchor resolves
+/// placement exactly, but a model biassed against trusting anchor line numbers
+/// sees nothing it can recognise in a bare `}` and re-reads the file to
+/// reassure itself — costing far more than one retained context line. When the
+/// trim leaves a weak locator, [`minimize_edit`] keeps one trimmed common line
+/// so the block shows something recognisable.
+///
+/// Whitespace is not counted because indentation is the part a model cannot
+/// distinguish; `    }` is no more informative than `}`.
+pub const MIN_LOCATOR_CHARS: usize = 8;
+
 /// Split text into lines, keeping each line's terminator. Joining the result
 /// reproduces the input exactly, including CRLF and a missing final newline.
 fn lines_with_terminators(text: &str) -> Vec<&str> {
@@ -26,6 +38,15 @@ fn lines_with_terminators(text: &str) -> Vec<&str> {
 
 fn join(lines: &[&str]) -> String {
     lines.concat()
+}
+
+fn non_whitespace_len(text: &str) -> usize {
+    text.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+/// Whether `text` is a weak locator: too little non-whitespace to recognise.
+fn is_weak_locator(text: &str) -> bool {
+    non_whitespace_len(text) < MIN_LOCATOR_CHARS
 }
 
 /// Minimize one edit against the line where its OLD text resolved.
@@ -58,6 +79,33 @@ pub fn minimize_edit(edit: &EditOp, resolved_start_line: usize) -> EditOp {
             prefix -= 1;
         } else if suffix > 0 {
             suffix -= 1;
+        }
+    }
+
+    // Weak-locator floor: a trimmed OLD of just `}`, `end`, `);` gives the
+    // model nothing to recognise, so it distrusts the anchor and re-reads the
+    // file. Keep one trimmed common line for company, from whichever side has
+    // more non-whitespace content (ties prefer the preceding line, usually the
+    // construct being closed). The restored line is common to OLD and NEW, so
+    // the edit still applies identically; and because it is persisted, the next
+    // pass trims it again and restores the same side -- a stable fixed point.
+    if !old.is_empty() {
+        let kept = &old[prefix..old.len() - suffix];
+        if is_weak_locator(&join(kept)) {
+            let above = prefix.checked_sub(1).map(|i| old[i]);
+            let below = (suffix > 0).then(|| old[old.len() - suffix]);
+            match (above, below) {
+                (Some(a), Some(b)) => {
+                    if non_whitespace_len(a) >= non_whitespace_len(b) {
+                        prefix -= 1;
+                    } else {
+                        suffix -= 1;
+                    }
+                }
+                (Some(_), None) => prefix -= 1,
+                (None, Some(_)) => suffix -= 1,
+                (None, None) => {}
+            }
         }
     }
 
@@ -139,6 +187,21 @@ pub fn split_and_minimize(edit: &EditOp, resolved_start_line: usize) -> Vec<Edit
             }
         }
 
+        // A weak hunk (a lone `}` or `end`) gains a recognisable neighbour from
+        // the unchanged run on either side. `minimize_edit` re-trims it for a
+        // strong hunk, so this costs nothing unless the locator is weak. The
+        // equality test only borrows genuinely unchanged lines.
+        if is_weak_locator(&join(&old[old_start..old_end])) {
+            if old_start > 0 && new_start > 0 && old[old_start - 1] == new[new_start - 1] {
+                old_start -= 1;
+                new_start -= 1;
+            }
+            if old_end < old.len() && new_end < new.len() && old[old_end] == new[new_end] {
+                old_end += 1;
+                new_end += 1;
+            }
+        }
+
         let candidate = EditOp {
             old_text: join(&old[old_start..old_end]),
             new_text: join(&new[new_start..new_end]),
@@ -190,25 +253,33 @@ mod tests {
 
     #[test]
     fn trims_common_prefix_and_suffix_lines() {
-        let (old, new, line) = minimized("a\nb\nc\nd\n", "a\nb\nX\nd\n", 10);
-        assert_eq!(old, "c\n");
-        assert_eq!(new, "X\n");
+        let (old, new, line) = minimized(
+            "alpha_line\nbravo_line\nTARGET_old_x\ndelta_line\n",
+            "alpha_line\nbravo_line\nTARGET_new_x\ndelta_line\n",
+            10,
+        );
+        assert_eq!(old, "TARGET_old_x\n");
+        assert_eq!(new, "TARGET_new_x\n");
         assert_eq!(line, 12);
     }
 
     #[test]
     fn keeps_a_context_line_for_a_pure_insertion() {
-        let (old, new, line) = minimized("a\n", "a\nb\n", 5);
-        assert_eq!(old, "a\n");
-        assert_eq!(new, "a\nb\n");
+        let (old, new, line) = minimized("alpha_line\n", "alpha_line\ninserted_line\n", 5);
+        assert_eq!(old, "alpha_line\n");
+        assert_eq!(new, "alpha_line\ninserted_line\n");
         assert_eq!(line, 5);
     }
 
     #[test]
     fn keeps_a_context_line_when_old_is_fully_shared() {
-        let (old, new, line) = minimized("a\nb\n", "X\na\nb\n", 5);
-        assert_eq!(old, "a\n");
-        assert_eq!(new, "X\na\n");
+        let (old, new, line) = minimized(
+            "alpha_line\nbravo_line\n",
+            "inserted_line\nalpha_line\nbravo_line\n",
+            5,
+        );
+        assert_eq!(old, "alpha_line\n");
+        assert_eq!(new, "inserted_line\nalpha_line\n");
         assert_eq!(line, 5);
     }
 
@@ -222,15 +293,25 @@ mod tests {
 
     #[test]
     fn preserves_terminators_exactly() {
-        let (old, new, line) = minimized("a\r\nb\r\nc\r\n", "a\r\nB\r\nc\r\n", 3);
-        assert_eq!(old, "b\r\n");
-        assert_eq!(new, "B\r\n");
+        let (old, new, line) = minimized(
+            "alpha_line\r\nbravo_line\r\ncharlie_line\r\n",
+            "alpha_line\r\nBRAVO_CHANGED\r\ncharlie_line\r\n",
+            3,
+        );
+        assert_eq!(old, "bravo_line\r\n");
+        assert_eq!(new, "BRAVO_CHANGED\r\n");
         assert_eq!(line, 4);
     }
 
     #[test]
     fn idempotent() {
-        let first = minimize_edit(&op("a\nb\nc\nd\n", "a\nb\nX\nd\n"), 10);
+        let first = minimize_edit(
+            &op(
+                "alpha_line\nbravo_line\nTARGET_old_x\ndelta_line\n",
+                "alpha_line\nbravo_line\nTARGET_new_x\ndelta_line\n",
+            ),
+            10,
+        );
         let second = minimize_edit(&first, first.start_line.unwrap().0 as usize);
         assert_eq!(first.old_text, second.old_text);
         assert_eq!(first.new_text, second.new_text);
@@ -261,57 +342,107 @@ mod tests {
 
     #[test]
     fn splits_at_a_long_internal_gap() {
-        // X->A and Y->B, four shared lines between them.
-        let out = split_and_minimize(&op("a\nX\nb\nc\nd\nY\ne\n", "a\nA\nb\nc\nd\nB\ne\n"), 10);
+        // old_x->new_x and old_y->new_y, three shared lines between them.
+        let out = split_and_minimize(
+            &op(
+                "alpha_line\nold_x_line\nbravo_line\ncharlie_line\ndelta_line\nold_y_line\necho_line\n",
+                "alpha_line\nnew_x_line\nbravo_line\ncharlie_line\ndelta_line\nnew_y_line\necho_line\n",
+            ),
+            10,
+        );
         assert_eq!(
             anchors_and_texts(&out),
             vec![
-                ("X\n".into(), "A\n".into(), 11),
-                ("Y\n".into(), "B\n".into(), 15),
+                ("old_x_line\n".into(), "new_x_line\n".into(), 11),
+                ("old_y_line\n".into(), "new_y_line\n".into(), 15),
             ]
         );
     }
 
     #[test]
     fn keeps_a_short_gap_inside_one_block() {
-        // X->A and Y->B separated by only two shared lines: one block.
-        let out = split_and_minimize(&op("a\nX\nb\nc\nY\ne\n", "a\nA\nb\nc\nB\ne\n"), 10);
+        // The two changes are separated by only two shared lines: one block.
+        let out = split_and_minimize(
+            &op(
+                "alpha_line\nold_x_line\nbravo_line\ncharlie_line\nold_y_line\necho_line\n",
+                "alpha_line\nnew_x_line\nbravo_line\ncharlie_line\nnew_y_line\necho_line\n",
+            ),
+            10,
+        );
         assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0].old_text, "X\nb\nc\nY\n");
-        assert_eq!(out[0].new_text, "A\nb\nc\nB\n");
+        assert_eq!(
+            out[0].old_text,
+            "old_x_line\nbravo_line\ncharlie_line\nold_y_line\n"
+        );
+        assert_eq!(
+            out[0].new_text,
+            "new_x_line\nbravo_line\ncharlie_line\nnew_y_line\n"
+        );
         assert_eq!(out[0].start_line.unwrap().0, 11);
     }
 
     #[test]
     fn a_split_insertion_borrows_following_context() {
-        let out = split_and_minimize(&op("a\nb\n", "a\nX\nb\n"), 5);
+        let out = split_and_minimize(
+            &op(
+                "alpha_line\nbravo_line\n",
+                "alpha_line\ninserted_line\nbravo_line\n",
+            ),
+            5,
+        );
         assert_eq!(
             anchors_and_texts(&out),
-            vec![("b\n".into(), "X\nb\n".into(), 6)]
+            vec![(
+                "bravo_line\n".into(),
+                "inserted_line\nbravo_line\n".into(),
+                6
+            )]
         );
     }
 
     #[test]
     fn a_trailing_insertion_borrows_preceding_context() {
-        let out = split_and_minimize(&op("a\nb\n", "a\nb\nX\n"), 5);
+        let out = split_and_minimize(
+            &op(
+                "alpha_line\nbravo_line\n",
+                "alpha_line\nbravo_line\ninserted_line\n",
+            ),
+            5,
+        );
         assert_eq!(
             anchors_and_texts(&out),
-            vec![("b\n".into(), "b\nX\n".into(), 6)]
+            vec![(
+                "bravo_line\n".into(),
+                "bravo_line\ninserted_line\n".into(),
+                6
+            )]
         );
     }
 
     #[test]
     fn a_pure_deletion_keeps_an_empty_new() {
-        let out = split_and_minimize(&op("a\nb\nc\n", "a\nc\n"), 3);
+        let out = split_and_minimize(
+            &op(
+                "alpha_line\nbravo_line\ncharlie_line\n",
+                "alpha_line\ncharlie_line\n",
+            ),
+            3,
+        );
         assert_eq!(
             anchors_and_texts(&out),
-            vec![("b\n".into(), String::new(), 4)]
+            vec![("bravo_line\n".into(), String::new(), 4)]
         );
     }
 
     #[test]
     fn splitting_is_idempotent() {
-        let first = split_and_minimize(&op("a\nX\nb\nc\nd\nY\ne\n", "a\nA\nb\nc\nd\nB\ne\n"), 10);
+        let first = split_and_minimize(
+            &op(
+                "alpha_line\nold_x_line\nbravo_line\ncharlie_line\ndelta_line\nold_y_line\necho_line\n",
+                "alpha_line\nnew_x_line\nbravo_line\ncharlie_line\ndelta_line\nnew_y_line\necho_line\n",
+            ),
+            10,
+        );
         let mut second = Vec::new();
         for e in &first {
             second.extend(split_and_minimize(e, e.start_line.unwrap().0 as usize));
@@ -322,8 +453,10 @@ mod tests {
     #[test]
     fn sub_blocks_partition_the_same_change() {
         // Applying the pieces one after another reproduces applying the whole.
-        let old = "a\nX\nb\nc\nd\nY\ne\n";
-        let new = "a\nA\nb\nc\nd\nB\ne\n";
+        let old =
+            "alpha_line\nold_x_line\nbravo_line\ncharlie_line\ndelta_line\nold_y_line\necho_line\n";
+        let new =
+            "alpha_line\nnew_x_line\nbravo_line\ncharlie_line\ndelta_line\nnew_y_line\necho_line\n";
         let whole = crate::apply::apply_to_text(old, &[op(old, new)]);
         let pieces = split_and_minimize(&op(old, new), 1);
         let mut text = old.to_string();
@@ -349,7 +482,50 @@ mod tests {
 
     #[test]
     fn no_change_is_a_single_minimized_edit() {
-        let out = split_and_minimize(&op("a\nb\n", "a\nb\n"), 5);
+        let out = split_and_minimize(
+            &op("alpha_line\nbravo_line\n", "alpha_line\nbravo_line\n"),
+            5,
+        );
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn weak_old_keeps_one_common_neighbour() {
+        let (old, new, line) = minimized("let alpha = 1;\n}\n", "let alpha = 1;\n},\n", 10);
+        assert_eq!(old, "let alpha = 1;\n}\n");
+        assert_eq!(new, "let alpha = 1;\n},\n");
+        assert_eq!(line, 10);
+    }
+
+    #[test]
+    fn weak_old_prefers_the_longer_neighbour() {
+        let (old, new, line) = minimized("x\n}\nlong_below_line\n", "x\n},\nlong_below_line\n", 10);
+        assert_eq!(old, "}\nlong_below_line\n");
+        assert_eq!(new, "},\nlong_below_line\n");
+        assert_eq!(line, 11);
+    }
+
+    #[test]
+    fn weak_floor_is_idempotent() {
+        let first = minimize_edit(&op("let alpha = 1;\n}\n", "let alpha = 1;\n},\n"), 10);
+        let second = minimize_edit(&first, first.start_line.unwrap().0 as usize);
+        assert_eq!(first.old_text, second.old_text);
+        assert_eq!(first.new_text, second.new_text);
+        assert_eq!(first.start_line, second.start_line);
+    }
+
+    #[test]
+    fn a_weak_hunk_borrows_a_neighbouring_line() {
+        let out = split_and_minimize(
+            &op(
+                "alpha_line\n}\nbravo_line\n",
+                "alpha_line\n},\nbravo_line\n",
+            ),
+            10,
+        );
+        assert_eq!(
+            anchors_and_texts(&out),
+            vec![("alpha_line\n}\n".into(), "alpha_line\n},\n".into(), 10)]
+        );
     }
 }
