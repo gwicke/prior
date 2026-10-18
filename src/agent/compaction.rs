@@ -319,6 +319,13 @@ async fn draft_at_pivot(
 /// apply half of doc/editor_cleanup.md §6. Data layer only: no display
 /// (the user has just seen the summary; the committed input line
 /// documents the write) and no confirm (the caller's UI owns that).
+///
+/// The one side effect beyond the session write is on the agent's usage
+/// store: the compaction rewrote the history the last completion's input
+/// count measured, so that report is invalidated. Nothing here computes
+/// an estimate — the turn boundary's per-cycle write (`read_input`) and
+/// the next turn's start (`prompt`) refresh it on demand, the same
+/// on-demand path session resume uses.
 pub(crate) async fn apply_compaction(
     app_state: &AppState,
     target_id: &str,
@@ -330,8 +337,17 @@ pub(crate) async fn apply_compaction(
     session
         .append_compaction(&draft.summary, target_id, draft.tokens_before)
         .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Flag only: the estimate the figure falls back to is refreshed on
+    // demand at the next turn boundary, not here — no context build on
+    // the compaction path.
+    if let Some(usage) = app_state.content().usage_handle() {
+        usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_context_report();
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1171,57 @@ mod tests {
             }
             other => panic!("expected Compaction entry, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn apply_compaction_drops_the_context_report_and_computes_no_estimate() {
+        // The compaction rewrote the history the last completion's input
+        // count measured: apply drops that report from the shared usage
+        // store, so `context_figure` (bar, /stat) falls back to the estimate
+        // — refreshed on demand at the next turn boundary. Apply computes no
+        // estimate of its own: the flag-only half of that contract.
+        let _g = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(
+            build_writable_session_with(
+                _g.path(),
+                vec![
+                    message_entry("u1", None, "user", "the question"),
+                    message_entry("a1", Some("u1"), "assistant", "the answer"),
+                ],
+            )
+            .await,
+        );
+        let app_state = compaction_app_state(s.clone());
+        // A live store as the agent's wiring installs it, carrying a
+        // standing provider report and a pre-compaction estimate.
+        let usage = std::sync::Arc::new(std::sync::Mutex::new(crate::agent::SessionUsage {
+            last_input_tokens: Some(100_000),
+            estimated_input_tokens: 90_000,
+            ..Default::default()
+        }));
+        app_state.content().set_usage(Some(usage.clone()));
+
+        let draft = generate_compaction(&app_state, "a1", CompactSummaryMode::TextOnly, "")
+            .await
+            .expect("generate");
+        apply_compaction(&app_state, "a1", &draft)
+            .await
+            .expect("apply");
+
+        let g = usage.lock().unwrap();
+        assert!(
+            g.last_input_tokens.is_none(),
+            "the report the compaction invalidated must be dropped"
+        );
+        assert_eq!(
+            g.estimated_input_tokens, 90_000,
+            "apply computes no estimate — the turn boundary's write owns that"
+        );
+        assert_eq!(
+            g.context_figure(),
+            90_000,
+            "the figure falls back to the estimate"
+        );
     }
 
     #[tokio::test]

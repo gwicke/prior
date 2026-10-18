@@ -309,11 +309,13 @@ mod tests {
     }
 
     #[test]
-    fn stat_header_shows_estimated_context_tokens() {
+    fn stat_header_shows_the_merged_context_figure() {
         let app_state = test_app_state();
         app_state.set_model("openai:gpt-4o");
-        // The estimate lives on the usage store, read off
-        // the same handle the bar pulls; seed it as an estimate, not a report.
+        // The figure lives on the usage store, read off the same handle the
+        // bar pulls — the merged one (`context_figure`): the provider's last
+        // report when one stands, else the estimate seeded here (no report
+        // has, so the estimate is what "current usage" must show).
         app_state
             .content()
             .set_usage(Some(Arc::new(std::sync::Mutex::new(
@@ -334,8 +336,8 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join("\n");
                 assert!(
-                    header_text.contains("estimated context tokens: 42000"),
-                    "header should show estimated context tokens: {}",
+                    header_text.contains("current usage: 42000"),
+                    "header should show the merged context figure: {}",
                     header_text
                 );
             }

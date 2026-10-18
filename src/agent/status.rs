@@ -790,9 +790,13 @@ fn compact_tokens(n: u64) -> String {
 /// context window is — the two facts needed to see why.
 ///
 /// Both token figures are read **live** off the agent's shared usage store:
-/// `usage` for the session/cost/cache totals, `context_tokens`
-/// for the estimated next-turn context — so `/stat` opened mid-turn is current,
-/// not a loop-cycle snapshot.
+/// `usage` for the session/cost/cache totals, `context_tokens` for the
+/// current context figure — so `/stat` opened mid-turn is current, not a
+/// loop-cycle snapshot. `context_tokens` is the *merged* figure
+/// (`SessionUsage::context_figure`: the provider's last report, else the
+/// estimate, with a report invalidated by a compaction stepping aside for
+/// the estimate) — the same single number the status bar shows, so the two
+/// surfaces cannot disagree and a post-compaction `/stat` is fresh too.
 pub fn session_stats_lines(
     provider: &str,
     model: &str,
@@ -845,10 +849,6 @@ pub fn session_stats_lines(
             lines.push("session: (unavailable)".to_string());
         }
     }
-    // Estimated compacted context tokens (what would be sent on next turn).
-    if context_tokens > 0 {
-        lines.push(format!("  estimated context tokens: {}", context_tokens));
-    }
 
     // ── model section ───────────────────────────────────────────────────
     lines.push(format!("model: {}:{}", provider, model));
@@ -890,8 +890,11 @@ pub fn session_stats_lines(
         None => lines.push("  context window limit: unknown (model not in catalog)".to_string()),
     }
 
-    // Current context usage (absolute + % of max).
-    let cur = usage.last_input_tokens;
+    // Current context usage (absolute + % of max) — the merged figure the
+    // status bar shows, not the raw last report: a compaction invalidates
+    // that report, and reading the merge here is what keeps this line
+    // fresh the moment one commits.
+    let cur = context_tokens;
     if cur > 0 {
         if let Some(max) = ctx_len {
             let pct = (cur as f64 / max as f64) * 100.0;
@@ -903,7 +906,7 @@ pub fn session_stats_lines(
             lines.push(format!("  current usage: {} tokens", cur));
         }
     } else {
-        lines.push("  current usage: n/a (no completion call recorded yet)".to_string());
+        lines.push("  current usage: n/a (no usage recorded yet)".to_string());
     }
 
     // Approximate session cost.
@@ -1006,16 +1009,23 @@ mod stat_tests {
         // number of user prompts (= turns), the latter the total entries
         // (user + assistant + toolResult).
         assert_eq!(lines[4], "  size: 7 turns (14 messages)");
-        // New line: estimated context tokens
-        assert_eq!(lines[5], "  estimated context tokens: 42000");
 
-        // Then the "model:" section starts on the next line, with the rest
-        // of the existing context-window / usage / cost / cache rows.
+        // The "model:" section starts right after the session section: the
+        // context figure has a single home there now — the merged "current
+        // usage" line — not a second entry under the session section.
         let model_idx = lines
             .iter()
             .position(|l| l.starts_with("model:"))
             .expect("model section must be present");
-        assert!(model_idx >= 6, "model section must follow session section");
+        assert_eq!(model_idx, 5, "model section must follow session section");
+        // The merged figure (here the estimate, no report standing) renders
+        // as the usage line.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("  current usage: 42000")),
+            "the merged figure should head the usage line: {lines:?}"
+        );
         assert!(lines[model_idx].contains("openrouter:minimax/minimax-m3:free"));
         assert!(lines.iter().any(|l| l.contains("context window limit")));
     }

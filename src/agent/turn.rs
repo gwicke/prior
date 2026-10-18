@@ -287,7 +287,12 @@ impl CodeAgent {
                             let u = call.usage;
                             if u.has_values() {
                                 if let Ok(mut g) = self.usage.lock() {
-                                    g.last_input_tokens = u.input_tokens;
+                                    // A fresh report replaces whatever stood
+                                    // before — including a compaction's
+                                    // invalidation — so this write is the
+                                    // switch back from estimate to the
+                                    // provider's own count.
+                                    g.last_input_tokens = Some(u.input_tokens);
                                     g.last_output_tokens = u.output_tokens;
                                     g.last_cached_input_tokens = u.cached_input_tokens;
                                     g.last_cache_creation_input_tokens = u.cache_creation_input_tokens;

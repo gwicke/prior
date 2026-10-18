@@ -1843,12 +1843,23 @@ mod tests {
         // A completion reports, mid-turn, writing the store in place — the one
         // thing the turn already does (agent/turn.rs, per completion). It wins
         // over the estimate.
-        usage.lock().unwrap().last_input_tokens = 100_000;
+        usage.lock().unwrap().last_input_tokens = Some(100_000);
         let after = compose_rows(&compose_area(&out, None, Vec::new()), 60);
         assert!(
             after[1].contains("100k"),
             "the provider's report wins over the estimate, no push involved: {:?}",
             after[1]
+        );
+
+        // A compaction invalidates the report (drops it) mid-menu: the
+        // estimate — refreshed on demand at the next turn boundary — stands
+        // in again at the next compose, with no push either way.
+        usage.lock().unwrap().invalidate_context_report();
+        let invalidated = compose_rows(&compose_area(&out, None, Vec::new()), 60);
+        assert!(
+            invalidated[1].contains("42k"),
+            "the dropped report hands the figure back to the estimate: {:?}",
+            invalidated[1]
         );
     }
 
