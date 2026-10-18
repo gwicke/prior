@@ -1508,10 +1508,12 @@ impl Repl {
         app_state.set_repo(ctx.repo.clone());
         // The context figure is read *live* by the bar and `/stat` off the
         // agent's usage store — so this cycle's estimate is recorded as an
-        // **estimate**, not a push into the status and not
-        // a report. Before any completion has reported the estimate is what
-        // `context_figure` falls back to; after one has, the provider's own
-        // count wins and this write is simply unused.
+        // **estimate**, not a push into the status and not a report. It is
+        // the on-demand estimate `context_figure` falls back to whenever no
+        // valid report stands: before the first completion has reported, and
+        // after a compaction dropped the last one (compaction drops, this
+        // write refreshes — no context build on the compaction path, and
+        // session resume rides the same path with no special case).
         if let Some(usage) = content.usage_handle() {
             usage.lock().unwrap().estimated_input_tokens = ctx.context_tokens;
         }

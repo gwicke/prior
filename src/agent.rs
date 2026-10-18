@@ -31,21 +31,30 @@ use transcript::maybe_strip_reasoning;
 
 /// Token-usage telemetry accumulated by an agent across a session.
 ///
-/// The `last_*` fields reflect the most recent completion request and back the
-/// "current context size" reported by `/stat`; the `session_*` fields are the
-/// running sum across every completion call (each call re-sends the full
-/// history, so this approximates the billed token cost). A zeroed field means
-/// the provider reported no value (rig's `Usage` sentinel for missing metrics).
+/// The `last_*` fields reflect the most recent completion request; the
+/// `session_*` fields are the running sum across every completion call (each
+/// call re-sends the full history, so this approximates the billed token
+/// cost). A zeroed `last_*` field means the provider reported no value (rig's
+/// `Usage` sentinel for missing metrics); the input count is an `Option`
+/// instead because it is the one figure a compaction can *invalidate* — its
+/// staleness is its absence.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionUsage {
     /// Input ("prompt") tokens of the most recent completion request — the
-    /// size of the context that would be re-sent on the next turn.
-    pub last_input_tokens: u64,
-    /// The **estimated** input size, recorded by the loop and the turn before
-    /// any completion has reported. An estimate is kept as an
-    /// estimate: it never impersonates a provider report in
-    /// [`Self::last_input_tokens`]. [`Self::context_figure`] is the one read
-    /// that falls back to it.
+    /// size of the context that would be re-sent on the next turn — when a
+    /// *valid* report stands. `None` before the first completion reports,
+    /// and again after a compaction invalidated the last one
+    /// ([`Self::invalidate_context_report`]): the context that report
+    /// measured no longer exists, so it is not a report on the current
+    /// context. The `Option` is the staleness — no flag beside it.
+    pub last_input_tokens: Option<u64>,
+    /// The **estimated** input size, recorded at every turn boundary by the
+    /// loop (`read_input`'s per-cycle write) and by the turn at start. An
+    /// estimate is kept as an estimate: it never impersonates a provider
+    /// report in [`Self::last_input_tokens`]. [`Self::context_figure`] is
+    /// the one read that falls back to it — whenever no valid report
+    /// stands, a first turn and a post-compaction turn alike, with no
+    /// special case for either.
     pub estimated_input_tokens: u64,
     /// Output ("completion") tokens of the most recent completion request.
     pub last_output_tokens: u64,
@@ -67,16 +76,35 @@ pub struct SessionUsage {
 
 impl SessionUsage {
     /// The context figure the bar and `/stat` show: the provider's own count of
-    /// what it last sent when one has reported, else the loop's/turn's
+    /// what it last sent when a valid report stands, else the loop's/turn's
     /// estimate. One read, so the two surfaces cannot disagree
     /// about which number stands — and so the estimate never has to pretend to
-    /// be a provider report to be seen.
+    /// be a provider report to be seen. A compaction drops the report
+    /// ([`Self::invalidate_context_report`]); the next completion's usage
+    /// write is the switch back.
     pub fn context_figure(&self) -> u64 {
-        if self.last_input_tokens > 0 {
-            self.last_input_tokens
-        } else {
-            self.estimated_input_tokens
+        match self.last_input_tokens {
+            // `> 0`: a provider may report a valueless input count next to a
+            // real output count; 0 describes no context, so it falls back.
+            Some(n) if n > 0 => n,
+            _ => self.estimated_input_tokens,
         }
+    }
+
+    /// Record that the context changed under the last completion's report (a
+    /// compaction committed): that report's input count measured a context
+    /// which no longer exists, so it is dropped — [`Self::context_figure`]
+    /// falls back to `estimated_input_tokens` until the next completion
+    /// call's usage write replaces it.
+    ///
+    /// Dropping only — nothing here recomputes the estimate, and nothing
+    /// else in `last_*` moves (they remain an honest record of what was
+    /// last billed). The estimate is refreshed on demand at every turn
+    /// boundary (`read_input`'s per-cycle write, `prompt`'s turn-start
+    /// write), so the compaction path stays free of a session-context build
+    /// and resume/other context rewrites need no special case of their own.
+    pub fn invalidate_context_report(&mut self) {
+        self.last_input_tokens = None;
     }
 }
 
@@ -853,6 +881,38 @@ mod tests {
     use crate::session::storage::SessionStorage;
     use crate::session::Session;
     use rig_core::message::{AssistantContent, Message, Text};
+
+    /// The merge at a glance: a valid provider report wins; no report (first
+    /// turn) or a dropped one (post-compaction) falls back to the estimate;
+    /// the next completion's write switches back. Invalidation drops the
+    /// report — it parks nothing behind a flag and touches nothing else.
+    #[test]
+    fn context_figure_merges_report_and_estimate() {
+        use super::SessionUsage;
+        let mut u = SessionUsage::default();
+        // No report yet: the estimate stands in.
+        u.estimated_input_tokens = 42_000;
+        assert_eq!(u.context_figure(), 42_000);
+
+        // A completion reports: the provider's own count wins.
+        u.last_input_tokens = Some(100_000);
+        assert_eq!(u.context_figure(), 100_000);
+
+        // A compaction invalidates the report: the estimate stands again and
+        // the report is *dropped* — the staleness is the absence.
+        u.invalidate_context_report();
+        assert!(u.last_input_tokens.is_none());
+        assert_eq!(u.context_figure(), 42_000);
+        // The rest of the telemetry is untouched: still an honest record of
+        // what was last billed.
+        u.last_output_tokens = 7;
+        u.invalidate_context_report();
+        assert_eq!(u.last_output_tokens, 7);
+
+        // The next completion's report switches the figure back.
+        u.last_input_tokens = Some(50_000);
+        assert_eq!(u.context_figure(), 50_000);
+    }
 
     /// Build a `Session` from `entries` for `compute_resume_model_prefill`
     /// tests. Mirrors `session::session::tests::build_session_for_test` —
