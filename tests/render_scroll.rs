@@ -2,7 +2,7 @@
 //! it opens while the input sits on the *bottom* row of the terminal.
 //!
 //! Strategy (see discussion in `doc/phase_1_plan.md` §3.7):
-//! 1. Spawn `picocode` in a *real* pty (so it enters raw mode and believes it
+//! 1. Spawn `prior` in a *real* pty (so it enters raw mode and believes it
 //!    is on a TTY). The pty only transports bytes — it does not emulate a
 //!    screen.
 //! 2. Capture the raw output bytes and feed them to a *terminal emulator*
@@ -13,7 +13,7 @@
 //!
 //! The bug only triggers when the input line is on the bottom row. With an
 //! 8-row terminal the short greeter leaves the input at row 3, so we *force*
-//! the cursor to the last row by answering `picocode`'s cursor-position query
+//! the cursor to the last row by answering `prior`'s cursor-position query
 //! (a DSR, `ESC[6n`) with `ESC[<ROWS>;1R` before it reads it. That makes the
 //! input sit on the bottom row, exactly the reported condition.
 //!
@@ -104,12 +104,12 @@ fn popup_scroll_does_not_duplicate_input() {
         })
         .expect("open pty");
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free"]);
     // Use a temp directory for XDG_CONFIG_HOME to avoid littering user's config with test sessions.
     let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn prior");
     // Keep the tempdir alive for the duration of the run.
     let _config_tempdir = config_tempdir;
 
@@ -119,12 +119,12 @@ fn popup_scroll_does_not_duplicate_input() {
 
     // Wait for the REPL to print its first screen (greeter + status).
     assert!(
-        wait_for(&bytes, "picocode -", Duration::from_secs(5)),
-        "picocode did not start the REPL (no greeter); raw-mode/pty setup failed"
+        wait_for(&bytes, "prior -", Duration::from_secs(5)),
+        "prior did not start the REPL (no greeter); raw-mode/pty setup failed"
     );
     eprintln!("[test] greeter seen");
 
-    // `picocode` is now inside `read_input` and has just issued a cursor-position
+    // `prior` is now inside `read_input` and has just issued a cursor-position
     // query (a DSR, `ESC[6n`); it blocks up to ~60ms waiting for the reply
     // `ESC[<row>;<col>R`. Answer with `ESC[<ROWS>;1R` so it believes the input
     // line sits on the *bottom* row — exactly the condition that triggers the
@@ -276,7 +276,7 @@ fn popup_scroll_does_not_duplicate_input() {
 /// wezterm (and xterm-style terminals) send Shift+Enter as the legacy CSI
 /// sequence `\x1b[13;2~` even when the Kitty keyboard protocol is *disabled*.
 /// crossterm 0.29 parses that as `KeyCode::F(3)` (+SHIFT), which does NOT
-/// reach the Enter handler. picocode maps `F(3)` -> insert newline, mirroring
+/// reach the Enter handler. prior maps `F(3)` -> insert newline, mirroring
 /// pi. This test drives the real key bytes through a pty + vt100 emulator and
 /// asserts a newline was inserted (the input becomes two rows).
 #[test]
@@ -292,12 +292,12 @@ fn shift_enter_inserts_newline_without_kitty() {
         })
         .expect("open pty");
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free"]);
     // Use a temp directory for XDG_CONFIG_HOME to avoid littering user's config with test sessions.
     let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn prior");
     // Keep the tempdir alive for the duration of the run.
     let _config_tempdir = config_tempdir;
 
@@ -306,8 +306,8 @@ fn shift_enter_inserts_newline_without_kitty() {
     let mut writer = pair.master.take_writer().expect("take writer");
 
     assert!(
-        wait_for(&bytes, "picocode -", Duration::from_secs(5)),
-        "picocode did not start the REPL (no greeter)"
+        wait_for(&bytes, "prior -", Duration::from_secs(5)),
+        "prior did not start the REPL (no greeter)"
     );
     // Don't force the input to the bottom row; keep it mid-screen so the
     // multi-line input has room to grow. Answer the cursor-position DSR with
@@ -382,11 +382,11 @@ fn committed_multiline_prompt_clears_the_bar_row() {
         })
         .expect("open pty");
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free"]);
     let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn prior");
     let _config_tempdir = config_tempdir;
 
     let reader = pair.master.try_clone_reader().expect("clone reader");
@@ -394,8 +394,8 @@ fn committed_multiline_prompt_clears_the_bar_row() {
     let mut writer = pair.master.take_writer().expect("take writer");
 
     assert!(
-        wait_for(&bytes, "picocode -", Duration::from_secs(5)),
-        "picocode did not start the REPL (no greeter)"
+        wait_for(&bytes, "prior -", Duration::from_secs(5)),
+        "prior did not start the REPL (no greeter)"
     );
     // Prompt high in the terminal: the frame starts at row 3, so submit runs
     // in the consume regime with the bar's row inside the committed span.
@@ -493,14 +493,14 @@ fn sharing_commit_with_a_wrapped_line_still_clears_the_bar_row() {
 
     // A config file the `/set` leaf can write to (settings-test pattern).
     let cfg_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
-    let cfg = cfg_tempdir.path().join("picocode.toml");
+    let cfg = cfg_tempdir.path().join("prior.toml");
     std::fs::write(&cfg, "\n").expect("write temp config");
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free", "-c"]);
     cmd.arg(cfg.to_str().unwrap());
     cmd.env("XDG_CONFIG_HOME", cfg_tempdir.path());
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn prior");
     let _cfg_tempdir = cfg_tempdir;
 
     let reader = pair.master.try_clone_reader().expect("clone reader");
@@ -508,8 +508,8 @@ fn sharing_commit_with_a_wrapped_line_still_clears_the_bar_row() {
     let mut writer = pair.master.take_writer().expect("take writer");
 
     assert!(
-        wait_for(&bytes, "picocode -", Duration::from_secs(5)),
-        "picocode did not start the REPL (no greeter)"
+        wait_for(&bytes, "prior -", Duration::from_secs(5)),
+        "prior did not start the REPL (no greeter)"
     );
     // Prompt high in the terminal (consume regime, bar's row inside the
     // committed span).
@@ -603,7 +603,7 @@ fn sharing_commit_with_a_wrapped_line_still_clears_the_bar_row() {
 #[test]
 fn settings_string_hierarchy_saves_and_errors() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let cfg = tmp.path().join("picocode.toml");
+    let cfg = tmp.path().join("prior.toml");
     // Pre-create so `-c` resolves to an existing (empty) file; the
     // save side-effect then lands here instead of the repo CWD.
     std::fs::write(&cfg, "\n").expect("write temp config");
@@ -617,7 +617,7 @@ fn settings_string_hierarchy_saves_and_errors() {
             pixel_height: 0,
         })
         .expect("open pty");
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     cmd.args([
         "-p",
         "openrouter",
@@ -629,7 +629,7 @@ fn settings_string_hierarchy_saves_and_errors() {
     // Use a temp directory for XDG_CONFIG_HOME to avoid littering user's config with test sessions.
     let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn prior");
     // Keep the tempdir alive for the duration of the run.
     let _config_tempdir = config_tempdir;
 
@@ -638,7 +638,7 @@ fn settings_string_hierarchy_saves_and_errors() {
     let mut writer = pair.master.take_writer().expect("take writer");
 
     assert!(
-        wait_for(&bytes, "picocode -", Duration::from_secs(5)),
+        wait_for(&bytes, "prior -", Duration::from_secs(5)),
         "REPL did not start"
     );
     // Answer the cursor-position DSR with a sane mid-screen row.

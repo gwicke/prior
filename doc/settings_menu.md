@@ -52,7 +52,7 @@ This plan mirrors the existing `/model` + `/thinking` inline-overlay design in
   and `Tab` completion (`/mod` → `/model `). `/set` must be added here so
   it appears in the `/` list and completes.
 - **Settings today are NOT persisted.** `Config` (`src/config.rs`) currently
-  loads `picocode.yaml`/`picocode.yml` (YAML) and holds only `agent_prompt`,
+  loads `prior.yaml`/`prior.yml` (YAML) and holds only `agent_prompt`,
   `tool_config`, `recipes`. The five target settings live **only** in
   `AgentConfig` (`provider`, `model`, `yolo`, `tool_call_limit`, `persona_name`,
   `thinking_level`) and CLI args; there is **no `Config::save`**. **Decision
@@ -265,7 +265,7 @@ loss.
 **Dependencies:** drop `serde_yaml`; add `toml_edit = { version = "0.25",
 features = ["serde"] }` (already present transitively at 0.25.13). `serde`
 already a dep. No separate `toml` crate required (use `toml_edit::de` for
-deserialize). `PicocodeError::Yaml` is replaced by a `Toml(String)` variant
+deserialize). `PriorError::Yaml` is replaced by a `Toml(String)` variant
 (mapped from both `toml_edit`/`toml` parse errors).
 
 ### A.6 Value autocomplete (optional, mostly Phase 2 polish)
@@ -383,13 +383,13 @@ Refinements from the recent work:
 - **File**: `src/main.rs`
   - **Change**: Switch config load to `settings.toml`; resolve setting
     precedence (CLI > file > built-in) for the 5 settings; update help strings
-    ("picocode.yaml" → "settings.toml"); pass `Config` into `run_interactive`.
+    ("prior.yaml" → "settings.toml"); pass `Config` into `run_interactive`.
 - **File**: `src/lib.rs`
   - **Change**: `pub mod settings;`, re-export `SettingsStore`, `SettingKey`.
-    Replace `PicocodeError::Yaml` with `Toml(String)` (mapped from
+    Replace `PriorError::Yaml` with `Toml(String)` (mapped from
     `toml_edit`/`toml` parse errors).
 - **File**: `settings.toml.example`
-  - **Change**: New (rename `picocode.yaml.example`): TOML syntax for
+  - **Change**: New (rename `prior.yaml.example`): TOML syntax for
     `agent_prompt`, `tool_config`, `recipes`, and the 5 settings keys (see
     §B.3).
 
@@ -418,7 +418,7 @@ Refinements from the recent work:
 - [ ] `Config::load` reads `settings.toml` (drop `.yaml`/`.yml`); deserialize
       via `toml_edit::de::from_str`. Keep `load(None)` cwd search.
 - [ ] Add 5 `#[serde(default)]` fields to `Config`; `#[derive]` unchanged.
-- [ ] `PicocodeError`: replace `Yaml` variant with `Toml(String)`; `From`
+- [ ] `PriorError`: replace `Yaml` variant with `Toml(String)`; `From`
       impls for `toml_edit`/`toml` parse errors.
 - [ ] **Unit tests**: `load` parses a TOML file with `recipes` + settings;
       missing/old file still parses via `#[serde(default)]`; built-in defaults
@@ -555,7 +555,7 @@ omitted ⇄ `None`. Full file also holds `agent_prompt`, `tool_config`, and
 - **2026-07-17** — Config format decision: **hard switch YAML→TOML** (no YAML
   fallback; experimental personal fork). Settings + `recipes` live in the same
   `settings.toml`; writes via `toml_edit` preserve comments + recipes. Dropped
-  `serde_yaml`; added `toml_edit` (serde feature). `PicocodeError::Yaml` →
+  `serde_yaml`; added `toml_edit` (serde feature). `PriorError::Yaml` →
   `Toml(String)`. Q1 resolved. Updated §A.5, §B.1, §B.2 (Stage 2), §B.3, §B.4.
 - **2026-07-17** — *Phase 1 implemented.* New `src/set.rs` (`SettingKey`,
   `ValueKind`, `SettingMeta`, `SETTINGS`, `SettingsStore` with `load`/`save`/
@@ -563,7 +563,7 @@ omitted ⇄ `None`. Full file also holds `agent_prompt`, `tool_config`, and
   `SlashKind::Settings`; `repl.rs::read_input` gains a `kind = 5` list branch +
   a `list ⇄ edit` two-state overlay (`edit_setting`/`edit_prev_input`/
   `edit_error`); `agent.rs::run_interactive` + `main.rs` wire a `&mut
-  SettingsStore` through. `picocode.yaml.example` → `settings.toml.example`.
+  SettingsStore` through. `prior.yaml.example` → `settings.toml.example`.
   92 lib tests + 2 pty tests green; `cargo build` warning-free. Phase 2
   (live-apply) and Stage 4 (value autocomplete) remain.
 

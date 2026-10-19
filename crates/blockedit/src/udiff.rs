@@ -4,7 +4,7 @@
 //! pasted into `edit`, so it is a unified diff proper: `---`/`+++` headers and
 //! `@@` hunk markers, which is what a pager, `patch` and every diff tool expect.
 //!
-//! This is deliberately *not* the same shape as picocode's in-panel edit preview
+//! This is deliberately *not* the same shape as prior's in-panel edit preview
 //! (`refined_diff_lines` in `content/preview.rs`), which is a display format: no
 //! file
 //! headers at all, a space after each `-`/`+` marker so the terminal panel can

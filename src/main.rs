@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
-use picocode::termio::TermIO;
-use picocode::{config::Config, create_agent, AgentConfig, Content, SettingsStore};
+use prior::termio::TermIO;
+use prior::{config::Config, create_agent, AgentConfig, Content, SettingsStore};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -35,10 +35,10 @@ struct Args {
     tool_call_limit: Option<usize>,
 
     /// Choose a persona for the agent
-    #[arg(long, help = format!("Choose a persona for the agent. Available built-in personas:\n{}", picocode::persona::list_personas()), global = true)]
+    #[arg(long, help = format!("Choose a persona for the agent. Available built-in personas:\n{}", prior::persona::list_personas()), global = true)]
     persona: Option<String>,
 
-    /// Path to config file (default: ~/.config/picocode/settings.toml; --config overrides)
+    /// Path to config file (default: ~/.config/prior/settings.toml; --config overrides)
     #[arg(short, long, global = true)]
     config: Option<String>,
 
@@ -69,7 +69,7 @@ enum Commands {
     Recipe { name: String },
 }
 
-/// External binaries picocode depends on at runtime. We fail closed at
+/// External binaries prior depends on at runtime. We fail closed at
 /// startup (rather than degrading) because both are integral to the sandboxed
 /// tool-execution model: `bwrap` provides the command namespace, `rg` backs
 /// the grep tool.
@@ -111,7 +111,7 @@ async fn main() {
         // Restore cooked mode first: the guard lives under `Draw`, out of
         // reach here, and the `Drop` backstop cannot fire while the reader
         // thread holds its `Arc`. Idempotent, no-op without a Tty backend.
-        picocode::termio::emergency_stop();
+        prior::termio::emergency_stop();
         let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s.to_string()
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
@@ -123,7 +123,7 @@ async fn main() {
         eprintln!(
             "\n\n--------------------------------------------------------------------------------"
         );
-        eprintln!("💥 Picocode encountered an unexpected error (panic).");
+        eprintln!("💥 Prior encountered an unexpected error (panic).");
         eprintln!("Message: {}", message);
         if let Some(location) = info.location() {
             eprintln!(
@@ -136,8 +136,8 @@ async fn main() {
         eprintln!(
             "--------------------------------------------------------------------------------"
         );
-        eprintln!("This is likely a bug in picocode or one of its dependencies.");
-        eprintln!("Please report it at: https://github.com/jondot/picocode/issues");
+        eprintln!("This is likely a bug in prior or one of its dependencies.");
+        eprintln!("Please report it at: https://github.com/jondot/prior/issues");
         eprintln!(
             "--------------------------------------------------------------------------------\n"
         );
@@ -146,7 +146,7 @@ async fn main() {
     if let Err(e) = run().await {
         // `process::exit` skips destructors; `run_interactive` already
         // suspended on its own paths, but nothing here did. Idempotent.
-        picocode::termio::emergency_stop();
+        prior::termio::emergency_stop();
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -157,12 +157,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Enable debug-providers mode if requested.
     if args.debug_providers {
-        picocode::model_catalog::set_debug_providers(true);
+        prior::model_catalog::set_debug_providers(true);
     }
 
     // Log available providers at startup (before any network calls).
     {
-        let providers = picocode::model_catalog::list_available_providers();
+        let providers = prior::model_catalog::list_available_providers();
         let configured: Vec<_> = providers.iter().filter(|(_, avail, _)| *avail).collect();
         let unconfigured: Vec<_> = providers.iter().filter(|(_, avail, _)| !*avail).collect();
         eprintln!("── Providers ──────────────────────────────────");
@@ -262,7 +262,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Only the global default sets a level at startup; temperature and top_p
     // have no global — they arrive with the per-model config in P4, and are
     // `None` (provider default) until then.
-    let params = picocode::params::ModelParams {
+    let params = prior::params::ModelParams {
         reasoning: config
             .default_reasoning_level
             .as_deref()
@@ -270,7 +270,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         temperature: None,
         top_p: None,
     };
-    let settings_path = picocode::platform::resolve_config_path(args.config.as_deref());
+    let settings_path = prior::platform::resolve_config_path(args.config.as_deref());
 
     let persona_name = args
         .persona
@@ -281,17 +281,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let show_reasoning = config
         .show_reasoning
         .as_deref()
-        .and_then(picocode::settings::ShowReasoning::parse_opt)
+        .and_then(prior::settings::ShowReasoning::parse_opt)
         .unwrap_or_default();
-    let show_reasoning_handle: picocode::settings::ShowReasoningHandle =
+    let show_reasoning_handle: prior::settings::ShowReasoningHandle =
         std::sync::Arc::new(std::sync::Mutex::new(show_reasoning));
     let reasoning_in_context = config.reasoning_in_context.unwrap_or_default();
-    let content: Arc<picocode::Content> = if quiet {
+    let content: Arc<prior::Content> = if quiet {
         // Quiet: content's own flag suppresses the screen, and `display_error`
         // still goes to stderr. Quiet is a property of the content, not a
         // backend — the condition below is exactly what would have selected
         // Plain.
-        Arc::new(picocode::Content::quiet())
+        Arc::new(prior::Content::quiet())
     } else {
         // The terminal backend is constructed **first**: it probes
         // the caps (which stay inside it — strip and frame-drop are the
@@ -310,10 +310,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(Content::new(term_io, show_reasoning_handle.clone()))
     };
 
-    let system_message_extension = picocode::load_agents_md();
+    let system_message_extension = prior::load_agents_md();
     let persona_prompt = persona_name
         .as_ref()
-        .and_then(|p| picocode::persona::get_persona(p));
+        .and_then(|p| prior::persona::get_persona(p));
 
     // Resolve the sandbox config: merge user settings with built-in defaults.
     // The sandbox is always active (there is no enable switch), so we must
@@ -354,7 +354,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         persona_prompt,
         persona_name,
         bash_auto_allow: Some(config.get_bash_auto_allow()),
-        agent_prompt: picocode::config::read_prompt(
+        agent_prompt: prior::config::read_prompt(
             config.agent_prompt.clone(),
             config.agent_prompt_file.clone(),
         )?,
@@ -374,11 +374,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let agent = create_agent(agent_config.clone()).await?;
             if let Some(r) = recipe {
                 let prompt =
-                    picocode::config::read_prompt(r.prompt.clone(), r.prompt_file.clone())?
+                    prior::config::read_prompt(r.prompt.clone(), r.prompt_file.clone())?
                         .ok_or("Recipe must have either 'prompt' or 'prompt_file'")?;
                 let response = agent.run_once(prompt).await?;
                 if r.is_error(&response)? {
-                    return Err(Box::new(picocode::PicocodeError::Other(
+                    return Err(Box::new(prior::PriorError::Other(
                         "Response matched error_if pattern".to_string(),
                     )));
                 }
@@ -405,7 +405,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", response);
                 }
             } else {
-                picocode::run_interactive(agent_config, settings, args.resume).await?;
+                prior::run_interactive(agent_config, settings, args.resume).await?;
             }
         }
     }
@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn check_runtime_deps_ok_when_both_present() {
         // Both binaries are now hard requirements, so this holds in any
-        // environment where picocode is expected to run.
+        // environment where prior is expected to run.
         assert!(check_runtime_deps().is_ok());
     }
 }

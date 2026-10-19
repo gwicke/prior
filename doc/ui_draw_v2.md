@@ -1744,7 +1744,7 @@ A recommended order for what remains is at the end of the section.
     checked against a terminal emulator and not merely against itself.
     **The two entry DSRs are still here, for reasons that are not this one.**
     `read_input`'s establishes the *starting* row — the cache begins at row 1
-    while the shell that launched picocode may have left its prompt further
+    while the shell that launched prior may have left its prompt further
     down, and every byte of the greeter would be counted from the wrong place.
     The one in `ui::confirm` is a cheap confirmation on a path where a wrong
     anchor strands the dialog, and whose tests assert behaviour rather than

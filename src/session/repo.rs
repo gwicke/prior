@@ -157,7 +157,7 @@ impl SessionMetaCache {
 
 impl JsonlSessionRepo {
     /// Create a new repo rooted at `base_dir` (typically
-    /// `~/.picocode/sessions/`).
+    /// `~/.prior/sessions/`).
     pub fn new(base_dir: PathBuf) -> Self {
         Self {
             base_dir,
@@ -810,7 +810,7 @@ impl SessionRepo for JsonlSessionRepo {
         let source_content = tokio::fs::read_to_string(&source.path).await?;
         let lines: Vec<&str> = source_content.lines().collect();
         if lines.is_empty() {
-            return Err(crate::PicocodeError::Other(
+            return Err(crate::PriorError::Other(
                 "Source session file is empty".into(),
             ));
         }

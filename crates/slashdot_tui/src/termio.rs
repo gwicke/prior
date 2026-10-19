@@ -194,7 +194,7 @@ impl Stream {
 ///
 /// `TermIO` picks the *input / lifecycle* side
 /// (`Tty`/`Plain`, from stdin); caps adjust output fidelity independently.
-/// `picocode "q" | cat` is the case that splits them: a tty stdin with a
+/// `prior "q" | cat` is the case that splits them: a tty stdin with a
 /// non-tty primary — frames dropped and output stripped for the stream, not
 /// for the process (see [`TermIO::write`] and [`TermIO::paints_frames`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -946,7 +946,7 @@ pub struct TermGuard {
     /// stream's, so on a real non-terminal primary they are **not emitted at
     /// all** (design §TermIO: the frame drop's rule, applied to this writer).
     /// Raw-mode flipping still runs — it is a stdin concern, and
-    /// `picocode > out.txt` over an interactive stdin still wants it.
+    /// `prior > out.txt` over an interactive stdin still wants it.
     primary: bool,
 }
 

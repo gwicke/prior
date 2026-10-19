@@ -34,7 +34,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::ansi::escape_end;
 
 /// The OSC-aware width measure, owned by `slashdot_tui::ansi` and re-exported
-/// here so picocode's callers (`ui/bar`, `agent/status`, and this module's
+/// here so prior's callers (`ui/bar`, `agent/status`, and this module's
 /// tests) keep one path. See [`crate::ansi::display_width_ansi`].
 pub use crate::ansi::display_width_ansi;
 /// The explicit-wrap spec, owned by `slashdot_tui::ansi` and re-exported here.

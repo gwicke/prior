@@ -226,7 +226,7 @@ pub(crate) fn header_block(
 
     block.push_str(&format!(
         "{} | {} ({})",
-        style("picocode").bold(),
+        style("prior").bold(),
         style(provider).cyan(),
         style(model).blue(),
     ));

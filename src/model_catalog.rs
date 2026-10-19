@@ -241,7 +241,7 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "zai",
 ];
 
-/// Does picocode know about this provider name?  Unknown providers cannot
+/// Does prior know about this provider name?  Unknown providers cannot
 /// have their API key verified, so OpenRouter-extrapolated entries must not
 /// be created for them (they would appear as "live" in the overlay even
 /// though no API key can be configured).

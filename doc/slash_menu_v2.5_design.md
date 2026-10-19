@@ -451,7 +451,7 @@ values for modifiers without a pre-defined enum (D7).
    `edit()` → `Prepared`), and the same arm is what makes it resolvable.
 2. **Editor handoff**: the node's `prepare()` opens an external editor
    via a callback captured at construction (the engine crate is
-   generic; the picocode-side node impl captures `open_editor` as
+   generic; the prior-side node impl captures `open_editor` as
    private state). Blocks, stores result, returns `Prepared`. Engine
    never knows about `$EDITOR`.
 

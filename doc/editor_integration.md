@@ -15,7 +15,7 @@ shell snippets, or structured text.
 
 - **Foreground child + terminal takeover** is the standard Unix pattern (`sudo`,
   `git commit`, `visudo`). The kernel handles job control: the child inherits
-  the pty, reads keystrokes, and paints the screen while picocode is
+  the pty, reads keystrokes, and paints the screen while prior is
   `waitpid`-ing. Re-entering raw mode after the child exits is the Ctrl-Z
   pattern, already proven in the codebase.
 
@@ -34,9 +34,9 @@ shell snippets, or structured text.
   - **Mitigation**: Detect non-zero exit, retry or abort. Also handle `$EDITOR`
     unset → fallback chain.
 - **Concern**:
-  **Tempfile race (editor saves + picocode reads while editor still writing)**
+  **Tempfile race (editor saves + prior reads while editor still writing)**
   - **Mitigation**: `waitpid` guarantees the file is fully written before
-    picocode reads it. No `inotify` needed.
+    prior reads it. No `inotify` needed.
 - **Concern**: **Tempfile contains stale content from a previous invocation**
   - **Mitigation**: Unlink before `waitpid` return read? No — we read, then
     unlink. The OS retains the inode until the last fd (ours) is closed
@@ -70,7 +70,7 @@ shell snippets, or structured text.
   prompt is preserved because `redraw` only clears from `input_row` downward.
   The greeter/status/divider/session content above the input is untouched.
 
-- **Pty-sharing live editor:** Running picocode in raw mode while hosting an
+- **Pty-sharing live editor:** Running prior in raw mode while hosting an
   editor *inside* the same pty (like Emacs `M-x term`) is a different feature
   and would require full terminal multiplexer logic. Out of scope.
 
@@ -155,7 +155,7 @@ use std::os::unix::fs::PermissionsExt;
 fn edit_in_editor(current: &str) -> io::Result<String> {
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let mut path = std::path::PathBuf::from(tmpdir);
-    path.push(format!("picocode_prompt_{}.txt", std::process::id()));
+    path.push(format!("prior_prompt_{}.txt", std::process::id()));
 
     // Write current content, mode 0600
     {
@@ -212,7 +212,7 @@ This ensures the next `redraw` writes at the correct screen position.
 #### 3.1.2 `src/settings.rs` — optional `editor_cmd` setting (deferred)
 
 A `SettingKey::EditorCmd` would let users override `$EDITOR` from within
-picocode's `/set` menu. This is **not required for v1** since `$VISUAL`
+prior's `/set` menu. This is **not required for v1** since `$VISUAL`
 / `$EDITOR` environment variables are the standard configuration channel.
 Add it as a follow-up if users request it.
 
@@ -254,7 +254,7 @@ Add it as a follow-up if users request it.
 - **Risk**: **Editor re-parents / daemonizes**
   - **Mitigation**: `Command::status` calls `waitpid` on the direct child. If
     the editor spawns a background daemon and exits immediately (common with GUI
-    launchers), picocode resumes too early — the tempfile may not yet be
+    launchers), prior resumes too early — the tempfile may not yet be
     written. **Mitigation:** detect editors known to daemonize (`code`, `gvim`)
     and sleep-wait for the file to reach a stable size, or document that users
     should set `$EDITOR` to a blocking CLI editor like `code -w` (the `-w` flag

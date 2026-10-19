@@ -115,7 +115,7 @@ Read from `~/src/pi` (`packages/coding-agent/src/core/session-manager.ts`,
 {"type":"compaction","id":"f6g7h8i9","parentId":"e5f6g7h8","timestamp":"2024-12-03T14:10:00.000Z","summary":"…","firstKeptEntryId":"c3d4e5f6","tokensBefore":50000}
 ```
 
-picocode's `SessionEntryContent::Compaction` (`src/session/types.rs:204`)
+prior's `SessionEntryContent::Compaction` (`src/session/types.rs:204`)
 serializes exactly this: `type: "compaction"` (serde tag), `firstKeptEntryId`,
 `tokensBefore`. Round-trip test exists (`session_entry_roundtrip_all_variants`).
 **No schema change needed.** Optional pi fields `details` / `fromHook` are
@@ -130,12 +130,12 @@ pi `appendCompaction` (`session-manager.ts:1028`) appends the entry with
 entry. The compaction entry **is a tree node** (in `byId`, appears in
 `getTree()`).
 
-picocode's `Session::append_compaction` (`src/session/session.rs:442`) does the
+prior's `Session::append_compaction` (`src/session/session.rs:442`) does the
 same: `parent_id = leaf_id`, inserts into `entries`/`children`, advances the
 leaf. `build_subtree` (`types.rs:518`) skips only `Leaf`/`SessionInfo` nodes, so
 compaction entries appear in the `/tree` overlay — matching pi's
 tree-selector, which renders them as `[compaction: Nk tokens]`
-(`tree-selector.ts:822`). picocode currently renders `[C] …` / `[C] (compacted)`
+(`tree-selector.ts:822`). prior currently renders `[C] …` / `[C] (compacted)`
 (`repl.rs:2983`); cosmetic only, see Phase 2.
 
 ### 3. Context scoping — pi's `buildContextEntries` (`session-manager.ts:414`)
@@ -173,7 +173,7 @@ So the LLM-visible context is:
 
 **Our empty-summary divergence (documented):** pi *always* emits the wrapper
 message (even for `summary = ""`). Per the requirement — "`<summary (from cmp
-entry, if available)>`" — picocode emits **no summary message at all** when
+entry, if available)>`" — prior emits **no summary message at all** when
 `summary` is empty. This is strictly cleaner for the LLM and does not affect
 serialization compatibility (the entry still carries `summary:""`). Once real
 summaries exist (Phase 6) we emit pi's exact wrapper.
@@ -191,7 +191,7 @@ pi (`prepareCompaction`, `compaction.ts:633`):
   summary messages (in path order), so context can contain several
   `compactionSummary` messages.
 
-**picocode's divergence (documented in `doc/nested_compactions.md`):**
+**prior's divergence (documented in `doc/nested_compactions.md`):**
 
 - **Runtime context steps over nested compactions.**
   `apply_compaction_transforms` drops **every** `Compaction` entry inside the
@@ -217,7 +217,7 @@ That is exactly the requested split: **replay full, context scoped.**
 
 ---
 
-## Current state in picocode (verified @ `9e4a481`)
+## Current state in prior (verified @ `9e4a481`)
 
 - `SessionEntryContent::Compaction { summary, first_kept_entry_id, tokens_before }`
   with pi-exact serde (`types.rs:204`); `SessionEntry::new_compaction`
@@ -682,7 +682,7 @@ Notes:
 - The leaf-is-compaction guard in the code sketch above is **superseded**:
   it was removed in doc/nested_compactions.md phase C (pi's
   `prepareCompaction` at `compaction.ts:637` refuses only when the dropped
-  span is empty; the picocode LLM-mode guard covers that no-op case).
+  span is empty; the prior LLM-mode guard covers that no-op case).
 - `append_compaction` advances the leaf; the very next turn's
   `append_message` uses `index.leaf_id` as parent, so **subsequent turns are
   appended in the session after the compaction entry** (requirement ✓).
@@ -1604,7 +1604,7 @@ to use (`/set <key> <free-text-value>` is the closest precedent).
     inside the kept range are **stepped over** (not re-emitted — see
     doc/nested_compactions.md phase A). LLM compaction mode injects the prior
     summary as `--- PREVIOUS SUMMARY ---` (phase B).
-- **Case**: Session written by pi, read by picocode (and vice versa)
+- **Case**: Session written by pi, read by prior (and vice versa)
   - **Behavior**: Schema identical; `build_index`/`get_path_to_root` treat
     compaction as a normal node; `build_context` scopes. Verify with round-trip
     test (below).
@@ -1848,16 +1848,16 @@ follow-up.
    scoping; non-empty pi-wrapper message; nested compaction stepped over;
    triple-nested only-latest-summary; missing `firstKeptEntryId` fallback;
    compaction entry never in output.
-2. **Serialization cross-compat**: assert picocode writes
+2. **Serialization cross-compat**: assert prior writes
    `{"type":"compaction",…,"firstKeptEntryId":…,"tokensBefore":…}`
    byte-compatible with the pi sample in `session-format.md`; parse pi's sample
    line into `SessionEntry` and back. (Extend
    `session_entry_roundtrip_all_variants`.)
 3. **Pi round-trip (manual/integration)**: write a compacted session with
-   picocode, open it in pi (`pi --session <file>` or via the TUI) and confirm
+   prior, open it in pi (`pi --session <file>` or via the TUI) and confirm
    the TUI shows the compaction node and the LLM context starts at
    `firstKeptEntryId`; then write a compacted session with pi and resume it in
-   picocode, confirming `build_context` scopes identically.
+   prior, confirming `build_context` scopes identically.
 4. **Replay tests** — **done**
    (`build_replay_units_marks_compaction_and_keeps_all_turns`,
    `build_replay_units_uncompacted_has_all_turns` + renderer tests): uncompacted

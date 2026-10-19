@@ -1,6 +1,6 @@
 //! A per-test directory for the diagnostic byte-stream dumps.
 //!
-//! The pty tests capture the raw bytes `picocode` emits and render them through
+//! The pty tests capture the raw bytes `prior` emits and render them through
 //! a terminal emulator. When one of their assertions fails, that byte stream is
 //! the only record of what the program actually drew — the screen the emulator
 //! shows has already lost the escape sequences and the ordering that explain
@@ -53,7 +53,7 @@ impl Dumps {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let name = format!("picocode-dumps-{}-{tag}-{nanos}", std::process::id());
+        let name = format!("prior-dumps-{}-{tag}-{nanos}", std::process::id());
         let path = std::env::temp_dir().join(name);
         std::fs::create_dir_all(&path).expect("create dump dir");
         eprintln!("[dump] {}", path.display());

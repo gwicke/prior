@@ -550,11 +550,11 @@ mod tests {
             &notify,
             Some(window),
             &mut || async {
-                std::future::pending::<std::result::Result<String, crate::PicocodeError>>().await
+                std::future::pending::<std::result::Result<String, crate::PriorError>>().await
             },
         )
         .await;
-        assert!(matches!(r, Err(crate::PicocodeError::Cancelled(_))));
+        assert!(matches!(r, Err(crate::PriorError::Cancelled(_))));
         assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
@@ -591,7 +591,7 @@ mod tests {
             &mut || {
                 calls += 1;
                 async {
-                    Err(crate::PicocodeError::LlmRateLimited {
+                    Err(crate::PriorError::LlmRateLimited {
                         retry_after_secs: Some(10),
                     })
                 }
@@ -599,7 +599,7 @@ mod tests {
         )
         .await;
         let _ = handle.await;
-        assert!(matches!(r, Err(crate::PicocodeError::Cancelled(_))));
+        assert!(matches!(r, Err(crate::PriorError::Cancelled(_))));
         assert_eq!(calls, 1, "no retry attempt may start after the Esc");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),

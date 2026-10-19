@@ -1484,7 +1484,7 @@ impl Repl {
         // tracked row is already right and this DSR confirms it. What it is
         // actually for is the *first* paint of a session: the cache starts at row
         // 1 because nothing has been written yet, while the shell that launched
-        // picocode may have left its prompt three rows down. Every byte of the
+        // prior may have left its prompt three rows down. Every byte of the
         // greeter would then be counted from the wrong place and the drift
         // would be baked in before the first prompt is drawn.
         // First prompt of the process only — every later prompt's tracked row
@@ -1876,7 +1876,7 @@ impl Repl {
             MAX_REWRITES,
             chain.join(" -> ")
         );
-        eprintln!("picocode: {}", msg);
+        eprintln!("prior: {}", msg);
         V25Frame::DoneError(msg, buf.trim_start_matches('/').to_string())
     }
 
@@ -2128,7 +2128,7 @@ impl Repl {
                 // protocol is *disabled*. crossterm 0.29 parses that as
                 // `KeyCode::F(3)` (+SHIFT), not Enter — so it never reaches the
                 // Enter handler above. Mirror pi: treat it as a newline.
-                // (picocode has no F-key bindings, so this is safe.)
+                // (prior has no F-key bindings, so this is safe.)
                 editor.insert_newline();
                 None
             }
@@ -2787,7 +2787,7 @@ fn wrap_line(
 }
 
 /// Persistent input-line history (in-memory + appended to
-/// `~/.config/picocode/history`). `Up`/`Down` navigate; the in-progress line is
+/// `~/.config/prior/history`). `Up`/`Down` navigate; the in-progress line is
 /// restored when navigating back past the newest entry.
 pub struct History {
     entries: Vec<String>,
@@ -2930,7 +2930,7 @@ mod tests {
         );
         let editor = Arc::new(Mutex::new(LineEditor::new()));
         // Built by hand rather than `History::load()`, which reads the real
-        // history file — a test that depends on the machine's `~/.picocode`, and
+        // history file — a test that depends on the machine's `~/.prior`, and
         // `add` would then write to it.
         let mut history = History {
             entries: Vec::new(),

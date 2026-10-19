@@ -71,7 +71,7 @@ auto_allow = [
   "^npm test",
 ]
 # Sandbox for the `bash` (and `agent-browser`) tools. Requires `bwrap`
-# (bubblewrap) on PATH; picocode fails closed at startup if it is absent. An
+# (bubblewrap) on PATH; prior fails closed at startup if it is absent. An
 # unset sandbox config causes commands to be refused rather than run unsandboxed
 # (there is no plain-shell fallback and no enable switch — the sandbox is
 # always active when configured).

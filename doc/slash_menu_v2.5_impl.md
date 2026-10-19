@@ -113,7 +113,7 @@ v2.5 engine.
 - **PageUp/PageDown**: visual-line-aware page scrolling via `page_delta()`
   helper that counts wrapped sub-lines to determine how many logical rows
   fit in the available screen height.
-- **Banner**: `picocode - type / for details` (removed `/help` mention).
+- **Banner**: `prior - type / for details` (removed `/help` mention).
 
 **Design deviations from step4 doc (per user clarification):**
 
@@ -988,7 +988,7 @@ added 7 targeted v2.5 tests.
 |`src/v25_model.rs`|`ModelNode` node impl + `build_model_node()` — dynamic catalog rows, Rc caching, columns, fields|
 |`src/v25_commands.rs`|Test-only node impls for engine harness testing         |
 |`src/repl.rs`|All `/` routes through v2.5 (`ActiveOverlay::V25Menu { plan }`). `SlashDotMenu` + handle in input loop. `eval_prompt` key dispatch. V25Menu overlay rendering (LogicalLine direct path, PageUp/PageDown). `DoneSuccess` dispatch by prefix. Cursor clamping.|
-|`src/agent.rs`       |Banner: `picocode - type / for details`                 |
+|`src/agent.rs`       |Banner: `prior - type / for details`                 |
 
 ---
 

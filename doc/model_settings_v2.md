@@ -564,7 +564,7 @@ against the published default. Otherwise every model would get an explicit
 breaking the reasoning models that reject it. The catalog default is a fact
 *about* the provider, which is why it is also excluded from the
 `ModelSettings` override set — a user editing a non-OpenRouter model's table
-is configuring picocode, not annotating the provider.
+is configuring prior, not annotating the provider.
 
 Validation: `temperature` ∈ [0.0, 2.0], `top_p` ∈ [0.0, 1.0], errors naming the
 key, the value and the range. A value inside our range but outside a known

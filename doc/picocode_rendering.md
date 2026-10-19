@@ -1,6 +1,6 @@
-# picocode Rendering & I/O Notes
+# prior Rendering & I/O Notes
 
-This document summarizes how `picocode` handles terminal input modes and
+This document summarizes how `prior` handles terminal input modes and
 output formatting. Sources: `src/output.rs`, `src/main.rs`, `src/agent.rs`,
 and `Cargo.toml`.
 

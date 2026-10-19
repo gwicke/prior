@@ -24,7 +24,7 @@ use blockedit::EditOp;
 
 /// Canonical transcript of the in-flight run, mirroring rig's `new_messages`
 /// shape: `[assistant, user(tool-results), assistant, …]` (the user prompt is
-/// added at persist time by `prompt()`, which owns `input`). picocode
+/// added at persist time by `prompt()`, which owns `input`). prior
 /// accumulates this from the stream events so a mid-turn failure can persist
 /// exactly what completed — and nothing more — before the REPL retries.
 ///

@@ -1,5 +1,5 @@
 //! Classification of provider and transport failures into
-//! [`crate::PicocodeError`], and the retry policy that follows from it.
+//! [`crate::PriorError`], and the retry policy that follows from it.
 //!
 //! One taxonomy, three entry points: [`classify_prompt_error`] for the blocking
 //! `chat()` surface used by `summarize`, [`classify_stream_error`] for the
@@ -10,7 +10,7 @@
 //! [`retry_budget`] and [`retry_delay_ms`] are what the REPL applies to
 //! whatever comes back. They live here rather than beside the loop because the
 //! policy is only meaningful against this taxonomy: which variants are
-//! retryable at all is decided by `PicocodeError::is_auto_retryable`, and the
+//! retryable at all is decided by `PriorError::is_auto_retryable`, and the
 //! budget deliberately covers every one of them.
 
 use rig_agent::agent::StreamingError;
@@ -18,12 +18,12 @@ use rig_agent::completion::{CompletionError, PromptError};
 
 /// Classify a non-streaming `PromptError` (returned from the blocking
 /// `chat()` surface used by `summarize`) into the same structured
-/// `PicocodeError` taxonomy the streaming path uses. Without this, a
+/// `PriorError` taxonomy the streaming path uses. Without this, a
 /// `/tree --summarize` 429 surfaces as the generic
-/// `PicocodeError::Other("summarize: CompletionError: HttpError: …")` and
+/// `PriorError::Other("summarize: CompletionError: HttpError: …")` and
 /// loses the Retry-After hint.
-pub(crate) fn classify_prompt_error(e: &PromptError, op: &str) -> crate::PicocodeError {
-    use crate::PicocodeError::*;
+pub(crate) fn classify_prompt_error(e: &PromptError, op: &str) -> crate::PriorError {
+    use crate::PriorError::*;
     match e {
         PromptError::CompletionError(ce) => {
             let classified = classify_completion_error(ce);
@@ -56,7 +56,7 @@ pub(crate) fn classify_prompt_error(e: &PromptError, op: &str) -> crate::Picocod
 /// same generous budget. They are all transient failures that should clear
 /// with a retry; the budget exists to cap a runaway, not to second-guess the
 /// policy. Post-MVP: expose this via `AgentConfig`.
-pub(crate) fn retry_budget(e: &crate::PicocodeError) -> u8 {
+pub(crate) fn retry_budget(e: &crate::PriorError) -> u8 {
     if e.is_auto_retryable() {
         50
     } else {
@@ -85,7 +85,7 @@ pub(crate) fn retry_budget(e: &crate::PicocodeError) -> u8 {
 /// the provider's hint, then add our exponential growth on top by treating
 /// the hint as the starting base.
 ///
-/// # `PICOCODE_TEST_RETRY_BASE_MS`
+/// # `PRIOR_TEST_RETRY_BASE_MS`
 ///
 /// The *base* of the no-hint schedule is overridable, in milliseconds, so the
 /// back-off tests in `tests/retry_backoff.rs` can exercise the growth and reset
@@ -100,7 +100,7 @@ pub(crate) fn retry_budget(e: &crate::PicocodeError) -> u8 {
 /// must respect, so it is never scaled down.
 ///
 /// Unset (or unparseable) means the production default: 1s.
-const TEST_RETRY_BASE_MS_VAR: &str = "PICOCODE_TEST_RETRY_BASE_MS";
+const TEST_RETRY_BASE_MS_VAR: &str = "PRIOR_TEST_RETRY_BASE_MS";
 
 /// The no-hint base delay, in milliseconds. See [`TEST_RETRY_BASE_MS_VAR`].
 fn retry_base_ms() -> u64 {
@@ -111,7 +111,7 @@ fn retry_base_ms() -> u64 {
     .unwrap_or(1000)
 }
 
-pub(crate) fn retry_delay_ms(e: &crate::PicocodeError, consecutive_failures: u8) -> u64 {
+pub(crate) fn retry_delay_ms(e: &crate::PriorError, consecutive_failures: u8) -> u64 {
     let n = consecutive_failures.saturating_sub(1).min(63) as u32;
     // Provider hint floors the delay. If present, we use it as the base of
     // the exponential schedule: attempt 1 = `hint`, attempt 2 = `hint*2`,
@@ -129,7 +129,7 @@ pub(crate) fn retry_delay_ms(e: &crate::PicocodeError, consecutive_failures: u8)
     retry_base_ms().saturating_mul(1u64 << n)
 }
 
-/// Classify a `StreamingError` into a structured `PicocodeError` variant.
+/// Classify a `StreamingError` into a structured `PriorError` variant.
 /// `prompt()` invokes this on every non-cancellation stream error. The
 /// return is what the REPL shows the user, what determines whether the
 /// REPL auto-retries, and (for malformed tool calls) the synthetic
@@ -137,13 +137,13 @@ pub(crate) fn retry_delay_ms(e: &crate::PicocodeError, consecutive_failures: u8)
 /// from the `provider_response_*` accessors on `CompletionError` (rig
 /// `error.rs` `forward_provider_response_helpers!`); unknown
 /// `ResponseError(String)` shapes fall through to `LlmStreamProtocol`.
-pub(crate) fn classify_stream_error(e: &StreamingError) -> crate::PicocodeError {
+pub(crate) fn classify_stream_error(e: &StreamingError) -> crate::PriorError {
     let ce: &CompletionError = match e {
         StreamingError::Completion(ce) => ce,
         StreamingError::Prompt(prompt_err) => match prompt_err.as_ref() {
             PromptError::CompletionError(ce) => ce,
             PromptError::MaxTurnsError { max_turns, .. } => {
-                return crate::PicocodeError::LlmMaxTurns {
+                return crate::PriorError::LlmMaxTurns {
                     max_turns: *max_turns,
                 };
             }
@@ -152,14 +152,14 @@ pub(crate) fn classify_stream_error(e: &StreamingError) -> crate::PicocodeError 
                 available_tools,
                 ..
             } => {
-                return crate::PicocodeError::LlmUnknownTool {
+                return crate::PriorError::LlmUnknownTool {
                     tool_name: tool_name.clone(),
                     available: available_tools.clone(),
                 };
             }
             // PromptCancelled is handled by the caller before this fn runs.
             PromptError::PromptCancelled { .. } | PromptError::MemoryError(_) => {
-                return crate::PicocodeError::Other(e.to_string());
+                return crate::PriorError::Other(e.to_string());
             }
         },
     };
@@ -287,13 +287,13 @@ fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Classify a `CompletionError` into a structured `PicocodeError`.
+/// Classify a `CompletionError` into a structured `PriorError`.
 ///
 /// Exposed for unit tests; `classify_stream_error` is the production
 /// entry point and unwraps both `StreamingError` variants before
 /// delegating here.
-pub(crate) fn classify_completion_error(ce: &CompletionError) -> crate::PicocodeError {
-    use crate::PicocodeError::*;
+pub(crate) fn classify_completion_error(ce: &CompletionError) -> crate::PriorError {
+    use crate::PriorError::*;
     if let Some(status) = ce.provider_response_status() {
         let code = status.as_u16();
         // A 2xx "success" status cannot signal failure on its own: some
@@ -365,8 +365,8 @@ pub(crate) fn classify_completion_error(ce: &CompletionError) -> crate::Picocode
 /// JSON envelope; without this detection it falls through to
 /// `LlmStreamProtocol` / `Other`, which misclassifies a rate-limit and is
 /// not respected by the `Retry-After` floor.
-fn detect_response_error(msg: &str) -> Option<crate::PicocodeError> {
-    use crate::PicocodeError::*;
+fn detect_response_error(msg: &str) -> Option<crate::PriorError> {
+    use crate::PriorError::*;
     // "tool call `X` arrived with malformed JSON input: <serde error>"
     if let Some(rest) = msg.strip_prefix("tool call `") {
         if let Some((name, after)) = rest.split_once('`') {
@@ -427,14 +427,14 @@ fn extract_openrouter_error_code(body: &str) -> Option<u16> {
 mod tests {
     use super::*;
 
-    use crate::PicocodeError;
+    use crate::PriorError;
     use rig_core::message::Message;
     use serial_test::serial;
     // ---- Error classification tests ----
     //
     // The auto-retry / error-formatting pipeline in `run_interactive`
     // depends on `classify_stream_error` producing a structured
-    // `PicocodeError` whose Display string is short, whose
+    // `PriorError` whose Display string is short, whose
     // `is_auto_retryable` / `retry_after_secs` / `synthetic_retry_feedback`
     // accessors agree, and which preserves the upstream
     // provider's `Retry-After` on 429. These tests pin that contract
@@ -464,7 +464,7 @@ mod tests {
     );
         let classified = super::classify_completion_error(&err);
         match classified {
-            PicocodeError::LlmMalformedToolCall {
+            PriorError::LlmMalformedToolCall {
                 ref tool_name,
                 ref parse_error,
             } => {
@@ -496,7 +496,7 @@ mod tests {
         );
         let classified = super::classify_completion_error(&err);
         match classified {
-            PicocodeError::LlmMalformedToolCall {
+            PriorError::LlmMalformedToolCall {
                 ref tool_name,
                 ref parse_error,
             } => {
@@ -543,7 +543,7 @@ mod tests {
         // available tools so the user can correct the model.
         assert!(!classified.is_auto_retryable());
         // Recovery feedback lives in the rig hook, not in
-        // `PicocodeError` — confirm so a future refactor doesn't drift.
+        // `PriorError` — confirm so a future refactor doesn't drift.
         assert!(classified.synthetic_retry_feedback().is_none());
         assert_eq!(classified.retry_after_secs(), None);
         let s = format!("{classified}");
@@ -557,8 +557,8 @@ mod tests {
     // (e.g. `invalid_tool_call_hook_can_repair_streaming_tool_name` in
     // `rig-agent/src/agent/prompt_request/streaming.rs`). The compile
     // time check that `LoggingHook` implements `on_invalid_tool_call`
-    // and the unit test on the resulting `PicocodeError` shape above
-    // are sufficient for picocode's half of the contract.
+    // and the unit test on the resulting `PriorError` shape above
+    // are sufficient for prior's half of the contract.
 
     #[test]
     fn max_turns_error_is_not_retryable() {
@@ -580,7 +580,7 @@ mod tests {
         // LlmStreamProtocol.
         let err = CompletionError::ResponseError("unexpected EOF mid-stream".into());
         let classified = super::classify_completion_error(&err);
-        assert!(matches!(classified, PicocodeError::LlmStreamProtocol(_)));
+        assert!(matches!(classified, PriorError::LlmStreamProtocol(_)));
     }
 
     #[test]
@@ -599,7 +599,7 @@ mod tests {
         );
         let classified = super::classify_completion_error(&ce);
         match classified {
-            PicocodeError::LlmRateLimited {
+            PriorError::LlmRateLimited {
                 ref retry_after_secs,
             } => {
                 assert_eq!(retry_after_secs, &Some(60));
@@ -629,7 +629,7 @@ mod tests {
         let pe = PromptError::CompletionError(ce);
         let classified = super::classify_prompt_error(&pe, "summarize");
         match classified {
-            PicocodeError::LlmRateLimited { retry_after_secs } => {
+            PriorError::LlmRateLimited { retry_after_secs } => {
                 assert_eq!(retry_after_secs, Some(30));
                 assert!(classified.is_auto_retryable());
             }
@@ -644,34 +644,34 @@ mod tests {
         // calls. The budget exists to cap a runaway, not to second-guess
         // the policy per class. Non-retryable classes get 0 (no retries).
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmRateLimited {
+            super::retry_budget(&PriorError::LlmRateLimited {
                 retry_after_secs: None
             }),
             50
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmRateLimited {
+            super::retry_budget(&PriorError::LlmRateLimited {
                 retry_after_secs: Some(60)
             }),
             50
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmUpstream {
+            super::retry_budget(&PriorError::LlmUpstream {
                 status: 502,
                 detail: Default::default(),
             }),
             50
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmTransport("reset".into())),
+            super::retry_budget(&PriorError::LlmTransport("reset".into())),
             50
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmStreamProtocol("eof".into())),
+            super::retry_budget(&PriorError::LlmStreamProtocol("eof".into())),
             50
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmMalformedToolCall {
+            super::retry_budget(&PriorError::LlmMalformedToolCall {
                 tool_name: "edit".into(),
                 parse_error: "expected `,` or `}`".into(),
             }),
@@ -679,42 +679,42 @@ mod tests {
         );
         // Non-retryable: 0 retries.
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmAuth { status: 401 }),
+            super::retry_budget(&PriorError::LlmAuth { status: 401 }),
             0
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmBilling { status: 402 }),
+            super::retry_budget(&PriorError::LlmBilling { status: 402 }),
             0
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmClient {
+            super::retry_budget(&PriorError::LlmClient {
                 status: 400,
                 detail: Default::default(),
             }),
             0
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmMaxTurns { max_turns: 16 }),
+            super::retry_budget(&PriorError::LlmMaxTurns { max_turns: 16 }),
             0
         );
         // LlmInterrupted delegates to its cause.
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmInterrupted {
-                cause: Box::new(PicocodeError::LlmRateLimited {
+            super::retry_budget(&PriorError::LlmInterrupted {
+                cause: Box::new(PriorError::LlmRateLimited {
                     retry_after_secs: None
                 }),
             }),
             50
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmInterrupted {
-                cause: Box::new(PicocodeError::LlmTransport("reset".into())),
+            super::retry_budget(&PriorError::LlmInterrupted {
+                cause: Box::new(PriorError::LlmTransport("reset".into())),
             }),
             50
         );
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmInterrupted {
-                cause: Box::new(PicocodeError::LlmAuth { status: 403 }),
+            super::retry_budget(&PriorError::LlmInterrupted {
+                cause: Box::new(PriorError::LlmAuth { status: 403 }),
             }),
             0
         );
@@ -731,7 +731,7 @@ mod tests {
         // attempt=1 → 1s, 2 → 2s, 3 → 4s, … (delay is `1 << (n-1)` seconds).
         // Milliseconds: production's 1000ms base, so these are the same
         // schedule as the old whole-second numbers.
-        let e = PicocodeError::LlmTransport("reset".into());
+        let e = PriorError::LlmTransport("reset".into());
         assert_eq!(super::retry_delay_ms(&e, 1), 1000);
         assert_eq!(super::retry_delay_ms(&e, 2), 2000);
         assert_eq!(super::retry_delay_ms(&e, 3), 4000);
@@ -752,8 +752,8 @@ mod tests {
     #[test]
     #[serial]
     fn retry_base_override_scales_the_no_hint_schedule_only() {
-        let no_hint = crate::PicocodeError::LlmTransport("reset".into());
-        let hinted = crate::PicocodeError::LlmRateLimited {
+        let no_hint = crate::PriorError::LlmTransport("reset".into());
+        let hinted = crate::PriorError::LlmRateLimited {
             retry_after_secs: Some(4),
         };
 
@@ -796,7 +796,7 @@ mod tests {
         // first attempt; subsequent attempts double from there. This
         // respects upstream's request while still growing on a string of
         // consecutive 429s.
-        let e = PicocodeError::LlmRateLimited {
+        let e = PriorError::LlmRateLimited {
             retry_after_secs: Some(5),
         };
         assert_eq!(super::retry_delay_ms(&e, 1), 5000);
@@ -805,7 +805,7 @@ mod tests {
         assert_eq!(super::retry_delay_ms(&e, 4), 40_000);
     }
 
-    // `#[serial]`: reads the process-global `PICOCODE_TEST_RETRY_BASE_MS`, which
+    // `#[serial]`: reads the process-global `PRIOR_TEST_RETRY_BASE_MS`, which
     // `retry_base_override_scales_the_no_hint_schedule_only` sets and removes
     // around each of its calls. Overlapping them makes that test see this one's
     // 20ms base and fail on the expected 1s.
@@ -815,7 +815,7 @@ mod tests {
         // Malformed tool calls carry no provider hint (the model is the
         // source of the error), so the first delay is 1s — fast feedback
         // for self-correction. Subsequent attempts double.
-        let e = PicocodeError::LlmMalformedToolCall {
+        let e = PriorError::LlmMalformedToolCall {
             tool_name: "edit".into(),
             parse_error: "expected `,` or `}`".into(),
         };
@@ -839,7 +839,7 @@ mod tests {
         ));
         let classified = super::classify_completion_error(&ce);
         match classified {
-            PicocodeError::LlmUpstream { status, .. } => {
+            PriorError::LlmUpstream { status, .. } => {
                 assert_eq!(status, 502);
                 assert!(classified.is_auto_retryable());
                 assert_eq!(classified.retry_after_secs(), None);
@@ -864,7 +864,7 @@ mod tests {
         let ce = CompletionError::HttpError(http_err);
         let classified = super::classify_completion_error(&ce);
         match classified {
-            PicocodeError::LlmTransport(ref msg) => {
+            PriorError::LlmTransport(ref msg) => {
                 assert!(msg.contains("openrouter.ai"), "msg: {msg}");
                 assert!(classified.is_auto_retryable());
             }
@@ -885,7 +885,7 @@ mod tests {
         let err = CompletionError::ResponseError(envelope.to_string());
         let classified = super::classify_completion_error(&err);
         match classified {
-            PicocodeError::LlmRateLimited { retry_after_secs } => {
+            PriorError::LlmRateLimited { retry_after_secs } => {
                 assert_eq!(retry_after_secs, None);
                 assert!(classified.is_auto_retryable());
             }
@@ -901,7 +901,7 @@ mod tests {
         let err = CompletionError::ResponseError(envelope.to_string());
         let classified = super::classify_completion_error(&err);
         match classified {
-            PicocodeError::LlmUpstream { status, .. } => {
+            PriorError::LlmUpstream { status, .. } => {
                 assert_eq!(status, 502);
                 assert!(classified.is_auto_retryable());
             }
@@ -931,7 +931,7 @@ mod tests {
         assert_eq!(ce.provider_response_status(), None);
         let classified = super::classify_completion_error(&ce);
         match classified {
-            PicocodeError::LlmRateLimited { retry_after_secs } => {
+            PriorError::LlmRateLimited { retry_after_secs } => {
                 assert_eq!(retry_after_secs, None);
                 assert!(classified.is_auto_retryable());
             }
@@ -955,7 +955,7 @@ mod tests {
         ));
         let classified = super::classify_completion_error(&ce);
         match classified {
-            PicocodeError::LlmUpstream { status, .. } => {
+            PriorError::LlmUpstream { status, .. } => {
                 assert_eq!(status, 502);
                 assert!(classified.is_auto_retryable());
             }
@@ -975,7 +975,7 @@ mod tests {
         ));
         let classified = super::classify_completion_error(&ce);
         assert!(
-            matches!(classified, PicocodeError::Other(_)),
+            matches!(classified, PriorError::Other(_)),
             "expected Other, got {classified:?}"
         );
         assert!(!classified.is_auto_retryable());
@@ -989,7 +989,7 @@ mod tests {
         let envelope = r#"{"id":"x","error":"invalid_argument"}"#;
         let err = CompletionError::ResponseError(envelope.to_string());
         let classified = super::classify_completion_error(&err);
-        assert!(matches!(classified, PicocodeError::LlmStreamProtocol(_)));
+        assert!(matches!(classified, PriorError::LlmStreamProtocol(_)));
     }
 
     #[test]
@@ -1005,7 +1005,7 @@ mod tests {
         let classified = super::classify_completion_error(&err);
         assert!(matches!(
             classified,
-            PicocodeError::LlmMalformedToolCall { .. }
+            PriorError::LlmMalformedToolCall { .. }
         ));
     }
 
@@ -1102,7 +1102,7 @@ mod tests {
     /// dangling separator.
     #[test]
     fn the_detail_is_rendered_as_a_suffix() {
-        let with = PicocodeError::LlmClient {
+        let with = PriorError::LlmClient {
             status: 400,
             detail: crate::ErrorDetail(Some("temperature must be <= 1.0".into())),
         };
@@ -1110,7 +1110,7 @@ mod tests {
             with.to_string(),
             "Provider rejected the request (HTTP 400); temperature must be <= 1.0."
         );
-        let without = PicocodeError::LlmClient {
+        let without = PriorError::LlmClient {
             status: 400,
             detail: Default::default(),
         };

@@ -51,7 +51,7 @@ compaction needs three things today:
    sends identical leading bytes (cache hit).
 3. **The "leaf is a compaction" guard blocks legitimate re-compaction.**
    Pi refuses only when the dropped span is empty (`compaction.ts:688`),
-   not when the leaf is a compaction. Picocode should match.
+   not when the leaf is a compaction. Prior should match.
 
 ## Design summary
 
@@ -64,7 +64,7 @@ latest compaction's `summary` still appears as the first
 
 This **diverges from pi**, which would emit each older compaction's
 summary as its own `compactionSummary` user message. Pi users loading a
-picocode-iterated session will see the older compaction summaries re-emit
+prior-iterated session will see the older compaction summaries re-emit
 at their path positions — the same noise pi itself produces for its own
 nested-compaction sessions.
 
@@ -140,7 +140,7 @@ still writes no summary.
 
 ## Cross-tool fidelity
 
-When a picocode-iterated session is loaded by pi:
+When a prior-iterated session is loaded by pi:
 
 - The latest compaction entry has standard pi shape (no schema change).
   Pi's `buildContextEntries` (`session-manager.ts:414‑449`) emits its

@@ -6,7 +6,7 @@
 //! against a stale read silently eats uncommitted work. So this crate never
 //! writes. It runs the script in memory, diffs the result against the file, and
 //! emits the diff as `@@@OLD`/`@@@NEW`/`@@@END` blocks with a `path:LINE` header
-//! on each one — the exact format picocode's `edit` tool consumes. The model
+//! on each one — the exact format prior's `edit` tool consumes. The model
 //! reviews the blocks, then hands them to `edit`.
 //!
 //! Layers of safety, each sufficient on its own (see `doc/bsed.md`):
@@ -18,7 +18,7 @@
 //! 2. **Process boundary** — the `bsed` binary is a separate process, so even a
 //!    library-level surprise (a `q` calling `std::process::exit`, a panic in a
 //!    pathological regex) cannot take the agent down with it.
-//! 3. **Read-only sandbox** — picocode runs `bsed preview` inside the same
+//! 3. **Read-only sandbox** — prior runs `bsed preview` inside the same
 //!    Bubblewrap namespace it uses for `rg`, so nothing here can write to the
 //!    workspace even in principle.
 //!

@@ -90,7 +90,7 @@ fn edit_in_editor(current: &str, mode: EditorMode) -> io::Result<String> {
 
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let mut path = PathBuf::from(tmpdir);
-    path.push(format!("picocode_prompt_{}", std::process::id()));
+    path.push(format!("prior_prompt_{}", std::process::id()));
 
     // Write current content. 0600 keeps other users from reading the prompt
     // mid-edit; View uses 0400 so the editor sees a file it cannot save.

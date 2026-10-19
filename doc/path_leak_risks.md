@@ -1,12 +1,12 @@
 # Host-path leak risks
 
-*Scope: which of picocode's two path spaces may be shown to the model. Pairs
+*Scope: which of prior's two path spaces may be shown to the model. Pairs
 with `doc/tool_error_handling.md`, which covers how tool errors are classified
 and displayed.*
 
 ## The two path spaces
 
-A path in picocode exists in two forms, and which one is correct depends on
+A path in prior exists in two forms, and which one is correct depends on
 **who performs the I/O** — the process boundary, not the tool:
 
 - **host**
@@ -97,7 +97,7 @@ Order of operations:
 
 1. Split `on_tool_result`: operator gets the full diagnostic, model gets
    `model_output`. Wire a real sink for `operator_message()`.
-2. Pass through messages picocode constructs (they are clean under the rule
+2. Pass through messages prior constructs (they are clean under the rule
    above); keep redacting strings from sources we cannot vouch for.
 3. Add the guard test: under a remapping policy, trigger each constructable
    error and assert the model-visible text contains no host-path token.

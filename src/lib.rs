@@ -86,7 +86,7 @@ impl std::fmt::Display for ErrorDetail {
 }
 
 #[derive(Error, Debug)]
-pub enum PicocodeError {
+pub enum PriorError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -231,7 +231,7 @@ pub enum PicocodeError {
     #[error("{}", .cause)]
     LlmInterrupted {
         /// The underlying classified error.
-        cause: Box<PicocodeError>,
+        cause: Box<PriorError>,
     },
 
     #[error("Missing API key for provider {0}. Please set the {1} environment variable.")]
@@ -250,7 +250,7 @@ pub enum PicocodeError {
     Cancelled(String),
 }
 
-impl PicocodeError {
+impl PriorError {
     /// Whether the REPL should automatically re-prompt once for this error.
     ///
     /// True for transient failures (rate-limit, transport, upstream 5xx,
@@ -261,14 +261,14 @@ impl PicocodeError {
     /// loop forever if the underlying problem is persistent.
     pub fn is_auto_retryable(&self) -> bool {
         match self {
-            PicocodeError::LlmInterrupted { cause } => cause.is_auto_retryable(),
+            PriorError::LlmInterrupted { cause } => cause.is_auto_retryable(),
             _ => matches!(
                 self,
-                PicocodeError::LlmRateLimited { .. }
-                    | PicocodeError::LlmUpstream { .. }
-                    | PicocodeError::LlmTransport(_)
-                    | PicocodeError::LlmStreamProtocol(_)
-                    | PicocodeError::LlmMalformedToolCall { .. }
+                PriorError::LlmRateLimited { .. }
+                    | PriorError::LlmUpstream { .. }
+                    | PriorError::LlmTransport(_)
+                    | PriorError::LlmStreamProtocol(_)
+                    | PriorError::LlmMalformedToolCall { .. }
             ),
         }
     }
@@ -278,8 +278,8 @@ impl PicocodeError {
     /// [`LlmInterrupted`](Self::LlmInterrupted) to the wrapped cause.
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
-            PicocodeError::LlmRateLimited { retry_after_secs } => *retry_after_secs,
-            PicocodeError::LlmInterrupted { cause } => cause.retry_after_secs(),
+            PriorError::LlmRateLimited { retry_after_secs } => *retry_after_secs,
+            PriorError::LlmInterrupted { cause } => cause.retry_after_secs(),
             _ => None,
         }
     }
@@ -299,8 +299,8 @@ impl PicocodeError {
     /// next prompt and letting the model retry.
     pub fn synthetic_retry_feedback(&self) -> Option<String> {
         match self {
-            PicocodeError::LlmInterrupted { cause } => cause.synthetic_retry_feedback(),
-            PicocodeError::LlmMalformedToolCall {
+            PriorError::LlmInterrupted { cause } => cause.synthetic_retry_feedback(),
+            PriorError::LlmMalformedToolCall {
                 tool_name,
                 parse_error,
             } => Some(format!(
@@ -314,7 +314,7 @@ impl PicocodeError {
     }
 }
 
-pub type Result<T> = std::result::Result<T, PicocodeError>;
+pub type Result<T> = std::result::Result<T, PriorError>;
 
 /// Write-back callback for a menu node: takes the value the user selected and
 /// commits it, `Ok(())` on success and an `Err` message to show on failure.

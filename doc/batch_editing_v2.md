@@ -360,7 +360,7 @@ canonical shape are untouched.
 
 The goal is to keep the custom parser **out of `output.rs`** and, more broadly, to establish a
 single **canonical internal form** (the pi array) that persist and render share. Normalize the args
-at each boundary where they enter picocode's internal representation, so every downstream consumer
+at each boundary where they enter prior's internal representation, so every downstream consumer
 (`get_preview`, `render_turn`, the session file) sees the same shape. (The **model-facing** form is
 a separate, deliberate divergence — the blob — handled in *What the model sees* below.)
 
@@ -389,9 +389,9 @@ at three call sites — **one shared `normalize_edit_args` fn**, called from eac
   - **Notes**: Already exists; kept for pre-existing files.
 
 Why normalize the **message** (before `rig_message_to_pi_entries`) rather than only the in-memory
-index: **pi reads picocode's files**, so the on-disk form must already be pi-canonical. This
+index: **pi reads prior's files**, so the on-disk form must already be pi-canonical. This
 deliberately overrides the codebase's default "normalize on read, keep JSONL raw" preference
-(`storage.rs:273`) — that preference assumed picocode was the only reader. It is not: pi is a second
+(`storage.rs:273`) — that preference assumed prior was the only reader. It is not: pi is a second
 reader, so the write path must emit the canonical shape.
 
 ### What the model sees: always the blob
@@ -453,7 +453,7 @@ audit trail is wanted. This is the accepted cost of pi-compat.
 pi's canonical `edit` call is `{path, edits:[{oldText,newText}]}` — an *array* of
 `oldText`/`newText` entries (multi-entry), under a **single** `path`
 (`packages/coding-agent/src/core/tools/edit.ts`; there is no per-edit `path`, and
-`applyEditsToNormalizedContent` writes one file per call). picocode's canonical in-memory form
+`applyEditsToNormalizedContent` writes one file per call). prior's canonical in-memory form
 already matches this (`normalize_args_in_place` folds legacy `old`/`new` into the array). So "pi
 compatibility" here means one concrete thing: **every model form (the new Aider text blob, the
 legacy array, or a legacy `old`/`new`) must be written to disk as that array**, or pi cannot read
@@ -827,7 +827,7 @@ number.
 ### Types
 
 Everything new lives in `blockedit` (pure, testable, shared with `bsed`); the `Message`-level split
-lives in picocode because `blockedit` has no rig types.
+lives in prior because `blockedit` has no rig types.
 
 ```rust
 // blob.rs — the path policy for splitting
@@ -1436,7 +1436,7 @@ blobification (`agent`). Full suite green.
   sentence moved into `BLOCK_SYNTAX` / `BLOCK_POLICY` consts, interpolated into both the description
   and the parameter, so the two copies that were drifting can no longer. A test asserts no
   advertised property is an array. The `sed` prompt's "pass them as its `edits` argument" now says
-  `blocks`, in picocode and in `bsed`'s banner.
+  `blocks`, in prior and in `bsed`'s banner.
 - `output.rs`: `get_preview` canonicalizes, and takes `path` from the canonical value. This retires
   the bogus `edit b.rs [1]` label.
 - Tests: the array-on-wire test became `an_edits_array_is_rejected_and_writes_nothing` (it now
@@ -1708,7 +1708,7 @@ carries the disjointness bug fix (the probe's `"hiorld"` corruption is now a lou
 
 ### Suggested order — completed
 
-1. ✅ **3 + 2** (implemented in [`f05d078`](https://github.com/gwicke/picocode/commit/f05d078)) —
+1. ✅ **3 + 2** (implemented in [`f05d078`](https://github.com/gwicke/prior/commit/f05d078)) —
    the skew rule and claim-based resolver are live; 653 tests pass.
 2. **1** — multi-file: the gate is still unmeasured (no session corpus was reachable to run the
    grep), with the design and the work breakdown done (W1–W8, *Phase 2*). **W1 has landed** — the

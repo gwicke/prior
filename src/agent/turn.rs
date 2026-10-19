@@ -518,7 +518,7 @@ impl CodeAgent {
                             // on *progress*, not on persistence, so the
                             // back-off resets even without a session.
                             if retryable && made_progress {
-                                return Err(crate::PicocodeError::LlmInterrupted {
+                                return Err(crate::PriorError::LlmInterrupted {
                                     cause: Box::new(classified),
                                 });
                             }
@@ -693,7 +693,7 @@ impl CodeAgent {
         }
 
         if aborted {
-            return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+            return Err(crate::PriorError::Cancelled("Aborted.".into()));
         }
 
         Ok(output)

@@ -1,13 +1,13 @@
 <div align="center">
-  <img src="picocode.gif" width="600"/>
+  <img src="prior.gif" width="600"/>
   <br/>
   <br/>
-  <h1>⚡️ picocode</h1>
+  <h1>⚡️ prior</h1>
   <p><b>The tiny coding agent that speaks every LLM.</b></p>
   <br/>
 </div>
 
-**picocode** is a minimal, high-performance Rust-based coding agent. It's a small, robust tool designed for developers who want a lightweight assistant that is easy to reason about, safe to use, and highly hackable.
+**prior** is a minimal, high-performance Rust-based coding agent. It's a small, robust tool designed for developers who want a lightweight assistant that is easy to reason about, safe to use, and highly hackable.
 
 ## 🚀 Quick Start
 
@@ -15,7 +15,7 @@ Get up and running in seconds:
 
 ```bash
 # 1. Install
-curl -sSfL https://raw.githubusercontent.com/jondot/picocode/main/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/jondot/prior/main/install.sh | sh
 
 # 2. Set your API Key (pick your provider)
 export ANTHROPIC_API_KEY=your_key_here # For Claude
@@ -27,14 +27,14 @@ export GOOGLE_API_KEY=your_key_here    # For Gemini
 export DEEPSEEK_API_KEY=your_key_here  # For DeepSeek
 
 # 3. Start coding
-picocode "Analyze this project and suggest improvements"
+prior "Analyze this project and suggest improvements"
 ```
 
-Or, download directly from [releases](https://github.com/jondot/picocode/releases)
+Or, download directly from [releases](https://github.com/jondot/prior/releases)
 
 ---
 
-## 🦀 Why picocode?
+## 🦀 Why prior?
 
 - **Tiny & Fast**: A single, compact binary written in Rust. No heavy dependencies, no bloat.
 - **Multi-LLM Sovereignty**: Works with Anthropic, OpenAI, DeepSeek, Google (Gemini), Ollama, and many more via [Rig](https://github.com/0xPlayground/rig).
@@ -45,7 +45,7 @@ Or, download directly from [releases](https://github.com/jondot/picocode/release
 
 ## 🎭 The Persona Gallery
 
-Picocode isn't just a tool; it has character. Use `--persona` to change the agent's expertise and "vibe":
+Prior isn't just a tool; it has character. Use `--persona` to change the agent's expertise and "vibe":
 
 | Persona      | Description                           | "Voice"                                                        |
 | :----------- | :------------------------------------ | :------------------------------------------------------------- |
@@ -68,7 +68,7 @@ Picocode isn't just a tool; it has character. Use `--persona` to change the agen
 
 ## ⚙️ Recipes & Automation
 
-Picocode supports named **Recipes** in a `settings.toml` config file for non-interactive execution (CI/CD, automation).
+Prior supports named **Recipes** in a `settings.toml` config file for non-interactive execution (CI/CD, automation).
 
 ```toml
 # settings.toml
@@ -85,18 +85,18 @@ persona = "security"
 Run it with:
 
 ```bash
-picocode recipe review-security
+prior recipe review-security
 ```
 
 ## ⚙️ CLI Modes & Flags
 
-Picocode is designed to be flexible, whether you're using it for a quick question or a complex automation task.
+Prior is designed to be flexible, whether you're using it for a quick question or a complex automation task.
 
 ### Main Commands
 
-- **Interactive Chat**: `picocode` or `picocode chat` (Default)
-- **Single Prompt**: `picocode "your prompt"` or `picocode input "your prompt"`
-- **Recipes**: `picocode recipe <name>` (Runs a pre-defined task from the config file)
+- **Interactive Chat**: `prior` or `prior chat` (Default)
+- **Single Prompt**: `prior "your prompt"` or `prior input "your prompt"`
+- **Recipes**: `prior recipe <name>` (Runs a pre-defined task from the config file)
 
 ### Common Flags
 
@@ -110,7 +110,7 @@ Picocode is designed to be flexible, whether you're using it for a quick questio
 
 ## 🛠 Available Tools
 
-Picocode gives the AI a comprehensive set of tools to interact with your environment:
+Prior gives the AI a comprehensive set of tools to interact with your environment:
 
 - **Filesystem**: `read_file`, `write_file`, `edit_file` (atomic search-replace), `list_dir`, `make_dir`, `remove`, `move_file`, `copy_file`.
 - **Search**: `grep_text` (regex search), `glob_files` (find files by pattern).
@@ -141,13 +141,13 @@ ro = []
 
 - **Deny-by-default filesystem**: when either `rw`/`ro` list is set, only the listed bindings are visible (plus read-only `/usr`, `/bin`, `/lib`, `/lib64`, `/etc` so tools can execute). The non-shell file tools (`read_file`, `write_file`, `edit_file`, `glob_files`, `grep_text`, `list_dir`, `make_dir`, `remove`, `move_file`, `copy_file`) enforce the **same** policy, so a remap like `/tmp` is seen identically by the shell and by the file tools. Writes require an `rw` binding; paths outside all bindings are denied.
 - `bwrap` is required at startup; if it is missing the process fails closed. There is no unsandboxed fallback — a command is never run outside the sandbox, and a disabled/unset sandbox config causes the command to be refused rather than executed by a plain shell.
-- This is defense-in-depth for an LLM-driven shell, not a jail against root — run picocode as an unprivileged user.
+- This is defense-in-depth for an LLM-driven shell, not a jail against root — run prior as an unprivileged user.
 
 See `doc/sandbox.md` for the full design.
 
-## 🛠 Hacking on picocode
+## 🛠 Hacking on prior
 
-Picocode is built with Rust and the [Rig](https://github.com/0xPlayground/rig) library. It's designed to be extremely easy to extend.
+Prior is built with Rust and the [Rig](https://github.com/0xPlayground/rig) library. It's designed to be extremely easy to extend.
 
 ### Prerequisites
 
@@ -158,8 +158,8 @@ Picocode is built with Rust and the [Rig](https://github.com/0xPlayground/rig) l
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/jondot/picocode.git
-cd picocode
+git clone https://github.com/jondot/prior.git
+cd prior
 
 # 2. Build and run
 cargo run -- "Analyze src/main.rs"
@@ -180,17 +180,17 @@ cargo run -- "Analyze src/main.rs"
 
 ## 📚 Use as a Library
 
-Picocode is structured as a library (`lib.rs`) and a binary (`main.rs`).
+Prior is structured as a library (`lib.rs`) and a binary (`main.rs`).
 
 Example usage:
 
 ```rust
-use picocode::{create_agent, AgentConfig, ConsoleOutput};
+use prior::{create_agent, AgentConfig, ConsoleOutput};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let output = Arc::new(ConsoleOutput::new(picocode::settings::default_show_reasoning_handle()));
+    let output = Arc::new(ConsoleOutput::new(prior::settings::default_show_reasoning_handle()));
 
     let agent = create_agent(AgentConfig {
         provider: "anthropic".into(),
@@ -205,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agent_prompt: None,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sandbox: None,
-        show_reasoning_handle: picocode::settings::default_show_reasoning_handle(),
+        show_reasoning_handle: prior::settings::default_show_reasoning_handle(),
     }).await?;
 
     let response = agent.run_once("Analyze the current project".into()).await?;

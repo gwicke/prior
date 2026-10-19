@@ -858,7 +858,7 @@ mod tests {
         }
 
         // Nonexistent host → stay-open error.
-        let (pa, _) = mk("ro", " /nonexistent-picocode-xyz-123");
+        let (pa, _) = mk("ro", " /nonexistent-prior-xyz-123");
         match futures::executor::block_on(node.submit(1, &pa)) {
             SubmitResult::Error(msg) => assert!(msg.contains("does not exist"), "{msg}"),
             _other => panic!("expected Error for missing host"),

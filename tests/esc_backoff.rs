@@ -235,19 +235,19 @@ fn esc_cuts_retry_backoff_and_keys_dispatch_during_it() {
         })
         .expect("open pty");
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     cmd.args(["-p", "llamacpp", "-m", "test", "--yolo", "true"]);
     // Keep the test off the developer's real config (and its sessions).
     let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
     cmd.env("LLAMACPP_API_BASE_URL", llm.base_url());
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn prior");
 
     let reader = pair.master.try_clone_reader().expect("clone reader");
     let (bytes, _stop) = spawn_reader(reader);
     let mut writer = pair.master.take_writer().expect("take writer");
 
-    let started = wait_for(&bytes, "picocode -", Duration::from_secs(10));
+    let started = wait_for(&bytes, "prior -", Duration::from_secs(10));
     assert!(started, "banner never appeared:\n{}", tail(&bytes));
     // Answer the DSR cursor-position query, same handshake as mock_turn.
     let _ = writer.write_all(format!("\x1b[{ROWS};1R").as_bytes());

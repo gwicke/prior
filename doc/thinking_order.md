@@ -50,7 +50,7 @@ only place reasoning is moved *before* text is `canonical_choice` /
 **only for the persisted turn history**, never for what the consumer renders. So
 display order == provider chunk order.
 
-### 2.3 picocode renders thinking inline, in stream order
+### 2.3 prior renders thinking inline, in stream order
 
 `src/output.rs` renders thinking (`stream_thinking`) and answer text
 (`stream_text`) immediately to stdout. `src/agent.rs` forwards `ReasoningDelta`
@@ -82,7 +82,7 @@ all — a different symptom (missing, not misordered).
 
 ## 3. Fix
 
-Implemented **entirely client-side in picocode** — no rig fork change required.
+Implemented **entirely client-side in prior** — no rig fork change required.
 
 ### 3.1 Design
 

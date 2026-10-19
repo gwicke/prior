@@ -6,7 +6,7 @@ checkout (`gwicke/rig` rev `1c2f4405`, `rig-agent`/`rig-run`/`rig-core` 0.42)
 `src/lib.rs` / `src/output.rs` at the time of writing and drift; anchors are
 named functions.*
 
-This document is the design for how picocode handles failures that
+This document is the design for how prior handles failures that
 interrupt an agent turn, and how it retries them without losing progress. It
 replaces the earlier "tool error handling" content: the *tool-execution* error
 story is settled and summarized here for reference, while the mid-turn
@@ -18,13 +18,13 @@ implementation in `src/agent.rs` / `src/lib.rs`.
 1. **Tool execution errors** — a registered tool runs and fails. Rig models
    these richly (`ToolResult` / `ToolErrorKind` / `ToolExecutionError`) and
    already feeds the failure text back to the model in the same run; the model
-   sees the error and can correct. Picocode's only job here is *display* (render
+   sees the error and can correct. Prior's only job here is *display* (render
    the failure distinctly) and *name recovery* (`on_invalid_tool_call`). This
    class is **done** — see
    [Tool execution errors](#tool-execution-errors-settled).
 2. **Turn-level provider / transport errors** — the provider's HTTP response
    or SSE stream fails mid-turn: 429, 401, 5xx, network drop, malformed
-   streamed tool-call JSON. These kill the whole rig run. Picocode classifies
+   streamed tool-call JSON. These kill the whole rig run. Prior classifies
    them (`classify_stream_error`) and the REPL auto-retries — but the current
    retry **re-runs the whole turn from the session**, losing any tool work the
    turn had already completed. This class is the **open design** — see
@@ -59,18 +59,18 @@ pub enum ToolResultAction { Keep, Rewrite(ToolOutput), Stop(String) }
 
 - `ToolCall.args` is always syntactically valid JSON: rig parses the provider
   payload into `ToolFunction.arguments: serde_json::Value` and re-serializes
-  it. The `.unwrap_or(Value::String(..))` fallback in picocode's
+  it. The `.unwrap_or(Value::String(..))` fallback in prior's
   `on_tool_call` is dead display code — **kept** as a future-proofing shim,
   never changed.
 - Malformed *typed* args (wrong types/missing fields) become
   `ToolErrorKind::InvalidArgs` inside rig dispatch → failed `ToolResult` →
   model sees the error text in the same run and can correct. The model always
   learns about failed tool calls.
-- No picocode-local `ToolErrorKind` exists; rig's
+- No prior-local `ToolErrorKind` exists; rig's
   `InvalidArgs | Timeout | Cancelled | NotFound | PermissionDenied |
   RateLimited | Provider | Network | Other` is the taxonomy.
 
-### Implemented in picocode
+### Implemented in prior
 
 - **Display (Task 1).** `Output::display_tool_error(tool_name, kind, message)`
   added with a default impl → `display_error`; `ConsoleOutput` overrides it to
@@ -85,7 +85,7 @@ pub enum ToolResultAction { Keep, Rewrite(ToolOutput), Stop(String) }
   feedback)` when a model calls an unknown/disallowed tool; the streaming
   request sets `.max_invalid_tool_call_retries(1)`. The model recovers
   in-run. On budget exhaustion, `classify_stream_error` maps the terminal
-  `PromptError::UnknownToolCall` to `PicocodeError::LlmUnknownTool` (escape
+  `PromptError::UnknownToolCall` to `PriorError::LlmUnknownTool` (escape
   hatch, `is_auto_retryable() == false`).
 
 ---
@@ -156,7 +156,7 @@ retried before rig sees it) would keep rig's `AgentRun` alive and its
 - It hides policy (when to stop retrying, what to tell the user) in a layer
   that can't render or steer.
 
-### Chosen architecture: picocode-side canonical transcript + resume-by-context
+### Chosen architecture: prior-side canonical transcript + resume-by-context
 
 The session is already the context carrier — `build_context()` feeds rig's
 `.history()`, compaction and session-resume already seed context from it, and
@@ -164,7 +164,7 @@ the `on_completion_call` hook can patch the exact history a request sends
 (`RequestPatch::history`, already used for reasoning stripping). So the design
 is:
 
-**Accumulate a canonical transcript of the run in picocode as it streams;
+**Accumulate a canonical transcript of the run in prior as it streams;
 on a mid-turn failure, persist the transcript up to the last *safe* boundary;
 retry by continuing from that boundary — with a steering message — rather than
 re-sending the original input.**
@@ -173,7 +173,7 @@ This mirrors exactly what rig does internally when it resumes a run or
 continues after tool results: the next completion request is
 `history = prior (session + partial transcript)`, `prompt = steering message`.
 
-### What picocode can already observe (the accumulation primitives)
+### What prior can already observe (the accumulation primitives)
 
 Verified against the stream surface:
 
@@ -231,7 +231,7 @@ Sources:
   `pending_tool_calls`.
 
 Because hooks run inside rig's `prompt` machinery and the stream loop lives in
-picocode's `prompt()`, the accumulator is shared via `Arc<Mutex<…>>` cloned
+prior's `prompt()`, the accumulator is shared via `Arc<Mutex<…>>` cloned
 into the `LoggingHook` instance that `prompt()` itself constructs
 (`src/agent.rs`, the `stream_prompt(...).add_hook(LoggingHook { … })` site) —
 no cross-run state, no new agent fields.
@@ -633,7 +633,7 @@ taxonomy and the `Retry-After` extraction.
 - `src/session/session.rs` — new
   `Session::count_persisted_user_prompts()` used as the persistence
   source-of-truth for the retry de-dup guard, tests.
-- `src/lib.rs` — `PicocodeError` steering signal (new variant or flag) if the
+- `src/lib.rs` — `PriorError` steering signal (new variant or flag) if the
   REPL needs to distinguish "no progress" from "progress persisted";
   `AgentConfig` re-export unchanged.
 - `src/output.rs` — unchanged (display already done).

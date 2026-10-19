@@ -1,5 +1,5 @@
-use picocode::termio::TermIO;
-use picocode::{create_agent, AgentConfig, Content};
+use prior::termio::TermIO;
+use prior::{create_agent, AgentConfig, Content};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -8,7 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    it owns the size watch and caps from there.
     let content = Arc::new(Content::new(
         TermIO::plain(),
-        picocode::settings::default_show_reasoning_handle(),
+        prior::settings::default_show_reasoning_handle(),
     ));
 
     // 2. Create the agent with a simple config struct
@@ -32,14 +32,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agent_prompt: None,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
-        show_reasoning_handle: picocode::settings::default_show_reasoning_handle(),
-        reasoning_in_context: picocode::settings::ReasoningInContextMode::Never,
+        show_reasoning_handle: prior::settings::default_show_reasoning_handle(),
+        reasoning_in_context: prior::settings::ReasoningInContextMode::Never,
         message_log_path: None,
         sessions_dir: None,
     })
     .await?;
 
-    println!("--- Picocode Library Example ---");
+    println!("--- Prior Library Example ---");
     println!("Asking the agent to analyze the current directory...\n");
 
     // 3. Run a task and get the response!

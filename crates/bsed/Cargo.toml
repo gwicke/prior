@@ -11,10 +11,10 @@ workspace = true
 [dependencies]
 blockedit = { path = "../blockedit" }
 # The walker for `preview -r`: .gitignore-aware, skips hidden files, and
-# already in the tree via picocode, so this is no new download.
+# already in the tree via prior, so this is no new download.
 ignore = "0.4.25"
 # For preview -r's --glob, with the same matcher and the same semantics as
-# picocode's `find` tool, so one mental model covers both.
+# prior's `find` tool, so one mental model covers both.
 globset = "0.4.18"
 sed-rs = "2"
 similar = "2"

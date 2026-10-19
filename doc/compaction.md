@@ -6,8 +6,8 @@ D" in §3.5.6 — **shipped** as the `reasoning_in_context` setting (default
 at persist time (`maybe_strip_reasoning` in `src/agent.rs`, applied in
 `persist_turn`). The graduated "Level 1" `drop_reasoning` compaction and the
 rest of this design are **not yet implemented**. This document proposes the
-*first* compaction strategy for picocode and grounds every claim in the actual
-rig fork and picocode code.
+*first* compaction strategy for prior and grounds every claim in the actual
+rig fork and prior code.
 
 Implementation status (verified against `git` history and `src/` as of the
 latest commit, `Add /stat command about current usage etc`):
@@ -114,7 +114,7 @@ Key facts that shape the design:
   (`agent/run/streamed.rs`), which maps
   `reasoning_items -> AssistantContent::Reasoning` *before* text/tool calls.
   `final_response_from_content` (`agent/prompt_request/streaming.rs:126`) stores
-  that content on the `PromptResponse` whose `messages()` picocode clones into
+  that content on the `PromptResponse` whose `messages()` prior clones into
   `history` (`src/agent.rs:111`). So historical assistant messages **do**
   contain reasoning blocks, and Level 1 has real content to remove.
 
@@ -156,7 +156,7 @@ window. There is no `context_window()` / `max_input_tokens()` on the model. So
 we cannot ask rig "how big can the context be?" — we must own that number (see
 §1.3).
 
-### 1.3 picocode already knows the context window
+### 1.3 prior already knows the context window
 
 `model_catalog.rs` already fetches `ModelEntry::context_length: Option<u64>`
 from OpenRouter (and a curated `DIRECT_PRICING` table + live `/models` pruning).
@@ -167,11 +167,11 @@ hardcoded `detectContextWindow` table (`ultra_compaction_notes.md §3`). Caveat:
 `context_length` can be `None` for unconfigured direct providers; we need a
 fallback constant (e.g. 128_000) + a warning when it's unknown.
 
-### 1.4 Gap: picocode never captures usage today
+### 1.4 Gap: prior never captures usage today
 
 `src/agent.rs:106` matches `MultiTurnStreamItem::CompletionCall(_)` and only
 ends a UI segment — it **discards the `Usage`**. `:110-111` captures
-`resp.messages()` but not `resp.usage()`. Net: today picocode has
+`resp.messages()` but not `resp.usage()`. Net: today prior has
 **zero awareness of how big the context is**. Compaction's first prerequisite is
 to plumb usage out of `prompt()` (§2.7). This is the single most important "off"
 finding (§3a).
@@ -488,7 +488,7 @@ history to be **immutable**; compaction wants it **mutable**. This section works
 out how far we can go without touching rig, and exactly what a rig change would
 buy.
 
-### 3.5.1 What the pi research implies (and where picocode differs)
+### 3.5.1 What the pi research implies (and where prior differs)
 
 `doc/pi_context_caching.md` shows pi emits cache hints with very different
 *granularity* per backend: a single `prompt_cache_key`+`session_id` for
@@ -498,9 +498,9 @@ system / last-tool / last-message for Anthropic-direct,
 **one logical cache boundary at the end of a stable prefix** plus a
 *session/sticky* key so the provider can reuse a previous prefix computation.
 
-picocode does **not** use pi's backend map — it rides rig. The equivalent of
+prior does **not** use pi's backend map — it rides rig. The equivalent of
 pi's "stable prefix + session affinity" in rig is the Anthropic auto-breakpoint.
-But unlike pi, rig gives picocode
+But unlike pi, rig gives prior
 **no handle to pin that boundary anywhere but the end of the conversation**
 (automatic mode) or the end of the last message (manual mode). There is no
 "anchor the cache at turn N and keep everything after it volatile" primitive.
@@ -573,7 +573,7 @@ advance too). This is exactly how rolling-summary agents keep a cache-hit
   **no `cache_control`** (`completion/message.rs` — zero `cache_control`
   fields), and in manual mode `apply_prompt_cache_control` *unconditionally*
   clears all message markers and forces the breakpoint onto the last message
-  (`providers/anthropic/completion.rs:2099-2112, 2138-2171`). So picocode cannot
+  (`providers/anthropic/completion.rs:2099-2112, 2138-2171`). So prior cannot
   today create a mid-history breakpoint or prevent the auto-last-message
   breakpoint. We must either (a) change rig, or (b) bypass rig's request builder
   (heavy).
@@ -581,7 +581,7 @@ advance too). This is exactly how rolling-summary agents keep a cache-hit
     1. **Expose `cache_control` on content/message types** and make
        `apply_prompt_cache_control` *preserve* caller-set markers instead of
        wiping them (`clear_message_cache_control` → skip blocks that already
-       carry one). picocode then pins a breakpoint on `history[anchor]`'s last
+       carry one). prior then pins a breakpoint on `history[anchor]`'s last
        block. Smallest surface-area change.
     2. **Add a dedicated anchor API**, e.g.
        `CompletionModel::with_prompt_caching_anchor()` or a
@@ -620,7 +620,7 @@ than this hack.
 - **For the *optimal* "cache-hit stable prefix + freely editable tail" design:
   YES, a small, well-scoped rig change is required** (Strategy C) — either
   expose `cache_control` on message content and stop force-clearing it, or add a
-  dedicated anchor API. Without it, picocode cannot create a cache-hit region
+  dedicated anchor API. Without it, prior cannot create a cache-hit region
   that survives history edits, so the best we can do on Anthropic-direct is "pay
   one full-context write per compaction" (Strategy A).
 
@@ -689,7 +689,7 @@ churn.
   so the constraint is in force the moment thinking is on. The robust answer
   most harnesses take is "just keep thinking" — which is exactly what undercuts
   option D.
-- **No-op under the default config.** With `thinking_level = off` (the picocode
+- **No-op under the default config.** With `thinking_level = off` (the prior
   default, §3d) there is no reasoning to omit, so option D does nothing. Its
   benefit materializes *only* when thinking is enabled — i.e. exactly the regime
   where the replay constraint bites. It is "free" only when it is a no-op, and
@@ -738,7 +738,7 @@ drop-in default.
   *"reasoning is not needed after the turn."* That is the conceptual twin of
   option D, but applied **post-hoc during compaction** rather than eagerly at
   store time. So option D = "move `stripReasoningBlocks` to store-time."
-  (picocode's v1 Level 1, §2.4, is the same idea as the post-hoc variant.)
+  (prior's v1 Level 1, §2.4, is the same idea as the post-hoc variant.)
 - **Anthropic's own API replay rule** (thinking block must precede tool_use on
   replay; no thinking→non-thinking assistant transition) is the constraint that
   makes eager-omission subtle, and is the reason production harnesses that use
@@ -784,7 +784,7 @@ routes to.
     `cached_tokens`). Option D keeps the prefix reasoning-free and therefore
     stable → cache hits, no compaction-driven re-creation. So Option D still
     yields the cache-stability win here.
-  - *OpenRouter* (picocode's `with_prompt_caching` path) caches
+  - *OpenRouter* (prior's `with_prompt_caching` path) caches
     **only the system prompt** (§3e/§3.5.1); conversation history is never
     cached, so history edits (compaction) never invalidate OpenRouter's cache
     regardless. Hence for OpenRouter the cache motivation for Option D is
@@ -813,7 +813,7 @@ I'm questioning the following rather than assuming them — please steer:
    fits all models is worth challenging.
 2. **"Guarantee the next turn completes" — hard or soft?** Providers hard-error
    at the real limit regardless of our reserve. Is the reserve purely a safety
-   margin (soft, best-effort compaction), or should picocode *refuse/error* when
+   margin (soft, best-effort compaction), or should prior *refuse/error* when
    even Level 1 can't make room (hard)? Tied directly to caveat §3f.
 3. **Most-recent-turn reasoning:** keep it (Anthropic safety, §3d) or drop it
    too (max reclamation)? Default proposal: drop everywhere for v1, validate

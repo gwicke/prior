@@ -1,7 +1,7 @@
 # Phase 1 Implementation Plan — Interactive TUI Foundation
 
 This plan covers the four feature groups in `doc/requirements.md`, grounded in
-the current architecture described in `doc/picocode_rendering.md`. It is
+the current architecture described in `doc/prior_rendering.md`. It is
 organized in two parts:
 
 - **Part A — Technical Design**: the *what* and *why* (constraints,
@@ -18,7 +18,7 @@ sections**; the audit trail lives in Part B §7.
 
 ### 1. Current-state constraints (why this is a re-architecture)
 
-From `doc/picocode_rendering.md` and a read of `src/`:
+From `doc/prior_rendering.md` and a read of `src/`:
 
 - **Cooked mode only.** All input flows through `std::io::stdin().read_line()`
   (`output.rs:327`, `:72`; `QuietOutput::confirm`). No `termios`, `tcsetattr`,
@@ -144,7 +144,7 @@ loop. We replace that with a `Repl` that owns:
   runtime live fetch. pi also gates reasoning on the per-model
   `supported_parameters` flag — exactly the gating we propose.
 
-  - **Provider availability via env-var scan (prerequisite):** picocode today
+  - **Provider availability via env-var scan (prerequisite):** prior today
     requires an explicit `--provider` (flag/recipe/default `anthropic`,
     `main.rs:110`) and only *then* validates that provider's key in
     `create_agent` via `check_env!` (hard `MissingApiKey` error if absent,
@@ -201,7 +201,7 @@ loop. We replace that with a `Repl` that owns:
     `Instant`-based expiry to avoid a new dep.
 
   - **Prioritization (later phase)**: config field
-    `model_priorities: Vec<String>` in `picocode.yaml` that pins rows to the top
+    `model_priorities: Vec<String>` in `prior.yaml` that pins rows to the top
     before filtering. Defer to Phase 2 but leave the hook
     (`sort_with_priority`).
 
@@ -212,7 +212,7 @@ loop. We replace that with a `Repl` that owns:
   **Investigation of `rig` 0.28 (done):** no provider exposes a *typed*
   thinking- level request API — `anthropic` only *parses* thinking in responses;
   `openai` `reasoning_effort` exists only on the **Responses API**
-  (`with_reasoning(Reasoning{effort})`), not picocode's **Completions** path
+  (`with_reasoning(Reasoning{effort})`), not prior's **Completions** path
   (which panics on reasoning); `openrouter` surfaces `reasoning` in its request
   struct. The universal, provider-agnostic path is core
   `CompletionRequest::additional_params` (a `serde_json::Value`
@@ -559,7 +559,7 @@ Notes:
 - **Word-boundary wrap** of the input as it grows; the input box **expands**
   (multiple rows), pushing session content upward via terminal scroll.
 - History (`Up`/`Down`) over previous prompts, persisted to
-  `~/.config/picocode/history` (Phase 1 in-memory + file append).
+  `~/.config/prior/history` (Phase 1 in-memory + file append).
 
 #### 3.6 Resize redraw
 
@@ -590,8 +590,8 @@ and removes the need for any scrollback re-emit, `SU`/`SD`, or status block.
 
 ```text
 ┌─ session output (native stdout, already in scrollback) ─────────────┐
-│ picocode - /menu for details. (or type /help)   ← startup hint    │
-│ picocode | openrouter (model) | limit:50 yolo=false  ← status    │
+│ prior - /menu for details. (or type /help)   ← startup hint    │
+│ prior | openrouter (model) | limit:50 yolo=false  ← status    │
 │ ───────────────────────────────────────────────  ← startup divider│
 │ > _                                            ← input line      │
 │ ───────────────────────────────────────────────  ← under-prompt  │
@@ -656,8 +656,8 @@ prompt itself owns, so the scrollback above is structurally untouchable.
 
 **Start-up greeter content (current):**
 
-- Hint: `picocode - /menu for details. (or type /help)`
-- Status: `picocode | {provider} ({model}) | limit:{N} yolo={bool}`
+- Hint: `prior - /menu for details. (or type /help)`
+- Status: `prior | {provider} ({model}) | limit:{N} yolo={bool}`
 - *Follow-up:* the hint references `/menu`, but the slash registry defines
   `/help` (and `/model`, `/thinking`, `/quit`). Either point the hint at `/help`
   or add a `/menu` alias. (Tracked, not yet fixed.)
@@ -911,7 +911,7 @@ prompt itself owns, so the scrollback above is structurally untouchable.
   ```
 
 - [x] History `Up`/`Down` (`src/repl.rs::History`): in-memory + appended to
-      `~/.config/picocode/history` (`$HOME/.config/picocode/history`); `Up`
+      `~/.config/prior/history` (`$HOME/.config/prior/history`); `Up`
       navigates when already on the first/last logical line, else moves the
       cursor across lines; in-progress line restored when paging past newest.
 - [x] **Unit tests** (`repl.rs`): insert; cross-line cursor move; boundary
@@ -1043,7 +1043,7 @@ prompt itself owns, so the scrollback above is structurally untouchable.
   protocol. crossterm 0.29 parses `\x1b[13;2~` as **`KeyCode::F(3)` (+SHIFT)**
   (verified empirically by the `shift_enter_inserts_newline_without_kitty`
   integration test: feeding those bytes yields a two-row input `abc`/`d`), so it
-  never reaches the `Enter` handler. picocode therefore maps `KeyCode::F(3)` →
+  never reaches the `Enter` handler. prior therefore maps `KeyCode::F(3)` →
   `insert_newline()` in `edit_key` (`src/repl.rs`). Because `\x1b[13;2~` is the
   standard xterm modified-key form, this is **not wezterm-specific** — it also
   covers konsole, gnome-terminal, alacritty (legacy mode), and any other

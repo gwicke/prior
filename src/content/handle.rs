@@ -2496,7 +2496,7 @@ mod tests {
     /// flag once did: a terminal primary keeps the reasoning on the primary
     /// edge (it is on screen, choreographed), a piped primary diverts it to
     /// meta (stderr through the real backends, which is what makes
-    /// `2>/dev/null` work for a consumer of `picocode "q" | cat`).
+    /// `2>/dev/null` work for a consumer of `prior "q" | cat`).
     #[test]
     fn reasoning_is_marked_reasoning_and_the_edge_routes_it() {
         let script = [Step::Think("Weighing the options.\n\n"), Step::ResponseEnd];
@@ -3229,7 +3229,7 @@ mod tests {
         // Matches the `grep_text` tool name (and any `Grep_*` family member).
         let args = serde_json::json!({
             "pat": "fn (main|run)\\(",
-            "path": "/home/gabriel/src/picocode2/src"
+            "path": "/home/gabriel/src/prior2/src"
         });
         for name in ["grep_text", "GrepText", "GrepFiles"] {
             let (label, diff) = get_preview(name, &args);
@@ -3237,7 +3237,7 @@ mod tests {
             // shown in full (no 50-col truncation).
             assert_eq!(
                 label,
-                "grep fn (main|run)\\( /home/gabriel/src/picocode2/src"
+                "grep fn (main|run)\\( /home/gabriel/src/prior2/src"
             );
             assert!(diff.is_empty());
         }

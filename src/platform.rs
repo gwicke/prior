@@ -1,4 +1,4 @@
-//! Cross-platform resolution of picocode's per-user data/config locations.
+//! Cross-platform resolution of prior's per-user data/config locations.
 //!
 //! Every per-user file (history, settings, …) lives under a single application
 //! directory. Centralizing the resolution here means adding support for a new
@@ -7,28 +7,28 @@
 //! automatically.
 //!
 //! Resolution order (first match wins):
-//! - `$XDG_CONFIG_HOME/picocode`  (XDG-compliant Linux/macOS)
-//! - `$HOME/.config/picocode`     (fallback Linux/macOS)
-//! - `%APPDATA%/picocode`         (Windows)
+//! - `$XDG_CONFIG_HOME/prior`  (XDG-compliant Linux/macOS)
+//! - `$HOME/.config/prior`     (fallback Linux/macOS)
+//! - `%APPDATA%/prior`         (Windows)
 //!
 //! [`app_config_dir`] returns `None` only when no usable home / application-data
 //! variable is set at all.
 
 use std::path::PathBuf;
 
-/// The picocode application config directory for the current platform.
+/// The prior application config directory for the current platform.
 ///
 /// `None` means no suitable location could be determined (e.g. neither
 /// `$HOME`/`$XDG_CONFIG_HOME` nor `%APPDATA%` is set).
 pub fn app_config_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg).join("picocode"));
+        return Some(PathBuf::from(xdg).join("prior"));
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return Some(PathBuf::from(home).join(".config").join("picocode"));
+        return Some(PathBuf::from(home).join(".config").join("prior"));
     }
     if let Some(app) = std::env::var_os("APPDATA") {
-        return Some(PathBuf::from(app).join("picocode"));
+        return Some(PathBuf::from(app).join("prior"));
     }
     None
 }
@@ -80,10 +80,10 @@ mod tests {
         std::env::set_var("XDG_CONFIG_HOME", "/xdg");
         std::env::remove_var("HOME");
         std::env::remove_var("APPDATA");
-        assert_eq!(app_config_dir(), Some(PathBuf::from("/xdg/picocode")));
+        assert_eq!(app_config_dir(), Some(PathBuf::from("/xdg/prior")));
         assert_eq!(
             config_path(),
-            Some(PathBuf::from("/xdg/picocode/settings.toml"))
+            Some(PathBuf::from("/xdg/prior/settings.toml"))
         );
         std::env::remove_var("XDG_CONFIG_HOME");
     }
@@ -96,7 +96,7 @@ mod tests {
         std::env::remove_var("APPDATA");
         assert_eq!(
             app_config_dir(),
-            Some(PathBuf::from("/home/me/.config/picocode"))
+            Some(PathBuf::from("/home/me/.config/prior"))
         );
         std::env::remove_var("HOME");
     }
@@ -111,7 +111,7 @@ mod tests {
         // host's separator, so build the expectation with `MAIN_SEPARATOR`
         // instead of a hard-coded backslash (keeps the test green off Windows).
         let expected = format!(
-            "C:\\Users\\me\\AppData\\Roaming{}picocode",
+            "C:\\Users\\me\\AppData\\Roaming{}prior",
             std::path::MAIN_SEPARATOR
         );
         assert_eq!(app_config_dir(), Some(PathBuf::from(expected)));

@@ -815,7 +815,7 @@ pub(crate) async fn apply_branch_summary(
 /// stdin untouched.
 ///
 /// `build` produces the summarization request and returns the model's reply
-/// (or a classified `PicocodeError`). On a retryable failure it is re-invoked
+/// (or a classified `PriorError`). On a retryable failure it is re-invoked
 /// (previous `build` again) after a `retry_delay_ms` back-off in
 /// [`cancellable_sleep_windowed`]; non-retryable errors and cancellation
 /// propagate out.
@@ -831,10 +831,10 @@ pub(crate) async fn retry_summarization<F, Fut>(
     cancel_notify: &Arc<tokio::sync::Notify>,
     mut window: Option<WindowPump<'_>>,
     build: &mut F,
-) -> std::result::Result<String, crate::PicocodeError>
+) -> std::result::Result<String, crate::PriorError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<String, crate::PicocodeError>>,
+    Fut: std::future::Future<Output = std::result::Result<String, crate::PriorError>>,
 {
     // Fresh operation: a stale cancel flag from a previous abort must not
     // cancel this one before the pump has read anything. `prompt()` applies
@@ -851,7 +851,7 @@ where
         // in-flight request on the floor.
         let attempt = build();
         tokio::pin!(attempt);
-        let outcome: Option<std::result::Result<String, crate::PicocodeError>> = loop {
+        let outcome: Option<std::result::Result<String, crate::PriorError>> = loop {
             tokio::select! {
                 r = &mut attempt => break Some(r),
                 _ = cancel_observed(user_cancel, cancel_notify) => break None,
@@ -866,10 +866,10 @@ where
             // Cancelled — a window `Esc` (signalled above) or the flag from
             // elsewhere. Nothing in flight to persist: a summarization has
             // no partial turn.
-            None => return Err(crate::PicocodeError::Cancelled("Aborted.".into())),
+            None => return Err(crate::PriorError::Cancelled("Aborted.".into())),
             Some(Ok(text)) => return Ok(text),
-            Some(Err(crate::PicocodeError::Cancelled(_))) => {
-                return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+            Some(Err(crate::PriorError::Cancelled(_))) => {
+                return Err(crate::PriorError::Cancelled("Aborted.".into()));
             }
             Some(Err(e)) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
@@ -878,13 +878,13 @@ where
                 let slept =
                     cancellable_sleep_windowed(user_cancel, cancel_notify, ms, &mut window).await;
                 if !slept {
-                    return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                    return Err(crate::PriorError::Cancelled("Aborted.".into()));
                 }
                 // `build` is re-invoked verbatim on the retry (re-sends the
                 // same conversation prefix from the session leaf; cheap, and
                 // identical to a normal prompt retry).
                 if user_cancel.load(Ordering::SeqCst) {
-                    return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                    return Err(crate::PriorError::Cancelled("Aborted.".into()));
                 }
                 continue;
             }
@@ -925,7 +925,7 @@ mod tests {
         let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
         let r = retry_summarization(content.as_ref(), cancel, notify, None, &mut || {
             calls += 1;
-            async { Ok::<_, crate::PicocodeError>("summary".to_string()) }
+            async { Ok::<_, crate::PriorError>("summary".to_string()) }
         })
         .await;
         assert_eq!(r.unwrap(), "summary");
@@ -945,7 +945,7 @@ mod tests {
             calls += 1;
             async move {
                 if calls == 1 {
-                    Err(crate::PicocodeError::LlmRateLimited {
+                    Err(crate::PriorError::LlmRateLimited {
                         retry_after_secs: Some(1),
                     })
                 } else {
@@ -966,10 +966,10 @@ mod tests {
         let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
         let r = retry_summarization(content.as_ref(), cancel, notify, None, &mut || {
             calls += 1;
-            async { Err(crate::PicocodeError::Llm("permanent".to_string())) }
+            async { Err(crate::PriorError::Llm("permanent".to_string())) }
         })
         .await;
-        assert!(matches!(r, Err(crate::PicocodeError::Llm(_))));
+        assert!(matches!(r, Err(crate::PriorError::Llm(_))));
         assert_eq!(calls, 1, "non-retryable must not retry");
     }
 
@@ -996,14 +996,14 @@ mod tests {
         let r = retry_summarization(content.as_ref(), &cancel_out, &notify, None, &mut || {
             calls += 1;
             async {
-                Err(crate::PicocodeError::LlmRateLimited {
+                Err(crate::PriorError::LlmRateLimited {
                     retry_after_secs: Some(5),
                 })
             }
         })
         .await;
         let _ = handle.await;
-        assert!(matches!(r, Err(crate::PicocodeError::Cancelled(_))));
+        assert!(matches!(r, Err(crate::PriorError::Cancelled(_))));
         assert_eq!(calls, 1, "cancelled during back-off must not retry");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),

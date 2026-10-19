@@ -646,7 +646,7 @@ descriptor)`:
   the accept is a submit (canonical line) or an intermediate state;
 - Esc as the per-level ladder (§5.1) — pure buffer/state rewrites.
 
-The engine is *pure*: no terminal I/O, no picocode types, no async. It
+The engine is *pure*: no terminal I/O, no prior types, no async. It
 emits a **render plan** (level, rows with marker positions, header, title
 hint) rather than strings where possible, so the host's table renderer can
 format.

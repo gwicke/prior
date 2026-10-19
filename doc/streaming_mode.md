@@ -11,7 +11,7 @@ Related docs:
 
 - `doc/thinking_audit.md` — already documents the *surfacing thinking content*
   gap thoroughly; this plan builds on it.
-- `doc/picocode_rendering.md` — documents the current `Output` trait and
+- `doc/prior_rendering.md` — documents the current `Output` trait and
   `termimad` usage.
 
 ---
@@ -456,7 +456,7 @@ the crate adds a `Theme::clickable_links: bool` field; when set,
 `Renderer::styled` wraps non-image links in OSC 8 sequences
 (`\x1b]8;;<href>\x1b\\ … \x1b]8;;\x1b\\`) so they are clickable in terminals
 that support it (iTerm2, GNOME Terminal, VS Code, Alacritty, WezTerm, Kitty).
-Off by default, so logs/pipes stay escape-free; picocode opts in
+Off by default, so logs/pipes stay escape-free; prior opts in
 **only on a real TTY**.
 
 Upstreamability / clean history:
@@ -467,13 +467,13 @@ Upstreamability / clean history:
   0.2.1)**: commit `c28fdd3` "Add OSC 8 clickable inline links, gated by
   Theme.clickable_links" and commit `41d0922` "Add Theme::dimmed() for faded
   secondary content". Each is a ready-to-open PR diff; `Theme` default behavior
-  is unchanged. picocode pins both crates to `rev = 41d0922` (see wiring below).
+  is unchanged. prior pins both crates to `rev = 41d0922` (see wiring below).
 - Patch touches only `crates/markdown-terminal/src/{theme,lib}.rs` — adds the
   `clickable_links` field + OSC 8 wrap in `styled` (+ 3 unit tests), and adds
   the `dimmed()` theme whose `reset` re-applies the faint attribute (+ 1 unit
   test).
 
-Wiring in picocode (`src/output.rs`):
+Wiring in prior (`src/output.rs`):
 
 - `render_markdown(src, width, color)` sets `theme.clickable_links = color`, and
   `ConsoleOutput::begin_response` (TTY) builds the `Renderer` with
@@ -486,8 +486,8 @@ Build setup (`Cargo.toml`): `[patch.crates-io]` points both
 `codewandler-markdown-terminal` and `codewandler-markdown-stream` at the fork
 (`git = "https://github.com/gwicke/codewandler-markdown", rev = "c28fdd3"`).
 Both are pinned to the same fork commit so `markdown_stream::Event` resolves to
-a single type across picocode and the patched renderer (otherwise the patched
-crate's workspace `markdown-stream` and picocode's registry `markdown-stream`
+a single type across prior and the patched renderer (otherwise the patched
+crate's workspace `markdown-stream` and prior's registry `markdown-stream`
 would be two sources and `feed(&[Event])` would fail to type-check). The local
 bind-mount path override used for testing was removed; the final setup
 references only the remote fork.
@@ -624,7 +624,7 @@ isolate.
 - **Unit — streaming parse/format:** extend `src/output.rs` tests (alongside the
   existing `wrap_*` suite) with `markdown_terminal` rendering tests: code fence
   - highlight, table alignment, nested list marker-once (the crate already tests
-  this internally; add a couple of picocode-specific snapshots).
+  this internally; add a couple of prior-specific snapshots).
 - **Unit — streaming loop:** rig provides `test_utils::MockCompletionModel` and
   `MockStreamEvent` (incl. reasoning events) in `rig-core`. Build a mock
   streaming agent and assert `Output` receives `stream_text` deltas equal to the
@@ -660,8 +660,8 @@ Supporting steering messages depends on the streaming work above: once responses
 stream token-by-token (Phase 1–3) there is a visible, multi-second "mid-turn"
 window in which the user may want to type a follow-up while the agent is still
 answering. The capture side already exists — the in-flight input bridge — but it
-currently discards all typed text. Before designing picocode's version, we
-checked how the **pi** coding agent (`/home/gabriel/src/picocode3/pi`, a
+currently discards all typed text. Before designing prior's version, we
+checked how the **pi** coding agent (`/home/gabriel/src/prior3/pi`, a
 TypeScript agent) handles this; its model is the reference design.
 
 ### 8.1 How pi implements steering (reference findings)
@@ -708,7 +708,7 @@ Net: pi does **true mid-run steering** because it runs its *own* agent loop
 into the context between tool calls. The queue is pull-based and drains on
 injection, with live TUI feedback and a dequeue/edit affordance.
 
-### 8.2 Current bridge in picocode (reuse, don't rebuild)
+### 8.2 Current bridge in prior (reuse, don't rebuild)
 
 While `prompt().await` blocks the main task, `run_interactive` (`src/agent.rs`)
 spawns a background thread via
@@ -726,10 +726,10 @@ So the raw-mode stdin reader, the `TermGuard` lifecycle, suspend/resume, and
 in that thread, (b) rendering the input line mid-turn, (c) the two queues, and
 (d) a way to feed them back into the loop.
 
-### 8.3 Design for picocode (mirror pi's two-queue, pull-based model)
+### 8.3 Design for prior (mirror pi's two-queue, pull-based model)
 
 Adopt pi's shape: a session/bridge owns `steering` + `followUp` queues; the
-agent loop *pulls* them at the checkpoints picocode actually has.
+agent loop *pulls* them at the checkpoints prior actually has.
 
 1. **Shared queues.** Add `Arc<Mutex<VecDeque<String>>>` for `steering` and
    `followUp` (plus `has_draft: AtomicBool` for cheap polling), created in
@@ -757,13 +757,13 @@ agent loop *pulls* them at the checkpoints picocode actually has.
      Until streaming lands, design around the reserved-region approach. Mirror
      pi's `"Steering: …"` / `"Follow-up: …"` live display and a dequeue/edit
      affordance.
-4. **Pull at the checkpoints picocode has.**
+4. **Pull at the checkpoints prior has.**
    - *Follow-up (easy, within rig):* after `prompt` returns and the reader
      thread is joined, check `followUp`. If non-empty, **do not** call
      `read_input`; feed each entry back as `InputAction::Submit` (re-drive the
      loop) in FIFO order, through the normal `prompt(input, Some(&mut history))`
      path — so it lands in the now-persisted `history` (§2.4 fix).
-   - *Steering (true mid-run):* picocode **cannot** inject into rig's *current*
+   - *Steering (true mid-run):* prior **cannot** inject into rig's *current*
      internal tool loop (see §8.4). Until that changes, treat typed-during-turn
      text the same as `followUp` (apply after the turn). When a custom agent
      loop exists (§8.4), poll a `get_steering_messages()` callback at each rig
@@ -775,7 +775,7 @@ agent loop *pulls* them at the checkpoints picocode actually has.
    clears the draft. `Ctrl-C`/`Ctrl-Z` unchanged. The reader thread remains the
    sole raw-mode reader during the await, so there is no double-read race.
 
-### 8.4 pi vs. picocode: why "true steering" needs a loop change
+### 8.4 pi vs. prior: why "true steering" needs a loop change
 
 An in-flight provider completion cannot be interrupted mid-stream, so a steering
 message is always applied at a *loop boundary*, never mid-token. pi achieves
@@ -783,11 +783,11 @@ true mid-run steering because it runs its **own** `runLoop` and can push user
 messages into `currentContext.messages` before the next
 `streamAssistantResponse`.
 
-picocode uses rig's `Agent`, which runs its **own** internal multi-turn tool
+prior uses rig's `Agent`, which runs its **own** internal multi-turn tool
 loop. rig 0.38's `LoggingHook` exposes only `on_completion_call`,
 `on_completion_response`, `on_tool_call`, `on_tool_result` checkpoints, and its
 `HookAction` is just `cont` / `terminate` — there is **no** "inject user
-message" hook or action. So picocode cannot splice a steering message into rig's
+message" hook or action. So prior cannot splice a steering message into rig's
 *current* internal loop; the rig turn finishes with the original prompt, and any
 steering text can only be applied on the *next* `prompt` call.
 
@@ -798,7 +798,7 @@ steering text can only be applied on the *next* `prompt` call.
   and the original §8 design. Delivers the user-visible benefit (type while it
   thinks; it picks it up next).
 - *Tier 2 (longer term, to match pi's true steering):* replace rig's `Agent`
-  internal loop with a custom pi-style loop in picocode that drives the rig
+  internal loop with a custom pi-style loop in prior that drives the rig
   `CompletionModel`/`Chat` directly, polls `get_steering_messages()` at each
   tool-call boundary, and injects into context. This is the only path to
   mid-run steering and is a larger refactor — flag it as a separate epic, not
@@ -849,4 +849,4 @@ steering text can only be applied on the *next* `prompt` call.
 - Source: `src/agent.rs` (`prompt`, `run_once`, `LoggingHook`,
   `build_rig_agent`), `src/output.rs` (`Output`, `ConsoleOutput::display_text`),
   `src/thinking.rs`.
-- Docs: `doc/thinking_audit.md`, `doc/picocode_rendering.md`.
+- Docs: `doc/thinking_audit.md`, `doc/prior_rendering.md`.

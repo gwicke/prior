@@ -504,7 +504,7 @@ impl rig_core::tool::Tool for EditFile {
         edit_files_with(args.files, Some(context)).await
     }
 
-    /// Keep picocode's own diagnostics out of rig's redaction.
+    /// Keep prior's own diagnostics out of rig's redaction.
     ///
     /// Without this the default `map_error` runs `from_error`, which redacts the
     /// model-visible text to the `Other` kind's default — so a missing file, a
@@ -523,7 +523,7 @@ impl rig_core::tool::Tool for EditFile {
     }
 }
 
-/// Classify a picocode [`ToolError`] into rig's taxonomy, preserving its message
+/// Classify a prior [`ToolError`] into rig's taxonomy, preserving its message
 /// as the model-visible one.
 ///
 /// Shared by [`EditFile`] and the agent's `Guard<T>`, because a wrapped and an
@@ -727,7 +727,7 @@ async fn edit_file_inner(
 ///
 /// A bare byte count rather than the `32kb` form `-b` now accepts: the tool picks
 /// this number, so a unit suffix buys nothing, and `bsed_available()` only
-/// resolves the binary from PATH without checking what it can parse. A picocode
+/// resolves the binary from PATH without checking what it can parse. A prior
 /// paired with a `bsed` older than unit support would fail every `sed` call over
 /// a suffix the user never typed. Units are for people typing into a shell.
 ///
@@ -883,7 +883,7 @@ pub async fn sed_preview(
     if !bsed_available() {
         return Err(ToolError::Generic(format!(
             "the `{BSED_BIN}` binary is not on PATH, so the sed tool cannot run. \
-             Install it with `cargo install --path .` (it ships alongside picocode)."
+             Install it with `cargo install --path .` (it ships alongside prior)."
         )));
     }
     // The path is bounds-checked against the sandbox policy, and the *check*
@@ -919,7 +919,7 @@ pub async fn sed_preview(
     let bin = bsed_path().ok_or_else(|| {
         ToolError::Generic(format!(
             "the `{BSED_BIN}` binary is not on PATH, so the sed tool cannot run. \
-             Install it with `cargo install --path .` (it ships alongside picocode)."
+             Install it with `cargo install --path .` (it ships alongside prior)."
         ))
     })?;
     // The script leads, then the flags. `bsed` now takes options anywhere, but
@@ -1128,7 +1128,7 @@ impl rig_core::tool::Tool for Bash {
     }
 }
 
-/// Process-wide resolved sandbox config. picocode runs a single agent per
+/// Process-wide resolved sandbox config. prior runs a single agent per
 /// process and publishes it once at agent creation via [`set_sandbox`]; a
 /// `Mutex` (rather than `OnceLock`) keeps the helper test-friendly while still
 /// being written exactly once in normal operation.
@@ -2846,10 +2846,10 @@ mod sandbox_tests {
         }
         // No `env` configured => built-in deny-secrets default (drops *_KEY etc).
         set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
-        std::env::set_var("PICOCODE_TEST_KEY", "supersecret");
+        std::env::set_var("PRIOR_TEST_KEY", "supersecret");
         // PATH must still be present for `cat` (external) to work, proving the
         // default is a blacklist, not a blanket wipe.
-        let out = run_sandboxed("echo \"K=[$PICOCODE_TEST_KEY] PATH_OK=$PATH\"", None)
+        let out = run_sandboxed("echo \"K=[$PRIOR_TEST_KEY] PATH_OK=$PATH\"", None)
             .await
             .unwrap();
         assert!(
@@ -2857,7 +2857,7 @@ mod sandbox_tests {
             "secret leaked into sandbox: {out}"
         );
         assert!(out.contains("PATH_OK="), "PATH missing: {out}");
-        std::env::remove_var("PICOCODE_TEST_KEY");
+        std::env::remove_var("PRIOR_TEST_KEY");
     }
 
     #[tokio::test]
@@ -2866,12 +2866,12 @@ mod sandbox_tests {
         if !bwrap_on_path() {
             return;
         }
-        std::env::set_var("PICOCODE_TEST_KEY2", "topsecret");
+        std::env::set_var("PRIOR_TEST_KEY2", "topsecret");
         set_sandbox(Some(sandbox_with_env(EnvPolicy {
             mode: EnvMode::OnlyAllow,
             patterns: vec!["PATH".into()],
         })));
-        let out = run_sandboxed("echo \"K=[$PICOCODE_TEST_KEY2] PATH_OK=$PATH\"", None)
+        let out = run_sandboxed("echo \"K=[$PRIOR_TEST_KEY2] PATH_OK=$PATH\"", None)
             .await
             .unwrap();
         assert!(
@@ -2879,7 +2879,7 @@ mod sandbox_tests {
             "secret leaked under only_allow: {out}"
         );
         assert!(out.contains("PATH_OK="), "PATH missing: {out}");
-        std::env::remove_var("PICOCODE_TEST_KEY2");
+        std::env::remove_var("PRIOR_TEST_KEY2");
     }
 
     #[tokio::test]
@@ -2896,8 +2896,8 @@ mod sandbox_tests {
             mode: EnvMode::OnlyAllow,
             patterns: vec![],
         })));
-        std::env::set_var("PICOCODE_WIPE_TEST", "wipedme");
-        let out = run_sandboxed("echo \"K=[$PICOCODE_WIPE_TEST] HOME=[$HOME]\"", None)
+        std::env::set_var("PRIOR_WIPE_TEST", "wipedme");
+        let out = run_sandboxed("echo \"K=[$PRIOR_WIPE_TEST] HOME=[$HOME]\"", None)
             .await
             .unwrap();
         assert!(
@@ -2905,7 +2905,7 @@ mod sandbox_tests {
             "host secret leaked under empty only_allow: {out}"
         );
         assert!(out.contains("HOME=[]"), "host HOME not wiped: {out}");
-        std::env::remove_var("PICOCODE_WIPE_TEST");
+        std::env::remove_var("PRIOR_WIPE_TEST");
     }
 
     #[tokio::test]
@@ -4471,7 +4471,7 @@ mod edit_args_wire_tests {
     /// overridden, a tool error's message is model-visible, and the moment it
     /// stops being redacted the rule at `doc/path_leak_risks.md:22-29` becomes
     /// the *only* thing standing between a remapping sandbox and a host path in
-    /// the transcript. The document calls that "a coincidence of what picocode
+    /// the transcript. The document calls that "a coincidence of what prior
     /// happens to format today"; this is the test that ends the coincidence.
     ///
     /// It runs under a remap (`/tmp` → a host directory) and asserts two things

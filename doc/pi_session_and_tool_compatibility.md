@@ -2,11 +2,11 @@
 
 ## 1. Goal
 
-Make picocode and pi sessions fully interchangeable:
+Make prior and pi sessions fully interchangeable:
 
-- **Read path**: picocode can load any pi session file and replay it, with
+- **Read path**: prior can load any pi session file and replay it, with
   correct tool call/result labels and syntax highlighting.
-- **Write path**: every picocode session file can be opened in pi's TUI
+- **Write path**: every prior session file can be opened in pi's TUI
   (`pi --session <path>`), with correctly named tools and recognised argument
   fields.
 - **No rendering-layer hacks**: the fix is applied in `session.rs` at the
@@ -19,7 +19,7 @@ Make picocode and pi sessions fully interchangeable:
 
 ### 2.1 Tool Names
 
-| Function | Pi name | Picocode name | Where defined (pi)    |
+| Function | Pi name | Prior name | Where defined (pi)    |
 | -------- | ------- | ------------- | --------------------- |
 | Bash     | `bash`  | `bash`        | `tools/bash.ts:291`   |
 | Read     | `read`  | `read_file`   | `tools/read.ts:20`    |
@@ -31,7 +31,7 @@ Make picocode and pi sessions fully interchangeable:
 
 ### 2.2 Argument Schemas
 
-|Tool |Pi field(s)                                           |Picocode field(s)|
+|Tool |Pi field(s)                                           |Prior field(s)|
 |-----|------------------------------------------------------|-----------------|
 |Bash |`command`, `timeout`                                  |`cmd`, `timeout` |
 |Read |`path`, `offset`, `limit`                             |same             |
@@ -49,7 +49,7 @@ hardcodes `"toolName": "tool"`. Pi requires the actual tool name
 
 ### 2.4 Session Header Model Metadata
 
-Pi's session header includes top-level fields not in picocode's `SessionHeader`
+Pi's session header includes top-level fields not in prior's `SessionHeader`
 struct:
 
 ```json
@@ -75,9 +75,9 @@ co-located with the existing `pi_message_to_rig` / `rig_message_to_pi_entries`:
 ```text
 session.rs
   ├── pi_message_to_rig()          # unchanged entry point
-  │   └── normalize_tool_call()    # NEW: pi → picocode name + args
+  │   └── normalize_tool_call()    # NEW: pi → prior name + args
   ├── rig_message_to_pi_entries()  # unchanged entry point
-  │   ├── denormalize_tool_call()  # NEW: picocode → pi name + args
+  │   ├── denormalize_tool_call()  # NEW: prior → pi name + args
   │   └── denormalize_tool_result()# NEW: writes real toolName in results
   └── pi_content_to_assistant_content()  # calls normalize_tool_call()
       pi_content_to_user_content()       # no tool calls here
@@ -89,10 +89,10 @@ Both maps operate on the **rig `Message`** type — once the rig message is
 canonical, the rest of the pipeline (replay, output rendering, context
 building) works unchanged.
 
-### 3.1 Normalise (pi → picocode, on session read)
+### 3.1 Normalise (pi → prior, on session read)
 
 ```rust
-/// Normalise tool call arguments from pi schema to picocode schema.
+/// Normalise tool call arguments from pi schema to prior schema.
 /// Mutates the `ToolFunction` in place.
 fn normalize_tool_call(tc: &mut ToolCall) {
     match tc.function.name.as_str() {
@@ -127,7 +127,7 @@ fn normalize_tool_call(tc: &mut ToolCall) {
             if let Some(pat) = args.remove("pattern") {
                 args["pat"] = pat;
             }
-            // Drop fields picocode doesn't use:
+            // Drop fields prior doesn't use:
             // glob, ignoreCase, literal, context, limit.
             args.remove("glob");
             args.remove("ignoreCase");
@@ -158,10 +158,10 @@ fn normalize_tool_call(tc: &mut ToolCall) {
 }
 ```
 
-### 3.2 Denormalise (picocode → pi, on session write)
+### 3.2 Denormalise (prior → pi, on session write)
 
 ```rust
-/// Convert picocode tool call arguments to pi schema.
+/// Convert prior tool call arguments to pi schema.
 /// Mutates the `ToolCall` (in the rig message) before serialisation to JSONL.
 fn denormalize_tool_call(tc: &mut ToolCall) {
     match tc.function.name.as_str() {
@@ -258,7 +258,7 @@ pi content array, apply `normalize_tool_call`.
 
 Full compatibility also requires **runtime changes to the tool implementations**
 in `src/tools.rs`, because the model is told the pi-compatible name and
-argument schema, not the picocode internal one.
+argument schema, not the prior internal one.
 
 ### 4.1 Align `Bash` tool to pi's schema
 
@@ -317,7 +317,7 @@ pub async fn write_file(…)
 ### 4.4 Align `edit_file` to pi's name `edit` + batch schema
 
 This is the most impactful change. Pi's `edit` tool accepts multiple
-replacements in one call. Picocode's `edit_file` does one replacement per
+replacements in one call. Prior's `edit_file` does one replacement per
 call.
 
 **Step 1—rename and flatten parameters:**
@@ -426,7 +426,7 @@ pub async fn list_dir(
 ) -> Result<String, ToolError>
 ```
 
-Add the optional `limit` parameter (pi sends it; picocode can truncate
+Add the optional `limit` parameter (pi sends it; prior can truncate
 server-side).
 
 ### 4.7 Align `glob_files` to pi's name `find`
@@ -498,7 +498,7 @@ In `Session::new_persisted`, check the index for `ModelChange` /
 `ThinkingLevelChange` entries. If none exist and the header has
 `provider`/`model_id`/`thinking_level`, synthesise synthetic entries so
 `build_context()` returns the correct values. This ensures a session
-created by pi and then resumed by picocode restores the same model.
+created by pi and then resumed by prior restores the same model.
 
 ---
 
@@ -506,11 +506,11 @@ created by pi and then resumed by picocode restores the same model.
 
 ### 6.1 Dual schema acceptance on read
 
-The normalisation functions in §3.1 recognise pi names. Existing picocode
-sessions on disk already use picocode names (e.g. `read_file` with `cmd`).
+The normalisation functions in §3.1 recognise pi names. Existing prior
+sessions on disk already use prior names (e.g. `read_file` with `cmd`).
 To handle both:
 
-- `normalize_tool_call` checks the tool name: if it's already a picocode
+- `normalize_tool_call` checks the tool name: if it's already a prior
   name, leave it unchanged (idempotent).
 - The serde `alias` attribute on tool `Args` structs lets the *tool* accept
   old field names during the transition period.
@@ -539,9 +539,9 @@ To handle both:
 |4  |`test_normalize_pi_grep`          |`grep` → `grep_text`, `pattern` → `pat`|
 |5  |`test_normalize_pi_ls`              |`ls` → `list_dir`                    |
 |6  |`test_normalize_pi_find`            |`find` → `glob_files`                |
-|7  |`test_normalize_picocode_idempotent`|Already picocode names → no-op       |
-|8  |`test_denormalize_picocode_bash`    |`bash` with `cmd` → `command`        |
-|9|`test_denormalize_picocode_edit`|`edit_file` → `edit` with `edits[{oldText,newText}]`|
+|7  |`test_normalize_prior_idempotent`|Already prior names → no-op       |
+|8  |`test_denormalize_prior_bash`    |`bash` with `cmd` → `command`        |
+|9|`test_denormalize_prior_edit`|`edit_file` → `edit` with `edits[{oldText,newText}]`|
 |10 |`test_denormalize_tool_result_name` |`toolName` set to correct pi name    |
 |11|`test_denormalize_roundtrip`|`normalize(denormalize(msg))` == original pi message|
 |12 |`test_header_model_metadata`   |`provider`/`modelId` written and read back|
@@ -569,7 +569,7 @@ release; phases 3-5 follow in the next release.
 
 **Goal**: pi session logs replay with correct tool call labels
 (`"$ cargo build"` instead of `"$ "`). No tool implementation changes; no
-write-path changes. Existing picocode sessions replay identically.
+write-path changes. Existing prior sessions replay identically.
 
 **Files changed**:
 
@@ -588,7 +588,7 @@ write-path changes. Existing picocode sessions replay identically.
          drop extra fields (`glob`, `ignoreCase`, etc.).
    - [x] `"ls"`: rename to `"list_dir"`, drop `limit`.
    - [x] `"find"`: rename to `"glob_files"`, `pattern` to `pat`.
-   - [x] Idempotent: if name is already a picocode name, return without
+   - [x] Idempotent: if name is already a prior name, return without
          mutation.
    - [x] Unknown tool names pass through unchanged.
 
@@ -599,7 +599,7 @@ write-path changes. Existing picocode sessions replay identically.
          converted (it mutates the assembled `ToolCall`).
 
 3. Update the existing test `test_pi_message_to_rig_assistant_tool_call`:
-   - [x] The test uses `"bash"` with `"cmd": "ls"` (picocode format).
+   - [x] The test uses `"bash"` with `"cmd": "ls"` (prior format).
          Normalisation is idempotent, so the test passes as-is.
    - [x] New test `test_normalize_tool_call_read` covers pi `"read"` mapping.
 
@@ -630,7 +630,7 @@ test` passes (all lib + integration + doc tests).
 ### Phase 2 - Tool name and argument schema alignment
 
 **Goal**: the model sees the pi-compatible tool names and field names. Old
-picocode sessions remain replayable via the Phase 1 normalisation layer (not
+prior sessions remain replayable via the Phase 1 normalisation layer (not
 via serde aliases - the tool structs only need to match what the model
 generates going forward).
 
@@ -693,16 +693,16 @@ generates going forward).
 
 - [x] `cargo test` passes (modulo pre-existing flaky platform test).
 - [x] `cargo test session:: tools::` passes (84 tests).
-- [ ] Quick manual test: run picocode, ask the model to run `ls` - the tool
+- [ ] Quick manual test: run prior, ask the model to run `ls` - the tool
   call shown in the UI should say `ls .` (not `list_dir .`).
-- [ ] Load an older picocode session: the replay shows correct tool labels
+- [ ] Load an older prior session: the replay shows correct tool labels
   (already verified by Phase 1 tests).
 
 ---
 
 ### Phase 3 - Edit batch support
 
-**Goal**: picocode's `edit` tool matches pi's API:
+**Goal**: prior's `edit` tool matches pi's API:
 `edit(path, edits: [{oldText, newText}])`. The `all` parameter is removed.
 
 **Files changed**:
@@ -748,19 +748,19 @@ generates going forward).
    - [x] `"edit"` → now a **no-op** (the tool IS `"edit"` with
          `edits[{oldText,newText}]` — matches pi's format exactly).
          Removed the previous flatten-to-old-format logic.
-   - [x] `"edit_file"` (old picocode sessions) → convert to `"edit"` with
+   - [x] `"edit_file"` (old prior sessions) → convert to `"edit"` with
          `edits[{oldText: old, newText: new}]` using the first (only) edit.
 
 5. **Rewrite canonical normalisation** (`src/session/session.rs`):
    - [x] The canonical format is now **pi-compatible** across all tools:
          `"read"`, `"write"`, `"edit"`, `"grep"`, `"ls"`, `"find"`, `"bash"`
          (with `"command"`).
-   - [x] Old picocode names (`"read_file"`, `"write_file"`, `"edit_file"`,
+   - [x] Old prior names (`"read_file"`, `"write_file"`, `"edit_file"`,
          `"grep_text"`, `"list_dir"`, `"glob_files"`) are mapped to the
          canonical names on read.
    - [x] `"bash"` with `"cmd"` → renamed to `"command"`.
    - [x] Previously the normalisation mapped the other direction (pi → old
-         picocode names). Flip completed.
+         prior names). Flip completed.
    - [x] Updated all 15 unit tests to match the new canonical format.
 
 6. Update `edit_preview` helper (`src/output.rs`):
@@ -803,7 +803,7 @@ generates going forward).
 - [x] `cargo test --lib session tools output` passes (121 tests).
 - [ ] Manual: ask the model to make a two-edit replacement, verify both
   replacements execute and the result message says "2 block(s)".
-- [ ] Manual: load a picocode session from before Phase 3 (contains
+- [ ] Manual: load a prior session from before Phase 3 (contains
   `edit_file` with `old`/`new`/`all` fields). The session replay should
   show the edit preview correctly.
 - [ ] Manual: load a pi session with `edits[{oldText,newText}]` — replay
@@ -875,14 +875,14 @@ set the correct `toolName`.
 
 - [x] `cargo test session::` passes.
 - [x] `cargo test` passes (287 tests).
-- [ ] Manual: run picocode, make a tool call, inspect `.jsonl` file.
+- [ ] Manual: run prior, make a tool call, inspect `.jsonl` file.
 
 ---
 
 ### Phase 5 - Session header metadata
 
 **Goal**: session files carry `provider`, `modelId`, `thinkingLevel` at the
-top level. On resume, picocode restores the model context from these fields
+top level. On resume, prior restores the model context from these fields
 when no `ModelChange`/`ThinkingLevelChange` entries exist.
 
 **Files changed**:
@@ -998,8 +998,8 @@ stable.
 **Verification**:
 
 - [x] `cargo test` passes (274 tests, 0 failures).
-- [x] Storage normalisation handles both old picocode and pi formats.
-- [x] All existing picocode sessions from before Phase 1 still load correctly
+- [x] Storage normalisation handles both old prior and pi formats.
+- [x] All existing prior sessions from before Phase 1 still load correctly
   (the JSONL format hasn't changed at the file level - only the tool
   names within `"message"` entries are different, and the storage
   normalisation layer handles both).

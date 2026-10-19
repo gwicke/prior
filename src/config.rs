@@ -1440,8 +1440,8 @@ impl Recipe {
 
 impl Config {
     /// Load config from the given `--config` path, or from the platform config
-    /// file (`~/.config/picocode/settings.toml` on Linux,
-    /// `%APPDATA%/picocode/settings.toml` on Windows) when `path` is `None`.
+    /// file (`~/.config/prior/settings.toml` on Linux,
+    /// `%APPDATA%/prior/settings.toml` on Windows) when `path` is `None`.
     ///
     /// If no config location is available (no `--config` and no home /
     /// application-data directory) or the resolved file does not exist, the
@@ -1450,7 +1450,7 @@ impl Config {
     pub fn load(path: Option<&str>) -> crate::Result<Self> {
         if let Some(path) = crate::platform::resolve_config_path(path) {
             if path.exists() {
-                let content = std::fs::read_to_string(&path).map_err(crate::PicocodeError::Io)?;
+                let content = std::fs::read_to_string(&path).map_err(crate::PriorError::Io)?;
                 return Self::parse(&content);
             }
         }
@@ -1475,11 +1475,11 @@ impl Config {
         // for the scalar fields.
         let doc: toml_edit::DocumentMut = content
             .parse()
-            .map_err(|e: toml_edit::TomlError| crate::PicocodeError::Toml(e.to_string()))?;
+            .map_err(|e: toml_edit::TomlError| crate::PriorError::Toml(e.to_string()))?;
         let models = crate::model_settings::read_from_doc(&doc)
-            .map_err(|m| crate::PicocodeError::Toml(format!("invalid per-model settings: {m}")))?;
+            .map_err(|m| crate::PriorError::Toml(format!("invalid per-model settings: {m}")))?;
         let mut config: Config = toml_edit::de::from_str(content)
-            .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?;
+            .map_err(|e| crate::PriorError::Toml(e.to_string()))?;
         config.models = models;
         config.migrate();
         Ok(config)
@@ -1524,7 +1524,7 @@ pub fn read_prompt(
 ) -> crate::Result<Option<String>> {
     if let Some(file_path) = prompt_file {
         let path = Path::new(&file_path);
-        let content = std::fs::read_to_string(path).map_err(crate::PicocodeError::Io)?;
+        let content = std::fs::read_to_string(path).map_err(crate::PriorError::Io)?;
         Ok(Some(content))
     } else {
         Ok(prompt)

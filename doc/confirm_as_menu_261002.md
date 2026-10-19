@@ -267,7 +267,7 @@ this is the real cost of the change and it is not optional:
   composes the same way, and its `subject` is the request's business.
 - **Behaviour change on the no-pump paths.** With the blocking driver gone,
   `ConsoleOutput::confirm` is now the *policy* and denies. So a one-shot
-  `picocode "q"` / `Recipe` run with a console output that reaches a gated tool
+  `prior "q"` / `Recipe` run with a console output that reaches a gated tool
   without an `auto_allow` pattern and without yolo is denied where it used to
   prompt. Denying is the right direction (it cannot run a tool the user never
   agreed to, and the dialog was never reliable without a REPL pump), but it is a

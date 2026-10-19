@@ -1,16 +1,16 @@
 #!/bin/sh
-# Install script for picocode
-# Usage: curl -sSfL https://raw.githubusercontent.com/jondot/picocode/main/install.sh | sh
+# Install script for prior
+# Usage: curl -sSfL https://raw.githubusercontent.com/jondot/prior/main/install.sh | sh
 
 set -e
 
 # ============================================================================
 # Project-specific configuration - modify these for your project
 # ============================================================================
-PROJECT_NAME="picocode"
-BINARY_NAME="picocode"
+PROJECT_NAME="prior"
+BINARY_NAME="prior"
 GITHUB_OWNER="jondot"
-GITHUB_REPO="picocode"
+GITHUB_REPO="prior"
 # Shipped alongside the main binary; a missing one only disables a tool.
 OPTIONAL_BINARIES="bsed"
 # ============================================================================

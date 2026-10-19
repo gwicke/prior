@@ -137,7 +137,7 @@ pub struct AgentConfig {
     /// When Some, messages are appended to this file in JSONL format.
     pub message_log_path: Option<String>,
     /// Optional custom directory for session storage. When None, the platform
-    /// default is used (e.g., `~/.config/picocode/sessions`).
+    /// default is used (e.g., `~/.config/prior/sessions`).
     pub sessions_dir: Option<std::path::PathBuf>,
 }
 
@@ -195,7 +195,7 @@ pub(crate) fn effective_params(
     (overrides.apply(&live), notes)
 }
 
-/// The provider-specific `additional_params` for one request: picocode's
+/// The provider-specific `additional_params` for one request: prior's
 /// reasoning/top_p composition, then any provider post-processing.
 ///
 /// The single place both the build path and the per-turn override path go
@@ -223,7 +223,7 @@ pub(crate) fn request_additional_params(
 /// Merge OpenRouter `ProviderPreferences` into the existing additional_params
 /// (typically thinking config).
 ///
-/// Only an explicit `routing` table contributes. With none, picocode sends no
+/// Only an explicit `routing` table contributes. With none, prior sends no
 /// provider preferences at all — there is deliberately no built-in upstream
 /// pin, because a hidden default that silently narrows where requests may go
 /// is worse than OpenRouter's own load balancing. A model that wants that
@@ -361,7 +361,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
     macro_rules! check_env {
         ($var:expr) => {
             if std::env::var($var).is_err() {
-                return Err(crate::PicocodeError::MissingApiKey(
+                return Err(crate::PriorError::MissingApiKey(
                     provider.to_string(),
                     $var.to_string(),
                 ));
@@ -369,7 +369,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
         };
         ($($var:expr),+ $(,)?) => {
             if !( $( std::env::var($var).is_ok() )||+ ) {
-                return Err(crate::PicocodeError::MissingApiKey(
+                return Err(crate::PriorError::MissingApiKey(
                     provider.to_string(),
                     vec![$($var.to_string()),+].join(" or "),
                 ));
@@ -548,7 +548,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
             build!(@builder AgentBuilder::new(cached_model))
         }
         _ => {
-            return Err(crate::PicocodeError::Other(format!(
+            return Err(crate::PriorError::Other(format!(
                 "Unsupported provider: {}",
                 provider
             )))
@@ -647,7 +647,7 @@ impl AgentHook for LoggingHook {
         _event: CompletionResponseEvent<'_>,
     ) -> ObservationAction {
         // Note: rig only fires `on_completion_response` on the *blocking*
-        // surface. The streaming surface (which picocode uses via
+        // surface. The streaming surface (which prior uses via
         // `stream_prompt`) fires `on_model_turn_finished` instead, so the
         // received-message logging lives there — see below.
         if self.user_cancel.load(Ordering::SeqCst) {
@@ -718,7 +718,7 @@ impl AgentHook for LoggingHook {
     /// retry. The recovery budget is configured on the streaming request
     /// via `.max_invalid_tool_call_retries(1)`; if the model hallucinates
     /// the same wrong name twice, rig exhausts the budget and the run
-    /// surfaces a `LlmUnknownTool` `PicocodeError` to the user.
+    /// surfaces a `LlmUnknownTool` `PriorError` to the user.
     ///
     /// Reference: rig `AgentHook::on_invalid_tool_call` (hook.rs:1218) +
     /// `InvalidToolCallAction::{Retry, Repair, Skip, Stop, Fail}` (run
@@ -782,7 +782,7 @@ impl AgentHook for LoggingHook {
     }
 }
 
-const DEFAULT_AGENT_PROMPT: &str = r#"You are picocode, a software engineering agent. You are direct, technical, and highly efficient.
+const DEFAULT_AGENT_PROMPT: &str = r#"You are prior, a software engineering agent. You are direct, technical, and highly efficient.
 
 Your mission is to assist the user in their development tasks by utilizing a set of specialized tools. You operate within a specific codebase and must maintain its integrity while delivering high-quality solutions.
 
@@ -902,7 +902,7 @@ fn build_rig_agent(
         .tool(guard(CopyFile, yolo, None, confirm_port.clone()));
 
     let auto_allow = bash_auto_allow.clone();
-    // Publish the resolved sandbox config for the shell tools. picocode runs a
+    // Publish the resolved sandbox config for the shell tools. prior runs a
     // single agent per process, so a process-wide slot is sufficient and keeps
     // the macro-generated tool structs untouched.
     set_sandbox(sandbox.clone());
@@ -966,7 +966,7 @@ impl<T: Tool<Error = crate::tools::ToolError>> Tool for Guard<T> {
         self.tool.parameters()
     }
 
-    /// Map picocode's domain errors into rig's typed error taxonomy so the
+    /// Map prior's domain errors into rig's typed error taxonomy so the
     /// model and hooks receive a meaningful classification instead of always
     /// `ToolErrorKind::Other` (which renders as the generic "the tool failed").
     ///

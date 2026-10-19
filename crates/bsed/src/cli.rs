@@ -7,7 +7,7 @@
 //! bsed apply [-p PATH] [-i] [FILE]    # read blocks from stdin, apply, write
 //! ```
 //!
-//! Previewing never writes and is what picocode runs (inside a read-only
+//! Previewing never writes and is what prior runs (inside a read-only
 //! sandbox). `apply` is for humans at a shell, and without `-i` it writes the
 //! result to stdout, so `bsed apply f.rs < blocks.txt | diff f.rs -` is a review
 //! loop that cannot damage anything.
@@ -132,7 +132,7 @@ impl Out {
     }
 }
 
-/// Entry point shared by the standalone binary and picocode's shim, so both
+/// Entry point shared by the standalone binary and prior's shim, so both
 /// resolve the same arguments the same way.
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -250,7 +250,7 @@ enum Failure {
 /// The dispatcher stays this thin on purpose. It used to reject a leading flag
 /// with "unknown option", on the reasoning that a flag cannot be an expression —
 /// true, but it left `bsed -p f.rs 's/a/b/'` unusable even though that is exactly
-/// what `sed` accepts, and what picocode's `sed` tool wants to run. Handing every
+/// what `sed` accepts, and what prior's `sed` tool wants to run. Handing every
 /// non-`apply` argument list to the preview parser instead means options may
 /// lead, the script may come from `-e`, `-f` or a positional, and an option that
 /// exists in neither mode is still rejected — by the parser that knows the
@@ -574,7 +574,7 @@ fn recursive_preview(
     mode: Mode,
     budget: usize,
 ) -> Result<Out, Failure> {
-    // Same matcher and the same semantics as picocode's `find` tool: the pattern
+    // Same matcher and the same semantics as prior's `find` tool: the pattern
     // is matched against the path *relative to the walk root*, so a recursive
     // match is written `**/*.rs`.
     let matcher = build_matcher(globs)?;

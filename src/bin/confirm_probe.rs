@@ -17,9 +17,9 @@
 //! `doc/confirm_as_menu_261002.md` §9.
 
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, KeyModifiers};
-use picocode::confirm::{ConfirmBridge, ConfirmDecision};
-use picocode::termio::TermIO;
-use picocode::Content;
+use prior::confirm::{ConfirmBridge, ConfirmDecision};
+use prior::termio::TermIO;
+use prior::Content;
 
 #[tokio::main]
 async fn main() {
@@ -34,7 +34,7 @@ async fn main() {
     // itself), and the frames apply through the hub's writer.
     let out = Content::new(
         TermIO::plain(),
-        picocode::settings::default_show_reasoning_handle(),
+        prior::settings::default_show_reasoning_handle(),
     );
     // The frame dims come from the content handle's `frame_size`:
     // the watched geometry, read fresh per paint.
@@ -59,8 +59,8 @@ async fn main() {
         println!("RESULT=NoRequest");
         return;
     };
-    let mut confirm = picocode::confirm::ConfirmPrompt::new(req, bridge.port.approvals().clone());
-    picocode::confirm::paint(&confirm, &out.hub());
+    let mut confirm = prior::confirm::ConfirmPrompt::new(req, bridge.port.approvals().clone());
+    prior::confirm::paint(&confirm, &out.hub());
 
     // The dialog no longer takes the reader gate — that was the whole reason it
     // had to be a blocking loop. Sampled while it is up, so the test can assert
@@ -68,7 +68,7 @@ async fn main() {
     //
     // Sampled here, *printed* at the end: a `println!` now would land on the
     // pty's own rows and overwrite the frame the positional assertions measure.
-    let gate_up = picocode::termio::reader_paused();
+    let gate_up = prior::termio::reader_paused();
 
     let decision = loop {
         // Raw mode delivers `Enter` as CR and no line discipline translates it,
@@ -85,11 +85,11 @@ async fn main() {
                     if let Some(decided) = confirm.handle_key(KeyEvent::new(code, modifiers)) {
                         break decided;
                     }
-                    picocode::confirm::paint(&confirm, &out.hub());
+                    prior::confirm::paint(&confirm, &out.hub());
                 }
             }
             Ok(Event::Resize(_, _)) => {
-                picocode::confirm::paint(&confirm, &out.hub());
+                prior::confirm::paint(&confirm, &out.hub());
             }
             Ok(_) => {}
             Err(_) => break ConfirmDecision::Deny,
@@ -104,9 +104,9 @@ async fn main() {
     // the same standing stack, dialog element dropped (`confirm::clear`, the
     // twin of the `confirm::paint` above), then write the decision line where
     // it was.
-    picocode::confirm::resolve(
+    prior::confirm::resolve(
         &out,
-        || picocode::confirm::clear(&out.hub()),
+        || prior::confirm::clear(&out.hub()),
         confirm.subject(),
         answered,
     );
@@ -127,5 +127,5 @@ async fn main() {
     println!("APPROVED={approved}");
     // Printed after RESULT so a harness waiting on RESULT has captured it too.
     println!("GATE_WHILE_UP={gate_up}");
-    println!("GATE_AFTER={}", picocode::termio::reader_paused());
+    println!("GATE_AFTER={}", prior::termio::reader_paused());
 }

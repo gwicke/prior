@@ -975,7 +975,7 @@ mod stat_tests {
         let info = SessionStatsInfo {
             id: "0199f3c1-7a2e-7000-8000-000000000000".into(),
             name: Some("my-session".into()),
-            cwd: Some("/home/gabriel/src/picocode2".into()),
+            cwd: Some("/home/gabriel/src/prior2".into()),
             created: "2025-01-02T03:04:05.000Z".into(),
             last_updated: Some("2025-01-02T10:11:12.000Z".into()),
             message_count: 14,
@@ -999,7 +999,7 @@ mod stat_tests {
         assert_eq!(lines[1], "  name: my-session");
         // The cwd is quoted whole: the overlay lists sessions from every
         // cwd, so a shortened form would not say which tree this is in.
-        assert_eq!(lines[2], "  cwd: /home/gabriel/src/picocode2");
+        assert_eq!(lines[2], "  cwd: /home/gabriel/src/prior2");
         assert!(
             lines[3].starts_with("  created:") && lines[3].contains("last update"),
             "expected created/last update line, got {:?}",

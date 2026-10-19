@@ -2,7 +2,7 @@
 //! drag) must neither consume session history from above the input nor leave the
 //! previous overlay frame stranded on screen.
 //!
-//! Strategy (same as `render_scroll.rs`): drive the real `picocode` binary in a
+//! Strategy (same as `render_scroll.rs`): drive the real `prior` binary in a
 //! pty, capture its raw output, and feed it to a real `vt100` terminal emulator.
 //! We additionally act as a competent terminal: whenever the child issues a
 //! cursor-position query (`ESC[6n`, a DSR) we answer it from the emulator's
@@ -59,7 +59,7 @@ fn pump<W: Write>(
     }
 }
 
-/// A spawned `picocode` in a pty plus a `vt100` emulator that answers the
+/// A spawned `prior` in a pty plus a `vt100` emulator that answers the
 /// child's cursor queries, so the child sees a real, reflowing terminal.
 struct Term {
     master: Box<dyn MasterPty + Send>,
@@ -82,14 +82,14 @@ impl Term {
                 pixel_height: 0,
             })
             .expect("open pty");
-        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
         cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free"]);
         let cfg = tempfile::tempdir().expect("tempdir");
         cmd.env("XDG_CONFIG_HOME", cfg.path());
         // Keep the config tempdir alive for the whole run by leaking it: the
         // test process is short-lived and this avoids threading an owner around.
         std::mem::forget(cfg);
-        let child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+        let child = pair.slave.spawn_command(cmd).expect("spawn prior");
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
         let writer = pair.master.take_writer().expect("take writer");
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -324,7 +324,7 @@ fn vertical_resize_then_type_does_not_stack_the_area() {
 /// which nothing else covers. Two leads remain, and neither is guessable from
 /// the report: the duplicate lands in *scrollback*, so whatever produces it also
 /// scrolls, and this harness has too little content to scroll; and
-/// "re-focusing" has no counterpart here — picocode handles no focus event at
+/// "re-focusing" has no counterpart here — prior handles no focus event at
 /// all, so it must be the terminal re-emitting something on focus.
 #[test]
 fn vertical_resize_then_type_at_the_screen_bottom_does_not_duplicate() {

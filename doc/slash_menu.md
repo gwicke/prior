@@ -1,6 +1,6 @@
 # Slash Menu Conventions & Infrastructure
 
-A compact primer for working on picocode's interactive slash-command menus.
+A compact primer for working on prior's interactive slash-command menus.
 Read this before adding, extending, or refactoring any slash menu UI. It
 describes **current usage** (verified against `src/repl.rs`, `src/agent.rs`,
 `src/slash.rs` at `9e4a481`) and the principles new menus must follow.

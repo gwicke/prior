@@ -1637,56 +1637,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "picocode"
-version = "0.6.0"
-dependencies = [
- "async-trait",
- "blockedit",
- "bsed",
- "chrono",
- "clap",
- "codewandler-markdown-stream",
- "codewandler-markdown-terminal",
- "console",
- "crossterm",
- "duct",
- "futures",
- "fuzzy-matcher",
- "globset",
- "ignore",
- "libc",
- "memchr",
- "memmap2",
- "parking_lot",
- "path-clean",
- "portable-pty",
- "regex",
- "reqwest",
- "rig-agent",
- "rig-core",
- "rig-reqwest",
- "schemars",
- "serde",
- "serde_json",
- "serial_test",
- "shellexpand",
- "similar",
- "slashdot_menu",
- "slashdot_tui",
- "tempfile",
- "termimad",
- "thiserror 2.0.20",
- "tokio",
- "toml_edit",
- "tracing",
- "unicode-segmentation",
- "unicode-width 0.1.14",
- "urlencoding",
- "uuid",
- "vt100",
-]
-
-[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1761,6 +1711,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "prior"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "blockedit",
+ "bsed",
+ "chrono",
+ "clap",
+ "codewandler-markdown-stream",
+ "codewandler-markdown-terminal",
+ "console",
+ "crossterm",
+ "duct",
+ "futures",
+ "fuzzy-matcher",
+ "globset",
+ "ignore",
+ "libc",
+ "memchr",
+ "memmap2",
+ "parking_lot",
+ "path-clean",
+ "portable-pty",
+ "regex",
+ "reqwest",
+ "rig-agent",
+ "rig-core",
+ "rig-reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "shellexpand",
+ "similar",
+ "slashdot_menu",
+ "slashdot_tui",
+ "tempfile",
+ "termimad",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml_edit",
+ "tracing",
+ "unicode-segmentation",
+ "unicode-width 0.1.14",
+ "urlencoding",
+ "uuid",
+ "vt100",
 ]
 
 [[package]]

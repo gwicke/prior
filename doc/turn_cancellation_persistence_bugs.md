@@ -71,7 +71,7 @@ does **not** contain the prior conversation.
 
 ### The mismatch
 
-picocode's write-back does `*h = fh`, i.e. it **overwrites** the whole
+prior's write-back does `*h = fh`, i.e. it **overwrites** the whole
 conversation with only the latest turn. After every successful turn, all earlier
 turns are dropped, so the model only ever sees the immediately preceding
 exchange.
@@ -90,7 +90,7 @@ if let Some(messages) = response.messages {
 }
 ```
 
-picocode's streaming path diverges from that contract, which is the structural
+prior's streaming path diverges from that contract, which is the structural
 source of the context loss.
 
 ---
@@ -121,12 +121,12 @@ run as a terminal **error** and never emits a `FinalResponse`:
   (`ModelTurnAction::Stop` → `yield Err(…cancel_error…); return`).
 - Same pattern for the observation / tool-call / tool-result `Stop` outcomes.
 
-Because the stream yields `Err`, picocode's loop early-returns:
+Because the stream yields `Err`, prior's loop early-returns:
 
 ```rust
 // src/agent.rs:74-75
 while let Some(item) = stream.next().await {
-    match item.map_err(|e| crate::PicocodeError::Other(e.to_string()))? {
+    match item.map_err(|e| crate::PriorError::Other(e.to_string()))? {
 ```
 
 The `?` propagates the error out of `prompt()`, so the write-back block
@@ -154,8 +154,8 @@ The two bugs compound:
 Note: rig's cancellation error actually carries the in-flight full history —
 `PromptError::prompt_cancelled(self.full_history(), reason)`
 (`rig-core/src/agent/run/mod.rs:573`) where `full_history()` = `chat_history +
-new_messages`. picocode throws that away by mapping it to a plain
-`PicocodeError::Other(e.to_string())` (`src/agent.rs:75`), losing the structured
+new_messages`. prior throws that away by mapping it to a plain
+`PriorError::Other(e.to_string())` (`src/agent.rs:75`), losing the structured
 history it could have persisted.
 
 ---
@@ -182,7 +182,7 @@ history it could have persisted.
    suggestion, which would have double-counted the prior turns. The abort
    therefore commits the partial turn (user prompt + partial assistant text) so
    the conversation continues seamlessly, and a clear `Aborted.` notice is
-   surfaced in `run_interactive` (via a new `PicocodeError::Cancelled` variant)
+   surfaced in `run_interactive` (via a new `PriorError::Cancelled` variant)
    instead of a generic `Error:`.
 
 3. **Hygiene.** **Implemented.** `user_cancel` is reset at the start of each
@@ -201,7 +201,7 @@ history it could have persisted.
 
 ## 5. Key references
 
-picocode (`src/agent.rs`):
+prior (`src/agent.rs`):
 
 - `prompt()` body: `:44-119`
 - cancel-flag reset: `:52`
@@ -213,7 +213,7 @@ picocode (`src/agent.rs`):
   `prompt(&input, Some(&mut history))`: `:807`, `:816`
 - `LoggingHook` `Stop` outcomes: `:397-459`
 
-picocode (`src/repl.rs`):
+prior (`src/repl.rs`):
 
 - in-flight reader sets `cancel` on `<Esc>`: `:107`
 

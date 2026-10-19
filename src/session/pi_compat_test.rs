@@ -1,7 +1,7 @@
 // Cross-compatibility test: read actual pi agent session store.
 //
 // This test locates `~/.pi/agent/sessions/`, enumerates every `.jsonl` file
-// across all CWD-encoded directories, and verifies that picocode can parse
+// across all CWD-encoded directories, and verifies that prior can parse
 // every entry, build the full `SessionIndex`, walk `get_path_to_root`, and
 // produce valid output.
 //
@@ -22,9 +22,9 @@ use crate::session::types::*;
 
 /// The pi agent's session directory, derived from the standard location on
 /// Linux and macOS (`~/.pi/agent/sessions/`). Override with the
-/// `PICOCODE_PI_SESSIONS` environment variable.
+/// `PRIOR_PI_SESSIONS` environment variable.
 fn pi_sessions_root() -> PathBuf {
-    if let Ok(path) = std::env::var("PICOCODE_PI_SESSIONS") {
+    if let Ok(path) = std::env::var("PRIOR_PI_SESSIONS") {
         return PathBuf::from(path);
     }
     let home = std::env::var("HOME")
@@ -72,7 +72,7 @@ mod tests {
                 "[pi-compat] SKIP: pi sessions root not found: {}",
                 root.display()
             );
-            eprintln!("[pi-compat]   Set PICOCODE_PI_SESSIONS to a custom path, or");
+            eprintln!("[pi-compat]   Set PRIOR_PI_SESSIONS to a custom path, or");
             eprintln!("[pi-compat]   install pi agent (https://github.com/badlogic/pi-mono)");
             return;
         }

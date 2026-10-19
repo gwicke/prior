@@ -1,4 +1,4 @@
-//! Probe the retry back-off behavior directly against the real `picocode`
+//! Probe the retry back-off behavior directly against the real `prior`
 //! binary and a mock OpenAI-compatible SSE server.
 //!
 //! Focus: does a "successful model response" (streamed text / tool work)
@@ -241,7 +241,7 @@ fn run_one(pattern: &str, label: &str, need: usize) -> (Vec<u64>, Vec<(u64, usiz
         })
         .expect("openpty");
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     let args: Vec<String> = vec![
         "-p".into(),
         "llamacpp".into(),
@@ -260,8 +260,8 @@ fn run_one(pattern: &str, label: &str, need: usize) -> (Vec<u64>, Vec<(u64, usiz
     // without this they sleep out real 1+2+4+8+16 s of back-off per run, which
     // made `retry_backoff` the slowest binary in the suite. The growth *shape*
     // is what these tests are about and it is unchanged — only its time base is.
-    // See `PICOCODE_TEST_RETRY_BASE_MS` in src/agent.rs.
-    cmd.env("PICOCODE_TEST_RETRY_BASE_MS", BASE_MS.to_string());
+    // See `PRIOR_TEST_RETRY_BASE_MS` in src/agent.rs.
+    cmd.env("PRIOR_TEST_RETRY_BASE_MS", BASE_MS.to_string());
     let mut child = pair.slave.spawn_command(cmd).expect("spawn");
     // Keep the tempdir alive for the duration of the run.
     let _config_tempdir = config_tempdir;
@@ -270,7 +270,7 @@ fn run_one(pattern: &str, label: &str, need: usize) -> (Vec<u64>, Vec<(u64, usiz
     let mut writer = pair.master.take_writer().expect("take writer");
 
     // Wait for startup banner.
-    let _started = wait_for(&bytes, "picocode -", Duration::from_secs(10));
+    let _started = wait_for(&bytes, "prior -", Duration::from_secs(10));
     // Answer cursor-position query.
     let _ = writer.write_all(format!("\x1b[{};1R", ROWS).as_bytes());
     let _ = writer.flush();
@@ -462,7 +462,7 @@ fn no_session_still_resets_backoff_after_progress() {
             pixel_height: 0,
         })
         .expect("openpty");
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     let args: Vec<String> = vec![
         "-p".into(),
         "llamacpp".into(),
@@ -477,13 +477,13 @@ fn no_session_still_resets_backoff_after_progress() {
     cmd.env_remove("HOME");
     cmd.env_remove("XDG_CONFIG_HOME");
     // Same scaled back-off base as `run_one` — see `BASE_MS`.
-    cmd.env("PICOCODE_TEST_RETRY_BASE_MS", BASE_MS.to_string());
+    cmd.env("PRIOR_TEST_RETRY_BASE_MS", BASE_MS.to_string());
     cmd.env_remove("APPDATA");
     let mut child = pair.slave.spawn_command(cmd).expect("spawn");
     let reader = pair.master.try_clone_reader().expect("clone reader");
     let (bytes, _stop) = spawn_reader(reader);
     let mut writer = pair.master.take_writer().expect("take writer");
-    let _started = wait_for(&bytes, "picocode -", Duration::from_secs(10));
+    let _started = wait_for(&bytes, "prior -", Duration::from_secs(10));
     let _ = writer.write_all(format!("\x1b[{};1R", ROWS).as_bytes());
     let _ = writer.flush();
     thread::sleep(Duration::from_millis(150));

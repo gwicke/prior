@@ -588,7 +588,7 @@ fn coerce_value(key: &str, item: &toml_edit::Item) -> Result<(), String> {
 ///
 /// The table is an *inline* table on purpose: a `[models."id".routing]` header
 /// would need a table-vs-value branch through the whole parse/write path, and
-/// picocode is the only consumer of this file.
+/// prior is the only consumer of this file.
 fn coerce_routing(item: &toml_edit::Item) -> Result<(), CoerceError> {
     let Some(value) = item.as_value() else {
         return Err(CoerceError::at_key(

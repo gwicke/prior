@@ -642,8 +642,8 @@ mod tests {
     #[test]
     fn encode_cwd_unix_path() {
         assert_eq!(
-            encode_cwd(Path::new("/home/gabriel/src/picocode")),
-            "--home-gabriel-src-picocode--"
+            encode_cwd(Path::new("/home/gabriel/src/prior")),
+            "--home-gabriel-src-prior--"
         );
     }
 

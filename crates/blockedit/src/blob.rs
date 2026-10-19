@@ -8,7 +8,7 @@
 //! - **Canonical array** — the internal/persisted form, pi-compatible:
 //!   `{"path": ..., "edits": [{"oldText": ..., "newText": ...}, ...]}`.
 //! - **Legacy** — `oldText`/`newText` (single) and `old`/`new` (very old
-//!   picocode). Accepted on ingress / replay only.
+//!   prior). Accepted on ingress / replay only.
 //!
 //! A block's markers may arrive in either order — the canonical `@@@OLD` …
 //! `@@@NEW` … `@@@END`, or the switched `@@@NEW` … `@@@OLD` … `@@@END` (new

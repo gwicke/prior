@@ -35,7 +35,7 @@ released 0.40.0 the migration is a different shape than the HEAD plan.
   manually stripping reasoning from history, because rig does it per-provider
   and only for pure-reasoning turns (reasoning attached to a text/tool-call
   turn still round-trips).
-- **It does NOT change how picocode *displays* a reasoning-only turn.** Such a
+- **It does NOT change how prior *displays* a reasoning-only turn.** Such a
   turn is still rendered dimmed (TTY) / on stderr (non-TTY) when it does occur
   (e.g. Anthropic, which keeps `thinking` blocks). The earlier option (B) —
   render reasoning-only turns as the visible answer — is still relevant for that
@@ -52,13 +52,13 @@ released 0.40.0 the migration is a different shape than the HEAD plan.
 - **Breaking changes are moderate but mechanical** (call-site renames,
   `PromptHook` → `AgentHook`, `Tool::call` signature, `FinalResponse` →
   `PromptResponse`, new `MultiTurnStreamItem` variants). No architectural
-  redesign of picocode is required.
+  redesign of prior is required.
 
 ## 2. How 0.40 fixes the reasoning/history issue
 
 ### Root cause (recap from `doc/streaming_mode.md` §Phase 5)
 
-picocode persists `resp.history()` (rig `Message`s that include `Reasoning`)
+prior persists `resp.history()` (rig `Message`s that include `Reasoning`)
 and feeds it back next turn via `with_history(...)`. The model therefore sees
 its own prior reasoning and, after a reasoning-heavy turn, continues reasoning
 instead of emitting a text reply → a reasoning-only turn that reads as "no
@@ -84,7 +84,7 @@ then drops assistant messages left without text**:
 So for **OpenAI-compatible providers** (openai, deepseek, groq, mistral,
 together, moonshot, perplexity, hyperbolic, mira, azure, huggingface,
 openrouter), a reasoning-only turn is **not** sent back to the model. The loop
-stops without any picocode-side reasoning stripping.
+stops without any prior-side reasoning stripping.
 
 ### Scope / caveat
 
@@ -94,7 +94,7 @@ stops without any picocode-side reasoning stripping.
   option is still worth adding as a uniform toggle (cheap, and it also cuts
   history token cost).
 - The fix addresses the *loop*, not the *display*: when a reasoning-only turn
-  still happens, picocode still shows it dimmed (TTY) / on stderr (non-TTY). If
+  still happens, prior still shows it dimmed (TTY) / on stderr (non-TTY). If
   we want those shown as the answer, implement option (B) from the Phase 5
   discussion (render the turn's reasoning as the visible response when no text
   was emitted).
@@ -127,7 +127,7 @@ stops without any picocode-side reasoning stripping.
 Our thinking-level mapping already uses `AgentBuilder::additional_params`, so
 adding Responses-API cache params is purely additive.
 
-## 4. Breaking changes affecting picocode
+## 4. Breaking changes affecting prior
 
 > **Scope note.** The subsections below (§4.1–§4.5) describe the API at **HEAD**
 > (post-0.40). The **released `v0.40.0`** differs in three material ways — see
@@ -317,8 +317,8 @@ is the normalized error type. `Guard<T>` only needs the new
 ### 4.6 Removed / unaffected
 
 - Raw `Completion` / `StreamingCompletion` traits removed (CHANGELOG line 107) —
-  picocode only uses `Agent::stream_prompt`, unaffected.
-- `AgentBuilder::dynamic_context` removed (line 32) — picocode uses static
+  prior only uses `Agent::stream_prompt`, unaffected.
+- `AgentBuilder::dynamic_context` removed (line 32) — prior uses static
   builder context, unaffected.
 - `Chat` now appends to caller history (#1733): `Agent::chat(prompt, &mut
   history)` extends `history`. Streaming `stream_chat` takes history by value,
@@ -381,7 +381,7 @@ release.
 
 ## 5. Migration effort
 
-- **Size:** moderate, mechanical. No picocode architectural change.
+- **Size:** moderate, mechanical. No prior architectural change.
 - **Files (HEAD plan):** `src/agent.rs` (`prompt` call-site renames;
   `LoggingHook` → `AgentHook`; `FinalResponse` → `PromptResponse` +
   `messages()`; match arms → `ToolExecutionCommitted`; `Reasoning`/
@@ -496,7 +496,7 @@ pass, 1 ignored**.
   builder, its `model_catalog.rs` entry + env-var arm, and the `main.rs`
   default-model arm
   - doc comment.
-- **Added (non-OAuth, chat-capable) — rig 0.40 providers picocode now wires:**
+- **Added (non-OAuth, chat-capable) — rig 0.40 providers prior now wires:**
   `doubleword`, `llamafile`, `minimax`, `xiaomimimo`, `zai`. Each got a client-
   builder arm (`check_env!` + `build!(provider::Client::from_env()?)`), a
   `model_catalog.rs` `required_env_vars` arm + `DIRECT_PRICING` entry (context
@@ -507,7 +507,7 @@ pass, 1 ignored**.
   `Qwen/Qwen3.5-4B`, `LLaMA_CPP`, `MiniMax-M2.7`, `mimo-v2.5-pro`, `glm-4.6`.
 - **Excluded `voyageai`** — embeddings-only provider (no `completion_model`/
   `AgentClient` chat path), so it cannot go through the `build!` chat builder.
-  Out of scope until picocode has an embeddings feature.
+  Out of scope until prior has an embeddings feature.
 - **Added (Tier 1, token env var): `chatgpt`, `copilot`** — see §7.6. Both
   implement `from_env()` + `AgentClient`, so they wire in like the others.
   `chatgpt` requires `CHATGPT_ACCESS_TOKEN`; `copilot` requires
@@ -544,7 +544,7 @@ tiers:
   first). `token_dir` is set to the settings `token/` sub-directory (see below);
   `allow_device_flow(true)` is always on because the flow only triggers on the
   explicit `oauth` sentinel (no silent fallback, so CI-gating isn't needed).
-  picocode does **not** implement the OAuth protocol — rig's `auth` module
+  prior does **not** implement the OAuth protocol — rig's `auth` module
   handles token exchange, polling, refresh, and persistence.
   - **Trigger (consistent with other providers):** keep `check_env!` requiring
     the token env var (a provider is still "triggered by an env var"), and treat
@@ -559,13 +559,13 @@ tiers:
     change (make `DeviceCodePrompt` + `mod auth` `pub`). Rig's built-in default
     handler prints the verification URL + code via `println!` (stdout). The
     token caching still works; only the prompt destination is stdout. Upstream
-    rig fix would route it to stderr cleanly. A `picocode login <provider>`
+    rig fix would route it to stderr cleanly. A `prior login <provider>`
     subcommand remains a nice-to-have.
 
 #### Token storage (`token_dir`)
 
 - Token dir = `platform::app_config_dir().join("token").join(<provider>)`
-  (e.g. `~/.config/picocode/token/chatgpt/auth.json`), created with `0o700`
+  (e.g. `~/.config/prior/token/chatgpt/auth.json`), created with `0o700`
   perms (see `create_private_dir` in `agent.rs`). This is separate from the
   settings file, as recommended. rig persists the full OAuth cache
   (`access_token`, `refresh_token`, `id_token`, `expires_at`, `account_id`)

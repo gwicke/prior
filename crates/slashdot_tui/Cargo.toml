@@ -10,7 +10,7 @@ workspace = true
 
 [features]
 # Test-only seams (`TermIO::recording`, `RenderManager::draw`, …) — off in
-# production builds, on for picocode's dev-dependency.
+# production builds, on for prior's dev-dependency.
 test-helpers = []
 
 [dependencies]

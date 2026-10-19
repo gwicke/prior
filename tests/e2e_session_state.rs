@@ -1,6 +1,6 @@
 //! E2E: session-state regression + interactive smokes.
 //!
-//! Drives the REAL `picocode` binary in a real pty with an isolated
+//! Drives the REAL `prior` binary in a real pty with an isolated
 //! `XDG_CONFIG_HOME` (so sessions/settings/history never touch the
 //! developer's home), a temp working directory (the session-dir encoding
 //! keys off the child's cwd), and pre-seeded session files on disk —
@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use picocode::session::types::{encode_cwd, session_filename};
+use prior::session::types::{encode_cwd, session_filename};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tempfile::TempDir;
 use vt100::Parser;
@@ -102,7 +102,7 @@ struct Fixture {
 fn setup() -> Fixture {
     let xdg = tempfile::tempdir().expect("xdg tempdir");
     let work = tempfile::tempdir().expect("work tempdir");
-    let sessions = xdg.path().join("picocode").join("sessions");
+    let sessions = xdg.path().join("prior").join("sessions");
     Fixture {
         _xdg: xdg,
         work,
@@ -114,7 +114,7 @@ fn setup() -> Fixture {
 /// session id. `model` (provider, model_id) is stamped into the header so
 /// resume computes a `/model …` prefill for it.
 fn seed_session(fx: &Fixture, model: (&str, &str), text: &str) -> String {
-    use picocode::session::SessionHeader;
+    use prior::session::SessionHeader;
     let work_path = Path::new(fx.work.path());
     let dir = fx.sessions.join(encode_cwd(work_path));
     std::fs::create_dir_all(&dir).expect("session dir");
@@ -184,10 +184,10 @@ fn wait_session_count(sessions: &Path, want: usize, what: &str) {
     }
 }
 
-/// Spawn picocode: llamacpp provider (no API key; base url points at a
+/// Spawn prior: llamacpp provider (no API key; base url points at a
 /// dead local port — client construction never pings it), model `test`,
 /// isolated XDG, child cwd = the fixture work dir.
-fn spawn_picocode(
+fn spawn_prior(
     fx: &Fixture,
 ) -> (
     Box<dyn portable_pty::Child + Send + Sync>,
@@ -204,18 +204,18 @@ fn spawn_picocode(
         })
         .expect("open pty");
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     cmd.args(["-p", "llamacpp", "-m", "test"]);
     cmd.cwd(fx.work.path());
     cmd.env("XDG_CONFIG_HOME", fx._xdg.path());
     cmd.env("LLAMACPP_API_BASE_URL", "http://127.0.0.1:1");
 
-    let child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let child = pair.slave.spawn_command(cmd).expect("spawn prior");
     let reader = pair.master.try_clone_reader().expect("clone reader");
     let (bytes, _stop) = spawn_reader(reader);
     let writer = pair.master.take_writer().expect("take writer");
 
-    assert_wait(&bytes, "picocode -", "the startup banner");
+    assert_wait(&bytes, "prior -", "the startup banner");
     // Answer the DSR cursor query so later `cursor_row()` calls don't eat
     // typed bytes while scanning stdin for a reply (mock_turn handshake).
     let mut writer = writer;
@@ -276,12 +276,12 @@ fn quit_and_wait(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            assert!(status.success(), "picocode must exit cleanly: {status}");
+            assert!(status.success(), "prior must exit cleanly: {status}");
             return;
         }
         if Instant::now() > deadline {
             let _ = child.kill();
-            panic!("picocode did not exit after /quit\n{}", screen_tail(bytes));
+            panic!("prior did not exit after /quit\n{}", screen_tail(bytes));
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -301,7 +301,7 @@ fn menu_traffic_never_creates_empty_session_files() {
     let _uuid2 = seed_session(&fx, ("llamacpp", "seed-b"), "seed-two");
     assert_eq!(count_sessions(&fx.sessions), 2, "seeded");
 
-    let (mut child, bytes, mut writer) = spawn_picocode(&fx);
+    let (mut child, bytes, mut writer) = spawn_prior(&fx);
 
     // --- /session listing smoke: the overlay shows the seeded session.
     type_line(&mut writer, "/session ");
@@ -366,7 +366,7 @@ fn resume_replays_history_and_seeds_model_prefill() {
     let uuid = seed_session(&fx, ("llamacpp", "old-e2e-model"), "hello-e2e");
     assert_eq!(count_sessions(&fx.sessions), 1, "seeded");
 
-    let (mut child, bytes, mut writer) = spawn_picocode(&fx);
+    let (mut child, bytes, mut writer) = spawn_prior(&fx);
 
     // Resume with an explicit replay count (deterministic regardless of
     // the settings default): history must render on screen.

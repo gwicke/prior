@@ -1,6 +1,6 @@
 # Reasoning rendered out of order with tool calls / final answer — ROOT CAUSED
 
-Provider **OpenRouter**, model **tencent/hy3:free**. picocode renders a turn's
+Provider **OpenRouter**, model **tencent/hy3:free**. prior renders a turn's
 reasoning *after* the final answer (and after the tool calls it discusses); the
 same model orders correctly in `pi`.
 
@@ -18,7 +18,7 @@ exact source — unless marked **[NOTE]**.
 
 ## 1. The bug in one line
 
-picocode renders streamed reasoning through a **separate GFM markdown parser**
+prior renders streamed reasoning through a **separate GFM markdown parser**
 and commits it at segment boundaries with `StreamParser::write(b"\n\n")`, which
 **does not close a trailing list** (GFM lists need lookahead to close). That
 reasoning is stranded in the thinking parser until `end_response` calls
@@ -27,7 +27,7 @@ So list-structured reasoning lands **below** the answer.
 
 ---
 
-## 2. Ground truth from the live trace (`PICOCODE_TRACE_STREAM`) [VERIFIED]
+## 2. Ground truth from the live trace (`PRIOR_TRACE_STREAM`) [VERIFIED]
 
 A temporary env-gated trace (since removed — see §9) logged every consumed
 `MultiTurnStreamItem` and hook call in arrival order (15023 items). Structure:
@@ -88,7 +88,7 @@ released by `flush()` — because GFM must see a non-list line (or EOF) to know
 the list ended and whether it's loose/tight
 (`codewandler-markdown/crates/markdown-stream`).
 
-picocode commits the *thinking* parser with `write(b"\n\n")` in three places and
+prior commits the *thinking* parser with `write(b"\n\n")` in three places and
 **never** `flush()` mid-response:
 
 - `stream_text` reasoning→answer transition (`src/output.rs:738`),
@@ -181,14 +181,14 @@ draft; corrected here:
 Not verified from pi's source. Consistent with §4: pi renders reasoning and
 answer in one arrival-ordered flow (a single parser / no separate deferred
 thinking document), so nothing is stranded and re-emitted after the answer.
-picocode's separate thinking parser + `write("\n\n")` commit + answer-first
+prior's separate thinking parser + `write("\n\n")` commit + answer-first
 final flush is the specific combination that reorders.
 
 ---
 
 ## 9. Instrumentation (removed)
 
-Root-causing used a temporary env-gated trace (`PICOCODE_TRACE_STREAM`) in
+Root-causing used a temporary env-gated trace (`PRIOR_TRACE_STREAM`) in
 `src/agent.rs` that logged every consumed `MultiTurnStreamItem` and hook call in
 arrival order — that is how the §2 timeline was captured. It has since been
 **removed** now that the bug is fixed. To reproduce the capture, re-add an

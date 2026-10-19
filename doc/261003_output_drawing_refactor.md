@@ -31,7 +31,7 @@ migration detail: `./261003_output_drawing_refactor_impl.md`.
 ```
 
 Render, Draw and TermIO (plus the width utilities and the `RenderElement` trait) live in their own
-crate, `slashdot_tui`. `slashdot_menu` and picocode's UI/content layers depend on it — the layering
+crate, `slashdot_tui`. `slashdot_menu` and prior's UI/content layers depend on it — the layering
 above is enforced by the dependency graph, not by convention. Two width measures live there:
 `display_width` (CSI-only) and the OSC-8-aware `display_width_ansi` (with `wrap_to_width`), so links
 and styling measure the same below both layers.
@@ -88,7 +88,7 @@ the agent holds a `Content` handle (never the hub); confirmation keeps its own `
 
 Compose UI chrome into a RenderElement stack. Same level as Content.
 
-- source: ui/ (picocode); bar.rs (the bar) — menu chrome elements come from `slashdot_menu`
+- source: ui/ (prior); bar.rs (the bar) — menu chrome elements come from `slashdot_menu`
   (below, RenderElement stack), which implements `RenderElement` for its views
 - Elements are long-lived and reused: the status bar and the input hold live state (the bar the
   stores it reads, the input the shared editor), joined by transient elements (menus, dialogs) as
@@ -273,7 +273,7 @@ pub struct TermHandles {
 // Closed enum, not a trait: exactly two runtime behaviors, and TermIO is not
 // an extension point. The variant picks the input / lifecycle side; caps adjust
 // output fidelity independently. A non-tty stdin selects Plain; stdout/stderr
-// caps are probed separately (`picocode "q" | cat` is Tty input with a non-tty
+// caps are probed separately (`prior "q" | cat` is Tty input with a non-tty
 // primary — frames dropped, primary stripped).
 pub enum TermIO {
     Tty(TtyIo),     // raw mode, reader thread, DSR; caps probed at construction
@@ -317,7 +317,7 @@ impl TermIO {
 - `suspend()` stops the reader and drops raw mode ($EDITOR, Ctrl-Z); `resume()` reverses it. Upper
   layers reach it only through the RenderManager / Draw pass-throughs. The mode guard's own escapes
   (bracketed paste, kitty keyboard, cursor) are primary-stream writes: emitted only when the primary
-  is a terminal, so a redirected primary (`picocode > out.txt`) does not collect them. Raw mode
+  is a terminal, so a redirected primary (`prior > out.txt`) does not collect them. Raw mode
   itself is unconditional — a stdin concern.
 - Two variants only. Constructors over Plain, not variants: `recording_with(caps)` (a real backend
   with pinned caps; `recording()` is the screen-caps shorthand) and `null()` (sinkhole). `--quiet`

@@ -102,7 +102,7 @@ workaround in the row-accounting tests disappears.
 
 Consequences to accept, stated plainly:
 
-- **Piped stdout changes shape.** `picocode "q" | cat` today emits one
+- **Piped stdout changes shape.** `prior "q" | cat` today emits one
   markdown block at the end; after this it streams block by block. The text is
   the same; the framing is not. That is the intent (one path, no buffered
   special case), and it belongs in the release notes.
@@ -212,7 +212,7 @@ content) or to stderr, decided once in `ConsoleOutput::new` because stdout does
 not become a terminal mid-run. The dim toggle travels with the reasoning, not
 with the answer, so the boundary that turns it off targets the same stream.
 
-**User-visible change:** `picocode "q" | cat` now streams block by block
+**User-visible change:** `prior "q" | cat` now streams block by block
 instead of emitting one markdown block at the end, and its reasoning goes to
 stderr consistently — including the *pending* reasoning committed at a segment
 boundary, which used to land on stdout.
@@ -286,7 +286,7 @@ necessary."*
 ## 4. Decisions I need
 
 1. **Reasoning off a tty.** `stream_thinking` writes to stderr when stdout is
-   not a terminal, so a consumer of `picocode "q" | cat` can drop it. Removing
+   not a terminal, so a consumer of `prior "q" | cat` can drop it. Removing
    the `live` branch would put reasoning on stdout through the renderer. My
    recommendation: keep that one branch — it is a *stream-selection* decision,
    not a render path, and it protects piped stdout — and remove only the

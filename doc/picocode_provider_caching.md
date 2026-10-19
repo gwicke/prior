@@ -1,6 +1,6 @@
-# picocode / rig-core Provider Caching
+# prior / rig-core Provider Caching
 
-This documents whether picocode or its upstream `rig-core` (resolved from
+This documents whether prior or its upstream `rig-core` (resolved from
 **gwicke/rig** at `f31c38c`, patched via `[patch.crates-io]` in `Cargo.toml`;
 effectively a 0.40-based fork) supply provider-side caching hints and read-back
 comparable to the pi agent (see `doc/pi_provider_caching.md`).
@@ -10,17 +10,17 @@ comparable to the pi agent (see `doc/pi_provider_caching.md`).
 - **pi capability**: Anthropic `cache_control` markers (system + last msg)
   - **rig-core fork (gwicke/rig @ f31c38c)**: **Yes** (`apply_cache_control` /
     `apply_prompt_cache_control`)
-  - **picocode app**: **Enabled** — `with_automatic_caching()` (top-level
+  - **prior app**: **Enabled** — `with_automatic_caching()` (top-level
     `cache_control`, API auto-advances)
 - **pi capability**: Anthropic `ttl: "1h"` (long retention)
   - **rig-core fork (gwicke/rig @ f31c38c)**: **Yes** — `CacheTtl::OneHour`
     variant plus `with_automatic_caching_1h()` builder
-  - **picocode app**: **Not used** — picocode calls `with_automatic_caching()`
+  - **prior app**: **Not used** — prior calls `with_automatic_caching()`
     (5 min default)
 - **pi capability**: Anthropic cache on last tool definition
   - **rig-core fork (gwicke/rig @ f31c38c)**: **Yes** —
     `apply_tool_cache_control()` marks the final non-deferred tool
-  - **picocode app**: **Covered** — automatic mode sets the breakpoint
+  - **prior app**: **Covered** — automatic mode sets the breakpoint
     server-side on the last cacheable block
 - **pi capability**: OpenAI/OpenRouter `cache_control` / `prompt_cache_key` /
   session-affinity
@@ -28,18 +28,18 @@ comparable to the pi agent (see `doc/pi_provider_caching.md`).
     `with_prompt_caching()` adds `cache_control: {"type": "ephemeral"}` to
     system prompt; OpenAI responses_api reads `cached_tokens` back but has no
     send-side hints
-  - **picocode app**: **Enabled** for OpenRouter (`with_prompt_caching()`)
+  - **prior app**: **Enabled** for OpenRouter (`with_prompt_caching()`)
 - **pi capability**: Amazon Bedrock cache points
   - **rig-core fork (gwicke/rig @ f31c38c)**: **Yes** — `rig-bedrock` crate has
     `CachePoint` support in Converse API requests
-  - **picocode app**: **Not used** — picocode does not build a Bedrock agent
+  - **prior app**: **Not used** — prior does not build a Bedrock agent
 - **pi capability**: Read-back of cache usage (input/output tokens)
   - **rig-core fork (gwicke/rig @ f31c38c)**: **Yes** for Anthropic, OpenAI,
     DeepSeek, Gemini, OpenRouter, Bedrock
-  - **picocode app**: **Captured and surfaced** — `SessionUsage` tracks
+  - **prior app**: **Captured and surfaced** — `SessionUsage` tracks
     cached/creation tokens; `/stat` displays cache hit rate
 
-Verdict: picocode now **actively enables** caching for the two most important
+Verdict: prior now **actively enables** caching for the two most important
 providers (Anthropic via `with_automatic_caching()`, OpenRouter via
 `with_prompt_caching()`), and **reads back and displays** cache metrics for all
 providers that report them. The only missing send-side piece is OpenAI's native
@@ -78,9 +78,9 @@ gwicke/rig checkout at `~/.cargo/git/checkouts/rig-794bcfddf11aa804/f31c38c/`)
   `cache_creation_input_tokens`, mapped into `Usage.cached_input_tokens` /
   `Usage.cache_creation_input_tokens`.
 
-### Usage in picocode
+### Usage in prior
 
-picocode calls `.with_automatic_caching()` (the top-level `cache_control`
+prior calls `.with_automatic_caching()` (the top-level `cache_control`
 approach) for Anthropic (see `src/agent.rs` lines ~458–463). This requires no
 beta header; the API manages the breakpoint automatically.
 
@@ -98,7 +98,7 @@ beta header; the API manages the breakpoint automatically.
 - `src/providers/openai/responses_api/mod.rs` — exposes `cached_tokens` in the
   usage struct (read-back only) and a `prompt_cache_key` /
   `prompt_cache_retention` field on the request struct (lines ~1657–1662).
-  picocode currently does not set these fields.
+  prior currently does not set these fields.
 
 ### OpenRouter
 
@@ -110,9 +110,9 @@ beta header; the API manages the breakpoint automatically.
   `cache_write_tokens` from the OpenRouter usage response, mapping into
   `Usage.cached_input_tokens` / `Usage.cache_creation_input_tokens`.
 
-### Usage in picocode
+### Usage in prior
 
-picocode calls `.with_prompt_caching()` for OpenRouter (`src/agent.rs` lines
+prior calls `.with_prompt_caching()` for OpenRouter (`src/agent.rs` lines
 ~468–471). No caching hints are sent for native OpenAI chat completions or
 responses API.
 
@@ -142,10 +142,10 @@ Files: `src/providers/gemini/completion.rs`, `src/providers/gemini/streaming.rs`
 - `src/streaming.rs` — reads back `cache_read_input_tokens` and
   `cache_write_input_tokens`, mapped into `Usage.cached_input_tokens` /
   `Usage.cache_creation_input_tokens`.
-- picocode does **not** build a Bedrock agent (no `"bedrock"` arm in
+- prior does **not** build a Bedrock agent (no `"bedrock"` arm in
   `create_agent()`), so these features are unused here.
 
-## 6. picocode application level
+## 6. prior application level
 
 Files: `src/agent.rs`
 
@@ -157,7 +157,7 @@ Files: `src/agent.rs`
   `cache_control: {"type": "ephemeral"}`.
 - **Other providers**: No caching hints are set (the default `build!($client)`
   arm at line ~474 uses plain `$client.agent(&model)`).
-- picocode **reads and surfaces** cache `Usage`. `CodeAgent::prompt()`
+- prior **reads and surfaces** cache `Usage`. `CodeAgent::prompt()`
   (agent.rs ~155–171) captures `cached_input_tokens` and
   `cache_creation_input_tokens` per-request into `SessionUsage`. The `/stat`
   command (via `session_stats_lines()`, lines ~1285–1351) displays a cache hit
@@ -187,12 +187,12 @@ generic `with_prompt_caching()` added to the shared `GenericCompletionModel`
 
 ## Notes
 
-- The behavior above is for the rig-core fork used by picocode
+- The behavior above is for the rig-core fork used by prior
   (gwicke/rig, resolved via `[patch.crates-io]` in `Cargo.toml`,
   tracked as version `0.40.0` in `Cargo.lock`). Older rig-core versions
   (0.28.0, 0.38.2, 0.39.0) also exist in `~/.cargo/registry/` but are not
   referenced by this crate.
-- As of the latest round of changes the only upstream mechanisms picocode does
+- As of the latest round of changes the only upstream mechanisms prior does
   **not** exploit are:
   - OpenAI responses API `prompt_cache_key` / `prompt_cache_retention`
   - Bedrock `CachePoint` (provider not integrated)
@@ -262,7 +262,7 @@ xAI, ZAI, etc.) can now enable prompt caching by calling
 `AgentRunner::merge_additional_params()` / `replace_additional_params()` methods
 provide fine-grained control. No rig fork changes were needed for this.
 
-picocode uses this plumbing to inject:
+prior uses this plumbing to inject:
 
 - `think_json` (thinking/reasoning configuration) for all providers
 - OpenRouter `ProviderPreferences` (provider pinning) merged with `think_json`
@@ -305,4 +305,4 @@ All items from the original plan have been implemented:
 - P3
   - OpenAI responses API `prompt_cache_key`
   - rig fork + `src/agent.rs`
-  - ❌ Not implemented (picocode doesn't use responses API)
+  - ❌ Not implemented (prior doesn't use responses API)

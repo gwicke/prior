@@ -1,4 +1,4 @@
-//! The standalone `bsed` binary. All the logic lives in the library so picocode
+//! The standalone `bsed` binary. All the logic lives in the library so prior
 //! can call exactly the same code paths.
 
 fn main() -> std::process::ExitCode {

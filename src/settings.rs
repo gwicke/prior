@@ -436,7 +436,7 @@ impl SettingsStore {
         if !path.exists() {
             return Ok(Self::from_config(&crate::Config::default(), Some(path)));
         }
-        let content = std::fs::read_to_string(path).map_err(crate::PicocodeError::Io)?;
+        let content = std::fs::read_to_string(path).map_err(crate::PriorError::Io)?;
         // `Config::parse` (not a bare `toml_edit::de::from_str`) so this path
         // gets the same forward migrations as `Config::load`.
         let cfg = crate::Config::parse(&content)?;
@@ -588,10 +588,10 @@ impl SettingsStore {
             None => return Ok(()),
         };
         let mut doc = if path.exists() {
-            let content = std::fs::read_to_string(path).map_err(crate::PicocodeError::Io)?;
+            let content = std::fs::read_to_string(path).map_err(crate::PriorError::Io)?;
             content
                 .parse::<toml_edit::DocumentMut>()
-                .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?
+                .map_err(|e| crate::PriorError::Toml(e.to_string()))?
         } else {
             let mut d = toml_edit::DocumentMut::new();
             d.decor_mut().set_prefix(
@@ -682,14 +682,14 @@ impl SettingsStore {
         // trace.
         for (id, settings) in &self.models {
             crate::model_settings::write_to_doc(&mut doc, id, settings)
-                .map_err(|e| crate::PicocodeError::Other(format!("{id}: {e}")))?;
+                .map_err(|e| crate::PriorError::Other(format!("{id}: {e}")))?;
         }
-        // Ensure the parent directory (e.g. ~/.config/picocode) exists before
+        // Ensure the parent directory (e.g. ~/.config/prior) exists before
         // writing, mirroring how the history file is created.
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(crate::PicocodeError::Io)?;
+            std::fs::create_dir_all(parent).map_err(crate::PriorError::Io)?;
         }
-        std::fs::write(path, doc.to_string()).map_err(crate::PicocodeError::Io)?;
+        std::fs::write(path, doc.to_string()).map_err(crate::PriorError::Io)?;
         Ok(())
     }
 
@@ -902,7 +902,7 @@ mod tests {
     #[test]
     fn apply_to_config_maps_the_five_settings() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut s = store(tmp.path().join("picocode.toml").as_path());
+        let mut s = store(tmp.path().join("prior.toml").as_path());
         // Baseline `AgentConfig` built the way `main.rs` does.
         let content = std::sync::Arc::new(crate::content::Content::quiet());
         let mut cfg = crate::AgentConfig {
@@ -981,7 +981,7 @@ mod tests {
     #[test]
     fn overlay_rows_filters_and_orders() {
         let tmp = tempfile::tempdir().unwrap();
-        let s = store(tmp.path().join("picocode.toml").as_path());
+        let s = store(tmp.path().join("prior.toml").as_path());
         let all = s.overlay_rows("");
         assert_eq!(all.len(), 9);
         let filtered = s.overlay_rows("model");
@@ -993,7 +993,7 @@ mod tests {
     #[test]
     fn set_value_persists_and_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("picocode.toml");
+        let path = tmp.path().join("prior.toml");
         let mut s = store(path.as_path());
         s.set_value(SettingKey::DefaultModel, "openrouter:foo/bar")
             .unwrap();
@@ -1014,7 +1014,7 @@ mod tests {
     #[test]
     fn unset_reasoning_level_is_omitted_from_the_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("picocode.toml");
+        let path = tmp.path().join("prior.toml");
         let mut s = store(path.as_path());
         assert_eq!(s.value(SettingKey::DefaultReasoning), "off");
         s.set_value(SettingKey::DefaultModel, "openrouter:foo")
@@ -1039,7 +1039,7 @@ mod tests {
     #[test]
     fn reasoning_level_round_trips_and_off_removes_the_key() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("picocode.toml");
+        let path = tmp.path().join("prior.toml");
         let mut s = store(path.as_path());
         s.set_value(SettingKey::DefaultReasoning, "max").unwrap();
         assert_eq!(s.default_reasoning_level.as_deref(), Some("max"));
@@ -1070,7 +1070,7 @@ mod tests {
     #[test]
     fn save_drops_the_pre_rename_key() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("picocode.toml");
+        let path = tmp.path().join("prior.toml");
         std::fs::write(&path, "default_thinking_level = \"high\"\n").unwrap();
         let mut s = SettingsStore::load(&path).unwrap();
         assert_eq!(s.default_reasoning_level.as_deref(), Some("high"));
@@ -1090,7 +1090,7 @@ mod tests {
     #[test]
     fn set_value_invalid_does_not_persist() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("picocode.toml");
+        let path = tmp.path().join("prior.toml");
         let mut s = store(path.as_path());
         let err = s.set_value(SettingKey::ToolCallLimit, "0").unwrap_err();
         assert!(err.contains("greater than 0"));
@@ -1100,7 +1100,7 @@ mod tests {
     #[test]
     fn set_value_none_persona_omits_key() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("picocode.toml");
+        let path = tmp.path().join("prior.toml");
         let mut s = store(path.as_path());
         s.set_value(SettingKey::DefaultPersona, "").unwrap();
         assert_eq!(s.default_persona, None);

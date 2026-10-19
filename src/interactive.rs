@@ -261,7 +261,7 @@ impl Interactive {
             let _ = config.content.manager.lock().unwrap().resume();
             // First screen: a one-line hint
             let content = &config.content;
-            content.display_text("Welcome to picocode - type `/` for details.");
+            content.display_text("Welcome to prior - type `/` for details.");
             content.display_separator();
         }
 
@@ -807,7 +807,7 @@ impl Interactive {
         // turns, a key typed at the very end of a turn lands in the next
         // prompt rather than being discarded (a deliberate change from the
         // per-turn queue, which died with the turn).
-        let response: std::result::Result<String, crate::PicocodeError> = {
+        let response: std::result::Result<String, crate::PriorError> = {
             let mut consecutive_failures: u8 = 0;
             let mut next_input: String = input.clone();
             // The params this turn sends. They are the live ones with
@@ -836,7 +836,7 @@ impl Interactive {
             // retry succeeds, so later interruptions get a short
             // continuation instead.
             let mut steer_delivered = false;
-            let outcome: std::result::Result<String, crate::PicocodeError> = loop {
+            let outcome: std::result::Result<String, crate::PriorError> = loop {
                 let prompt_result = agent
                     .as_ref()
                     .unwrap()
@@ -865,8 +865,8 @@ impl Interactive {
                     .await;
                 match prompt_result {
                     Ok(text) => break Ok(text),
-                    Err(crate::PicocodeError::Cancelled(_)) => {
-                        break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                    Err(crate::PriorError::Cancelled(_)) => {
+                        break Err(crate::PriorError::Cancelled("Aborted.".into()));
                     }
                     // Mid-turn failure that persisted progress: the
                     // underlying run produced content/tool calls
@@ -878,7 +878,7 @@ impl Interactive {
                     // the provider's Retry-After floor). The budget
                     // is still consumed (one retry used), but the
                     // exponential delay does not compound.
-                    Err(crate::PicocodeError::LlmInterrupted { cause, .. })
+                    Err(crate::PriorError::LlmInterrupted { cause, .. })
                         if consecutive_failures < retry_budget(&cause) =>
                     {
                         consecutive_failures = 0;
@@ -909,7 +909,7 @@ impl Interactive {
                         )
                         .await;
                         if !slept {
-                            break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                            break Err(crate::PriorError::Cancelled("Aborted.".into()));
                         }
                         // Steering prompt: the synthetic feedback for
                         // e.g. malformed tool calls (carries the parse
@@ -949,7 +949,7 @@ impl Interactive {
                         // will be persisted/deduped as its own message.
                         turn.mark_new_dispatch();
                         if self.cancel.load(Ordering::SeqCst) {
-                            break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                            break Err(crate::PriorError::Cancelled("Aborted.".into()));
                         }
                         continue;
                     }
@@ -985,7 +985,7 @@ impl Interactive {
                         )
                         .await;
                         if !slept {
-                            break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                            break Err(crate::PriorError::Cancelled("Aborted.".into()));
                         }
                         if let Some(feedback) = e.synthetic_retry_feedback() {
                             // `prompt()` already persisted `user(input)`
@@ -1009,7 +1009,7 @@ impl Interactive {
                         // before `prompt()` clears its flag. Bail
                         // out here so the retry respects `Esc`.
                         if self.cancel.load(Ordering::SeqCst) {
-                            break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                            break Err(crate::PriorError::Cancelled("Aborted.".into()));
                         }
                         continue;
                     }
@@ -1023,7 +1023,7 @@ impl Interactive {
         // and into the next prompt.
         match response {
             Ok(_) => {}
-            Err(crate::PicocodeError::Cancelled(msg)) => {
+            Err(crate::PriorError::Cancelled(msg)) => {
                 // Turn aborted via `<Esc>`; `prompt()` already persisted
                 // the in-flight history, so show a clear notice instead
                 // of a generic "Error:".
@@ -1478,7 +1478,7 @@ mod tests {
         // Host file we remap into the sandbox at a path absent on the host.
         let sentinel = "SANDBOX_REGRESSION_MARKER_12345";
         let _tmp = tempfile::tempdir().unwrap();
-        let host_path = _tmp.path().join("picocode_sandbox_regr.txt");
+        let host_path = _tmp.path().join("prior_sandbox_regr.txt");
         std::fs::write(&host_path, sentinel).unwrap();
         let probe = "/sandbox_probe_xyz".to_string();
 

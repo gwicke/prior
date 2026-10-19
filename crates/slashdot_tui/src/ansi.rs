@@ -496,7 +496,7 @@ pub fn utf8_len(b: u8) -> usize {
 /// is not counted as text (content rows carry them, so a CSI-only measure
 /// reads a 9-column link as 39). Escape rules match [`strip_ansi`], without
 /// allocating. Owned by this crate so UI and content share one measure below
-/// both layers; picocode's `row_count` re-exports it.
+/// both layers; prior's `row_count` re-exports it.
 pub fn display_width_ansi(s: &str) -> usize {
     let bytes = s.as_bytes();
     let mut width = 0;

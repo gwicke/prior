@@ -323,7 +323,7 @@ fn rank_of(spelling: &str) -> Option<u8> {
     }
 }
 
-/// The request-shaping knobs picocode sends per turn. Every field is optional
+/// The request-shaping knobs prior sends per turn. Every field is optional
 /// and `None` means "unspecified — leave the provider's own default alone",
 /// which is the shape of a model the user never configured.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]

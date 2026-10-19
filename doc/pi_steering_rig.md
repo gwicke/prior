@@ -227,7 +227,7 @@ agent-loop level
 ([`agent-loop.ts:186-187`](../pi/packages/agent/src/agent-loop.ts)), which is
 isomorphic to the re-drive approach (the steering messages are in the canonical
 transcript before the next LLM call). The re-drive is therefore the more
-faithful translation of pi's design; the hook is a picocode-specific latency
+faithful translation of pi's design; the hook is a prior-specific latency
 optimization with additional bookkeeping.
 
 ## 4. Provider handling — what rig gives you for free
@@ -306,7 +306,7 @@ current tool finishes. But a user who `<Esc>` expects the turn to stop *now*,
 and if the response doesn't arrive for 60 seconds (a long `sleep` or a verbose
 reasoning turn) the steering message is equally delayed.
 
-For picocode, clean responsive steering requires fixing cancellation first.
+For prior, clean responsive steering requires fixing cancellation first.
 
 ### 6.1 How `<Esc>` cancellation works today
 
@@ -366,7 +366,7 @@ while let Some(item) = turn_stream.next().await { … }
 **drop the stream** and let the `Err` propagate. Concretely:
 
 1. **Thread a `tokio_util::sync::CancellationToken`** through the agent/runner
-   hierarchy so both picocode and rig's streaming loop can observe it.
+   hierarchy so both prior and rig's streaming loop can observe it.
 2. **Check the token after every `turn_stream.next()`** in `drive_agent`
    (`streaming.rs:589`). If cancelled, drop the turn stream and yield
    `PromptCancelled`.
@@ -374,7 +374,7 @@ while let Some(item) = turn_stream.next().await { … }
    ones) can register the token with the HTTP client so the TCP connection is
    dropped immediately rather than waiting for the full response.
 
-Because picocode controls the rig fork (pinned in `Cargo.toml`), these changes
+Because prior controls the rig fork (pinned in `Cargo.toml`), these changes
 go into the fork's `rig-core/src/agent/` and `rig-core/src/client/` — no
 upstream PR needed.
 
@@ -567,7 +567,7 @@ milliseconds, not after the command/stream finishes.
   `<Esc>` fires during the LLM response streaming (before any tool call).
 
   Expose a builder method `.cancel_token(token)` on `AgentRunner` so
-  picocode can pass it when constructing the agent.
+  prior can pass it when constructing the agent.
 
 - [ ] **1f. Rig fork — wire `CancellationToken` to provider HTTP client.**
   Optionally: register the token as a `reqwest::Request::abort()` handler
@@ -575,7 +575,7 @@ milliseconds, not after the command/stream finishes.
   the full HTTP response. Bonus; the token check in the streaming loop
   (1e) already catches cancellation on the next chunk boundary.
 
-- [ ] **1g. Picocode — thread the cancel signal through to the rig token.**
+- [ ] **1g. Prior — thread the cancel signal through to the rig token.**
   In `run_interactive` (or `CodeAgent::prompt`), create a
   `CancellationToken` and pass it to both the rig agent and the in-flight
   reader thread. When `<Esc>` fires, the reader sets `cancel` and sends
@@ -613,7 +613,7 @@ the user's prompt; model switches don't break tool-call pairing.
       h.extend(to_commit);
   }
   self.output.end_response();
-  return Err(crate::PicocodeError::Other(e.to_string()));
+  return Err(crate::PriorError::Other(e.to_string()));
   ```
 
   This ensures a subsequent `prompt()` or steering message sees the
@@ -762,7 +762,7 @@ if let Some(ref mut h) = history {
     h.extend(to_commit);
 }
 self.output.end_response();
-return Err(crate::PicocodeError::Other(e.to_string()));
+return Err(crate::PriorError::Other(e.to_string()));
 ```
 
 The `input` and `output` locals are still live at the error site — `input` is
@@ -837,7 +837,7 @@ apply:
      **fail** with a request error.
    - **Anthropic** uses the `id` verbatim — no constraint on `call_id`.
 
-   **Current status for picocode:** picocode uses `openai::Client` which
+   **Current status for prior:** prior uses `openai::Client` which
    targets the Chat Completions API (not Responses API), so the `call_id`
    gap was **theoretical** — it worked before. The mitigation described
    below is now implemented proactively (Phase 2b).
@@ -881,7 +881,7 @@ apply:
    efficiency cost.
 
 3. **Provider-specific content** (e.g. Anthropic `server_tool_use`, OpenAI
-   `file_search` call results): these are not emitted by picocode's agent (it
+   `file_search` call results): these are not emitted by prior's agent (it
    only uses `Bash`, `ReadFile`, `WriteFile`, etc.), so this is not a concern
    here.
 

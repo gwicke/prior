@@ -68,7 +68,7 @@ FS complete for sandbox, with space-in-path support
 
 ---
 
-## Review (picocode, Phase 7 in flight)
+## Review (prior, Phase 7 in flight)
 
 Read against the current engine: `MenuNode` (data descriptor, 117 lines) +
 centralized `Interpreter` (~1500 lines: state derivation, Tab/Enter/Esc,
@@ -350,7 +350,7 @@ Adopt **A** as node-model v2; skip **B** as stated, or fold it into A:
 
 ---
 
-## Round 2 responses (picocode)
+## Round 2 responses (prior)
 
 ### On the `&mut` traversal question (§4) — the direct answer
 
@@ -463,7 +463,7 @@ engine-owned (control flow, not per-node data); (a) and (b) are trivial.
 - I think the "accept / cancel" dialog could be rendered by the same node that
   also owns the final submit handler. Actually, she custom submit handler itself
   could keep track of the state machine:
-  1) if no cache match: run the prep, show editor (picocode shared code)
+  1) if no cache match: run the prep, show editor (prior shared code)
   2) call a pre-defined (not overridable) menu method that renders the accept /
      cancel dialog and handles keystrokes / cursoring, and returns yay or nay on
      enter

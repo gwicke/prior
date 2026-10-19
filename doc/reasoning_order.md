@@ -16,7 +16,7 @@ the turn boundary" fix) and the observed artifact: *a final message that
 mentions a final tool call (e.g. a test run) reads as if it references a tool
 call that was already shown earlier in the turn.* The user asked how the `pi`
 agent (bind-mounted at `pi/`) handles the same problem, to inform a better
-picocode fix.
+prior fix.
 
 ---
 
@@ -43,7 +43,7 @@ So thinking and text land in the array **in provider arrival order**. There is
 (`transform-messages.ts` only downgrades/normalizes cross-model content; it does
 not reorder). Consequence: in the rare "text then late reasoning" case, `pi`
 will *also* render reasoning **below** the answer — it does not specially fix
-that sub-problem. The difference vs. picocode is the render model (see §2), not
+that sub-problem. The difference vs. prior is the render model (see §2), not
 the streaming layer.
 
 ### 1.2 Render layer — renders the content array as-is
@@ -78,7 +78,7 @@ needed to withhold anything — it just draws the timeline it already has.
 
 ### 1.4 Net effect in `pi`
 
-- The artifact picocode shows (final message mentioning a tool call that was
+- The artifact prior shows (final message mentioning a tool call that was
   "shown earlier") **does not occur**, because the final answer is co-located in
   the timeline with the tool call it references and is visually its own block.
 - `pi` performs **no reordering or cleanup** of reasoning vs. response. Its
@@ -87,7 +87,7 @@ needed to withhold anything — it just draws the timeline it already has.
   the text it followed (verified: no `unshift`/`.sort`/reorder of thinking vs.
   text anywhere in `ai`/`tui`/`coding-agent`). So if `pi` *did* receive a
   text→late-reasoning stream, it would render reasoning **below** the answer
-  exactly like the pre-fix picocode bug — it just wouldn't flicker or
+  exactly like the pre-fix prior bug — it just wouldn't flicker or
   disappear, because a redraw model never retracts already-emitted content.
 
 ### 1.5 Why the misorder is unobserved in `pi` (empirical)
@@ -95,22 +95,22 @@ needed to withhold anything — it just draws the timeline it already has.
 In practice the reasoning models `pi` exercises emit their reasoning **first**,
 as a distinct phase, and only then the final answer — an ordered
 `reasoning… → answer` stream. On such a stream there is nothing to reorder, so
-neither `pi` nor picocode ever shows reasoning below the answer. The
-"answer → late reasoning" interleaving that triggers picocode's `answer_hold`
+neither `pi` nor prior ever shows reasoning below the answer. The
+"answer → late reasoning" interleaving that triggers prior's `answer_hold`
 (`thinking_order.md` §2.4) is a provider-specific quirk attributed to certain
 OpenRouter-routed models and is *occasional*. The reason `pi` looks clean is the
 **ordered stream**, not any redraw-time cleanup.
 
-This bears directly on picocode: `answer_hold` exists solely to defend against
+This bears directly on prior: `answer_hold` exists solely to defend against
 that rare out-of-order stream, yet it is applied to **every** reasoning turn and
 is precisely what *causes* the coupling artifact. Defending a rare case by
 degrading the common case argues for making the hold conditional (Rec A).
 
 ---
 
-## 2. Why picocode is different
+## 2. Why prior is different
 
-picocode renders to an **append-only streaming terminal** (`src/output.rs`):
+prior renders to an **append-only streaming terminal** (`src/output.rs`):
 once a line is written it cannot be moved or inserted above. The only reliable
 signal that no more reasoning will arrive is the **turn boundary**
 (`CompletionCall` / `FinalResponse`). Hence `thinking_order.md`'s fix
@@ -126,13 +126,13 @@ of a `RunTests` line shown earlier.
 
 `pi` avoids the coupling artifact because its timeline places each response in
 its own chronologically-ordered block (and, in practice, the stream is already
-ordered so nothing is deferred to begin with). picocode cannot adopt `pi`'s
+ordered so nothing is deferred to begin with). prior cannot adopt `pi`'s
 timeline approach without becoming a full-screen redraw TUI (a large
 architectural change, out of scope here).
 
 ---
 
-## 3. Updated recommendations for picocode
+## 3. Updated recommendations for prior
 
 The goal: keep `thinking_order.md`'s correctness for late reasoning, but remove
 the "final message mentions an earlier tool call" coupling artifact.
@@ -170,9 +170,9 @@ plan.)
 chronologically. (A redraw model would also make the rare late-reasoning
 misorder trivially fixable by reordering the content model — but note `pi` does
 **not** currently do this, and in practice the misorder is unobserved because
-reasoning is emitted before the answer.) Adopting `pi`'s timeline in picocode
+reasoning is emitted before the answer.) Adopting `pi`'s timeline in prior
 would mean moving from append-only streaming to a full-screen redraw renderer —
-a significant rewrite, inconsistent with picocode's deliberately streaming
+a significant rewrite, inconsistent with prior's deliberately streaming
 terminal design. Document it as the reference architecture; out of scope for an
 incremental fix.
 
@@ -182,32 +182,32 @@ incremental fix.
 
 - Render model
   - **`pi`**: Full-screen redraw of a message timeline
-  - **picocode (current)**: Append-only streaming terminal
-  - **picocode (proposed)**: unchanged
+  - **prior (current)**: Append-only streaming terminal
+  - **prior (proposed)**: unchanged
 - Answer withholding
   - **`pi`**: None
-  - **picocode (current)**: Held to turn boundary for whole turn
-  - **picocode (proposed)**: Held only after out-of-order reasoning observed
+  - **prior (current)**: Held to turn boundary for whole turn
+  - **prior (proposed)**: Held only after out-of-order reasoning observed
     (Rec A)
 - Final answer placement
   - **`pi`**: Its own block, right after tool result
-  - **picocode (current)**: Deferred to bottom of turn
-  - **picocode (proposed)**: Live on clean turns; held only on mis-ordered turns
+  - **prior (current)**: Deferred to bottom of turn
+  - **prior (proposed)**: Live on clean turns; held only on mis-ordered turns
 - "Mentions earlier tool call" artifact
   - **`pi`**: Does not occur
-  - **picocode (current)**: Occurs
-  - **picocode (proposed)**: Removed on clean turns (Rec A) + visually separated
+  - **prior (current)**: Occurs
+  - **prior (proposed)**: Removed on clean turns (Rec A) + visually separated
     when held (Rec B)
 - Reasoning-below-answer misorder
   - **`pi`**: Not observed in practice (streams ordered); would misorder if it
     occurred, but no cleanup logic
-  - **picocode (current)**: Fixed by holding
-  - **picocode (proposed)**: Still fixed by holding; Rec A limits holding to the
+  - **prior (current)**: Fixed by holding
+  - **prior (proposed)**: Still fixed by holding; Rec A limits holding to the
     rare turns that need it
 - Effort
   - **`pi`**: —
-  - **picocode (current)**: —
-  - **picocode (proposed)**: Rec A + Rec B: localized changes to `agent.rs` +
+  - **prior (current)**: —
+  - **prior (proposed)**: Rec A + Rec B: localized changes to `agent.rs` +
     `output.rs`
 
 **Recommended next step:** the recurring case is the **late-reasoning misorder**
@@ -231,7 +231,7 @@ committed. Keep the existing `late_reasoning_*` tests and add one replaying
 
 ### 5.1 Recurrence + concrete repro (this investigation)
 
-The out-of-order artifact **recurred in a live picocode run** while using the
+The out-of-order artifact **recurred in a live prior run** while using the
 **same models on OpenRouter** where `pi` renders cleanly. Most recent
 occurrence, with specifics now known:
 
@@ -252,7 +252,7 @@ unavoidable tradeoff.
 **What is established:**
 
 - `pi` (same models, OpenRouter) → clean, no out-of-order output.
-- picocode (same models, OpenRouter) → late-reasoning misorder, repeatedly.
+- prior (same models, OpenRouter) → late-reasoning misorder, repeatedly.
 - The rig fork's *yield* order is correct: `CompletionCall` is yielded in the
   `CallModel` step and `display_tool_call` fires later in `CallTools`, so the
   held-answer flush precedes the tool-call line (no flush/tool-call inversion).
@@ -309,7 +309,7 @@ provider — which is exactly why the same model/provider behaves differently.
 - **Exact symptom:** reasoning *after* the final response (late-reasoning
   misorder, type (a)) — **not** the coupling tradeoff (type (b)).
 - **Repro artifact:** `reasoning_order_issue.txt` (1232-line session transcript;
-  see §5.1 for the line-level evidence). A `PICOCODE_TRACE` run (§6) is no
+  see §5.1 for the line-level evidence). A `PRIOR_TRACE` run (§6) is no
   longer needed to *confirm* the cause, but remains useful to verify the fix and
   to confirm whether `Reasoning` items arrive after `CompletionCall` (the
   secondary issue).
@@ -364,7 +364,7 @@ implemented.**
 
 ### 6.1 Env-gated trace
 
-Add `PICOCODE_TRACE=<path>`. With it set:
+Add `PRIOR_TRACE=<path>`. With it set:
 
 - In `agent.rs::prompt`'s `while let Some(item)` loop, log each
   `MultiTurnStreamItem` with a monotonic nanosecond clock since turn start:

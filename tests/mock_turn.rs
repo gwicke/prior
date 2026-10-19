@@ -1,6 +1,6 @@
 //! End-to-end blank-line layout probe.
 //!
-//! Drives the REAL `picocode` binary against a local mock OpenAI-compatible
+//! Drives the REAL `prior` binary against a local mock OpenAI-compatible
 //! SSE server (via the `llamacpp` provider, which needs no API key and honors
 //! `LLAMACPP_API_BASE_URL`), inside a real pty, then renders the captured byte
 //! stream through `vt100` and prints the visible screen. Used to observe the
@@ -298,7 +298,7 @@ fn run_turn_typing(
         })
         .expect("open pty");
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     let mut args: Vec<String> = vec![
         "-p".into(),
         "llamacpp".into(),
@@ -311,7 +311,7 @@ fn run_turn_typing(
     let _config_tempdir;
     if thinking {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg = tmp.path().join("picocode.toml");
+        let cfg = tmp.path().join("prior.toml");
         std::fs::write(&cfg, "default_reasoning_level = \"high\"\n").unwrap();
         args.extend(["-c".into(), cfg.display().to_string()]);
         // Keep the tempdir alive for the duration of the run.
@@ -324,7 +324,7 @@ fn run_turn_typing(
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
     cmd.args(args);
     cmd.env("LLAMACPP_API_BASE_URL", llm.base_url());
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn prior");
     // Keep the tempdir alive for the duration of the run.
     _config_tempdir = Some(config_tempdir);
 
@@ -332,9 +332,9 @@ fn run_turn_typing(
     let (bytes, _stop) = spawn_reader(reader);
     let mut writer = pair.master.take_writer().expect("take writer");
 
-    let started = wait_for(&bytes, "picocode -", Duration::from_secs(10));
+    let started = wait_for(&bytes, "prior -", Duration::from_secs(10));
     eprintln!("[{label}] started={started}");
-    // Answer picocode's cursor-position query (DSR `ESC[6n`) so `cursor_row()`
+    // Answer prior's cursor-position query (DSR `ESC[6n`) so `cursor_row()`
     // does not swallow our typed bytes while scanning stdin for the reply.
     // Same handshake as tests/render_scroll.rs.
     let _ = writer.write_all(format!("\x1b[{dsr_row};1R").as_bytes());

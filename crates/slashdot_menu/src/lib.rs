@@ -9,7 +9,7 @@
 //! through [`node_impl::SlashDotNode`] implementations, the prompt buffer
 //! through a narrow [`prompt::PromptBuffer`] interface.
 //!
-//! See `doc/slash_menu_v2.5_design.md` in the picocode repository for the
+//! See `doc/slash_menu_v2.5_design.md` in the prior repository for the
 //! design this implements.
 
 // --- Public API (what the host sees) ---

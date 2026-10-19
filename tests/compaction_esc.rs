@@ -229,20 +229,20 @@ fn esc_cancels_compaction_backoff_and_parked_keys_reach_read_input() {
         })
         .expect("open pty");
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     cmd.args(["-p", "llamacpp", "-m", "test", "--yolo", "true"]);
     let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
     cmd.env("LLAMACPP_API_BASE_URL", llm.base_url());
     // The unpumped (red) path reaches $EDITOR after the floor; keep it inert.
     cmd.env("EDITOR", "/bin/true");
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn prior");
 
     let reader = pair.master.try_clone_reader().expect("clone reader");
     let (bytes, _stop) = spawn_reader(reader);
     let mut writer = pair.master.take_writer().expect("take writer");
 
-    let started = wait_for(&bytes, "picocode -", Duration::from_secs(10));
+    let started = wait_for(&bytes, "prior -", Duration::from_secs(10));
     assert!(started, "banner never appeared:\n{}", tail(&bytes));
     let _ = writer.write_all(format!("\x1b[{ROWS};1R").as_bytes());
     let _ = writer.flush();

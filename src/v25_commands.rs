@@ -1,7 +1,7 @@
 //! v2.5 command node implementations for testing the slashdot_menu engine.
 //!
 //! These test nodes exercise the engine's traversal, cursor, drill,
-//! and submit paths without depending on the full picocode host.
+//! and submit paths without depending on the full prior host.
 
 #[cfg(test)]
 mod tests {

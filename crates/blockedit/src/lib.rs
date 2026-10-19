@@ -1,13 +1,13 @@
 //! The `@@@OLD` / `@@@NEW` / `@@@END` block-edit core.
 //!
-//! One implementation, three consumers: picocode's `edit` tool, the `bsed`
+//! One implementation, three consumers: prior's `edit` tool, the `bsed`
 //! binary (which previews GNU sed changes in exactly this format, and applies
 //! them from a shell), and the session layer's canonicalization.
 //!
 //! Everything here is pure — it operates on `&str`, [`serde_json::Value`],
 //! and returns text. There is no agent, no tool-call plumbing, and no path
 //! *policy*: resolving a caller-supplied path against an allowlist stays with
-//! the caller, so this crate is safe to run outside picocode.
+//! the caller, so this crate is safe to run outside prior.
 //!
 //! Module map:
 //!

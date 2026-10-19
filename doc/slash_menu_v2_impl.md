@@ -1,7 +1,7 @@
 # Slash menu v2 — implementation plan
 
 Implements the design in `slash_menu_v2_design.md` as a new sub-crate,
-**`slashdot_menu`**, independent of picocode itself (design rationale:
+**`slashdot_menu`**, independent of prior itself (design rationale:
 crate independence was reviewed inline; summary below). No new code-level
 detail beyond what is needed to stage and verify the work; types/signatures
 are sketched where the boundary matters.
@@ -18,7 +18,7 @@ record; post-7.2 work moves to the v2.5 plan.
 
 ```text
 crates/slashdot_menu/
-  Cargo.toml            # no picocode dependency
+  Cargo.toml            # no prior dependency
   src/
     lib.rs
     node.rs             # MenuNode descriptor, FieldSpec, ColumnDef
@@ -47,27 +47,27 @@ crates/slashdot_menu/
   }
   ```
 
-  Implemented in picocode over the existing editor (`set`/`set_text` is
+  Implemented in prior over the existing editor (`set`/`set_text` is
   already the primitive the v1 overlays use). No cursor movement, no spans,
   no editing operations leak into the crate. The *view cursor* (highlighted
   row) is separate: the host passes it into `tab_at`/`enter_at` (§4).
 
 - **Rendering**: the crate emits a **render plan**, not a ratatui frame. The
   plan is plain data (rows of styled segments, marker chars, alignment), so
-  picocode paints it with ratatui today and any replacement later. The crate
+  prior paints it with ratatui today and any replacement later. The crate
   depends only on ANSI-style primitives it owns (`Style { fg, bg, bold }`,
   no ratatui types).
 
 - **Frame abstraction**: `frame.rs` defines the panel geometry contract the
   interpreter needs (available width/height, vertical budgeting for header
   block vs option rows). Close in shape to ratatui's `Frame`/`Rect` but
-  defined locally; picocode's paint step maps plan + real frame.
+  defined locally; prior's paint step maps plan + real frame.
 
 - **Table & fuzzy**: `src/table.rs` and `src/fuzzy.rs` move into the crate
-  (picocode re-exports or depend on the crate — decide at code time; moving
-  and re-exporting avoids duplication, they have no picocode-internal deps).
+  (prior re-exports or depend on the crate — decide at code time; moving
+  and re-exporting avoids duplication, they have no prior-internal deps).
 
-Everything picocode-specific — catalog, sessions, tree, settings, bindings,
+Everything prior-specific — catalog, sessions, tree, settings, bindings,
 fs, editor — stays behind handler traits defined in `node.rs` (§2).
 
 ---
@@ -143,7 +143,7 @@ Phase 0 and reused everywhere.
 ### Phase 0 — crate scaffolding + moved primitives
 
 - Create `crates/slashdot_menu`, workspace entry, no external deps.
-- Move `table.rs` + `fuzzy.rs` in; picocode `use`s the crate (re-export in
+- Move `table.rs` + `fuzzy.rs` in; prior `use`s the crate (re-export in
   `lib.rs` to keep internal paths stable).
 - Port the ~existing table/fuzzy unit tests.
 - **Verify**: `cargo test -p slashdot_menu` and full workspace build.
@@ -220,7 +220,7 @@ Phase 0 and reused everywhere.
 - **Tests**: `/stat`-like (interstitial no-leaf), confirm prep→accept state
   survival, leaf-returns-path (the `/compact` case).
 
-### Phase 6 — picocode integration (per command, design §10 order)
+### Phase 6 — prior integration (per command, design §10 order)
 
 Migrate commands one by one, each step replacing bespoke overlay variants and
 `from_buffer`/`handle_*` arms:
@@ -671,7 +671,7 @@ Remaining steps, in order:
 
 ---
 
-## 4. Integration approach inside picocode
+## 4. Integration approach inside prior
 
 - `repl.rs` keeps the *dispatch* (key events → overlay) but its per-menu
   logic is replaced by: parse buffer → interpreter call → apply result

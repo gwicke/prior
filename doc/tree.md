@@ -8,7 +8,7 @@ optionally summarizes the abandoned branch via the LLM.
 
 This mirrors pi's tree navigator
 (`packages/coding-agent/src/modes/interactive/components/tree-selector.ts`) but
-adapted to picocode's architectural constraints: no TypeScript async, no
+adapted to prior's architectural constraints: no TypeScript async, no
 extension hooks, no separate agent-session layer.
 
 ## Critique of this plan (read before implementing)

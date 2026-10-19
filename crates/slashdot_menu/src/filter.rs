@@ -1,6 +1,6 @@
 //! Field filtering & sorting (design §7.1).
 //!
-//! Generalizes picocode's hand-written `ModelFilter`/`apply_modifier` into
+//! Generalizes prior's hand-written `ModelFilter`/`apply_modifier` into
 //! one mechanism: every field of a dynamic row is addressable by a modifier
 //! token named after the field.
 //!

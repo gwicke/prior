@@ -18,19 +18,19 @@ type_complexity = "allow"
 too_many_arguments = "allow"
 
 [package]
-name = "picocode"
+name = "prior"
 version = "0.6.0"
-authors = ["Dotan Nahum <dotan@rng0.io>"]
+authors = ["Gabriel Wicke <gswicke@gmail.com>", "Dotan Nahum <dotan@rng0.io>"]
 edition = "2021"
-default-run = "picocode"
-description = "The tiny, high-performance Rust coding agent that speaks every LLM."
+default-run = "prior"
+description = "A small and efficient coding agent inspired by and session-compatible with pi."
 license = "MIT"
-repository = "https://github.com/jondot/picocode"
-homepage = "https://github.com/jondot/picocode"
+repository = "https://github.com/gwicke/prior"
+homepage = "https://github.com/gwicke/prior"
 readme = "README.md"
-keywords = ["cli", "ai", "coding-assistant", "llm", "agent", "rust", "claude"]
+keywords = ["cli", "ai", "coding-assistant", "llm", "agent", "rust", "pi"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["picocode.gif", ".github/"]
+exclude = ["prior.gif", ".github/"]
 
 [lints]
 workspace = true
@@ -84,11 +84,11 @@ default = []
 test-utils = []
 
 [lib]
-name = "picocode"
+name = "prior"
 path = "src/lib.rs"
 
 [[bin]]
-name = "picocode"
+name = "prior"
 path = "src/main.rs"
 
 # The `bsed` binary is a two-line shim over the bsed crate (src/bin/bsed.rs)
@@ -130,14 +130,12 @@ slashdot_tui = { path = "crates/slashdot_tui", features = ["test-helpers"] }
 # Fork of codewandler-markdown-terminal adding OSC 8 clickable inline links
 # (gated by Theme.clickable_links) and a faded `Theme::dimmed()` for streamed
 # thinking. Both crates are pinned to the same fork commit so
-# `markdown_stream::Event` resolves to one type across picocode and the patched
+# `markdown_stream::Event` resolves to one type across prior and the patched
 # renderer. Once the fork is pushed, `cargo build` updates Cargo.lock to the
 # git source. See doc/streaming_mode.md (§OSC 8 links, §Phase 5 thinking).
 [patch.crates-io]
-codewandler-markdown-terminal = { git =
-"https://github.com/gwicke/codewandler-markdown", branch = "main" }
-codewandler-markdown-stream = { git =
-"https://github.com/gwicke/codewandler-markdown", branch = "main" }
+codewandler-markdown-terminal = { git = "https://github.com/gwicke/codewandler-markdown", branch = "main" }
+codewandler-markdown-stream = { git = "https://github.com/gwicke/codewandler-markdown", branch = "main" }
 # TEMPORARY: tracks the local checkout of the sed-rs fork while the upstream PR
 # for `a`/`i`/`c` text whitespace is open. `sed-rs` 2.0.0 drops leading
 # whitespace from the text of a backslash-introduced `a`/`i`/`c`, which makes a

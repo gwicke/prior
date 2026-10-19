@@ -40,7 +40,7 @@ compiler**: a preview, in the one format the agent already knows how to apply.
 ## 2. Architecture (agreed shape)
 
 ```text
- picocode (agent)                          crates/bsed
+ prior (agent)                          crates/bsed
  ┌────────────────────────┐                ┌──────────────────────────────┐
  │ tool `sed`             │                │ lib: script → engine → diff  │
  │  path / expressions    │   argv         │      → hunks → blocks        │
@@ -470,7 +470,7 @@ A preview runs via `run_sandboxed_ro(argv, cfg, timeout)` (`src/tools.rs:1256`),
 identical to the grep/`rg` path:
 
 - argv only, never a shell; the model never supplies a subcommand, a flag name,
-  or a path — picocode templates the whole argv and the expressions ride as one
+  or a path — prior templates the whole argv and the expressions ride as one
   argv element (data, not structure).
 - read-only namespace: cwd ro-bound, `/tmp` an ephemeral tmpfs, `--unshare-net`,
   `--cap-drop ALL`, `--die-with-parent`, `prlimit --as` memory cap, watchdog
@@ -725,7 +725,7 @@ way to write files, and a second writer is exactly what this design removes.
   per token, and a silently truncated tree refactor is the worst outcome
   available. The 50 KiB budget is for the agent's single-file preview; `-b` does
   not apply here.
-- **The walk** uses `ignore` (already in the tree via picocode): `.gitignore` is
+- **The walk** uses `ignore` (already in the tree via prior): `.gitignore` is
   honoured *without* requiring a git repository — skipping `node_modules` should
   not depend on whether the tree is under version control — hidden files are
   skipped, and files are visited in **sorted order** so two runs over one tree
@@ -790,7 +790,7 @@ $ bsed -u 's/old_name/new_name/' -p src/x.rs
 ```
 
 It is a real unified diff: `---`/`+++` headers and `@@` hunks, which is what
-`patch` and every diff tool reads. That is the reason it is not picocode's
+`patch` and every diff tool reads. That is the reason it is not prior's
 in-panel edit preview (`refined_diff_lines` in `src/output.rs`): that one is a
 *display* format, with no file headers at all, a space after each `-`/`+` so the
 terminal panel can align columns, and a 60-line cap because it is about to be
@@ -903,12 +903,12 @@ a second one to write.
 
 **Distribution: one `cargo install --path .`, two binaries.** Cargo installs
 every `[[bin]]` target of the package you point it at, so the only question is
-whether `bsed` is a target of the `picocode` package or of a different one. It
-should be a target of `picocode`, as a two-line shim that delegates to the
+whether `bsed` is a target of the `prior` package or of a different one. It
+should be a target of `prior`, as a two-line shim that delegates to the
 crate:
 
 ```rust
-// picocode/src/bin/bsed.rs
+// prior/src/bin/bsed.rs
 fn main() -> std::process::ExitCode { bsed::cli::main() }
 ```
 
@@ -919,7 +919,7 @@ stays self-contained and separately installable later
 (`cargo install --path crates/bsed`, or published and installed by name). The
 release build already produces both, so `release.yml` needs only the archive
 step updated and `install.sh` only two names. The cost is honest and small:
-`picocode` gains a compile-time dependency on `sed-rs`, and the tarball grows by
+`prior` gains a compile-time dependency on `sed-rs`, and the tarball grows by
 one binary — worth paying for "the tool is simply there after a normal install",
 which is what turns the conditional advertisement in §9 into graceful
 degradation rather than a feature most users never get.
@@ -927,7 +927,7 @@ degradation rather than a feature most users never get.
 ## 8. Crate layout
 
 ```text
-crates/bsed/            # package: lib + bin bsed. No dependency from picocode.
+crates/bsed/            # package: lib + bin bsed. No dependency from prior.
   Cargo.toml                # sed-rs = "2", similar = "2", thiserror = "2", clap? (hand-rolled argv is fine)
   src/lib.rs                # pub fn preview(req) -> Result<Preview, Error>
   src/script.rs             # split lines, parse each, walk the AST (deny-list), join
@@ -937,7 +937,7 @@ crates/bsed/            # package: lib + bin bsed. No dependency from picocode.
   src/bin/bsed.rs           # argv parsing, exit codes
   tests/                    # golden + contract tests
 
-crates/blockedit/           # NEW: the pure block-edit core, extracted from picocode
+crates/blockedit/           # NEW: the pure block-edit core, extracted from prior
   src/parse.rs              # from src/edit_blocks.rs   (parse/render/canonicalize)
   src/match.rs              # from src/edit_match.rs     (resolve/diagnose; `similar`)
   src/apply.rs              # from src/tools.rs         (resolve_edits + apply-on-text)
@@ -949,13 +949,13 @@ it is the risky part of this proposal: `src/edit_blocks.rs` (759 lines),
 `src/edit_match.rs` (928 lines) and `edit_file`/`resolve_edits` in
 `src/tools.rs` must move with their tests, keeping the persisted JSON shape
 (`{"oldText","newText","startLine"}`) byte-identical for session replay.
-`picocode` re-exports the types; `bsed` depends on `blockedit` for the markers
+`prior` re-exports the types; `bsed` depends on `blockedit` for the markers
 and to self-validate the blob it emits.
 
 The extraction should be its own PR, before any `sed` work: it is a refactor
 with no behaviour change, and it de-risks the crate work.
 
-## 9. Integration in picocode
+## 9. Integration in prior
 
 - **Where**: `Cargo.toml`
   - **Change**:
@@ -1000,7 +1000,7 @@ with no behaviour change, and it de-risks the crate work.
 - **Where**: `.github/workflows/release.yml`
   - **Change**: `cargo build --release --target …` already builds every
     workspace member, so the archive step just needs both binaries:
-    `tar … picocode bsed`.
+    `tar … prior bsed`.
 
 ## 10. Worked example (real prototype output)
 
@@ -1060,7 +1060,7 @@ hand-written.
 5. **Round-trip contract** (the most valuable test in the project): `blocks.rs`
    output → `blockedit::parse_blob` → assert parsed
    `(old_text, new_text, anchor)` equals the hunk slices and anchors are exact.
-   Run it as an integration test in *picocode* too, so the two sides cannot
+   Run it as an integration test in *prior* too, so the two sides cannot
    drift.
 6. **Anchored-resolution tests against the real `edit` backend** — the
    assumption §4.1 rests on, pinned as an executable claim rather than a

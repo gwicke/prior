@@ -2,7 +2,7 @@
 
 ## Motivation
 
-picocode currently has **zero persistent session storage**. The conversation
+prior currently has **zero persistent session storage**. The conversation
 history lives only in a `Vec<Message>` (`history` in `run_interactive`,
 `src/agent.rs:1108`) that is in-memory and lost on restart. There is no way to:
 
@@ -14,7 +14,7 @@ history lives only in a `Vec<Message>` (`history` in `run_interactive`,
 This document specifies a session storage layer that follows the
 [pi agent](https://github.com/badlogic/pi-mono) model closely, aiming for
 **JSONL on-disk format compatibility**. Every design decision is evaluated
-against the goal that a pi session file and a picocode session file should be
+against the goal that a pi session file and a prior session file should be
 interchangeable (modulo trivial serde renaming).
 
 ---
@@ -30,7 +30,7 @@ entries representing every state change in the session.
 ### File Layout (pi-compatible)
 
 ```text
-~/.picocode/sessions/
+~/.prior/sessions/
   └── <cwd-encoded>/
        └── <timestamp>_<uuid>.jsonl
 ```
@@ -68,15 +68,15 @@ The algorithm:
 > in the same directory appear in the same folder) and is never decoded back
 > to a path.
 >
-> This means `cp -r ~/.pi/agent/sessions/* ~/.picocode/sessions/` works
-> verbatim for import — the directory names match exactly, and picocode
+> This means `cp -r ~/.pi/agent/sessions/* ~/.prior/sessions/` works
+> verbatim for import — the directory names match exactly, and prior
 > reads CWD from the same header field.
 
 Examples:
 
 |Original path                       |Encoded directory name                   |
 |------------------------------------|-----------------------------------------|
-|`/home/gabriel/src/picocode`        |`--home-gabriel-src-picocode--`          |
+|`/home/gabriel/src/prior`        |`--home-gabriel-src-prior--`          |
 |`/Users/badlogic/workspaces/pi-mono`|`--Users-badlogic-workspaces-pi-mono--`  |
 |`/home/my-project/src`              |`--home-my-project-src--`                |
 |`C:\Users\me\project`         |`--C-Users-me-project--` (`\` → `-`, `:` → `-`)|
@@ -101,7 +101,7 @@ fn encode_cwd(path: &std::path::Path) -> String {
 /// Decode a CWD directory name back to a path.
 ///
 /// **Lossy!** This is inherently ambiguous (see note above) so the result is
-/// best-effort. In practice, picocode reads `cwd` from the session header
+/// best-effort. In practice, prior reads `cwd` from the session header
 /// instead of decoding the directory name. This function exists for display
 /// and debugging — never for resolving the session's working directory.
 fn decode_cwd(encoded: &str) -> Option<String> {
@@ -150,7 +150,7 @@ fn parse_session_filename(name: &str) -> Option<(String, String)> {
 ### Full Path Example
 
 ```text
-~/.picocode/sessions/--home-gabriel-src-picocode--/2026-07-20T22-22-21-906Z_019f819f-80d2-7948-8ee8-c96d4785c6ec.jsonl
+~/.prior/sessions/--home-gabriel-src-prior--/2026-07-20T22-22-21-906Z_019f819f-80d2-7948-8ee8-c96d4785c6ec.jsonl
 ```
 
 ---
@@ -169,7 +169,7 @@ same field layout).
   "version": 3,
   "id": "d703a1a9-1b7b-4fb1-b512-c9738b1fe617",
   "timestamp": "2025-11-20T23:33:50.805Z",
-  "cwd": "/home/gabriel/src/picocode",
+  "cwd": "/home/gabriel/src/prior",
   "parentSession": "<optional absolute path to parent session file>",
   "metadata": { ... }
 }
@@ -283,12 +283,12 @@ content items. Mapping to rig's `Message` type:
 > group consecutive pi `"toolResult"` entries into one `User` message.
 
 > **pi entry IDs:** pi uses 8-character hex strings for entry IDs (e.g.
-> `"84c3124c"`); the session header uses a standard UUID. picocode uses UUIDv7
+> `"84c3124c"`); the session header uses a standard UUID. prior uses UUIDv7
 > throughout. The importer accepts any string, not validating as UUID.
 
 ### Wire Compatibility Strategy
 
-picocode's *own* storage uses **pi's camelCase field names directly** — not
+prior's *own* storage uses **pi's camelCase field names directly** — not
 snake_case. This means:
 
 - `parentId` not `parent_id`
@@ -305,7 +305,7 @@ The serde attributes on our Rust types use `#[serde(rename_all = "camelCase")]`
 at the container level, and explicit `#[serde(rename = "...")]` where pi uses a
 different key name.
 
-This means **picocode JSONL files are directly readable by pi** and vice versa,
+This means **prior JSONL files are directly readable by pi** and vice versa,
 modulo the session header `version` field (both use `3`).
 
 ---
@@ -611,7 +611,7 @@ impl JsonlSessionStorage {
         }
 
         let header = header.ok_or_else(|| {
-            crate::PicocodeError::Other("Session file has no header".into())
+            crate::PriorError::Other("Session file has no header".into())
         })?;
 
         Ok(SessionIndex {
@@ -640,7 +640,7 @@ impl JsonlSessionStorage {
 
 ```rust
 pub(crate) struct JsonlSessionRepo {
-    base_dir: PathBuf,  // ~/.picocode/sessions/
+    base_dir: PathBuf,  // ~/.prior/sessions/
 }
 
 impl JsonlSessionRepo {
@@ -1125,7 +1125,7 @@ pass. 78 real pi agent session files (46,825 entries) read with zero errors.
    for every non-leaf type). `build_index()` must track `last_entry_id` and fall
    back when no explicit leaf entry exists. A `saw_leaf_entry` flag ensures
    explicit leaf entries (including `None` clears) are still authoritative for
-   picocode's own sessions.
+   prior's own sessions.
 
 2. **Read-only mount needed.** pi's session directory (`~/.pi/agent/sessions/`)
    is often on a read-only filesystem. `JsonlSessionStorage` needs
@@ -1206,7 +1206,7 @@ session.
 
 ### Checklist
 
-- [x] **3.1 Session initialization** — `~/.picocode/sessions/` at startup,
+- [x] **3.1 Session initialization** — `~/.prior/sessions/` at startup,
       `Session` via `repo.create(cwd)`, stored as `Option<Session>`
 - [x] **3.2 `prompt()` signature** — `session: Option<&Session>`, prior context
       from `build_context().await`, stripping before LLM
@@ -1254,7 +1254,7 @@ through the v2.5 `SlashDotNode` tree: `SessionListNode` + action leaf nodes,
 ┌──────────────────────────────────────────────────────────────┐
 │ /session                              (commands filter)      │
 ├──────────────────────────────────────────────────────────────┤
-│  ◉  today 14:32    * picocode session storage   2 files      │
+│  ◉  today 14:32    * prior session storage   2 files      │
 │     today 11:07      parent: rename experiments              │
 │     yesterday         test-harness rewrite                   │
 │     Jul 14            parent: initial design                 │
@@ -1268,10 +1268,10 @@ session opens the per-session action menu:
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│ /session "picocode session storage"                          │
+│ /session "prior session storage"                          │
 ├──────────────────────────────────────────────────────────────┤
-│  Session: picocode session storage                           │
-│  Working dir: /home/gabriel/src/picocode2                    │
+│  Session: prior session storage                           │
+│  Working dir: /home/gabriel/src/prior2                    │
 │  238 turns | created today 14:32 | parent: fork-target       │
 │                                                              │
 │  ◉  resume          (current session, greyed out)            │
@@ -1285,16 +1285,16 @@ Selecting an action sets the input line to a full-sentence form and commits it
 (no additional confirmation):
 
 - **Action**: resume
-  - **Input after Enter**: `/session "picocode session storage" resume`
+  - **Input after Enter**: `/session "prior session storage" resume`
   - **Behaviour**: Switch to selected session
 - **Action**: fork
-  - **Input after Enter**: `/session "picocode session storage" fork`
+  - **Input after Enter**: `/session "prior session storage" fork`
   - **Behaviour**: Fork from the leaf, create new session, switch
 - **Action**: rename
-  - **Input after Enter**: `/session "picocode session storage" rename`
+  - **Input after Enter**: `/session "prior session storage" rename`
   - **Behaviour**: Pre-fills input for typing new name
 - **Action**: delete
-  - **Input after Enter**: `/session "picocode session storage" delete`
+  - **Input after Enter**: `/session "prior session storage" delete`
   - **Behaviour**: Remove the file, remove from list
 
 Typing these directly (without the overlay) also works:
@@ -1315,13 +1315,13 @@ existing `Submit` path:
 ```rust
 // What the user types → what run_interactive() dispatches
 "/session"                     → overlay opens (kind 10)
-"/session picocode session storage resume"  → resume session
-"/session picocode session storage fork"    → fork session
-"/session picocode session storage rename"  → overlay closes, input set to
-                                             `/session "picocode session storage" rename `
+"/session prior session storage resume"  → resume session
+"/session prior session storage fork"    → fork session
+"/session prior session storage rename"  → overlay closes, input set to
+                                             `/session "prior session storage" rename `
                                              (user types new name, then submit)
-"/session picocode session storage rename my-new-name" → rename session
-"/session picocode session storage delete"  → delete session file
+"/session prior session storage rename my-new-name" → rename session
+"/session prior session storage delete"  → delete session file
 ```
 
 **`ReplCtx` new fields:**
@@ -1437,16 +1437,16 @@ No separate Phase 5 is needed.
 
 ### 1. pi Wire Compatibility
 
-**Decision:** picocode's JSONL files are **identical** to pi's (camelCase, same
+**Decision:** prior's JSONL files are **identical** to pi's (camelCase, same
 tags, same field layout). This means:
 
-- A pi session file can be opened in picocode with zero transformation
-- A picocode session file can be opened in pi with zero transformation
+- A pi session file can be opened in prior with zero transformation
+- A prior session file can be opened in pi with zero transformation
 - The serde attributes use `#[serde(rename_all = "camelCase")]` at all levels
 - `Message` content is stored as raw `serde_json::Value` in the pi
   `AgentMessage` format, not rig's format
 
-The only difference is entry ID length: pi uses 8-char hex strings, picocode
+The only difference is entry ID length: pi uses 8-char hex strings, prior
 uses full UUIDv7 strings. The importer accepts any string.
 
 ### 2. JSONL File Format (Reaffirmed)
@@ -1542,9 +1542,9 @@ at the OS level.
 ### Q3: pi Import Path
 
 Planned as a future `/import-pi-session <path>` command. Since the formats are
-wire-compatible, this is almost trivial: copy the file into the picocode
+wire-compatible, this is almost trivial: copy the file into the prior
 sessions directory, generate a new header line. The only non-trivial step is
-mapping pi's 8-char entry IDs to full UUIDv7 — but since picocode's
+mapping pi's 8-char entry IDs to full UUIDv7 — but since prior's
 `SessionEntry.id` is `String` (not UUID), even that is straightforward.
 
 ### Q4: Error Recovery

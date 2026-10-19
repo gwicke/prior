@@ -42,7 +42,7 @@ auto_allow = ["^cargo test"]
 
 [tool_config.bash.sandbox]
 # No `enabled` switch: the sandbox is always active when `bwrap` is present
-# (and `bwrap` is required at startup, so picocode fails closed without it).
+# (and `bwrap` is required at startup, so prior fails closed without it).
 timeout_secs = 120        # default: 120
 network = false           # default: false (unshare network)
 memory_mb = 1024          # default: none (unlimited)
@@ -266,7 +266,7 @@ bwrap
 - **Timeout vs memory.** If memory is exceeded the process is killed by the
   kernel (OOM within the limit), not by the timeout. The timeout covers hangs;
   the memory cap covers runaway allocation.
-- **`--die-with-parent`** ensures orphans are cleaned up if picocode dies.
+- **`--die-with-parent`** ensures orphans are cleaned up if prior dies.
 - **Exit status.** `unchecked()` keeps duct from erroring on non-zero exit; the
   command's stdout/stderr is returned and the agent sees the real exit
   behavior through output. (Optionally surface a non-zero exit as a
@@ -275,7 +275,7 @@ bwrap
 ### Environment isolation
 
 bwrap **inherits the parent environment verbatim** by default — it applies no
-env filtering of its own. picocode runs with provider API keys in its process
+env filtering of its own. prior runs with provider API keys in its process
 environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `HF_TOKEN`, `AWS_*`, ...),
 plus any host secrets the operator's shell holds (`SSH_AUTH_SOCK`,
 `GITHUB_TOKEN`, ...). Without explicit sanitization, a sandboxed LLM command
@@ -303,7 +303,7 @@ patterns = ["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"]
   environment (only `PWD` survives bwrap's `--clearenv`); commands that need
   `PATH` will fail, so whitelists must include it.
 
-**Default.** When `sandbox.env` is omitted entirely, picocode applies the
+**Default.** When `sandbox.env` is omitted entirely, prior applies the
 built-in `disallow` policy `["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*",
 "SSH_AUTH_SOCK"]`. This drops common secret shapes while leaving `PATH`,
 `HOME`, `TERM`, `LANG`, ... intact, so ordinary commands keep working. It is a
@@ -354,7 +354,7 @@ with zero config.
 - **Not a hardening boundary against root.** bwrap provides isolation, not a
   bulletproof jail; it assumes the sandbox user is unprivileged. It is a
   defense-in-depth measure appropriate for an LLM-driven shell, not a
-  substitute for running picocode as a non-root user.
+  substitute for running prior as a non-root user.
 - **`from` paths should be validated** against path traversal (reuse
   `validate_path` from `tools.rs`) so a malicious/erroneous config can't bind
   `/etc` or `/` unexpectedly. The remap `to` is created inside the namespace,

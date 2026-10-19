@@ -1,4 +1,4 @@
-//! Text wrapping for table cells (moved from picocode's `output::wrap` so the
+//! Text wrapping for table cells (moved from prior's `output::wrap` so the
 //! crate stays dependency-free).
 
 use unicode_width::UnicodeWidthChar;

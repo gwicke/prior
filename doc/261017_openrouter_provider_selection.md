@@ -43,7 +43,7 @@ the better shape for that and can be layered on later.
   `openrouter::ProviderPreferences` has `only`, `order`, `ignore`, `allow_fallbacks`, `sort`, … and
   `to_json()` returns `{"provider": {…}}`. No rig change required. We mirror a *subset* in our own
   typed struct (§1) rather than depending on rig types in the settings layer.
-- picocode merges OpenRouter preferences in `agent/build.rs::merge_openrouter_params`, which runs on
+- prior merges OpenRouter preferences in `agent/build.rs::merge_openrouter_params`, which runs on
   both the build path and the per-turn override path (`request_additional_params`) — routing
   carried in `AgentConfig` therefore reaches both paths automatically, preserving the baked ==
   per-turn parity invariant that `build.rs` tests assert. It used to pin
@@ -100,7 +100,7 @@ pub struct Routing {
   today. A nested `[models."id".routing]` header would be the TOML-1.0-legal alternative for
   external-tool compatibility, but needs table-vs-value branching in
   `parse_fragment`/`apply_one`, header line scanning, and an `Item::Table` build path in
-  `write_to_doc` — not worth it while picocode is the file's only consumer.
+  `write_to_doc` — not worth it while prior is the file's only consumer.
 - `deny_unknown_fields` + the existing key-vocabulary machinery gives loud typo errors inside the
   table for free (a nested suggestion needs a small extension to `suggest_key` — `"routing.only"`
   style keys, or a dedicated message naming the accepted routing keys).

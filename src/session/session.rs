@@ -3938,7 +3938,7 @@ mod tests {
         // triggers. Use the MEANINGFUL case: target = a0 -> predecessor = u0.
         // A `tempfile::TempDir`, not a hand-named path under `temp_dir()`: it
         // is removed on drop, so a passing test leaves nothing in `/tmp` and
-        // the hundreds of `picocode-cmp-boundary-*` directories that pattern
+        // the hundreds of `prior-cmp-boundary-*` directories that pattern
         // accumulated stop growing.
         let dir = tempfile::tempdir().unwrap();
         let filename = session_filename(&chrono::Utc::now());

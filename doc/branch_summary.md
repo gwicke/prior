@@ -44,7 +44,7 @@ native confirm → `submit()` writes. Only the effect differs, and only in
 ## pi parity — verified against `~/src/pi`
 
 The placement is the whole feature, and it is the opposite of what the deleted
-picocode code did (`git show 09fcbd4^:src/agent.rs`, which wrote the summary at
+prior code did (`git show 09fcbd4^:src/agent.rs`, which wrote the summary at
 the **spur tip** with `from_id` = the **common ancestor**):
 
 - `SessionManager.branchWithSummary` (`core/session-manager.ts:1302`) sets
@@ -117,7 +117,7 @@ From `core/compaction/branch-summarization.ts`:
   retry/Es-cancel for the whole request.
 - **UX**: when the selected entry is a *user message*, pi sets the new leaf to
   that message's **parent** and pre-fills the **input buffer** with its text
-  (re-edit semantics). picocode splits this off as its own row —
+  (re-edit semantics). prior splits this off as its own row —
   `/tree <id> edit` — because "continue after this prompt" (`switch cursor`,
   leaf = the entry) and "replace this prompt" (`edit`, leaf = its parent) are
   both wanted; see below.

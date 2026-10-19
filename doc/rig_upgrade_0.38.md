@@ -31,7 +31,7 @@ where `Self::Error = rig::client::ProviderClientError` for all standard
 providers.
 
 Fix: unwrap at every call site with `?` (inside `create_agent`, which returns
-`Result<...>`), and add `From<ProviderClientError>` to `PicocodeError`.
+`Result<...>`), and add `From<ProviderClientError>` to `PriorError`.
 
 ### 2. `Agent<M>` -> `Agent<M, P>` (hook carried in the type)
 

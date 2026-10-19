@@ -38,7 +38,7 @@ fn normalize_args_in_place(name: &str, args: &mut serde_json::Value) {
     };
     match name {
         "bash" => {
-            // Pi uses "command"; old picocode used "cmd".
+            // Pi uses "command"; old prior used "cmd".
             if let Some(cmd) = obj.remove("cmd") {
                 obj.insert("command".into(), cmd);
             }
@@ -289,7 +289,7 @@ impl JsonlSessionStorage {
         // Split into lines, replace the first line (header)
         let mut lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
-            return Err(crate::PicocodeError::Other(
+            return Err(crate::PriorError::Other(
                 "Session file is empty, cannot update header".into(),
             ));
         }
@@ -300,7 +300,7 @@ impl JsonlSessionStorage {
 
         // Write to temp file in same directory (for atomic rename on same filesystem)
         let parent_dir = self.path.parent().ok_or_else(|| {
-            crate::PicocodeError::Other("Session file has no parent directory".into())
+            crate::PriorError::Other("Session file has no parent directory".into())
         })?;
 
         let temp_path = parent_dir.join(format!(".{}.tmp", Uuid::now_v7()));
@@ -337,7 +337,7 @@ impl JsonlSessionStorage {
 
         // Use unsafe to call utimensat for precise mtime restoration
         let path_cstr = std::ffi::CString::new(self.path.as_os_str().as_encoded_bytes())
-            .map_err(|e| crate::PicocodeError::Other(format!("Invalid path for CString: {}", e)))?;
+            .map_err(|e| crate::PriorError::Other(format!("Invalid path for CString: {}", e)))?;
         unsafe {
             libc::utimensat(
                 libc::AT_FDCWD,
@@ -363,7 +363,7 @@ impl SessionStorage for JsonlSessionStorage {
         let first_line = content
             .lines()
             .next()
-            .ok_or_else(|| crate::PicocodeError::Other("Session file is empty".into()))?;
+            .ok_or_else(|| crate::PriorError::Other("Session file is empty".into()))?;
         let header: SessionHeader = serde_json::from_str(first_line)?;
         Ok(header)
     }
@@ -384,7 +384,7 @@ impl SessionStorage for JsonlSessionStorage {
 
         let lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
-            return Err(crate::PicocodeError::Other("Session file is empty".into()));
+            return Err(crate::PriorError::Other("Session file is empty".into()));
         }
 
         // First line is always the header.
@@ -446,7 +446,7 @@ impl SessionStorage for JsonlSessionStorage {
                         //  valid JSON."
                         continue;
                     }
-                    return Err(crate::PicocodeError::Other(format!(
+                    return Err(crate::PriorError::Other(format!(
                         "Failed to parse session entry at line {}: {}",
                         i + 2,
                         e
@@ -883,7 +883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_picocode_output_is_pi_compatible() {
+    async fn test_prior_output_is_pi_compatible() {
         let (_guard, storage, path) = create_temp_storage().await;
 
         // Write header

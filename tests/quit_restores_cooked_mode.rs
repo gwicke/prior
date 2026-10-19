@@ -54,13 +54,13 @@ fn run_quit_on_pty() -> (String, libc::tcflag_t) {
         .expect("open pty");
     let master_fd = pair.master.as_raw_fd().expect("master fd");
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
     // Isolate from the developer's real config, sessions and tokens — the
     // test only needs the prompt loop to start and `/quit` to leave it.
     cmd.env("HOME", home.path());
     cmd.env("XDG_CONFIG_HOME", home.path().join(".config"));
     cmd.env("TERM", "xterm-256color");
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn prior");
 
     let mut reader = pair.master.try_clone_reader().expect("clone reader");
     let mut writer = pair.master.take_writer().expect("take writer");
@@ -93,7 +93,7 @@ fn run_quit_on_pty() -> (String, libc::tcflag_t) {
     while lflag(master_fd) & libc::ICANON != 0 {
         assert!(
             Instant::now() < raw_deadline,
-            "picocode never entered raw mode (output so far: {:?})",
+            "prior never entered raw mode (output so far: {:?})",
             String::from_utf8_lossy(&bytes.lock().unwrap())
         );
         thread::sleep(Duration::from_millis(20));
@@ -127,12 +127,12 @@ fn run_quit_on_pty() -> (String, libc::tcflag_t) {
             Ok(None) => {
                 assert!(
                     Instant::now() < exit_deadline,
-                    "picocode did not exit after /quit (output so far: {:?})",
+                    "prior did not exit after /quit (output so far: {:?})",
                     String::from_utf8_lossy(&bytes.lock().unwrap())
                 );
                 thread::sleep(Duration::from_millis(20));
             }
-            Err(e) => panic!("waiting for picocode failed: {e}"),
+            Err(e) => panic!("waiting for prior failed: {e}"),
         }
     }
 
