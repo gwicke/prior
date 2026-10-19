@@ -889,9 +889,11 @@ mod tests {
     #[test]
     fn context_figure_merges_report_and_estimate() {
         use super::SessionUsage;
-        let mut u = SessionUsage::default();
         // No report yet: the estimate stands in.
-        u.estimated_input_tokens = 42_000;
+        let mut u = SessionUsage {
+            estimated_input_tokens: 42_000,
+            ..Default::default()
+        };
         assert_eq!(u.context_figure(), 42_000);
 
         // A completion reports: the provider's own count wins.

@@ -657,7 +657,7 @@ async fn edit_files_with(
         };
         results.push(blockedit::FileResult { path, result });
     }
-    if let Some(ctx) = context.as_deref_mut() {
+    if let Some(ctx) = context {
         if !resolutions.files.is_empty() {
             ctx.insert_result(resolutions);
         }

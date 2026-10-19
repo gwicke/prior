@@ -423,7 +423,7 @@ impl SlashDotNode for ModelNode {
                 *self.pending_edit.borrow_mut() = Some(PendingEdit {
                     epoch,
                     model: model.clone(),
-                    settings,
+                    settings: *settings,
                 });
                 SubmitResult::Prepared(Some((
                     format!("Save these settings for {model}"),
