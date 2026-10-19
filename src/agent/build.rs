@@ -298,13 +298,19 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
         (signed_in $vendor:literal $auth:expr) => {{
             build!(@builder signed_in_builder($vendor, &model, $auth)?)
         }};
-        // Every other provider. OpenRouter and Z.AI used to get an ephemeral
-        // `cache_control` breakpoint on the system prompt and the last message;
-        // rig 0.45 has no such switch for the OpenAI family (its cache option
-        // speaks OpenAI's `prompt_cache_retention`, and refuses models that keep
-        // only a long cache), so the breakpoint is dropped rather than emulated
-        // with an option that can fail a run. Both gateways still cache
-        // automatically where the upstream model does.
+        // OpenRouter: the `cache_control` breakpoint the fork put on the system
+        // prompt and last message, now a generation option. A one-hour marker
+        // is preferred; OpenRouter's automatically-caching upstreams refuse one,
+        // and `openrouter_cache_retention` asks rig which model this is rather
+        // than keeping a copy of its upstream list.
+        (cached_openrouter $client:expr) => {{
+            let model: rig_core::driver::DynModel<rig_core::operation::Completion> =
+                $client.completion(&model).into();
+            let retention = openrouter_cache_retention(&model);
+            build!(@builder AgentBuilder::new(model).cache(retention))
+        }};
+        // Every other provider. Z.AI (both endpoints) caches implicitly and has
+        // no retention control, so there is nothing to send.
         ($client:expr) => {{
             build!(@builder AgentBuilder::new($client.completion(&model)))
         }};
@@ -529,7 +535,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
         }
         "openrouter" => {
             check_env!("OPENROUTER_API_KEY");
-            build!(openrouter::from_env()?)
+            build!(cached_openrouter openrouter::from_env()?)
         }
         "perplexity" => {
             check_env!("PERPLEXITY_API_KEY");
@@ -648,6 +654,26 @@ where
 /// The handler key the signed-in model is registered under, inside the
 /// builder's own table.
 const SIGNED_IN_MODEL_KEY: &str = "model:signed-in";
+
+/// The cache retention to ask an OpenRouter model for.
+///
+/// A one-hour `cache_control` marker is preferred. The upstreams that cache
+/// automatically (`openai/`, `deepseek/`, `x-ai/`, `groq/`) refuse one, and a
+/// refusal fails the run, so `check` is asked which this model is: a dry run
+/// that sends nothing and reads no message. Only the cache option is set on
+/// that request, so a refusal is the cache's.
+fn openrouter_cache_retention(
+    model: &rig_core::driver::DynModel<rig_core::operation::Completion>,
+) -> rig_core::completion::CacheRetention {
+    use rig_core::completion::{CacheRetention, CheckError, CompletionRequest, GenerationOptions};
+
+    let long = CompletionRequest::new("cache check")
+        .options(GenerationOptions::default().cache(CacheRetention::Long));
+    match model.check(&long) {
+        Err(CheckError::Unsupported(_)) => CacheRetention::Short,
+        _ => CacheRetention::Long,
+    }
+}
 
 /// The base URL a `llama-server` client sends to.
 ///
@@ -1133,6 +1159,31 @@ mod tests {
             false,
         );
         assert!(signed_in_builder("copilot", "gpt-5-codex", auth).is_ok());
+    }
+
+    /// OpenRouter takes a one-hour cache marker for the upstreams that cache on
+    /// request, but refuses one for the upstreams that cache automatically;
+    /// asking `check` is what keeps prior from failing those runs (or shipping a
+    /// copy of rig's upstream list).
+    #[test]
+    fn openrouter_asks_for_the_longest_cache_the_upstream_takes() {
+        use rig_core::completion::CacheRetention;
+        use rig_core::driver::DynModel;
+        use rig_core::operation::Completion;
+
+        let retention = |model: &str| {
+            let model: DynModel<Completion> = openrouter::new("test-key").completion(model).into();
+            openrouter_cache_retention(&model)
+        };
+
+        // Anthropic-style upstreams take an explicit breakpoint.
+        assert_eq!(
+            retention("anthropic/claude-sonnet-4.5"),
+            CacheRetention::Long
+        );
+        // These cache automatically and refuse a one-hour marker.
+        assert_eq!(retention("openai/gpt-5.5"), CacheRetention::Short);
+        assert_eq!(retention("deepseek/deepseek-chat"), CacheRetention::Short);
     }
 
     #[test]
