@@ -302,7 +302,7 @@ async fn draft_at_pivot(
                 crate::session::render_files_section(&mut file_section, &files, "Files");
                 if !file_section.is_empty() {
                     instruction.push_str("\n\n");
-                    instruction.push_str(&file_section.trim_start());
+                    instruction.push_str(file_section.trim_start());
                 }
             }
 
