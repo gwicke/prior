@@ -185,13 +185,13 @@ dependencies = [
 
 [[package]]
 name = "bsed"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bsed-blockedit",
  "globset",
+ "gwicke-sed-rs",
  "ignore",
  "portable-pty",
- "sed-rs",
  "serde_json",
  "serial_test",
  "similar",
@@ -331,20 +331,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
 dependencies = [
  "cc",
-]
-
-[[package]]
-name = "codewandler-markdown-stream"
-version = "0.2.1"
-source = "git+https://github.com/gwicke/codewandler-markdown?branch=main#738e12af256a81ea39168d386490c716520e4361"
-
-[[package]]
-name = "codewandler-markdown-terminal"
-version = "0.2.1"
-source = "git+https://github.com/gwicke/codewandler-markdown?branch=main#738e12af256a81ea39168d386490c716520e4361"
-dependencies = [
- "codewandler-markdown-stream",
- "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -952,6 +938,34 @@ dependencies = [
  "futures-core",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "gwicke-markdown-stream"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5fa83152a4603045eacb4b9dd9dfc617398d6b305da07e9d40d6f33942435c4"
+
+[[package]]
+name = "gwicke-markdown-terminal"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6165e10fce625444567a70e73b7f856984f8c0c6c94fb74fbc2ce3eee5f8ccff"
+dependencies = [
+ "gwicke-markdown-stream",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "gwicke-sed-rs"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a29c284707f0d50e5b9e6e24f70f2f1797ecffef42e9435a89a9acc3d5d3cd9"
+dependencies = [
+ "clap",
+ "regex",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1691,14 +1705,14 @@ dependencies = [
  "bsed-blockedit",
  "chrono",
  "clap",
- "codewandler-markdown-stream",
- "codewandler-markdown-terminal",
  "console",
  "crossterm",
  "duct",
  "futures",
  "fuzzy-matcher",
  "globset",
+ "gwicke-markdown-stream",
+ "gwicke-markdown-terminal",
  "ignore",
  "libc",
  "memchr",
@@ -2318,17 +2332,6 @@ checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
 dependencies = [
  "core-foundation-sys",
  "libc",
-]
-
-[[package]]
-name = "sed-rs"
-version = "2.0.0"
-source = "git+https://github.com/gwicke/sed-rs.git?branch=main#93309fa5bcef90a6c3f16bf33bc22425340540c8"
-dependencies = [
- "clap",
- "regex",
- "tempfile",
- "thiserror 2.0.21",
 ]
 
 [[package]]
