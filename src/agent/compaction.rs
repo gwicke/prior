@@ -281,11 +281,31 @@ async fn draft_at_pivot(
             // the committed line wins; otherwise the setting (with
             // built-in fallback).
             let settings = app_state.settings();
-            let instruction = if llm_payload.trim().is_empty() {
+            let mut instruction = if llm_payload.trim().is_empty() {
                 settings.llm_compact_prompt()
             } else {
                 llm_payload.to_string()
             };
+
+            // Append cumulative file list (same as manual/text-only: previous
+            // summary files first with custom labels preserved, then newly
+            // touched files in last-access order). This gives the LLM a
+            // structured reference and the user an editable list in the editor.
+            let (files, _) = crate::session::merge_files_with_previous(
+                seed_text.as_deref(),
+                &since,
+                session_dir,
+            );
+            if !files.is_empty() {
+                let mut file_section = String::new();
+                crate::session::render_files_section(&mut file_section, &files, "Documents");
+                crate::session::render_files_section(&mut file_section, &files, "Files");
+                if !file_section.is_empty() {
+                    instruction.push_str("\n\n");
+                    instruction.push_str(&file_section.trim_start());
+                }
+            }
+
             // The leaf sits at the predecessor, so this reads the scoped
             // prefix — a previous compaction at or before the point
             // enters as its leading <summary> wrapper, and retries

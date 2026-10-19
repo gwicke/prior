@@ -450,7 +450,7 @@ fn previous_text_without_file_sections(summary: &str) -> String {
 /// the front in their original relative order. Auto-recorded files (descriptor
 /// = "read"/"modified"/""/None) are moved to the end in order of last access
 /// within the current compaction span (most recent last).
-fn merge_files_with_previous<T: Borrow<SessionEntry>>(
+pub(crate) fn merge_files_with_previous<T: Borrow<SessionEntry>>(
     previous_summary: Option<&str>,
     entries: &[T],
     session_dir: &std::path::Path,
