@@ -445,6 +445,11 @@ fn previous_text_without_file_sections(summary: &str) -> String {
 /// preserved), then files newly touched in `entries` (chronological), with
 /// read→modified promotion in place. Returns the files plus the previous
 /// summary's non-file notes (used by manual mode).
+///
+/// Ordering: custom-labeled files (descriptor ≠ "read"/"modified"/"") stay at
+/// the front in their original relative order. Auto-recorded files (descriptor
+/// = "read"/"modified"/""/None) are moved to the end in order of last access
+/// within the current compaction span (most recent last).
 fn merge_files_with_previous<T: Borrow<SessionEntry>>(
     previous_summary: Option<&str>,
     entries: &[T],
@@ -460,32 +465,111 @@ fn merge_files_with_previous<T: Borrow<SessionEntry>>(
         notes = parsed_notes;
     }
 
-    let mut seen_paths: std::collections::HashSet<String> =
-        files.iter().map(|f| f.path.clone()).collect();
+    // Path -> current index in `files`. Updated on every move/append.
+    let mut path_to_index: std::collections::HashMap<String, usize> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.path.clone(), i))
+        .collect();
 
-    let mut new_files: Vec<TouchedFile> = Vec::new();
+    // Walk entries chronologically; process assistant tool calls in order.
     for entry in entries {
         if let SessionEntryContent::Message { message } = &entry.borrow().content {
             if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                collect_touched_files(message, &mut new_files, session_dir);
-            }
-        }
-    }
-
-    for new_file in new_files {
-        if let Some(existing) = files.iter_mut().find(|f| f.path == new_file.path) {
-            if new_file.modified {
-                existing.modified = true;
-                if existing.descriptor.as_deref() == Some("read") {
-                    existing.descriptor = Some("modified".to_string());
+                let touches = extract_touches_from_message(message, session_dir);
+                for (path, modified) in touches {
+                    handle_touch(&mut files, &mut path_to_index, path, modified);
                 }
             }
-        } else if seen_paths.insert(new_file.path.clone()) {
-            files.push(new_file);
         }
     }
 
     (files, notes)
+}
+
+/// Check if a TouchedFile has a custom descriptor (not auto-generated).
+fn is_custom_labeled(file: &TouchedFile) -> bool {
+    matches!(
+        file.descriptor.as_deref(),
+        Some(d) if d != "read" && d != "modified" && !d.is_empty()
+    )
+}
+
+/// Promote a file's status from read to modified if the new touch is a write/edit.
+fn promote_if_needed(file: &mut TouchedFile, modified: bool) {
+    if modified && !file.modified {
+        file.modified = true;
+        if file.descriptor.as_deref() == Some("read") {
+            file.descriptor = Some("modified".to_string());
+        }
+    }
+}
+
+/// Handle a single file touch: move auto-recorded files to end, keep custom in place.
+fn handle_touch(
+    files: &mut Vec<TouchedFile>,
+    path_to_index: &mut std::collections::HashMap<String, usize>,
+    path: String,
+    modified: bool,
+) {
+    if let Some(&idx) = path_to_index.get(&path) {
+        // File already tracked
+        if is_custom_labeled(&files[idx]) {
+            // Custom-labeled: stay in place, only promote if needed
+            promote_if_needed(&mut files[idx], modified);
+        } else {
+            // Auto-recorded: move to end
+            let mut file = files.remove(idx);
+            // Fix indices for shifted elements (idx .. len)
+            for i in idx..files.len() {
+                path_to_index.insert(files[i].path.clone(), i);
+            }
+            promote_if_needed(&mut file, modified);
+            let new_idx = files.len();
+            files.push(file);
+            path_to_index.insert(path, new_idx);
+        }
+    } else {
+        // New file: append to end as auto-recorded
+        let new_file = TouchedFile {
+            path: path.clone(),
+            modified,
+            descriptor: None,
+        };
+        let new_idx = files.len();
+        files.push(new_file);
+        path_to_index.insert(path, new_idx);
+    }
+}
+
+/// Extract (path, modified) pairs from assistant tool calls in a message.
+fn extract_touches_from_message(
+    message: &serde_json::Value,
+    session_dir: &std::path::Path,
+) -> Vec<(String, bool)> {
+    let mut touches = Vec::new();
+    if let Some(content) = message.get("content").and_then(|c| c.as_array()) {
+        for item in content {
+            if item.get("type").and_then(|t| t.as_str()) != Some("toolCall") {
+                continue;
+            }
+            let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let modified = matches!(name, "write" | "edit");
+            if !matches!(name, "read" | "write" | "edit") {
+                continue;
+            }
+            if let Some(path) = item
+                .get("arguments")
+                .and_then(|a| a.get("path"))
+                .and_then(|p| p.as_str())
+            {
+                let normalized =
+                    relativize_path(session_dir, path).unwrap_or_else(|| path.to_string());
+                touches.push((normalized, modified));
+            }
+        }
+    }
+    touches
 }
 
 /// Build the deterministic "text only" summary for a compaction draft.
