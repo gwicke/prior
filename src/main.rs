@@ -373,9 +373,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Recipe { name: _ } => {
             let agent = create_agent(agent_config.clone()).await?;
             if let Some(r) = recipe {
-                let prompt =
-                    prior::config::read_prompt(r.prompt.clone(), r.prompt_file.clone())?
-                        .ok_or("Recipe must have either 'prompt' or 'prompt_file'")?;
+                let prompt = prior::config::read_prompt(r.prompt.clone(), r.prompt_file.clone())?
+                    .ok_or("Recipe must have either 'prompt' or 'prompt_file'")?;
                 let response = agent.run_once(prompt).await?;
                 if r.is_error(&response)? {
                     return Err(Box::new(prior::PriorError::Other(

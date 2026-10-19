@@ -3,8 +3,8 @@
 //!
 //! One taxonomy, three entry points: [`classify_prompt_error`] for the blocking
 //! `chat()` surface used by `summarize`, [`classify_stream_error`] for the
-//! streaming turn, and [`classify_completion_error`] underneath both — every
-//! provider error arrives as a `CompletionError` wearing some transport's
+//! streaming turn, and [`classify_provider_error`] underneath both — every
+//! provider error arrives as a `ProviderError` wearing some transport's
 //! clothes, and this is the only place the shapes are unwrapped.
 //!
 //! [`retry_budget`] and [`retry_delay_ms`] are what the REPL applies to
@@ -13,27 +13,35 @@
 //! retryable at all is decided by `PriorError::is_auto_retryable`, and the
 //! budget deliberately covers every one of them.
 
-use rig_agent::agent::StreamingError;
-use rig_agent::completion::{CompletionError, PromptError};
+use rig_agent::completion::PromptError;
+use rig_core::error::ProviderError;
 
 /// Classify a non-streaming `PromptError` (returned from the blocking
 /// `chat()` surface used by `summarize`) into the same structured
 /// `PriorError` taxonomy the streaming path uses. Without this, a
 /// `/tree --summarize` 429 surfaces as the generic
-/// `PriorError::Other("summarize: CompletionError: HttpError: …")` and
+/// `PriorError::Other("summarize: ProviderError: Http …")` and
 /// loses the Retry-After hint.
 pub(crate) fn classify_prompt_error(e: &PromptError, op: &str) -> crate::PriorError {
     use crate::PriorError::*;
     match e {
-        PromptError::CompletionError(ce) => {
-            let classified = classify_completion_error(ce);
+        PromptError::Provider(provider_error) => {
+            let classified = classify_provider_error(provider_error);
             // Re-tag the display so the user sees which op failed.
             match classified {
-                Other(_) | Llm(_) => Llm(format!("{op}: {ce}")),
+                Other(_) | Llm(_) => Llm(format!("{op}: {provider_error}")),
                 other => other,
             }
         }
-        PromptError::MaxTurnsError { max_turns, .. } => LlmMaxTurns {
+        PromptError::Report(report) => {
+            let classified = classify_report(report);
+            // Re-tag the display so the user sees which op failed.
+            match classified {
+                Other(_) | Llm(_) => Llm(format!("{op}: {report}")),
+                other => other,
+            }
+        }
+        PromptError::MaxTurns { max_turns, .. } => LlmMaxTurns {
             max_turns: *max_turns,
         },
         PromptError::UnknownToolCall {
@@ -44,8 +52,10 @@ pub(crate) fn classify_prompt_error(e: &PromptError, op: &str) -> crate::PriorEr
             tool_name: tool_name.clone(),
             available: available_tools.clone(),
         },
-        PromptError::PromptCancelled { reason, .. } => Cancelled(reason.clone()),
-        PromptError::MemoryError(_) => Other(format!("{op}: {e}")),
+        PromptError::Cancelled { reason, .. } => Cancelled(reason.clone()),
+        // `PromptError` is `#[non_exhaustive]`: memory failures and any future
+        // variant are reported verbatim.
+        _ => Other(format!("{op}: {e}")),
     }
 }
 
@@ -129,41 +139,33 @@ pub(crate) fn retry_delay_ms(e: &crate::PriorError, consecutive_failures: u8) ->
     retry_base_ms().saturating_mul(1u64 << n)
 }
 
-/// Classify a `StreamingError` into a structured `PriorError` variant.
+/// Classify a streamed run's `PromptError` into a structured `PriorError`.
 /// `prompt()` invokes this on every non-cancellation stream error. The
 /// return is what the REPL shows the user, what determines whether the
 /// REPL auto-retries, and (for malformed tool calls) the synthetic
 /// feedback the model sees on the retry. Status / headers / body come
-/// from the `provider_response_*` accessors on `CompletionError` (rig
-/// `error.rs` `forward_provider_response_helpers!`); unknown
-/// `ResponseError(String)` shapes fall through to `LlmStreamProtocol`.
-pub(crate) fn classify_stream_error(e: &StreamingError) -> crate::PriorError {
-    let ce: &CompletionError = match e {
-        StreamingError::Completion(ce) => ce,
-        StreamingError::Prompt(prompt_err) => match prompt_err.as_ref() {
-            PromptError::CompletionError(ce) => ce,
-            PromptError::MaxTurnsError { max_turns, .. } => {
-                return crate::PriorError::LlmMaxTurns {
-                    max_turns: *max_turns,
-                };
-            }
-            PromptError::UnknownToolCall {
-                tool_name,
-                available_tools,
-                ..
-            } => {
-                return crate::PriorError::LlmUnknownTool {
-                    tool_name: tool_name.clone(),
-                    available: available_tools.clone(),
-                };
-            }
-            // PromptCancelled is handled by the caller before this fn runs.
-            PromptError::PromptCancelled { .. } | PromptError::MemoryError(_) => {
-                return crate::PriorError::Other(e.to_string());
-            }
+/// from the `provider_response_*` accessors on `ProviderError`; unknown
+/// `ProviderError::Response(String)` shapes fall through to `LlmStreamProtocol`.
+pub(crate) fn classify_stream_error(e: &PromptError) -> crate::PriorError {
+    use crate::PriorError::*;
+    match e {
+        PromptError::Provider(provider_error) => classify_provider_error(provider_error),
+        PromptError::Report(report) => classify_report(report),
+        PromptError::MaxTurns { max_turns, .. } => LlmMaxTurns {
+            max_turns: *max_turns,
         },
-    };
-    classify_completion_error(ce)
+        PromptError::UnknownToolCall {
+            tool_name,
+            available_tools,
+            ..
+        } => LlmUnknownTool {
+            tool_name: tool_name.clone(),
+            available: available_tools.clone(),
+        },
+        // Cancellation is handled by the caller before this fn runs, and every
+        // other variant (memory, reports, future ones) is reported verbatim.
+        _ => Other(e.to_string()),
+    }
 }
 
 /// Reduce a provider's error body to one line a human can act on.
@@ -287,70 +289,121 @@ fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Classify a `CompletionError` into a structured `PriorError`.
+/// Classify a provider failure into a structured `PriorError`.
 ///
-/// Exposed for unit tests; `classify_stream_error` is the production
-/// entry point and unwraps both `StreamingError` variants before
-/// delegating here.
-pub(crate) fn classify_completion_error(ce: &CompletionError) -> crate::PriorError {
+/// Exposed for unit tests; `classify_stream_error` and
+/// `classify_prompt_error` are the production entry points and unwrap the
+/// `PromptError` before delegating here.
+pub(crate) fn classify_provider_error(ce: &ProviderError) -> crate::PriorError {
     use crate::PriorError::*;
     if let Some(status) = ce.provider_response_status() {
-        let code = status.as_u16();
         // A 2xx "success" status cannot signal failure on its own: some
         // providers (OpenRouter, GMICloud via SSE) stream an error envelope
         // *inside* a 200 OK body, so those defer to the body-based envelope
         // detection below. Every genuine failure status (and the odd 1xx/3xx)
         // classifies from the status directly.
         if !status.is_success() {
-            let headers = ce.provider_response_headers();
-            let retry_after_secs = headers
-                .and_then(|h| h.get("retry-after"))
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| {
-                    // Retry-After can be either a delta-seconds integer or an
-                    // HTTP-date. We only handle the integer form (the form
-                    // OpenRouter and most providers use for rate limits).
-                    s.parse::<u64>().ok()
-                });
-            // The body is the provider's own account of what it rejected. rig
-            // keeps it verbatim on the error, so there is no reason to show the
-            // user a status code and nothing else.
-            let detail = provider_error_detail(ce.provider_response_body());
-            return match code {
-                401 | 403 => LlmAuth { status: code },
-                402 => LlmBilling { status: code },
-                429 => LlmRateLimited { retry_after_secs },
-                500..=599 => LlmUpstream {
-                    status: code,
-                    detail,
-                },
-                400..=499 => LlmClient {
-                    status: code,
-                    detail,
-                },
-                // 1xx/3xx are not errors at the transport layer; treat as
-                // generic.
-                _ => Other(ce.to_string()),
-            };
+            return classify_status(
+                status.as_u16(),
+                ce.provider_response_headers(),
+                ce.provider_response_body(),
+            );
         }
     }
 
     match ce {
-        CompletionError::HttpError(_) => LlmTransport(ce.to_string()),
-        CompletionError::ProviderError(_) => LlmTransport(ce.to_string()),
-        CompletionError::ResponseError(msg) => {
+        ProviderError::Http(_) => LlmTransport(ce.to_string()),
+        // A rig-side diagnostic rather than the provider's own reply: still a
+        // transport-level failure, never a provider verdict.
+        ProviderError::Provider(_) => LlmTransport(ce.to_string()),
+        ProviderError::Response(msg) => {
             detect_response_error(msg).unwrap_or_else(|| LlmStreamProtocol(msg.clone()))
         }
         // SSE streamed the provider's error envelope as the terminal event:
-        // rig's `completion_error_from_body` builds this as a
-        // `ProviderResponse` with NO HTTP status (or a 2xx one from
-        // `from_http_response`). The body IS the JSON envelope, so run the
-        // same detector the `ResponseError` path uses instead of falling
-        // through to `Other` (which is not auto-retryable).
-        CompletionError::ProviderResponse(pre) => {
-            detect_response_error(&pre.body).unwrap_or_else(|| Other(ce.to_string()))
+        // rig builds this as a `ProviderResponse` with NO HTTP status (or a 2xx
+        // one from `from_http_response`). The body IS the JSON envelope, so run
+        // the same detector the `Response` path uses instead of falling through
+        // to `Other` (which is not auto-retryable).
+        ProviderError::ProviderResponse(response)
+        | ProviderError::InvalidAuthentication(response) => {
+            detect_response_error(&response.body).unwrap_or_else(|| Other(ce.to_string()))
         }
         _ => Other(ce.to_string()),
+    }
+}
+
+/// Classify a relayed failure (`PromptError::Report`).
+///
+/// A provider failure that crossed a handler or a stream boundary arrives as
+/// an [`ErrorReport`](rig_core::error::ErrorReport) rather than a
+/// `ProviderError`. The report preserves the same status, headers and body a
+/// direct error would carry (and, unlike the direct error, its `http_status`
+/// survives the relay), so the status path is shared rather than duplicated.
+pub(crate) fn classify_report(report: &rig_core::error::ErrorReport) -> crate::PriorError {
+    use crate::PriorError::*;
+    use rig_core::error::ErrorKind;
+
+    if let Some(status) = report.provider_response_status() {
+        if !status.is_success() {
+            return classify_status(
+                status.as_u16(),
+                report.provider_response_headers(),
+                report.provider_response_body(),
+            );
+        }
+    }
+    if let Some(body) = report.provider_response_body() {
+        if let Some(classified) = detect_response_error(body) {
+            return classified;
+        }
+    }
+    match report.kind {
+        ErrorKind::Http | ErrorKind::Timeout => LlmTransport(report.to_string()),
+        ErrorKind::Cancelled => Cancelled(report.message.clone()),
+        ErrorKind::Response | ErrorKind::Json => detect_response_error(&report.message)
+            .unwrap_or_else(|| LlmStreamProtocol(report.message.clone())),
+        _ => detect_response_error(&report.message).unwrap_or_else(|| Other(report.to_string())),
+    }
+}
+
+/// The status/body classification shared by a direct provider error and a
+/// relayed report.
+fn classify_status(
+    code: u16,
+    headers: Option<&rig_core::http_client::HeaderMap>,
+    body: Option<&str>,
+) -> crate::PriorError {
+    use crate::PriorError::*;
+    let retry_after_secs = headers
+        .and_then(|h| h.get("retry-after"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            // Retry-After can be either a delta-seconds integer or an
+            // HTTP-date. We only handle the integer form (the form
+            // OpenRouter and most providers use for rate limits).
+            s.parse::<u64>().ok()
+        });
+    // The body is the provider's own account of what it rejected. rig keeps
+    // it verbatim on the error, so there is no reason to show the user a
+    // status code and nothing else.
+    let detail = provider_error_detail(body);
+    match code {
+        401 | 403 => LlmAuth { status: code },
+        402 => LlmBilling { status: code },
+        429 => LlmRateLimited { retry_after_secs },
+        500..=599 => LlmUpstream {
+            status: code,
+            detail,
+        },
+        400..=499 => LlmClient {
+            status: code,
+            detail,
+        },
+        // 1xx/3xx are not errors at the transport layer; treat as generic.
+        _ => Other(detail.0.map_or_else(
+            || format!("HTTP status {code}"),
+            |d| format!("HTTP {code}: {d}"),
+        )),
     }
 }
 
@@ -358,8 +411,8 @@ pub(crate) fn classify_completion_error(ce: &CompletionError) -> crate::PriorErr
 /// with no richer classification. Today this covers the
 /// assembler-emitted malformed-tool-call message and the OpenRouter-style
 /// JSON error envelopes that some providers stream in the body of a 200 OK
-/// response (rig captures those as `CompletionError::ProviderResponse` with
-/// no HTTP status — or as `ResponseError(String)` on other transports). The
+/// response (rig captures those as `ProviderError::ProviderResponse` with
+/// no HTTP status — or as `ProviderError::Response(String)` on other transports). The
 /// latter surfaces as `error.code: 429` with
 /// `error_type: "rate_limit_exceeded"` (or `provider_unavailable`) inside a
 /// JSON envelope; without this detection it falls through to
@@ -381,7 +434,7 @@ fn detect_response_error(msg: &str) -> Option<crate::PriorError> {
     // OpenRouter-style JSON envelope: `{"error":{"code":429,"message":"...",
     // "metadata":{"error_type":"rate_limit_exceeded"}}, ...}`. The body
     // is sometimes wrapped by `ProviderResponseError: ` (the `Display`
-    // output of `CompletionError::ProviderResponse(...)` when status is
+    // output of `ProviderError::ProviderResponse(...)` when status is
     // `None`); strip the prefix if present.
     let body = msg.strip_prefix("ProviderResponseError: ").unwrap_or(msg);
     if let Some(code) = extract_openrouter_error_code(body) {
@@ -441,14 +494,14 @@ mod tests {
     // so a future refactor can't silently turn a recoverable rate
     // limit into a fatal `Other` again.
 
-    use rig_agent::agent::StreamingError;
-    use rig_agent::completion::{CompletionError, PromptError};
+    use rig_agent::completion::PromptError;
+    use rig_core::error::ProviderError;
     use std::collections::HashMap;
 
     #[test]
     fn classify_429_with_retry_after_is_rate_limited_and_retryable() {
         // Simulate a HttpError with status 429 + Retry-After: 60. Rig
-        // surfaces this as CompletionError::HttpError(http_client::Error);
+        // surfaces this as ProviderError::Http(http_client::Error);
         // the provider_response_* helpers are wired by the
         // `impl_provider_response_helpers!` macro in rig-core. We can't
         // build a real `http_client::Error` here (it lives in a private
@@ -458,11 +511,11 @@ mod tests {
         // the body is unparseable. The real 429 path is exercised in
         // the integration tests; this unit test pins the contract for
         // a representative error string.
-        let err = CompletionError::ResponseError(
+        let err = ProviderError::Response(
         "tool call `edit` arrived with malformed JSON input: expected `,` or `}` at line 1 column 335"
             .into(),
     );
-        let classified = super::classify_completion_error(&err);
+        let classified = super::classify_provider_error(&err);
         match classified {
             PriorError::LlmMalformedToolCall {
                 ref tool_name,
@@ -489,12 +542,12 @@ mod tests {
         // is to paste the parse error and let the model retry, and that
         // works (the model re-reads the source and re-emits clean JSON).
         // Automate it — do not special-case it as non-retryable.
-        let err = CompletionError::ResponseError(
+        let err = ProviderError::Response(
             "tool call `edit` arrived with malformed JSON input: \
          control character (\\u0000-\\u001F) found while parsing a string at line 2 column 0"
                 .into(),
         );
-        let classified = super::classify_completion_error(&err);
+        let classified = super::classify_provider_error(&err);
         match classified {
             PriorError::LlmMalformedToolCall {
                 ref tool_name,
@@ -513,10 +566,10 @@ mod tests {
 
     #[test]
     fn classify_prompt_cancelled_is_not_retryable() {
-        let e = StreamingError::Prompt(Box::new(PromptError::prompt_cancelled(
-            Vec::<Message>::new(),
-            "user pressed Esc",
-        )));
+        let e = PromptError::Cancelled {
+            chat_history: Vec::<Message>::new(),
+            reason: "user pressed Esc".into(),
+        };
         let classified = super::classify_stream_error(&e);
         // The REPL converts this to a Cancelled at the call site; the
         // classifier itself should leave it as a prompt error. We
@@ -527,12 +580,12 @@ mod tests {
 
     #[test]
     fn unknown_tool_call_with_available_list_surfaces_usefully() {
-        let e = StreamingError::Prompt(Box::new(PromptError::UnknownToolCall {
+        let e = PromptError::UnknownToolCall {
             tool_name: "nonexistent".into(),
             available_tools: vec!["read".into(), "write".into()],
             allowed_tools: vec!["read".into(), "write".into()],
-            chat_history: Box::new(Vec::new()),
-        }));
+            chat_history: Vec::new(),
+        };
         let classified = super::classify_stream_error(&e);
         // Not retryable at the REPL layer: recovery is owned by
         // `LoggingHook::on_invalid_tool_call`, which uses the rig-run
@@ -562,11 +615,11 @@ mod tests {
 
     #[test]
     fn max_turns_error_is_not_retryable() {
-        let e = StreamingError::Prompt(Box::new(PromptError::MaxTurnsError {
+        let e = PromptError::MaxTurns {
             max_turns: 16,
-            chat_history: Box::new(Vec::new()),
-            prompt: Box::new(Message::user("test")),
-        }));
+            chat_history: Vec::new(),
+            prompt: Message::user("test"),
+        };
         let classified = super::classify_stream_error(&e);
         assert!(!classified.is_auto_retryable());
         let s = format!("{classified}");
@@ -578,8 +631,8 @@ mod tests {
         // A different ResponseError (e.g. SSE protocol violation) should
         // NOT be misclassified as MalformedToolCall. Falls through to
         // LlmStreamProtocol.
-        let err = CompletionError::ResponseError("unexpected EOF mid-stream".into());
-        let classified = super::classify_completion_error(&err);
+        let err = ProviderError::Response("unexpected EOF mid-stream".into());
+        let classified = super::classify_provider_error(&err);
         assert!(matches!(classified, PriorError::LlmStreamProtocol(_)));
     }
 
@@ -590,14 +643,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_str("60").unwrap());
         let body = HashMap::from([("error".to_string(), "rate_limited".to_string())]);
-        let ce = CompletionError::ProviderResponse(
+        let ce = ProviderError::ProviderResponse(
             ProviderResponseError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 serde_json::to_string(&body).unwrap(),
             )
-            .with_headers(Some(Box::new(headers))),
+            .with_headers(Some(headers)),
         );
-        let classified = super::classify_completion_error(&ce);
+        let classified = super::classify_provider_error(&ce);
         match classified {
             PriorError::LlmRateLimited {
                 ref retry_after_secs,
@@ -612,21 +665,21 @@ mod tests {
     #[test]
     fn classify_prompt_error_429_preserves_retry_after() {
         // The non-streaming `chat()` path used by `summarize` returns a
-        // `PromptError` rather than a `StreamingError`. A 429 must still
+        // `PromptError`. A 429 must still
         // classify as `LlmRateLimited` with the Retry-After hint preserved
         // so the REPL can back off correctly on `/tree --summarize`.
         use rig_core::http_client::{HeaderMap, HeaderValue, StatusCode};
         use rig_core::ProviderResponseError;
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_str("30").unwrap());
-        let ce = CompletionError::ProviderResponse(
+        let ce = ProviderError::ProviderResponse(
             ProviderResponseError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "{\"error\":\"rate_limited\"}".to_string(),
             )
-            .with_headers(Some(Box::new(headers))),
+            .with_headers(Some(headers)),
         );
-        let pe = PromptError::CompletionError(ce);
+        let pe = PromptError::Provider(ce);
         let classified = super::classify_prompt_error(&pe, "summarize");
         match classified {
             PriorError::LlmRateLimited { retry_after_secs } => {
@@ -678,10 +731,7 @@ mod tests {
             50
         );
         // Non-retryable: 0 retries.
-        assert_eq!(
-            super::retry_budget(&PriorError::LlmAuth { status: 401 }),
-            0
-        );
+        assert_eq!(super::retry_budget(&PriorError::LlmAuth { status: 401 }), 0);
         assert_eq!(
             super::retry_budget(&PriorError::LlmBilling { status: 402 }),
             0
@@ -833,11 +883,11 @@ mod tests {
         use rig_core::http_client::StatusCode;
         use rig_core::ProviderResponseError;
         let body = r#"{"id":"gen-1788441206-TngoywArM91X9nINXYNP","object":"chat.completion.chunk","created":1788441206,"model":"z-ai/glm-5.3-flash","provider":"DeepInfra","choices":[],"error":{"code":502,"message":"Upstream error from DeepInfra: TimeoutError: Timeout on reading data from socket","metadata":{"error_type":"provider_unavailable"}}}"#;
-        let ce = CompletionError::ProviderResponse(ProviderResponseError::new(
+        let ce = ProviderError::ProviderResponse(ProviderResponseError::new(
             StatusCode::BAD_GATEWAY,
             body.to_string(),
         ));
-        let classified = super::classify_completion_error(&ce);
+        let classified = super::classify_provider_error(&ce);
         match classified {
             PriorError::LlmUpstream { status, .. } => {
                 assert_eq!(status, 502);
@@ -851,7 +901,7 @@ mod tests {
     #[test]
     fn classify_http_client_error_sending_request_is_retryable_transport() {
         // The second error from the task: reqwest surfaces connection
-        // failures as `CompletionError::HttpError(Instance(...))`. It must
+        // failures as `ProviderError::Http(Instance(...))`. It must
         // classify as `LlmTransport` and be auto-retryable. We can't
         // construct a real reqwest::Error here, so we wrap a stub std
         // error via `Error::instance` (the boxed-error path reqwest uses).
@@ -861,8 +911,8 @@ mod tests {
             "error sending request for url (https://openrouter.ai/api/v1/chat/completions)",
         );
         let http_err = http_client::Error::instance(stub);
-        let ce = CompletionError::HttpError(http_err);
-        let classified = super::classify_completion_error(&ce);
+        let ce = ProviderError::Http(std::sync::Arc::new(http_err));
+        let classified = super::classify_provider_error(&ce);
         match classified {
             PriorError::LlmTransport(ref msg) => {
                 assert!(msg.contains("openrouter.ai"), "msg: {msg}");
@@ -876,14 +926,14 @@ mod tests {
     fn classify_openrouter_429_mid_stream_envelope_is_rate_limited() {
         // OpenRouter sometimes streams a 429 in the body of a 200 OK
         // response (the `error.code` field of a JSON envelope). Rig
-        // surfaces this as `CompletionError::ProviderResponse(...)` with
+        // surfaces this as `ProviderError::ProviderResponse(...)` with
         // `status == None` and the JSON body as the `Display` string. The
         // classifier must extract the 429 and map it to `LlmRateLimited`
         // so the REPL's Retry-After floor and the 50-attempt budget
         // apply.
         let envelope = r#"ProviderResponseError: {"id":"gen-1788453950-hBER7wC6ldCU829zmnAe","object":"chat.completion.chunk","created":1788453950,"model":"unknown","provider":"GMICloud","choices":[],"error":{"code":429,"message":"Provider returned error","metadata":{"error_type":"rate_limit_exceeded"}}}"#;
-        let err = CompletionError::ResponseError(envelope.to_string());
-        let classified = super::classify_completion_error(&err);
+        let err = ProviderError::Response(envelope.to_string());
+        let classified = super::classify_provider_error(&err);
         match classified {
             PriorError::LlmRateLimited { retry_after_secs } => {
                 assert_eq!(retry_after_secs, None);
@@ -898,8 +948,8 @@ mod tests {
         // Same envelope shape, but with a 5xx code. Must map to
         // `LlmUpstream { status: 502 }`.
         let envelope = r#"ProviderResponseError: {"error":{"code":502,"message":"Upstream error from DeepInfra: TimeoutError","metadata":{"error_type":"provider_unavailable"}}}"#;
-        let err = CompletionError::ResponseError(envelope.to_string());
-        let classified = super::classify_completion_error(&err);
+        let err = ProviderError::Response(envelope.to_string());
+        let classified = super::classify_provider_error(&err);
         match classified {
             PriorError::LlmUpstream { status, .. } => {
                 assert_eq!(status, 502);
@@ -913,7 +963,7 @@ mod tests {
     fn classify_provider_response_429_envelope_without_status_is_rate_limited() {
         // The production shape of the reported bug: rig's SSE decoder
         // (`completion_error_from_body`) turns a terminal error envelope
-        // streamed inside a 200 OK into `CompletionError::ProviderResponse`
+        // streamed inside a 200 OK into `ProviderError::ProviderResponse`
         // with NO HTTP status and the raw JSON as the body — NOT a
         // `ResponseError` with a prefixed string (which the sibling tests
         // above emulate). Previously this fell through to `Other` (Display
@@ -922,14 +972,14 @@ mod tests {
         // and map it to `LlmRateLimited` so the REPL's budget applies.
         use rig_core::ProviderResponseError;
         let body = r#"{"id":"gen-1788464790-qEKKA0Klq7sLFL2HAM4O","object":"chat.completion.chunk","created":1788464790,"model":"unknown","provider":"GMICloud","choices":[],"error":{"code":429,"message":"Provider returned error","metadata":{"error_type":"rate_limit_exceeded"}}}"#;
-        let ce = CompletionError::ProviderResponse(ProviderResponseError::without_status(
+        let ce = ProviderError::ProviderResponse(ProviderResponseError::without_status(
             body.to_string(),
         ));
         // Sanity-check the fixture matches the production wiring: no HTTP
         // status is preserved, so only body-based envelope detection can
         // classify this.
         assert_eq!(ce.provider_response_status(), None);
-        let classified = super::classify_completion_error(&ce);
+        let classified = super::classify_provider_error(&ce);
         match classified {
             PriorError::LlmRateLimited { retry_after_secs } => {
                 assert_eq!(retry_after_secs, None);
@@ -949,11 +999,11 @@ mod tests {
         use rig_core::http_client::StatusCode;
         use rig_core::ProviderResponseError;
         let body = r#"{"id":"gen-x","object":"chat.completion.chunk","created":0,"model":"unknown","provider":"GMICloud","choices":[],"error":{"code":502,"message":"Upstream error","metadata":{"error_type":"provider_unavailable"}}}"#;
-        let ce = CompletionError::ProviderResponse(ProviderResponseError::new(
+        let ce = ProviderError::ProviderResponse(ProviderResponseError::new(
             StatusCode::OK,
             body.to_string(),
         ));
-        let classified = super::classify_completion_error(&ce);
+        let classified = super::classify_provider_error(&ce);
         match classified {
             PriorError::LlmUpstream { status, .. } => {
                 assert_eq!(status, 502);
@@ -970,10 +1020,10 @@ mod tests {
         // must keep the pre-fix behavior: fall through to `Other`, NOT get
         // auto-retried (there is no signal it is transient).
         use rig_core::ProviderResponseError;
-        let ce = CompletionError::ProviderResponse(ProviderResponseError::without_status(
+        let ce = ProviderError::ProviderResponse(ProviderResponseError::without_status(
             "provider exploded".to_string(),
         ));
-        let classified = super::classify_completion_error(&ce);
+        let classified = super::classify_provider_error(&ce);
         assert!(
             matches!(classified, PriorError::Other(_)),
             "expected Other, got {classified:?}"
@@ -987,8 +1037,8 @@ mod tests {
         // provider's envelope) should not match — falls through to
         // `LlmStreamProtocol` as before.
         let envelope = r#"{"id":"x","error":"invalid_argument"}"#;
-        let err = CompletionError::ResponseError(envelope.to_string());
-        let classified = super::classify_completion_error(&err);
+        let err = ProviderError::Response(envelope.to_string());
+        let classified = super::classify_provider_error(&err);
         assert!(matches!(classified, PriorError::LlmStreamProtocol(_)));
     }
 
@@ -998,11 +1048,11 @@ mod tests {
         // detection must keep working alongside the new OpenRouter
         // envelope detection — they share the same `detect_response_error`
         // entry point.
-        let err = CompletionError::ResponseError(
+        let err = ProviderError::Response(
             "tool call `edit` arrived with malformed JSON input: expected `,` or `}` at line 1"
                 .into(),
         );
-        let classified = super::classify_completion_error(&err);
+        let classified = super::classify_provider_error(&err);
         assert!(matches!(
             classified,
             PriorError::LlmMalformedToolCall { .. }

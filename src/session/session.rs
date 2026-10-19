@@ -19,8 +19,12 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use rig_core::message::{
-    AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolCall, ToolCallId,
-    ToolFunction, ToolResult, ToolResultContent, UserContent,
+    AssistantContent, CallId, Message, Reasoning, Text, ToolFunction, ToolResult,
+    ToolResultContent, UserContent,
+};
+
+use crate::agent::transcript::{
+    assistant_content, assistant_message, response_id, tool_call, tool_name,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -58,9 +62,10 @@ use crate::session::types::*;
 /// `render_blob`, `canonicalize_edit_value`, and
 /// `normalize_args_in_place` (the reload path).
 fn canonicalize_edit_tool_calls(msg: &Message) -> Option<Message> {
-    let Message::Assistant { id, content } = msg else {
+    let Message::Assistant(turn) = msg else {
         return None;
     };
+    let content = &turn.content;
     let needs = content
         .iter()
         .any(|c| matches!(c, AssistantContent::ToolCall(tc) if tc.function.name == "edit"));
@@ -77,17 +82,18 @@ fn canonicalize_edit_tool_calls(msg: &Message) -> Option<Message> {
             new_content.push(c.clone());
             continue;
         }
-        match crate::edit_blocks::per_file_blocks(&tc.function.arguments) {
+        match crate::edit_blocks::per_file_blocks(&tc.function.arguments_value()) {
             Some(per_file) => {
                 let n = per_file.len();
                 for (i, blocks) in per_file.iter().enumerate() {
                     let mut single = tc.clone();
                     single.id = crate::edit_blocks::split_id(&tc.id, i, n);
-                    single.provider = None;
-                    single.signature = None;
-                    single.additional_params = None;
-                    single.function.arguments = crate::edit_blocks::canonicalize_edit_value(
-                        &serde_json::json!({ "blocks": blocks }),
+                    single.native = None;
+                    single.function = ToolFunction::new(
+                        tc.function.name.clone(),
+                        crate::edit_blocks::canonicalize_edit_value(
+                            &serde_json::json!({ "blocks": blocks }),
+                        ),
                     );
                     new_content.push(AssistantContent::ToolCall(single));
                 }
@@ -97,16 +103,18 @@ fn canonicalize_edit_tool_calls(msg: &Message) -> Option<Message> {
             // degrades to being stored raw rather than being lost.
             None => {
                 let mut tc = tc.clone();
-                tc.function.arguments =
-                    crate::edit_blocks::canonicalize_edit_value(&tc.function.arguments);
+                tc.function = ToolFunction::new(
+                    tc.function.name.clone(),
+                    crate::edit_blocks::canonicalize_edit_value(&tc.function.arguments_value()),
+                );
                 new_content.push(AssistantContent::ToolCall(tc));
             }
         }
     }
-    Some(Message::Assistant {
-        id: id.clone(),
-        content: new_content,
-    })
+    Some(assistant_message(
+        response_id(turn).map(str::to_string),
+        new_content,
+    ))
 }
 
 /// Split a multi-file `edit` result into N per-file results, so the stored
@@ -148,7 +156,6 @@ fn split_edit_tool_results(msg: &Message) -> Option<Message> {
         for (i, f) in files.iter().enumerate() {
             let mut single = tr.clone();
             single.call = crate::edit_blocks::split_id(&tr.call, i, n);
-            single.provider = None;
             // Each result is that file's single-file result verbatim: a success
             // note, or the full `{ui_view, model_view}` envelope. Re-serializing
             // the object is deliberate — the file's outcome must survive the
@@ -1260,11 +1267,11 @@ impl Session {
 
         // Before serialising, extract tool call names from an Assistant message
         // so tool result entries can carry the correct "toolName".
-        if let Message::Assistant { content, .. } = msg {
+        {
             let mut map = self.tool_name_by_call_id.lock().unwrap();
-            for item in content.iter() {
+            for item in assistant_content(msg).iter() {
                 if let AssistantContent::ToolCall(tc) = item {
-                    map.insert(tc.id.clone().into_string(), tc.function.name.clone());
+                    map.insert(tc.id.to_string(), tc.function.name.to_string());
                 }
             }
         }
@@ -1875,12 +1882,12 @@ pub(crate) fn pi_message_to_rig(value: &serde_json::Value) -> Option<Message> {
         }
         "assistant" => {
             let content = pi_content_to_assistant_content(value.get("content")?)?;
-            Some(Message::Assistant {
-                id: value
+            Some(crate::agent::transcript::assistant_message(
+                value
                     .get("responseId")
                     .and_then(|v| v.as_str().map(String::from)),
                 content,
-            })
+            ))
         }
         _ => None,
     }
@@ -1908,13 +1915,15 @@ fn pi_toolresult_to_rig(value: &serde_json::Value) -> Option<ToolResult> {
     let content = pi_content_to_toolresult_content(value.get("content")?)?;
 
     Some(ToolResult {
-        call: ToolCallId::new(id)?,
-        provider: None,
-        name: value
-            .get("toolName")
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_else(|| "tool".to_string()),
+        call: CallId::from_wire(id),
+        name: tool_name(
+            value
+                .get("toolName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool"),
+        ),
         content,
+        is_error: false,
     })
 }
 
@@ -1945,25 +1954,25 @@ fn pi_content_to_assistant_content(content: &serde_json::Value) -> Option<Vec<As
             }
             "thinking" => {
                 let thinking = item.get("thinking")?.as_str()?;
-                let signature = item
-                    .get("thinkingSignature")
-                    .and_then(|s| s.as_str().map(String::from));
-                items.push(AssistantContent::Reasoning(Reasoning::new_with_signature(
-                    thinking, signature,
-                )));
+                // pi stores the provider's thinking signature beside the text;
+                // rig 0.45 keeps provider data in the block's `native` item, so
+                // the signature rides there and is written back out below.
+                let block = AssistantContent::Reasoning(Reasoning::new(thinking));
+                let signature = item.get("thinkingSignature").and_then(|s| s.as_str());
+                items.push(match signature {
+                    Some(signature) => block.with_native(serde_json::json!({
+                        "type": "thinking",
+                        "thinking": thinking,
+                        "signature": signature,
+                    })),
+                    None => block,
+                });
             }
             "toolCall" => {
-                let id = item.get("id")?.as_str()?.to_string();
-                let name = item.get("name")?.as_str()?.to_string();
+                let id = item.get("id")?.as_str()?;
+                let name = item.get("name")?.as_str()?;
                 let arguments = item.get("arguments")?.clone();
-                let tc = ToolCall {
-                    id: ToolCallId::new(id)?,
-                    provider: None,
-                    function: ToolFunction::new(name, arguments),
-                    signature: None,
-                    additional_params: None,
-                };
-                items.push(AssistantContent::ToolCall(tc));
+                items.push(AssistantContent::ToolCall(tool_call(id, name, arguments)));
             }
             _ => {}
         }
@@ -2074,7 +2083,7 @@ pub(crate) fn rig_message_to_pi_entries(
                             content: SessionEntryContent::Message {
                                 message: serde_json::json!({
                                     "role": "toolResult",
-                                    "toolCallId": tr.call.as_str(),
+                                    "toolCallId": tr.call.to_string(),
                                     "toolName": "tool",
                                     "content": content_items,
                                     "isError": false,
@@ -2088,57 +2097,39 @@ pub(crate) fn rig_message_to_pi_entries(
             }
             entries
         }
-        Message::Assistant { id, content } => {
+        Message::Assistant(turn) => {
             let mut pi_content: Vec<serde_json::Value> = Vec::new();
-            for c in content.iter() {
+            for c in turn.content.iter() {
                 match c {
                     AssistantContent::Text(t) => {
                         pi_content.push(serde_json::json!({"type":"text","text":t.text}));
                     }
                     AssistantContent::Reasoning(r) => {
-                        for rc in &r.content {
-                            match rc {
-                                ReasoningContent::Text { text, signature } => {
-                                    let mut obj = serde_json::json!({
-                                        "type": "thinking",
-                                        "thinking": text,
-                                    });
-                                    if let Some(sig) = signature {
-                                        obj["thinkingSignature"] =
-                                            serde_json::Value::String(sig.clone());
-                                    }
-                                    pi_content.push(obj);
-                                }
-                                ReasoningContent::Encrypted(data) => {
-                                    pi_content.push(serde_json::json!({
-                                        "type": "thinking",
-                                        "thinking": format!("[encrypted: {}]", data),
-                                    }));
-                                }
-                                ReasoningContent::Redacted { data } => {
-                                    pi_content.push(serde_json::json!({
-                                        "type": "thinking",
-                                        "thinking": format!("[redacted: {}]", data),
-                                    }));
-                                }
-                                ReasoningContent::Summary(s) => {
-                                    pi_content.push(serde_json::json!({
-                                        "type": "thinking",
-                                        "thinking": s,
-                                    }));
-                                }
-                            }
+                        let mut obj = serde_json::json!({
+                            "type": "thinking",
+                            "thinking": r.text,
+                        });
+                        // The provider's thinking signature, when the block
+                        // still holds it (round-tripped through `native`).
+                        if let Some(sig) = r
+                            .native
+                            .as_ref()
+                            .and_then(|native| native.item.get("signature"))
+                            .and_then(|sig| sig.as_str())
+                        {
+                            obj["thinkingSignature"] = serde_json::Value::String(sig.to_string());
                         }
+                        pi_content.push(obj);
                     }
                     AssistantContent::ToolCall(tc) => {
                         pi_content.push(serde_json::json!({
                             "type": "toolCall",
-                            "id": tc.id,
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
+                            "id": tc.id.to_string(),
+                            "name": tc.function.name.to_string(),
+                            "arguments": tc.function.arguments_value(),
                         }));
                     }
-                    AssistantContent::Image(_) => {}
+                    _ => {}
                 }
             }
 
@@ -2146,8 +2137,8 @@ pub(crate) fn rig_message_to_pi_entries(
                 "role": "assistant",
                 "content": pi_content,
             });
-            if let Some(aid) = id {
-                message["responseId"] = serde_json::Value::String(aid.clone());
+            if let Some(aid) = response_id(turn) {
+                message["responseId"] = serde_json::Value::String(aid.to_string());
             }
 
             let entry = SessionEntry {
@@ -2211,6 +2202,7 @@ pub(crate) fn derive_model_change<T: Borrow<SessionEntry>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::transcript::text_tool_result;
     use crate::session::storage::JsonlSessionStorage;
     use crate::session::types::session_filename;
     use std::path::Path;
@@ -2351,17 +2343,23 @@ mod tests {
         });
         let msg = pi_message_to_rig(&pi).unwrap();
         match msg {
-            Message::Assistant { id, content } => {
-                assert_eq!(id, Some("msg_001".into()));
+            Message::Assistant(turn) => {
+                let id = response_id(&turn);
+                let content = &turn.content;
+                assert_eq!(id, Some("msg_001"));
                 assert_eq!(content.len(), 2);
                 match content.first().unwrap() {
-                    AssistantContent::Reasoning(r) => match &r.content[0] {
-                        ReasoningContent::Text { text, signature } => {
-                            assert_eq!(text, "let me think");
-                            assert_eq!(signature.as_deref(), Some("sig123"));
-                        }
-                        _ => panic!("expected ReasoningContent::Text"),
-                    },
+                    AssistantContent::Reasoning(r) => {
+                        assert_eq!(r.text, "let me think");
+                        // The signature rides the block's provider item.
+                        assert_eq!(
+                            r.native
+                                .as_ref()
+                                .and_then(|native| native.item.get("signature"))
+                                .and_then(|sig| sig.as_str()),
+                            Some("sig123")
+                        );
+                    }
                     _ => panic!("expected Reasoning"),
                 }
                 match content.get(1).unwrap() {
@@ -2383,11 +2381,12 @@ mod tests {
         });
         let msg = pi_message_to_rig(&pi).unwrap();
         match msg {
-            Message::Assistant { content, .. } => {
-                assert_eq!(content.len(), 1);
+            Message::Assistant(turn) => {
+                assert_eq!(turn.content.len(), 1);
+                let content = &turn.content;
                 match content.first().unwrap() {
                     AssistantContent::ToolCall(tc) => {
-                        assert_eq!(tc.id, "tc_001");
+                        assert_eq!(tc.id.to_string(), "tc_001");
                         assert_eq!(tc.function.name, "bash");
                         // pi_message_to_rig is a raw conversion, not a
                         // normalisation step.  The "cmd" field is preserved
@@ -2461,18 +2460,18 @@ mod tests {
         }
 
         // 2: assistant with tool call
-        assert!(matches!(&messages[1], Message::Assistant { .. }));
+        assert!(matches!(&messages[1], Message::Assistant(_)));
 
         // 3: user with 2 tool results (batched)
         assert!(matches!(&messages[2], Message::User { .. }));
         if let Message::User { content } = &messages[2] {
             assert_eq!(content.len(), 2);
             match content.first().unwrap() {
-                UserContent::ToolResult(tr) => assert_eq!(tr.call.as_str(), "tc_1"),
+                UserContent::ToolResult(tr) => assert_eq!(tr.call.to_string(), "tc_1"),
                 _ => panic!("expected ToolResult"),
             }
             match content.get(1).unwrap() {
-                UserContent::ToolResult(tr) => assert_eq!(tr.call.as_str(), "tc_2"),
+                UserContent::ToolResult(tr) => assert_eq!(tr.call.to_string(), "tc_2"),
                 _ => panic!("expected ToolResult"),
             }
         }
@@ -2752,16 +2751,17 @@ mod tests {
 
     #[test]
     fn test_rig_assistant_with_reasoning_roundtrip() {
-        let assistant = Message::Assistant {
-            id: Some("resp-1".into()),
-            content: vec![
-                AssistantContent::Reasoning(Reasoning::new_with_signature(
-                    "step by step",
-                    Some("sig".into()),
-                )),
+        let assistant = assistant_message(
+            Some("resp-1".into()),
+            vec![
+                AssistantContent::Reasoning(Reasoning::new("step by step")).with_native(
+                    serde_json::json!({
+                        "type": "thinking", "thinking": "step by step", "signature": "sig",
+                    }),
+                ),
                 AssistantContent::Text(Text::new("done")),
             ],
-        };
+        );
 
         let entries = rig_message_to_pi_entries(&assistant, "a1", &None);
         assert_eq!(entries.len(), 1);
@@ -2769,17 +2769,22 @@ mod tests {
         let converted = extract_messages(&entries);
         assert_eq!(converted.len(), 1);
         match &converted[0] {
-            Message::Assistant { id, content } => {
-                assert_eq!(id.as_deref(), Some("resp-1"));
+            Message::Assistant(turn) => {
+                let id = response_id(turn);
+                let content = &turn.content;
+                assert_eq!(id, Some("resp-1"));
                 assert_eq!(content.len(), 2);
                 match content.first().unwrap() {
-                    AssistantContent::Reasoning(r) => match &r.content[0] {
-                        ReasoningContent::Text { text, signature } => {
-                            assert_eq!(text, "step by step");
-                            assert_eq!(signature.as_deref(), Some("sig"));
-                        }
-                        _ => panic!("expected ReasoningContent::Text"),
-                    },
+                    AssistantContent::Reasoning(r) => {
+                        assert_eq!(r.text, "step by step");
+                        assert_eq!(
+                            r.native
+                                .as_ref()
+                                .and_then(|native| native.item.get("signature"))
+                                .and_then(|sig| sig.as_str()),
+                            Some("sig")
+                        );
+                    }
                     _ => panic!("expected Reasoning"),
                 }
                 match content.get(1).unwrap() {
@@ -2795,10 +2800,10 @@ mod tests {
     fn test_rig_tool_result_roundtrip() {
         let tool_result = Message::User {
             content: vec![UserContent::ToolResult(ToolResult {
-                call: ToolCallId::new("tc_1").unwrap(),
-                provider: None,
-                name: "tool".into(),
+                call: CallId::from_wire("tc_1"),
+                name: tool_name("tool"),
                 content: vec![ToolResultContent::Text(Text::new("output"))],
+                is_error: false,
             })],
         };
 
@@ -2820,7 +2825,7 @@ mod tests {
             Message::User { content } => {
                 assert_eq!(content.len(), 1);
                 match content.first().unwrap() {
-                    UserContent::ToolResult(tr) => assert_eq!(tr.call.as_str(), "tc_1"),
+                    UserContent::ToolResult(tr) => assert_eq!(tr.call.to_string(), "tc_1"),
                     _ => panic!("expected ToolResult"),
                 }
             }
@@ -2857,19 +2862,14 @@ mod tests {
                               b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
 
     fn multi_call(id: &str) -> Message {
-        Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
-                id: rig_core::message::ToolCallId::new(id).unwrap(),
-                provider: None,
-                function: rig_core::message::ToolFunction::new(
-                    "edit".into(),
-                    serde_json::json!({ "blocks": MULTI_BLOB }),
-                ),
-                signature: None,
-                additional_params: None,
-            })],
-        }
+        assistant_message(
+            None,
+            vec![AssistantContent::ToolCall(tool_call(
+                id,
+                "edit",
+                serde_json::json!({ "blocks": MULTI_BLOB }),
+            ))],
+        )
     }
 
     fn multi_result(id: &str) -> Message {
@@ -2887,18 +2887,19 @@ mod tests {
         ]);
         Message::User {
             content: vec![UserContent::ToolResult(rig_core::message::ToolResult {
-                call: rig_core::message::ToolCallId::new(id).unwrap(),
-                provider: None,
-                name: "edit".into(),
+                call: CallId::from_wire(id),
+                name: tool_name("edit"),
                 content: vec![rig_core::message::ToolResultContent::text(array)],
+                is_error: false,
             })],
         }
     }
 
     fn calls_of(m: &Message) -> Vec<rig_core::message::ToolCall> {
-        let Message::Assistant { content, .. } = m else {
+        let Message::Assistant(turn) = m else {
             panic!("expected assistant")
         };
+        let content = &turn.content;
         content
             .iter()
             .filter_map(|c| match c {
@@ -2944,19 +2945,18 @@ mod tests {
             // layer, including collect_touched_files, stay unaware of
             // multi-file editing.
             assert_eq!(args.get("path").and_then(|v| v.as_str()), Some(*name));
-            assert!(args.get("edits").unwrap().is_array(), "{args}");
+            assert!(args.get("edits").unwrap().is_array(), "{args:?}");
             assert!(
                 args.get("blocks").is_none(),
-                "block form must not persist: {args}"
+                "block form must not persist: {args:?}"
             );
             // The derived id is the same one the result half uses.
             if i == 0 {
-                assert_eq!(calls[i].id.to_string(), format!("t1"));
+                assert_eq!(calls[i].id.to_string(), "t1".to_string());
             } else {
                 assert_eq!(calls[i].id.to_string(), format!("t1_f{i}n2"));
             }
-            assert!(calls[i].provider.is_none());
-            assert!(calls[i].signature.is_none());
+            assert!(calls[i].native.is_none());
         }
     }
 
@@ -2981,19 +2981,14 @@ mod tests {
 
     #[test]
     fn a_single_file_call_and_a_plain_result_are_untouched() {
-        let solo = Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
-                id: rig_core::message::ToolCallId::new("s1").unwrap(),
-                provider: None,
-                function: rig_core::message::ToolFunction::new(
-                    "edit".into(),
-                    serde_json::json!({"blocks": "solo.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END"}),
-                ),
-                signature: None,
-                additional_params: None,
-            })],
-        };
+        let solo = assistant_message(
+            None,
+            vec![AssistantContent::ToolCall(tool_call(
+                "s1",
+                "edit",
+                serde_json::json!({"blocks": "solo.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END"}),
+            ))],
+        );
         let out = canonicalize_edit_tool_calls(&solo).expect("assistant message");
         let calls = calls_of(&out);
         assert_eq!(calls.len(), 1, "a single-file call is never split into N");
@@ -3012,12 +3007,12 @@ mod tests {
         // passes through whole.
         let plain = Message::User {
             content: vec![UserContent::ToolResult(rig_core::message::ToolResult {
-                call: rig_core::message::ToolCallId::new("s1").unwrap(),
-                provider: None,
-                name: "edit".into(),
+                call: rig_core::message::CallId::from_wire("s1"),
+                name: tool_name("edit"),
                 content: vec![rig_core::message::ToolResultContent::text(
                     "Invalid block: bad",
                 )],
+                is_error: false,
             })],
         };
         assert_eq!(split_edit_tool_results(&plain), None);
@@ -3027,15 +3022,15 @@ mod tests {
     fn a_non_edit_tool_result_is_never_split() {
         let bash = Message::User {
             content: vec![UserContent::ToolResult(rig_core::message::ToolResult {
-                call: rig_core::message::ToolCallId::new("b1").unwrap(),
-                provider: None,
-                name: "bash".into(),
+                call: rig_core::message::CallId::from_wire("b1"),
+                name: tool_name("bash"),
                 // An array result from another tool must not be mistaken for
                 // ours: it has no `path` per entry, so parse_file_results
                 // rejects it.
                 content: vec![rig_core::message::ToolResultContent::text(
                     r#"[{"stdout":"hi"}]"#,
                 )],
+                is_error: false,
             })],
         };
         assert_eq!(split_edit_tool_results(&bash), None);
@@ -3115,7 +3110,8 @@ mod tests {
             .messages
             .iter()
             .flat_map(|m| match m {
-                Message::Assistant { content, .. } => content
+                Message::Assistant(turn) => turn
+                    .content
                     .iter()
                     .filter_map(|c| match c {
                         AssistantContent::ToolCall(tc) => Some(tc.id.to_string()),
@@ -3317,8 +3313,6 @@ mod tests {
     /// "insufficient tool messages following tool_calls message".
     #[tokio::test]
     async fn test_multiple_tool_results_all_preserved() {
-        use rig_core::message::{ToolResult, ToolResultContent};
-
         let _tmp = tempfile::tempdir().unwrap();
         let dir = _tmp.path().to_path_buf();
         let filename = session_filename(&chrono::Utc::now());
@@ -3339,64 +3333,34 @@ mod tests {
             .unwrap();
 
         // Assistant turn with three tool calls.
-        let assistant_with_tools = Message::Assistant {
-            id: None,
-            content: vec![
-                AssistantContent::ToolCall(rig_core::message::ToolCall {
-                    id: ToolCallId::new("tc_0").unwrap(),
-                    provider: None,
-                    function: rig_core::message::ToolFunction::new(
-                        "read".into(),
-                        serde_json::json!({}),
-                    ),
-                    signature: None,
-                    additional_params: None,
-                }),
-                AssistantContent::ToolCall(rig_core::message::ToolCall {
-                    id: ToolCallId::new("tc_1").unwrap(),
-                    provider: None,
-                    function: rig_core::message::ToolFunction::new(
-                        "read".into(),
-                        serde_json::json!({}),
-                    ),
-                    signature: None,
-                    additional_params: None,
-                }),
-                AssistantContent::ToolCall(rig_core::message::ToolCall {
-                    id: ToolCallId::new("tc_2").unwrap(),
-                    provider: None,
-                    function: rig_core::message::ToolFunction::new(
-                        "ls".into(),
-                        serde_json::json!({}),
-                    ),
-                    signature: None,
-                    additional_params: None,
-                }),
+        let assistant_with_tools = assistant_message(
+            None,
+            vec![
+                AssistantContent::ToolCall(tool_call("tc_0", "read", serde_json::json!({}))),
+                AssistantContent::ToolCall(tool_call("tc_1", "read", serde_json::json!({}))),
+                AssistantContent::ToolCall(tool_call("tc_2", "ls", serde_json::json!({}))),
             ],
-        };
+        );
         session.append_message(&assistant_with_tools).await.unwrap();
 
         // Three tool results in one User message.
         let tool_results = Message::User {
             content: vec![
-                UserContent::ToolResult(ToolResult {
-                    call: ToolCallId::new("tc_0").unwrap(),
-                    provider: None,
-                    name: "tool".into(),
-                    content: vec![ToolResultContent::Text(Text::new("result 0"))],
-                }),
-                UserContent::ToolResult(ToolResult {
-                    call: ToolCallId::new("tc_1").unwrap(),
-                    provider: None,
-                    name: "tool".into(),
-                    content: vec![ToolResultContent::Text(Text::new("result 1"))],
-                }),
-                UserContent::ToolResult(ToolResult {
-                    call: ToolCallId::new("tc_2").unwrap(),
-                    provider: None,
-                    name: "tool".into(),
-                    content: vec![ToolResultContent::Text(Text::new("result 2"))],
-                }),
+                UserContent::ToolResult(text_tool_result(
+                    CallId::from_wire("tc_0"),
+                    "tool",
+                    "result 0",
+                )),
+                UserContent::ToolResult(text_tool_result(
+                    CallId::from_wire("tc_1"),
+                    "tool",
+                    "result 1",
+                )),
+                UserContent::ToolResult(text_tool_result(
+                    CallId::from_wire("tc_2"),
+                    "tool",
+                    "result 2",
+                )),
             ],
         };
         session.append_message(&tool_results).await.unwrap();
@@ -3429,10 +3393,10 @@ mod tests {
             "all three tool results must be present after roundtrip"
         );
 
-        let ids: Vec<&str> = content
+        let ids: Vec<String> = content
             .iter()
             .map(|c| match c {
-                UserContent::ToolResult(tr) => tr.call.as_str(),
+                UserContent::ToolResult(tr) => tr.call.to_string(),
                 _ => panic!("expected ToolResult"),
             })
             .collect();
@@ -3462,10 +3426,6 @@ mod tests {
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        use rig_core::message::{
-            ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
-        };
-
         // --- Turn 1: user asks about weather, assistant responds with tool
         // call, tool executes, assistant gives final answer ---
         session
@@ -3473,29 +3433,23 @@ mod tests {
             .await
             .unwrap();
         session
-            .append_message(&Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::ToolCall(ToolCall {
-                    id: ToolCallId::new("call_abc").unwrap(),
-                    provider: None,
-                    function: ToolFunction::new(
-                        "get_weather".to_string(),
-                        serde_json::json!({"city": "NYC"}),
-                    ),
-                    signature: None,
-                    additional_params: None,
-                })],
-            })
+            .append_message(&assistant_message(
+                None,
+                vec![AssistantContent::ToolCall(tool_call(
+                    "call_abc",
+                    "get_weather",
+                    serde_json::json!({"city": "NYC"}),
+                ))],
+            ))
             .await
             .unwrap();
         session
             .append_message(&Message::User {
-                content: vec![UserContent::ToolResult(RigToolResult {
-                    call: ToolCallId::new("call_abc").unwrap(),
-                    provider: None,
-                    name: "tool".into(),
-                    content: vec![ToolResultContent::Text(Text::new("72F"))],
-                })],
+                content: vec![UserContent::ToolResult(text_tool_result(
+                    CallId::from_wire("call_abc"),
+                    "tool",
+                    "72F",
+                ))],
             })
             .await
             .unwrap();
@@ -3510,12 +3464,13 @@ mod tests {
 
         // Check alternation: user -> assistant(toolCall) -> user(toolResult) -> assistant(text)
         assert!(matches!(&ctx1.messages[0], Message::User { .. }));
-        assert!(matches!(&ctx1.messages[1], Message::Assistant { .. }));
+        assert!(matches!(&ctx1.messages[1], Message::Assistant(_)));
         assert!(matches!(&ctx1.messages[2], Message::User { .. }));
-        assert!(matches!(&ctx1.messages[3], Message::Assistant { .. }));
+        assert!(matches!(&ctx1.messages[3], Message::Assistant(_)));
 
         // Verify the tool call is present in message[1]
-        if let Message::Assistant { content, .. } = &ctx1.messages[1] {
+        if let Message::Assistant(turn) = &ctx1.messages[1] {
+            let content = &turn.content;
             let has_tool_call = content
                 .iter()
                 .any(|c| matches!(c, AssistantContent::ToolCall(_)));
@@ -3554,7 +3509,8 @@ mod tests {
         // followed by a tool result or another assistant message.
         for i in 0..ctx2.messages.len().saturating_sub(1) {
             let is_assistant_with_tool_call = match &ctx2.messages[i] {
-                Message::Assistant { content, .. } => content
+                Message::Assistant(turn) => turn
+                    .content
                     .iter()
                     .any(|c| matches!(c, AssistantContent::ToolCall(_))),
                 _ => false,
@@ -3994,36 +3950,29 @@ mod tests {
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        use rig_core::message::{
-            ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
-        };
-
         // Turn: user -> assistant(read tool call) -> user(tool result) -> assistant
         session
             .append_message(&Message::user("read file"))
             .await
             .unwrap();
         session
-            .append_message(&Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::ToolCall(ToolCall {
-                    id: ToolCallId::new("tc_read").unwrap(),
-                    provider: None,
-                    function: ToolFunction::new("read".into(), serde_json::json!({"path": "x.rs"})),
-                    signature: None,
-                    additional_params: None,
-                })],
-            })
+            .append_message(&assistant_message(
+                None,
+                vec![AssistantContent::ToolCall(tool_call(
+                    "tc_read",
+                    "read",
+                    serde_json::json!({"path": "x.rs"}),
+                ))],
+            ))
             .await
             .unwrap();
         session
             .append_message(&Message::User {
-                content: vec![UserContent::ToolResult(RigToolResult {
-                    call: ToolCallId::new("tc_read").unwrap(),
-                    provider: None,
-                    name: "tool".into(),
-                    content: vec![ToolResultContent::Text(Text::new("file contents"))],
-                })],
+                content: vec![UserContent::ToolResult(text_tool_result(
+                    CallId::from_wire("tc_read"),
+                    "tool",
+                    "file contents",
+                ))],
             })
             .await
             .unwrap();
@@ -4069,19 +4018,14 @@ mod tests {
 
         let blob = "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END";
         session
-            .append_message(&Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::ToolCall(ToolCall {
-                    id: ToolCallId::new("tc_edit").unwrap(),
-                    provider: None,
-                    function: ToolFunction::new(
-                        "edit".into(),
-                        serde_json::json!({"path": "src/x.rs", "blocks": blob}),
-                    ),
-                    signature: None,
-                    additional_params: None,
-                })],
-            })
+            .append_message(&assistant_message(
+                None,
+                vec![AssistantContent::ToolCall(tool_call(
+                    "tc_edit",
+                    "edit",
+                    serde_json::json!({"path": "src/x.rs", "blocks": blob}),
+                ))],
+            ))
             .await
             .unwrap();
 
@@ -4123,58 +4067,42 @@ mod tests {
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        use rig_core::message::{
-            ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
-        };
-
         // Turn: assistant calls two different tools, then user provides results.
         session
             .append_message(&Message::user("do things"))
             .await
             .unwrap();
         session
-            .append_message(&Message::Assistant {
-                id: None,
-                content: vec![
-                    AssistantContent::ToolCall(ToolCall {
-                        id: ToolCallId::new("tc_bash").unwrap(),
-                        provider: None,
-                        function: ToolFunction::new(
-                            "bash".into(),
-                            serde_json::json!({"command": "ls"}),
-                        ),
-                        signature: None,
-                        additional_params: None,
-                    }),
-                    AssistantContent::ToolCall(ToolCall {
-                        id: ToolCallId::new("tc_read").unwrap(),
-                        provider: None,
-                        function: ToolFunction::new(
-                            "read".into(),
-                            serde_json::json!({"path": "x.rs"}),
-                        ),
-                        signature: None,
-                        additional_params: None,
-                    }),
+            .append_message(&assistant_message(
+                None,
+                vec![
+                    AssistantContent::ToolCall(tool_call(
+                        "tc_bash",
+                        "bash",
+                        serde_json::json!({"command": "ls"}),
+                    )),
+                    AssistantContent::ToolCall(tool_call(
+                        "tc_read",
+                        "read",
+                        serde_json::json!({"path": "x.rs"}),
+                    )),
                 ],
-            })
+            ))
             .await
             .unwrap();
         session
             .append_message(&Message::User {
                 content: vec![
-                    UserContent::ToolResult(RigToolResult {
-                        call: ToolCallId::new("tc_bash").unwrap(),
-                        provider: None,
-                        name: "tool".into(),
-                        content: vec![ToolResultContent::Text(Text::new("file1.txt"))],
-                    }),
-                    UserContent::ToolResult(RigToolResult {
-                        call: ToolCallId::new("tc_read").unwrap(),
-                        provider: None,
-                        name: "tool".into(),
-                        content: vec![ToolResultContent::Text(Text::new("content"))],
-                    }),
+                    UserContent::ToolResult(text_tool_result(
+                        CallId::from_wire("tc_bash"),
+                        "tool",
+                        "file1.txt",
+                    )),
+                    UserContent::ToolResult(text_tool_result(
+                        CallId::from_wire("tc_read"),
+                        "tool",
+                        "content",
+                    )),
                 ],
             })
             .await
@@ -4229,10 +4157,6 @@ mod tests {
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        use rig_core::message::{
-            ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
-        };
-
         // Empty session: 0 user prompts.
         assert_eq!(session.count_persisted_user_prompts().await, 0);
 
@@ -4252,26 +4176,23 @@ mod tests {
 
         // A tool-result batch (role "toolResult") must NOT be counted.
         session
-            .append_message(&Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::ToolCall(ToolCall {
-                    id: ToolCallId::new("tc_read").unwrap(),
-                    provider: None,
-                    function: ToolFunction::new("read".into(), serde_json::json!({})),
-                    signature: None,
-                    additional_params: None,
-                })],
-            })
+            .append_message(&assistant_message(
+                None,
+                vec![AssistantContent::ToolCall(tool_call(
+                    "tc_read",
+                    "read",
+                    serde_json::json!({}),
+                ))],
+            ))
             .await
             .unwrap();
         session
             .append_message(&Message::User {
-                content: vec![UserContent::ToolResult(RigToolResult {
-                    call: ToolCallId::new("tc_read").unwrap(),
-                    provider: None,
-                    name: "tool".into(),
-                    content: vec![ToolResultContent::Text(Text::new("file contents"))],
-                })],
+                content: vec![UserContent::ToolResult(text_tool_result(
+                    CallId::from_wire("tc_read"),
+                    "tool",
+                    "file contents",
+                ))],
             })
             .await
             .unwrap();
@@ -5091,12 +5012,9 @@ mod tests {
     #[test]
     fn extract_seed_from_context_returns_none_for_non_user_message() {
         use crate::session::types::SessionContext;
-        use rig_core::message::Message;
+
         let ctx = SessionContext {
-            messages: vec![Message::Assistant {
-                id: None,
-                content: vec![],
-            }],
+            messages: vec![assistant_message(None, vec![])],
             thinking_level: None,
             model: None,
         };

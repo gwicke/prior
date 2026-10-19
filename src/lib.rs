@@ -57,8 +57,10 @@ pub use settings::{SettingKey, SettingsStore, ShowReasoning, ShowReasoningHandle
 
 // Re-export core rig types for library users
 pub use rig_agent::agent::AgentBuilder;
-pub use rig_core::client::{CompletionClient, ProviderClient};
-pub use rig_core::completion::CompletionModel;
+// rig 0.45 has no client capability traits: a provider client is a concrete
+// struct that builds `Model<..>` drivers, erased to `DynModel<Completion>` when
+// a consumer wants one model-agnostic type.
+pub use rig_core::driver::{DynModel, Model};
 pub use rig_core::providers;
 
 pub use agent::build::{create_agent, load_agents_md, AgentConfig};
@@ -238,7 +240,7 @@ pub enum PriorError {
     MissingApiKey(String, String),
 
     #[error("Provider client error: {0}")]
-    ProviderClient(#[from] rig_core::client::ProviderClientError),
+    ProviderClient(#[from] rig_core::client::EnvError),
 
     #[error("Regex error: {0}")]
     Regex(#[from] regex::Error),

@@ -27,6 +27,7 @@ use crate::termio::InputEvent;
 use crate::tools::set_sandbox;
 use crate::Result;
 
+use crate::agent::transcript::assistant_message;
 use rig_core::message::{AssistantContent, Message, Text};
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -744,10 +745,10 @@ impl Interactive {
                         let msg = Message::user(format!("Ran shell command: {cmd}"));
                         if let Some(s) = self.app_state.session() {
                             let _ = s.append_message(&msg).await;
-                            let reply = Message::Assistant {
-                                id: None,
-                                content: vec![AssistantContent::Text(Text::new(out.to_string()))],
-                            };
+                            let reply = assistant_message(
+                                None,
+                                vec![AssistantContent::Text(Text::new(out.to_string()))],
+                            );
                             let _ = s.append_message(&reply).await;
                         }
                     } else {

@@ -36,13 +36,15 @@ exclude = ["prior.gif", ".github/"]
 workspace = true
 
 [dependencies]
-rig-core = { version = "0.42.0", git = "https://github.com/gwicke/rig", branch = "main", features = ["derive"] }
+# `reqwest` gives the concrete provider clients their `from_env` / `client`
+# constructors on the shared `rig-reqwest` transport.
+rig-core = { version = "0.45.0", features = ["derive", "reqwest"] }
 slashdot-menu = { version = "0.1.0", path = "crates/slashdot-menu" }
 slashdot-tui = { version = "0.1.0", path = "crates/slashdot-tui" }
 bsed-blockedit = { version = "0.1.0", path = "crates/bsed-blockedit" }
 bsed = { version = "0.1.0", path = "crates/bsed" }
-rig-agent = { version = "0.42.0", git = "https://github.com/gwicke/rig", branch = "main", features = ["derive"] }
-rig-reqwest = { version = "0.42.0", git = "https://github.com/gwicke/rig", branch = "main" }
+rig-agent = { version = "0.45.0", features = ["derive"] }
+rig-reqwest = { version = "0.45.0" }
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -121,7 +123,7 @@ serial_test = "3.1"
 # (tests/quit_restores_cooked_mode.rs) — already a regular dependency; the
 # dev edge lets integration tests name it directly.
 libc = "0.2"
-rig-core = { git = "https://github.com/gwicke/rig", branch = "main", features = ["test-utils"] }
+rig-core = { version = "0.45.0", features = ["test-utils", "reqwest"] }
 # Test-only seams of the drawing crate (`TermIO::recording`, `RenderManager::draw`)
 # — features of a dependency unify per-build, so `cargo test` sees them and a
 # production `cargo build` does not.

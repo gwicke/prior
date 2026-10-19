@@ -1,5 +1,5 @@
+use rig_core::rig_tool;
 use rig_core::tool::{ToolContext, ToolErrorKind, ToolExecutionError};
-use rig_core::tool_macro as rig_tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -177,18 +177,22 @@ whichever bound is reached first ends the read; 0 means the default for both. A 
 stops before the end of the file ends with a footer giving the byte position and the next \
 `offset`/`byte_offset` to continue from. Page by lines with `offset`, or by bytes with \
 `byte_offset` for files with very long lines; they are mutually exclusive.",
+    // Parameter descriptions ride the macro, not doc comments: rustc rejects a
+    // doc comment on a function parameter before the attribute macro can strip
+    // it.
+    params(
+        offset = "0-based line to start from (0 = start of file). Must be 0 when `byte_offset` is set.",
+        limit = "Max lines to return: 0 = default 500, clamped to 2000.",
+        byte_offset = "Absolute byte to start from, snapped to a UTF-8 boundary; 0 = use `offset`. Byte paging for files with very long lines. Must be 0 when `offset` is set.",
+        byte_limit = "Max bytes of content: 0 = default 10240, clamped to 51200."
+    ),
     required(path)
 )]
 pub async fn read_file(
     path: String,
-    /// 0-based line to start from (0 = start of file). Must be 0 when `byte_offset` is set.
     offset: ReadOffset,
-    /// Max lines to return: 0 = default 500, clamped to 2000.
     limit: ReadLimit,
-    /// Absolute byte to start from, snapped to a UTF-8 boundary; 0 = use `offset`.
-    /// Byte paging for files with very long lines. Must be 0 when `offset` is set.
     byte_offset: ByteOffset,
-    /// Max bytes of content: 0 = default 10240, clamped to 51200.
     byte_limit: ByteLimit,
 ) -> Result<String, ToolError> {
     let p = get_path(&path)?;
@@ -581,7 +585,7 @@ pub async fn edit_files(files: Vec<FileEdit>) -> Result<String, ToolError> {
 /// Attached to the tool context via [`ToolContext::insert_result`] so the
 /// history-rewrite hook can anchor a successful call without re-reading a file
 /// that has already changed. Never sent to the model and never persisted.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FileResolution {
     pub path: String,
     pub matched_lines: Vec<usize>,
@@ -591,9 +595,17 @@ pub struct FileResolution {
 ///
 /// Failed files are absent: there is no resolved line to anchor them to, so
 /// their calls are replayed unchanged.
-#[derive(Clone, Debug, Default)]
+///
+/// A [`ContextValue`] because rig 0.45 stores host-only tool-result metadata as
+/// serializable, keyed context values; the key is prior's own, since this
+/// never leaves the process.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct EditResolutions {
     pub files: Vec<FileResolution>,
+}
+
+impl rig_core::tool::ContextValue for EditResolutions {
+    const KEY: &'static str = "prior.edit.resolutions";
 }
 
 /// The tool entry point. The context is optional so tests and `bsed`-style
@@ -619,7 +631,7 @@ async fn edit_files_with(
         }
         if let Some(ctx) = context.as_deref_mut() {
             if !resolutions.files.is_empty() {
-                ctx.insert_result(resolutions);
+                let _ = ctx.insert_result(resolutions);
             }
         }
         return Ok(raw);
@@ -659,7 +671,7 @@ async fn edit_files_with(
     }
     if let Some(ctx) = context {
         if !resolutions.files.is_empty() {
-            ctx.insert_result(resolutions);
+            let _ = ctx.insert_result(resolutions);
         }
     }
     Ok(bsed_blockedit::render_file_results(&results))
@@ -3653,6 +3665,7 @@ mod edit_file_tests {
         assert!(raw.contains("Replaced 1 block(s)"));
         let res = ctx
             .result::<EditResolutions>()
+            .expect("the result slot always decodes")
             .expect("successful edits carry placements");
         assert_eq!(res.files.len(), 1);
         assert_eq!(res.files[0].path, "anchor.txt");
@@ -3681,7 +3694,7 @@ mod edit_file_tests {
         )
         .await
         .unwrap();
-        assert!(ctx.result::<EditResolutions>().is_none());
+        assert!(ctx.result::<EditResolutions>().unwrap().is_none());
     }
 }
 
@@ -3694,16 +3707,23 @@ mod edit_args_wire_tests {
 
     use super::*;
     use crate::edit_match::looks_like_edit_failure;
-    use rig_core::tool::{ErasedTool, ToolContext};
+    use rig_core::serve::adapters::ToolAdapter;
+    use rig_core::tool::ToolContext;
     use serial_test::serial;
 
     /// Run the tool exactly as the runtime would: serialize the args JSON to
     /// a string and dispatch through the erased boundary.
     async fn execute_edit(args_json: serde_json::Value) -> rig_core::tool::ToolResult {
-        let ctx = &mut ToolContext::new();
-        EditFile
-            .execute(serde_json::to_string(&args_json).unwrap(), ctx)
+        // The same dispatch path a real call takes: arguments parsed, errors
+        // mapped, output converted.
+        let mut ctx = ToolContext::new();
+        match ToolAdapter::new(EditFile)
+            .run_with(&mut ctx, args_json)
             .await
+        {
+            Ok(output) => rig_core::tool::ToolResult::success(output),
+            Err(error) => rig_core::tool::ToolResult::failed(error),
+        }
     }
 
     // ---- Batch shape ----
@@ -4328,7 +4348,7 @@ mod edit_args_wire_tests {
     fn schema_is_flat_with_no_anyof() {
         // The whole point of v2: a flat bag of optional scalars, with NO
         // `anyOf` union or nested array that weak harnesses stringify.
-        let schema = EditFile.parameters();
+        let schema = <EditFile as rig_core::tool::Tool>::parameters(&EditFile);
         assert!(
             schema.get("anyOf").is_none(),
             "schema must not use anyOf: {schema}"
@@ -4345,7 +4365,7 @@ mod edit_args_wire_tests {
                 "missing property `{key}`: {schema}"
             );
         }
-        let desc = EditFile.description();
+        let desc = <EditFile as rig_core::tool::Tool>::description(&EditFile);
         assert!(
             props.get("endLine").is_none(),
             "`endLine` must no longer be advertised: {schema}"
@@ -4417,7 +4437,7 @@ mod edit_args_wire_tests {
     /// the block form.
     #[test]
     fn every_advertised_property_is_one_the_parser_reads() {
-        let schema = EditFile.parameters();
+        let schema = <EditFile as rig_core::tool::Tool>::parameters(&EditFile);
         let props = schema
             .get("properties")
             .and_then(|v| v.as_object())
@@ -4452,7 +4472,7 @@ mod edit_args_wire_tests {
 
         // The description must name the advertised field, or the model is told
         // one thing and handed another.
-        let desc = EditFile.description();
+        let desc = <EditFile as rig_core::tool::Tool>::description(&EditFile);
         assert!(
             desc.contains(BLOCKS_FIELD),
             "the description must name the field it advertises: {desc}"
@@ -4784,14 +4804,16 @@ mod rename_verification {
     //! call crosses. Written to fail loudly if any layer drifts back.
     use super::*;
     use crate::edit_match::looks_like_edit_failure;
-    use rig_core::tool::{ErasedTool, ToolContext};
+    use rig_core::serve::adapters::ToolAdapter;
+    use rig_core::tool::ToolContext;
     use serial_test::serial;
 
     async fn call(args: serde_json::Value) -> rig_core::tool::ToolResult {
-        let ctx = &mut ToolContext::new();
-        EditFile
-            .execute(serde_json::to_string(&args).unwrap(), ctx)
-            .await
+        let mut ctx = ToolContext::new();
+        match ToolAdapter::new(EditFile).run_with(&mut ctx, args).await {
+            Ok(output) => rig_core::tool::ToolResult::success(output),
+            Err(error) => rig_core::tool::ToolResult::failed(error),
+        }
     }
 
     #[tokio::test]

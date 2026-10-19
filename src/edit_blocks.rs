@@ -19,19 +19,16 @@ pub use bsed_blockedit::blob::*;
 /// independently arrive at the same id for the same file. Minting a random id
 /// on either side would pair a call with the wrong result, and re-deriving a
 /// fresh one would break correlation with an already-stored half.
-pub fn split_id(
-    orig: &rig_core::message::ToolCallId,
-    i: usize,
-    n: usize,
-) -> rig_core::message::ToolCallId {
+pub fn split_id(orig: &rig_core::message::CallId, i: usize, n: usize) -> rig_core::message::CallId {
     // Use the original tool call ID for the first file, only assign derived IDs for additional
     // files. This ensures that the original tool call ID has a valid matching result, which some
     // providers (e.g. deepseek) require within a turn.
     if i == 0 {
         orig.clone()
     } else {
-        rig_core::message::ToolCallId::new(format!("{orig}_f{i}n{n}"))
-            .expect("a derived id is never empty")
+        // The wire form of the derived id is never empty (`orig_` is always a
+        // prefix), so it is always a provider-shaped id.
+        rig_core::message::CallId::from_wire(format!("{orig}_f{i}n{n}"))
     }
 }
 

@@ -14,9 +14,7 @@
 //! executions. A turn is a user prompt followed by a chain of them.
 
 use crate::content::Content;
-use rig_core::message::{
-    AssistantContent, Message, ReasoningContent, ToolResultContent, UserContent,
-};
+use rig_core::message::{AssistantContent, Message, ToolResultContent, UserContent};
 use std::borrow::Borrow;
 
 // ---------------------------------------------------------------------------
@@ -134,7 +132,7 @@ pub(crate) fn build_replay_units<T: Borrow<crate::session::SessionEntry>>(
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
-                        seg.tool_results.push((tr.call.clone().into_string(), text));
+                        seg.tool_results.push((tr.call.to_string(), text));
                     }
                 }
             }
@@ -229,23 +227,14 @@ fn user_text_of(message: &serde_json::Value) -> Option<String> {
 /// always belong to the current turn).
 fn feed_turn_into(open: &mut Option<ConversationTurn>, msg: &Message) {
     let Some(turn) = open.as_mut() else { return };
-    let Message::Assistant { content, .. } = msg else {
+    let Message::Assistant(assistant) = msg else {
         return;
     };
     let mut seg = AssistantSegment::new();
-    for item in content.iter() {
+    for item in assistant.content.iter() {
         match item {
             AssistantContent::Reasoning(r) => {
-                let t: String = r
-                    .content
-                    .iter()
-                    .filter_map(|rc| match rc {
-                        ReasoningContent::Text { text, .. } => Some(text.as_str()),
-                        ReasoningContent::Summary(s) => Some(s.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let t = r.text.clone();
                 if !t.is_empty() {
                     seg.thinking.push(t);
                 }
@@ -255,9 +244,9 @@ fn feed_turn_into(open: &mut Option<ConversationTurn>, msg: &Message) {
             }
             AssistantContent::ToolCall(tc) => {
                 seg.tool_calls.push((
-                    tc.id.clone().into_string(),
-                    tc.function.name.clone(),
-                    tc.function.arguments.clone(),
+                    tc.id.to_string(),
+                    tc.function.name.to_string(),
+                    tc.function.arguments_value(),
                 ));
             }
             _ => {}

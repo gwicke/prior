@@ -16,13 +16,14 @@
 use super::errors::{classify_prompt_error, classify_stream_error};
 use super::pumps::dispatch_in_turn_event;
 use super::transcript::{
-    minimize_edit_tool_calls, normalize_call_ids, reasoning_text, EditAnchorLedger, TurnTranscript,
+    assistant_message, minimize_edit_tool_calls, normalize_call_ids, EditAnchorLedger,
+    TurnTranscript,
 };
 use crate::Result;
 use futures::StreamExt;
-use rig_agent::agent::{MultiTurnStreamItem, StreamingError};
-use rig_agent::completion::{Prompt, PromptError};
-use rig_agent::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
+use rig_agent::agent::MultiTurnStreamItem;
+use rig_agent::completion::PromptError;
+use rig_agent::streaming::{Item, StreamEvent};
 use rig_core::message::{AssistantContent, Message, Reasoning, Text, UserContent};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -142,7 +143,7 @@ impl CodeAgent {
         //
         // With no overrides `params` *is* `live_params`, so this recomputes what
         // was baked at build time and the turn is unchanged.
-        let request = self.agent.stream_prompt(input);
+        let request = self.agent.prompt(input);
         let request = match params.temperature {
             Some(t) => request.temperature(t),
             None => request.without_temperature(),
@@ -177,7 +178,7 @@ impl CodeAgent {
             // §Layer 1 Task 2.
             .max_invalid_tool_call_retries(1)
             .history(prior)
-            .await;
+            .stream();
 
         let mut output = String::new();
         let mut reasoning_buffer = String::new(); // Accumulate reasoning for aborted/errored turns
@@ -242,31 +243,26 @@ impl CodeAgent {
             tokio::select! {
                 item = stream.next() => {
                     match item {
-                        Some(Ok(MultiTurnStreamItem::StreamAssistantItem(content))) => match content {
-                            StreamedAssistantContent::Text(text) => {
-                                let delta = text.text();
-                                output.push_str(delta);
-                                self.content.stream_text(delta);
+
+                        Some(Ok(MultiTurnStreamItem::StreamAssistantItem(item))) => match item {
+                            // rig 0.45 streams text and reasoning as
+                            // *fragments*; the part's `End` carries the
+                            // finalized block, which the transcript picks up
+                            // from the turn hook, so only fragments are
+                            // painted and accumulated here.
+                            Item::Event(StreamEvent::Text { text, .. }) => {
+                                output.push_str(&text);
+                                self.content.stream_text(&text);
                             }
-                            StreamedAssistantContent::Reasoning { reasoning, .. } => {
-                                let t = reasoning_text(&reasoning);
-                                if !t.is_empty() {
-                                    reasoning_buffer.push_str(&t); // Accumulate for partial persistence
-                                    self.content.stream_thinking(&t);
-                                }
+                            Item::Event(StreamEvent::Reasoning { text, .. })
+                                if !text.is_empty() =>
+                            {
+                                reasoning_buffer.push_str(&text); // Accumulate for partial persistence
+                                self.content.stream_thinking(&text);
                             }
-                            StreamedAssistantContent::ReasoningDelta { reasoning, .. }
-                                if !reasoning.is_empty() => {
-                                    reasoning_buffer.push_str(&reasoning); // Accumulate for partial persistence
-                                    self.content.stream_thinking(&reasoning);
-                                }
                             _ => {}
                         },
-                        Some(Ok(MultiTurnStreamItem::StreamUserItem(
-                            StreamedUserContent::ToolResult {
-                                tool_result, ..
-                            },
-                        ))) => {
+                        Some(Ok(MultiTurnStreamItem::ToolResult { tool_result })) => {
                             // Tool-result stream items are the canonical
                             // `Message::User` content rig committed to its own
                             // `new_messages`. Accumulate them (batched by
@@ -285,29 +281,36 @@ impl CodeAgent {
                             // sentinel for "provider reported nothing" (e.g. ollama), so
                             // skip it to keep the telemetry honest.
                             let u = call.usage;
-                            if u.has_values() {
+                            if u.is_reported() {
+                                // rig 0.45 reports each counter as `Option`:
+                                // an unreported counter adds nothing, and the
+                                // `last_*` mirror keeps prior's `0 == "no
+                                // report"` convention.
+                                let counter = |value: Option<u64>| value.unwrap_or(0);
                                 if let Ok(mut g) = self.usage.lock() {
                                     // A fresh report replaces whatever stood
                                     // before — including a compaction's
                                     // invalidation — so this write is the
                                     // switch back from estimate to the
                                     // provider's own count.
-                                    g.last_input_tokens = Some(u.input_tokens);
-                                    g.last_output_tokens = u.output_tokens;
-                                    g.last_cached_input_tokens = u.cached_input_tokens;
-                                    g.last_cache_creation_input_tokens = u.cache_creation_input_tokens;
-                                    g.session_input_tokens += u.input_tokens;
-                                    g.session_output_tokens += u.output_tokens;
-                                    g.session_cached_input_tokens += u.cached_input_tokens;
-                                    g.session_cache_creation_input_tokens += u.cache_creation_input_tokens;
-                                    g.session_reasoning_tokens += u.reasoning_tokens;
+                                    g.last_input_tokens = u.input_tokens;
+                                    g.last_output_tokens = counter(u.output_tokens);
+                                    g.last_cached_input_tokens = counter(u.cached_input_tokens);
+                                    g.last_cache_creation_input_tokens =
+                                        counter(u.cache_creation_input_tokens);
+                                    g.session_input_tokens += counter(u.input_tokens);
+                                    g.session_output_tokens += counter(u.output_tokens);
+                                    g.session_cached_input_tokens += counter(u.cached_input_tokens);
+                                    g.session_cache_creation_input_tokens +=
+                                        counter(u.cache_creation_input_tokens);
+                                    g.session_reasoning_tokens += counter(u.reasoning_tokens);
                                 }
                             }
                             // Commit the text so far before the tool call / result line.
                             self.content.end_response_segment();
                         }
                         Some(Ok(MultiTurnStreamItem::FinalResponse(resp))) => {
-                            final_history = resp.messages().map(|h| h.to_vec());
+                            final_history = Some(resp.messages.clone());
                         }
                         Some(Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. })) => {}
                         Some(Ok(MultiTurnStreamItem::ModelTurnRetried { .. })) => {}
@@ -332,8 +335,7 @@ impl CodeAgent {
                             // context. When reasoning is enabled, include it so the
                             // model can resume its train of thought on a steering
                             // message (controlled by `reasoning_in_context` mode).
-                            if let StreamingError::Prompt(prompt_err) = &e {
-                                if let PromptError::PromptCancelled { .. } = prompt_err.as_ref() {
+                            if let PromptError::Cancelled { .. } = &e {
                                     // Cancelled mid-run (Esc or a hook Stop).
                                     // Persist the user prompt plus whatever
                                     // completed: the finalized transcript
@@ -377,14 +379,14 @@ impl CodeAgent {
                                                 let reasoning_text = std::mem::take(&mut reasoning_buffer);
                                                 content.push(AssistantContent::Reasoning(Reasoning::new(&reasoning_text)));
                                             }
-                                            partial.push(Message::Assistant { id: None, content }); // id:None marks aborted turn
+                                            // No response id marks an aborted turn.
+                                            partial.push(assistant_message(None, content));
                                         }
                                     }
                                     cancelled_history = Some(partial);
                                     aborted = true;
                                     break;
                                 }
-                            }
                             // Phase 2a: preserve user prompt on non-cancellation
                             // errors. Commit the partial turn so the next prompt or
                             // steering message sees the user's input and any partial
@@ -505,7 +507,7 @@ impl CodeAgent {
                                             content.push(AssistantContent::Reasoning(Reasoning::new(&reasoning_text)));
                                         }
                                         let _ = s
-                                            .append_message(&Message::Assistant { id: None, content })
+                                            .append_message(&assistant_message(None, content))
                                             .await;
                                     }
                                 }
@@ -524,6 +526,9 @@ impl CodeAgent {
                             }
                             return Err(classified);
                         }
+                        // `MultiTurnStreamItem` is non-exhaustive: an item this
+                        // loop does not interpret is ignored.
+                        Some(Ok(_)) => {}
                         None => break,
                     }
                 }
@@ -558,7 +563,8 @@ impl CodeAgent {
                                     let reasoning_text = std::mem::take(&mut reasoning_buffer);
                                     content.push(AssistantContent::Reasoning(Reasoning::new(&reasoning_text)));
                                 }
-                                partial.push(Message::Assistant { id: None, content }); // id:None marks aborted turn
+                                // No response id marks an aborted turn.
+                                partial.push(assistant_message(None, content));
                             }
                         }
                         cancelled_history = Some(partial);
@@ -729,6 +735,7 @@ impl CodeAgent {
             .prompt(Message::user(prompt))
             .max_turns(SUMMARIZATION_MAX_TURNS)
             .await
+            .map(|response| response.output())
             .map_err(|e| classify_prompt_error(&e, "summarize"))
     }
 
@@ -779,6 +786,7 @@ impl CodeAgent {
             .history(prior)
             .max_turns(SUMMARIZATION_MAX_TURNS)
             .await
+            .map(|response| response.output())
             .map_err(|e| classify_prompt_error(&e, "summarize"))
     }
 }

@@ -15,12 +15,92 @@
 //! session, no output.
 
 use rig_core::message::{
-    AssistantContent, Message, ReasoningContent, Text, ToolCallId, ToolFunction, ToolResult,
-    ToolResultContent, UserContent,
+    Api, AssistantContent, AssistantMessage, CallId, Message, Origin, Text, ToolFunction, ToolName,
+    ToolResult, ToolResultContent, UserContent,
 };
 use std::collections::HashMap;
 
 use bsed_blockedit::EditOp;
+
+/// The wire triple prior stamps on the turns it builds itself.
+///
+/// rig 0.45 keeps no message id: an assistant turn's provider identity lives
+/// in [`AssistantMessage::origin`], whose `response_id` is what prior stores
+/// as pi's `responseId`. The remaining fields name the wire/model that
+/// produced the turn, and "prior" says exactly that — none of these turns
+/// carries provider items, so rig always replays them canonically rather than
+/// from a provider's own encoding.
+const PRIOR_ORIGIN: &str = "prior";
+
+/// An assistant turn carrying prior's own content and the provider's response
+/// id, if any. `None` marks a turn prior built itself — an aborted or errored
+/// partial turn, which is what pi's missing `responseId` means.
+pub(crate) fn assistant_message(
+    response_id: Option<String>,
+    content: Vec<AssistantContent>,
+) -> Message {
+    let turn = AssistantMessage::new(content);
+    Message::Assistant(match response_id {
+        Some(id) => turn.with_origin(Origin {
+            api: Api::from_static(PRIOR_ORIGIN),
+            provider: PRIOR_ORIGIN.to_string(),
+            model: PRIOR_ORIGIN.to_string(),
+            response_model: None,
+            response_id: Some(id),
+            context: None,
+        }),
+        None => turn,
+    })
+}
+
+/// The provider response id prior keeps for an assistant turn, i.e. pi's
+/// `responseId`: `None` for a turn prior built itself (aborted/errored).
+pub(crate) fn response_id(turn: &AssistantMessage) -> Option<&str> {
+    turn.origin
+        .as_ref()
+        .and_then(|origin| origin.response_id.as_deref())
+}
+
+/// A [`ToolName`] from `name`. Every name prior holds is a literal or one a
+/// model emitted in a call that was already decoded, so the empty case cannot
+/// occur; an empty one would still be representable, so it is mapped to a
+/// stand-in rather than panicking mid-turn.
+pub(crate) fn tool_name(name: &str) -> ToolName {
+    ToolName::new(name).unwrap_or_else(|_| ToolName::new("tool").expect("literal is not empty"))
+}
+
+/// A tool call identified by its wire id: the shape prior holds in storage,
+/// from pi's JSONL, and in its tests.
+pub(crate) fn tool_call(
+    id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> rig_core::message::ToolCall {
+    rig_core::message::ToolCall::new(
+        CallId::from_wire(id),
+        ToolFunction::new(tool_name(name), arguments),
+    )
+}
+
+/// A tool result answering `call` with one literal text part.
+#[cfg(test)]
+pub(crate) fn text_tool_result(call: CallId, name: &str, text: impl Into<String>) -> ToolResult {
+    ToolResult {
+        call,
+        name: tool_name(name),
+        content: vec![ToolResultContent::Text(Text::new(text))],
+        is_error: false,
+    }
+}
+
+/// The content blocks of an assistant message, or an empty slice for any other
+/// role.
+pub(crate) fn assistant_content(msg: &Message) -> &[AssistantContent] {
+    match msg {
+        Message::Assistant(turn) => &turn.content,
+        _ => &[],
+    }
+}
 
 /// Canonical transcript of the in-flight run, mirroring rig's `new_messages`
 /// shape: `[assistant, user(tool-results), assistant, …]` (the user prompt is
@@ -65,14 +145,14 @@ impl TurnTranscript {
     /// out of history) are skipped.
     pub(crate) fn push_assistant_turn(
         &mut self,
-        id: Option<String>,
+        response_id: Option<String>,
         content: Vec<AssistantContent>,
     ) {
         self.flush_results();
         if !assistant_content_is_visible(&content) {
             return;
         }
-        self.committed.push(Message::Assistant { id, content });
+        self.committed.push(assistant_message(response_id, content));
         self.assistant_turns += 1;
     }
 
@@ -92,34 +172,35 @@ impl TurnTranscript {
     /// a synthesized text result. Never truncates or drops progress.
     pub(crate) fn finalize(&mut self) -> Vec<Message> {
         self.flush_results();
-        let needs_synthesis = matches!(
-            self.committed.last(),
-            Some(Message::Assistant { content, .. })
-                if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_)))
-        );
-        if needs_synthesis {
-            let calls: Vec<&rig_core::message::ToolCall> = match self.committed.last() {
-                Some(Message::Assistant { content, .. }) => content
+        let calls: Vec<&rig_core::message::ToolCall> = match self.committed.last() {
+            Some(msg)
+                if assistant_content(msg)
+                    .iter()
+                    .any(|c| matches!(c, AssistantContent::ToolCall(_))) =>
+            {
+                assistant_content(msg)
                     .iter()
                     .filter_map(|c| match c {
                         AssistantContent::ToolCall(tc) => Some(tc),
                         _ => None,
                     })
-                    .collect(),
-                _ => Vec::new(),
-            };
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        if !calls.is_empty() {
             let synthesized: Vec<UserContent> = calls
                 .iter()
                 .map(|tc| {
                     UserContent::ToolResult(rig_core::message::ToolResult {
                         call: tc.id.clone(),
-                        provider: tc.provider.clone(),
                         name: tc.function.name.clone(),
                         content: vec![ToolResultContent::text(format!(
                             "[tool call `{}` was interrupted before execution; \
                              it did not run. Continue from the conversation above.]",
                             tc.function.name
                         ))],
+                        is_error: false,
                     })
                 })
                 .collect();
@@ -157,20 +238,7 @@ fn assistant_content_is_visible(content: &[AssistantContent]) -> bool {
 /// Flatten a rig `Reasoning` payload into plain text. Provider-specific
 /// encrypted/redacted blocks are kept verbatim; other shapes are ignored.
 pub(crate) fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
-    let mut result = String::new();
-    for c in &r.content {
-        let s = match c {
-            ReasoningContent::Text { text, .. } => text.as_str(),
-            ReasoningContent::Summary(s) => s.as_str(),
-            ReasoningContent::Encrypted(s) => s.as_str(),
-            ReasoningContent::Redacted { data } => data.as_str(),
-        };
-        if !result.is_empty() {
-            result.push('\n');
-        }
-        result.push_str(s);
-    }
-    result
+    r.text.clone()
 }
 
 /// Render `edit` tool-call arguments in the model-facing block form.
@@ -186,20 +254,22 @@ pub(crate) fn blob_edit_tool_calls(messages: Vec<Message>) -> Vec<Message> {
     messages
         .into_iter()
         .map(|m| match m {
-            Message::Assistant { id, content } => {
-                let content = content
+            Message::Assistant(mut turn) => {
+                let content = std::mem::take(&mut turn.content)
                     .into_iter()
                     .map(|c| match c {
                         AssistantContent::ToolCall(tc) if tc.function.name == "edit" => {
                             let mut tc = tc;
-                            tc.function.arguments =
-                                crate::edit_blocks::array_to_blob_value(&tc.function.arguments);
+                            let blob = crate::edit_blocks::array_to_blob_value(
+                                &tc.function.arguments_value(),
+                            );
+                            tc.function = ToolFunction::new(tc.function.name.clone(), blob);
                             AssistantContent::ToolCall(tc)
                         }
                         other => other,
                     })
                     .collect();
-                Message::Assistant { id, content }
+                Message::Assistant(turn.with_content(content))
             }
             other => other,
         })
@@ -237,30 +307,30 @@ pub(crate) fn minimize_edit_tool_calls(
     messages
         .into_iter()
         .map(|m| match m {
-            Message::Assistant { id, content } => {
-                let content = content
+            Message::Assistant(mut turn) => {
+                let content = std::mem::take(&mut turn.content)
                     .into_iter()
                     .map(|c| match c {
                         AssistantContent::ToolCall(tc)
                             if tc.function.name == "edit"
-                                && ledger.contains_key(tc.id.as_ref()) =>
+                                && ledger.contains_key(&*tc.id.wire()) =>
                         {
-                            let Some(resolutions) = ledger.get(tc.id.as_ref()) else {
+                            let Some(resolutions) = ledger.get(&*tc.id.wire()) else {
                                 return AssistantContent::ToolCall(tc);
                             };
                             let Some(args) =
-                                minimized_edit_args(&tc.function.arguments, resolutions)
+                                minimized_edit_args(&tc.function.arguments_value(), resolutions)
                             else {
                                 return AssistantContent::ToolCall(tc);
                             };
                             let mut tc = tc;
-                            tc.function.arguments = args;
+                            tc.function = ToolFunction::new(tc.function.name.clone(), args);
                             AssistantContent::ToolCall(tc)
                         }
                         other => other,
                     })
                     .collect();
-                Message::Assistant { id, content }
+                Message::Assistant(turn.with_content(content))
             }
             other => other,
         })
@@ -395,7 +465,7 @@ pub(crate) fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message
     // The call (assistant message) and its result (a user message) are
     // different messages, and the result follows the call, so build the whole
     // plan before rebuilding any message.
-    let mut results: HashMap<ToolCallId, String> = HashMap::new();
+    let mut results: HashMap<CallId, String> = HashMap::new();
     for m in &messages {
         let Message::User { content } = m else {
             continue;
@@ -409,12 +479,9 @@ pub(crate) fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message
         }
     }
 
-    let mut plan: HashMap<ToolCallId, SplitEditCall> = HashMap::new();
+    let mut plan: HashMap<CallId, SplitEditCall> = HashMap::new();
     for m in &messages {
-        let Message::Assistant { content, .. } = m else {
-            continue;
-        };
-        for c in content {
+        for c in assistant_content(m) {
             let AssistantContent::ToolCall(tc) = c else {
                 continue;
             };
@@ -422,7 +489,9 @@ pub(crate) fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message
                 continue;
             }
             if let Some(result) = results.get(&tc.id) {
-                if let Some(split) = split_edit_call_and_result(&tc.function.arguments, result) {
+                if let Some(split) =
+                    split_edit_call_and_result(&tc.function.arguments_value(), result)
+                {
                     plan.insert(tc.id.clone(), split);
                 }
             }
@@ -439,9 +508,9 @@ pub(crate) fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     for m in messages {
         match m {
-            Message::Assistant { id, content } => {
-                let mut new_content = Vec::with_capacity(content.len());
-                for c in content {
+            Message::Assistant(mut turn) => {
+                let mut new_content = Vec::with_capacity(turn.content.len());
+                for c in std::mem::take(&mut turn.content) {
                     let AssistantContent::ToolCall(tc) = &c else {
                         new_content.push(c);
                         continue;
@@ -454,20 +523,15 @@ pub(crate) fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message
                     for (i, blocks) in split.per_file.iter().enumerate() {
                         new_content.push(AssistantContent::ToolCall(rig_core::message::ToolCall {
                             id: crate::edit_blocks::split_id(&tc.id, i, n),
-                            provider: None,
                             function: ToolFunction::new(
-                                "edit".into(),
+                                ToolName::new("edit").expect("a literal tool name is never empty"),
                                 serde_json::json!({ "blocks": blocks }),
                             ),
-                            signature: None,
-                            additional_params: None,
+                            native: None,
                         }));
                     }
                 }
-                out.push(Message::Assistant {
-                    id,
-                    content: new_content,
-                });
+                out.push(Message::Assistant(turn.with_content(new_content)));
             }
             Message::User { content } => {
                 let mut new_content = Vec::with_capacity(content.len());
@@ -489,9 +553,9 @@ pub(crate) fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message
                     for (i, result) in split.results.iter().enumerate() {
                         new_content.push(UserContent::ToolResult(ToolResult {
                             call: crate::edit_blocks::split_id(&tr.call, i, n),
-                            provider: None,
                             name: tr.name.clone(),
                             content: vec![ToolResultContent::text(result.clone())],
+                            is_error: false,
                         }));
                     }
                 }
@@ -590,9 +654,10 @@ pub(crate) fn maybe_strip_reasoning(
     messages
         .into_iter()
         .map(|m| match m {
-            Message::Assistant { id, content } => {
-                let is_aborted = id.is_none(); // No provider responseId = aborted/errored turn
-                let kept: Vec<AssistantContent> = content
+            Message::Assistant(mut turn) => {
+                // No provider responseId = aborted/errored turn.
+                let is_aborted = response_id(&turn).is_none();
+                let kept: Vec<AssistantContent> = std::mem::take(&mut turn.content)
                     .into_iter()
                     .filter(|c| {
                         if keep_aborted && is_aborted && matches!(c, AssistantContent::Reasoning(_))
@@ -608,7 +673,7 @@ pub(crate) fn maybe_strip_reasoning(
                 } else {
                     kept
                 };
-                Message::Assistant { id, content }
+                Message::Assistant(turn.with_content(content))
             }
             other => other,
         })
@@ -620,11 +685,10 @@ pub(crate) fn maybe_strip_reasoning(
 /// be force-kept: the thinking+tool_use replay contract only applies on
 /// turns that actually involve tool calls.
 fn turn_has_tool_calls(messages: &[Message]) -> bool {
-    messages.iter().any(|m| match m {
-        Message::Assistant { content, .. } => content
+    messages.iter().any(|m| {
+        assistant_content(m)
             .iter()
-            .any(|c| matches!(c, AssistantContent::ToolCall(_))),
-        _ => false,
+            .any(|c| matches!(c, AssistantContent::ToolCall(_)))
     })
 }
 
@@ -752,35 +816,29 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             },
         ]);
         vec![
-            Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
-                    id: ToolCallId::new("t1").unwrap(),
-                    provider: None,
-                    function: ToolFunction::new(
-                        "edit".into(),
-                        serde_json::json!({ "blocks": blocks }),
-                    ),
-                    signature: None,
-                    additional_params: None,
-                })],
-            },
+            assistant_message(
+                None,
+                vec![AssistantContent::ToolCall(tool_call(
+                    "t1",
+                    "edit",
+                    serde_json::json!({ "blocks": blocks }),
+                ))],
+            ),
             Message::User {
-                content: vec![UserContent::ToolResult(ToolResult {
-                    call: ToolCallId::new("t1").unwrap(),
-                    provider: None,
-                    name: "edit".into(),
-                    content: vec![ToolResultContent::text(result)],
-                })],
+                content: vec![UserContent::ToolResult(text_tool_result(
+                    CallId::from_wire("t1"),
+                    "edit",
+                    result,
+                ))],
             },
         ]
     }
 
     fn tool_calls_of(m: &Message) -> Vec<rig_core::message::ToolCall> {
-        let Message::Assistant { content, .. } = m else {
+        if !matches!(m, Message::Assistant(_)) {
             panic!("expected an assistant message")
-        };
-        content
+        }
+        assistant_content(m)
             .iter()
             .filter_map(|c| match c {
                 AssistantContent::ToolCall(tc) => Some(tc.clone()),
@@ -824,15 +882,14 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             );
             // The id is derived, not minted, so both split sites agree.
             if i == 0 {
-                assert_eq!(calls[i].id.to_string(), format!("t1"));
+                assert_eq!(calls[i].id.to_string(), "t1".to_string());
             } else {
                 assert_eq!(calls[i].id.to_string(), format!("t1_f{i}n3"));
             }
             // A synthesized call has no provider id or signature: Anthropic
             // keys tool_result on the id it issued, and N copies of one would
             // be unmatchable.
-            assert!(calls[i].provider.is_none());
-            assert!(calls[i].signature.is_none());
+            assert!(calls[i].native.is_none());
         }
 
         // Three results, one per call, paired by that same derived id.
@@ -870,22 +927,20 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     #[test]
     fn successful_calls_are_minimized_and_line_anchored() {
         use crate::tools::{EditResolutions, FileResolution};
-        let call = Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
-                id: ToolCallId::new("e1").unwrap(),
-                provider: None,
+        let call = assistant_message(
+            None,
+            vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: CallId::from_wire("e1"),
                 function: ToolFunction::new(
-                    "edit".into(),
+                    tool_name("edit"),
                     serde_json::json!({
                         "blocks": "a.rs\n@@@OLD\nkeep_line_alpha\nold_value_line\nkeep_line_bravo\n\
                                    @@@NEW\nkeep_line_alpha\nnew_value_line\nkeep_line_bravo\n@@@END"
                     }),
                 ),
-                signature: None,
-                additional_params: None,
+                native: None,
             })],
-        };
+        );
         let mut ledger = EditAnchorLedger::default();
         ledger.insert(
             "e1".into(),
@@ -910,13 +965,12 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     #[test]
     fn a_long_internal_gap_splits_into_anchored_sub_blocks() {
         use crate::tools::{EditResolutions, FileResolution};
-        let call = Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
-                id: ToolCallId::new("e1").unwrap(),
-                provider: None,
+        let call = assistant_message(
+            None,
+            vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: CallId::from_wire("e1"),
                 function: ToolFunction::new(
-                    "edit".into(),
+                    tool_name("edit"),
                     serde_json::json!({
                         "blocks": "a.rs\n@@@OLD\nalpha_context_line\nold_x_context_line\n\
                                    bravo_context_line\ncharlie_line\ndelta_context_line\n\
@@ -925,10 +979,9 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                                    delta_context_line\nnew_y_context_line\necho_context_line\n@@@END"
                     }),
                 ),
-                signature: None,
-                additional_params: None,
+                native: None,
             })],
-        };
+        );
         let mut ledger = EditAnchorLedger::default();
         ledger.insert(
             "e1".into(),
@@ -954,21 +1007,19 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     #[test]
     fn minimization_is_idempotent() {
         use crate::tools::{EditResolutions, FileResolution};
-        let call = Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
-                id: ToolCallId::new("e1").unwrap(),
-                provider: None,
+        let call = assistant_message(
+            None,
+            vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: CallId::from_wire("e1"),
                 function: ToolFunction::new(
-                    "edit".into(),
+                    tool_name("edit"),
                     serde_json::json!({
                         "blocks": "a.rs\n@@@OLD\nkeep\nold\nkeep2\n@@@NEW\nkeep\nnew\nkeep2\n@@@END"
                     }),
                 ),
-                signature: None,
-                additional_params: None,
+                native: None,
             })],
-        };
+        );
         let mut ledger = EditAnchorLedger::default();
         ledger.insert(
             "e1".into(),
@@ -986,19 +1037,17 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     #[test]
     fn a_failed_call_without_resolutions_is_untouched() {
-        let call = Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
-                id: ToolCallId::new("e1").unwrap(),
-                provider: None,
+        let call = assistant_message(
+            None,
+            vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: CallId::from_wire("e1"),
                 function: ToolFunction::new(
-                    "edit".into(),
+                    tool_name("edit"),
                     serde_json::json!({"blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END"}),
                 ),
-                signature: None,
-                additional_params: None,
+                native: None,
             })],
-        };
+        );
         let out = minimize_edit_tool_calls(vec![call.clone()], &EditAnchorLedger::default());
         assert_eq!(out, vec![call]);
     }
@@ -1012,25 +1061,23 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     #[test]
     fn a_single_file_call_is_left_byte_identical() {
-        let call = Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
-                id: ToolCallId::new("s1").unwrap(),
-                provider: None,
+        let call = assistant_message(
+            None,
+            vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: CallId::from_wire("s1"),
                 function: ToolFunction::new(
-                    "edit".into(),
+                    tool_name("edit"),
                     serde_json::json!({"blocks": "solo.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END"}),
                 ),
-                signature: None,
-                additional_params: None,
+                native: None,
             })],
-        };
+        );
         let result = Message::User {
             content: vec![UserContent::ToolResult(ToolResult {
-                call: ToolCallId::new("s1").unwrap(),
-                provider: None,
-                name: "edit".into(),
+                call: CallId::from_wire("s1"),
+                name: tool_name("edit"),
                 content: vec![ToolResultContent::text("Replaced 1 block(s) in ./solo.rs")],
+                is_error: false,
             })],
         };
         let hist = vec![call, result];
@@ -1053,22 +1100,23 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             "path": "src/x.rs",
             "edits": [{"oldText": "a", "newText": "b"}]
         });
-        let mk = |args: serde_json::Value| Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
-                id: rig_core::message::ToolCallId::new("t1").unwrap(),
-                provider: None,
-                function: rig_core::message::ToolFunction::new("edit".into(), args),
-                signature: None,
-                additional_params: None,
-            })],
+        let mk = |args: serde_json::Value| {
+            assistant_message(
+                None,
+                vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                    id: rig_core::message::CallId::from_wire("t1"),
+                    function: rig_core::message::ToolFunction::new(tool_name("edit"), args),
+                    native: None,
+                })],
+            )
         };
 
         // Canonical array -> blob, under the model-facing field name.
         let out = blob_edit_tool_calls(vec![mk(args)]);
-        let Message::Assistant { content, .. } = &out[0] else {
+        let Message::Assistant(turn) = &out[0] else {
             panic!("expected assistant")
         };
+        let content = &turn.content;
         let AssistantContent::ToolCall(tc) = &content[0] else {
             panic!("expected tool call")
         };
@@ -1091,13 +1139,14 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let already =
             serde_json::json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
         let out2 = blob_edit_tool_calls(vec![mk(already.clone())]);
-        let Message::Assistant { content, .. } = &out2[0] else {
+        let Message::Assistant(turn) = &out2[0] else {
             panic!("expected assistant")
         };
+        let content = &turn.content;
         let AssistantContent::ToolCall(tc) = &content[0] else {
             panic!("expected tool call")
         };
-        assert_eq!(tc.function.arguments, already);
+        assert_eq!(tc.function.arguments_value(), already);
     }
 
     #[test]
@@ -1152,11 +1201,11 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     #[test]
     fn transcript_batches_tool_results_between_assistant_turns() {
         use super::TurnTranscript;
-        use rig_core::message::{ToolCall, ToolFunction, ToolResultContent};
+        use rig_core::message::{ToolCall, ToolFunction};
 
         let tc = ToolCall::from_wire(
             "call_1",
-            ToolFunction::new("read".to_string(), serde_json::json!({})),
+            ToolFunction::new(tool_name("read"), serde_json::json!({})),
         );
         let call_id = tc.id.clone();
         let mut t = TurnTranscript::default();
@@ -1164,12 +1213,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         t.push_assistant_turn(None, vec![AssistantContent::ToolCall(tc)]);
         assert!(t.has_progress());
         // Tool result streams back (batch accumulates).
-        t.push_tool_result(rig_core::message::ToolResult {
-            call: call_id,
-            provider: None,
-            name: "read".to_string(),
-            content: vec![ToolResultContent::text("ok")],
-        });
+        t.push_tool_result(text_tool_result(call_id, "read", "ok"));
         // Next assistant turn flushes the batch as one Message::User.
         t.push_assistant_turn(None, vec![AssistantContent::text("done")]);
         let f = t.finalize();
@@ -1187,7 +1231,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
         let tc = ToolCall::from_wire(
             "call_1",
-            ToolFunction::new("read".to_string(), serde_json::json!({})),
+            ToolFunction::new(tool_name("read"), serde_json::json!({})),
         );
         let mut t = TurnTranscript::default();
         t.push_assistant_turn(None, vec![AssistantContent::ToolCall(tc)]);
@@ -1228,7 +1272,9 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
     #[test]
     fn reasoning_text_extracts_text_with_signature() {
-        let r = Reasoning::new_with_signature("with sig", Some("sig".to_string()));
+        // rig 0.45 keeps the provider's signature in the block's `native`
+        // item; the text is the whole canonical payload.
+        let r = Reasoning::new("with sig");
         assert_eq!(reasoning_text(&r), "with sig");
     }
     // Regression test for root cause #1: a successful turn must *append* to the
@@ -1310,18 +1356,19 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     #[test]
     fn strips_reasoning_for_non_anthropic_when_never() {
         use crate::settings::ReasoningInContextMode;
-        let assistant = Message::Assistant {
-            id: None,
-            content: vec![
+        let assistant = assistant_message(
+            None,
+            vec![
                 AssistantContent::Reasoning(Reasoning::new("hidden thought")),
                 AssistantContent::Text(Text::new("answer")),
             ],
-        };
+        );
         let msgs = vec![Message::user("q"), assistant];
 
         // Never + non-Anthropic: reasoning dropped, text preserved.
         let out = maybe_strip_reasoning(msgs.clone(), ReasoningInContextMode::Never, "openai", "");
-        if let Message::Assistant { content, .. } = &out[1] {
+        if let Message::Assistant(turn) = &out[1] {
+            let content = &turn.content;
             assert!(!content
                 .iter()
                 .any(|c| matches!(c, AssistantContent::Reasoning(_))));
@@ -1335,7 +1382,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // Always: reasoning kept.
         let kept =
             maybe_strip_reasoning(msgs.clone(), ReasoningInContextMode::Always, "openai", "");
-        if let Message::Assistant { content, .. } = &kept[1] {
+        if let Message::Assistant(turn) = &kept[1] {
+            let content = &turn.content;
             assert!(content
                 .iter()
                 .any(|c| matches!(c, AssistantContent::Reasoning(_))));
@@ -1350,7 +1398,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             "anthropic",
             "claude-3-5-sonnet",
         );
-        if let Message::Assistant { content, .. } = &stripped[1] {
+        if let Message::Assistant(turn) = &stripped[1] {
+            let content = &turn.content;
             assert!(!content
                 .iter()
                 .any(|c| matches!(c, AssistantContent::Reasoning(_))));
@@ -1368,21 +1417,21 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     fn aborted_turns_only_preserves_reasoning_for_aborted() {
         use crate::settings::ReasoningInContextMode;
         // Successful turn: has responseId
-        let successful_assistant = Message::Assistant {
-            id: Some("resp-123".into()),
-            content: vec![
+        let successful_assistant = assistant_message(
+            Some("resp-123".into()),
+            vec![
                 AssistantContent::Reasoning(Reasoning::new("successful thought")),
                 AssistantContent::Text(Text::new("successful answer")),
             ],
-        };
+        );
         // Aborted turn: no responseId
-        let aborted_assistant = Message::Assistant {
-            id: None,
-            content: vec![
+        let aborted_assistant = assistant_message(
+            None,
+            vec![
                 AssistantContent::Reasoning(Reasoning::new("aborted thought")),
                 AssistantContent::Text(Text::new("aborted answer")),
             ],
-        };
+        );
         let msgs = vec![
             Message::user("q1"),
             successful_assistant,
@@ -1400,7 +1449,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let contents: Vec<&Vec<AssistantContent>> = out
             .iter()
             .filter_map(|m| match m {
-                Message::Assistant { content, .. } => Some(content),
+                Message::Assistant(turn) => Some(&turn.content),
                 _ => None,
             })
             .collect();
@@ -1425,20 +1474,20 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     // force-kept (thinking+tool_use replay contract), even with the flag off.
     #[test]
     fn anthropic_tool_call_turn_forces_reasoning_kept() {
-        let assistant = Message::Assistant {
-            id: None,
-            content: vec![
+        let assistant = assistant_message(
+            None,
+            vec![
                 AssistantContent::Reasoning(Reasoning::new("hidden thought")),
                 AssistantContent::Text(Text::new("answer")),
                 AssistantContent::ToolCall(rig_core::message::ToolCall::new(
-                    rig_core::message::ToolCallId::new("tool-1").unwrap(),
+                    rig_core::message::CallId::from_wire("tool-1"),
                     rig_core::message::ToolFunction::new(
-                        "Bash".to_string(),
+                        tool_name("Bash"),
                         serde_json::json!({"cmd": "ls"}),
                     ),
                 )),
             ],
-        };
+        );
         let msgs = vec![Message::user("q"), assistant];
 
         let forced = maybe_strip_reasoning(
@@ -1447,7 +1496,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             "anthropic",
             "claude-3-5-sonnet",
         );
-        if let Message::Assistant { content, .. } = &forced[1] {
+        if let Message::Assistant(turn) = &forced[1] {
+            let content = &turn.content;
             assert!(content
                 .iter()
                 .any(|c| matches!(c, AssistantContent::Reasoning(_))));

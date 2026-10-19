@@ -21,22 +21,18 @@
 //! addendum.
 
 use rig_agent::agent::{
-    Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent,
-    CompletionResponseEvent, HookContext, InvalidToolCallAction, InvalidToolCallContext,
-    ModelTurnAction, ModelTurnFinished, NoToolConfig, ObservationAction, RequestPatch, ToolCall,
-    ToolCallAction, ToolResultAction, ToolResultEvent,
+    Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, DispatchAction,
+    DispatchEvent, HookContext, InvalidToolCallAction, InvalidToolCallContext, ModelTurnAction,
+    ModelTurnFinished, OutcomeAction, OutcomeEvent, RequestPatch,
 };
-use rig_agent::client::AgentClientExt;
 use rig_agent::tool::ToolContext;
-use rig_core::client::CompletionClient;
-use rig_core::message::Message;
+
 use rig_core::providers::{
     anthropic, azure, chatgpt, cohere, copilot, deepseek, doubleword, gemini, groq, huggingface,
-    hyperbolic, llamacpp, minimax, mira, mistral, moonshot, ollama, openai, openrouter, perplexity,
-    together, xai, xiaomimimo, zai,
+    hyperbolic, minimax, mira, mistral, moonshot, ollama, openai, openrouter, perplexity, together,
+    xai, xiaomimimo, zai,
 };
 use rig_core::tool::{Tool, ToolExecutionError};
-use rig_reqwest::client::{DefaultTransportBuilder, DefaultTransportClient};
 use serde_json;
 
 use crate::params;
@@ -47,9 +43,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::agent::msglog::MessageLogger;
 use crate::agent::transcript::{
-    blob_edit_tool_calls, is_tool_available, maybe_strip_reasoning, minimize_edit_tool_calls,
-    model_facing_tool_text, reasoning_remap_note, split_multi_file_edit_calls, EditAnchorLedger,
-    TurnTranscript,
+    assistant_message, blob_edit_tool_calls, is_tool_available, maybe_strip_reasoning,
+    minimize_edit_tool_calls, model_facing_tool_text, reasoning_remap_note,
+    split_multi_file_edit_calls, EditAnchorLedger, TurnTranscript,
 };
 use crate::agent::CodeAgent;
 use crate::tools::{
@@ -285,32 +281,32 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
     }
 
     macro_rules! build {
-        // Anthropic: enable automatic prompt caching with 1-hour TTL so the
-        // static prefix (system prompt + tool definitions + growing conversation
-        // history) is cached server-side for the duration of an interactive
-        // session and billed as cache reads instead of full input tokens on
-        // every turn. The API advances the cache breakpoint automatically.
+        // Anthropic: cache breakpoints on the static prefix (system prompt +
+        // tool definitions) and a moving breakpoint on the last message, all
+        // at a one-hour TTL, so the growing conversation is billed as cache
+        // reads for the duration of an interactive session. With a request
+        // cache retention set, rig advances the moving breakpoint itself and
+        // the explicit markers take that TTL.
         (anthropic $client:expr) => {{
-            let cached_model = $client
-                .completion_model(&model)
-                .with_automatic_caching_1h();
-            build!(@builder AgentBuilder::new(cached_model))
+            let mut model = $client.completion(&model);
+            model.wire = model.wire.with_prompt_caching();
+            build!(@builder AgentBuilder::new(model)
+                .cache(rig_core::completion::CacheRetention::Long))
         }};
-        // OpenRouter: enable prompt caching so the system-prompt prefix is
-        // marked with `cache_control: {"type": "ephemeral"}` and billed at the
-        // cache-hit rate on subsequent turns. Any provider preference — only
-        // ever the model's own `routing` table — arrives already merged in
-        // `reasoning_json`, because `request_additional_params` owns that
-        // merge for the bake and the per-turn path alike; merging again here
-        // would only duplicate it.
-        (openrouter $client:expr) => {{
-            let cached_model = $client
-                .completion_model(&model)
-                .with_prompt_caching();
-            build!(@builder_with_params AgentBuilder::new(cached_model), reasoning_json.clone())
+        // ChatGPT / Copilot: an OAuth sign-in refreshed per request by rig's
+        // `SignedInModel`, over the catalog entry for `vendor/model`.
+        (signed_in $vendor:literal $auth:expr) => {{
+            build!(@builder signed_in_builder($vendor, &model, $auth)?)
         }};
+        // Every other provider. OpenRouter and Z.AI used to get an ephemeral
+        // `cache_control` breakpoint on the system prompt and the last message;
+        // rig 0.45 has no such switch for the OpenAI family (its cache option
+        // speaks OpenAI's `prompt_cache_retention`, and refuses models that keep
+        // only a long cache), so the breakpoint is dropped rather than emulated
+        // with an option that can fail a run. Both gateways still cache
+        // automatically where the upstream model does.
         ($client:expr) => {{
-            build!(@builder $client.agent(&model))
+            build!(@builder AgentBuilder::new($client.completion(&model)))
         }};
         (@builder $builder:expr) => {{
             build!(@builder_with_params $builder, reasoning_json.clone())
@@ -380,49 +376,43 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
     let agent: CodeAgent = match provider.as_str() {
         "anthropic" => {
             check_env!("ANTHROPIC_API_KEY");
-            build!(anthropic anthropic::Client::from_env()?)
+            build!(anthropic anthropic::Anthropic::from_env()?)
         }
         "openai" => {
             check_env!("OPENAI_API_KEY");
-            build!(openai::Client::from_env()?)
+            build!(openai::OpenAI::from_env()?)
         }
         "azure" => {
             check_env!("AZURE_OPENAI_API_KEY");
             check_env!("AZURE_OPENAI_ENDPOINT");
-            build!(azure::Client::from_env()?)
+            build!(azure::from_env()?)
         }
         "cohere" => {
             check_env!("COHERE_API_KEY");
-            build!(cohere::Client::from_env()?)
+            build!(cohere::Cohere::from_env()?)
         }
         "chatgpt" => {
             check_env!("CHATGPT_ACCESS_TOKEN");
             let token = std::env::var("CHATGPT_ACCESS_TOKEN").unwrap();
             if token == OAUTH_TOKEN {
-                let dir = token_base.as_ref().map(|b| b.join("chatgpt"));
-                if let Some(d) = &dir {
-                    let _ = create_private_dir(d);
-                }
-                // Device-code prompt is surfaced by rig's default handler (the
-                // `DeviceCodePrompt` type is private, so a custom stderr handler
-                // can't be passed without a rig change). `token_dir` routes the
-                // cached refresh token into the settings `token` sub-directory.
-                let client = match dir {
-                    Some(d) => chatgpt::Client::builder()
-                        .oauth()
-                        .token_dir(d)
-                        .allow_device_flow(true)
-                        .build()
-                        .map_err(rig_core::client::ProviderClientError::from)?,
-                    None => chatgpt::Client::builder()
-                        .oauth()
-                        .allow_device_flow(true)
-                        .build()
-                        .map_err(rig_core::client::ProviderClientError::from)?,
-                };
-                build!(client)
+                let dir = token_base
+                    .as_ref()
+                    .map(|b| b.join("chatgpt"))
+                    .unwrap_or_else(|| std::path::PathBuf::from(".prior-chatgpt-token"));
+                let _ = create_private_dir(&dir);
+                // The OAuth sign-in is refreshed per request by rig's
+                // `SignedInModel`; the device-code prompt is shown by rig's
+                // default handler. The token store is the settings `token`
+                // sub-directory, so refresh tokens stay private.
+                let auth = chatgpt::auth::Authenticator::new(
+                    chatgpt::auth::AuthSource::OAuth,
+                    chatgpt::auth::FileTokenStore::new(dir),
+                    chatgpt::auth::DeviceCodeHandler::default(),
+                    true,
+                );
+                build!(signed_in "chatgpt" auth)
             } else {
-                build!(chatgpt::Client::from_env()?)
+                build!(chatgpt::from_env()?)
             }
         }
         "copilot" => {
@@ -430,109 +420,136 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
             let oauth = ["GITHUB_COPILOT_API_KEY", "COPILOT_GITHUB_ACCESS_TOKEN"]
                 .iter()
                 .any(|v| std::env::var(v).as_deref() == Ok(OAUTH_TOKEN));
+            let dir = token_base
+                .as_ref()
+                .map(|b| b.join("copilot"))
+                .unwrap_or_else(|| std::path::PathBuf::from(".prior-copilot-token"));
             if oauth {
-                let dir = token_base.as_ref().map(|b| b.join("copilot"));
-                if let Some(d) = &dir {
-                    let _ = create_private_dir(d);
+                let _ = create_private_dir(&dir);
+                let auth = copilot::auth::Authenticator::new(
+                    copilot::auth::AuthSource::OAuth,
+                    copilot::auth::FileTokenStore::new(dir),
+                    copilot::auth::DeviceCodeHandler::default(),
+                    true,
+                );
+                build!(signed_in "copilot" auth)
+            } else if let Ok(session) = std::env::var("GITHUB_COPILOT_API_KEY") {
+                // A Copilot session token: the Copilot dialect of the OpenAI
+                // wire takes it as a key and derives the API endpoint from it.
+                // The endpoint override the provider has always honoured is
+                // not read by `with_key`, so apply it here.
+                let mut config = openai::OpenAIConfig::with_key(&copilot::DIALECT, session);
+                if let Ok(base_url) = std::env::var("GITHUB_COPILOT_API_BASE")
+                    .or_else(|_| std::env::var("COPILOT_BASE_URL"))
+                {
+                    config = config.with_base_url(base_url);
                 }
-                let client = match dir {
-                    Some(d) => copilot::Client::builder()
-                        .oauth()
-                        .token_dir(d)
-                        .allow_device_flow(true)
-                        .build()
-                        .map_err(rig_core::client::ProviderClientError::from)?,
-                    None => copilot::Client::builder()
-                        .oauth()
-                        .allow_device_flow(true)
-                        .build()
-                        .map_err(rig_core::client::ProviderClientError::from)?,
-                };
-                build!(client)
+                build!(config.client())
             } else {
-                build!(copilot::Client::from_env()?)
+                // A GitHub access token is not a Copilot session: rig's
+                // authenticator exchanges it and refreshes the session it gets
+                // back, so the run outlives one session token.
+                let token = std::env::var("COPILOT_GITHUB_ACCESS_TOKEN").map_err(|_| {
+                    crate::PriorError::MissingApiKey(
+                        provider.to_string(),
+                        "GITHUB_COPILOT_API_KEY or COPILOT_GITHUB_ACCESS_TOKEN".to_string(),
+                    )
+                })?;
+                let _ = create_private_dir(&dir);
+                let auth = copilot::auth::Authenticator::new(
+                    copilot::auth::AuthSource::GitHubAccessToken(token),
+                    copilot::auth::FileTokenStore::new(dir),
+                    copilot::auth::DeviceCodeHandler::default(),
+                    true,
+                );
+                build!(signed_in "copilot" auth)
             }
         }
         "deepseek" => {
             check_env!("DEEPSEEK_API_KEY");
-            build!(deepseek::Client::from_env()?)
+            build!(deepseek::from_env()?)
         }
         "doubleword" => {
             check_env!("DOUBLEWORD_API_KEY");
-            build!(doubleword::Client::from_env()?)
+            build!(doubleword::from_env()?)
         }
         "gemini" | "google" => {
             check_env!("GOOGLE_API_KEY");
-            build!(gemini::Client::from_env()?)
+            build!(gemini::Gemini::from_env()?)
         }
         "groq" => {
             check_env!("GROQ_API_KEY");
-            build!(groq::Client::from_env()?)
+            build!(groq::from_env()?)
         }
         "huggingface" => {
             check_env!("HF_TOKEN");
-            build!(huggingface::Client::from_env()?)
+            build!(huggingface::from_env()?)
         }
         "hyperbolic" => {
             check_env!("HYPERBOLIC_API_KEY");
-            build!(hyperbolic::Client::from_env()?)
+            build!(hyperbolic::from_env()?)
         }
         "llamafile" | "llamacpp" => {
-            // llamacpp's client defaults to `http://localhost:8080`; the
-            // `LLAMACPP_API_BASE_URL` env var is optional.
-            build!(llamacpp::Client::from_env()?)
+            // A local `llama-server` needs no credential: rig 0.45's
+            // `llamacpp::from_env` nonetheless demands `LLAMACPP_API_KEY`, so
+            // build the config directly with an optional key. The dialect
+            // defaults to `http://localhost:8080/v1`; `LLAMACPP_API_BASE_URL`
+            // overrides it.
+            let client = openai::OpenAIConfig::with_key(
+                &openai::wire::LLAMACPP,
+                std::env::var("LLAMACPP_API_KEY").unwrap_or_default(),
+            );
+            let client = match std::env::var("LLAMACPP_API_BASE_URL") {
+                Ok(base_url) => client.with_base_url(llamacpp_base_url(&base_url)),
+                Err(_) => client,
+            };
+            build!(client.client())
         }
         "mira" => {
             check_env!("MIRA_API_KEY");
-            build!(mira::Client::from_env()?)
+            build!(mira::from_env()?)
         }
         "minimax" => {
             check_env!("MINIMAX_API_KEY");
-            build!(minimax::Client::from_env()?)
+            build!(minimax::from_env()?)
         }
         "mistral" => {
             check_env!("MISTRAL_API_KEY");
-            build!(mistral::Client::from_env()?)
+            build!(mistral::from_env()?)
         }
         "moonshot" => {
             check_env!("MOONSHOT_API_KEY");
-            build!(moonshot::Client::from_env()?)
+            build!(moonshot::from_env()?)
         }
         "ollama" => {
             if std::env::var("OLLAMA_API_BASE_URL").is_err() {
                 std::env::set_var("OLLAMA_API_BASE_URL", "http://localhost:11434");
             }
-            build!(ollama::Client::from_env()?)
+            build!(ollama::Ollama::from_env()?)
         }
         "openrouter" => {
             check_env!("OPENROUTER_API_KEY");
-            build!(openrouter openrouter::Client::from_env()?)
+            build!(openrouter::from_env()?)
         }
         "perplexity" => {
             check_env!("PERPLEXITY_API_KEY");
-            build!(perplexity::Client::from_env()?)
+            build!(perplexity::from_env()?)
         }
         "together" => {
             check_env!("TOGETHER_API_KEY");
-            build!(together::Client::from_env()?)
+            build!(together::from_env()?)
         }
         "xai" => {
             check_env!("XAI_API_KEY");
-            build!(xai::Client::from_env()?)
+            build!(xai::from_env()?)
         }
         "xiaomimimo" => {
             check_env!("XIAOMI_MIMO_API_KEY");
-            build!(xiaomimimo::Client::from_env()?)
+            build!(xiaomimimo::from_env()?)
         }
         "zai" => {
             check_env!("ZAI_API_KEY");
-            // OpenAI-compatible endpoint — enable prompt caching so the
-            // system prompt and last message are marked with cache_control.
-            // Effective when the upstream model/gateway supports it.
-            let cached_model = zai::Client::from_env()?
-                .completion_model(&model)
-                .with_prompt_caching();
-            build!(@builder AgentBuilder::new(cached_model))
+            build!(zai::from_env()?)
         }
         // ZAI Anthropic-compatible endpoint (ANTHROPIC_API_BASE_URL). Uses
         // the Anthropic provider with automatic prompt caching. Enable by
@@ -542,10 +559,10 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
         // directly so automatic caching is available regardless of base URL.
         "zai-anthropic" => {
             check_env!("ZAI_API_KEY");
-            let cached_model = zai::AnthropicClient::from_env()?
-                .completion_model(&model)
-                .with_automatic_caching();
-            build!(@builder AgentBuilder::new(cached_model))
+            // Z.AI's Anthropic-compatible endpoint caches implicitly: rig's
+            // Z.AI dialect places no markers and refuses a long retention, so
+            // the request is built without either.
+            build!(zai::anthropic_from_env()?)
         }
         _ => {
             return Err(crate::PriorError::Other(format!(
@@ -585,6 +602,71 @@ pub(crate) struct LoggingHook {
     pub(crate) edit_anchors: Arc<Mutex<EditAnchorLedger>>,
 }
 
+/// An [`AgentBuilder`] over rig's [`SignedInModel`]: the catalog entry for
+/// `vendor/model`, served with a credential `auth` resolves and refreshes per
+/// request, so a long session outlives its access token.
+///
+/// rig 0.45 models a subscription sign-in this way rather than as a client
+/// with an OAuth mode. The model's catalog entry (or, when prior serves an id
+/// rig's catalog does not list, a synthesized one) names the wire.
+///
+/// [`SignedInModel`]: rig_core::client::signed_in::SignedInModel
+fn signed_in_builder<A>(vendor: &str, model: &str, auth: A) -> Result<AgentBuilder>
+where
+    A: rig_core::client::signed_in::CredentialSource,
+{
+    use rig_core::catalog::{Catalog, ModelSpec};
+    use rig_core::client::signed_in::SignedInModel;
+    use rig_core::effect::HandlerKey;
+    use rig_core::providers::registry::ProviderId;
+
+    let reference = format!("{vendor}/{model}");
+    // prior ships its own model list and serves ids rig's catalog does not
+    // list (Copilot's `gpt-5-codex`, for one). The signed-in model needs a
+    // spec only to name its wire, so fall back to a synthesized one: the
+    // vendor's format, tool calling on, and no other facts, which refuses no
+    // option.
+    let spec = match Catalog::builtin().resolve(&reference) {
+        Ok(resolved) => resolved.spec.clone(),
+        Err(_) => {
+            let provider = ProviderId::catalog(vendor).ok_or_else(|| {
+                crate::PriorError::Other(format!("`{vendor}` is not a provider rig knows"))
+            })?;
+            ModelSpec::new(provider, model).with_tools(true)
+        }
+    };
+    let handlers = rig_agent::handlers::Handlers::default();
+    let key = HandlerKey::from(SIGNED_IN_MODEL_KEY);
+    let signed_in = SignedInModel::new(spec, auth, rig_reqwest::shared())
+        .map_err(|error| crate::PriorError::Other(error.to_string()))?;
+    handlers
+        .register(key.clone(), signed_in)
+        .map_err(|error| crate::PriorError::Other(error.to_string()))?;
+    Ok(AgentBuilder::over_handlers(handlers, "prior", key))
+}
+
+/// The handler key the signed-in model is registered under, inside the
+/// builder's own table.
+const SIGNED_IN_MODEL_KEY: &str = "model:signed-in";
+
+/// The base URL a `llama-server` client sends to.
+///
+/// rig 0.45's `LLAMACPP` dialect carries `/v1` in its default endpoint, and a
+/// `LLAMACPP_API_BASE_URL` override replaces it wholesale, so a bare
+/// `http://host:port` would lose the version prefix. prior has always accepted
+/// both the bare host `llama-server` prints in its banner and the
+/// OpenAI-conventional host plus `/v1`, so add the prefix unless the override
+/// already carries it. This is the rule the provider itself applied before
+/// 0.45 made it the dialect's job.
+fn llamacpp_base_url(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}/v1")
+    }
+}
+
 impl AgentHook for LoggingHook {
     async fn on_completion_call(
         &self,
@@ -607,7 +689,7 @@ impl AgentHook for LoggingHook {
         // shape. This hook is the one place that sees the whole request history,
         // so it covers prior and within-turn messages alike.
         let stripped_history = maybe_strip_reasoning(
-            event.history.to_vec(),
+            event.history.iter().map(|m| (**m).clone()).collect(),
             self.reasoning_in_context,
             &self.provider,
             &self.model,
@@ -641,22 +723,6 @@ impl AgentHook for LoggingHook {
         CompletionCallAction::Patch(RequestPatch::new().history(history))
     }
 
-    async fn on_completion_response(
-        &self,
-        _ctx: &HookContext,
-        _event: CompletionResponseEvent<'_>,
-    ) -> ObservationAction {
-        // Note: rig only fires `on_completion_response` on the *blocking*
-        // surface. The streaming surface (which prior uses via
-        // `stream_prompt`) fires `on_model_turn_finished` instead, so the
-        // received-message logging lives there — see below.
-        if self.user_cancel.load(Ordering::SeqCst) {
-            ObservationAction::Stop("cancelled by user".into())
-        } else {
-            ObservationAction::Continue
-        }
-    }
-
     async fn on_model_turn_finished(
         &self,
         _ctx: &HookContext,
@@ -671,10 +737,8 @@ impl AgentHook for LoggingHook {
             // (the streaming one never calls `on_completion_response`), so
             // this is the single place the received side is logged.
             if let Some(logger) = &self.message_logger {
-                let msg = Message::Assistant {
-                    id: event.identity.message_id.clone(),
-                    content: event.content.clone(),
-                };
+                let msg =
+                    assistant_message(event.identity.response_id.clone(), event.content.clone());
                 let turn_id = logger.current_turn_id();
                 logger.log_message("received", &msg, turn_id).await;
             }
@@ -684,30 +748,38 @@ impl AgentHook for LoggingHook {
             // returns `Continue`, i.e. the turn was accepted — matching rig's
             // own history commit for the same content.
             if let Ok(mut t) = self.transcript.lock() {
-                t.push_assistant_turn(event.identity.message_id.clone(), event.content.clone());
+                t.push_assistant_turn(event.identity.response_id.clone(), event.content.clone());
             }
             ModelTurnAction::Continue
         }
     }
 
-    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+    /// A tool call is about to be dispatched: paint it (for the in-flight
+    /// panel) and let a pending `<Esc>` cancel the run before the tool body
+    /// starts. This replaces rig 0.42's `on_tool_call`.
+    async fn on_dispatch(&self, _ctx: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        let Some(tool_name) = event.tool_name() else {
+            // A completion dispatch (or another family): nothing to paint.
+            return DispatchAction::proceed();
+        };
         if self.user_cancel.load(Ordering::SeqCst) {
-            return ToolCallAction::Stop("cancelled by user".into());
+            return DispatchAction::stop("cancelled by user");
         }
-        let mut args_json = serde_json::from_str(event.args)
-            .unwrap_or(serde_json::Value::String(event.args.to_string()));
+        let args = event.tool_args().unwrap_or("{}");
+        let mut args_json =
+            serde_json::from_str(args).unwrap_or(serde_json::Value::String(args.to_string()));
         // Canonicalize `edit` arguments to the array form for display, so
         // `get_preview` sees the same shape it gets on replay (the parser stays
         // out of the preview helpers). No-op for other tools / already-canonical
         // args.
-        if event.tool_name == "edit" {
+        if tool_name == "edit" {
             // Display only: do not minimize (the edit has not run). Keep the
             // canonical `startLine` here in sync with `get_preview`,
             // `array_to_blob_value`, and `normalize_args_in_place`.
             args_json = crate::edit_blocks::canonicalize_edit_value(&args_json);
         }
-        self.content.display_tool_call(event.tool_name, &args_json);
-        ToolCallAction::Run
+        self.content.display_tool_call(tool_name, &args_json);
+        DispatchAction::proceed()
     }
 
     /// Model called a tool that isn't registered or isn't in the current
@@ -747,38 +819,48 @@ impl AgentHook for LoggingHook {
         )))
     }
 
-    async fn on_tool_result(
-        &self,
-        _ctx: &HookContext,
-        event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
+    /// A dispatched effect resolved. Completion outcomes are where a pending
+    /// `<Esc>` stops the run; tool outcomes paint the result and record where
+    /// an `edit` landed. This replaces rig 0.42's `on_completion_response` and
+    /// `on_tool_result`.
+    async fn on_outcome(&self, _ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
         if self.user_cancel.load(Ordering::SeqCst) {
-            return ToolResultAction::Stop("cancelled by user".into());
+            return OutcomeAction::stop("cancelled by user");
         }
+        if event.tool_result().is_none() {
+            // A completion (or another family): nothing to paint here.
+            return OutcomeAction::proceed();
+        }
+        let Some(tool_name) = event.tool_name() else {
+            return OutcomeAction::proceed();
+        };
         // Capture where this `edit` actually applied before the file changes
         // again. The persist path in `src/agent/turn.rs` shares this ledger;
-        // without it a successful
-        // unanchored call could not be minimized later. Insert only on
-        // success: the tool attaches `EditResolutions` after a write.
-        if event.tool_name == "edit" {
-            if let (Some(id), Some(res)) = (
-                event.tool_call_id,
-                event.tool_context.result::<crate::tools::EditResolutions>(),
-            ) {
+        // without it a successful unanchored call could not be minimized
+        // later. Insert only on success: the tool attaches `EditResolutions`
+        // after a write.
+        if tool_name == "edit" {
+            let resolutions = event
+                .tool_context()
+                .map(|ctx| ctx.result::<crate::tools::EditResolutions>())
+                .unwrap_or(Ok(None));
+            if let (Some(id), Ok(Some(res))) = (event.call_id, resolutions) {
                 self.edit_anchors
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(id.to_string(), res.clone());
+                    .insert(id.to_string(), res);
             }
         }
-        self.content
-            .display_tool_result(&event.raw_result.output().render());
-        if let Some(text) = event.raw_result.output().as_text() {
-            if let Some(cleaned) = model_facing_tool_text(event.tool_name, text) {
-                return ToolResultAction::rewrite(cleaned);
+        let Some(result) = event.tool_result() else {
+            return OutcomeAction::proceed();
+        };
+        self.content.display_tool_result(&result.output().render());
+        if let Some(text) = result.output().as_text() {
+            if let Some(cleaned) = model_facing_tool_text(tool_name, text) {
+                return OutcomeAction::rewrite_tool_result(&event, cleaned);
             }
         }
-        ToolResultAction::Keep
+        OutcomeAction::proceed()
     }
 }
 
@@ -831,7 +913,7 @@ blocks, then pass them to `edit` as its `blocks` argument to apply. `sed` refuse
 than the ~2 lines of trailing context you get by default."#;
 
 fn build_rig_agent(
-    builder: AgentBuilder<NoToolConfig>,
+    builder: AgentBuilder,
     yolo: bool,
     confirm_port: Option<crate::confirm::ConfirmPort>,
     system_message_extension: Option<String>,
@@ -867,6 +949,11 @@ fn build_rig_agent(
 
     let mut builder = builder
         .preamble(&system_message)
+        // rig 0.45 fails a run whose finish reason is outside its normalized
+        // vocabulary. prior serves local servers (llama.cpp, Ollama) and
+        // gateways that emit their own codes, and has always treated an
+        // unrecognised stop as a normal one, so keep that leniency.
+        .accept_unknown_finish_reasons(true)
         .tool(ReadFile)
         .tool(WriteFile)
         .tool(EditFile)
@@ -1033,6 +1120,48 @@ mod tests {
     use crate::agent::msglog::MessageLogger;
     use crate::agent::transcript::reasoning_remap_note;
     // ---- per-turn overrides: the request path (doc/model_settings_v2.md A.10) ----
+
+    /// prior serves model ids rig's catalog does not list (its Copilot default
+    /// is `gpt-5-codex`), so the signed-in path must synthesize a spec rather
+    /// than refuse them.
+    #[test]
+    fn signed_in_builder_accepts_a_model_rig_does_not_list() {
+        let auth = copilot::auth::Authenticator::new(
+            copilot::auth::AuthSource::ApiKey("test-token".to_string()),
+            copilot::auth::MemoryTokenStore::default(),
+            copilot::auth::DeviceCodeHandler::default(),
+            false,
+        );
+        assert!(signed_in_builder("copilot", "gpt-5-codex", auth).is_ok());
+    }
+
+    #[test]
+    fn llamacpp_base_url_adds_v1_only_when_missing() {
+        // A bare host is what `llama-server` prints in its banner.
+        assert_eq!(
+            llamacpp_base_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/v1"
+        );
+        assert_eq!(
+            llamacpp_base_url("http://127.0.0.1:8080/"),
+            "http://127.0.0.1:8080/v1"
+        );
+        // The OpenAI-conventional spelling already carries it.
+        assert_eq!(
+            llamacpp_base_url("http://127.0.0.1:8080/v1"),
+            "http://127.0.0.1:8080/v1"
+        );
+        assert_eq!(
+            llamacpp_base_url("http://127.0.0.1:8080/v1/"),
+            "http://127.0.0.1:8080/v1"
+        );
+        // A mount point keeps its path, with the version appended after it,
+        // as the provider has always done.
+        assert_eq!(
+            llamacpp_base_url("https://gw.example/llama"),
+            "https://gw.example/llama/v1"
+        );
+    }
 
     fn store_with(default_reasoning: &str) -> crate::settings::SettingsStore {
         let mut s = crate::settings::SettingsStore::from_config(&crate::Config::default(), None);
@@ -1287,7 +1416,7 @@ mod tests {
     async fn streaming_run_logs_sent_and_received() {
         use futures::StreamExt;
         use rig_agent::agent::{AgentBuilder, MultiTurnStreamItem};
-        use rig_agent::streaming::StreamingPrompt;
+        use rig_agent::streaming::{Item, StreamEvent};
         use rig_core::completion::Usage;
         use rig_core::test_utils::{mock_final, MockCompletionModel, MockStreamEvent};
         use std::sync::atomic::AtomicBool;
@@ -1315,7 +1444,7 @@ mod tests {
 
         let hook_content = Arc::new(crate::content::Content::quiet());
         let mut stream = agent
-            .stream_prompt("hi")
+            .prompt("hi")
             .add_hook(LoggingHook {
                 content: hook_content,
                 user_cancel: Arc::new(AtomicBool::new(false)),
@@ -1327,14 +1456,15 @@ mod tests {
                 edit_anchors: Arc::new(std::sync::Mutex::new(Default::default())),
             })
             .max_turns(1)
-            .await;
+            .stream();
 
         let mut final_text = String::new();
         while let Some(item) = stream.next().await {
             match item {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(
-                    rig_agent::streaming::StreamedAssistantContent::Text(t),
-                )) => final_text.push_str(t.text()),
+                Ok(MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                    text,
+                    ..
+                }))) => final_text.push_str(&text),
                 Ok(_) => {}
                 Err(e) => panic!("stream error: {e}"),
             }

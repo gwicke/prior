@@ -523,8 +523,8 @@ mod tests {
                 assert_eq!(after, before, "{script}: {banner}");
                 continue;
             }
-            let parsed =
-                bsed_blockedit::parse_blocks(&blob).unwrap_or_else(|e| panic!("{script}: {e}\n{blob}"));
+            let parsed = bsed_blockedit::parse_blocks(&blob)
+                .unwrap_or_else(|e| panic!("{script}: {e}\n{blob}"));
             let edits: Vec<EditOp> = parsed
                 .edits
                 .iter()

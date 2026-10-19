@@ -1012,7 +1012,9 @@ impl Content {
         {
             let width = self.width();
             let avail = width.saturating_sub(content::panel::RESULT_INDENT).max(1);
-            if let Some(table) = bsed_blockedit::arg_error_view::render_arg_error_table(cleaned, avail) {
+            if let Some(table) =
+                bsed_blockedit::arg_error_view::render_arg_error_table(cleaned, avail)
+            {
                 for line in &table {
                     self.paint_panel(&style(line.clone()).dim().to_string(), true);
                 }
@@ -3235,10 +3237,7 @@ mod tests {
             let (label, diff) = get_preview(name, &args);
             // Label is shortened to just `grep`, and both pattern and path are
             // shown in full (no 50-col truncation).
-            assert_eq!(
-                label,
-                "grep fn (main|run)\\( /home/gabriel/src/prior2/src"
-            );
+            assert_eq!(label, "grep fn (main|run)\\( /home/gabriel/src/prior2/src");
             assert!(diff.is_empty());
         }
     }

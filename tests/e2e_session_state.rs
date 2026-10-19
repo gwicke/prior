@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use prior::session::types::{encode_cwd, session_filename};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use prior::session::types::{encode_cwd, session_filename};
 use tempfile::TempDir;
 use vt100::Parser;
 

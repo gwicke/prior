@@ -6,9 +6,7 @@ use crate::session::Session;
 
 use rig_agent::agent::Agent;
 
-use rig_core::message::{
-    AssistantContent, Message, ReasoningContent, ToolResultContent, UserContent,
-};
+use rig_core::message::{AssistantContent, Message, ToolResultContent, UserContent};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -377,22 +375,14 @@ pub(crate) fn estimate_context_tokens(messages: &[Message]) -> u64 {
                     }
                 }
             }
-            Message::Assistant { content, .. } => {
-                for c in content.iter() {
+            Message::Assistant(turn) => {
+                for c in turn.content.iter() {
                     match c {
                         AssistantContent::Text(t) => n += text_tokens(&t.text),
-                        AssistantContent::Reasoning(r) => {
-                            for rc in r.content.iter() {
-                                match rc {
-                                    ReasoningContent::Text { text, .. } => n += text_tokens(text),
-                                    ReasoningContent::Summary(s) => n += text_tokens(s),
-                                    _ => {}
-                                }
-                            }
-                        }
+                        AssistantContent::Reasoning(r) => n += text_tokens(&r.text),
                         AssistantContent::ToolCall(tc) => {
                             n += text_tokens(&tc.function.name)
-                                + text_tokens(&tc.function.arguments.to_string());
+                                + text_tokens(&tc.function.arguments_json());
                         }
                         _ => {}
                     }
@@ -878,6 +868,7 @@ mod tests {
         compute_resume_model_prefill, message_role, record_model_change, record_reasoning_change,
         session_recorded_model_id, session_recorded_reasoning, MessageLogger,
     };
+    use crate::agent::transcript::assistant_message;
     use crate::session::storage::SessionStorage;
     use crate::session::Session;
     use rig_core::message::{AssistantContent, Message, Text};
@@ -1676,10 +1667,10 @@ mod tests {
         logger
             .log_message(
                 "received",
-                &Message::Assistant {
-                    id: Some("resp-1".into()),
-                    content: vec![AssistantContent::Text(Text::new("hi"))],
-                },
+                &assistant_message(
+                    Some("resp-1".into()),
+                    vec![AssistantContent::Text(Text::new("hi"))],
+                ),
                 logger.current_turn_id(),
             )
             .await;
@@ -1709,13 +1700,7 @@ mod tests {
 
         // message_role helper agrees with the serialized role.
         assert_eq!(message_role(&Message::user("x")), "user");
-        assert_eq!(
-            message_role(&Message::Assistant {
-                id: None,
-                content: vec![],
-            }),
-            "assistant"
-        );
+        assert_eq!(message_role(&assistant_message(None, vec![])), "assistant");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

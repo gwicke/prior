@@ -1478,8 +1478,8 @@ impl Config {
             .map_err(|e: toml_edit::TomlError| crate::PriorError::Toml(e.to_string()))?;
         let models = crate::model_settings::read_from_doc(&doc)
             .map_err(|m| crate::PriorError::Toml(format!("invalid per-model settings: {m}")))?;
-        let mut config: Config = toml_edit::de::from_str(content)
-            .map_err(|e| crate::PriorError::Toml(e.to_string()))?;
+        let mut config: Config =
+            toml_edit::de::from_str(content).map_err(|e| crate::PriorError::Toml(e.to_string()))?;
         config.models = models;
         config.migrate();
         Ok(config)

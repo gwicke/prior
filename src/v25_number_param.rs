@@ -251,7 +251,7 @@ impl SlashDotNode for NumberParamNode {
                 display_value(self.param, &params)
             ),
             format!("range: {} – {}", fmt_value(lo), fmt_value(hi)),
-            format!("default: provider (empty clears it back to that)"),
+            "default: provider (empty clears it back to that)".to_string(),
             format!("effect: {}", self.param.effect()),
         ];
         // The catalog-derived facts (does the model accept this knob, and
