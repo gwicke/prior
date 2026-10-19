@@ -8,4 +8,4 @@
 
 ## Formatting
 
-- Code: Always run `cargo fmt` before commit.
+- Code: Always run `cargo fmt` and `cargo clippy` before commit. Fix all warnings.
