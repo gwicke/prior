@@ -128,7 +128,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
                 for c in &chunks[..last] {
                     out.push(format!("{indent}{c}"));
                 }
-                line = format!("{indent}{}", &chunks[last]);
+                line = format!("{indent}{}", chunks[last]);
                 continue;
             }
             let content_len = UnicodeWidthStr::width(line.as_str()).saturating_sub(indent_width);

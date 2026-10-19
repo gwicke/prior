@@ -521,8 +521,8 @@ fn handle_touch(
             // Auto-recorded: move to end
             let mut file = files.remove(idx);
             // Fix indices for shifted elements (idx .. len)
-            for i in idx..files.len() {
-                path_to_index.insert(files[i].path.clone(), i);
+            for (i, file) in files.iter().enumerate().skip(idx) {
+                path_to_index.insert(file.path.clone(), i);
             }
             promote_if_needed(&mut file, modified);
             let new_idx = files.len();

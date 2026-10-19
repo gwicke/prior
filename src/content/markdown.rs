@@ -18,8 +18,10 @@ use crate::content::text::expand_tabs;
 /// Uses GFM (`parse_gfm`) so tables / task-lists / strikethrough render as users
 /// expect, with the default ANSI theme and OSC 8 clickable links.
 pub(crate) fn render_markdown(src: &str, width: usize) -> String {
-    let mut theme = Theme::default();
-    theme.clickable_links = true;
+    let theme = Theme {
+        clickable_links: true,
+        ..Default::default()
+    };
     markdown_terminal::render_with(&markdown_stream::parse_gfm(src), &theme, width)
 }
 

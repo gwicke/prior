@@ -105,8 +105,8 @@ pub fn minimize_edit(edit: &EditOp, resolved_start_line: usize) -> EditOp {
     if prefix + suffix >= old.len() && !old.is_empty() {
         if prefix > 0 {
             prefix -= 1;
-        } else if suffix > 0 {
-            suffix -= 1;
+        } else {
+            suffix = suffix.saturating_sub(1);
         }
     }
 

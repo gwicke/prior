@@ -26,7 +26,7 @@ use crate::model_settings::{self, ModelSettings};
 pub enum EditOutcome {
     /// The user accepted a new record. It has **not** been written; the caller
     /// decides where it goes (`SettingsStore::put_model_settings`).
-    Updated(ModelSettings),
+    Updated(Box<ModelSettings>),
     /// Nothing to do: the editor was abandoned, or the text came back
     /// identical to what we offered.
     Unchanged,
@@ -80,7 +80,7 @@ pub fn edit_fragment(
             // user may leave them untouched, and they must not become part of
             // the stored record.
             model_settings::strip_generated_comments(&mut parsed, &rendered.generated_comments);
-            EditOutcome::Updated(parsed)
+            EditOutcome::Updated(Box::new(parsed))
         }
     }
 }
