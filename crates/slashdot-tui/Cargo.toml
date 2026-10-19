@@ -1,9 +1,11 @@
 [package]
-name = "slashdot_tui"
+name = "slashdot-tui"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-description = "Drawing stack between content and the terminal: RenderElement/RenderManager, Draw, TermIO, ANSI/width utilities."
+license = "GPL-3.0-or-later"
+description = "Drawing stack for composing scrollback above raw / frame content: RenderElement/RenderManager, Draw, TermIO, ANSI/width utilities."
+homepage = "https://github.com/gwicke/prior"
+repository = "https://github.com/gwicke/prior"
 
 [lints]
 workspace = true

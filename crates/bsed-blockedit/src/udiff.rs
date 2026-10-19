@@ -63,7 +63,7 @@ pub struct Hunk {
 /// Split `old -> new` into changed regions, merging across unchanged gaps of at
 /// most `split_gap` lines.
 ///
-/// This is the diff behind `blockedit::minimize::split_and_minimize`. It diffs
+/// This is the diff behind `bsed_blockedit::minimize::split_and_minimize`. It diffs
 /// *line slices*, so the caller controls what a "line" is; the minimizer passes
 /// slices that keep their terminators (`split_inclusive('\n')`) so a group's
 /// slices concatenate back byte-exactly. Same `from_slices` rule as [`unified`]:

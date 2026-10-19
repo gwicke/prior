@@ -328,7 +328,7 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blockedit::{apply::ApplyOutcome, EditOp};
+    use bsed_blockedit::{apply::ApplyOutcome, EditOp};
 
     const FILE: &str = "fn main() {\n    let x = 1;\n    let y = 2;\n    if count > 0 {\n        run();\n    }\n    // trailing\n    let z = 3;\n}\n";
 
@@ -491,7 +491,7 @@ mod tests {
             .collect();
         let TextPreview { blob, .. } =
             preview_text(&file, "src/x.rs", "s/run/walk/g", opts()).unwrap();
-        let parsed = blockedit::parse_blocks(&blob).unwrap();
+        let parsed = bsed_blockedit::parse_blocks(&blob).unwrap();
         assert_eq!(parsed.edits.len(), 14);
         for (i, e) in parsed.edits.iter().enumerate() {
             // trailing=2 is on, so each block carries its change plus two
@@ -524,18 +524,18 @@ mod tests {
                 continue;
             }
             let parsed =
-                blockedit::parse_blocks(&blob).unwrap_or_else(|e| panic!("{script}: {e}\n{blob}"));
+                bsed_blockedit::parse_blocks(&blob).unwrap_or_else(|e| panic!("{script}: {e}\n{blob}"));
             let edits: Vec<EditOp> = parsed
                 .edits
                 .iter()
                 .map(|e| EditOp {
                     old_text: e.old_text.clone(),
                     new_text: e.new_text.clone(),
-                    start_line: e.start_line.map(blockedit::EditStartLine),
+                    start_line: e.start_line.map(bsed_blockedit::EditStartLine),
                     origin: None,
                 })
                 .collect();
-            let applied = match blockedit::apply_to_text(before, &edits) {
+            let applied = match bsed_blockedit::apply_to_text(before, &edits) {
                 ApplyOutcome::Applied { text, .. } => text,
                 ApplyOutcome::Failed { report, .. } => panic!("{script}: {report}"),
             };
@@ -660,7 +660,7 @@ mod tests {
                 );
                 continue;
             }
-            let parsed = blockedit::parse_blocks(&blob)
+            let parsed = bsed_blockedit::parse_blocks(&blob)
                 .unwrap_or_else(|e| panic!("{script}: preview did not parse: {e}\n{blob}"));
             let edits: Vec<EditOp> = parsed
                 .edits
@@ -668,11 +668,11 @@ mod tests {
                 .map(|e| EditOp {
                     old_text: e.old_text.clone(),
                     new_text: e.new_text.clone(),
-                    start_line: e.start_line.map(blockedit::EditStartLine),
+                    start_line: e.start_line.map(bsed_blockedit::EditStartLine),
                     origin: None,
                 })
                 .collect();
-            let applied = match blockedit::apply_to_text(FILE, &edits) {
+            let applied = match bsed_blockedit::apply_to_text(FILE, &edits) {
                 ApplyOutcome::Applied { text, .. } => text,
                 ApplyOutcome::Failed { report, .. } => panic!("{script}: {report}"),
             };

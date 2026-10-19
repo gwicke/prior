@@ -13,7 +13,7 @@ cut off before it is rendered.
 
 ### What the diff actually renders
 
-`crates/blockedit/src/diagnose.rs`:
+`crates/bsed_blockedit/src/diagnose.rs`:
 
 1. `find_anchor` — longest common **substring** between `oldText` and the file.
 2. A window of `oldText.len() + WINDOW_PAD (256)` bytes **on each side** of the
@@ -434,19 +434,19 @@ the new wording.
 
 ### Files
 
-- **File**: `crates/blockedit/src/diagnose.rs`
+- **File**: `crates/bsed_blockedit/src/diagnose.rs`
   - **Change**: `diagnose` rewrite; the two constants; six constructors drop the
     `oldText` clause; `BatchItem` fields; `BatchEditFailure::build` gains the
     origin header and the `total > 1` fallback; module doc
-- **File**: `crates/blockedit/src/resolve.rs`
+- **File**: `crates/bsed_blockedit/src/resolve.rs`
   - **Change**: `not_found_failure` — drop `anchor_info`, realign fallback text
-- **File**: `crates/blockedit/src/blob.rs`
+- **File**: `crates/bsed_blockedit/src/blob.rs`
   - **Change**: `ParsedEdit.raw_header`
-- **File**: `crates/blockedit/src/wire.rs`
+- **File**: `crates/bsed_blockedit/src/wire.rs`
   - **Change**: `to_ops` passes `raw_header` → `EditOp.origin`; the single-edit
     form reconstructs origin from the `path` argument; `elision_notice` made
     `pub(crate)` for shared phrasing
-- **File**: `crates/blockedit/src/types.rs`
+- **File**: `crates/bsed_blockedit/src/types.rs`
   - **Change**: `EditOp.origin`
 - **File**: `src/tools.rs`
   - **Change**: two tests asserting `"Closest match"` in both views (`:2777`,

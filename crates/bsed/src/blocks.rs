@@ -6,7 +6,7 @@
 //! ignored by the blob parser (a header must be a single whitespace-free token),
 //! so the banner is safe to sit in front of the payload.
 
-use blockedit::blob::{DIVIDER, REPLACE_MARKER, SEARCH_MARKER};
+use bsed_blockedit::blob::{DIVIDER, REPLACE_MARKER, SEARCH_MARKER};
 
 use crate::hunks::Block;
 
@@ -33,7 +33,7 @@ fn render_block(path: &str, b: &Block) -> String {
 /// A line inside OLD or NEW that the blob parser would read as structure.
 ///
 /// Only the three *exact* markers are structural. A near miss such as
-/// `@@@END>` is content and round-trips fine (see `blockedit::blob`), so this
+/// `@@@END>` is content and round-trips fine (see `bsed_blockedit::blob`), so this
 /// check is narrow on purpose — a false positive here would refuse an edit that
 /// would have applied cleanly.
 pub fn structural_marker_in(text: &str) -> Option<&'static str> {
@@ -74,7 +74,7 @@ pub fn verify(blocks: &[Block], blob: &str) -> Result<(), String> {
         }
     }
 
-    let parsed = blockedit::parse_blocks(blob).map_err(|e| {
+    let parsed = bsed_blockedit::parse_blocks(blob).map_err(|e| {
         format!("the blocks could not be rendered in the edit tool's block format: {e}")
     })?;
     if parsed.edits.len() != blocks.len() {
@@ -176,7 +176,7 @@ mod tests {
         assert!(r.shown < r.total, "{r:?}");
         assert!(r.truncated);
         // Whatever survived is still whole and parseable.
-        let parsed = blockedit::parse_blocks(&r.blob).unwrap();
+        let parsed = bsed_blockedit::parse_blocks(&r.blob).unwrap();
         assert_eq!(parsed.edits.len(), r.shown);
         assert_eq!(parsed.edits[0].old_text, "old text here");
     }
@@ -185,7 +185,7 @@ mod tests {
     fn round_trip_preserves_texts_and_anchors() {
         let blocks = vec![b(3, "a\nb", "A\nB"), b(9, "x", "y")];
         let r = render("src/x.rs", &blocks, 50_000);
-        let parsed = blockedit::parse_blocks(&r.blob).unwrap();
+        let parsed = bsed_blockedit::parse_blocks(&r.blob).unwrap();
         assert_eq!(parsed.path.as_deref(), Some("src/x.rs"));
         assert_eq!(parsed.edits.len(), 2);
         assert_eq!(parsed.edits[0].old_text, "a\nb");

@@ -873,7 +873,7 @@ impl Content {
     /// halves disagree, which is not something to guess at, so it degrades to
     /// rendering the result alone.
     pub(crate) fn multi_file_pairs(&self, result: &str) -> Option<Vec<(String, Value, String)>> {
-        let files = blockedit::parse_file_results(result)?;
+        let files = bsed_blockedit::parse_file_results(result)?;
         let (name, args) = self.last_tool.lock().unwrap().clone()?;
         if !name.eq_ignore_ascii_case("edit") {
             return None;
@@ -994,7 +994,7 @@ impl Content {
         // the panel shows the problem, the expected block, and the offending
         // structure — not a wall of prefixes. (Display is secondary to the model
         // here, but the same text, so the same cleanup.)
-        cleaned = blockedit::strip_arg_error_prefixes(cleaned);
+        cleaned = bsed_blockedit::strip_arg_error_prefixes(cleaned);
 
         let is_error =
             unquoted.starts_with("Toolset error") || unquoted.starts_with("ToolCallError");
@@ -1012,7 +1012,7 @@ impl Content {
         {
             let width = self.width();
             let avail = width.saturating_sub(content::panel::RESULT_INDENT).max(1);
-            if let Some(table) = blockedit::arg_error_view::render_arg_error_table(cleaned, avail) {
+            if let Some(table) = bsed_blockedit::arg_error_view::render_arg_error_table(cleaned, avail) {
                 for line in &table {
                     self.paint_panel(&style(line.clone()).dim().to_string(), true);
                 }
@@ -1501,7 +1501,7 @@ impl Content {
         // A result with no matching call context (replayed on its own): the
         // call half, and so the diff, is gone, but the report is still per
         // file and still needs its path to attribute a failure.
-        if let Some(files) = blockedit::parse_file_results(result) {
+        if let Some(files) = bsed_blockedit::parse_file_results(result) {
             for fr in files {
                 let label = highlight_label_fg(&format!("edit {}", fr.path), "bash", self.width());
                 for row in label.split('\n') {
@@ -4164,7 +4164,7 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     /// A single-edit failure shows a definition list, not the block table.
     ///
     /// The `Expected:` section follows the shape the caller used (see
-    /// `blockedit::wire`), so this message is JSON on both sides; `arg_error_view`
+    /// `bsed_blockedit::wire`), so this message is JSON on both sides; `arg_error_view`
     /// returns `None` for it and the panel stacks it. The table pairs *block
     /// markers* against what the model sent, so against a JSON `Actual:` it was five
     /// `@@@OLD` rows with one row of JSON beside them.
@@ -4300,11 +4300,11 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
             "Replaced 1 block(s) in ./a.rs",
             "Replaced 1 block(s) in ./b.rs",
         ];
-        let array = blockedit::render_file_results(
+        let array = bsed_blockedit::render_file_results(
             &["a.rs", "b.rs"]
                 .iter()
                 .zip(notes)
-                .map(|(path, note)| blockedit::FileResult {
+                .map(|(path, note)| bsed_blockedit::FileResult {
                     path: (*path).into(),
                     result: Value::String((*note).into()),
                 })

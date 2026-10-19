@@ -88,7 +88,7 @@ pi parity and then withdrawn, because it is the exact thing weak harnesses mangl
 *stringifying* it, which turns a batch into a JSON string and silently loses the edit.
 
 Two of the three reasons that decision rested on turned out not to hold, so the array is accepted
-again (`crates/blockedit/src/wire.rs`, and `doc/edits_readd_and_arg_errors.md` for the full
+again (`crates/bsed_blockedit/src/wire.rs`, and `doc/edits_readd_and_arg_errors.md` for the full
 argument):
 
 - **The stringify hazard is handled rather than avoided.** An `edits` *string* whose first character
@@ -252,7 +252,7 @@ within the repo) rather than inventing a local one. If the normalized forms are 
 Shared parser API (one parser, shared by every site that consumes a blob):
 
 ```rust
-// crates/blockedit/src/blob.rs
+// crates/bsed_blockedit/src/blob.rs
 pub struct ParsedBlocks {
     /// Some(path) iff every header present agrees and at least one is.
     pub path: Option<String>,
@@ -530,7 +530,7 @@ Risks / trade-offs:
 
 - `src/edit_blocks.rs` (new): parser (`parse_blocks`/`merge_path`) + `canonicalize_edit_value` (→
   array) + `array_to_blob_value`/`render_blob` (→ blob) + unit tests.
-  *(Now `crates/blockedit/src/{blob,wire}.rs`, reached through a re-export shim.)*
+  *(Now `crates/bsed_blockedit/src/{blob,wire}.rs`, reached through a re-export shim.)*
 - `src/tools.rs`: replace `EditArgs`/`EditArgsVariant` with a flat struct; variant selection in
   `from_wire`; call `parse_blocks` for the string form; hand-written flat `parameters()`; update
   `EditFile::description` and `EDIT_ARGS_EXAMPLE`.
@@ -648,7 +648,7 @@ The original plan does not survive contact with the code. Five findings:
    **path-per-call is the pi-compatible multi-file shape**, not a workaround for one. The canonical
    form does not move; the largest Phase 2 item is gone.
 2. **The parser work is already done.** `ParsedEdit` carries its own `header`, `parse_blocks` sets
-   `multi_file`, and `blockedit::group_by_file(parsed, fallback) -> Vec<FileBatch>` is exactly the
+   `multi_file`, and `bsed_blockedit::group_by_file(parsed, fallback) -> Vec<FileBatch>` is exactly the
    split this section describes, in first-seen order, with a tested consumer (`bsed apply -i`).
    "Parser allows a header per block; blocks may repeat or omit a path" is implemented — and its
    answer to the open question below is already coded.
@@ -806,10 +806,10 @@ number.
 
 ### Files
 
-`src/edit_blocks.rs` is a re-export shim — edit `crates/blockedit`, not the shim.
+`src/edit_blocks.rs` is a re-export shim — edit `crates/bsed_blockedit`, not the shim.
 
 - **#**: W1–W3
-  - **File**: `blockedit/src/{blob,wire,diagnose}.rs`
+  - **File**: `bsed_blockedit/src/{blob,wire,diagnose}.rs`
   - **Change**: split policy + cap, `EditArgs.files`, the envelope
 - **#**: W4–W5
   - **File**: `src/tools.rs`
@@ -826,8 +826,8 @@ number.
 
 ### Types
 
-Everything new lives in `blockedit` (pure, testable, shared with `bsed`); the `Message`-level split
-lives in prior because `blockedit` has no rig types.
+Everything new lives in `bsed_blockedit` (pure, testable, shared with `bsed`); the `Message`-level split
+lives in prior because `bsed_blockedit` has no rig types.
 
 ```rust
 // blob.rs — the path policy for splitting
@@ -914,7 +914,7 @@ unconditionally, in either order, on repeated turns.
 
 Each is independently shippable and independently revertible.
 
-**W1 — the path policy (`blockedit/src/blob.rs`). — DONE.** `split_by_file` is implemented alongside
+**W1 — the path policy (`bsed_blockedit/src/blob.rs`). — DONE.** `split_by_file` is implemented alongside
 `group_by_file`, which is left alone: `bsed apply -i` already ships against it, and re-basing it on
 a different policy would change a released binary's behaviour for no gain. `split_by_file`, in
 order:
@@ -969,7 +969,7 @@ untouched.
   form, a single token as a wrong path. This is the P1 lesson applied one level down — name the
   malformation rather than report an absence.
 
-**W2 — the tool's Args (`blockedit/src/wire.rs`). — DONE.** `EditArgs` is now
+**W2 — the tool's Args (`bsed_blockedit/src/wire.rs`). — DONE.** `EditArgs` is now
 `{ files: Vec<FileEdit> }`, with `FileEdit { path, edits }`. `from_wire` routes a **multi-file**
 block blob through `split_by_file` and wraps the single-edit and single-file block shapes as a
 one-element `files`, so the tool has one loop and no shape special-case beyond construction.
@@ -980,7 +980,7 @@ on `parsed.multi_file`, not on "did it look multi-file": a single-file blob stil
 into (there is only one candidate, so a default cannot be wrong).
 
 *`to_ops` is now shared.* The `ParsedEdit → EditOp` map moved out of `from_wire` into
-`blockedit::blob::to_ops`, and `bsed`'s private copy (`crates/bsed/src/cli.rs:677`) is deleted in
+`bsed_blockedit::blob::to_ops`, and `bsed`'s private copy (`crates/bsed/src/cli.rs:677`) is deleted in
 favour of it. It was going to be the third copy, and a copy is a place a new field silently fails to
 reach.
 
@@ -1000,7 +1000,7 @@ the others written.
   call's problems in one round trip instead of one file per trip. Until W4, a multi-file call is
   applied file-by-file and each file's own report is returned.
 
-**W3 — the result shape (`blockedit/src/diagnose.rs` + `src/output.rs`) — DONE.** The multi-file
+**W3 — the result shape (`bsed_blockedit/src/diagnose.rs` + `src/output.rs`) — DONE.** The multi-file
 result is a **bare JSON array of per-file results**, one entry per file, each `result` being that
 file's single-file result *verbatim* (a success note string, or a `{ui_view, model_view}` failure
 envelope):
@@ -1233,15 +1233,15 @@ would **add structure**. They are opposite jobs; do not "unify" them. (Today onl
 ### Test matrix
 
 - **Area**: split policy
-  - **Where**: `blockedit` unit
+  - **Where**: `bsed_blockedit` unit
   - **Cases**: 4 rules; header-less block rejected even with `path` set; `./a.rs`+`a.rs` → 1 batch;
     `path` conflict → error; ordering; 32/33 cap
 - **Area**: wire
-  - **Where**: `blockedit` unit
+  - **Where**: `bsed_blockedit` unit
   - **Cases**: 2 shapes; multi-file → N; single-file unchanged; `edits` array rejected; `blocks` as
     array unrecognised
 - **Area**: result shape
-  - **Where**: `blockedit` unit
+  - **Where**: `bsed_blockedit` unit
   - **Cases**: array round-trips; per-file `result` verbatim; single-file unchanged
 - **Area**: tool e2e
   - **Where**: `tools::edit_args_wire_tests` (reuse `CwdGuard`, `#[serial]`)
@@ -1299,8 +1299,8 @@ file if it were wrong.
 - **Risk**: Unbounded fan-out from one string argument
   - **Mitigation**: `MAX_FILES_PER_CALL`, checked before any file is touched
 - **Risk**: `bsed` drift
-  - **Mitigation**: both binaries share `blockedit`; W1–W3 add to it rather than fork it, and
-    `blockedit`'s tests (plus `bsed`'s own) gate the change
+  - **Mitigation**: both binaries share `bsed_blockedit`; W1–W3 add to it rather than fork it, and
+    `bsed_blockedit`'s tests (plus `bsed`'s own) gate the change
 - **Risk**: A stricter multi-file rule than the single-file one costs a round trip on a sloppy blob
   - **Mitigation**: accepted: the cost is one filename line per block in a format whose header line
     is already idiomatic, and the alternative is a silent wrong-file write
@@ -1374,7 +1374,7 @@ file if it were wrong.
 
 ## Implementation status (W1 — the multi-file path policy — done)
 
-- `blockedit::blob::split_by_file`: the four rules below, no caller yet. `MAX_FILES_PER_CALL = 32`;
+- `bsed_blockedit::blob::split_by_file`: the four rules below, no caller yet. `MAX_FILES_PER_CALL = 32`;
   grouping is keyed on the normalized path while `FileBatch.path` keeps the first spelling.
   `group_by_file` is untouched apart from the block-index fix, and `bsed` is unaffected.
 - **Every block names its own file — in every blob, not just multi-file.** No defaulting to the
@@ -1400,7 +1400,7 @@ can reach it. A single-file blob still goes through `merge_path` and still defau
 
 - `src/edit_blocks.rs` (new): `parse_blocks`, `merge_path`, `render_blob`, `canonicalize_edit_value`
   (→ array, best-effort), `array_to_blob_value` (→ blob). Unit-tested. *Since moved: the file is now
-  a re-export shim over `crates/blockedit/src/{blob,wire,resolve,apply,diagnose,path}.rs`, so the
+  a re-export shim over `crates/bsed_blockedit/src/{blob,wire,resolve,apply,diagnose,path}.rs`, so the
   `src/edit_blocks::*` paths named throughout this document still resolve but the code lives in the
   crate.*
 - `src/tools.rs`: `EditArgs` reduced to `{path, edits: Vec<EditOp>}` with a manual `Deserialize`
@@ -1418,13 +1418,13 @@ can reach it. A single-file blob still goes through `merge_path` and still defau
   canonicalizes its input so a blob it can resolve renders normally and one it cannot renders no
   diff and no range.
 
-New tests: block parse/merge round-trips (`blockedit`), flat-schema shape, block-form
+New tests: block parse/merge round-trips (`bsed_blockedit`), flat-schema shape, block-form
 apply/infer/conflict (`tools`), persisted-canonical and legacy-normalize (`session`), history
 blobification (`agent`). Full suite green.
 
 ## Implementation status (`blocks`, no array on the wire — done)
 
-- `blockedit::blob`: `BLOCKS_FIELD` + `blob_text`, the one accessor every site uses to find the
+- `bsed_blockedit::blob`: `BLOCKS_FIELD` + `blob_text`, the one accessor every site uses to find the
   blob, so the field name is stated once. A blob string under a pre-rename `edits` as a **string**
   is still read (`LEGACY_BLOCKS_FIELD`), so the rename does not break callers that never saw it.
 - `array_to_blob_value` emits `blocks`; `canonicalize_edit_value` reads it. The canonical array
@@ -1499,7 +1499,7 @@ success-string location hint. Green.
 ## Notes / follow ups
 
 Each idea below is evaluated against the current code (findings verified against rig rev `1c2f440`,
-a live probe of `edit_file`, and probe tests against the `blockedit` crate). Status is per item, as
+a live probe of `edit_file`, and probe tests against the `bsed_blockedit` crate). Status is per item, as
 marked.
 
 ### 1. Multi-file batches split into single-file batches — investigated

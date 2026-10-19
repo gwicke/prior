@@ -22,7 +22,7 @@ stripped -> blob_edit_tool_calls -> split_multi_file_edit_calls
 
 Add a minimization pass here. `src/agent/transcript.rs:183` converts canonical
 `{path, edits:[{oldText,newText}]}` back to block form; `:277` splits multi-file calls.
-`render_blob` (`crates/blockedit/src/blob.rs:436`) currently drops anchors on render, and
+`render_blob` (`crates/bsed_blockedit/src/blob.rs:436`) currently drops anchors on render, and
 `edits_to_value` (`:467`) drops `startLine` on persist. Both need to preserve it.
 
 ## Resolved placement provenance
@@ -30,8 +30,8 @@ Add a minimization pass here. `src/agent/transcript.rs:183` converts canonical
 By the time we rewrite history the file has already changed, so the apply line cannot be recomputed.
 Capture it during execution instead.
 
-`apply_to_text` (`crates/blockedit/src/apply.rs:69`) already computes `matched_lines`.
-`src/tools.rs:414` (`edit_file`) currently only uses them for a note. Add a blockedit minimizer (new
+`apply_to_text` (`crates/bsed_blockedit/src/apply.rs:69`) already computes `matched_lines`.
+`src/tools.rs:414` (`edit_file`) currently only uses them for a note. Add a bsed_blockedit minimizer (new
 `minimize.rs`):
 
 ```rust
@@ -126,7 +126,7 @@ separate pass:
 
 ### Reuse the existing diff
 
-`blockedit` already depends on `similar`, and `udiff::unified` (`crates/blockedit/src/udiff.rs`)
+`bsed_blockedit` already depends on `similar`, and `udiff::unified` (`crates/bsed_blockedit/src/udiff.rs`)
 already diffs with `TextDiff::from_slices` rather than `from_lines` because `from_lines` breaks on
 a bare `\r`. Keep that rule. The splitter differs in one way: a hunk's ranges index line slices
 that keep their terminators (`split_inclusive('\n')`, already in `minimize.rs`), so a group's slices

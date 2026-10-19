@@ -487,7 +487,7 @@ fn a_tight_budget_returns_a_partial_batch_and_says_so() {
     let status = stderr(&all);
     // Premise of the test: both files really do change, so a budget can cut.
     assert_eq!(
-        blockedit::parse_blocks(&full).unwrap().edits.len(),
+        bsed_blockedit::parse_blocks(&full).unwrap().edits.len(),
         2,
         "{full}"
     );
@@ -523,7 +523,7 @@ fn a_tight_budget_returns_a_partial_batch_and_says_so() {
     assert!(err.contains("returned"), "{err}");
     assert!(err.contains("of 2 "), "should report the total: {err}");
     // Exactly one file's blocks, and the payload still parses.
-    let parsed = blockedit::parse_blocks(&out).expect("payload parses");
+    let parsed = bsed_blockedit::parse_blocks(&out).expect("payload parses");
     assert_eq!(parsed.edits.len(), 1, "{out}");
     let path = parsed.edits[0].header.clone().unwrap();
     // The walk roots at `.`, so the header is spelled `./one.rs`; `split_by_file`
@@ -547,7 +547,7 @@ fn every_recursive_call_returns_at_least_one_batch() {
         assert_eq!(code(&o), 0, "{budget}: {}", stderr(&o));
         let out = stdout(&o);
         assert!(!out.is_empty(), "{budget}: nothing returned");
-        blockedit::parse_blocks(&out).unwrap_or_else(|e| panic!("{budget}: {e}"));
+        bsed_blockedit::parse_blocks(&out).unwrap_or_else(|e| panic!("{budget}: {e}"));
         assert!(
             !stderr(&o).contains("returned 0 of"),
             "{budget}: a batch of nothing: {}",
@@ -565,7 +565,7 @@ fn a_redirected_preview_is_only_the_blocks() {
     let o = run_in(d.path(), None, &["-r", "-p", ".", "s/old_name/new_name/g"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let out = stdout(&o);
-    let parsed = blockedit::parse_blocks(&out).expect("payload parses as blocks");
+    let parsed = bsed_blockedit::parse_blocks(&out).expect("payload parses as blocks");
     assert_eq!(parsed.edits.len(), 2, "{out}");
     for line in out.lines() {
         assert!(
@@ -581,7 +581,7 @@ fn a_redirected_preview_is_only_the_blocks() {
         out.lines().next().unwrap().contains(':'),
         "header first: {out}"
     );
-    blockedit::parse_blocks(&out).expect("payload parses as blocks");
+    bsed_blockedit::parse_blocks(&out).expect("payload parses as blocks");
     assert!(!out.contains("sed preview:"), "{out}");
 }
 

@@ -107,7 +107,7 @@ nobody asked.
 
 ### 1c. A stringified array is recovered, not misparsed
 
-`blob_text` (`crates/blockedit/src/blob.rs:39-44`) accepts **any** string under
+`blob_text` (`crates/bsed_blockedit/src/blob.rs:39-44`) accepts **any** string under
 `edits`, so `"edits": "[{\"oldText\":…}]"` — the exact hazard the blob form was
 introduced to kill (`doc/batch_editing_v2.md:64-89`) — currently reaches
 `parse_blocks` and dies as `Invalid block: …`.
@@ -194,7 +194,7 @@ defunct and gets corrected.
 
 ## Tests
 
-`crates/blockedit/src/wire.rs` — new: array batched onto one file; per-entry
+`crates/bsed_blockedit/src/wire.rs` — new: array batched onto one file; per-entry
 anchors and their precedence; redundant agreeing entry `path`; array with no
 top-level `path`; `[]`; non-object entry; missing `oldText`/`newText`; entries
 naming two files; entry `path` disagreeing with the call; array beside

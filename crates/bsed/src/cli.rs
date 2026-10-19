@@ -19,7 +19,7 @@ use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use blockedit::{apply::ApplyOutcome, EditOp, ParsedEdit};
+use bsed_blockedit::{apply::ApplyOutcome, EditOp, ParsedEdit};
 
 use crate::{Context, Options};
 
@@ -204,7 +204,7 @@ fn emit(body: &str) {
 /// already has the bytes) and only when it carries blocks, since a copy is only
 /// useful if there is something in it to edit and re-pipe.
 fn should_spool(body: &str, is_tty: bool) -> bool {
-    is_tty && body.contains(blockedit::SEARCH_MARKER)
+    is_tty && body.contains(bsed_blockedit::SEARCH_MARKER)
 }
 
 /// Write `body` to a fresh temp file whose name says what it is.
@@ -494,7 +494,7 @@ fn diff_one(
 ) -> Result<Out, Failure> {
     let (new, n) =
         crate::preview_new(text, shown, expressions).map_err(|e| Failure::User(e.to_string()))?;
-    let d = blockedit::udiff::unified(text, &new, shown, diff_context);
+    let d = bsed_blockedit::udiff::unified(text, &new, shown, diff_context);
     if d.is_empty() {
         return Ok(Out {
             payload: String::new(),
@@ -662,7 +662,7 @@ fn recursive_preview(
                 }
                 Err(e) => return Err(Failure::User(e.to_string())),
             };
-            let d = blockedit::udiff::unified(&text, &new, &shown, mode.diff_context);
+            let d = bsed_blockedit::udiff::unified(&text, &new, &shown, mode.diff_context);
             if d.is_empty() {
                 continue;
             }
@@ -896,7 +896,7 @@ fn relative_to(root: &Path, f: &Path) -> std::path::PathBuf {
 /// How many blocks a rendered blob carries: one `@@@OLD` per block.
 fn count_blocks(blob: &str) -> usize {
     blob.lines()
-        .filter(|l| l.trim() == blockedit::SEARCH_MARKER)
+        .filter(|l| l.trim() == bsed_blockedit::SEARCH_MARKER)
         .count()
 }
 
@@ -936,9 +936,9 @@ fn apply(args: &[String]) -> Result<Out, Failure> {
         None => None,
     };
     let blob = read_stdin()?;
-    let parsed = blockedit::parse_blocks(&blob).map_err(|e| Failure::User(e.to_string()))?;
+    let parsed = bsed_blockedit::parse_blocks(&blob).map_err(|e| Failure::User(e.to_string()))?;
     let batches =
-        blockedit::group_by_file(parsed, named.as_deref().map(|p| p.to_str().unwrap_or("")))
+        bsed_blockedit::group_by_file(parsed, named.as_deref().map(|p| p.to_str().unwrap_or("")))
             .map_err(Failure::User)?;
 
     if batches.len() > 1 && !in_place {
@@ -959,7 +959,7 @@ fn apply(args: &[String]) -> Result<Out, Failure> {
     // two hundred should not block the other hundred and ninety-nine.
     for batch in &batches {
         let path = &batch.path;
-        let edits: Vec<EditOp> = blockedit::to_ops(&batch.edits);
+        let edits: Vec<EditOp> = bsed_blockedit::to_ops(&batch.edits);
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
@@ -967,7 +967,7 @@ fn apply(args: &[String]) -> Result<Out, Failure> {
                 continue;
             }
         };
-        match blockedit::apply_to_text(&text, &edits) {
+        match bsed_blockedit::apply_to_text(&text, &edits) {
             ApplyOutcome::Applied { text, .. } => {
                 if in_place {
                     if let Err(e) = std::fs::write(path, &text) {
@@ -1052,8 +1052,8 @@ fn apply(args: &[String]) -> Result<Out, Failure> {
         let path = &batches[0].path;
         let text = std::fs::read_to_string(path)
             .map_err(|e| Failure::Internal(format!("{}: {e}", path)))?;
-        let edits: Vec<EditOp> = blockedit::to_ops(&batches[0].edits);
-        if let ApplyOutcome::Applied { text, .. } = blockedit::apply_to_text(&text, &edits) {
+        let edits: Vec<EditOp> = bsed_blockedit::to_ops(&batches[0].edits);
+        if let ApplyOutcome::Applied { text, .. } = bsed_blockedit::apply_to_text(&text, &edits) {
             return Ok(Out::all(text));
         }
     }

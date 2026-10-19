@@ -737,10 +737,10 @@ impl From<SandboxMaxOutputBytes> for Option<usize> {
 }
 
 /// The `edit` tool's 1-indexed `startLine` anchor (and the same numbers a
-/// `path:LINE` header parses to). Defined in the `blockedit` crate so the
+/// `path:LINE` header parses to). Defined in the `bsed_blockedit` crate so the
 /// `bsed` binary shares one type; re-exported here for the existing
 /// `crate::config::EditStartLine` call sites.
-pub use blockedit::EditStartLine;
+pub use bsed_blockedit::EditStartLine;
 
 /// How many unchanged lines the `sed` preview attaches around each change.
 ///

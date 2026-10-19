@@ -1,6 +1,6 @@
 [workspace]
-members = [".", "crates/slashdot_menu", "crates/slashdot_tui", "crates/blockedit", "crates/bsed"]
-resolver = "2"
+members = [".", "crates/slashdot-menu", "crates/slashdot-tui", "crates/bsed-blockedit", "crates/bsed"]
+resolver = "3"
 
 # Two lints that fire on shape rather than on correctness. Both are answered by
 # "extract a type", and here the extraction would cost more than it buys: the
@@ -18,13 +18,13 @@ type_complexity = "allow"
 too_many_arguments = "allow"
 
 [package]
-name = "prior"
-version = "0.6.0"
+name = "prior-agent"
+version = "0.1.0"
 authors = ["Gabriel Wicke <gswicke@gmail.com>", "Dotan Nahum <dotan@rng0.io>"]
 edition = "2021"
 default-run = "prior"
-description = "A small and efficient coding agent inspired by and session-compatible with pi."
-license = "MIT"
+description = "A small coding agent inspired by and session-compatible with pi."
+license = "GPL-3.0-or-later"
 repository = "https://github.com/gwicke/prior"
 homepage = "https://github.com/gwicke/prior"
 readme = "README.md"
@@ -36,13 +36,13 @@ exclude = ["prior.gif", ".github/"]
 workspace = true
 
 [dependencies]
-rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
-slashdot_menu = { path = "crates/slashdot_menu" }
-slashdot_tui = { path = "crates/slashdot_tui" }
-blockedit = { path = "crates/blockedit" }
-bsed = { path = "crates/bsed" }
-rig-agent = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
-rig-reqwest = { git = "https://github.com/gwicke/rig", rev = "1c2f4405" }
+rig-core = { version = "0.42.0", git = "https://github.com/gwicke/rig", branch = "main", features = ["derive"] }
+slashdot-menu = { version = "0.1.0", path = "crates/slashdot-menu" }
+slashdot-tui = { version = "0.1.0", path = "crates/slashdot-tui" }
+bsed-blockedit = { version = "0.1.0", path = "crates/bsed-blockedit" }
+bsed = { version = "0.1.0", path = "crates/bsed" }
+rig-agent = { version = "0.42.0", git = "https://github.com/gwicke/rig", branch = "main", features = ["derive"] }
+rig-reqwest = { version = "0.42.0", git = "https://github.com/gwicke/rig", branch = "main" }
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -121,11 +121,11 @@ serial_test = "3.1"
 # (tests/quit_restores_cooked_mode.rs) — already a regular dependency; the
 # dev edge lets integration tests name it directly.
 libc = "0.2"
-rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["test-utils"] }
+rig-core = { git = "https://github.com/gwicke/rig", branch = "main", features = ["test-utils"] }
 # Test-only seams of the drawing crate (`TermIO::recording`, `RenderManager::draw`)
 # — features of a dependency unify per-build, so `cargo test` sees them and a
 # production `cargo build` does not.
-slashdot_tui = { path = "crates/slashdot_tui", features = ["test-helpers"] }
+slashdot-tui = { version = "0.1.0", path = "crates/slashdot-tui", features = ["test-helpers"] }
 
 # Fork of codewandler-markdown-terminal adding OSC 8 clickable inline links
 # (gated by Theme.clickable_links) and a faded `Theme::dimmed()` for streamed

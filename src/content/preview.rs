@@ -361,7 +361,7 @@ pub(crate) const SED_PREVIEW_BANNER: &str = "sed preview: ";
 /// Identified by that banner, **not** by "the text happens to contain
 /// `@@@OLD`". This renderer is applied to *every* tool result before the
 /// result-specific ones, and the `edit` tool's own argument errors embed the
-/// fixed `Expected:` example (`blockedit::wire::EDIT_ARGS_EXAMPLE`) — which is a
+/// fixed `Expected:` example (`bsed_blockedit::wire::EDIT_ARGS_EXAMPLE`) — which is a
 /// well-formed block. So a content sniff parsed the example out of the error,
 /// drew it as a phantom `-`/`+` diff, and returned before the error itself was
 /// ever rendered; its trailing "summary" was the error's first line cut at the

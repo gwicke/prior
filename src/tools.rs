@@ -14,16 +14,16 @@ use crate::config::{
 };
 use crate::path_util::relativize_path;
 
-// The block-edit core moved to the `blockedit` crate so the `bsed` binary
+// The block-edit core moved to the `bsed_blockedit` crate so the `bsed` binary
 // previews and applies in exactly the format the `edit` tool consumes. These
 // re-exports keep every call site in this file spelled as before.
-pub use blockedit::wire::{EditArgs, FileEdit, MAX_ECHOED_ARGS};
+pub use bsed_blockedit::wire::{EditArgs, FileEdit, MAX_ECHOED_ARGS};
 // The advertised blob field is spelled by the same const the parser reads, so the
 // schema and `EditArgs::from_wire` cannot drift into naming two different fields.
 #[allow(unused)]
-use blockedit::blob::{BLOCKS_FIELD, LEGACY_BLOCKS_FIELD};
-use blockedit::ApplyOutcome;
-pub use blockedit::{apply_to_text, EditOp};
+use bsed_blockedit::blob::{BLOCKS_FIELD, LEGACY_BLOCKS_FIELD};
+use bsed_blockedit::ApplyOutcome;
+pub use bsed_blockedit::{apply_to_text, EditOp};
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, JsonSchema)]
 pub enum ToolError {
@@ -635,7 +635,7 @@ async fn edit_files_with(
         let (raw, matched_lines) = match edit_file_inner(path.clone(), edits).await {
             Ok(r) => r,
             Err(e) => {
-                results.push(blockedit::FileResult {
+                results.push(bsed_blockedit::FileResult {
                     path: path.clone(),
                     result: serde_json::Value::String(format!("could not edit {path}: {e}")),
                 });
@@ -655,19 +655,19 @@ async fn edit_files_with(
             Ok(v) => v,
             Err(_) => serde_json::Value::String(raw),
         };
-        results.push(blockedit::FileResult { path, result });
+        results.push(bsed_blockedit::FileResult { path, result });
     }
     if let Some(ctx) = context {
         if !resolutions.files.is_empty() {
             ctx.insert_result(resolutions);
         }
     }
-    Ok(blockedit::render_file_results(&results))
+    Ok(bsed_blockedit::render_file_results(&results))
 }
 
 /// Apply a batch of edits to one file, all-or-nothing.
 ///
-/// The matching and application logic lives in the `blockedit` crate (shared
+/// The matching and application logic lives in the `bsed_blockedit` crate (shared
 /// with the `bsed` binary); this wrapper is the agent-facing IO: resolve the
 /// path against the sandbox policy, read, apply, write, and report.
 pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolError> {
@@ -715,7 +715,7 @@ async fn edit_file_inner(
     let cwd = std::env::current_dir().unwrap_or_else(|_| sandbox_path.clone());
     let shown = relativize_path(&sandbox_path, &cwd);
     Ok((
-        blockedit::success_note(&edits, &matched_lines, &shown),
+        bsed_blockedit::success_note(&edits, &matched_lines, &shown),
         Some(matched_lines),
     ))
 }
@@ -3637,7 +3637,7 @@ mod edit_file_tests {
             .unwrap();
         let mut ctx = ToolContext::default();
         let raw = edit_files_with(
-            vec![blockedit::FileEdit {
+            vec![bsed_blockedit::FileEdit {
                 path: "anchor.txt".into(),
                 edits: vec![EditOp {
                     old_text: "beta".into(),
@@ -3668,7 +3668,7 @@ mod edit_file_tests {
             .unwrap();
         let mut ctx = ToolContext::default();
         edit_files_with(
-            vec![blockedit::FileEdit {
+            vec![bsed_blockedit::FileEdit {
                 path: "anchor.txt".into(),
                 edits: vec![EditOp {
                     old_text: "does not exist".into(),
@@ -3791,7 +3791,7 @@ mod edit_args_wire_tests {
         // problem, the line-based `Expected:` block, and the echo. (The raw
         // result still carries rig's wrapper; the agent hook removes it.)
         let raw = result.output().render();
-        let msg = blockedit::strip_arg_error_prefixes(&raw);
+        let msg = bsed_blockedit::strip_arg_error_prefixes(&raw);
         assert!(
             msg.contains("Expected:"),
             "must show expected shape, got: {msg}"
@@ -3821,7 +3821,7 @@ mod edit_args_wire_tests {
         .await;
         assert!(result.is_error(), "missing newText must fail: {result:?}");
         let raw = result.output().render();
-        let msg = blockedit::strip_arg_error_prefixes(&raw);
+        let msg = bsed_blockedit::strip_arg_error_prefixes(&raw);
         assert!(msg.contains("Expected:"), "got: {msg}");
         // The correction is in the shape the caller used: this call is
         // `oldText`-shaped, so it is shown the JSON call that works, not the
@@ -3835,7 +3835,7 @@ mod edit_args_wire_tests {
         let result = execute_edit(serde_json::json!("just a string")).await;
         assert!(result.is_error());
         let raw = result.output().render();
-        let msg = blockedit::strip_arg_error_prefixes(&raw);
+        let msg = bsed_blockedit::strip_arg_error_prefixes(&raw);
         assert!(msg.contains("must be a JSON object"), "got: {msg}");
     }
 

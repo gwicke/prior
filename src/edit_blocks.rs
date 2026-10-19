@@ -1,14 +1,14 @@
-//! Re-export of the `blockedit` crate's blob parser, plus the split primitives
+//! Re-export of the `bsed_blockedit` crate's blob parser, plus the split primitives
 //! both surfaces of a multi-file call share.
 //!
-//! The implementation moved to `crates/blockedit/src/blob.rs` so the `bsed`
+//! The implementation moved to `crates/bsed_blockedit/src/blob.rs` so the `bsed`
 //! binary can emit and consume the exact same format without depending on
 //! prior. This module stays as the in-crate path so the ~15 existing
 //! `crate::edit_blocks::…` call sites are untouched.
 
 use serde_json::Value;
 
-pub use blockedit::blob::*;
+pub use bsed_blockedit::blob::*;
 
 /// The id of file `i` of `n` in a split of `orig`.
 ///
@@ -50,7 +50,7 @@ pub fn split_id(
 ///
 /// `render_blob` keeps each block's `path:LINE`, so anchored/minimized calls
 /// must stay anchored through a split. Keep this in sync with
-/// `blockedit::blob::{parse_blocks, render_blob, edits_to_value}` and
+/// `bsed_blockedit::blob::{parse_blocks, render_blob, edits_to_value}` and
 /// `Session::canonicalize_edit_tool_calls` (the persist-side split).
 pub fn per_file_blocks(args: &Value) -> Option<Vec<String>> {
     let parsed = parse_blocks(blob_text(args)?).ok()?;

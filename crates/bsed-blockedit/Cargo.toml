@@ -1,9 +1,11 @@
 [package]
-name = "blockedit"
+name = "bsed-blockedit"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-description = "The @@@OLD/@@@NEW/@@@END block-edit core: blob parser, match resolver, and applier. Pure — no agent, no I/O policy."
+license = "GPL-3.0-or-later"
+description = "An @@@OLD/@@@NEW/@@@END block-edit core: block parser, match resolver, and applier."
+homepage = "https://github.com/gwicke/prior"
+repository = "https://github.com/gwicke/prior"
 
 [lints]
 workspace = true

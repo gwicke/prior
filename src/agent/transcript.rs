@@ -20,7 +20,7 @@ use rig_core::message::{
 };
 use std::collections::HashMap;
 
-use blockedit::EditOp;
+use bsed_blockedit::EditOp;
 
 /// Canonical transcript of the in-flight run, mirroring rig's `new_messages`
 /// shape: `[assistant, user(tool-results), assistant, …]` (the user prompt is
@@ -273,7 +273,7 @@ fn minimized_edit_args(
     args: &serde_json::Value,
     resolutions: &crate::tools::EditResolutions,
 ) -> Option<serde_json::Value> {
-    let parsed = blockedit::EditArgs::from_wire(args).ok()?;
+    let parsed = bsed_blockedit::EditArgs::from_wire(args).ok()?;
     let mut any_resolved = false;
     let mut blobs = Vec::with_capacity(parsed.files.len());
     for file in parsed.files {
@@ -293,7 +293,7 @@ fn minimized_edit_args(
                         let base = edit.start_line.map(|s| s.0 as usize).unwrap_or(*line);
                         // One input edit may split into several anchored
                         // sub-edits at long internal unchanged runs.
-                        blockedit::split_and_minimize(edit, base)
+                        bsed_blockedit::split_and_minimize(edit, base)
                     })
                     .collect()
             }
@@ -301,9 +301,9 @@ fn minimized_edit_args(
             // was: no resolved line means no honest anchor.
             _ => file.edits,
         };
-        let edits: Vec<blockedit::ParsedEdit> = minimized
+        let edits: Vec<bsed_blockedit::ParsedEdit> = minimized
             .into_iter()
-            .map(|e| blockedit::ParsedEdit {
+            .map(|e| bsed_blockedit::ParsedEdit {
                 old_text: e.old_text,
                 new_text: e.new_text,
                 start_line: e.start_line.map(|s| s.0),
@@ -313,10 +313,10 @@ fn minimized_edit_args(
                 // `render_blob` emits the canonical `@@@OLD`-first order
                 // regardless of how the call arrived, so the re-rendered block
                 // is always old-first.
-                order: blockedit::BlockOrder::OldFirst,
+                order: bsed_blockedit::BlockOrder::OldFirst,
             })
             .collect();
-        blobs.push(blockedit::render_blob(&file.path, &edits));
+        blobs.push(bsed_blockedit::render_blob(&file.path, &edits));
     }
     any_resolved.then(|| serde_json::json!({ "blocks": blobs.join("\n\n") }))
 }
@@ -357,7 +357,7 @@ struct SplitEditCall {
 /// call to the original single form is the safe reading of that.
 fn split_edit_call_and_result(args: &serde_json::Value, result: &str) -> Option<SplitEditCall> {
     let per_file = crate::edit_blocks::per_file_blocks(args)?;
-    let results: Vec<String> = blockedit::parse_file_results(result)?
+    let results: Vec<String> = bsed_blockedit::parse_file_results(result)?
         .iter()
         .map(|f| match &f.result {
             serde_json::Value::String(s) => s.clone(),
@@ -690,7 +690,7 @@ pub(crate) fn model_facing_tool_text<'a>(tool_name: &str, text: &'a str) -> Opti
     if tool_name != "edit" {
         return None;
     }
-    let cleaned = blockedit::strip_arg_error_prefixes(text);
+    let cleaned = bsed_blockedit::strip_arg_error_prefixes(text);
     (cleaned != text).then_some(cleaned)
 }
 
@@ -735,18 +735,18 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let blocks = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
                       b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END\n\n\
                       c.rs\n@@@OLD\nq\n@@@NEW\nQ\n@@@END";
-        let result = blockedit::render_file_results(&[
-            blockedit::FileResult {
+        let result = bsed_blockedit::render_file_results(&[
+            bsed_blockedit::FileResult {
                 path: "a.rs".into(),
                 result: serde_json::json!("Replaced 1 block(s) in ./a.rs"),
             },
-            blockedit::FileResult {
+            bsed_blockedit::FileResult {
                 path: "b.rs".into(),
                 result: serde_json::json!({
                     "ui_view": "edit failed: nope", "model_view": "long diff"
                 }),
             },
-            blockedit::FileResult {
+            bsed_blockedit::FileResult {
                 path: "c.rs".into(),
                 result: serde_json::json!("Replaced 1 block(s) in ./c.rs"),
             },

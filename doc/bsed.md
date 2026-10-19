@@ -56,7 +56,7 @@ compiler**: a preview, in the one format the agent already knows how to apply.
  │ tool `edit` (existing) │                       └──────────────┐
  └────────────────────────┘                                      │
         ▲                                                         │
-        └──── crates/blockedit  (parse / match / apply, shared) ──┘
+        └──── crates/bsed_blockedit  (parse / match / apply, shared) ──┘
              extracted from src/edit_blocks.rs + src/edit_match.rs + edit_file
 ```
 
@@ -890,7 +890,7 @@ appliable, and `apply` then rejected it. Now:
 
 ### 7.4 The multi-file seam
 
-`blockedit::group_by_file(parsed, fallback_path)` is where "a blob may span
+`bsed_blockedit::group_by_file(parsed, fallback_path)` is where "a blob may span
 files" meets "a write is atomic per file": it splits a parsed blob into one
 batch per file, in first-seen order, with header-less blocks falling back to the
 caller's `path` argument. It is the single place that knowledge lives, and it is
@@ -937,19 +937,19 @@ crates/bsed/            # package: lib + bin bsed. No dependency from prior.
   src/bin/bsed.rs           # argv parsing, exit codes
   tests/                    # golden + contract tests
 
-crates/blockedit/           # NEW: the pure block-edit core, extracted from prior
+crates/bsed_blockedit/           # NEW: the pure block-edit core, extracted from prior
   src/parse.rs              # from src/edit_blocks.rs   (parse/render/canonicalize)
   src/match.rs              # from src/edit_match.rs     (resolve/diagnose; `similar`)
   src/apply.rs              # from src/tools.rs         (resolve_edits + apply-on-text)
   src/types.rs              # EditOp / EditStartLine, serde names unchanged
 ```
 
-`blockedit` is what makes §7's `apply` and the round-trip contract possible, and
+`bsed_blockedit` is what makes §7's `apply` and the round-trip contract possible, and
 it is the risky part of this proposal: `src/edit_blocks.rs` (759 lines),
 `src/edit_match.rs` (928 lines) and `edit_file`/`resolve_edits` in
 `src/tools.rs` must move with their tests, keeping the persisted JSON shape
 (`{"oldText","newText","startLine"}`) byte-identical for session replay.
-`prior` re-exports the types; `bsed` depends on `blockedit` for the markers
+`prior` re-exports the types; `bsed` depends on `bsed_blockedit` for the markers
 and to self-validate the blob it emits.
 
 The extraction should be its own PR, before any `sed` work: it is a refactor
@@ -959,8 +959,8 @@ with no behaviour change, and it de-risks the crate work.
 
 - **Where**: `Cargo.toml`
   - **Change**:
-    `members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/bsed"]`;
-    `blockedit = { path = … }`. add `bsed` as a dep, purely for the `bsed` shim
+    `members = [".", "crates/slashdot_menu", "crates/bsed_blockedit", "crates/bsed"]`;
+    `bsed_blockedit = { path = … }`. add `bsed` as a dep, purely for the `bsed` shim
     binary (§7).
 - **Where**: `src/tools.rs`
   - **Change**:
@@ -1058,7 +1058,7 @@ hand-written.
    newline.
 4. `blocks.rs` — golden blobs + budget truncation at a block boundary.
 5. **Round-trip contract** (the most valuable test in the project): `blocks.rs`
-   output → `blockedit::parse_blob` → assert parsed
+   output → `bsed_blockedit::parse_blob` → assert parsed
    `(old_text, new_text, anchor)` equals the hunk slices and anchors are exact.
    Run it as an integration test in *prior* too, so the two sides cannot
    drift.
@@ -1071,7 +1071,7 @@ hand-written.
    line; (c) a blob with its headers stripped → falls to the unanchored pass and
    is rejected as non-unique, which is exactly the argument for anchoring every
    block.
-7. `blockedit` extraction — existing tests move with the code; add a
+7. `bsed_blockedit` extraction — existing tests move with the code; add a
    session-replay test over a recorded `edit` call to prove the JSON shape is
    unchanged.
 8. Tool-level — `sed` absent from `$PATH` ⇒ tool not advertised; exit 2 ⇒
@@ -1109,7 +1109,7 @@ row points to.
     shim; `crates/bsed` stays independently installable
   - **Where**: §7
 - **#**: 6
-  - **Question**: `crates/blockedit`
+  - **Question**: `crates/bsed_blockedit`
   - **Decision**: **separate crate** — keeps the binary separable later
   - **Where**: §8
 - **#**: 7
@@ -1169,7 +1169,7 @@ Still open — small tuning decisions, not architecture:
    guard, or drop `<`/`>` from balancing entirely? Dropping is safer but stops
    `Vec<T>` and `HashMap<K, V>` in a changed line from triggering growth.
 3. **`bsed apply` in v1** or with `replace -r` later? `apply` is the piece a
-   shell user reaches for first, but it is not available until `blockedit` is
+   shell user reaches for first, but it is not available until `bsed_blockedit` is
    extracted.
 
 ## 13. Deferred
@@ -1253,7 +1253,7 @@ that failed come back as blocks to fix.
 Two smaller notes on what shipped:
 
 - **`bsed apply` is in v1.** The question was whether to defer it, but it fell
-  out of the `blockedit` extraction for free — it is `apply_to_text` plus a file
+  out of the `bsed_blockedit` extraction for free — it is `apply_to_text` plus a file
   write — and without `-i` it writes to stdout, so
   `bsed apply f.rs < blocks.txt | diff f.rs -` is a review loop that cannot
   touch the file. It is how the round-trip property is tested.

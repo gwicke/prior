@@ -2,14 +2,16 @@
 name = "bsed"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-or-later"
 description = "Preview a GNU sed script as line-anchored @@@OLD/@@@NEW/@@@END block edits. Ships the `bsed` binary."
+homepage = "https://github.com/gwicke/prior"
+repository = "https://github.com/gwicke/prior"
 
 [lints]
 workspace = true
 
 [dependencies]
-blockedit = { path = "../blockedit" }
+bsed-blockedit = { version = "0.1.0", path = "../bsed-blockedit" }
 # The walker for `preview -r`: .gitignore-aware, skips hidden files, and
 # already in the tree via prior, so this is no new download.
 ignore = "0.4.25"

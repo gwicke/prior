@@ -139,7 +139,7 @@ fn split_edit_tool_results(msg: &Message) -> Option<Message> {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let Some(files) = blockedit::parse_file_results(&text).filter(|f| f.len() > 1) else {
+        let Some(files) = bsed_blockedit::parse_file_results(&text).filter(|f| f.len() > 1) else {
             new_content.push(c.clone());
             continue;
         };
@@ -2873,12 +2873,12 @@ mod tests {
     }
 
     fn multi_result(id: &str) -> Message {
-        let array = blockedit::render_file_results(&[
-            blockedit::FileResult {
+        let array = bsed_blockedit::render_file_results(&[
+            bsed_blockedit::FileResult {
                 path: "a.rs".into(),
                 result: serde_json::json!("Replaced 1 block(s) in ./a.rs"),
             },
-            blockedit::FileResult {
+            bsed_blockedit::FileResult {
                 path: "b.rs".into(),
                 result: serde_json::json!({
                     "ui_view": "edit failed: nope", "model_view": "long diff"
