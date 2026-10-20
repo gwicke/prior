@@ -108,7 +108,11 @@ pub const DEFAULT_LLM_COMPACT_PROMPT: &str = "Summarize the conversation in less
 /// * `Never` — strip all reasoning blocks from context to save tokens.
 /// * `AbortedTurnsOnly` — strip reasoning from successful turns, but preserve
 ///   reasoning from aborted/errored turns so the model can resume its train
-///   of thought when the user provides a steering message.
+///   of thought when the user provides a steering message. Only the trailing
+///   run of aborts is kept: once a later user turn completes with a final
+///   response, the reasoning of every abort it superseded is stripped too
+///   (it is stale context by then), saving its tokens for the rest of the
+///   session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningInContextMode {

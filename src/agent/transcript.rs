@@ -628,9 +628,17 @@ pub(crate) fn persist_turn(
 /// - Provider is Anthropic-family **and** the turn contains tool calls
 ///   (the thinking+tool_use replay contract)
 ///
-/// When mode is `AbortedTurnsOnly`, reasoning is preserved for assistant
-/// messages with `id: None` (aborted/errored turns created locally without
-/// a provider responseId), but stripped from successful turns.
+/// When mode is `AbortedTurnsOnly`, reasoning is preserved only for the
+/// *trailing run* of aborted assistant messages — those with `id: None`
+/// (aborted/errored turns created locally without a provider responseId)
+/// that follow the **last** completed turn. That window is the one the
+/// reasoning exists for: the model continuing the thread it was aborted
+/// mid-way through. Once a later user turn completes with a final response,
+/// the abort it superseded is closed and its reasoning is stale context —
+/// it is stripped like a normal turn's, saving the tokens on every request
+/// for the rest of the session. Successive aborts with no completion
+/// between them all keep theirs: several aborts in a row are still one
+/// unfinished thread.
 ///
 /// Assistant messages left empty by the filter get a placeholder `Text` so
 /// the message stays well-formed and user/assistant alternation holds.
@@ -651,18 +659,33 @@ pub(crate) fn maybe_strip_reasoning(
         reasoning_in_context,
         crate::settings::ReasoningInContextMode::AbortedTurnsOnly
     );
+    // `AbortedTurnsOnly` keeps reasoning only for the *trailing* run of
+    // aborted turns: those positioned after the last completed assistant
+    // message (one carrying a provider responseId). An abort older than
+    // that completion is closed — a later user turn ran to a final answer —
+    // so its reasoning no longer helps and is stripped. `None` (no completed
+    // turn anywhere yet) leaves every abort in the trailing run.
+    let last_completed = messages.iter().rposition(|m| match m {
+        Message::Assistant(turn) => response_id(turn).is_some(),
+        _ => false,
+    });
     messages
         .into_iter()
-        .map(|m| match m {
+        .enumerate()
+        .map(|(i, m)| match m {
             Message::Assistant(mut turn) => {
                 // No provider responseId = aborted/errored turn.
                 let is_aborted = response_id(&turn).is_none();
+                let in_trailing_run = last_completed.is_none_or(|last| i > last);
                 let kept: Vec<AssistantContent> = std::mem::take(&mut turn.content)
                     .into_iter()
                     .filter(|c| {
-                        if keep_aborted && is_aborted && matches!(c, AssistantContent::Reasoning(_))
+                        if keep_aborted
+                            && is_aborted
+                            && in_trailing_run
+                            && matches!(c, AssistantContent::Reasoning(_))
                         {
-                            true // Preserve reasoning for aborted turns
+                            true // Preserve reasoning for the trailing aborted run
                         } else {
                             !matches!(c, AssistantContent::Reasoning(_))
                         }
@@ -1412,7 +1435,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     }
 
     /// Test AbortedTurnsOnly mode: preserves reasoning for aborted turns (id: None)
-    /// but strips from successful turns (id: Some).
+    /// but strips from successful turns (id: Some). Here the abort trails the
+    /// completion, so it is still the open thread and keeps its reasoning.
     #[test]
     fn aborted_turns_only_preserves_reasoning_for_aborted() {
         use crate::settings::ReasoningInContextMode;
@@ -1468,6 +1492,108 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         assert!(contents[1]
             .iter()
             .any(|c| matches!(c, AssistantContent::Text(t) if t.text == "aborted answer")));
+    }
+
+    /// Once a later user turn completes, an abort it superseded is closed:
+    /// its reasoning is stale context and must be stripped, while an abort
+    /// trailing the completion (the still-open thread) keeps its reasoning.
+    #[test]
+    fn aborted_reasoning_stripped_once_a_later_turn_completes() {
+        use crate::settings::ReasoningInContextMode;
+        let aborted = |label: &str, thought: &str| {
+            assistant_message(
+                None,
+                vec![
+                    AssistantContent::Reasoning(Reasoning::new(thought)),
+                    AssistantContent::Text(Text::new(label)),
+                ],
+            )
+        };
+        let completed = assistant_message(
+            Some("resp-1".into()),
+            vec![AssistantContent::Text(Text::new("final answer"))],
+        );
+        let msgs = vec![
+            Message::user("q1"),
+            aborted("abort-1", "stale thought"),
+            Message::user("q2"),
+            completed,
+            Message::user("q3"),
+            aborted("abort-2", "open thought"),
+        ];
+
+        let out =
+            maybe_strip_reasoning(msgs, ReasoningInContextMode::AbortedTurnsOnly, "openai", "");
+        let thought = |m: &Message| match m {
+            Message::Assistant(turn) => turn.content.iter().find_map(|c| match c {
+                AssistantContent::Reasoning(r) => Some(reasoning_text(r)),
+                _ => None,
+            }),
+            _ => None,
+        };
+        let assistants: Vec<&Message> = out
+            .iter()
+            .filter(|m| matches!(m, Message::Assistant(_)))
+            .collect();
+        // [abort-1, completed, abort-2]
+        assert_eq!(assistants.len(), 3);
+        assert_eq!(
+            thought(assistants[0]),
+            None,
+            "the abort before the completion is stale and must be stripped"
+        );
+        assert_eq!(
+            thought(assistants[2]),
+            Some("open thought".to_string()),
+            "the abort trailing the completion is the still-open thread"
+        );
+        // The stale abort keeps its text, so the message stays well-formed.
+        assert!(assistant_content(assistants[0])
+            .iter()
+            .any(|c| matches!(c, AssistantContent::Text(t) if t.text == "abort-1")));
+    }
+
+    /// Two successive aborts with no completion between them are still one
+    /// unfinished thread: both keep their reasoning.
+    #[test]
+    fn successive_aborts_all_keep_their_reasoning() {
+        use crate::settings::ReasoningInContextMode;
+        let abort = |thought: &str| {
+            assistant_message(
+                None,
+                vec![
+                    AssistantContent::Reasoning(Reasoning::new(thought)),
+                    AssistantContent::Text(Text::new("partial")),
+                ],
+            )
+        };
+        let msgs = vec![
+            Message::user("q1"),
+            abort("first abort"),
+            Message::user("steer"),
+            abort("second abort"),
+            Message::user("steer again"),
+        ];
+
+        let out =
+            maybe_strip_reasoning(msgs, ReasoningInContextMode::AbortedTurnsOnly, "openai", "");
+        let kept: Vec<String> = out
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(turn) => Some(
+                    turn.content
+                        .iter()
+                        .filter_map(|c| match c {
+                            AssistantContent::Reasoning(r) => Some(reasoning_text(r)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(kept, vec!["first abort", "second abort"]);
     }
 
     // Anthropic-family turn WITH a tool call: the leading reasoning must be
