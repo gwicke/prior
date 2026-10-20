@@ -33,5 +33,7 @@ and link a doc/ and/or commit hash
 - [ ] Minimize tool context
   - [ ] More aggressive truncation for long `read` / `bash` outputs
   - [ ] Strip failed edits from previous (before last) completion turns
-- [ ] Strip reasoning content for older aborted / failed turns once a newer turn completes
-      successfully with a final answer.
+
+## Tool robustness
+
+- [ ] Read tool does not seem to understand ~/* paths (home dir).
