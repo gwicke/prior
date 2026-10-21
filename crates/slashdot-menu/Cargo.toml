@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 fuzzy-matcher = "0.3"
-unicode-width = "0.1"
+unicode-width = "0.2"
 async-trait = "0.1"
 slashdot-tui = { version = "0.1.0", path = "../slashdot-tui" }
 

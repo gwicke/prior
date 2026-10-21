@@ -5,6 +5,8 @@
 //! the tty — one reader thread, the size watch, DSR. [`ansi`] holds the byte /
 //! width / escape transforms and the write wrappers; [`ansi::display_width`]
 //! is the shared string-measure the layers and `slashdot_menu` agree on.
+//! [`wrap`] is the width-fitting split/reflow over `&str`, built on that
+//! same measure.
 //!
 //! The crate knows nothing of the layers above: no repl, no content, no
 //! menu chrome. Elements arrive through the `RenderManager`'s configure/render
@@ -14,3 +16,4 @@ pub mod ansi;
 pub mod draw;
 pub mod render;
 pub mod termio;
+pub mod wrap;

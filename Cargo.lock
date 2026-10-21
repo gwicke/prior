@@ -209,7 +209,7 @@ dependencies = [
  "serde_json",
  "shellexpand",
  "similar",
- "unicode-width 0.1.14",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -1740,7 +1740,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "unicode-segmentation",
- "unicode-width 0.1.14",
+ "unicode-width 0.2.2",
  "urlencoding",
  "uuid",
  "vt100",
@@ -2656,7 +2656,7 @@ dependencies = [
  "futures",
  "fuzzy-matcher",
  "slashdot-tui",
- "unicode-width 0.1.14",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -2666,7 +2666,7 @@ dependencies = [
  "crossterm",
  "libc",
  "tokio",
- "unicode-width 0.1.14",
+ "unicode-width 0.2.2",
  "vt100",
 ]
 

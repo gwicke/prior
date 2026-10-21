@@ -14,9 +14,7 @@
 //! [`Table::render`] for selectable lists and [`Table::render_with_header`]
 //! for static summaries.
 
-use unicode_width::UnicodeWidthChar;
-
-use crate::wrap::wrap;
+use slashdot_tui::wrap::{char_widths, normalize, width_of, wrap};
 
 /// Horizontal alignment of a column's cells (and its header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,11 +46,12 @@ pub struct Table {
 
 impl Table {
     /// Create a table with the given header labels. All columns default to
-    /// left-aligned, a min width of 3, and equal shrink priority.
+    /// left-aligned, a min width of 3, and equal shrink priority. Labels are
+    /// normalized (`wrap`'s control-character contract), like row cells.
     pub fn new(headers: &[&str]) -> Self {
         let n = headers.len();
         Table {
-            headers: headers.iter().map(|s| s.to_string()).collect(),
+            headers: headers.iter().map(|s| normalize(s).into_owned()).collect(),
             aligns: vec![Align::Left; n],
             min_widths: vec![3; n],
             priorities: vec![1; n],
@@ -93,9 +92,15 @@ impl Table {
     }
 
     /// Append a row. `cells` may be shorter/longer than the column count;
-    /// missing cells render as empty, extra cells are ignored.
+    /// missing cells render as empty, extra cells are ignored. Cells are
+    /// normalized (`wrap`'s control-character contract) on the way in, so the
+    /// widths [`Table::layout`] measures match what wrapping and painting
+    /// later render for the same bytes.
     pub fn add_row<C: AsRef<str>>(&mut self, cells: &[C]) -> &mut Self {
-        let row: Vec<String> = cells.iter().map(|c| c.as_ref().to_string()).collect();
+        let row: Vec<String> = cells
+            .iter()
+            .map(|c| normalize(c.as_ref()).into_owned())
+            .collect();
         self.rows.push(row);
         self
     }
@@ -209,7 +214,7 @@ impl Table {
         // (so headers always fit) and at least 1.
         let min: Vec<usize> = (0..n)
             .map(|i| {
-                let h = display_width(&self.headers[i]);
+                let h = width_of(&self.headers[i]);
                 self.min_widths.get(i).copied().unwrap_or(3).max(h).max(1)
             })
             .collect();
@@ -220,8 +225,8 @@ impl Table {
             let w = self
                 .rows
                 .iter()
-                .fold(display_width(header), |w, r| match r.get(col) {
-                    Some(c) => w.max(display_width(c)),
+                .fold(width_of(header), |w, r| match r.get(col) {
+                    Some(c) => w.max(width_of(c)),
                     None => w,
                 });
             *slot = w;
@@ -307,83 +312,44 @@ impl Table {
 
 pub use slashdot_tui::ansi::display_width;
 
-fn char_width(c: char) -> usize {
-    UnicodeWidthChar::width(c).unwrap_or(1)
-}
-
-/// Split `s` into renderable units: `(byte length, visible width,
-/// is_escape)`. An SGR sequence is one atomic unit of width 0, so
-/// truncation can never cut a styled run in half.
-fn style_units(s: &str) -> Vec<(usize, usize, bool)> {
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let (off, c) = chars[i];
-        if c == '\x1b' {
-            let mut j = i + 1;
-            while j < chars.len() && !chars[j].1.is_ascii_alphabetic() {
-                j += 1;
-            }
-            let end = if j < chars.len() {
-                chars[j].0 + chars[j].1.len_utf8()
-            } else {
-                s.len()
-            };
-            out.push((end - off, 0, true));
-            i = j + 1;
-        } else {
-            out.push((c.len_utf8(), char_width(c), false));
-            i += 1;
-        }
-    }
-    out
-}
-
 /// Keep the first (`from_end == false`) or last `visible` display columns
-/// of `s`, ANSI-aware: escape sequences ride along without consuming
-/// width, and a sequence is never cut in half. `fit` re-emits the reset
-/// once the ellipsis is composed — that is where the style would
-/// otherwise bleed out of the row.
+/// of `s`, ANSI-aware, on the shared [`char_widths`] measurement: escape
+/// sequences ride along without consuming width, and a sequence is never
+/// cut in half. Zero-width escape chars *inside* the kept window are kept
+/// with it — so a truncated hyperlink keeps the sequence that closes it
+/// (dropping it would leave the link open across the rest of the row).
+/// `fit` re-emits the reset once the ellipsis is composed — that is where
+/// an SGR style would otherwise bleed out of the row.
 fn keep_visible(s: &str, visible: usize, from_end: bool) -> String {
-    let units = style_units(s);
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let widths = char_widths(s);
     let mut w = 0;
     if from_end {
-        let mut start = units.len();
-        while start > 0 {
-            let (_, cw, _) = units[start - 1];
-            if w + cw > visible {
+        let mut start = s.len();
+        for (i, &(off, _)) in chars.iter().enumerate().rev() {
+            if w + widths[i] > visible {
                 break;
             }
-            w += cw;
-            start -= 1;
+            w += widths[i];
+            start = off;
         }
-        let mut off = 0;
-        for (len, _, _) in units.iter().take(start) {
-            off += len;
-        }
-        s[off..].to_string()
+        s[start..].to_string()
     } else {
         let mut end = 0;
-        while end < units.len() {
-            let (_, cw, _) = units[end];
-            if w + cw > visible {
+        for (i, &(_, c)) in chars.iter().enumerate() {
+            if w + widths[i] > visible {
                 break;
             }
-            w += cw;
-            end += 1;
+            w += widths[i];
+            end += c.len_utf8();
         }
-        let mut off = 0;
-        for (len, _, _) in units.iter().take(end) {
-            off += len;
-        }
-        s[..off].to_string()
+        s[..end].to_string()
     }
 }
 
 /// Pad `s` (already <= `width` visible) to `width` per `align`.
 fn pad(s: &str, width: usize, align: Align) -> String {
-    let w = display_width(s);
+    let w = width_of(s);
     if w >= width {
         return s.to_string();
     }
@@ -414,7 +380,7 @@ fn keep_last(s: &str, visible: usize) -> String {
 /// Fit `cell` into `width` visible columns, ellipsizing on overflow. The
 /// ellipsis is placed at the end (left), start (right), or middle (center).
 fn fit(cell: &str, width: usize, align: Align, ellipsis: char) -> String {
-    let w = display_width(cell);
+    let w = width_of(cell);
     if w <= width {
         return pad(cell, width, align);
     }
@@ -461,50 +427,30 @@ pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) ->
     if match_indices.is_empty() {
         return cell.to_string();
     }
-    let cell_width = display_width(cell);
+    let cell_width = width_of(cell);
     if cell_width <= max_width {
         // Fits: highlight in place.
         return highlight_matches(cell, match_indices);
     }
 
     // Per-character tables: byte → char index, char → byte index / visible col.
-    // ANSI-aware: an SGR sequence occupies characters but no columns, so
-    // the window arithmetic below is in *visible* columns while the slice
-    // still re-emits the escapes verbatim. (A styled cell reaching this
-    // path is the norm: the caller highlights before rendering.)
+    // ANSI-aware on the shared `char_widths` walk: escape bytes occupy
+    // characters but no columns, so the window arithmetic below is in
+    // *visible* columns while the slice still re-emits the escapes verbatim.
+    // (A styled cell reaching this path is the norm: the caller highlights
+    // before rendering.)
     let chars: Vec<char> = cell.chars().collect();
     let n_chars = chars.len();
+    let widths = char_widths(cell);
     let mut byte_to_char = vec![0usize; cell.len() + 1];
     let mut char_to_visible = Vec::with_capacity(n_chars + 1);
     let mut visible = 0;
     char_to_visible.push(0);
-    // Mark the characters that belong to SGR sequences (ESC .. final
-    // letter) so they occupy characters but no visible columns.
-    let mut in_escape = vec![false; n_chars];
-    let mut k = 0;
-    while k < n_chars {
-        if chars[k] == '\x1b' {
-            let mut j = k + 1;
-            while j < n_chars && !chars[j].is_ascii_alphabetic() {
-                j += 1;
-            }
-            let end = (j + 1).min(n_chars);
-            for slot in in_escape.iter_mut().take(end).skip(k) {
-                *slot = true;
-            }
-            k = end;
-        } else {
-            k += 1;
-        }
-    }
-
     let mut byte_off = 0usize;
     for (i, c) in chars.iter().enumerate() {
         byte_to_char[byte_off] = i;
         byte_off += c.len_utf8();
-        if !in_escape[i] {
-            visible += char_width(*c);
-        }
+        visible += widths[i];
         char_to_visible.push(visible);
     }
     let vis = |ci: usize| char_to_visible[ci];
@@ -1177,6 +1123,22 @@ mod tests {
             out[0].contains("hello world this "),
             "truncation must keep the full column budget: {:?}",
             out[0]
+        );
+    }
+
+    /// An OSC 8 hyperlink truncates by visible width — the URL is escape
+    /// payload, not columns — and the kept side retains the sequence that
+    /// closes the link.
+    #[test]
+    fn osc_link_truncates_by_visible_width() {
+        let link = "\x1b]8;;https://example.com/a/very/long/url\x1b\\link\x1b]8;;\x1b\\";
+        // Fits at 4 visible columns: untouched (would previously measure the
+        // URL's tail as visible text and ellipsize).
+        assert_eq!(keep_first(link, 4), link);
+        // Truncated: the closing sequence rides along with the kept text.
+        assert_eq!(
+            keep_first("ab\x1b]8;;https://example.com\x1b\\cd", 3),
+            "ab\x1b]8;;https://example.com\x1b\\c"
         );
     }
 

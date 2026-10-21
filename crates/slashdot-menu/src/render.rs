@@ -13,8 +13,11 @@ use std::sync::Arc;
 pub struct LogicalLine(pub String);
 
 impl LogicalLine {
+    /// Build a logical line, normalizing control characters (tabs etc.) per
+    /// `wrap`'s contract — measured width only matches rendered width if
+    /// nothing here can move the cursor or expand to a tab stop.
     pub fn new(s: impl Into<String>) -> Self {
-        LogicalLine(s.into())
+        LogicalLine(slashdot_tui::wrap::normalize_string(s.into()))
     }
 }
 
@@ -116,6 +119,7 @@ impl Marker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::display_width;
 
     #[test]
     fn markers_cursor_active() {
@@ -440,8 +444,8 @@ mod tests {
     }
 }
 
-use crate::table::display_width;
-use crate::wrap::split_to_width;
+use slashdot_tui::ansi::display_width_ansi;
+use slashdot_tui::wrap::split_to_width;
 
 /// Width of the marker column every painted row starts with: `"> "`, `"* "`,
 /// or two spaces. The layout width a painter's content is split at is
@@ -524,7 +528,10 @@ pub fn paint_row(content: &str, style: RowStyle, tw: usize) -> String {
             "  "
         };
         let text = format!("{}{}", lead, piece);
-        let pad = tw.saturating_sub(display_width(&text));
+        // OSC-aware: the splitter already measured `piece` with the same
+        // rules (escape_end), so the pad adds up to exactly `tw` columns for
+        // hyperlink-bearing content too.
+        let pad = tw.saturating_sub(display_width_ansi(&text));
         out.push(format!("{bg}{fg}{text}{}\x1b[0m", " ".repeat(pad)));
     }
     out.join("\n")
