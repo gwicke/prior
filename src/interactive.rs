@@ -416,7 +416,8 @@ impl Interactive {
             // The user presses Enter to resume the top (most recent) session.
             // This is simpler than resolving the session ID upfront and avoids
             // any race conditions with the session repository listing.
-            app_state.set_prefill("/session .path:.".to_string());
+            // NOTE: trailing space is required for drill, do not remove!
+            app_state.set_prefill("/session .path:. ".to_string());
         }
         // One prompt session, carried across turns (ui_draw_v2 §4.5 U4).
         //

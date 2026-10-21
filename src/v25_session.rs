@@ -189,7 +189,7 @@ pub fn session_fields() -> Vec<FieldSpec> {
 
 /// Parent listing node for `/session`. Provides the static "session" row,
 /// column definitions, field metadata, and `drill_rewrite` (adds default
-/// `.path:.` filter on drill). `SessionListNode` is its dynamic child.
+/// `.path:. ` filter on drill). `SessionListNode` is its dynamic child.
 pub struct SessionListingNode;
 
 #[async_trait::async_trait(?Send)]
@@ -212,7 +212,8 @@ impl SlashDotNode for SessionListingNode {
     async fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         // On drill, add a default path filter to show only sessions
         // relevant to the current working directory.
-        Some("session .path:.".to_string())
+        // NOTE trailing whitespace - required.
+        Some("session .path:. ".to_string())
     }
 }
 
@@ -1354,7 +1355,7 @@ mod tests {
         let mut node = SessionListingNode;
         let path = vec!["session".to_string()];
         let result = crate::agent::block_on_test(node.drill_rewrite(&PathArgs::new(path, " ")));
-        assert_eq!(result, Some("session .path:.".to_string()));
+        assert_eq!(result, Some("session .path:. ".to_string()));
     }
 
     #[test]
