@@ -30,6 +30,12 @@ pub struct ViewRows {
     /// Per-row match indices for fuzzy highlighting: RowRef → (field_name → byte indices).
     /// Only populated for string columns that are displayed and have fuzzy terms.
     match_indices: HashMap<RowRef, HashMap<String, Vec<usize>>>,
+    /// Columns to show *in addition* to the node's declared ones — the
+    /// field the listing is sorted on, and (later) the fields a
+    /// `.columns:` modifier names. Resolved against the node's
+    /// declared columns at plan time in `NodeEntry` (`resolve_columns`);
+    /// the extras need not be disjoint from them.
+    extra_columns: Option<Vec<ColumnDef>>,
 }
 
 /// The slots are not `Debug` (and do not need to be): a plan carries the
@@ -55,6 +61,7 @@ impl ViewRows {
             order,
             active_ids,
             match_indices,
+            extra_columns: None,
         }
     }
 
@@ -69,6 +76,7 @@ impl ViewRows {
             order,
             active_ids,
             match_indices: HashMap::new(),
+            extra_columns: None,
         }
     }
 
@@ -116,6 +124,18 @@ impl ViewRows {
         ))
     }
 
+    /// Declare extra columns for this view (content side). They are
+    /// merged with the node's declared columns at layout time.
+    pub(crate) fn with_extra_columns(mut self, extra: Vec<ColumnDef>) -> Self {
+        self.extra_columns = if extra.is_empty() { None } else { Some(extra) };
+        self
+    }
+
+    /// The extra columns declared for this view, if any.
+    pub(crate) fn extra_columns(&self) -> Option<&[ColumnDef]> {
+        self.extra_columns.as_deref()
+    }
+
     /// The render side's ONLY data surface: rows in display order with
     /// the active (`*`) flag resolved — resolution and active-set
     /// lookup happen inside. Stale handles degrade to skipped rows
@@ -141,6 +161,19 @@ impl ViewRows {
     pub(crate) fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
+}
+
+/// The implicit pair every row has: the id and the description. A
+/// listing node that declares no columns shows exactly these two.
+///
+/// The labels are the ones the implicit path uses internally for the
+/// width floor (the description column's floor is 11, from the label),
+/// so materializing the pair must not change the layout.
+pub(crate) fn implicit_columns() -> Vec<ColumnDef> {
+    vec![
+        ColumnDef::new("id", "id"),
+        ColumnDef::new("description", "description"),
+    ]
 }
 
 /// Does this (view, columns) pair get a table-header line at all? The

@@ -10,7 +10,8 @@ and link a doc/ and/or commit hash
       prompt). Either make the empty input source read lines (batch-friendly: pairs with
       `Repl::batch_slash`) or stop the loop on empty input.
 - [ ] table rendering and filtering: dynamic columns
-  - Include filter / sort columns in layout (.columns)
+  - Include filter / sort columns in layout (.columns) — sort column done
+        (doc/slashdot/extra_columns.md); filter columns and a `.columns:` modifier to go
   - [ ] Less misleading / confusing modifier value auto-complete - headers currently say MODIFIER |
         DESCRIPTION, with the description being just "string". Should be "Column values" or similar
   - Quoted string / space support
