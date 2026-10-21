@@ -1572,7 +1572,7 @@ mod tests {
         assert!(b.model_view.contains("No edits applied"));
         assert!(b.model_view.contains("2 of 3 edit(s) failed"));
         // Multi-failure: ui_view is the count-only summary.
-        assert!(b.ui_view.contains("2 of 3 edit(s) had problems"));
+        assert!(b.ui_view.contains("2 of 3 edit(s) failed validation"));
         assert!(!b.ui_view.contains("--- edit #"));
     }
 

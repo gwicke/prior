@@ -1278,8 +1278,24 @@ mod tests {
         let (expected, actual) = rest.split_once("\n\nActual:\n").expect("shape");
         assert!(why.contains("missing required field 'path'"), "{why}");
         assert_eq!(expected, SINGLE_EDIT_ARGS_EXAMPLE);
-        // The echo is serde's compact rendering of the raw arguments.
-        assert_eq!(actual, "{\"newText\":\"b\",\"oldText\":\"a\"}");
+        // The echo is serde's compact rendering of the raw arguments — compact
+        // being the part worth pinning, so it is checked separately.
+        assert!(!actual.contains(' '), "the echo is not compact: {actual}");
+        //
+        // Compared as *values*, not as text: the key order of a serialized
+        // JSON object is serde_json's, not ours — a `BTreeMap` sorts the keys,
+        // and `preserve_order` (enabled in this workspace by rig-core, and
+        // therefore in every production build) keeps them in insertion order.
+        // The two builds disagree, and only one of them matches what the
+        // binary actually emits, so pinning the order here would make the
+        // test pass in one build and fail in the other. `Value`'s equality is
+        // order-insensitive, which is exactly the property being asserted.
+        let echoed: Value = serde_json::from_str(actual).expect("the echo is JSON");
+        assert_eq!(
+            echoed,
+            json!({ "oldText": "a", "newText": "b" }),
+            "{actual}"
+        );
         assert!(!e.contains("@@@OLD"), "block syntax leaked in: {e}");
 
         // Blob: the block template, as before.
