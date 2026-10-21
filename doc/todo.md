@@ -37,7 +37,8 @@ and link a doc/ and/or commit hash
       measure with `wrap::width_of` (classify-led ASCII fast path).
 - [ ] `DetailItem::height` paints the detail section just to count rows, then `render` paints it
       again — split once and share (cheap since `split_to_width` is borrowed now).
-- [ ] Bump `unicode-width` 0.1 -> 0.2 workspace-wide (already in the lockfile via other deps).
+- [x] Bumped `unicode-width` 0.1 -> 0.2 across our crates (0.1 remains in the tree only via
+      `termimad`).
 
 ## Token efficiency
 
