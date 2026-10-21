@@ -1009,16 +1009,91 @@ impl NodeEntry {
             self.sort_row_refs(&mut ranked, sort_field, sort_dir);
         }
 
-        let rows = Arc::new(ViewRows::new(
-            self.content.data_rc.clone(),
-            ranked,
-            self.content.active_ids.clone(),
-            rank_result.match_indices,
-        ));
+        let rows = Arc::new(
+            ViewRows::new(
+                self.content.data_rc.clone(),
+                ranked,
+                self.content.active_ids.clone(),
+                rank_result.match_indices,
+            )
+            .with_extra_columns(Self::extra_columns_for(&query, &field_space)),
+        );
         self.content.slots_dirty = false;
         self.content.last_key = key;
         self.content.view_rows = Some(Arc::clone(&rows));
         rows
+    }
+
+    /// The extra columns this query asks for: the field the listing is
+    /// sorted on.
+    ///
+    /// The declaration is unconditional — whether the field is already a
+    /// column of the node is [`resolve_columns`]'s call, at plan time.
+    ///
+    /// The header is the field's own key; alignment follows the field's
+    /// type. The wrap style is the resolution's to settle — it takes it
+    /// from the level's own columns, which are not in scope here.
+    fn extra_columns_for(query: &crate::filter::Query, field_space: &FieldSpace) -> Vec<ColumnDef> {
+        let Some((field, _dir)) = query.sort.as_ref() else {
+            return Vec::new();
+        };
+        let is_number = field_space
+            .spec(field)
+            .map(|s| s.is_number)
+            .unwrap_or(false);
+        vec![
+            ColumnDef::new(field.clone(), field.clone()).align(if is_number {
+                crate::table::Align::Right
+            } else {
+                crate::table::Align::Left
+            }),
+        ]
+    }
+
+    /// The columns a listing shows: the node's declared columns plus the
+    /// view's extra ones. Resolved here at plan time, where both are in
+    /// hand — the view just carries the extras.
+    ///
+    /// The extras are *declarations*, not a contract: an extra whose field
+    /// is already displayed is dropped (the node's own column wins — it
+    /// carries the node's header, alignment and sizing), and the first
+    /// declaration of a field wins among the extras themselves. Everything
+    /// else is appended, in order, so the node's own layout is untouched.
+    ///
+    /// Nothing to add ⇒ the declared columns are handed back unchanged
+    /// (no copy, and the header behaviour is exactly as it was). With
+    /// extras, the implicit pair (in `view`, next to the renderer's own
+    /// fallback) becomes the explicit base, so an extra has a column to
+    /// sit in.
+    fn resolve_columns(declared: Vec<ColumnDef>, extra: Option<&[ColumnDef]>) -> Vec<ColumnDef> {
+        let Some(extra) = extra.filter(|e| !e.is_empty()) else {
+            return declared;
+        };
+        // The extras that are not displayed yet, in order; the first
+        // declaration of a field wins among them. An added column takes
+        // the base's wrap style: a single non-wrapping column would flip
+        // the whole table to single-line rendering.
+        let wraps = declared.iter().all(|c| c.wrap);
+        let mut added: Vec<ColumnDef> = Vec::new();
+        for col in extra {
+            if declared.iter().any(|c| c.field == col.field) {
+                continue;
+            }
+            if added.iter().any(|c| c.field == col.field) {
+                continue;
+            }
+            added.push(col.clone().wrap(wraps));
+        }
+        if added.is_empty() {
+            return declared;
+        }
+        let mut out = if declared.is_empty() {
+            crate::view::implicit_columns()
+        } else {
+            declared
+        };
+        out.extend(added);
+        out
     }
 
     /// Build this level's `ViewRequest` (detail from `error` line +
@@ -1043,7 +1118,9 @@ impl NodeEntry {
             .matched_id
             .as_ref()
             .map(|r| path_args.suffix[r.clone()].to_string());
-        let columns = self.inner.columns();
+        // The node's declared columns plus the view's extra ones (the
+        // field the listing is sorted on), resolved here at plan time.
+        let columns = Self::resolve_columns(self.inner.columns(), rows.extra_columns());
         let mut detail: Vec<LogicalLine> = Vec::new();
         if let Some(msg) = error {
             detail.push(LogicalLine::new(format!("[ERROR]: {msg}")));
@@ -1620,6 +1697,7 @@ mod tests {
     use crate::node_impl::{
         CONFIRM_ACCEPT, CONFIRM_ACCEPT_LABEL, CONFIRM_CANCEL, CONFIRM_CANCEL_LABEL,
     };
+    use crate::table::Align;
     use std::rc::Rc;
     use std::sync::Arc;
 
@@ -3374,6 +3452,118 @@ mod tests {
         root
     }
 
+    /// `fielded_root`'s rows, but with a level that declares columns
+    /// (id + tier): the sorted-on field (price) is not one of them. The
+    /// columns/fields live on the level that renders (the root); the
+    /// rows come from the child.
+    fn columned_root() -> NodeEntry {
+        use crate::fields::FieldSpec;
+        use crate::node_impl::StaticListingNode;
+        let mut root = NodeEntry::new_root();
+        root.inner = Box::new(
+            StaticListingNode::new(&[])
+                .with_fields(vec![
+                    FieldSpec::new("tier", false),
+                    FieldSpec::new("price", true),
+                ])
+                .with_columns(vec![
+                    ColumnDef::new("id", "Model"),
+                    ColumnDef::new("tier", "Tier"),
+                ]),
+        );
+        root.children
+            .push(NodeEntry::new_child(Box::new(FieldedNode)));
+        root
+    }
+
+    /// The columns a plan shows, as field names.
+    fn plan_fields(result: &MenuResult) -> Vec<String> {
+        match result {
+            MenuResult::Continue(plan, _) => plan.columns.iter().map(|c| c.field.clone()).collect(),
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    fn traverse(root: &mut NodeEntry, suffix: &str) -> MenuResult {
+        futures::executor::block_on(root.refresh_data(ep(), &[], suffix));
+        futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            suffix,
+            &rctx(),
+        ))
+    }
+
+    /// No sort ⇒ the node's columns, exactly.
+    #[test]
+    fn sorted_column_absent_without_a_sort() {
+        let mut root = columned_root();
+        assert_eq!(plan_fields(&traverse(&mut root, "")), ["id", "tier"]);
+    }
+
+    /// Sorting on a field the node does not show adds it: the value the
+    /// user sorted on is on screen next to the node's own.
+    #[test]
+    fn sorted_column_added_when_not_already_shown() {
+        let mut root = columned_root();
+        let result = traverse(&mut root, ".sort:price");
+        assert_eq!(plan_fields(&result), ["id", "tier", "price"]);
+        // The value renders in the added (right-aligned) column, and the
+        // rows are sorted by it (price desc: m2 3.0, m3 1.0, m1 0.0).
+        let rows = rows_of(result);
+        assert!(rows[0].contains('3'), "{rows:?}");
+        assert!(rows[2].contains('0'), "{rows:?}");
+    }
+
+    /// Sorting on a field the node already shows changes nothing.
+    #[test]
+    fn sorted_column_already_shown_changes_nothing() {
+        let mut root = columned_root();
+        assert_eq!(
+            plan_fields(&traverse(&mut root, ".sort:tier")),
+            ["id", "tier"]
+        );
+    }
+
+    /// An unknown sort field is no sort at all: no extra column.
+    #[test]
+    fn unknown_sort_field_adds_no_column() {
+        let mut root = columned_root();
+        assert_eq!(
+            plan_fields(&traverse(&mut root, ".sort:nope")),
+            ["id", "tier"]
+        );
+    }
+
+    /// A level with no declared columns keeps the implicit pair, with
+    /// the sorted-on field appended.
+    #[test]
+    fn sorted_column_on_an_implicit_level_appends_to_the_implicit_pair() {
+        let mut root = fielded_root();
+        let result = traverse(&mut root, ".sort:price");
+        assert_eq!(plan_fields(&result), ["id", "description", "price"]);
+        // The added column has a label, so the header line appears.
+        let header = match &result {
+            MenuResult::Continue(plan, _) => plan.table_header.clone(),
+            other => panic!("expected Continue, got {:?}", other),
+        };
+        assert!(header.is_some(), "the added column is labelled");
+    }
+
+    /// Without a sort, the implicit level shows no header — unchanged.
+    #[test]
+    fn implicit_level_shows_no_header_without_a_sort() {
+        let mut root = fielded_root();
+        let result = traverse(&mut root, "");
+        let header = match &result {
+            MenuResult::Continue(plan, _) => plan.table_header.clone(),
+            other => panic!("expected Continue, got {:?}", other),
+        };
+        assert!(header.is_none(), "implicit level, no extras: no header");
+        assert!(plan_fields(&result).is_empty(), "empty = the implicit pair");
+    }
+
     /// Rendered row texts from a Continue result, with ANSI codes stripped.
     fn rows_of(result: MenuResult) -> Vec<String> {
         match result {
@@ -3399,6 +3589,90 @@ mod tests {
             result.push(c);
         }
         result
+    }
+
+    // --- column resolution (extra columns) --------------------------------
+
+    fn fields_of(cols: &[ColumnDef]) -> Vec<&str> {
+        cols.iter().map(|c| c.field.as_str()).collect()
+    }
+
+    /// Nothing to add ⇒ the declared columns come back untouched: an
+    /// empty list stays empty (the renderer keeps its implicit pair
+    /// fallback, headers and all), so a level with no extras renders
+    /// exactly as it did before the mechanism existed.
+    #[test]
+    fn resolve_without_extras_returns_the_declared_columns() {
+        let declared = vec![
+            ColumnDef::new("id", "Model"),
+            ColumnDef::new("tier", "Tier"),
+        ];
+        assert_eq!(NodeEntry::resolve_columns(declared.clone(), None), declared);
+        assert_eq!(
+            NodeEntry::resolve_columns(declared.clone(), Some(&[])),
+            declared
+        );
+        assert!(NodeEntry::resolve_columns(Vec::new(), None).is_empty());
+    }
+
+    /// An extra the node does not show is appended; the node's own
+    /// columns keep their order, headers and sizing.
+    #[test]
+    fn resolve_appends_an_undeclared_extra() {
+        let declared = vec![ColumnDef::new("id", "Model")];
+        let extra = vec![ColumnDef::new("price", "price").align(Align::Right)];
+        let out = NodeEntry::resolve_columns(declared, Some(&extra));
+        assert_eq!(fields_of(&out), vec!["id", "price"]);
+        assert_eq!(out[0].header, "Model", "the node's column is untouched");
+        assert_eq!(out[1].align, Align::Right, "the extra keeps its align");
+    }
+
+    /// An extra the node already shows is dropped: nothing to add, so
+    /// the declared list stands.
+    #[test]
+    fn resolve_drops_an_extra_the_node_already_shows() {
+        let declared = vec![
+            ColumnDef::new("id", "Model"),
+            ColumnDef::new("tier", "Tier"),
+        ];
+        let extra = vec![ColumnDef::new("tier", "tier")];
+        assert_eq!(
+            NodeEntry::resolve_columns(declared.clone(), Some(&extra)),
+            declared,
+            "sorting on a shown column changes nothing"
+        );
+    }
+
+    /// Two extras naming the same field: the first declaration wins.
+    #[test]
+    fn resolve_keeps_the_first_extra_for_a_field() {
+        let declared = vec![ColumnDef::new("id", "Model")];
+        let extra = vec![
+            ColumnDef::new("price", "price"),
+            ColumnDef::new("price", "again"),
+        ];
+        let out = NodeEntry::resolve_columns(declared, Some(&extra));
+        assert_eq!(fields_of(&out), vec!["id", "price"]);
+        assert_eq!(out[1].header, "price");
+    }
+
+    /// A level with no declared columns gets the implicit pair as the
+    /// base, so the extra has a column to sit in.
+    #[test]
+    fn resolve_on_an_implicit_level_appends_to_the_implicit_pair() {
+        let extra = vec![ColumnDef::new("tier", "tier")];
+        let out = NodeEntry::resolve_columns(Vec::new(), Some(&extra));
+        assert_eq!(fields_of(&out), vec!["id", "description", "tier"]);
+    }
+
+    /// An added column takes the base's wrap style: one non-wrapping
+    /// column would flip the whole table to single-line rendering.
+    #[test]
+    fn resolve_adds_the_extra_with_the_base_wrap_style() {
+        let declared = vec![ColumnDef::new("id", "Model").wrap(false)];
+        let extra = vec![ColumnDef::new("price", "price").wrap(true)];
+        let out = NodeEntry::resolve_columns(declared, Some(&extra));
+        assert!(!out[1].wrap, "the extra inherits the level's wrap style");
     }
 
     #[test]
@@ -3693,12 +3967,14 @@ mod tests {
             ".sort:tier",
             &rctx(),
         ));
-        let dialog = match &result {
-            MenuResult::Continue(plan, _) => plan.table_header.is_some(),
-            other => panic!("expected Continue, got {:?}", other),
-        };
-        assert!(!dialog, "an exact sort field must not re-open the dialog");
+        // The dialog's rows are modifier candidates; the listing's are
+        // data rows (the listing's own header is no discriminator — a
+        // sorted implicit level has one too).
         let rows = rows_of(result);
+        assert!(
+            !rows.iter().any(|r| r.starts_with('.')),
+            "an exact sort field must not re-open the dialog: {rows:?}"
+        );
         assert!(rows.iter().any(|r| r.contains("m1")), "{rows:?}");
     }
 
