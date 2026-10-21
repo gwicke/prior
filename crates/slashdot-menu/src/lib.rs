@@ -29,7 +29,6 @@ pub mod render;
 pub mod table;
 pub mod value;
 pub mod view;
-pub mod wrap;
 
 // Re-export public types for convenience.
 pub use elements::{ElementSet, Update};

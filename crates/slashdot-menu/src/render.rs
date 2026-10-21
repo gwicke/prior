@@ -17,7 +17,7 @@ impl LogicalLine {
     /// `wrap`'s contract — measured width only matches rendered width if
     /// nothing here can move the cursor or expand to a tab stop.
     pub fn new(s: impl Into<String>) -> Self {
-        LogicalLine(crate::wrap::normalize_string(s.into()))
+        LogicalLine(slashdot_tui::wrap::normalize_string(s.into()))
     }
 }
 
@@ -444,8 +444,8 @@ mod tests {
     }
 }
 
-use crate::wrap::split_to_width;
 use slashdot_tui::ansi::display_width_ansi;
+use slashdot_tui::wrap::split_to_width;
 
 /// Width of the marker column every painted row starts with: `"> "`, `"* "`,
 /// or two spaces. The layout width a painter's content is split at is

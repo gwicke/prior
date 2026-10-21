@@ -16,7 +16,7 @@
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::wrap::{normalize, wrap};
+use slashdot_tui::wrap::{normalize, wrap};
 
 /// Horizontal alignment of a column's cells (and its header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

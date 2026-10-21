@@ -1,14 +1,18 @@
-//! Text wrapping for table cells (moved from prior's `output::wrap` so the
-//! crate stays dependency-free).
+//! Text wrapping and splitting by display width. Not menu-specific — it is
+//! width arithmetic over `&str` — so it lives here next to the measurement
+//! it must agree with. (For the *other* wrap in this crate:
+//! [`ansi::wrap_to_width`] makes the terminal's own wrapping explicit as
+//! `\n` bytes for the overwrite rule; this module reflows or hard-splits
+//! content to fit a chosen width.)
 //!
 //! # Measurement contract
 //!
-//! All width math in this module uses [`slashdot_tui::ansi`]'s measurement —
-//! [`escape_end`] to skip escape sequences whole (CSI final bytes, OSC
-//! terminated by BEL or ST) and `unicode-width` for glyph widths. One
-//! semantic for "how wide is this line": the check, the split, and the
-//! painter's padding must agree, or a line the check passes would be cut at
-//! the wrong column by the splitter (and vice versa).
+//! All width math in this module uses [`ansi`]'s measurement — [`escape_end`]
+//! to skip escape sequences whole (CSI final bytes, OSC terminated by BEL or
+//! ST) and `unicode-width` for glyph widths. One semantic for "how wide is
+//! this line": the check, the split, and the painter's padding must agree, or
+//! a line the check passes would be cut at the wrong column by the splitter
+//! (and vice versa).
 //!
 //! # Normalization contract
 //!
@@ -17,8 +21,8 @@
 //! column (or not at all) but rendered as an advance to the next tab stop.
 //! Carriage returns, bells and backspaces move the cursor and overprint.
 //! Before anything is measured or rendered, control characters are therefore
-//! replaced at ingestion ([`LogicalLine::new`](crate::render::LogicalLine::new),
-//! `Table::add_row`), and defensively here:
+//! replaced at ingestion (the menu's `LogicalLine::new` and `Table::add_row`),
+//! and defensively here:
 //!
 //! - `\t` becomes `TAB_SPACES` spaces (a fixed count — tab stops depend on
 //!   the rendered column, which wrapping moves, so expansion can never be
@@ -29,13 +33,14 @@
 //! - escape sequences themselves are copied verbatim (an OSC payload may
 //!   contain control bytes that belong to the sequence).
 //!
-//! [`escape_end`]: slashdot_tui::ansi::escape_end
+//! [`escape_end`]: ansi::escape_end
 
 use std::borrow::Cow;
 use std::ops::Range;
 
-use slashdot_tui::ansi::{display_width_ansi, escape_end};
 use unicode_width::UnicodeWidthChar;
+
+use crate::ansi::{display_width_ansi, escape_end};
 
 /// Spaces a tab is normalized to. Fixed rather than tab-stop-aligned: a tab
 /// stop depends on the column it renders at, and wrapping changes that
@@ -97,9 +102,9 @@ fn classify(line: &str) -> Class {
 }
 
 /// Replace tab / control characters per the module's normalization contract.
-/// A no-op (borrowed) unless [`classify`] says otherwise — one pass, no
-/// allocation for clean text.
-pub(crate) fn normalize(text: &str) -> Cow<'_, str> {
+/// A no-op (borrowed) unless the cheap classification scan says otherwise —
+/// one pass, no allocation for clean text.
+pub fn normalize(text: &str) -> Cow<'_, str> {
     if classify(text) == Class::Dirty {
         Cow::Owned(normalize_dirty(text))
     } else {
@@ -109,7 +114,7 @@ pub(crate) fn normalize(text: &str) -> Cow<'_, str> {
 
 /// [`normalize`] for callers that already hold a `String`: keeps the input
 /// allocation when nothing needs replacing.
-pub(crate) fn normalize_string(s: String) -> String {
+pub fn normalize_string(s: String) -> String {
     if classify(&s) == Class::Dirty {
         normalize_dirty(&s)
     } else {
