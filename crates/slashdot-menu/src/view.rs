@@ -15,7 +15,8 @@ use crate::fields::{row_field_value, Row};
 use crate::node_entry::RowRef;
 use crate::node_impl::{DataResponse, RenderContext};
 use crate::render::{LogicalLine, RenderPlan};
-use crate::table::{display_width, highlight_matches};
+use crate::table::highlight_matches;
+use slashdot_tui::wrap::width_of;
 use std::fmt;
 
 /// The view's single input: source rows + display order + markers,
@@ -301,7 +302,7 @@ pub(crate) fn assemble_table(
                     // highlight it). Otherwise highlight in place (the
                     // wrap path renders the whole cell).
                     let col_w = col_widths.get(col_idx).copied().unwrap_or(0);
-                    if !use_wrap && col_w > 0 && display_width(&cell) > col_w {
+                    if !use_wrap && col_w > 0 && width_of(&cell) > col_w {
                         extract_snippet(&cell, indices, col_w)
                     } else {
                         highlight_matches(&cell, indices)

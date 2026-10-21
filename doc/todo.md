@@ -31,8 +31,10 @@ and link a doc/ and/or commit hash
 
 ## Width / wrapping
 
-- [ ] `table::style_units` (fit/truncation) still uses the old "escape runs to first alpha" parser —
-      OSC 8 URLs count as visible columns there; switch it to `ansi::escape_end` like `wrap` did.
+- [x] `table::style_units` (fit/truncation) used the old "escape runs to first alpha" parser —
+      OSC 8 URLs counted as visible columns there. Replaced: `style_units` and `extract_snippet`'s
+      third parser are gone, both rebuilt on `wrap::char_widths`; `fit`/`pad`/`layout`/`view`
+      measure with `wrap::width_of` (classify-led ASCII fast path).
 - [ ] `DetailItem::height` paints the detail section just to count rows, then `render` paints it
       again — split once and share (cheap since `split_to_width` is borrowed now).
 - [ ] Bump `unicode-width` 0.1 -> 0.2 workspace-wide (already in the lockfile via other deps).

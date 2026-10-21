@@ -64,9 +64,14 @@ enum Class {
 /// Single byte pass answering "does this line need attention, and how wide
 /// is it if it doesn't?". Escape sequences are skipped whole (their payload
 /// is not classified — control bytes inside an OSC belong to the sequence).
+///
+/// `Class::Ascii` carries the *width* of the line: its printable-ASCII byte
+/// count, which equals its display width (each such byte is one column).
+/// `\n` separators are excluded — they render as nothing.
 fn classify(line: &str) -> Class {
     let bytes = line.as_bytes();
     let mut i = 0;
+    let mut len = 0;
     let mut has_esc = false;
     let mut non_ascii = false;
     while i < bytes.len() {
@@ -78,13 +83,14 @@ fn classify(line: &str) -> Class {
                 continue;
             }
             if b == b'\n' {
-                i += 1; // line separator — untouched by normalization
+                i += 1; // line separator — zero width, untouched by normalization
                 continue;
             }
             if b < 0x20 || b == 0x7f {
                 return Class::Dirty; // tab, CR, BEL, BS, ...
             }
             i += 1; // printable ASCII
+            len += 1;
         } else {
             // C1 controls encode as U+0080..=U+009F: 0xc2 0x80..=0x9f.
             if b == 0xc2 && i + 1 < bytes.len() && (0x80..=0x9f).contains(&bytes[i + 1]) {
@@ -97,7 +103,7 @@ fn classify(line: &str) -> Class {
     if has_esc || non_ascii {
         Class::Plain
     } else {
-        Class::Ascii(bytes.len())
+        Class::Ascii(len)
     }
 }
 
@@ -168,6 +174,42 @@ fn escape_end_at(line: &str, start: usize) -> usize {
 /// control characters (none survive normalization) as zero.
 fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Per-char visible widths of `text`, aligned with `text.chars()`: every byte
+/// of an escape sequence gets a `0` entry (it renders nothing), visible chars
+/// their `unicode-width`. One shared walk, so a caller that windows or sums
+/// widths agrees with [`split_to_width`] — the truncation and snippet paths
+/// in `slashdot_menu` measure with this instead of their own escape parsers.
+pub fn char_widths(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            let end = escape_end(bytes, i);
+            out.extend(std::iter::repeat_n(0, text[i..end].chars().count()));
+            i = end;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(char_width(ch));
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Visible width of `s` under the shared measurement, led by the cheap
+/// classification scan: pure printable ASCII is its byte length — one byte
+/// pass, no decoding, no escape parsing. Anything else measures with
+/// [`display_width_ansi`] after normalization. This is the check to use
+/// before deciding whether [`split_to_width`] needs to cut at all.
+pub fn width_of(s: &str) -> usize {
+    match classify(s) {
+        Class::Ascii(len) => len,
+        Class::Plain => display_width_ansi(s),
+        Class::Dirty => display_width_ansi(&normalize_dirty(s)),
+    }
 }
 
 /// A byte range of the logical line covering one visible char plus any
@@ -542,6 +584,34 @@ mod tests {
         // it cuts after "a" + two of the tab's spaces.
         assert_eq!(split_to_width("a\tb", 10), vec!["a    b"]);
         assert_eq!(split_to_width("a\tb", 3), vec!["a  ", "  b"]);
+    }
+
+    #[test]
+    fn width_of_is_the_byte_length_for_ascii() {
+        assert_eq!(width_of("plain text"), 10);
+        // Leading whitespace counts (it is not the indent-capturing wrap).
+        assert_eq!(width_of("  x"), 3);
+    }
+
+    #[test]
+    fn width_of_measures_escapes_and_wide_glyphs() {
+        assert_eq!(width_of("\x1b[1;35mmod\x1b[0mel"), 5);
+        let link = "\x1b]8;;https://example.com/a/very/long/url\x1b\\link\x1b]8;;\x1b\\";
+        assert_eq!(width_of(link), 4, "the URL is escape payload");
+        assert_eq!(width_of("日本語"), 6);
+    }
+
+    #[test]
+    fn width_of_normalizes_controls_first() {
+        assert_eq!(width_of("a\tb"), 6, "tab is TAB_SPACES spaces");
+        assert_eq!(width_of("a\x07b"), 3);
+    }
+
+    #[test]
+    fn char_widths_aligns_with_chars_and_zeroes_escapes() {
+        let s = "\x1b[1mab";
+        assert_eq!(char_widths(s), vec![0, 0, 0, 0, 1, 1]);
+        assert_eq!(char_widths("日"), vec![2]);
     }
 
     #[test]
