@@ -1,46 +1,212 @@
 //! Text wrapping for table cells (moved from prior's `output::wrap` so the
 //! crate stays dependency-free).
+//!
+//! # Measurement contract
+//!
+//! All width math in this module uses [`slashdot_tui::ansi`]'s measurement —
+//! [`escape_end`] to skip escape sequences whole (CSI final bytes, OSC
+//! terminated by BEL or ST) and `unicode-width` for glyph widths. One
+//! semantic for "how wide is this line": the check, the split, and the
+//! painter's padding must agree, or a line the check passes would be cut at
+//! the wrong column by the splitter (and vice versa).
+//!
+//! # Normalization contract
+//!
+//! Width accounting is only sound for text whose characters render the way
+//! `unicode-width` measures them. Tabs do not: a tab is measured as one
+//! column (or not at all) but rendered as an advance to the next tab stop.
+//! Carriage returns, bells and backspaces move the cursor and overprint.
+//! Before anything is measured or rendered, control characters are therefore
+//! replaced at ingestion ([`LogicalLine::new`](crate::render::LogicalLine::new),
+//! `Table::add_row`), and defensively here:
+//!
+//! - `\t` becomes `TAB_SPACES` spaces (a fixed count — tab stops depend on
+//!   the rendered column, which wrapping moves, so expansion can never be
+//!   made correct, only consistent),
+//! - a `\r` directly before a `\n` is dropped (CRLF line endings),
+//! - any other control character outside an escape sequence becomes one
+//!   space,
+//! - escape sequences themselves are copied verbatim (an OSC payload may
+//!   contain control bytes that belong to the sequence).
+//!
+//! [`escape_end`]: slashdot_tui::ansi::escape_end
 
+use std::borrow::Cow;
+use std::ops::Range;
+
+use slashdot_tui::ansi::{display_width_ansi, escape_end};
 use unicode_width::UnicodeWidthChar;
 
-/// One visible character plus any ANSI escape sequences that precede it.
-/// `w` is the character's visible width (escapes have width 0).
-#[derive(Clone)]
+/// Spaces a tab is normalized to. Fixed rather than tab-stop-aligned: a tab
+/// stop depends on the column it renders at, and wrapping changes that
+/// column — so no expansion can be correct after a reflow.
+const TAB_SPACES: usize = 4;
+
+/// One logical line, classified by the cheap pre-measurement scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// Pure printable ASCII: no escapes, no control bytes, no multi-byte
+    /// chars. Width equals byte length — no decoding needed.
+    Ascii(usize),
+    /// No control characters needing replacement (but has escapes and/or
+    /// multi-byte chars). Measure with [`display_width_ansi`].
+    Plain,
+    /// Contains a tab or another control character outside an escape
+    /// sequence: must be normalized before measurement.
+    Dirty,
+}
+
+/// Single byte pass answering "does this line need attention, and how wide
+/// is it if it doesn't?". Escape sequences are skipped whole (their payload
+/// is not classified — control bytes inside an OSC belong to the sequence).
+fn classify(line: &str) -> Class {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut has_esc = false;
+    let mut non_ascii = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x80 {
+            if b == 0x1b {
+                has_esc = true;
+                i = escape_end(bytes, i);
+                continue;
+            }
+            if b == b'\n' {
+                i += 1; // line separator — untouched by normalization
+                continue;
+            }
+            if b < 0x20 || b == 0x7f {
+                return Class::Dirty; // tab, CR, BEL, BS, ...
+            }
+            i += 1; // printable ASCII
+        } else {
+            // C1 controls encode as U+0080..=U+009F: 0xc2 0x80..=0x9f.
+            if b == 0xc2 && i + 1 < bytes.len() && (0x80..=0x9f).contains(&bytes[i + 1]) {
+                return Class::Dirty;
+            }
+            non_ascii = true;
+            i += 1; // continuation bytes are all >= 0x80; byte-wise is safe
+        }
+    }
+    if has_esc || non_ascii {
+        Class::Plain
+    } else {
+        Class::Ascii(bytes.len())
+    }
+}
+
+/// Replace tab / control characters per the module's normalization contract.
+/// A no-op (borrowed) unless [`classify`] says otherwise — one pass, no
+/// allocation for clean text.
+pub(crate) fn normalize(text: &str) -> Cow<'_, str> {
+    if classify(text) == Class::Dirty {
+        Cow::Owned(normalize_dirty(text))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// [`normalize`] for callers that already hold a `String`: keeps the input
+/// allocation when nothing needs replacing.
+pub(crate) fn normalize_string(s: String) -> String {
+    if classify(&s) == Class::Dirty {
+        normalize_dirty(&s)
+    } else {
+        s
+    }
+}
+
+/// Rebuild `text` with control characters replaced. Escape sequences are
+/// copied verbatim; everything else follows the module contract.
+fn normalize_dirty(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            let end = escape_end(bytes, i);
+            out.push_str(&text[i..end]);
+            i = end;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
+        i += ch.len_utf8();
+        match ch {
+            '\n' => out.push('\n'),
+            '\t' => {
+                for _ in 0..TAB_SPACES {
+                    out.push(' ');
+                }
+            }
+            '\r' => {
+                // CRLF: the \r belongs to the line ending — drop it.
+                if i < bytes.len() && bytes[i] != b'\n' {
+                    out.push(' ');
+                }
+            }
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Byte index just past the ANSI escape sequence starting at `start` (which
+/// must be an ESC). Uses the shared [`escape_end`] so splitting, measuring
+/// and normalizing always skip the same bytes.
+fn escape_end_at(line: &str, start: usize) -> usize {
+    escape_end(line.as_bytes(), start)
+}
+
+/// Visible width of one char under the shared semantic: `unicode-width`,
+/// control characters (none survive normalization) as zero.
+fn char_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// A byte range of the logical line covering one visible char plus any
+/// escape sequences preceding it (escapes ride with the *following* char, so
+/// a cut never strands them on the wrong side of a wrap).
+#[derive(Clone, Copy)]
 struct Atom {
-    esc: String,
+    start: usize,
+    end: usize,
     ch: char,
     w: usize,
 }
 
-/// Split `text` into atoms, pulling any ANSI SGR escape sequences into the
-/// following character's `esc` so escapes are never counted as width and
-/// never split across a wrap boundary as their own token.
+/// Split `text` into atoms. Zero-copy: atoms are offsets into `text`, not
+/// owned pieces. Assumes `text` is normalized (callers normalize first) and
+/// pure `Plain` content — the ASCII fast path lives in the callers.
 fn atoms(text: &str) -> Vec<Atom> {
+    let bytes = text.as_bytes();
     let mut out = Vec::new();
-    let mut chars = text.chars().peekable();
-    let mut pending = String::new();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            pending.push(c);
-            for e in chars.by_ref() {
-                pending.push(e);
-                if e.is_ascii_alphabetic() {
-                    break;
-                }
-            }
+    let mut pending = 0; // start of the current atom (its escape run)
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i = escape_end_at(text, i);
             continue;
         }
-        let w = UnicodeWidthChar::width(c).unwrap_or(1);
+        let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
+        let w = char_width(ch);
+        let end = i + ch.len_utf8();
         out.push(Atom {
-            esc: std::mem::take(&mut pending),
-            ch: c,
+            start: pending,
+            end,
+            ch,
             w,
         });
+        pending = end;
+        i = end;
     }
-    // Trailing escapes with no following visible char.
-    if !pending.is_empty() {
+    if pending < bytes.len() {
+        // Trailing escapes with no following visible char: their own
+        // zero-width atom so a render still emits them.
         out.push(Atom {
-            esc: pending,
+            start: pending,
+            end: bytes.len(),
             ch: '\0',
             w: 0,
         });
@@ -52,20 +218,61 @@ fn atom_width(a: &Atom) -> usize {
     a.w
 }
 
-/// Render a slice of atoms to a string (escapes + chars).
-fn render(atoms: &[Atom]) -> String {
-    let mut s = String::new();
-    for a in atoms {
-        s.push_str(&a.esc);
-        if a.ch != '\0' {
-            s.push(a.ch);
-        }
-    }
-    s
-}
-
 fn total_width(atoms: &[Atom]) -> usize {
     atoms.iter().map(atom_width).sum()
+}
+
+/// Render a slice of atoms by slicing the logical line — no per-char push.
+fn render<'a>(text: &'a str, atoms: &[Atom]) -> &'a str {
+    match (atoms.first(), atoms.last()) {
+        (Some(first), Some(last)) => &text[first.start..last.end],
+        _ => "",
+    }
+}
+
+/// Cut `rest` into (head, head-tail) at `width` display columns. Escapes
+/// immediately preceding the overflowing char ride to the next line with it
+/// (matching [`atoms`]: a cut never splits an escape run from its char).
+/// Never returns an empty head for non-empty input.
+fn cut_at(rest: &str, width: usize) -> (&str, &str) {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    let mut used = 0;
+    let mut run: Option<usize> = None; // start of the current escape run
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            run.get_or_insert(i);
+            i = escape_end_at(rest, i);
+            continue;
+        }
+        let ch = rest[i..].chars().next().unwrap_or('\u{fffd}');
+        let cw = char_width(ch);
+        if used + cw > width && used > 0 {
+            let at = run.unwrap_or(i);
+            return (&rest[..at], &rest[at..]);
+        }
+        used += cw;
+        i += ch.len_utf8();
+        run = None;
+    }
+    (rest, "")
+}
+
+/// Whole-line pieces of `line` at `width` columns — the cold path, reached
+/// only after the caller's cheap check says the line overflows.
+fn split_pieces(line: &str, width: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while !rest.is_empty() {
+        let (head, tail) = cut_at(rest, width);
+        if head.is_empty() {
+            out.push(rest);
+            break;
+        }
+        out.push(head);
+        rest = tail;
+    }
+    out
 }
 
 /// Wrap `text` to fit `width` display columns per line.
@@ -89,6 +296,8 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         return text.lines().map(|l| l.to_string()).collect();
     }
     let width = width.max(1);
+    let normalized = normalize(text);
+    let text = normalized.as_ref();
     let mut out: Vec<String> = Vec::new();
     for logical in text.split('\n') {
         if logical.is_empty() {
@@ -101,130 +310,92 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
             .iter()
             .take_while(|a| a.ch.is_whitespace())
             .count();
-        let indent_atoms = &logical_atoms[..indent_len];
-        let indent_str = render(indent_atoms);
-        let indent_w = total_width(indent_atoms);
+        let indent_str = render(logical, &logical_atoms[..indent_len]);
+        let indent_w = total_width(&logical_atoms[..indent_len]);
         let body = &logical_atoms[indent_len..];
-        if body.iter().all(|a| a.w == 0) && body.is_empty() {
-            out.push(indent_str);
-            continue;
-        }
         if body.is_empty() {
-            out.push(indent_str);
+            out.push(indent_str.to_string());
             continue;
         }
         let content_width = width.saturating_sub(indent_w).max(1);
 
-        // Split body into words (runs of non-whitespace atoms) and spaces.
-        let mut words: Vec<Vec<Atom>> = Vec::new();
-        let mut cur: Vec<Atom> = Vec::new();
-        for a in body {
+        // Split body into words: contiguous ranges of non-whitespace atoms.
+        let mut words: Vec<Range<usize>> = Vec::new();
+        let mut cur: Option<usize> = None;
+        for (i, a) in body.iter().enumerate() {
             if a.ch.is_whitespace() {
-                if !cur.is_empty() {
-                    words.push(std::mem::take(&mut cur));
+                if let Some(s) = cur.take() {
+                    words.push(s..i);
                 }
-            } else {
-                cur.push(Atom {
-                    esc: a.esc.clone(),
-                    ch: a.ch,
-                    w: a.w,
-                });
+            } else if cur.is_none() {
+                cur = Some(i);
             }
         }
-        if !cur.is_empty() {
-            words.push(cur);
+        if let Some(s) = cur {
+            words.push(s..body.len());
         }
 
-        let mut line: Vec<Atom> = indent_atoms
-            .iter()
-            .map(|a| Atom {
-                esc: a.esc.clone(),
-                ch: a.ch,
-                w: a.w,
-            })
-            .collect();
+        let mut line = indent_str.to_string();
         let mut line_w = indent_w;
 
-        let new_indent = || -> Vec<Atom> {
-            indent_atoms
-                .iter()
-                .map(|a| Atom {
-                    esc: a.esc.clone(),
-                    ch: a.ch,
-                    w: a.w,
-                })
-                .collect()
-        };
         for word in words {
-            let word_w = total_width(&word);
+            let word_atoms = &body[word.clone()];
+            let word_w = total_width(word_atoms);
+            let word_str = render(logical, word_atoms);
             if word_w > content_width {
                 // Flush any pending content, then hard-split the long word.
                 if line_w > indent_w {
-                    out.push(render(&line));
+                    out.push(std::mem::take(&mut line));
                 }
                 // Emit chunks of `content_width` visible columns; keep the
                 // last chunk pending as the current line.
-                let mut chunk: Vec<Atom> = Vec::new();
+                let mut chunk_start = word.start;
                 let mut chunk_w = 0;
                 let mut first_chunk = true;
-                for a in word {
+                for k in word.clone() {
+                    let a = body[k];
                     if chunk_w + a.w > content_width && chunk_w > 0 {
+                        let piece = render(logical, &body[chunk_start..k]);
                         if first_chunk {
-                            let mut l = new_indent();
-                            l.append(&mut chunk);
-                            out.push(render(&l));
+                            // First chunk keeps the indent; it is emitted,
+                            // not pending — only the word's last chunk stays
+                            // in `line`.
+                            out.push(format!("{indent_str}{piece}"));
                             first_chunk = false;
                         } else {
-                            out.push(render(&chunk));
-                            chunk.clear();
+                            out.push(piece.to_string());
                         }
+                        chunk_start = k;
                         chunk_w = 0;
                     }
                     chunk_w += a.w;
-                    chunk.push(a);
                 }
-                line = if first_chunk {
-                    let mut l = new_indent();
-                    l.extend(chunk);
-                    line_w = total_width(&l);
-                    l
+                let tail = render(logical, &body[chunk_start..]);
+                if first_chunk {
+                    line = format!("{indent_str}{tail}");
+                    line_w = indent_w + chunk_w;
                 } else {
-                    line_w = total_width(&chunk);
-                    chunk
-                };
+                    line = tail.to_string();
+                    line_w = chunk_w;
+                }
                 continue;
             }
             let content_len = line_w.saturating_sub(indent_w);
             if content_len == 0 {
-                line.extend(word);
+                line.push_str(word_str);
                 line_w += word_w;
             } else if content_len + 1 + word_w > content_width {
-                out.push(render(&line));
-                line = indent_atoms
-                    .iter()
-                    .map(|a| Atom {
-                        esc: a.esc.clone(),
-                        ch: a.ch,
-                        w: a.w,
-                    })
-                    .collect();
-                line.extend(word);
+                out.push(std::mem::take(&mut line));
+                line = format!("{indent_str}{word_str}");
                 line_w = indent_w + word_w;
             } else {
-                line.push(Atom {
-                    esc: String::new(),
-                    ch: ' ',
-                    w: 1,
-                });
-                line.extend(word);
+                line.push(' ');
+                line.push_str(word_str);
                 line_w += 1 + word_w;
             }
         }
-        if line_w > 0 {
-            let rendered = render(&line);
-            if !rendered.is_empty() {
-                out.push(rendered);
-            }
+        if line_w > 0 && !line.is_empty() {
+            out.push(line);
         }
     }
     out
@@ -242,35 +413,51 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 /// word-level wrapping when it is warranted.
 ///
 /// Each logical line (`\n`-separated) is split independently; blank lines
-/// are preserved. A line that already fits is returned unchanged, escapes
-/// included. An over-long line is cut at `width` visible columns, hard: a
-/// word longer than the line is cut mid-word rather than reflowed, and a
-/// space that lands on the boundary simply ends the line it is in.
-pub fn split_to_width(text: &str, width: usize) -> Vec<String> {
+/// are preserved. A line that already fits is returned as a borrow of the
+/// input — the common case is one classification pass and no allocation.
+/// An over-long line is cut at `width` visible columns, hard: a word longer
+/// than the line is cut mid-word rather than reflowed, and a space that
+/// lands on the boundary simply ends the line it is in.
+pub fn split_to_width(text: &str, width: usize) -> Vec<Cow<'_, str>> {
     let width = width.max(1);
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<Cow<'_, str>> = Vec::new();
     for logical in text.split('\n') {
-        if logical.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let logical_atoms = atoms(logical);
-        if total_width(&logical_atoms) <= width {
-            out.push(render(&logical_atoms));
-            continue;
-        }
-        let mut chunk: Vec<Atom> = Vec::new();
-        let mut chunk_w = 0;
-        for a in &logical_atoms {
-            if chunk_w + a.w > width && chunk_w > 0 {
-                out.push(render(&chunk));
-                chunk = Vec::new();
-                chunk_w = 0;
+        match classify(logical) {
+            // Pure printable ASCII: width is byte length. Fits → one borrow;
+            // overflows → cut at byte offsets, no decoding at all.
+            Class::Ascii(len) => {
+                if len <= width {
+                    out.push(Cow::Borrowed(logical));
+                    continue;
+                }
+                let bytes = logical.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    let end = (i + width).min(bytes.len());
+                    out.push(Cow::Borrowed(&logical[i..end]));
+                    i = end;
+                }
             }
-            chunk.push(a.clone());
-            chunk_w += a.w;
+            // Has tabs / control chars: replace first (rare), split the
+            // normalized text — pieces are owned copies of it.
+            Class::Dirty => {
+                let norm = normalize_dirty(logical);
+                for piece in split_pieces(&norm, width) {
+                    out.push(Cow::Owned(piece.to_string()));
+                }
+            }
+            // Escapes and/or multi-byte chars: one ANSI-aware measure, and
+            // only if that overflows does the line get cut.
+            Class::Plain => {
+                if display_width_ansi(logical) <= width {
+                    out.push(Cow::Borrowed(logical));
+                    continue;
+                }
+                for piece in split_pieces(logical, width) {
+                    out.push(Cow::Borrowed(piece));
+                }
+            }
         }
-        out.push(render(&chunk));
     }
     out
 }
@@ -291,6 +478,14 @@ mod tests {
     #[test]
     fn split_leaves_a_fitting_line_untouched() {
         assert_eq!(split_to_width("a  b", 10), vec!["a  b"]);
+    }
+
+    #[test]
+    fn split_returns_a_borrow_on_the_common_path() {
+        // The fitting-line check must not allocate a rebuilt copy.
+        let parts = split_to_width("short ascii row", 80);
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0], Cow::Borrowed(_)));
     }
 
     #[test]
@@ -321,6 +516,45 @@ mod tests {
     }
 
     #[test]
+    fn split_counts_an_escapable_width_as_visible_only() {
+        // OSC 8 hyperlink: the URL is an escape payload, zero columns.
+        let link = "\x1b]8;;https://example.com/a/very/long/url\x1b\\link\x1b]8;;\x1b\\";
+        assert_eq!(display_width_ansi(link), 4);
+        assert_eq!(split_to_width(link, 4), vec![link]);
+    }
+
+    #[test]
+    fn split_cuts_at_escapes_keeping_them_with_their_char() {
+        // Escape run precedes "wor"; the cut at 4 columns happens before
+        // the whole atom, so the escape stays with "wor" on line two.
+        let parts = split_to_width("abcd\x1b[1mwor", 4);
+        assert_eq!(parts, vec!["abcd", "\x1b[1mwor"]);
+    }
+
+    #[test]
+    fn split_replaces_tabs_with_fixed_spaces() {
+        // "a\tb" normalizes to "a    b" (a + 4 spaces + b): fits at 10; at 3
+        // it cuts after "a" + two of the tab's spaces.
+        assert_eq!(split_to_width("a\tb", 10), vec!["a    b"]);
+        assert_eq!(split_to_width("a\tb", 3), vec!["a  ", "  b"]);
+    }
+
+    #[test]
+    fn normalize_is_a_noop_for_clean_text() {
+        assert!(matches!(normalize("plain \u{30}text"), Cow::Borrowed(_)));
+        assert!(matches!(normalize("\x1b[1mbold\x1b[0m"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn normalize_replaces_controls_and_drops_crlf() {
+        assert_eq!(normalize("a\rb").as_ref(), "a b");
+        assert_eq!(normalize("a\r\nb").as_ref(), "a\nb");
+        assert_eq!(normalize("a\x07b").as_ref(), "a b");
+        // Escape sequences survive verbatim, payload control bytes included.
+        assert_eq!(normalize("\x1b]8;;url\x07x").as_ref(), "\x1b]8;;url\x07x");
+    }
+
+    #[test]
     fn wraps_at_width() {
         assert_eq!(wrap("hello world", 5), vec!["hello", "world"]);
     }
@@ -331,6 +565,14 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("    "));
         assert!(lines[1].starts_with("    "));
+    }
+
+    #[test]
+    fn wrap_replaces_leading_tabs_in_indent() {
+        // A tab in the indent is measured (and rendered) as fixed spaces.
+        let lines = wrap("\tabc def ghi", 8);
+        assert!(lines[0].starts_with("    "), "lines: {lines:?}");
+        assert!(lines.iter().all(|l| !l.contains('\t')));
     }
 
     #[test]

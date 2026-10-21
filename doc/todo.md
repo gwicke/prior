@@ -29,6 +29,14 @@ and link a doc/ and/or commit hash
       estimate (turn-boundary write) until the next completion reports. `/stat` shows the same
       merged figure as the bar.
 
+## Width / wrapping
+
+- [ ] `table::style_units` (fit/truncation) still uses the old "escape runs to first alpha" parser —
+      OSC 8 URLs count as visible columns there; switch it to `ansi::escape_end` like `wrap` did.
+- [ ] `DetailItem::height` paints the detail section just to count rows, then `render` paints it
+      again — split once and share (cheap since `split_to_width` is borrowed now).
+- [ ] Bump `unicode-width` 0.1 -> 0.2 workspace-wide (already in the lockfile via other deps).
+
 ## Token efficiency
 
 - [ ] Minimize tool context

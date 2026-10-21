@@ -16,7 +16,7 @@
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::wrap::wrap;
+use crate::wrap::{normalize, wrap};
 
 /// Horizontal alignment of a column's cells (and its header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,9 +93,15 @@ impl Table {
     }
 
     /// Append a row. `cells` may be shorter/longer than the column count;
-    /// missing cells render as empty, extra cells are ignored.
+    /// missing cells render as empty, extra cells are ignored. Cells are
+    /// normalized (`wrap`'s control-character contract) on the way in, so the
+    /// widths [`Table::layout`] measures match what wrapping and painting
+    /// later render for the same bytes.
     pub fn add_row<C: AsRef<str>>(&mut self, cells: &[C]) -> &mut Self {
-        let row: Vec<String> = cells.iter().map(|c| c.as_ref().to_string()).collect();
+        let row: Vec<String> = cells
+            .iter()
+            .map(|c| normalize(c.as_ref()).into_owned())
+            .collect();
         self.rows.push(row);
         self
     }
