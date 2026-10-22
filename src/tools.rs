@@ -1618,6 +1618,51 @@ fn capture_bounded(
 /// from writes; only explicitly declared bindings add writable/project paths.
 const ESSENTIAL_RO_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64"];
 
+/// Read-only `/etc` entries bound into every sandbox that configures no `/etc`
+/// binding of its own. The whole directory used to be bound, which exposed
+/// `/etc/hosts`, `/etc/passwd`, `/etc/ssl` and `/etc/localtime` — mild host
+/// fingerprinting, and with `--unshare-uts` there is no reason to hand over the
+/// host's identity. This is the working set a normal command needs:
+///
+/// - `/etc/alternatives` is load-bearing, not decoration: on a Debian host
+///   `/usr/bin/awk` is a symlink into it, so without the directory most
+///   `/usr/bin` symlinks dangle. (bwrap dereferences *sources* but preserves
+///   symlinks it mounts, so `awk` resolves only if its target exists.)
+/// - `/etc/ld.so.cache` + `/etc/ld.so.preload` are how the dynamic loader
+///   finds libraries; `/etc/ssl` is the CA store (TLS clients), `/etc/localtime`
+///   the timezone.
+/// - NSS: `/etc/nsswitch.conf` names the resolution order and `/etc/gai.conf`,
+///   `/etc/host.conf` tune it; `/etc/hosts` is the local static table.
+///   `/etc/resolv.conf` is normally a symlink (NetworkManager, systemd-resolved)
+///   and bwrap dereferences symlink sources, so listing it plainly picks up the
+///   resolved target with no host-specific remap.
+/// - `bash.bashrc` + `profile` are read by interactive/`sh -c` shells;
+///   `mime.types`/`mailcap` cover tools that sniff file types; `w3m` is for the
+///   `w3m` text browser used for docs.
+///
+/// Entries are skipped when absent on the host (bwrap errors on a missing
+/// source, so this list must tolerate a non-Debian `/etc` — e.g. `/etc/w3m`,
+/// `/etc/mailcap` and, on this host, `/etc/passwd` itself).
+const ESSENTIAL_ETC: &[&str] = &[
+    "/etc/alternatives",
+    "/etc/bash.bashrc",
+    "/etc/gai.conf",
+    "/etc/group",
+    "/etc/host.conf",
+    "/etc/hosts",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.preload",
+    "/etc/localtime",
+    "/etc/mailcap",
+    "/etc/mime.types",
+    "/etc/nsswitch.conf",
+    "/etc/passwd",
+    "/etc/profile",
+    "/etc/resolv.conf",
+    "/etc/ssl",
+    "/etc/w3m",
+];
+
 /// Single-quote a string for safe embedding as a single argument inside a
 /// `sh -c` payload. The only shell metacharacter not inert inside single
 /// quotes is the single quote itself; we escape it as `''\''` (close, escaped
@@ -1755,11 +1800,21 @@ fn build_bwrap_args(
             args.push(dir.to_string());
         }
     }
-    // Mount /etc: when the user binds sub-paths of /etc, we create an
-    // empty directory first so their mounts have a place to land.  When
-    // nothing references /etc at all, fall back to ro-binding the whole
-    // directory (old behavior).  When an exact /etc bind is configured,
-    // the user takes full control and we add nothing extra.
+    // Mount /etc. Three cases:
+    //
+    // - An exact `/etc` binding: the operator takes full control, we add
+    //   nothing.
+    // - Bindings *under* `/etc`: create the empty directory so their mounts
+    //   have somewhere to land, and add nothing else (the operator's list is
+    //   authoritative — adding our defaults could shadow theirs, since bwrap
+    //   resolves overlapping mounts "last wins").
+    // - Neither: bind [`ESSENTIAL_ETC`]. This replaced ro-binding the whole
+    //   directory, which handed over the host's `/etc/passwd`, `/etc/hosts`,
+    //   `/etc/ssl` and `/etc/localtime` for no benefit.
+    //
+    // bwrap auto-creates missing parent directories for a bind target and
+    // dereferences a symlink *source*, which is what lets `/etc/resolv.conf`
+    // (a symlink into `/run/...` on most hosts) be listed plainly.
     let etc_exact = binds.iter().any(|b| b.to == std::path::Path::new("/etc"));
     let etc_sub = binds.iter().any(|b| b.to.starts_with("/etc/"));
     if etc_exact {
@@ -1768,11 +1823,16 @@ fn build_bwrap_args(
         // User binds sub-paths under /etc; create the empty directory first.
         args.push("--dir".into());
         args.push("/etc".into());
-    } else if std::path::Path::new("/etc").is_dir() {
-        // No /etc bindings at all — ro-bind the full directory.
-        args.push("--ro-bind".into());
-        args.push("/etc".into());
-        args.push("/etc".into());
+    } else {
+        for entry in ESSENTIAL_ETC {
+            // bwrap fails on a missing source, so a minimal or non-Debian
+            // `/etc` must simply contribute fewer entries.
+            if std::path::Path::new(entry).exists() {
+                args.push("--ro-bind".into());
+                args.push(entry.to_string());
+                args.push(entry.to_string());
+            }
+        }
     }
 
     if binds.is_empty() {
@@ -1835,12 +1895,56 @@ fn build_bwrap_args(
         args.push("/tmp".into());
     }
 
+    // Fresh `/dev` and `/proc` by default (R3e). Both are *populated* by bwrap,
+    // never bound from the host: a plain bind of either yields a broken tree
+    // (`/dev/null` unopenable, `/proc` not a procfs at all). They used to be
+    // mounted only when the operator bound them, which left the default
+    // namespace without `/dev/null` or `/proc/self/exe` — so ordinary work
+    // (`git`, `cargo`) failed unless the bindings happened to list them.
+    //
+    // Mounting `/proc` is what makes the env scrub (R1) load-bearing: the
+    // sandboxed command can read `/proc/1/environ`, which under
+    // `--unshare-pid` is *bwrap's* environment, so bwrap must not inherit the
+    // host's. See `bwrap_scrub_env`.
+    //
+    // Skip whichever one the bindings already provide, so an explicit
+    // `/dev`/`/proc` binding is not mounted twice (harmless, but the argv is
+    // user-visible in `--version`-style output and in tests).
+    // (A trailing slash is tolerated, matching the binding translation below.)
+    let has_special = |want: &str| {
+        binds
+            .iter()
+            .any(|b| b.to.to_string_lossy().trim_end_matches('/') == want)
+    };
+    if !has_special("/dev") {
+        args.push("--dev".into());
+        args.push("/dev".into());
+    }
+    if !has_special("/proc") {
+        args.push("--proc".into());
+        args.push("/proc".into());
+    }
+
+    // Network isolation. NOTE: once R3a's egress bridge lands this flag becomes
+    // unconditional, and `network` stops selecting "share the host netns" —
+    // egress will instead be granted through a SOCKS5 bridge. Until that exists,
+    // `network: true` still means what it always meant, because unsharing here
+    // with no bridge would silently remove all connectivity.
+    // See `doc/261021_sandbox_env_x11_audit.md` (R3a/R3b).
     if !cfg.network.unwrap_or(false) {
         args.push("--unshare-net".into());
     }
     if cfg.pid_isolation.unwrap_or(true) {
         args.push("--unshare-pid".into());
     }
+    // SysV IPC and the UTS namespace (R3e). `--unshare-ipc` closes the host's
+    // shared-memory segments (`ipcs -m` lists them today) and with them the
+    // MIT-SHM framebuffer path; `--unshare-uts` plus `--hostname` stops the
+    // sandbox reporting the host's hostname (`--unshare-uts` alone still does).
+    args.push("--unshare-ipc".into());
+    args.push("--unshare-uts".into());
+    args.push("--hostname".into());
+    args.push("sandbox".into());
     if cfg.drop_caps.unwrap_or(true) {
         args.push("--cap-drop".into());
         args.push("ALL".into());
@@ -2639,6 +2743,47 @@ mod sandbox_tests {
         .await
         .unwrap();
         assert_eq!(out, "PROC_OK");
+    }
+
+    /// The default `/etc` binding is a working set, not the whole directory
+    /// (R3e). The properties that matter: nothing in the list breaks ordinary
+    /// tools, and files outside the list are absent.
+    #[tokio::test]
+    #[serial]
+    async fn sandboxed_etc_is_a_working_set_not_the_whole_directory() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
+
+        // `/usr/bin/awk` is a symlink into `/etc/alternatives` on Debian: it
+        // resolves only if that directory is bound. This is the entry the list
+        // would silently be useless without.
+        let out = run_sandboxed("awk 'BEGIN{print 1+1}'", None).await.unwrap();
+        assert_eq!(out, "2", "awk must resolve via /etc/alternatives");
+
+        // The dynamic loader and the static host table, same argument.
+        let out = run_sandboxed("test -f /etc/ld.so.cache && echo CACHE_OK", None)
+            .await
+            .unwrap();
+        assert_eq!(out, "CACHE_OK");
+        let out = run_sandboxed("test -f /etc/hosts && echo HOSTS_OK", None)
+            .await
+            .unwrap();
+        assert_eq!(out, "HOSTS_OK");
+
+        // A file that exists on the host but is not in `ESSENTIAL_ETC` must be
+        // absent, proving this is a working set rather than the old whole-`/etc`
+        // bind. `/etc/os-release` is on essentially every Linux host.
+        if std::path::Path::new("/etc/os-release").exists() {
+            let out = run_sandboxed(
+                "test -e /etc/os-release && echo PRESENT || echo ABSENT",
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out, "ABSENT", "/etc must not be bound whole");
+        }
     }
 
     // ---- Phase 1b: LLM-configurable per-call timeout override ----

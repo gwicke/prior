@@ -1087,8 +1087,25 @@ pub enum EnvMode {
 /// only removes the secret shapes it happens to know about and passes
 /// everything else through, so the effective default is the allowlist below.
 /// See `doc/261021_sandbox_env_x11_audit.md` (Finding 2) and `doc/sandbox.md`.
-pub const DEFAULT_ENV_DISALLOW: &[&str] =
-    &["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"];
+pub const DEFAULT_ENV_DISALLOW: &[&str] = &[
+    "*_KEY",
+    "*_SECRET",
+    "*_TOKEN",
+    "AWS_*",
+    "SSH_AUTH_SOCK",
+    // The desktop/session variables: every one of them names a host IPC
+    // endpoint (X11, Wayland, D-Bus, the session bus) that a sandboxed command
+    // has no business reaching. Not being *told* where the display is is not a
+    // barrier on its own — the abstract X11 socket is reachable whenever the
+    // network namespace is shared — but it costs nothing and closes the
+    // hint-based path. See doc/261021_sandbox_env_x11_audit.md (R3e).
+    "DISPLAY",
+    "XAUTHORITY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "SSH_AGENT_PID",
+];
 
 /// Built-in default `env` allowlist, applied when the user configures no `env`
 /// block.

@@ -242,9 +242,12 @@ bwrap
   --ro-bind <cwd> <cwd>            # baseline: CWD visible read-only (if no path overrides)
   [for each path in cfg.ro]   --ro-bind <from> <to>
   [for each path in cfg.rw]   --bind   <from> <to>
+  --dev /dev --proc /proc               # fresh instances; skipped if bound explicitly
+  --ro-bind /etc/<entry> …              # ESSENTIAL_ETC working set (not all of /etc)
   --tmpfs /tmp  (size from tmp_size_mb, via --size)
-  [--unshare-net]                       # unless network: true
+  [--unshare-net]                       # unless network: true (R3a makes this unconditional)
   [--unshare-pid --pid]                 # if pid_isolation (default true)
+  --unshare-ipc --unshare-uts --hostname sandbox
   [--cap-drop ALL]                      # if drop_caps (default true)
   --die-with-parent
   -- prlimit --as=<memory_mb*1024*1024> -- <cmd argv>   # memory cap via direct argv (see below)
@@ -387,7 +390,16 @@ with zero config.
 - **Deny-by-default root** is the key guarantee: without an explicit binding,
   host files are invisible. Never use `--ro-bind / /`.
 - **`--unshare-net`** blocks network egress by default; opt-in via
-  `network: true`.
+  `network: true`. Once R3a's egress bridge lands the flag becomes
+  unconditional and `network: true` means "egress through the bridge", so X11's
+  abstract socket is unreachable regardless of the setting.
+- **`/etc` is a working set, not the whole directory.** `ESSENTIAL_ETC` binds
+  the files a normal command needs (`/etc/alternatives`, the loader cache, NSS
+  config, the CA store, timezone, shell profile). The host's `/etc/passwd`,
+  `/etc/shadow` and `/etc/os-release` are not visible. Absent entries are
+  skipped, so a minimal `/etc` still boots.
+- **Fresh `/dev` and `/proc`** are mounted by default. Mounting `/proc` is why
+  the bwrap env scrub matters: `/proc/1/environ` is bwrap's own environment.
 - **Capability drop + PID namespace** limit privilege escalation and hide the
   host process tree.
 - **Not a hardening boundary against root.** bwrap provides isolation, not a
@@ -585,10 +597,11 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
 - [ ] Implement `build_bwrap_expr(cmd, &SandboxConfig, &[ResolvedBind])`.
 - [ ] Deny-by-default root: when `paths` non-empty, bind only declared entries;
       when empty, fall back to `--ro-bind <cwd> <cwd>` + writable tmpfs.
-- [ ] Emit flags: per-path `--ro-bind`/`--bind`; `--tmpfs /tmp --size`;
+- [x] Emit flags: per-path `--ro-bind`/`--bind`; `--dev /dev --proc /proc`;
+      `--ro-bind` per `ESSENTIAL_ETC` entry; `--tmpfs /tmp --size`;
       `--unshare-net` (unless `network`); `--unshare-pid --pid`
-      (if `pid_isolation`); `--cap-drop ALL` (if `drop_caps`);
-      `--die-with-parent`.
+      (if `pid_isolation`); `--unshare-ipc --unshare-uts --hostname sandbox`;
+      `--cap-drop ALL` (if `drop_caps`); `--die-with-parent`.
 - [x] Memory wrapper: `prlimit --as=<MB*1024*1024> -- <argv>` (direct argv, no
       shell); `ulimit -v` shell-builtin fallback when `prlimit` absent.
 - [ ] Integration tests (tempfile): ro/rw remap round-trip; `network:false`

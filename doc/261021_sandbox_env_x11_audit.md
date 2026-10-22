@@ -66,13 +66,16 @@ Five reference implementations are used throughout:
 
 `build_bwrap_args` (`src/tools.rs:1704`) assembles, in order:
 
-- `--ro-bind` for each of `ESSENTIAL_RO_DIRS` = `/usr /bin /lib /lib64` (`src/tools.rs:1611`), plus
-  `/etc` when no `/etc` binding is configured.
+- `--ro-bind` for each of `ESSENTIAL_RO_DIRS` = `/usr /bin /lib /lib64`, plus one per entry in
+  `ESSENTIAL_ETC` when no `/etc` binding is configured (a working set, not the whole directory —
+  R3e, implemented).
+- Fresh `--dev /dev` and `--proc /proc` by default, unless a binding already targets either.
 - User `ro`/`rw` bindings; a binding whose in-sandbox target is `/dev` or `/proc` is translated to
-  bwrap's `--dev` / `--proc` (`src/tools.rs:1790-1801`).
+  bwrap's `--dev` / `--proc`.
 - A `--tmpfs /tmp` scratch area (unless a user binding covers `/tmp`).
-- `--unshare-net` unless `network: true`; `--unshare-pid` and `--cap-drop ALL` by default;
-  `--die-with-parent`.
+- `--unshare-net` unless `network: true` (unconditional once R3a lands); `--unshare-pid` and
+  `--cap-drop ALL` by default; `--unshare-ipc --unshare-uts --hostname sandbox` always
+  (R3e, implemented); `--die-with-parent`.
 - `--clearenv` followed by one `--setenv NAME VALUE` per variable the env policy permits, then the
   sandbox's own forced values (`src/tools.rs:1850-1876`).
 
@@ -769,20 +772,22 @@ proxy, a trust store, an audit log) that duplicates policy prior already has. Bu
 
 ## Additional observations (not separately requested, found during the audit)
 
-- **`/dev` is usually absent from the sandbox.** With the default config (no bindings) prior mounts
-  no `/dev`, so `echo hi > /dev/null` fails with `Directory nonexistent` and `/proc` is likewise
-  absent. Only a config that binds `/dev` or `/proc` gets them. This is fail-closed and correct, but
-  it surprises tools that expect `/dev/null` — and `git` fails without it.
-- **`/etc` is ro-bound whole** when no `/etc` binding is configured, which exposes `/etc/hosts`,
-  `/etc/ssl` (CA store), `/etc/localtime` and `/etc/passwd` — mild host fingerprinting, no secrets.
+- **`/dev` and `/proc` used to be absent from the sandbox.** With the default config (no bindings)
+  prior mounted neither, so `echo hi > /dev/null` failed with `Directory nonexistent`. Only a config
+  that bound them got them, which left the default namespace unable to run `git` or `cargo`.
+  **Fixed in R3e**: both are mounted fresh by default.
+- **`/etc` used to be ro-bound whole** when no `/etc` binding was configured, exposing `/etc/hosts`,
+  `/etc/ssl`, `/etc/localtime` and `/etc/passwd` — mild host fingerprinting, no secrets.
+  **Fixed in R3e**: a named working set (`ESSENTIAL_ETC`) replaces it.
 - **The UTS namespace is not unshared**, so `hostname` inside the sandbox returns the host hostname
   (`pad`). Note that `--unshare-uts` alone does not change this — a new UTS namespace still inherits
   the hostname until `--hostname` is given: `--unshare-uts --hostname sandbox` reports `sandbox`.
-  Closing the leak needs both flags.
+  Closing the leak needs both flags. **Fixed in R3e.**
 - **The IPC namespace is not unshared**, so the sandbox sees the host's System V shared-memory
   segments (`ipcs -m` lists 8 of them). `--unshare-ipc` closes this; it is also the namespace that
   would matter for X11's MIT-SHM path, which is a faster and more direct way to read framebuffers
   than `XGetImage`. Confirmed the flag is free to add: `network: true` does not depend on it.
+  **Fixed in R3e.**
 - **`--cap-drop ALL` is a no-op for an unprivileged user.** Measured with and without the flag,
   `CapEff`/`CapBnd` are `0000000000000000` either way — the user never held capabilities to begin
   with, so there is nothing to drop. The flag is not harmful, but it is not contributing anything.
@@ -1129,19 +1134,28 @@ Not the X11 fix. `bwrap --seccomp FD` (an FD, not a path), denying only:
 socket it was meant to protect. `srt` needs that hammer because it does not have the bridge; prior
 does not.
 
-#### R3e — Environment hygiene (cheap, do it with R3a)
+#### R3e — Environment hygiene (IMPLEMENTED 2026-10-22)
 
-- `DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` are already excluded by the R2
-  allowlist. Add them to `DEFAULT_ENV_DISALLOW` too, for operators who opt back into the denylist.
-  These are the *hint* for Finding 3, not the barrier, but not being told where the display is
-  costs nothing.
-- `--unshare-ipc` unconditionally. Closes the host SysV segment exposure (`ipcs -m` currently lists
-  8) and the MIT-SHM framebuffer path. Free.
-- `--dev /dev` and `--proc /proc` by default, as `srt` does. `git` fails without `/dev/null` and
-  `cargo` without `/proc/self/exe`; mounting `/proc` makes R1 mandatory, which is the correct
-  dependency.
+- `DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`,
+  `SSH_AGENT_PID` are excluded by the R2 allowlist, and are now also in `DEFAULT_ENV_DISALLOW` for
+  operators who opt back into the denylist. These are the *hint* for Finding 3, not the barrier, but
+  not being told where the display is costs nothing.
+- `--unshare-ipc` unconditionally. Closes the host SysV segment exposure and the MIT-SHM
+  framebuffer path. Free.
+- `--dev /dev` and `--proc /proc` by default. `git` fails without `/dev/null` and `cargo` without
+  `/proc/self/exe`; mounting `/proc` makes R1 mandatory, which is the correct dependency.
 - `--unshare-uts --hostname sandbox`. Both flags — `--unshare-uts` alone still reports the host
   hostname.
+- **`/etc` narrowed to `ESSENTIAL_ETC`** (added during implementation; it was an "additional
+  observation" rather than a numbered item). The whole directory used to be bound, exposing
+  `/etc/passwd`, `/etc/hosts` and `/etc/os-release`. The working set is `/etc/alternatives` (without
+  which all of `/usr/bin`'s alternatives symlinks dangle — `awk` is one), the loader cache, NSS
+  config, the CA store, timezone, shell profile and `mime.types`/`mailcap`/`w3m`. Absent entries are
+  skipped, because bwrap errors on a missing bind source. Verified: `awk`, `getent hosts`, DNS, TLS
+  CA store, `git`, `rustc`, `node` all still work; `/etc/os-release` is absent.
+  - Two bwrap behaviours make the plain list sufficient: it dereferences a symlink *source* (so
+    `/etc/resolv.conf` → `/run/NetworkManager/...` needs no host-specific remap) and auto-creates
+    missing parent directories for a bind target.
 
 #### R3f — The config schema (this is what makes macOS cheap)
 
