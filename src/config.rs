@@ -532,112 +532,6 @@ impl From<SandboxMemoryMb> for Option<u64> {
     Default,
     serde::Serialize,
 )]
-pub struct SandboxTmpSizeMb(pub Option<u64>);
-
-impl<'de> serde::Deserialize<'de> for SandboxTmpSizeMb {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct Visitor;
-
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = Option<u64>;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a positive integer for tmp_size_mb (not a string), or null")
-            }
-
-            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(Some(value))
-            }
-
-            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if value < 0 {
-                    return Err(E::custom("invalid tmp_size_mb: negative value not allowed"));
-                }
-                Ok(Some(value as u64))
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if value.is_empty() {
-                    return Ok(None);
-                }
-                if let Ok(parsed) = value.parse::<u64>() {
-                    Ok(Some(parsed))
-                } else {
-                    Err(E::custom(format!(
-                        "invalid tmp_size_mb: '{}' - must be number",
-                        value
-                    )))
-                }
-            }
-
-            fn visit_none<E>(self) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(None)
-            }
-
-            fn visit_unit<E>(self) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(None)
-            }
-        }
-
-        deserializer.deserialize_any(Visitor).map(SandboxTmpSizeMb)
-    }
-}
-
-impl SandboxTmpSizeMb {
-    pub fn map<U, F: FnOnce(u64) -> U>(self, f: F) -> Option<U> {
-        self.0.map(f)
-    }
-
-    pub fn unwrap_or(self, default: u64) -> u64 {
-        self.0.unwrap_or(default)
-    }
-
-    pub fn or(self, other: SandboxTmpSizeMb) -> SandboxTmpSizeMb {
-        if self.0.is_some() {
-            self
-        } else {
-            other
-        }
-    }
-}
-
-impl From<SandboxTmpSizeMb> for Option<u64> {
-    fn from(w: SandboxTmpSizeMb) -> Option<u64> {
-        w.0
-    }
-}
-
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    schemars::JsonSchema,
-    Default,
-    serde::Serialize,
-)]
 pub struct SandboxMaxOutputBytes(pub Option<usize>);
 
 impl<'de> serde::Deserialize<'de> for SandboxMaxOutputBytes {
@@ -986,9 +880,6 @@ pub struct SandboxConfig {
     /// Drop all capabilities. Default true.
     #[serde(default)]
     pub drop_caps: Option<bool>,
-    /// Size of the tmpfs mounted at /tmp inside the sandbox (MB). Default 256.
-    #[serde(default)]
-    pub tmp_size_mb: SandboxTmpSizeMb,
     /// Read-only filesystem bindings. Each entry is either a bare path (mounted
     /// at the same in-sandbox location) or an explicit `{ from, to }` remap.
     /// Paths are resolved relative to the agent CWD (`~` expands to the home
@@ -1140,7 +1031,6 @@ impl SandboxConfig {
             memory_mb: self.memory_mb,
             pid_isolation: self.pid_isolation.or(Some(true)),
             drop_caps: self.drop_caps.or(Some(true)),
-            tmp_size_mb: self.tmp_size_mb.or(SandboxTmpSizeMb(Some(256))),
             ro: self.ro.clone(),
             rw: self.rw.clone(),
             env: self.env.clone(),
@@ -1596,6 +1486,14 @@ fn normalize(p: &Path) -> PathBuf {
 
 /// Build a [`PathPolicy`] from a sandbox config. Returns `None` when there are
 /// no explicit bindings (permissive default).
+///
+/// The `/tmp` mapping is added here so the file tools and the shell resolve
+/// `/tmp` to the *same* host directory (see `doc/sandbox.md` → "`/tmp` is a
+/// per-session directory"). It comes from the one resolver both call
+/// ([`crate::sandbox_tmp::resolve`]), so the two cannot drift: a `write /tmp/f`
+/// lands on the file a later `bash cat /tmp/f` reads. When there is no session
+/// (one-shot runs) the shell gets a throwaway tmpfs and there is nothing to
+/// map.
 pub fn resolve_path_policy(
     cfg: &SandboxConfig,
     cwd: &Path,
@@ -1604,7 +1502,14 @@ pub fn resolve_path_policy(
     if cfg.ro.is_empty() && cfg.rw.is_empty() {
         return None;
     }
-    let binds = resolve_paths(cwd, home, &cfg.ro, &cfg.rw).ok()?;
+    let mut binds = resolve_paths(cwd, home, &cfg.ro, &cfg.rw).ok()?;
+    if let Ok(Some(dir)) = crate::sandbox_tmp::resolve(&binds) {
+        // The session directory replaces any user `/tmp` remap, exactly as the
+        // bwrap argv replaces it: the user binding was the *base* the session
+        // directory was created under.
+        binds.retain(|b| b.to != Path::new("/tmp"));
+        binds.push(crate::sandbox_tmp::bind(&dir));
+    }
     Some(PathPolicy {
         remap: RemapTable::build(&binds),
         binds,
@@ -1968,7 +1873,6 @@ mod tests {
             memory_mb: SandboxMemoryMb(Some(512)),
             pid_isolation: None,
             drop_caps: None,
-            tmp_size_mb: SandboxTmpSizeMb(None),
             ro: vec![],
             rw: vec![],
             env: None,
@@ -1980,7 +1884,6 @@ mod tests {
         assert_eq!(d.memory_mb, SandboxMemoryMb(Some(512)));
         assert_eq!(d.pid_isolation, Some(true));
         assert_eq!(d.drop_caps, Some(true));
-        assert_eq!(d.tmp_size_mb, SandboxTmpSizeMb(Some(256)));
         // Output cap defaults when unset.
         assert_eq!(
             d.max_output_bytes,
@@ -2010,7 +1913,6 @@ mod tests {
         assert_eq!(d.network, NetworkPolicy::disabled());
         assert_eq!(d.pid_isolation, Some(true));
         assert_eq!(d.drop_caps, Some(true));
-        assert_eq!(d.tmp_size_mb, SandboxTmpSizeMb(Some(256)));
         assert_eq!(
             d.max_output_bytes,
             SandboxMaxOutputBytes(Some(DEFAULT_MAX_OUTPUT_BYTES))

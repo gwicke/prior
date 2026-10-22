@@ -29,6 +29,7 @@ pub mod prompt_complete;
 pub mod repl;
 pub mod row_count;
 pub mod sandbox_state;
+pub mod sandbox_tmp;
 pub mod session;
 pub mod settings;
 pub mod settings_editor;

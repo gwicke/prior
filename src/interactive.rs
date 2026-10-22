@@ -217,6 +217,14 @@ impl Interactive {
         // Store the original (non-merged) sandbox config so the remove overlay
         // can list config-provided bindings and allow temporary exclusion.
         crate::sandbox_state::set_base(config.sandbox.clone());
+        // Prune session /tmp directories left by sessions that are gone (a
+        // session deleted while prior was not running, a crash between the
+        // file write and the directory removal, a directory whose session file
+        // was removed by hand). Best-effort and age-gated, so a live session's
+        // directory is never touched.
+        if let Some(cfg) = config.sandbox.as_ref() {
+            crate::sandbox_tmp::sweep(cfg);
+        }
         // Publish the resolved sandbox config immediately so that user-initiated
         // `!`/`!!` shell commands use the same bwrap/timeout policy as the agent's
         // `bash` tool — even before the agent is lazily created on the first
@@ -1490,7 +1498,6 @@ mod tests {
             memory_mb: crate::config::SandboxMemoryMb(None),
             pid_isolation: Some(true),
             drop_caps: Some(true),
-            tmp_size_mb: crate::config::SandboxTmpSizeMb(Some(16)),
             ro: vec![],
             rw: vec![BindPath::Remap {
                 from: host_path.display().to_string(),

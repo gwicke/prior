@@ -58,6 +58,12 @@ pub fn set_base(cfg: Option<SandboxConfig>) {
     }
 }
 
+/// The stored base config, for callers (session cleanup) that need it without
+/// touching the live published copy.
+pub fn base_config() -> Option<SandboxConfig> {
+    BASE_CONFIG.lock().ok().and_then(|b| b.clone())
+}
+
 /// Mark a config-provided sandbox path as excluded (temporarily removed).
 pub fn exclude(sandbox_path: &str) -> Result<(), String> {
     let resolved = resolve_sandbox_path(sandbox_path);

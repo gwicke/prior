@@ -10,7 +10,7 @@ use tokio::fs;
 use crate::config::{
     bwrap_scrub_env, env_vars_to_keep, resolve_path_policy, resolve_paths, BashTimeout, ByteLimit,
     ByteOffset, ContextLines, ReadLimit, ReadOffset, SandboxConfig, SandboxMaxOutputBytes,
-    SandboxMemoryMb, SandboxTimeoutSecs, SandboxTmpSizeMb,
+    SandboxMemoryMb, SandboxTimeoutSecs,
 };
 use crate::path_util::relativize_path;
 
@@ -101,6 +101,17 @@ fn get_path(path: &str) -> Result<PathBuf, ToolError> {
 fn get_path_with(path: &str, is_write: bool) -> Result<PathBuf, ToolError> {
     let base = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
 
+    // `/tmp` is the session's scratch directory, not the host's (and not a
+    // path outside the cwd). When a policy is active its remap already covers
+    // this (built from the same resolver `resolve_path_policy`); with no
+    // policy the permissive default has no remap, so map `/tmp` here or the
+    // shell and the file tools would disagree about where `/tmp/f` lives.
+    if !has_path_policy() {
+        if let Some(host) = crate::sandbox_tmp::tool_path(path) {
+            return Ok(host);
+        }
+    }
+
     // When a path policy is active (sandbox active with explicit bindings),
     // rewrite via the remap table, then enforce coverage + mode.
     if let Some(policy) = current_path_policy() {
@@ -127,6 +138,11 @@ fn get_sandbox_path(path: &str) -> Result<PathBuf, ToolError> {
     if let Some(policy) = current_path_policy() {
         Ok(policy.resolve_sandbox(path))
     } else {
+        // `/tmp` maps to the session's scratch directory on the host, but the
+        // agent named it `/tmp/f` and should be shown it that way.
+        if crate::sandbox_tmp::tool_path(path).is_some() {
+            return Ok(std::path::Path::new(path).to_path_buf());
+        }
         let base = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
         validate_path(&base, path)
     }
@@ -1218,6 +1234,13 @@ fn current_path_policy() -> Option<crate::config::PathPolicy> {
     resolve_path_policy(c, &cwd, home.as_deref())
 }
 
+/// Whether a [`PathPolicy`](crate::config::PathPolicy) is active. The
+/// permissive default (no explicit bindings) has none, so `get_path_with` maps
+/// `/tmp` itself there ([`crate::sandbox_tmp::tool_path`]).
+fn has_path_policy() -> bool {
+    current_path_policy().is_some()
+}
+
 /// Maximum per-command timeout (seconds) an LLM may request via the bash
 /// tool's `timeout` argument. Mirrors pi's ceiling of `2_147_483_647` ms
 /// (i32::MAX), expressed in whole seconds.
@@ -1935,15 +1958,36 @@ fn build_bwrap_args(
         }
     }
 
+    // `/tmp` becomes a directory named for the session, bound over `/tmp`
+    // (doc/sandbox.md → "`/tmp` is a per-session directory"). Created here, in
+    // the parent, because bwrap hard-errors on a missing bind source and the
+    // sandbox cannot create its own mount source. `None` when there is no
+    // session: one-shot runs persist nothing between commands, so they keep the
+    // throwaway tmpfs.
+    let session_tmp = crate::sandbox_tmp::resolve(&binds)
+        .map_err(|e| ToolError::Generic(format!("sandbox config error: {e}")))?;
+    // A user binding with `to == "/tmp"` is the *base* the session directory was
+    // created under; when there is a session it is replaced by the session bind
+    // below. Without a session it is emitted verbatim (the operator's remap).
+    let tmp_base = |b: &crate::config::ResolvedBind| b.to == std::path::Path::new("/tmp");
+    // `Path::starts_with` compares components, so it treats `/tmp` as a prefix
+    // of `/tmp/` — the exact path must be excluded or the base would be
+    // classified as a sub-binding and deferred last, shadowing the `/tmp` mount.
+    let is_tmp_sub = |b: &crate::config::ResolvedBind| !tmp_base(b) && b.to.starts_with("/tmp");
+    let had_tmp_base = binds.iter().any(tmp_base);
+    // Sub-`/tmp` bindings are emitted last, so their deeper mount wins over the
+    // `/tmp` mount. Reversed, the `/tmp` mount would shadow them and silently
+    // re-expose the base directory in their place.
+    let mut tmp_subs: Vec<&crate::config::ResolvedBind> = Vec::new();
+
     if binds.is_empty() {
-        // Default: read-only CWD + a writable tmpfs scratch area.
+        // Default: read-only CWD + a writable /tmp scratch area.
         args.push("--ro-bind".into());
         args.push(cwd.to_string_lossy().to_string());
         args.push(cwd.to_string_lossy().to_string());
     } else {
         // Deny-by-default: only declared bindings are visible (on top of the
-        // essential read-only system dirs above). User bindings come BEFORE the
-        // scratch tmpfs so a user binding at /tmp wins over the tmpfs.
+        // essential read-only system dirs above).
         for b in &binds {
             // `/dev` and `/proc` can NOT be mounted with `--bind`/`--ro-bind`.
             // Binding `/dev` that way produces a *non-functional* device tree
@@ -1967,6 +2011,16 @@ fn build_bwrap_args(
                 args.push("/proc".into());
                 continue;
             }
+            if is_tmp_sub(b) {
+                tmp_subs.push(b);
+                continue;
+            }
+            // With a session the user `/tmp` base is replaced by the session
+            // bind emitted below; without one it is the operator's remap and
+            // stands as written.
+            if session_tmp.is_some() && tmp_base(b) {
+                continue;
+            }
             args.push(
                 if !read_only && b.mode.is_writable() {
                     "--bind"
@@ -1980,19 +2034,38 @@ fn build_bwrap_args(
         }
     }
 
-    // Scratch tmpfs at /tmp, but only when no user binding already provides
-    // /tmp (a later tmpfs would otherwise shadow a user's /tmp bind).
-    let tmp_covered = binds.iter().any(|b| {
-        let t = b.to.as_os_str();
-        t == "/tmp" || t.to_string_lossy().starts_with("/tmp/")
-    });
-    if !tmp_covered {
-        let tmp_size = cfg.tmp_size_mb.unwrap_or(256);
-        let tmp_bytes = tmp_size * 1024 * 1024;
+    // The `/tmp` mount: the per-session directory when there is a session,
+    // otherwise a throwaway tmpfs (unless the operator already binds `/tmp`
+    // themselves, in which case that bind above stands).
+    if let Some(dir) = &session_tmp {
+        // Writable even on a read-only spawn: it is scratch space, exactly as
+        // the tmpfs this replaces was, and read-only tools (`rg`, `sed`) write
+        // temp files there.
+        args.push("--bind".into());
+        args.push(dir.to_string_lossy().to_string());
+        args.push("/tmp".into());
+    } else if !had_tmp_base {
+        // Fixed size: the `tmp_size_mb` knob was retired with the per-session
+        // directory, and this fallback is a one-shot run's throwaway scratch.
+        let tmp_bytes = 256 * 1024 * 1024;
         args.push("--size".into());
         args.push(tmp_bytes.to_string());
         args.push("--tmpfs".into());
         args.push("/tmp".into());
+    }
+
+    // Deferred sub-`/tmp` mounts, last so the deepest wins.
+    for b in tmp_subs {
+        args.push(
+            if !read_only && b.mode.is_writable() {
+                "--bind"
+            } else {
+                "--ro-bind"
+            }
+            .into(),
+        );
+        args.push(b.from.to_string_lossy().to_string());
+        args.push(b.to.to_string_lossy().to_string());
     }
 
     // Fresh `/dev` and `/proc` by default (R3e). Both are *populated* by bwrap,
@@ -2881,7 +2954,6 @@ mod sandbox_tests {
             memory_mb: crate::config::SandboxMemoryMb(None),
             pid_isolation: Some(true),
             drop_caps: Some(true),
-            tmp_size_mb: crate::config::SandboxTmpSizeMb(Some(16)),
             ro,
             rw,
             env: None,
@@ -3550,7 +3622,12 @@ mod sandbox_tests {
             return;
         }
         // Bind a temp dir at the in-sandbox path /tmp (rw). Both the shell and
-        // the non-shell tools must address the same host file.
+        // the non-shell tools must address the same host file: the session
+        // directory is created *under* the remap base, so /tmp/x.txt lands at
+        // <base>/prior-<id>/x.txt for both worlds. Set a known id so the test
+        // does not depend on whatever session a parallel test published.
+        let id = "nonshell-remap-consistency";
+        crate::sandbox_tmp::set_session_id(id);
         let dir = tempfile::tempdir().unwrap();
         sandbox_with_paths(
             vec![],
@@ -3559,6 +3636,7 @@ mod sandbox_tests {
                 to: "/tmp".to_string(),
             }],
         );
+        let session_dir = dir.path().join(crate::sandbox_tmp::dir_name(id));
 
         // Non-shell write to /tmp/x.
         super::write_file("/tmp/x.txt".to_string(), "from-tool".to_string())
@@ -3569,15 +3647,15 @@ mod sandbox_tests {
             .await
             .unwrap();
 
-        // Both landed on the host temp dir.
+        // Both landed on the host, inside the session directory.
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("x.txt"))
+            std::fs::read_to_string(session_dir.join("x.txt"))
                 .unwrap()
                 .trim(),
             "from-tool"
         );
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("x2.txt"))
+            std::fs::read_to_string(session_dir.join("x2.txt"))
                 .unwrap()
                 .trim(),
             "from-shell"
@@ -3593,6 +3671,130 @@ mod sandbox_tests {
         .await
         .unwrap();
         assert!(read.contains("from-shell"));
+        // Leave no session published: the id is a process-global and every
+        // other sandbox test would otherwise name its /tmp after this one.
+        crate::sandbox_tmp::set_session_id("");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn two_calls_in_one_session_share_tmp() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // The per-session directory persists between two commands — the whole
+        // point of the change (a tmpfs was thrown away after every call).
+        let dir = tempfile::tempdir().unwrap();
+        crate::sandbox_tmp::set_session_id("share-tmp");
+        sandbox_with_paths(
+            vec![],
+            vec![BindPath::Remap {
+                from: dir.path().to_string_lossy().to_string(),
+                to: "/tmp".to_string(),
+            }],
+        );
+        run_sandboxed("echo persisted > /tmp/f", None)
+            .await
+            .unwrap();
+        let out = run_sandboxed("cat /tmp/f", None).await.unwrap();
+        assert_eq!(out, "persisted");
+        crate::sandbox_tmp::set_session_id("");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn two_sessions_do_not_share_tmp() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // A marker written by one session must be absent in the other.
+        let dir = tempfile::tempdir().unwrap();
+        let binds = vec![BindPath::Remap {
+            from: dir.path().to_string_lossy().to_string(),
+            to: "/tmp".to_string(),
+        }];
+        crate::sandbox_tmp::set_session_id("session-a");
+        sandbox_with_paths(vec![], binds.clone());
+        run_sandboxed("echo a > /tmp/marker", None).await.unwrap();
+
+        crate::sandbox_tmp::set_session_id("session-b");
+        sandbox_with_paths(vec![], binds);
+        let out = run_sandboxed("ls /tmp/marker 2>/dev/null || echo absent", None)
+            .await
+            .unwrap();
+        assert_eq!(out, "absent");
+        crate::sandbox_tmp::set_session_id("");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tmp_bind_precedes_a_sub_tmp_bind() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // A binding under /tmp must be emitted AFTER the /tmp mount, or it is
+        // shadowed and the base directory is silently re-exposed in its place.
+        let dir = tempfile::tempdir().unwrap();
+        let sub = tempfile::tempdir().unwrap();
+        std::fs::write(sub.path().join("inner.txt"), "inner").unwrap();
+        crate::sandbox_tmp::set_session_id("tmp-sub-order");
+        sandbox_with_paths(
+            vec![BindPath::Remap {
+                from: sub.path().to_string_lossy().to_string(),
+                to: "/tmp/sub".to_string(),
+            }],
+            vec![BindPath::Remap {
+                from: dir.path().to_string_lossy().to_string(),
+                to: "/tmp".to_string(),
+            }],
+        );
+        let out = run_sandboxed("cat /tmp/sub/inner.txt", None).await.unwrap();
+        assert_eq!(out, "inner");
+        crate::sandbox_tmp::set_session_id("");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn argv_has_one_tmp_mount_and_sub_binds_follow_it() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // Pure argv shape (no spawn): the `/tmp` mount must appear exactly once
+        // and any binding under it must come after, or bwrap's "last wins" rule
+        // shadows the sub-bind. Guards the `Path::starts_with` trap where
+        // `/tmp`.starts_with(`/tmp/`) is true and the base was deferred last.
+        let dir = tempfile::tempdir().unwrap();
+        let sub = tempfile::tempdir().unwrap();
+        crate::sandbox_tmp::set_session_id("argv-shape");
+        sandbox_with_paths(
+            vec![BindPath::Remap {
+                from: sub.path().to_string_lossy().to_string(),
+                to: "/tmp/sub".to_string(),
+            }],
+            vec![BindPath::Remap {
+                from: dir.path().to_string_lossy().to_string(),
+                to: "/tmp".to_string(),
+            }],
+        );
+        let cfg = sandbox_config();
+        let cfg = cfg.as_ref().as_ref().unwrap();
+        let args = build_bwrap_args(cfg, false, &[], None).unwrap();
+        // Count *mount targets* (`--bind <from> <to>`), not every `/tmp`:
+        // `TMPDIR` is set to it too, so a naive `== "/tmp"` count is 2.
+        let binds_to_tmp: Vec<usize> = args
+            .windows(3)
+            .enumerate()
+            .filter(|(_, w)| (w[0] == "--bind" || w[0] == "--ro-bind") && w[2] == "/tmp")
+            .map(|(i, _)| i + 2)
+            .collect();
+        assert_eq!(binds_to_tmp.len(), 1, "exactly one /tmp mount: {args:?}");
+        let tmp_at = binds_to_tmp[0];
+        let sub_at = args.iter().position(|a| a == "/tmp/sub").unwrap();
+        assert!(
+            tmp_at < sub_at,
+            "the /tmp mount must precede /tmp/sub: {args:?}"
+        );
+        crate::sandbox_tmp::set_session_id("");
     }
 
     #[tokio::test]
@@ -3645,7 +3847,6 @@ mod sandbox_tests {
             memory_mb: crate::config::SandboxMemoryMb(None),
             pid_isolation: Some(true),
             drop_caps: Some(true),
-            tmp_size_mb: crate::config::SandboxTmpSizeMb(Some(16)),
             ro: vec![],
             rw: vec![],
             env: Some(env),

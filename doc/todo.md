@@ -18,14 +18,12 @@ and link a doc/ and/or commit hash
       sniff), so `w3m`/`wget` (no SOCKS code) get egress; `HTTP_PROXY`/`HTTPS_PROXY` are `http://`,
       `ALL_PROXY` stays `socks5h://`. Accept loop is now concurrent (was one-at-a-time). R3i in the
       audit.
-- [ ] sandbox: `/tmp` is a per-session directory. Today it is either a per-*call* tmpfs (nothing
-      persists between two `bash` calls) or, when a binding remaps `/tmp`, one host directory shared
-      by every session and cwd. Target: `app_config_dir()/sandbox-tmp/prior-<session-uuid>`, mode
-      0700, bound over `/tmp`; keyed on the session id so a cwd change keeps continuity;
-      `PathPolicy` must resolve `/tmp` to the same place. Same change retires `tmp_size_mb` (the
-      field, deserializer, `--size`, example line) and adds cleanup at `/clear`,
-      `/session <id> delete`, plus an mtime sweep. Design in `doc/sandbox.md` -> "`/tmp` is a
-      per-session directory".
+- [x] sandbox: `/tmp` is a per-session directory. `app_config_dir()/sandbox-tmp/prior-<uuid>`, mode
+      0700, bound over `/tmp` (a `/tmp` remap is the base the session dir is created under). Id read
+      live at spawn, so `/tmp` follows `/clear` and resume; `PathPolicy` resolves `/tmp` through the
+      same resolver. `tmp_size_mb` retired (one-shot runs keep a fixed 256 MB tmpfs). Cleanup at
+      `/clear`, `/session <id> delete`, plus a 7-day mtime sweep on startup. Design in
+      `doc/sandbox.md` -> "`/tmp` is a per-session directory".
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing `egress::host_allowed`;
       `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https; HTTP-only clients now come
       through R3i's front end instead).

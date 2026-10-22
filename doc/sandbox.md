@@ -52,8 +52,6 @@ network = false           # default: false (no egress; netns unshared)
 memory_mb = 1024          # default: none (unlimited)
 pid_isolation = true      # default: true (--unshare-pid --pid)
 drop_caps = true           # default: true (--cap-drop ALL)
-tmp_size_mb = 256         # RETIRED once /tmp is a per-session directory (see below);
-                          # still the tmpfs cap in the current build
 # Bindings are split into two lists: `ro` (read-only) and `rw` (read-write).
 # Each entry is a bare PATH (identical host/in-sandbox path) or a remap
 # `{ from = "HOST", to = "SANDBOX" }`.
@@ -97,11 +95,6 @@ pub struct SandboxConfig {
     /// Drop all capabilities. Default true.
     #[serde(default)]
     pub drop_caps: Option<bool>,
-    /// Size cap for `/tmp` when it is a tmpfs. Default 256 MB. **Retired** by
-    /// the per-session `/tmp` directory, which removes the tmpfs entirely — see
-    /// "`/tmp` is a per-session directory"; the field goes with it.
-    #[serde(default)]
-    pub tmp_size_mb: Option<u64>,
     /// Read-only filesystem bindings (bare path or `{ from, to }` remap).
     #[serde(default)]
     pub ro: Vec<BindPath>,
@@ -251,10 +244,14 @@ bwrap
   [for each path in cfg.rw]   --bind   <from> <to>
   --dev /dev --proc /proc               # fresh instances; skipped if bound explicitly
   --ro-bind /etc/<entry> …              # ESSENTIAL_ETC working set (not all of /etc)
-  --bind <data_dir>/sandbox-tmp/prior-<session-uuid> /tmp
-                                       # per-session; replaces the old
-                                       # `--tmpfs /tmp` (see "/tmp is a
-                                       # per-session directory")
+  --bind <base>/prior-<session-uuid> /tmp
+                                       # per-session; <base> is a `/tmp`
+                                       # remap's host side, else
+                                       # <data_dir>/sandbox-tmp. Replaces
+                                       # the old `--tmpfs /tmp`; see "/tmp
+                                       # is a per-session directory".
+                                       # [--tmpfs /tmp] only for one-shot
+                                       # runs with no session
   --new-session                         # ALWAYS: no controlling terminal
   --unshare-net                         # ALWAYS (R3a): egress, if any, is bridged
   [--unshare-pid --pid]                 # if pid_isolation (default true)
@@ -430,20 +427,20 @@ Two details are load-bearing:
 
 See `doc/261021_sandbox_env_x11_audit.md` (Finding 5).
 
-### `/tmp` is a per-session directory (planned)
+### `/tmp` is a per-session directory
 
-Today `/tmp` is one of two things, and neither is right:
+Before this change `/tmp` was one of two things, and neither was right:
 
-- **No binding targets `/tmp`** — it is a fresh 256 MB `--tmpfs`, thrown away
-  after every command. Nothing persists between two `bash` calls in one
-  session, so a build artefact cannot be made and then used.
-- **A binding remaps `/tmp`** — e.g. `rw = [{ from = "~/tmp/agents", to = "/tmp" }]`.
-  Then every session, in every project, shares one host directory. `/tmp`
-  files leak *between unrelated sessions*, and a stray `.py`/`.rs` there can
-  shadow a stdlib module for whatever runs next.
+- **No binding targeted `/tmp`** — it was a fresh 256 MB `--tmpfs`, thrown away
+  after every command. Nothing persisted between two `bash` calls in one
+  session, so a build artefact could not be made and then used.
+- **A binding remapped `/tmp`** — e.g. `rw = [{ from = "~/tmp/agents", to = "/tmp" }]`.
+  Then every session, in every project, shared one host directory. `/tmp`
+  files leaked *between unrelated sessions*, and a stray `.py`/`.rs` there
+  could shadow a stdlib module for whatever ran next.
 
-The target design replaces both cases with one rule: **`/tmp` is a directory
-named for the session, created by prior, bound over `/tmp`.**
+One rule replaces both: **`/tmp` is a directory named for the session, created
+by prior, bound over `/tmp`.**
 
 #### Name and location
 
@@ -510,12 +507,22 @@ prefix: the sweeper removes prior's directories and nothing else, even if
 The effective `/tmp` destination is resolved first, exactly as bindings are
 resolved today:
 
-1. a binding with `to == "/tmp"` and a **directory** `from` — use that
-   directory as the base;
+1. a binding with `to == "/tmp"` whose `from` is a directory (or does not exist
+   yet — `create_dir_all` makes it) — use that directory as the base;
 2. no such binding — use `<data_dir>/sandbox-tmp/` as the base;
 3. a binding with `to == "/tmp"` whose `from` is a **file** — no writable `/tmp`
-   exists in that layout. Reject it at config-resolution time with a clear
-   error rather than emitting a namespace whose `/tmp` is a file.
+   exists in that layout. Rejected with a clear error rather than emitting a
+   namespace whose `/tmp` is a file.
+
+Two cases fall back to the throwaway tmpfs instead of a session directory,
+because there is no name to give it:
+
+- **No session.** A one-shot `--input` / recipe run has no session id and
+  persists nothing between commands, so a tmpfs loses nothing.
+- **No config directory.** With neither `HOME` nor `XDG_CONFIG_HOME` there is
+  nowhere durable to put `sandbox-tmp/`; a hard error would refuse to run the
+  sandbox at all, which is the wrong trade. It falls back to the tmpfs rather
+  than failing the command.
 
 prior then creates `<base>/prior-<uuid>/` (in the parent, before the spawn —
 bwrap hard-errors on a missing bind source: `Can't find source path`), and emits
@@ -523,28 +530,26 @@ bwrap hard-errors on a missing bind source: `Can't find source path`), and emits
 two mounts at `/tmp` would only leave the later one visible, and `--size` is
 rejected by bwrap when followed by a bind rather than `--tmpfs`.
 
-This replaces the existing `tmp_covered` test (`src/tools.rs`), which today
-suppresses the tmpfs whenever *any* binding targets `/tmp` **or a path under it**.
-That is too broad for this design: a binding at `to = "/tmp/scratch"` would
-suppress the `/tmp` mount and leave the rest of `/tmp` unwritable. Sub-path
-bindings are still emitted, just **after** the `/tmp` bind so the deeper mount
-wins — verified, and load-bearing: in the reverse order the sub-binding is
-shadowed and the base directory is silently exposed in its place.
+This replaced the old `tmp_covered` test (`src/tools.rs`), which suppressed the
+tmpfs whenever *any* binding targeted `/tmp` **or a path under it**. That was too
+broad: a binding at `to = "/tmp/scratch"` suppressed the `/tmp` mount and left
+the rest of `/tmp` unwritable. Sub-path bindings are still emitted, just
+**after** the `/tmp` bind so the deeper mount wins — load-bearing, and the trap
+that bit this implementation: `Path::starts_with` compares components, so
+`/tmp`.starts_with(`/tmp/`) is *true*; without an explicit `!= /tmp` in the
+sub-binding test, the base binding is deferred last and shadows the session bind,
+silently re-exposing the whole base directory in `/tmp`'s place.
 
-Consequences to document where the old behaviour is described:
+Consequences where the old behaviour is described:
 
-- **`tmp_size_mb` is retired** (decided). Once `/tmp` is the per-session
-  directory it has no meaning: the size is the host filesystem's, and there is
-  no second mount to cap. It is *not* removed in this doc change — until the
-  new `/tmp` exists, a config with no binding over `/tmp` still gets a real
-  tmpfs and `tmp_size_mb` still bounds it, so deleting the field now would
-  silently unbound a live limit. The field, its `SandboxTmpSizeMb`
-  deserializer, the `--size` emission and the `settings.toml.example` line go
-  in the same change that lands the per-session directory.
-  - The field is `#[serde(default)]` and `SandboxConfig` is **not**
-    `deny_unknown_fields`, so a user config that still has `tmp_size_mb` after
-    the removal parses cleanly and ignores the key. No migration is needed, and
-    no startup warning is owed: it was advisory sizing, not a security control.
+- **`tmp_size_mb` is retired** (done). With `/tmp` a host directory it had no
+  meaning: the size is the host filesystem's and there is no tmpfs left to cap.
+  The field, its `SandboxTmpSizeMb` deserializer, the `--size` emission and the
+  example line are gone. `SandboxConfig` is **not** `deny_unknown_fields`, so a
+  user config that still carries `tmp_size_mb` parses cleanly and ignores the
+  key — no migration, no warning: it was advisory sizing, not a control. A
+  one-shot run with no session (see below) still gets a fixed-size throwaway
+  tmpfs, now hard-coded at 256 MB.
 - The default config (no `/tmp` binding) previously gave each *call* a clean
   `/tmp`. It now gives each *session* one. That is the intended change, but it
   means a command can now observe what an earlier command in the same session
@@ -567,24 +572,40 @@ resolved base the bwrap argv uses. One function resolves `/tmp`, and both the
 argv builder and the policy builder call it — the consistency
 `doc/path_leak_risks.md` already requires for every other remap.
 
-The id must be captured when the sandbox config is resolved and published, not
-read live inside `build_bwrap_args`. `set_sandbox` publishes the config once at
-startup, and `/clear` swaps the session id mid-process; deriving the directory
-name at spawn time would move `/tmp` from under a running session. Storing it in
-the config makes the directory stable for the session by construction.
+The id is **read live at spawn**, not captured into the published config. This
+started as a worry — `set_sandbox` publishes the config once, so a captured id
+would go stale on `/clear` — but reading live is what we want: `/clear` and
+`/session … resume` genuinely switch sessions, and `/tmp` must follow. The id is
+published by `AppState` on every `current_id` write (`set_current_session_id`,
+`activate_session`) into a process-global slot that `AppState` already owns; the
+sandbox layer reads it at spawn. So the directory is stable *within* a session —
+nothing writes the id between its commands — and moves exactly when the session
+does. A test that publishes an id and then switches it asserts the isolation.
+
+The `/tmp` mapping for the file tools when **no** binding list is set needs one
+more piece: there is no `PathPolicy` in the permissive default, so `get_path_with`
+asks `sandbox_tmp::tool_path("/tmp/…")` directly and maps into the session
+directory, normalizing `..` and rejecting anything that escapes it.
 
 #### Tests
 
-- Two consecutive `bash` calls in one session see each other's `/tmp` files.
-- Two sessions do not (a marker written by one is absent in the other).
-- A resumed session keeps its `/tmp` across a cwd change (id unchanged → same
-  directory).
-- A `/tmp` remap is honoured: the per-session directory is created *inside* the
-  configured base, not beside it.
-- The `write` tool writes to the same host file that a subsequent `bash` `cat
-  /tmp/f` returns.
-- `/tmp` is not the host `/tmp`: `readlink /proc/self/fd/…` is not required, but
-  a file created in the host's `/tmp` before the call must be invisible inside.
+- Two consecutive `bash` calls in one session see each other's `/tmp` files
+  (`two_calls_in_one_session_share_tmp`).
+- Two sessions do not (a marker written by one is absent in the other;
+  `two_sessions_do_not_share_tmp`).
+- A `/tmp` remap is honoured: the session directory is created *inside* the
+  configured base, not beside it (`a_session_makes_a_directory_under_the_base`).
+- The `write` tool writes to the same host file a subsequent `bash` `cat /tmp/f`
+  returns, with the session directory under the remap base
+  (`nonshell_remap_consistency`).
+- A binding under `/tmp` is emitted after the `/tmp` mount and wins
+  (`tmp_bind_precedes_a_sub_tmp_bind`) — the ordering that the misclassified
+  base silently breaks.
+- Naming (`dir_name` / `session_id_of`), the file-remap rejection, and `0700`
+  creation live in `sandbox_tmp`'s own tests.
+
+A resumed session keeps its `/tmp` across a cwd change because the id does not
+change; this is a property of the key rather than a separate test.
 
 ### Path-binding special case
 

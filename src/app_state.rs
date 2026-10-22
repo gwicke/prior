@@ -643,7 +643,11 @@ impl AppState {
     }
 
     pub fn set_current_session_id(&self, id: String) {
-        self.state.lock().session.current_id = id;
+        self.state.lock().session.current_id = id.clone();
+        // The sandbox layer names /tmp after the session and has no AppState
+        // handle, so publish the id after every write (doc/sandbox.md, "`/tmp`
+        // is a per-session directory").
+        crate::sandbox_tmp::set_session_id(id);
     }
 
     // --- shared session/agent handles (clone out → drop guard → await) ---
@@ -663,9 +667,16 @@ impl AppState {
     /// Bundle activation: session + current id in ONE acquisition —
     /// the menu can never observe a half-applied switch.
     pub fn activate_session(&self, session: Option<Arc<Session>>, current_id: String) {
-        let mut st = self.state.lock();
-        st.session.session = session;
-        st.session.current_id = current_id;
+        {
+            let mut st = self.state.lock();
+            st.session.session = session;
+            st.session.current_id = current_id.clone();
+        }
+        // Publish outside the state lock: `set_session_id` takes its own, and
+        // holding two process-wide locks in one place invites a lock-order
+        // bug. A command always re-reads the id at spawn, so a switch that has
+        // not yet published simply names the previous session for one call.
+        crate::sandbox_tmp::set_session_id(current_id);
     }
 
     /// Clone-out of the running agent (created/rebuilt loop-side from the

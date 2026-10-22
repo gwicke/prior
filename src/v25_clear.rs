@@ -47,6 +47,13 @@ impl SlashDotNode for ClearNode {
         // same order the applier used; deletion is idempotent.
         crate::agent::start_fresh_session(&self.app_state, &name).await;
         if !outgoing.is_empty() {
+            // The outgoing session's /tmp is dead once its file is gone: the
+            // id changes, so nothing can reach it again. Best-effort — a
+            // leaked directory is swept later, whereas an error here must not
+            // cost the user their fresh session.
+            if let Some(cfg) = crate::sandbox_state::base_config() {
+                crate::sandbox_tmp::remove(&cfg, &outgoing);
+            }
             if let Some(repo) = self.app_state.repo() {
                 let meta = repo
                     .list(None)

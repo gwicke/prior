@@ -784,7 +784,15 @@ impl SlashDotNode for SessionDeleteNode {
             return SubmitResult::Done(Some("Cannot delete the current session".to_string()));
         }
         match repo.delete(&meta).await {
-            Ok(()) => SubmitResult::Done(None),
+            Ok(()) => {
+                // The session's /tmp goes with it. Not the current session (the
+                // guard above refused that), so no running command can have it
+                // open. Best-effort: a leak is swept later.
+                if let Some(cfg) = crate::sandbox_state::base_config() {
+                    crate::sandbox_tmp::remove(&cfg, &session_id);
+                }
+                SubmitResult::Done(None)
+            }
             Err(e) => SubmitResult::Done(Some(format!("Cannot delete session: {}", e))),
         }
     }
