@@ -3,6 +3,10 @@
 NOTE: Keep things tight - normally no more than 1-2 lines per bullet point. More detail -> create
 and link a doc/ and/or commit hash
 
+- [ ] sandbox R3/R4: `network: true` becomes an egress bridge (SOCKS5, host:port allowlist) and
+      `--unshare-net` stays on always, so X11 is unreachable by construction instead of via a
+      Landlock/seccomp ladder. R4 absorbs the Landlock work (per-path unix sockets).
+      Spec + handover: `doc/261021_sandbox_env_x11_audit.md` ("Where to start next"). R1/R2 are done.
 - [ ] `--quiet` with no positional prompt spins: the non-REPL input arm (`repl == None`) pairs
       `Content::quiet`'s empty input source (`InputSource::Empty`, always `""`) with
       `if input.is_empty() { continue }` — a pre-existing hot loop (reproduces at `50e4e69`; piped

@@ -8,7 +8,16 @@ reproduced, not inferred.*
 ## Status
 
 **R1 and R2 are implemented** (see "Implementation notes" at the end of the Recommendations
-section). R3 (the X11 control) and R4 are not.
+section). **R3, R4, R5 and R6 are not.** R3 was revised on 2026-10-22 after testing the design
+against four reference implementations and this host: it is no longer a Landlock/seccomp ladder but
+a bridge design (R3a–R3h), with Landlock moved to R4 where it is the only fix. Handover notes — what
+to read first, what order to build it in, and what is already settled — are at the end of the
+document ("Where to start next").
+
+The revision was prompted by one question: *can `network: true` keep the network namespace, so that
+the X11 vector disappears by construction instead of needing three layered controls?* The answer is
+yes, and both reference implementations already do some version of it — see "Cross-check:
+`nono`'s passed-listener bridge" and "Why `network: true` must not share the network namespace".
 
 ## Summary
 
@@ -27,18 +36,29 @@ Three findings, in descending severity:
    synthetic input are all available. CONFIRMED. `DISPLAY`/`XAUTHORITY` survive the env filter, so
    the sandboxed command is *told* where the display is.
 
-Two consequences for the plan of record:
+Consequences for the plan of record:
 
 - An allowlist alone is **not** enough. It has to be paired with R1, or the filter stays decorative.
-- X11 should be blocked by **layered** controls — the network namespace for reachability, Landlock
-  for per-path control, seccomp as the fallback — not by removing `DISPLAY`, which is only a hint
-  (R3).
+- Finding 3's fix is not "remove `DISPLAY`" (a hint) and — as of the 2026-10-22 revision — not a
+  Landlock/seccomp ladder either. It is a **network contract**: the netns stays on unconditionally,
+  and `network: true` means *egress through a bridge*, not *share the host netns*. That removes the
+  abstract socket by unreachability on every kernel, needs no LSM and no ABI probe, and is the one
+  shape that also has a cheap macOS implementation (R3).
 
-Two reference implementations are used throughout. Anthropic's
-[sandbox-runtime](https://github.com/anthropics/sandbox-runtime) (`srt`) is the closest comparable
-implementation; it shares Finding 1 — see "Cross-check: sandbox-runtime". The Rust option `nono`,
-together with Landlock itself, is the better model for the X11 control — see "Cross-check: Landlock,
-and the Rust alternatives".
+Five reference implementations are used throughout:
+
+- Anthropic's [sandbox-runtime](https://github.com/anthropics/sandbox-runtime) (`srt`), the closest
+  comparable implementation. It shares Finding 1 (see "Cross-check: Anthropic's sandbox-runtime")
+  and supplies the macOS network model and the shape of the SOCKS5 policy.
+- `nono`'s NEP-0004, which specifies the Linux bridge as a **passed listening fd** rather than a
+  bound socket path — the design R3 adopts, and better than `srt`'s (see "Cross-check: `nono`'s
+  passed-listener bridge").
+- `zerobox` (Codex's crates), whose `linux-sandbox/src/proxy_routing.rs` is a working socat-free
+  bridge of the same family, and several lines of which are load-bearing evidence below.
+- Landlock itself, which R3 no longer uses for the X11 vector but which remains the only fix for
+  the binding-reopens-a-socket class (R4). See "Cross-check: Landlock, and the Rust alternatives".
+- Anthropic's `sandbox-runtime` again, for the macOS side: its Seatbelt profile needs **no bridge at
+  all**, which is the inverse of the Linux problem and a large part of why mac support is cheap.
 
 ---
 
@@ -276,11 +296,11 @@ Abstract sockets live in a **network-namespace-scoped** namespace. That gives a 
 ### Evidence — X11 works with `network: true`
 
 ```text
-### A: with --unshare-net (prior default when network=false)
+--- A: with --unshare-net (prior default when network=false)
 Error: Can't open display: (null)
 Failed creating new xdo instance
 
-### B: without --unshare-net (prior when network=true)
+--- B: without --unshare-net (prior when network=true)
 1257
 4194367
 4194306
@@ -332,8 +352,14 @@ the capability: a determined command can guess `:0`, and the abstract socket is 
 
 `network: true` is the operator's explicit "let this command reach the network" switch. It is
 reasonable to read that as *TCP* egress. It is not reasonable to read it as "the command may drive
-my mouse and read my clipboard". X11 is a **local IPC** channel, not network egress, so it should be
-governed by a separate, dedicated control — not inherited from the network knob.
+my mouse and read my clipboard". X11 is a **local IPC** channel, not network egress, so it must not
+be inherited from the network knob.
+
+The 2026-10-21 conclusion here was "govern X11 by a separate control, layered on top of a shared
+netns". The 2026-10-22 revision draws the line one step earlier: **the netns is that control**, so
+the right fix is to stop tying it to the network knob at all, and make `network: true` a bridge
+instead. See "Why `network: true` must not share the network namespace". That is the smallest
+change that satisfies this section's own argument, and it needs no LSM.
 
 ---
 
@@ -341,8 +367,9 @@ governed by a separate, dedicated control — not inherited from the network kno
 
 `srt` (<https://github.com/anthropics/sandbox-runtime>, "Beta Research Preview", TypeScript) is the
 closest comparable implementation: it uses `sandbox-exec` on macOS and `bubblewrap` on Linux, with
-proxy-based network filtering. It is a useful reference for two of the three findings, and it
-confirms the third is not yet addressed anywhere.
+proxy-based network filtering. It is a useful reference for two of the three findings; for the third
+it is the model for the *policy*, and a demonstration of the mechanism prior should **not** copy
+(bound socket path rather than a passed fd).
 
 ### Their network architecture is the inverse of slirp4netns
 
@@ -359,14 +386,20 @@ No `slirp4netns`, no `/dev/net/tun`, no IPv6 caveat. Their own comment states th
 > "Linux's `--unshare-net` provides only all-or-nothing network isolation. Domain filtering happens
 > at the host proxy level, not the sandbox boundary."
 
-Two consequences for prior:
+Consequences for prior:
 
-- **The proxy bridge is a viable alternative to slirp4netns** if prior ever wants *filtered* egress
-  (allowlist by domain) rather than raw egress. It needs `socat`, which is an extra runtime
-  dependency, and it only works for tools that honour `HTTP_PROXY`/`ALL_PROXY` — `curl` with
-  `--resolve`, raw sockets, and many CLIs do not.
-- **Their approach confirms `--unshare-net` is the right default for prior.** The netns is what
-  isolates the abstract socket; the proxy is what makes filtered egress possible on top of it.
+- **This is the shape R3 adopts.** `--unshare-net` unconditionally, egress through a bridge. What
+  prior would do differently is the *mechanism* of the bridge: not `socat` (an extra runtime
+  dependency, and one that has to exist inside the sandbox too) and not a bound socket path (which
+  re-opens the binding channel R4 is about), but a **listening fd passed out of the namespace** —
+  see "Cross-check: `nono`'s passed-listener bridge".
+- **Two of their limitations are worth inheriting as decisions rather than bugs.** The bridge only
+  carries protocols that honour a proxy variable (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`); `curl
+  --resolve`, raw sockets and CLIs that ignore proxy env do not go through it. That is a *feature*
+  under deny-default — those tools simply have no egress — but it must be documented, because it is
+  a behavioural change from today's `network: true`.
+- **Their SOCKS5 filtering is the policy model to copy**, even though it is TypeScript. See
+  "Their SOCKS5 is the policy engine prior needs".
 
 ### They block Unix sockets with seccomp — a good answer to Finding 3
 
@@ -398,9 +431,11 @@ denying that syscall denies *all* Unix socket use — including the abstract X11
 **barrier**, not a hint, which is strictly better than removing `DISPLAY`.
 
 It is, however, **all-or-nothing**: it cannot permit a specific socket, so it also breaks legitimate
-Unix-socket use inside the sandbox. Landlock's `ResolveUnix` (ABI 9+) does not have that limitation
-— see "Cross-check: Landlock, and the Rust alternatives" below, which revises this into a layered
-recommendation (R3).
+Unix-socket use inside the sandbox. Landlock's `ResolveUnix` (ABI 9+) does not have that
+limitation — see "Cross-check: Landlock, and the Rust alternatives" below. Neither is R3's primary
+control after the 2026-10-22 revision: the netns stays on, so the abstract socket is unreachable
+before either is consulted. seccomp remains as the last layer for `AF_VSOCK` and `io_uring`, which
+no namespace and no path rule fences.
 
 Two details in their filter are worth adopting directly:
 
@@ -436,6 +471,30 @@ instead of dropping a secret, replace it with a sentinel and have the proxy subs
 value back on egress to permitted hosts. That is more machinery than prior needs today, but it is
 the design that supports "the command can use the credential, but only for this domain".
 
+### Their SOCKS5 is the policy engine prior needs
+
+`src/sandbox/socks-proxy.ts` (480 lines) is the closest thing to a specification for what prior's
+egress policy should decide, and it is worth reading for the *ordering* rather than the code:
+
+- **Auth first, then the allowlist, then dial.** The per-command SOCKS username carries an
+  attribution suffix (`srt.<encodedCommand>`), so a denial can be logged against the invocation that
+  caused it. prior needs the *attribution*, not the token: one sandbox per tool call is already an
+  identity. Adopt the token only if several sandboxes ever share one bridge.
+- **`refuseOpaqueTunnels`** — a switch to refuse every `CONNECT` at the handshake. That is how they
+  express "this profile gets HTTP-proxied traffic only, no opaque TCP".
+- **Direct dials go through `lookupFor`, and a refused resolution is answered "not allowed by
+  ruleset"** (`resolved-address-guard.ts`) — i.e. DNS is resolved proxy-side, in the supervisor, so
+  the sandbox never learns an address it cannot reach anyway.
+- **`allowUnixSockets` is documented as macOS-only** ("Ignored on Linux (seccomp cannot filter by
+  path)"). On macOS Seatbelt *can* filter by path, so the same config field means different things
+  per platform. prior's config should not inherit that ambiguity — see R3's config note.
+
+They do **not** filter `CONNECT` by port, and their HTTP proxy is 1439 lines plus 1514 for TLS MITM
+because they support credential masking (certificate generation, per-host CA, body substitution,
+AWS SigV4 re-signing). **prior needs none of that**: SOCKS5 `CONNECT` is opaque, so filtering on
+`host:port` and splicing bytes is the whole job. That is the difference between ~300 lines and
+~3000, and it is why R3 chooses SOCKS5-only.
+
 ### Two differences worth adopting regardless
 
 - **They always bind `--dev /dev`.** prior currently mounts neither `/dev` nor `/proc` by default,
@@ -448,13 +507,132 @@ the design that supports "the command can use the credential, but only for this 
 
 ---
 
+## Cross-check: `nono`'s passed-listener bridge
+
+`nono`'s NEP-0004 (`~/src/nono/neps/0004-opt-in-linux-namespace-isolation.md`) specifies the Linux
+side of the same contract `srt` implements, and specifies it **better**. Their words:
+
+> **Proxy bridge (Phase 1, ProxyOnly only).** A socket stays in the network namespace it was created
+> in, whichever process later holds its file descriptor. The bridge uses that property, so nothing
+> runs inside the namespace except the workload and no new filesystem endpoint exists:
+>
+> 1. In the bootstrap child, after `unshare` and bringing up `lo`, the child creates a TCP socket,
+>    binds it to `127.0.0.1:<port>` *inside* the new netns … and calls `listen`.
+> 2. The child sends the listening fd to the supervisor over the existing bootstrap socketpair
+>    (`SCM_RIGHTS`), then closes its own copy before Landlock is applied and before `exec`. The
+>    workload never holds the listener.
+> 3. The supervisor, outside the namespace, `accept()`s on the passed fd. Each accepted connection
+>    belongs to the child's netns and is handed to `nono-proxy`'s existing connection handler
+>    in-process, exactly as a connection from the host TCP listener would.
+
+And their own comparison against the alternative:
+
+> Compared with an in-namespace relay forwarding to a proxy Unix socket, this design has no relay
+> process, no relay sandbox, no Unix-socket listener in `nono-proxy`, no supervisor-owned socket
+> directory, and no socket grant in the child's capability set. The bridge's only state is a
+> listening fd owned by the supervisor.
+
+That last point is the reason R3 adopts this mechanism over `srt`'s. `srt` binds a socket *path*
+into the sandbox (`linux-sandbox-utils.ts:1519`, `claude-http-<id>.sock`), which is exactly the
+channel R4 warns about: a filesystem socket survives `--unshare-net`, and a directory binding can
+re-expose it. A passed fd has **no path**, so there is nothing to bind, nothing to re-expose, and
+nothing to grant in the capability set. The class of bug disappears rather than being documented.
+
+**Verified on this host.** Built the NEP-0004 sequence by hand (Python `send_fds`/`recv_fds` as a
+stand-in for the supervisor's `SCM_RIGHTS`), with bwrap carrying `--unshare-net`:
+
+```text
+host: received listening fd [4] msg b'L'
+shim: listener bound in-ns: ('127.0.0.1', 3128)
+HTTP: HTTP/1.1 200 OK
+proxy log: ['ALLOW example.com:80']
+```
+
+So a TCP listener created inside the netns, accepted on from outside, carries real traffic. The
+host's own proxy never has a socket in the sandbox's filesystem.
+
+### Two implementation facts that shrink the work
+
+- **`duct` can pass fds.** It has no `pass_fds` argument, but `Expression::before_spawn` hands you a
+  `&mut std::process::Command` (`duct-1.1.2/src/lib.rs:913`), which does. Verified with a
+  standalone crate: the child wrote to an inherited fd and the parent read it —
+  `host got via fd: "via-duct"`. So `build_bwrap_expr` (`src/tools.rs:1889`) can keep using `duct`;
+  this does not force a rewrite onto raw `Command`.
+- **`lo` is already up inside bwrap's netns.** `ip link show lo` inside `--unshare-net` reports
+  `lo: <LOOPBACK,UP,LOWER_UP>`. `zerobox` carries ~60 lines to bring it up by hand
+  (`linux-sandbox/src/proxy_routing.rs:560-621`, a raw `SIOCGIFFLAGS`/`SIOCSIFADDR` dance plus an
+  `EADDRNOTAVAIL` retry path in `bind_local_loopback_listener`). **prior does not need any of it** —
+  bind `127.0.0.1:<port>` directly. (Verified: binding `127.0.0.1:0` inside the netns succeeds.)
+
+### What `zerobox` is worth
+
+`zerobox`'s `proxy_routing.rs` (832 lines) is a working socat-free bridge of the same family and is
+useful as a second opinion on the *sequencing*: host bridge spawn → readiness pipe → local bridge →
+env rewrite → cleanup worker that reaps stale socket dirs by owner pid. Read it for `fork` +
+`PIPE_CLOEXEC` readiness handshakes and `PR_SET_PDEATHSIG` hardening
+(`harden_bridge_process`). But it bridges through socket paths in a directory
+(`proxy-route-<n>.sock`), so it inherits the R4 class that NEP-0004 avoids, and ~half of its 832
+lines is the socket-dir lifecycle prior would not need.
+
+Its `network-proxy` crate (9.4k lines) and `nono-proxy` (22.6k lines) are **not** viable
+dependencies for prior: both drag in a full HTTP proxy, TLS MITM, credential/OAuth machinery, and
+`zerobox-network-proxy` pins `rama = "=0.3.0-alpha.4"` across six exact-pinned alpha crates. prior
+already has `tokio` and `libc`, which is all the bridge needs.
+
+---
+
+## Why `network: true` must not share the network namespace
+
+This is the decision R3 is built on, so it is argued here rather than buried in the recommendation.
+
+Today `network: true` means "omit `--unshare-net`", which is what makes Finding 3 reachable. The
+alternative is to keep `--unshare-net` always and define `network: true` as *egress through the
+bridge*. Both were measured on this host, same sandbox, same client, only the netns differing:
+
+```text
+== unshare-net (proposed)
+x11_abstract: BLOCKED ([Errno 111] Connection refused)
+direct_tcp:   BLOCKED ([Errno 101] Network is unreachable)
+proxy_ok:     HTTP/1.1 200 OK
+proxy_denied: rep code 2
+
+== shared netns (today's network: true)
+x11_abstract: CONNECTED          <-- finding 3
+direct_tcp:   CONNECTED          <-- unfiltered egress
+proxy_ok:     HTTP/1.1 200 OK
+proxy_denied: rep code 2
+```
+
+The proposed side keeps everything `network: true` is *for* and drops everything it is not. Denials
+are attributable at the bridge (`ALLOW example.com:80`, `DENY-HOST evil.invalid`,
+`DENY-PORT example.com:22`), which today they are not at all.
+
+Three objections, and their answers:
+
+- *"A filter is weaker than a namespace."* Agreed, and that is why the netns stays: reachability is
+  still removed by the namespace, and the bridge is the only way out. nono's own principle, adopted
+  as prior's: *"Mediation inspects a hostile interface point-by-point; a namespace removes the
+  interface wholesale."*
+- *"Tools that ignore proxy variables get no egress."* Correct, and intended. It is also true of
+  `network: false` today, so it is a narrowing, not a new failure mode.
+- *"It is more code."* Yes — ~300 lines and a supervisor change, against three layered controls
+  (Landlock ABI probe, `ResolveUnix` default-grant curation, seccomp BPF) that would each need
+  their own fallback ladder and would not transfer to macOS. It is fewer moving parts to *own*.
+
+The consequence worth stating plainly: **prior's `network` knob becomes a policy, not a boolean.**
+See R3's config note for the schema.
+
+---
+
 ## Cross-check: Landlock, and the Rust alternatives
 
-The survey at `~/src/research/261021_sandbox_survey.md` covers the landscape comprehensively; this
-section records what I verified by hand against the `nono` checkout at `~/src/nono`, because it
-changes the recommendation for R3.
+The survey at `doc/261021_sandbox_survey.md` covers the landscape comprehensively; this section
+records what I verified by hand against the `nono` checkout at `~/src/nono`. It changed R3 once
+(the 2026-10-21 revision made Landlock primary), and the 2026-10-22 revision changed it back: the
+netns keeps the abstract-socket job, and Landlock moves to R4, where it is the only fix for
+*specific* sockets rather than a substitute for reachability removal.
 
-### Landlock is a better fit than bwrap for the X11 problem
+### Landlock can close the X11 vector, if the netns is not doing it
 
 Landlock is an LSM, not a namespace tool: an unprivileged process irreversibly restricts its own
 ambient rights, and the restrictions are inherited by children. It needs no user namespace, and it
@@ -485,15 +663,26 @@ granted dir socket:   connect(/tmp/ll_ok/s.sock)   CONNECTED (allowed)
 non-granted dir socket: connect(/tmp/ll_no/s.sock) BLOCKED (Permission denied)
 ```
 
-This is a **better** answer than the seccomp filter in R3, for three reasons:
+This is a **better** answer than a seccomp filter, for three reasons:
 
 1. It is **per-path**, not all-or-nothing. seccomp can only deny `socket(AF_UNIX)` wholesale, which
-   also breaks any legitimate Unix-socket plumbing (prior's `agent-browser` tool, a proxy bridge).
-   `ResolveUnix` allows exactly the sockets that are named and denies the rest.
+   also breaks any legitimate Unix-socket plumbing (`agent-browser`'s control socket, the egress
+   bridge's own listener). `ResolveUnix` allows exactly the sockets that are named and denies the
+   rest.
 2. It **does not block `socket()`**, so tools that create a Unix socket for inter-process
    coordination keep working.
-3. It is **not gated on the network setting** — the isolation comes from the LSM, not a netns, so
-   `network: true` no longer implies "may drive the user's mouse".
+3. It is **not gated on the network setting** — the isolation comes from the LSM, not a netns.
+
+But it is **not the primary X11 control**, and that is the correction the 2026-10-22 revision makes.
+Points 1–3 are all arguments against *seccomp*, and seccomp is now the third layer. Against the
+netns, Landlock loses on every axis that matters here: it needs an ABI probe and a fallback ladder;
+`ResolveUnix` is ABI 9+ (Linux 7.1+), which almost no host has; granting it without curated paths
+flips existing profiles into deny-all; and it is a hundred lines of policy that has no macOS
+analogue. The netns does the same job on every kernel, for free, and `nono`'s own reasoning says why
+— *"a namespace removes the interface wholesale"*.
+
+Landlock earns its place at R4 instead, on the question the netns cannot answer: **which specific
+sockets should remain reachable.**
 
 ### The important caveat: Landlock does not cover everything
 
@@ -527,9 +716,10 @@ is not a sound boundary at all:
 > check and use. Mediation inspects a hostile interface point-by-point; a namespace removes the
 > interface wholesale.
 
-That reasoning applies to prior too. **Reachability removal beats mediation**, which is why the
-netns (`--unshare-net`) remains the right primary control for the *abstract* socket, and why R3's
-seccomp filter is best understood as a *complement* rather than the primary defence.
+That reasoning applies to prior too, and it is the load-bearing sentence for R3's revision:
+**reachability removal beats mediation.** The netns (`--unshare-net`) is the right primary control
+for the *abstract* socket. Landlock `ResolveUnix` is the right control for *pathname* sockets that
+a binding legitimately exposes (R4). seccomp is a complement, not the primary defence.
 
 ### What `nono` does and does not settle
 
@@ -554,21 +744,26 @@ nono does **not** address Finding 1. Its `scrub.rs` is output hygiene (redacting
 records), not environment isolation, and it does not scrub the *parent's* environment the way R1
 requires.
 
-### Recommendation change
+### Recommendation change (superseded)
 
-R3 is revised: **Landlock becomes the primary X11 control where available, with seccomp and the
-netns as layered fallbacks.** See R3 for the revised text. The new ordering is:
+The 2026-10-21 revision made **Landlock the primary X11 control, with seccomp and the netns as
+layered fallbacks**, ordered `unshare-net` → Landlock → seccomp. **That ordering is superseded.** It
+was correct about seccomp (per-path beats all-or-nothing) and wrong about what the netns is for: if
+the netns stays on unconditionally, the abstract socket is unreachable on every kernel and neither
+Landlock nor seccomp is needed for Finding 3.
 
-1. `--unshare-net` (already prior's default) — removes the abstract socket by unreachability. Works
-   on every kernel, and is what makes `network: true` safe.
-2. Landlock `ResolveUnix` (ABI 9+) or abstract-socket scope (ABI 6+) — adds per-path control, so the
-   control no longer depends on the netns and pathname sockets can be handled too.
-3. seccomp deny `socket(AF_UNIX)` — the blunt fallback for kernels without Landlock, and the one
-   that also covers `AF_VSOCK` and `io_uring`.
+The current ordering is in R3 and R4:
 
-prior should not adopt nono as a dependency: it is a large surface (a supervisor process, a proxy, a
-trust store, an audit log) that duplicates policy prior already has. But it is an excellent
-**reference**, and its Landlock + seccomp + namespace layering is a sound model to copy.
+1. **`--unshare-net` unconditionally** — abstract sockets unreachable; `network: true` becomes a
+   bridge, not a shared netns (R3a).
+2. **seccomp** for `AF_VSOCK` and `io_uring` only — the two classes no namespace and no path rule
+   fences (R3d).
+3. **Landlock `ResolveUnix`** for *pathname* sockets exposed by a binding — the R4 question, not the
+   R3 one.
+
+prior should still not adopt nono as a dependency: it is a large surface (a supervisor process, a
+proxy, a trust store, an audit log) that duplicates policy prior already has. But it is an excellent
+**reference**, and NEP-0004's passed-listener bridge is the mechanism R3 adopts.
 
 ---
 
@@ -587,7 +782,7 @@ trust store, an audit log) that duplicates policy prior already has. But it is a
 - **The IPC namespace is not unshared**, so the sandbox sees the host's System V shared-memory
   segments (`ipcs -m` lists 8 of them). `--unshare-ipc` closes this; it is also the namespace that
   would matter for X11's MIT-SHM path, which is a faster and more direct way to read framebuffers
-  than `XGetImage`.
+  than `XGetImage`. Confirmed the flag is free to add: `network: true` does not depend on it.
 - **`--cap-drop ALL` is a no-op for an unprivileged user.** Measured with and without the flag,
   `CapEff`/`CapBnd` are `0000000000000000` either way — the user never held capabilities to begin
   with, so there is nothing to drop. The flag is not harmful, but it is not contributing anything.
@@ -598,12 +793,24 @@ trust store, an audit log) that duplicates policy prior already has. But it is a
   achieved by not binding it, not by uid isolation.
 - **The `ipc`, `uts` and `cgroup` namespaces are shared with the host** (the ns inodes are identical
   inside and outside), so `--unshare-ipc` and `--unshare-uts` are both currently missing.
+- **Loopback is already up inside a fresh netns.** `ip link show lo` inside `--unshare-net` reports
+  `lo: <LOOPBACK,UP,LOWER_UP>`, and binding `127.0.0.1:0` from inside succeeds. Two consequences for
+  R3: the egress bridge can bind directly (no `ioctl` dance), and a sandboxed command *can* run its
+  own local TCP servers — which is what `agent-browser` and any test suite that listens on
+  `127.0.0.1` needs. This is the same conclusion nono reached separately, and it is why they made
+  namespace-private loopback an explicit opt-in rather than something to be fought.
+- **A single socket *file* can be ro-bound into the sandbox** at an arbitrary path
+  (`--ro-bind /host/x.sock /run/prior-egress.sock`), and connecting to it works. This is why "bind a
+  directory" is not required for a socket channel — and also why R4's warning cannot be satisfied by
+  "don't bind directories": the operator is one `--ro-bind` away from exposing any socket, and prior
+  offers `ro`/`rw` *path* bindings, which accept files.
 
 ---
 
 ## Recommendations
 
-Ordered by priority. R1 and R2 are implemented; R3 and R4 are not.
+Ordered by priority. **R1 and R2 are implemented; R3, R4, R5 and R6 are not.** R3 was revised on
+2026-10-22 (bridge design, not a Landlock ladder); R4 absorbed the Landlock work that R3 gave up.
 
 ### R1 — Scrub bwrap's *own* environment before it spawns the payload (prerequisite for R2/R3)
 
@@ -776,133 +983,298 @@ implemented. What *is* implemented is that an explicit `sandbox.env` block is au
 — the built-in allowlist and the forced `TMPDIR` are not mixed in behind the operator's back, so the
 old denylist behaviour is still available by asking for it explicitly.
 
-### R3 — Block X11 independently of the network knob (layered)
+### R3 — Make `network` a policy, not a boolean (the egress bridge)
 
-Do not let `network: true` imply "may drive the user's mouse". X11 is a **local IPC** channel, not
-network egress, and it should be governed by a dedicated control rather than inherited from the
-network knob.
+**Not implemented.** Revised 2026-10-22; supersedes the Landlock/seccomp ladder.
 
-Three layers, strongest first. The ordering changed after checking Landlock (see "Cross-check:
-Landlock, and the Rust alternatives") — Landlock is a better primary control than seccomp, because
-it can be *per-path*.
+The requirement: do not let `network: true` imply "may drive the user's mouse". X11 is **local
+IPC**, not network egress, so it must not be inherited from the network knob. The 2026-10-21
+revision tried to satisfy that with three layered controls on top of a shared netns. The corrected
+design is smaller: **keep `--unshare-net` unconditionally, and redefine `network: true` as egress
+through a bridge.** Then the abstract socket is unreachable on every kernel, with no LSM, no ABI
+probe, and no fallback ladder — and the same policy shape has a three-line macOS implementation.
 
-**Layer 1 — Landlock, where the kernel supports it (primary).** Landlock is an LSM: an unprivileged
-process restricts its own ambient rights, the restriction is inherited by children, and it needs no
-user namespace. Two relevant access rights, both verified on this host (kernel 7.1.13, ABI 9):
+The measurements behind this are in "Why `network: true` must not share the network namespace", the
+bridge mechanism is in "Cross-check: `nono`'s passed-listener bridge", and the policy model is in
+"Cross-check: Anthropic's sandbox-runtime". This section is the specification.
 
-- **ABI 6 (Linux 6.12): `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`** — blocks connecting to abstract
-  sockets created outside the sandbox's Landlock domain. This is the X11 vector exactly.
-- **ABI 9 (Linux 7.1): `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`** — per-path control of *pathname* socket
-  connects, which is what closes the D-Bus / `docker.sock` / `ssh-agent` class.
+#### R3a — The network contract
 
-Measured, using the `landlock` 0.4.7 crate:
+- `--unshare-net` is emitted **always**. `network` no longer controls the netns.
+- `network: true` means: prior starts a bridge, publishes `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`
+  pointing at it, and the sandbox's only route out is that bridge.
+- `network: false` (default) means no bridge and no proxy variables — unchanged from today.
+- The bridge is a **listening fd created inside the netns and accepted from outside**, per
+  `nono`'s NEP-0004. No socket path exists in the sandbox filesystem, so there is nothing for a
+  binding to re-expose (which is R4's class, handled by construction rather than by a rule).
+- No `socat`, no `slirp4netns`, no `/dev/net/tun`. Verified: `lo` is already up inside the netns, so
+  the bridge binds `127.0.0.1:<port>` directly.
+
+Consequences to document, because they are operator-visible:
+
+- **Tools that ignore proxy variables get no egress.** `curl --resolve`, raw sockets, and CLIs that
+  do not read `ALL_PROXY` fail closed. Intended; they also fail closed today under `network: false`.
+- **Host loopback services become unreachable** from the sandbox. Correct under deny-default, but it
+  is a change for anyone using `network: true` to reach a local dev server.
+- **UDP gets nothing.** SOCKS5 `CONNECT` is TCP-only. DNS still works, because resolution happens in
+  the bridge (`socks5h` semantics — the sandbox never learns an address it cannot use).
+
+#### R3b — The bridge mechanism (the part that is subtle)
+
+Follow NEP-0004's sequence exactly; the deviations from `zerobox` and `srt` are deliberate and
+explained. There is one unavoidable shape change to prior's spawn path, and it is the main risk in
+this item: **the supervisor must outlive the child**, because it holds the listener and pumps bytes
+for the sandbox's whole lifetime. `build_bwrap_expr` returns a `duct::Expression` that the caller
+`.read()`s to completion (`src/tools.rs:1889`, `:1939`); the accepted listener cannot live inside
+that expression's lifetime.
+
+Sketch, in terms of prior's existing code:
+
+1. **Create the socketpair and fork the bootstrap child** before building the bwrap argv.
+   `bwrap` becomes the bootstrap child's payload rather than `duct`'s direct target, or the child is
+   a small pre-exec step. Either way the fd must survive into the netns: `Command::pass_fds` via
+   `duct`'s `before_spawn` (`duct-1.1.2/src/lib.rs:913`) — verified working.
+2. **In the child, after the netns exists.** The ordering matters: the socket must be created in the
+   new namespace, so it has to happen inside bwrap's namespace, not before it. Bind `127.0.0.1:0`,
+   `listen`, and send the fd out over the socketpair with `SCM_RIGHTS`; then close the local copy
+   and `exec` the workload. The workload never holds a listener.
+3. **In the supervisor** (prior), `recvmsg` the fd, wrap it in a `TcpListener`, and run an accept
+   loop; for each connection, parse SOCKS5, consult the allowlist, dial, and splice.
+4. **Publish the endpoint** to the sandbox as proxy env vars. Because the listener lives in the
+   sandbox's netns, the port is whatever was bound in step 2 — return it over the same socketpair
+   alongside the fd.
+
+**An ordering constraint that the sketch above hides.** The proxy variables are part of bwrap's argv
+(the env policy emits `--setenv`), but the port is not known until the child has bound inside the
+netns — which is *after* the argv is built. Two ways out, both used in the references:
+
+- **Fix the port number.** NEP-0004 binds `127.0.0.1:<port>` where `<port>` is *the same number the
+  host proxy uses*, precisely so the child environment can be built before the bind. This is the
+  simplest fix and probably what prior should do: pick the port, put it in the argv, bind it in the
+  child, fail the launch if it is taken.
+- **Or pass the env in over the bootstrap socketpair**, which NEP-0004 does for *other* proxy values
+  (`activate_proxy_routes_in_netns` rewrites them after `unshare`, before `exec`). More general,
+  more moving parts.
+
+Related: `ALL_PROXY=socks5h://127.0.0.1:<port>` is the variable that matters for a SOCKS-only
+bridge. `HTTPS_PROXY`/`HTTP_PROXY` pointing at a `socks5h://` URL is accepted by `curl` but not
+universally by other clients, so **either set only `ALL_PROXY`, or set all three and document the
+expectation**.
+That choice belongs with R3a's operator-facing consequences.
+
+Two open design questions to settle before writing code:
+
+- **Where does the in-namespace bind happen?** bwrap has no "run this before exec" hook, so either
+  (a) a tiny shim as bwrap's payload that binds+sends+execs, which is what NEP-0004 does, or
+  (b) a two-phase launch. (a) is simpler and matches the reference; it means prior needs a small
+  helper binary or an `sh -c` fragment. Prefer a helper binary for the same reason `bsed` is
+  resolved absolutely (`src/tools.rs:767`) — but note it must be bound into the sandbox.
+- **Does this interact with `prlimit` (`memory_wrapped_target`, `src/tools.rs:1671`)?** It wraps the
+  payload; the bind-and-send shim would sit outside it. Check the ordering.
+
+There is a **fallback worth keeping in the design** even though it is not the primary: if the
+two-phase/shim approach proves too invasive for the `duct` path, a single socket file can be
+`--ro-bind`-ed in and connected to (`CONFIRMED`: `--ro-bind /host/x.sock /run/prior-egress.sock`
+then connect works). That is `zerobox`'s and `srt`'s approach, it is simpler, and its only real
+disadvantage is the R4 class — a path exists that a binding could re-expose. Ship the fd-passing
+design if it fits; record the socket-file design as the known-inferior alternative so the decision
+is not re-litigated after a compaction.
+
+#### R3c — The policy engine (SOCKS5, host+port, ~300 lines)
+
+SOCKS5 `CONNECT` only. No HTTP proxy, no TLS MITM, no credential masking — those are 1439 + 1514
+lines in `srt` and exist for a feature prior does not have.
+
+Decision order, modelled on `srt`'s `socks-proxy.ts`:
+
+1. Greeting: **no auth**, for now. `srt` uses SOCKS username/password to carry a per-command token
+   so a denial can be attributed (`srt.<encodedCommand>`); prior runs one sandbox per tool call, so
+   the *tool call* is the attribution unit and the bridge logs it directly. If prior ever
+   multiplexes several sandboxes onto one bridge, adopt `srt`'s token scheme — that is why it
+   exists, and it is the cheap version of the same idea.
+2. Read the `CONNECT` request. Resolve the hostname **in the bridge** (`socks5h`), never in the
+   sandbox.
+3. Apply the allowlist on `host:port`. Deny → SOCKS reply `0x02`, and log the denial with the tool
+   call / command that caused it. A denial with no attribution is not actionable for the model or
+   the operator, and it is the single most useful thing this engine produces.
+4. Dial the resolved address, reply `0x00`, splice both directions until EOF.
+
+Verified behaviour on this host, with the sandbox under `--unshare-net` and the bridge as the only
+route:
 
 ```text
-# abstract socket (the X11 vector)
-before landlock:: CONNECTED (not blocked)
-after  landlock:: BLOCKED (Operation not permitted (os error 1))
-# TCP is unaffected
-after  landlock TCP:: TCP CONNECTED (allowed)
-
-# pathname sockets, ResolveUnix granted under one directory only
-granted dir socket:   connect(/tmp/ll_ok/s.sock)   CONNECTED (allowed)
-non-granted dir socket: connect(/tmp/ll_no/s.sock) BLOCKED (Permission denied)
+[1] allowed host -> rep 0        HTTP/1.1 200 OK
+[2] denied host  -> rep 2        proxy log: DENY-HOST evil.invalid
+[3] denied port  -> rep 2        proxy log: DENY-PORT example.com:22
+[4] direct TCP   -> blocked      [Errno 101] Network is unreachable
+[5] X11 abstract -> blocked      [Errno 111] Connection refused
 ```
 
-This is strictly better than a blanket seccomp deny: it is per-path, it does not block `socket()`
-itself, and it does not depend on the netns.
+Two hardening details to copy from `srt`/`zerobox`: deny `AF_VSOCK` and `io_uring` at the seccomp
+layer (R3d) because they route around `connect()`; and set `PR_SET_PDEATHSIG` in any helper process
+so a killed prior does not leave a bridge listening into a dead namespace (`zerobox`'s
+`harden_bridge_process`).
 
-The `landlock` crate is a small, dependency-light addition (it is pure `libc` syscalls). Two
-cautions from the crate's own docs and nono's NEP-0004:
+#### R3d — seccomp, demoted to the two cases nothing else covers
 
-- **Pin an explicit ABI.** The crate deliberately refuses to expose "all access flags for the
-  running kernel" — a ruleset built against "whatever this kernel supports" silently changes
-  semantics when the crate is updated.
-- **Handling `ResolveUnix` without granting anything flips existing profiles into
-  deny-all-unix-connects** on V9 kernels: fail-closed, but breaking. It needs curated default
-  grants, the same class of problem nono tracks as #1827.
+Not the X11 fix. `bwrap --seccomp FD` (an FD, not a path), denying only:
 
-**Layer 2 — the network namespace (reachability).** `--unshare-net` already removes the abstract
-socket by unreachability, and it is prior's default. This is the layer that makes `network: true`
-safe, and it is the one that works on every kernel. nono's own reasoning is worth adopting as a
-principle:
+- `socket(AF_VSOCK, …)` — the netns does not fence VM sockets.
+- `io_uring_setup` / `io_uring_enter` / `io_uring_register` — `IORING_OP_SOCKET` and
+  `IORING_OP_CONNECT` create and use sockets in kernel context, bypassing any `connect()`-based rule
+  *and* the netns check for the socket path.
 
-> Mediation inspects a hostile interface point-by-point; a namespace removes the interface
-> wholesale.
+**Do not** deny `socket(AF_UNIX)` wholesale. It breaks `agent-browser`'s control socket
+(`src/tools.rs:2043`) and the bridge's own plumbing, and the netns already removed the abstract
+socket it was meant to protect. `srt` needs that hammer because it does not have the bridge; prior
+does not.
 
-**Layer 3 — seccomp (fallback, and the only layer that covers vsock and io_uring).** Deny
-`socket(AF_UNIX, …)` so the sandboxed command cannot create a Unix socket at all. `srt`'s filter
-(`vendor/seccomp-src/seccomp-unix-block.c`) is a working reference and was verified here to block
-X11 with `network: true`. The filter should deny, at minimum:
+#### R3e — Environment hygiene (cheap, do it with R3a)
 
-- `socket(AF_UNIX, …)` — blocks X11, D-Bus, and every other Unix socket.
-- `socket(AF_VSOCK, …)` — VM sockets are not fenced by the network namespace.
-- `io_uring_setup` / `io_uring_enter` / `io_uring_register` — `IORING_OP_SOCKET` creates sockets in
-  kernel context and bypasses the `socket()` rule.
-- Optionally the `namespaces` rules from `srt` (deny `unshare`/`clone` with
-  `CLONE_NEWUSER|CLONE_NEWNS`, `setns`, `mount`, `pivot_root`, …) so a sandboxed process cannot
-  escape by making a new user namespace.
+- `DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` are already excluded by the R2
+  allowlist. Add them to `DEFAULT_ENV_DISALLOW` too, for operators who opt back into the denylist.
+  These are the *hint* for Finding 3, not the barrier, but not being told where the display is
+  costs nothing.
+- `--unshare-ipc` unconditionally. Closes the host SysV segment exposure (`ipcs -m` currently lists
+  8) and the MIT-SHM framebuffer path. Free.
+- `--dev /dev` and `--proc /proc` by default, as `srt` does. `git` fails without `/dev/null` and
+  `cargo` without `/proc/self/exe`; mounting `/proc` makes R1 mandatory, which is the correct
+  dependency.
+- `--unshare-uts --hostname sandbox`. Both flags — `--unshare-uts` alone still reports the host
+  hostname.
 
-bwrap supports this natively: `bwrap --seccomp FD` (an FD, not a path).
+#### R3f — The config schema (this is what makes macOS cheap)
 
-**Constraint to design around.** Denying `socket(AF_UNIX)` also denies *creating* the client socket
-needed to reach a Unix socket that was bound into the sandbox — and, more importantly for prior, it
-denies the socket creation that ordinary tooling does for inter-process coordination. Verified:
+`network` is `Option<bool>` today (`src/config.rs:968`). The revision replaces it with a policy that
+both backends consume:
 
 ```text
-s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-→ PermissionError: [Errno 1] Operation not permitted
+[tool_config.bash.sandbox.network]
+enabled = true
+allow   = ["github.com:443", "*.crates.io:443", "crates.io:80"]
 ```
 
-So any Unix-socket-based plumbing (an `agent-browser` control socket, a proxy bridge) must either
-present a **TCP** endpoint to sandboxed code, or have its socket created *before* the filter is
-applied — `srt` does the latter by starting its `socat` relays before `apply-seccomp`, and the
-former by using `TCP6-LISTEN:3128` inside the sandbox. prior should pick one deliberately rather
-than discover this at runtime.
+- `enabled = false` (default) — no bridge, no proxy vars, netns always.
+- `enabled = true, allow = []` — **deny all**. An explicitly empty allowlist must not mean "allow
+  all"; that is the fail-open direction and it would make the boolean a bypass again.
+- Keep a bare `network = true` working, deprecated, meaning "deny all with a warning" or mapping to
+  a documented default set — **decide this explicitly**, it is user-facing and documented in
+  `settings.toml.example` and `doc/sandbox.md`.
 
-**Secondary control — always drop `DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`**
-from the environment, in *both* policy modes. These are never needed by a build and are the enabling
-hint for Finding 3. Under an allowlist (R2) they are excluded automatically; under the current
-denylist they are not, so this should be added to the deny list as a stopgap for operators who keep
-the denylist.
+Do **not** reuse `srt`'s `allowUnixSockets` field: it is macOS-only and means two different things
+per platform. If prior ever wants a socket allowlist, it is a separate key, and on Linux it belongs
+to R4's Landlock work, not to the network policy.
 
-**Also in scope for R3:**
+#### R3g — macOS: the same policy, three rules, no bridge process
 
-- **Mount `/dev` and `/proc` by default.** `srt` does both, and the alternative is a sandbox where
-  `git` fails on a missing `/dev/null` and `cargo` fails on a missing `/proc/self/exe`. Mounting
-  `/proc` makes R1 mandatory — which is the correct dependency, not an argument against it.
-- **Add `--unshare-ipc`** regardless. It closes the shared-memory exposure and the MIT-SHM
-  framebuffer path, and it is the namespace that X11's shared-memory transport actually uses. It is
-  a free win, and it also stops the sandbox from listing the host's SysV segments.
-- **Consider `--unshare-uts --hostname sandbox`** to stop the host hostname leaking. Note that
-  `--unshare-uts` alone is not enough — the new namespace still reports the host hostname until
-  `--hostname` is given.
+This is why the schema above is the deliverable and the Linux bridge is an implementation detail.
+**R3c's policy engine is shared; only the transport differs.**
 
-A reasonable target state: X11 is blocked in *all* configurations, and `network: true` means TCP/UDP
-egress only. Concretely, in priority order:
+On macOS the transport is a plain TCP listener on host loopback — the bridge *is* the proxy, with no
+namespace and no fd passing, because the sandbox shares the host's network stack. Seatbelt then
+expresses the whole policy declaratively. `sandbox-runtime`'s
+`src/sandbox/macos-sandbox-utils.ts:1318-1344` is the reference:
 
-1. `--unshare-net` stays the default (already true) and is what makes `network: true` safe.
-2. Landlock is layered on where the kernel supports ABI 6+ (abstract socket scope) and ABI 9+
-   (`ResolveUnix` for pathname sockets), with a capability probe and a graceful fallback to layer 3.
-3. The seccomp filter is the fallback for kernels without Landlock, and the only layer that covers
-   `AF_VSOCK` and `io_uring`.
-4. `DISPLAY` / `XAUTHORITY` / `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` are dropped from the environment
-   in both policy modes, so the sandboxed command is not even *told* where the display is.
+```scheme
+(deny default)
+(allow network-outbound (remote ip "localhost:3128"))
+(allow network-bind (local ip "localhost:3128"))
+(allow network-inbound (local ip "localhost:3128"))
+```
 
-The order matters: Landlock first because it is per-path and does not break legitimate Unix-socket
-use; seccomp only where Landlock is unavailable, because it is all-or-nothing.
+No socat, no socket bind, no relay process, no passed fd. The asymmetry is the reverse of intuition:
+**macOS is the easy platform for this, Linux is the hard one.**
 
-### R4 — Make the Unix-socket surface explicit
+Concretely, the platform split is one trait:
 
-`--unshare-net` blocks abstract sockets but **not** filesystem sockets. A directory binding can
-therefore re-open a channel the network namespace closed. Two complementary steps:
+```text
+Linux:   bind inside the netns -> pass the listening fd out -> accept in prior
+macOS:   bind on host loopback -> accept in prior
+both:    SOCKS5 policy engine (R3c) -> allowlist -> dial -> splice
+```
 
-- Document this in `doc/sandbox.md` next to the `--unshare-net` claim, which currently reads as if
-  it blocks all egress.
-- Consider dropping the `network` knob's implication and instead describing the two independent
-  axes: *network namespace* (TCP/UDP + abstract sockets) and *filesystem bindings* (filesystem
-  sockets). An operator who binds `~/.config/gcloud` may be handing over a credential helper socket
-  without realising it.
+Which also means **R3c can be written and tested on either platform first**, against a host-loopback
+listener, before the Linux fd plumbing exists. That is the cheapest path to a working policy engine
+and it is worth taking.
+
+Notes for whoever implements it:
+
+- **Host loopback on macOS is not private.** Any process running as the same user can connect to
+  `127.0.0.1:3128` and use the bridge. That is acceptable (they already have the user's network
+  access) but it means the bridge must hold no authority the sandbox lacks: it dials only what the
+  allowlist permits and holds no credentials. If that ever changes, `srt`'s `proxyAuthToken` (SOCKS
+  username/password) becomes necessary — the same mechanism that carries their attribution suffix.
+- `localhost:<port>` does **not** match `::ffff:127.0.0.1`. Runtimes that connect to loopback over
+  dual-stack sockets (Java) need `AF_INET`; `srt` injects `JAVA_TOOL_OPTIONS` for exactly this.
+  Check whether that matters for prior's tools before porting the workaround.
+- The profile needs `(allow network*)` replaced wholesale, not amended. `srt` emits
+  `(allow network*)` when no restriction is wanted (`:1257`) — prior has no such mode.
+- Seatbelt **can** filter Unix sockets by path (`(allow network-outbound (remote unix-socket
+  (subpath …)))`), which Linux cannot do below Landlock ABI 9 (`srt` documents `allowUnixSockets` as
+  macOS-only for this reason). mac is *ahead* of Linux on that axis; do not design the policy model
+  around Linux's weak spot.
+
+#### R3h — What is deferred, and why
+
+- **Filtering by domain for HTTPS** requires seeing SNI, which means either TLS MITM (1500 lines,
+  a CA to manage) or an allowlist on `host:port` only. prior takes the latter: `github.com:443` is
+  allowed as an endpoint, not as a URL. Say so in the docs, because "allowlist by domain" raises an
+  expectation SOCKS5 cannot meet.
+- **Credential masking** (`srt`'s sentinel substitution) is out of scope. It is the right design for
+  "the agent may use the key, only here", but it is strictly more machinery than prior needs now.
+- **UDP** is out of scope; see R3a.
+
+### R4 — The Unix-socket surface: document it, then constrain it with Landlock
+
+**Not implemented.** This absorbed the Landlock work that R3 gave up, and it is now the *only*
+place Landlock is proposed.
+
+`--unshare-net` blocks abstract sockets but **not** filesystem sockets. R3's bridge removes the
+abstract vector for good, but a binding can still expose a pathname socket — and prior's `ro`/`rw`
+bindings accept *files*, so a single socket file is enough:
+
+```text
+--ro-bind /host/agent.sock /run/x.sock  →  connect("/run/x.sock") CONNECTED   (CONFIRMED)
+```
+
+So "don't bind directories containing sockets" is not a rule prior can enforce; the operator is one
+path binding away. Three steps, in order of cost:
+
+**(a) Document the two axes.** `doc/sandbox.md`'s `--unshare-net` claim currently reads as if it
+blocks all egress. It blocks the abstract namespace and TCP; it does not block pathname sockets that
+a binding exposes. Describe the two independent axes explicitly: *network* (TCP/UDP + abstract
+sockets, governed by R3's policy) and *filesystem bindings* (pathname sockets, governed by nothing
+today). An operator who binds `~/.config/gcloud` or `~/.docker` may be handing over a credential
+helper socket without realising it, and that should be said next to the binding docs, not just here.
+
+**(b) Consider warning on socket-shaped bindings.** prior can `stat` a binding source at argv-build
+time (`build_bwrap_args`, `src/tools.rs:1712`) and know it is a socket. A warning (or a
+`sandbox.allow_socket_binds` opt-in) is cheap and catches the common accident. It is a *hint*, not a
+control — say so — but hints are how operators learn.
+
+**(c) Landlock `ResolveUnix` where the kernel has it.** This is the only kernel-enforced per-path
+control available, and it is the correct home for the work R3 no longer needs:
+
+- **ABI 9 (Linux 7.1+): `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`** — per-path control of pathname socket
+  connects. Verified on this host: with `ResolveUnix` granted under one directory only,
+  `connect(/tmp/ll_ok/s.sock)` succeeded and `connect(/tmp/ll_no/s.sock)` was `EPERM`.
+- **ABI 6 (Linux 6.12+): `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`** — belt-and-braces for the abstract
+  vector R3 already removed by unreachability. Worth setting if trivially available, not worth a
+  fallback ladder on its own.
+
+Three cautions, all from the `landlock` crate's docs and nono's NEP-0004:
+
+- **Pin an explicit ABI.** The crate deliberately refuses to expose "all flags for the running
+  kernel", because a ruleset built against "whatever this kernel supports" silently changes meaning
+  on a crate update.
+- **Granting `ResolveUnix` without any grant flips a profile to deny-all pathname connects** on
+  kernels that support it — fail-closed, but breaking. It needs curated default grants, which is
+  nono's open item #1827 and is the real cost of this step.
+- **Kernel coverage is the limit.** ABI 9 is Linux 7.1. On any ordinary 2026 host, only step (a) and
+  (b) apply. Do not design for (c) being present.
+
+Do **not** propose seccomp `socket(AF_UNIX)` here either: it cannot filter by path, so it denies
+`agent-browser`'s own socket and the bridge, which is precisely the trade R3d rejects.
 
 ### R5 — Close the documentation gap
 
@@ -919,6 +1291,12 @@ Still open:
   does not: the filesystem-socket channel (R4) defeats it.
 - The R3 work (a dedicated X11 control) is not done, so the doc still cannot promise that the X
   server is unreachable.
+- **R3 changes what `network: true` means**, so `doc/sandbox.md`'s network section needs a rewrite
+  when R3a lands: netns always on, egress through the bridge, proxy variables published, tools that
+  ignore them fail closed, host loopback unreachable, no UDP. That is a larger doc change than R1/R2
+  needed, and it is user-facing.
+- **`settings.toml.example` needs the `network` table** (R3f) once the schema lands, including the
+  "empty allowlist means deny all" rule and the fate of bare `network = true`.
 
 ### R6 — Tests
 
@@ -941,13 +1319,24 @@ of the bwrap invocation. Added for R1 and R2:
   `explicit_env_policy_suppresses_the_built_in_defaults` — pin the `PWD` / `TMPDIR` decisions and
   the "an explicit block is authoritative in full" rule.
 
-Still wanted, for R3/R4:
+Still wanted, for R3/R4. The first two are the ones that would have caught Finding 3 in the first
+place, and both should be **socket-level assertions, not `xdotool`/`xdpyinfo` probes** — those may
+not be installed, and a missing binary looks identical to a blocked one.
 
-- A test asserting that the seccomp filter blocks `socket(AF_UNIX, …)` while leaving `AF_INET`
-  alone, and that `AF_VSOCK` is blocked.
-- A test asserting that with `network: true` the X server is still unreachable (i.e. that X11
-  blocking is independent of the network knob). This needs a socket-level assertion rather than an
-  `xdpyinfo` probe, since `xdpyinfo` may not be installed.
+- `x11_abstract_socket_unreachable_with_network_enabled` — with `network: true`, `connect("\0/tmp/
+  .X11-unix/X0")` fails. This is the regression test for Finding 3 under the new contract.
+- `bridge_carries_allowed_host_and_refuses_others` — through `ALL_PROXY`, an allowlisted
+  `host:port` gets a SOCKS `0x00`, a non-allowlisted one gets `0x02`, and a log line names the
+  denial. Needs a loopback-only target so the test does not depend on the internet.
+- `direct_tcp_is_blocked_even_with_network_enabled` — `connect(1.1.1.1:80)` fails with
+  `ENETUNREACH`, proving the bridge is the only route.
+- `empty_allowlist_denies_everything` — pins the fail-closed default from R3f (the rule most likely
+  to regress into "allow all").
+- `sandbox_sees_own_loopback` — binding `127.0.0.1:0` inside the sandbox works, so `agent-browser`
+  and local test servers keep functioning under the always-on netns.
+- For R3d: `AF_VSOCK` blocked, `io_uring_setup` blocked, `AF_INET`/`AF_UNIX` *not* blocked (the last
+  is the assertion that stops someone re-adding the wholesale Unix-socket deny).
+- For R4(b): a socket-shaped binding produces the warning; a directory binding does not.
 
 ---
 
@@ -1013,7 +1402,61 @@ for label, addr in [('filesystem','/tmp/.X11-unix/X0'), ('abstract','\0/tmp/.X11
     except Exception as e: print(f'{label}: {e}')"
 ```
 
-**The seccomp X11 block** (R3), using `srt`'s filter:
+**The bridge, end to end** (R3b/R3c) — the shape R3 adopts, and the measurement that decided it:
+
+```sh
+# Supervisor side: a SOCKS5 server on a unix socket (stand-in for prior's bridge).
+# Child side: bwrap --unshare-net, and inside it a relay listening on
+# 127.0.0.1:3128 that forwards to that socket.
+bwrap ... --unshare-net --unshare-pid --unshare-ipc --bind /tmp/sy /tmp/sy \
+      --dev /dev --proc /proc -- /bin/sh -c 'python3 bridge.py & python3 probe.py'
+```
+
+Result (same sandbox, only the netns differing):
+
+```text
+== --unshare-net
+x11_abstract: BLOCKED ([Errno 111] Connection refused)
+direct_tcp:   BLOCKED ([Errno 101] Network is unreachable)
+proxy_ok:     CONNECTED   HTTP/1.1 200 OK
+proxy_denied: rep code 2  (proxy log: DENY-HOST evil.invalid, DENY-PORT example.com:22)
+
+== shared netns (today's network: true)
+x11_abstract: CONNECTED
+direct_tcp:   CONNECTED
+```
+
+**The passed-listener variant** (NEP-0004's mechanism, which R3b prefers over the socket-file relay
+above). The child binds inside the new netns and sends the *listening fd* out:
+
+```python
+# child, after unshare, inside the new netns
+srv = socket.socket(); srv.bind(("127.0.0.1", 3128)); srv.listen(32)
+socket.send_fds(boot_socketpair, [b"L"], [srv.fileno()])
+# supervisor: recv_fds(...) -> socket.socket(fileno=fd).accept() ...
+```
+
+Result:
+
+```text
+host: received listening fd [4] msg b'L'
+shim: listener bound in-ns: ('127.0.0.1', 3128)
+HTTP: HTTP/1.1 200 OK
+proxy log: ['ALLOW example.com:80']
+```
+
+And the `duct` fd-inheritance check, since prior spawns through `duct`:
+
+```rust
+// duct has no pass_fds, but before_spawn hands over &mut std::process::Command
+duct::cmd("sh", ["-c", &script])
+    .full_env(vec![("PATH", path)])
+    .read()   // child wrote to an inherited fd
+// → host got via fd: "via-duct"
+```
+
+**The seccomp X11 block** (`srt`'s filter, measured but **not** adopted by R3 — R3d keeps only the
+vsock/io_uring half):
 
 ```sh
 git clone --depth 1 https://github.com/anthropics/sandbox-runtime.git
@@ -1025,3 +1468,74 @@ gcc -o /tmp/seccomp-unix-block \
 bwrap ... --seccomp 3 --setenv DISPLAY :0 3</tmp/unix-block.bpf -- xdotool search --name ""
 # → Error: Can't open display
 ```
+
+---
+
+## Where to start next (handover notes)
+
+Written so that R3 can be picked up cold after a context reset. Everything here is either a verified
+fact or an explicitly open decision; nothing needs to be re-derived.
+
+**Read first:** R3a (the contract), R3b (the mechanism), R3f (the schema), R3g (the macOS split
+that keeps the policy shared). Everything else is detail.
+
+**Order of work, and why:**
+
+1. **R3e (hygiene) and R3f (schema) first.** They are small, they do not touch the spawn path, and
+   they pin the user-facing surface before any code depends on it. R3e also makes the doc's claims
+   true (`--unshare-ipc`, `/dev`, `/proc`, `--unshare-uts`). Decide the bare-`network = true`
+   question in R3f here — it is a config-compat decision and nothing later can be built until it is
+   settled.
+2. **R3c (the policy engine) before R3b.** Because R3g splits the transport from the policy, R3c can
+   be developed and tested against a plain **host-loopback** listener — no bwrap, no fd passing, no
+   namespace. Write the SOCKS5 engine and its allowlist tests first; then R3b is only "how does the
+   listener get into the namespace", which is a much smaller and more testable question. Borrow
+   `socks-proxy.ts` for decision ordering, not for code.
+3. **R3b next, and treat it as the risk.** It is the only item that changes prior's spawn path: the
+   supervisor must outlive the child, and `build_bwrap_expr` returns a `duct::Expression` the caller
+   reads to completion (`src/tools.rs:1399`, `:1889`). Spike the smallest thing that proves:
+   listener bound in-ns → fd out → accepted on outside → one SOCKS handshake answered. If the
+   lifetime change does not fit, the fallback is the socket-file design (R3b's last paragraph) and
+   the rest of the plan is unaffected.
+4. **R3d (seccomp)** last of the Linux work; it is small and independent.
+5. **R3g (macOS)** only when the schema from step 1 exists, and it is genuinely three rules plus a
+   profile generator — do not start it earlier, because the point of the schema is that mac consumes
+   it unchanged. It does **not** block on R3b: mac needs no fd passing, so step 2's engine plus a
+   host-loopback listener is a complete macOS implementation.
+6. **R4** is independent of all of the above and can run in parallel with any step. Its (a) and (b)
+   parts are documentation and a warning; only (c) needs the `landlock` crate.
+
+**Facts already established, do not re-test:**
+
+- `--unshare-net` blocks the abstract socket and TCP; it does **not** block pathname sockets that a
+  binding exposes. Same-sandbox A/B measured.
+- `lo` is already UP inside a fresh bwrap netns; `bind 127.0.0.1:0` succeeds from inside. No
+  `ioctl` dance needed (this is what makes ~60 lines of `zerobox` unnecessary).
+- A listening fd created inside the netns can be sent to a process outside it and will carry real
+  traffic. Verified with `send_fds`/`recv_fds`.
+- `duct` can pass fds via `before_spawn`, verified with a standalone crate.
+- SOCKS5 `CONNECT` relay with host+port filtering works under `--unshare-net`, and denials are
+  distinguishable (`0x02`) from dial failures.
+- A single socket *file* can be `--ro-bind`-ed in and connected to — the fallback mechanism, and the
+  proof of R4's premise.
+- Seatbelt needs no bridge on macOS: `(allow network-outbound (remote ip "localhost:3128"))` plus
+  two more allow lines is the whole implementation (`srt:macos-sandbox-utils.ts:1318-1344`).
+
+**Open decisions, deliberately not made above:**
+
+- Bare `network = true`: deny-all-with-warning, or a documented default allowlist? (R3f)
+- Bridge as a helper *binary* bound into the sandbox, or an `sh -c` fragment? (R3b — a binary is
+  cleaner and matches `bsed`'s absolute-path treatment, but it must be bound in.)
+- Does R4's socket-binding warning default to warn, or require an opt-in flag? (R4b)
+- Should `agent-browser`'s control socket stay on AF_UNIX (needs no seccomp carve-out under this
+  design) or move to TCP over the namespace loopback? (R3d/R3e — currently it works either way,
+  since R3d does not deny `socket(AF_UNIX)`.)
+
+**Do not re-litigate:**
+
+- Landlock as the primary X11 control. It was the 2026-10-21 position and it is wrong once the netns
+  stays on. Landlock belongs to R4.
+- Wholesale seccomp `deny socket(AF_UNIX)`. It breaks `agent-browser` and the bridge; R3d keeps only
+  `AF_VSOCK` and `io_uring`.
+- Adopting `nono-proxy` or `zerobox-network-proxy` as dependencies. Both are 9k–22k lines with a
+  full HTTP/TLS/OAuth surface, and one exact-pins six `rama` alpha crates.
