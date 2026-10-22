@@ -397,6 +397,31 @@ No tool needs stdin: every sandboxed call is non-interactive, `--clearenv`
 removes anything that would prompt, and the egress bridge uses fd 3. Closing it
 is therefore behaviour-neutral.
 
+### The sandbox inherits no other fd (R8)
+
+bwrap forwards every inherited non-`CLOEXEC` descriptor into the payload, and
+neither `--clearenv`, `--unshare-*` nor `--cap-drop` says anything about file
+descriptors. A session log, memmap or socket prior happened to hold open would
+otherwise be readable and writable from inside the sandbox.
+
+`seal_inherited_fds` (`src/tools.rs`) is installed as a `pre_exec` hook on every
+bwrap spawn (both `duct` builders and the `ls`-for-completions path). It runs in
+the forked child, after std has installed stdio, and marks every descriptor ≥ 3
+`CLOEXEC` with `close_range(3, UINT_MAX, CLOSE_RANGE_CLOEXEC)`, then clears the
+flag again on the one fd the payload is meant to keep — the egress bootstrap fd,
+and only when egress is on. So the payload sees stdio plus, at most, that fd.
+
+Two details are load-bearing:
+
+- **Marking, not closing.** A plain `close_range(3, …, 0)` would also close
+  std's own `CLOEXEC` exec-error pipe, turning a clean `ENOENT` on a failed
+  `execve` into a runtime abort. `CLOSE_RANGE_CLOEXEC` leaves it open until
+  `execve`, where the kernel's own `CLOEXEC` handling closes it.
+- **Linux 5.11+.** `close_range` is required; on `ENOSYS` the spawn fails rather
+  than leaking the table. prior already requires bwrap, so the floor is cheap.
+
+See `doc/261021_sandbox_env_x11_audit.md` (Finding 5).
+
 ### Path-binding special case
 
 When either binding list (`cfg.ro` or `cfg.rw`) is **non-empty**, do **not**
@@ -449,6 +474,10 @@ with zero config.
   prior's tty: no keystroke readback, no escape-sequence injection into the
   user's screen, no `termios`/winsize tampering. See "The sandbox has no
   terminal" above.
+- **Only stdio (and the egress fd) cross into the sandbox.** Every other
+  inherited descriptor is marked `CLOEXEC` in the child before `execve`, so an
+  open session log, memmap or socket cannot be read or written from inside. See
+  "The sandbox inherits no other fd" above.
 - **Not a hardening boundary against root.** bwrap provides isolation, not a
   bulletproof jail; it assumes the sandbox user is unprivileged. It is a
   defense-in-depth measure appropriate for an LLM-driven shell, not a

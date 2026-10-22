@@ -7,7 +7,7 @@ reproduced, not inferred.*
 
 ## Status
 
-**R1, R2, R3a/b/c/e/f and R7 are implemented.** **R3d, R3g, R3h, R4, R5 and R6 are not.** R3 was
+**R1, R2, R3a/b/c/e/f, R7 and R8 are implemented.** **R3d, R3g, R3h, R4, R5 and R6 are not.** R3 was
 revised on 2026-10-22 after testing the design against four reference implementations and this host:
 it is no longer a Landlock/seccomp ladder but a bridge design (R3a–R3h), with Landlock moved to R4
 where it is the only fix. The Linux half then landed the same day: `--unshare-net` is now
@@ -23,7 +23,7 @@ yes, and both reference implementations already do some version of it — see "C
 
 ## Summary
 
-Four findings, in descending severity:
+Five findings, in descending severity:
 
 1. **The env filter is bypassable whenever `/proc` is mounted.** The bwrap parent's
    `/proc/1/environ` still holds the *host* environment, so a sandboxed command can read every
@@ -41,6 +41,10 @@ Four findings, in descending severity:
    command could read the user's keystrokes (prior runs the terminal raw) and write escape sequences
    into it. CONFIRMED. `--new-session` (added 2026-10-22) denies *acquiring* a controlling terminal
    but cannot revoke an inherited fd; the fix is to redirect stdin (R7).
+5. **The sandbox inherited every other non-`CLOEXEC` fd prior held open.** R7 closed fd 0, but bwrap
+   forwards *any* inherited descriptor into the payload, so a session log, memmap or socket prior had
+   open reached the command. CONFIRMED with a leaked file fd. The fix is to seal the whole table at
+   spawn time, keeping only stdio and the egress bootstrap fd (R8).
 
 Consequences for the plan of record:
 
@@ -450,14 +454,78 @@ Keep `--new-session` as well. Closing stdin without it still leaves the sandbox 
 `/dev/tty` (a fresh devpts' `ptmx` is present, and prior's tty is on the host's devpts, but the
 ctty route is what `--new-session` closes, cheaply).
 
-**Also audit the rest of the fd table.** bwrap passes through every inherited non-`CLOEXEC`
-descriptor. Today the only intentional one is fd 3 (egress bootstrap); everything else prior might
-hold open is inherited by the payload. Closing the set explicitly before `exec` (or documenting the
-invariant) is future work, not part of R7.
+**The rest of the fd table is Finding 5 / R8** (below), now implemented.
 
 **Also record it as its own axis.** "The sandbox has no terminal" is a property, not a consequence
 of the netns or the env filter — it belongs in `doc/sandbox.md`'s security list next to the
 `--unshare-net` bullet, which it now is.
+
+---
+
+## Finding 5 — the sandbox inherits every other open fd (severity: medium)
+
+*Found 2026-10-22, the same session as Finding 4, when the audit item "check the rest of the fd
+table" was taken up. R7 closed fd 0 and made the terminal the visible case; the underlying defect is
+broader — it is *any* inherited descriptor, not just the tty.*
+
+### Mechanism
+
+bwrap forwards every inherited non-`CLOEXEC` descriptor into the payload. It does not filter the
+table, and `--clearenv`, `--unshare-*` and `--cap-drop` do nothing about fds: those are all about
+namespaces, environment and capabilities. Whether an fd leaks is decided entirely by the parent's
+`FD_CLOEXEC` bits at the moment of `execve`.
+
+prior is a long-running process that holds files open (session logs, memory-mapped session
+files, sockets, tempfiles). A std `File`/`TcpListener` is `CLOEXEC` by default, but anything that
+clears the bit — a raw `libc::open`, a `mmap` of a manually opened fd, a library that opts out — is
+inherited. The egress bootstrap fd is deliberately non-`CLOEXEC` (the shim must receive it), which is
+exactly the shape of the leak: it was chosen, and everything else was not.
+
+### Evidence
+
+Reproduced with a deliberately inheritable fd leaked into the bwrap spawn:
+
+```text
+parent: open("/tmp/prior_r8_fd_marker"), fcntl(F_SETFD, 0)   -> fd 9, non-CLOEXEC
+inside: readlink /proc/self/fd/9                             -> /tmp/prior_r8_fd_marker
+```
+
+The payload read the host file through an fd it was never meant to see. After the fix the same probe
+reports the fd absent. (A separate measurement confirmed that std's own files and sockets *are*
+`CLOEXEC`, which is why the exposure was latent rather than constant — the leak needed a caller that
+cleared the bit, and prior has no such caller today. Sealing the table makes the invariant hold
+regardless of what future code does.)
+
+### Why a plain `close_range` is the wrong fix
+
+Closing the range `[3, ∞)` in a `pre_exec` hook looks obvious and is a trap: std keeps its own
+`CLOEXEC` pipe — the one it writes an `execve` failure to so the parent can report `ENOENT` instead
+of a bare exit — at fd ≥ 3. Closing it makes a failed exec a runtime abort. Measured:
+
+```text
+child pre_exec: close_range(3, UINT_MAX, 0)   -> spawn /nonexistent -> status 6,
+                                                 "fatal runtime error: assertion failed:
+                                                  output.write(&bytes).is_ok()"
+child pre_exec: close_range(3, UINT_MAX, CLOEXEC) -> clean Err(ENOENT)
+```
+
+### Recommendation — R8
+
+**IMPLEMENTED 2026-10-22** in `src/tools.rs::seal_inherited_fds`.
+
+Runs in the forked child via `pre_exec`, after std has installed stdio, and issues
+`close_range(3, UINT_MAX, CLOSE_RANGE_CLOEXEC)`, then clears `CLOEXEC` on the one fd the payload is
+meant to inherit (the egress bootstrap fd, if egress is on). Marking rather than closing keeps std's
+error pipe alive until `execve`, where the kernel closes it; the payload still sees only stdio plus
+the kept fd. Wired into both duct builders (`build_bwrap_expr`, `build_bwrap_expr_argv`) and into the
+`std::process::Command` completion path (`sandbox_list_lines`, no egress fd to keep).
+
+Requires Linux 5.11+ (`close_range`); on `ENOSYS` the spawn fails rather than leaking the table. That
+floor is acceptable — prior already requires bwrap, and 5.11 is from 2021.
+
+Regression test: `sandboxed_commands_inherit_no_stray_fds` leaks a non-`CLOEXEC` fd and asserts it is
+absent inside the namespace. Verified to fail (`fd 9 -> /tmp/prior_r8_fd_marker`) with the seal
+disabled and pass with it enabled.
 
 ---
 
@@ -909,9 +977,15 @@ proxy, a trust store, an audit log) that duplicates policy prior already has. Bu
 
 ## Recommendations
 
-Ordered by priority. **R1, R2, R7, and all of R3 except R3d are implemented** (R3a/b/c/e/f landed
+Ordered by priority. **R1, R2, R7, R8, and all of R3 except R3d are implemented** (R3a/b/c/e/f landed
 2026-10-22, in that order). **R3d, and R4/R5/R6, are not.** R3 was revised on 2026-10-22 (bridge
 design, not a Landlock ladder); R4 absorbed the Landlock work that R3 gave up.
+
+### R8 — Seal the inherited fd table (implemented 2026-10-22)
+
+**Implemented** — see Finding 5. `seal_inherited_fds` marks every descriptor ≥ 3 `CLOEXEC` in the
+child before `execve`, keeping stdio and the egress bootstrap fd. Rejects kernels without
+`close_range` (pre-5.11) rather than leaking the table.
 
 ### R7 — Close the inherited terminal (implemented 2026-10-22)
 
@@ -1537,9 +1611,10 @@ Still open:
 
 ### R6 — Tests
 
-**Partly done.** The existing env tests covered the filter in isolation, and would not have caught
-any of the three findings, because all three are about the *composition* of the filter with the rest
-of the bwrap invocation. Added for R1 and R2:
+**Partly done.** Regression tests exist for R1, R2, R7 and R8 (`sandboxed_commands_get_no_terminal`,
+`sandboxed_commands_inherit_no_stray_fds`). The existing env tests covered the filter in isolation
+and would not have caught any of the findings, because they are about the *composition* of the
+filter with the rest of the bwrap invocation. Added for R1 and R2:
 
 - `bwrap_own_environ_does_not_leak_host_secrets` — the test that would have caught Finding 1, and
   the regression test for the R1 fix. It must mount `/proc` to be meaningful; a test without `/proc`
@@ -1725,15 +1800,17 @@ that keeps the policy shared). Everything else is detail.
    allowlist. See "How it was actually implemented" under R3b for the shape, and R3c for the engine.
 2. **R7 (inherited terminal) — DONE** 2026-10-22. A finding, not a plan item, until it was measured:
    `--new-session` alone left prior's tty on fd 0. See Finding 4.
-3. **R3d (seccomp) is the next Linux item**, and it is small and independent: `AF_VSOCK` and
+3. **R8 (fd table) — DONE** 2026-10-22. The general form of R7: seal every descriptor ≥ 3 before
+   `execve`, keep only stdio and the egress bootstrap fd. See Finding 5.
+4. **R3d (seccomp) is the next Linux item**, and it is small and independent: `AF_VSOCK` and
    `io_uring` only. `PR_SET_PDEATHSIG` on the shim is the other half of the same hardening pass and
    can ride with it.
-4. **R3g (macOS)** can start any time now: the schema and the SOCKS5 engine are both done, and the
+5. **R3g (macOS)** can start any time now: the schema and the SOCKS5 engine are both done, and the
    engine is platform-neutral (`egress::host_allowed`, `serve_socks5`'s decision order). mac needs no
    fd passing — a host-loopback listener plus three Seatbelt allow rules is the whole transport.
    Build the profile generator in one module and make the applier a strategy; do **not** back onto
    `zerobox`/`nono` as dependencies.
-5. **R4** is independent of all of the above and can run in parallel with any step. Its (a) and (b)
+6. **R4** is independent of all of the above and can run in parallel with any step. Its (a) and (b)
    parts are documentation and a warning; only (c) needs the `landlock` crate.
 
 **Facts already established, do not re-test:**
