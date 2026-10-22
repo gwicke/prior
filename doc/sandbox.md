@@ -44,7 +44,11 @@ auto_allow = ["^cargo test"]
 # No `enabled` switch: the sandbox is always active when `bwrap` is present
 # (and `bwrap` is required at startup, so prior fails closed without it).
 timeout_secs = 120        # default: 120
-network = false           # default: false (unshare network)
+network = false           # default: false (no egress; netns unshared)
+# network = true          # open destinations, STILL netns-unshared (host-safe)
+# [network]               # optional narrowing on top of `true`
+# enabled = true
+# allow = ["github.com:443"]
 memory_mb = 1024          # default: none (unlimited)
 pid_isolation = true      # default: true (--unshare-pid --pid)
 drop_caps = true           # default: true (--cap-drop ALL)
@@ -80,9 +84,9 @@ pub struct SandboxConfig {
     /// Wall-clock timeout for the whole command. Default 120s. 0/None = no timeout.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
-    /// Give the sandbox network access. Default false (--unshare-net).
+    /// Network egress policy: bare bool or `{ enabled, allow }`.
     #[serde(default)]
-    pub network: Option<bool>,
+    pub network: NetworkPolicy,
     /// RLIMIT_AS in MB (virtual memory cap). Default none.
     #[serde(default)]
     pub memory_mb: Option<u64>,
@@ -389,10 +393,18 @@ with zero config.
 
 - **Deny-by-default root** is the key guarantee: without an explicit binding,
   host files are invisible. Never use `--ro-bind / /`.
-- **`--unshare-net`** blocks network egress by default; opt-in via
-  `network: true`. Once R3a's egress bridge lands the flag becomes
-  unconditional and `network: true` means "egress through the bridge", so X11's
-  abstract socket is unreachable regardless of the setting.
+- **The network namespace is never shared.** `--unshare-net` is emitted
+  regardless of `network`, and `network = true` means "egress *through the
+  bridge*", not "join the host's namespace" (R3a). This is what makes
+  `network = true` host-safe: the abstract X11 socket
+  (`\0/tmp/.X11-unix/X0`) and host `127.0.0.1` services are unreachable because
+  nothing routes to them, independent of whether an allowlist is set.
+  - Two socket kinds, two mechanisms. *Abstract* sockets live in the network
+    namespace, so unsharing is necessary and sufficient. *Pathname* sockets
+    (`/run/user/*/bus`) live in the filesystem, which the netns does not
+    govern — they are excluded by deny-default bindings, and R4's Landlock work
+    is the belt for the case where a binding re-exposes one. An allowlist is a
+    destination filter on top; it is never the safety mechanism.
 - **`/etc` is a working set, not the whole directory.** `ESSENTIAL_ETC` binds
   the files a normal command needs (`/etc/alternatives`, the loader cache, NSS
   config, the CA store, timezone, shell profile). The host's `/etc/passwd`,
@@ -599,7 +611,9 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
       when empty, fall back to `--ro-bind <cwd> <cwd>` + writable tmpfs.
 - [x] Emit flags: per-path `--ro-bind`/`--bind`; `--dev /dev --proc /proc`;
       `--ro-bind` per `ESSENTIAL_ETC` entry; `--tmpfs /tmp --size`;
-      `--unshare-net` (unless `network`); `--unshare-pid --pid`
+      `--unshare-net` (transitional: still conditional until the R3a bridge
+      exists, because unsharing without a bridge would remove all egress);
+      `--unshare-pid --pid`
       (if `pid_isolation`); `--unshare-ipc --unshare-uts --hostname sandbox`;
       `--cap-drop ALL` (if `drop_caps`); `--die-with-parent`.
 - [x] Memory wrapper: `prlimit --as=<MB*1024*1024> -- <argv>` (direct argv, no

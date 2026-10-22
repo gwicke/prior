@@ -7,12 +7,12 @@ reproduced, not inferred.*
 
 ## Status
 
-**R1 and R2 are implemented** (see "Implementation notes" at the end of the Recommendations
-section). **R3, R4, R5 and R6 are not.** R3 was revised on 2026-10-22 after testing the design
-against four reference implementations and this host: it is no longer a Landlock/seccomp ladder but
-a bridge design (R3a–R3h), with Landlock moved to R4 where it is the only fix. Handover notes — what
-to read first, what order to build it in, and what is already settled — are at the end of the
-document ("Where to start next").
+**R1, R2, R3e and R3f are implemented.** **R3's bridge half (R3a–R3d, R3g, R3h), R4, R5 and R6
+are not.** R3 was revised on 2026-10-22 after testing the design against four reference
+implementations and this host: it is no longer a Landlock/seccomp ladder but a bridge design
+(R3a–R3h), with Landlock moved to R4 where it is the only fix. Handover notes — what to read first,
+what order to build it in, and what is already settled — are at the end of the document ("Where to
+start next").
 
 The revision was prompted by one question: *can `network: true` keep the network namespace, so that
 the X11 vector disappears by construction instead of needing three layered controls?* The answer is
@@ -814,8 +814,9 @@ proxy, a trust store, an audit log) that duplicates policy prior already has. Bu
 
 ## Recommendations
 
-Ordered by priority. **R1 and R2 are implemented; R3, R4, R5 and R6 are not.** R3 was revised on
-2026-10-22 (bridge design, not a Landlock ladder); R4 absorbed the Landlock work that R3 gave up.
+Ordered by priority. **R1, R2, R3e and R3f are implemented; the rest of R3, and R4/R5/R6, are
+not.** R3 was revised on 2026-10-22 (bridge design, not a Landlock ladder); R4 absorbed the Landlock
+work that R3 gave up.
 
 ### R1 — Scrub bwrap's *own* environment before it spawns the payload (prerequisite for R2/R3)
 
@@ -1159,21 +1160,30 @@ does not.
 
 #### R3f — The config schema (this is what makes macOS cheap)
 
-`network` is `Option<bool>` today (`src/config.rs:968`). The revision replaces it with a policy that
-both backends consume:
+**IMPLEMENTED 2026-10-22 as [`NetworkPolicy`]** (`src/config.rs`), with the empty-allowlist question
+settled the opposite way to this document's earlier lean. `network` is no longer `Option<bool>`; it
+accepts a bare boolean (unchanged spelling) or a table, and serializes back to the terse form so a
+rewritten config stays diff-friendly:
 
 ```text
-[tool_config.bash.sandbox.network]
+network = false                                  # default: no egress, netns unshared
+network = true                                   # open destinations, STILL netns-unshared
+[tool_config.bash.sandbox.network]               # optional narrowing on top of `true`
 enabled = true
-allow   = ["github.com:443", "*.crates.io:443", "crates.io:80"]
+allow   = ["github.com:443", "*.crates.io:443"]
 ```
 
-- `enabled = false` (default) — no bridge, no proxy vars, netns always.
-- `enabled = true, allow = []` — **deny all**. An explicitly empty allowlist must not mean "allow
-  all"; that is the fail-open direction and it would make the boolean a bypass again.
-- Keep a bare `network = true` working, deprecated, meaning "deny all with a warning" or mapping to
-  a documented default set — **decide this explicitly**, it is user-facing and documented in
-  `settings.toml.example` and `doc/sandbox.md`.
+- **`enabled = true, allow = []` is "open but host-safe", not deny-all** (decided 2026-10-22).
+  Rationale: the reachability guarantee comes from the *namespace*, not the allowlist, so an empty
+  allowlist is not a bypass. The safety property — abstract X11 socket and host `127.0.0.1`
+  unreachable — holds for every enabled form, because `--unshare-net` is unconditional and egress
+  goes through the bridge. "Open but safe for the host" is the intended first-class default;
+  operators narrow with `allow` when they want to. To permit nothing, use `false`.
+- Consequence for ordering: "host-safe" has no meaning until the bridge exists, so **R3b must land
+  before the flag can be flipped unconditional**. Until then `build_bwrap_args` keeps
+  `--unshare-net` conditional on `enabled`, because unsharing with no path out would silently remove
+  all egress, including `agent_browser`. The flag flip and R3b are one change.
+- A bare `network = true` is therefore *not* deprecated: it is exactly `enabled = true, allow = []`.
 
 Do **not** reuse `srt`'s `allowUnixSockets` field: it is macOS-only and means two different things
 per platform. If prior ever wants a socket allowlist, it is a separate key, and on Linux it belongs
@@ -1525,26 +1535,27 @@ that keeps the policy shared). Everything else is detail.
 
 **Order of work, and why:**
 
-1. **R3e (hygiene) and R3f (schema) first.** They are small, they do not touch the spawn path, and
-   they pin the user-facing surface before any code depends on it. R3e also makes the doc's claims
-   true (`--unshare-ipc`, `/dev`, `/proc`, `--unshare-uts`). Decide the bare-`network = true`
-   question in R3f here — it is a config-compat decision and nothing later can be built until it is
-   settled.
-2. **R3c (the policy engine) before R3b.** Because R3g splits the transport from the policy, R3c can
-   be developed and tested against a plain **host-loopback** listener — no bwrap, no fd passing, no
-   namespace. Write the SOCKS5 engine and its allowlist tests first; then R3b is only "how does the
-   listener get into the namespace", which is a much smaller and more testable question. Borrow
-   `socks-proxy.ts` for decision ordering, not for code.
-3. **R3b next, and treat it as the risk.** It is the only item that changes prior's spawn path: the
-   supervisor must outlive the child, and `build_bwrap_expr` returns a `duct::Expression` the caller
-   reads to completion (`src/tools.rs:1399`, `:1889`). Spike the smallest thing that proves:
-   listener bound in-ns → fd out → accepted on outside → one SOCKS handshake answered. If the
-   lifetime change does not fit, the fallback is the socket-file design (R3b's last paragraph) and
-   the rest of the plan is unaffected.
+1. **R3e (hygiene) — DONE**, and **R3f (schema) — DONE.** Both landed 2026-10-22. R3f settled the
+   bare-`network = true` question as *open but host-safe* rather than deny-all; see that section for
+   why, and note that it is what promotes R3b ahead of R3c.
+2. **R3b (the bridge) is now the next item, and it is the risk.** The 2026-10-22 decision made
+   "open but host-safe" the default meaning of `network = true`, and that meaning does not exist
+   until there is a path out of the unshared namespace. The flag cannot be flipped unconditional
+   before the bridge lands, so these are one change. It is also the only item that changes prior's
+   spawn path: the supervisor must outlive the child, and `build_bwrap_expr` returns a
+   `duct::Expression` the caller reads to completion (`src/tools.rs:1399`, `:1889`). Spike the
+   smallest thing that proves: listener bound in-ns → fd out → accepted on outside → one SOCKS
+   handshake answered. If the lifetime change does not fit, the fallback is the socket-file design
+   (R3b's last paragraph) and the rest of the plan is unaffected.
+3. **R3c (the policy engine) after R3b, not before.** R3b lands with a pass-through bridge that
+   carries any destination; R3c then adds the SOCKS5 host:port allowlist inside it. The original
+   order had R3c first so the engine could be tested against host loopback with no bwrap, and that
+   testing strategy still holds — it is just no longer the critical path, because the *default*
+   behaviour (`open`) needs the bridge and does not need the engine at all.
 4. **R3d (seccomp)** last of the Linux work; it is small and independent.
 5. **R3g (macOS)** only when the schema from step 1 exists, and it is genuinely three rules plus a
    profile generator — do not start it earlier, because the point of the schema is that mac consumes
-   it unchanged. It does **not** block on R3b: mac needs no fd passing, so step 2's engine plus a
+   it unchanged. It does **not** block on R3b: mac needs no fd passing, so R3c's engine plus a
    host-loopback listener is a complete macOS implementation.
 6. **R4** is independent of all of the above and can run in parallel with any step. Its (a) and (b)
    parts are documentation and a warning; only (c) needs the `landlock` crate.
@@ -1567,7 +1578,8 @@ that keeps the policy shared). Everything else is detail.
 
 **Open decisions, deliberately not made above:**
 
-- Bare `network = true`: deny-all-with-warning, or a documented default allowlist? (R3f)
+- ~~Bare `network = true`~~ — **settled 2026-10-22**: open destinations, still netns-unshared
+  ("open but host-safe"). An allowlist narrows; it is not the safety mechanism. See R3f.
 - Bridge as a helper *binary* bound into the sandbox, or an `sh -c` fragment? (R3b — a binary is
   cleaner and matches `bsed`'s absolute-path treatment, but it must be bound in.)
 - Does R4's socket-binding warning default to warn, or require an opt-in flag? (R4b)

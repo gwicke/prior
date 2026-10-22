@@ -1931,7 +1931,7 @@ fn build_bwrap_args(
     // `network: true` still means what it always meant, because unsharing here
     // with no bridge would silently remove all connectivity.
     // See `doc/261021_sandbox_env_x11_audit.md` (R3a/R3b).
-    if !cfg.network.unwrap_or(false) {
+    if !cfg.network.enabled {
         args.push("--unshare-net".into());
     }
     if cfg.pid_isolation.unwrap_or(true) {
@@ -2553,7 +2553,7 @@ mod sandbox_tests {
             timeout_secs: timeout_secs
                 .map(|v| crate::config::SandboxTimeoutSecs(Some(v)))
                 .unwrap_or(crate::config::SandboxTimeoutSecs(None)),
-            network: Some(false),
+            network: crate::config::NetworkPolicy::disabled(),
             memory_mb: crate::config::SandboxMemoryMb(None),
             pid_isolation: Some(true),
             drop_caps: Some(true),
@@ -3010,7 +3010,7 @@ mod sandbox_tests {
     fn sandbox_with_env(env: EnvPolicy) -> SandboxConfig {
         SandboxConfig {
             timeout_secs: crate::config::SandboxTimeoutSecs(Some(30)),
-            network: Some(false),
+            network: crate::config::NetworkPolicy::disabled(),
             memory_mb: crate::config::SandboxMemoryMb(None),
             pid_isolation: Some(true),
             drop_caps: Some(true),

@@ -1486,7 +1486,7 @@ mod tests {
 
         let sandbox = SandboxConfig {
             timeout_secs: crate::config::SandboxTimeoutSecs(Some(30)),
-            network: Some(false),
+            network: crate::config::NetworkPolicy::disabled(),
             memory_mb: crate::config::SandboxMemoryMb(None),
             pid_isolation: Some(true),
             drop_caps: Some(true),

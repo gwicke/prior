@@ -963,9 +963,20 @@ pub struct SandboxConfig {
     /// Wall-clock timeout (seconds) for the whole command. `None`/0 = no timeout.
     #[serde(default)]
     pub timeout_secs: SandboxTimeoutSecs,
-    /// Give the sandbox network access. Default false (network is unshared).
-    #[serde(default)]
-    pub network: Option<bool>,
+    /// Network egress policy. Accepts either a bare boolean (the old spelling)
+    /// or a table. See [`NetworkPolicy`] for the semantics and
+    /// `doc/sandbox.md`.
+    ///
+    /// - `network = false` / absent — no egress; the network namespace is
+    ///   unshared and nothing is reachable.
+    /// - `network = true` — **open but host-safe**: destinations are
+    ///   unrestricted, but the sandbox still does not share the host's network
+    ///   namespace, so host-local services and the abstract X11 socket stay
+    ///   unreachable. Requires the egress bridge.
+    /// - `[network] allow = ["host:port", …]` — additionally restrict
+    ///   destinations to the listed host[:port] pairs.
+    #[serde(default, deserialize_with = "deserialize_network")]
+    pub network: NetworkPolicy,
     /// RLIMIT_AS in MB (virtual-memory cap). Default none (unlimited).
     #[serde(default)]
     pub memory_mb: SandboxMemoryMb,
@@ -1002,6 +1013,115 @@ pub struct SandboxConfig {
     pub max_output_bytes: SandboxMaxOutputBytes,
 }
 
+/// Network egress policy for the sandbox.
+///
+/// Written as a bare boolean or a table:
+///
+/// ```toml
+/// network = true                                   # open but host-safe
+/// network = false                                  # no egress (default)
+///
+/// [tool_config.bash.sandbox.network]
+/// enabled = true
+/// allow   = ["github.com:443", "*.crates.io:443"]  # optional narrowing
+/// ```
+///
+/// The distinction that matters is between *destination* policy and *namespace*
+/// policy. Both of the enabled forms keep the sandbox in its own network
+/// namespace — that is what makes `network = true` **host-safe** rather than a
+/// bypass: the abstract X11 socket and host `127.0.0.1` services are unreachable
+/// because nothing routes to them, not because a rule filters them. The
+/// allowlist then narrows *destinations* on top of that, and an empty or absent
+/// `allow` means "any destination".
+///
+/// This is deliberately not fail-closed on an empty allowlist. The reachability
+/// guarantee comes from the namespace, so `enabled = true, allow = []` is "open
+/// but safe", which is the documented first-class default. An operator who wants
+/// nothing reachable sets `enabled = false` (or omits the block), which is the
+/// actual closed state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetworkPolicy {
+    /// Whether egress is permitted at all. Default `false`.
+    pub enabled: bool,
+    /// Optional destination allowlist, each entry `host` or `host:port`.
+    /// Empty means any destination. Only meaningful when `enabled`.
+    pub allow: Vec<String>,
+}
+
+impl NetworkPolicy {
+    /// No egress; the network namespace is unshared and nothing is reachable.
+    pub fn disabled() -> NetworkPolicy {
+        NetworkPolicy::default()
+    }
+
+    /// Egress to any destination, still inside the sandbox's own netns — the
+    /// meaning of a bare `network = true`.
+    pub fn open() -> NetworkPolicy {
+        NetworkPolicy {
+            enabled: true,
+            allow: Vec::new(),
+        }
+    }
+
+    /// True when an allowlist narrows destinations (as opposed to `open()`).
+    pub fn is_restricted(&self) -> bool {
+        self.enabled && !self.allow.is_empty()
+    }
+}
+
+impl Serialize for NetworkPolicy {
+    /// Round-trips to the **bare boolean** when no allowlist is set, so a config
+    /// read and rewritten by prior does not grow a table for the common case.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if !self.enabled {
+            return s.serialize_bool(false);
+        }
+        if self.allow.is_empty() {
+            return s.serialize_bool(true);
+        }
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(Some(2))?;
+        m.serialize_entry("enabled", &true)?;
+        m.serialize_entry("allow", &self.allow)?;
+        m.end()
+    }
+}
+
+/// Deserialize [`NetworkPolicy`] from a bare boolean (the legacy/terse spelling)
+/// or from a table `{ enabled, allow }`.
+///
+/// Kept as a free function because `#[serde(default)]` plus a custom
+/// deserializer needs a named target rather than an inline closure.
+fn deserialize_network<'de, D>(deserializer: D) -> Result<NetworkPolicy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Table {
+        #[serde(default)]
+        enabled: bool,
+        #[serde(default)]
+        allow: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Flag(bool),
+        Table(Table),
+    }
+
+    Ok(match Repr::deserialize(deserializer)? {
+        Repr::Flag(false) => NetworkPolicy::disabled(),
+        Repr::Flag(true) => NetworkPolicy::open(),
+        Repr::Table(t) => NetworkPolicy {
+            enabled: t.enabled,
+            allow: t.allow,
+        },
+    })
+}
+
 /// Default cap on combined stdout+stderr (bytes) retained per sandboxed
 /// command. Output beyond this is truncated with a notice. Overridable via the
 /// `[tool_config.bash.sandbox]` `max_output_bytes` setting.
@@ -1016,7 +1136,7 @@ impl SandboxConfig {
     pub fn with_defaults(&self) -> SandboxConfig {
         SandboxConfig {
             timeout_secs: self.timeout_secs.or(SandboxTimeoutSecs(Some(120))),
-            network: self.network.or(Some(false)),
+            network: self.network.clone(),
             memory_mb: self.memory_mb,
             pid_isolation: self.pid_isolation.or(Some(true)),
             drop_caps: self.drop_caps.or(Some(true)),
@@ -1665,6 +1785,90 @@ mod tests {
         toml_edit::de::from_str(toml).expect("sandbox config should parse")
     }
 
+    // ---- network policy (R3f) ----
+
+    #[test]
+    fn network_absent_is_disabled() {
+        let cfg = parse_bind("");
+        assert_eq!(cfg.network, NetworkPolicy::disabled());
+        assert!(!cfg.network.enabled);
+    }
+
+    #[test]
+    fn network_bare_boolean_still_works() {
+        // The old spelling must keep parsing: `network = true` is now "open but
+        // host-safe" rather than "share the host's netns".
+        let cfg = parse_bind("network = true");
+        assert_eq!(cfg.network, NetworkPolicy::open());
+        assert!(cfg.network.enabled);
+        assert!(
+            !cfg.network.is_restricted(),
+            "a bare true grants any destination"
+        );
+
+        let cfg = parse_bind("network = false");
+        assert_eq!(cfg.network, NetworkPolicy::disabled());
+    }
+
+    #[test]
+    fn network_table_parses_allowlist() {
+        let cfg = parse_bind(
+            r#"
+            [network]
+            enabled = true
+            allow = ["github.com:443", "*.crates.io:443"]
+            "#,
+        );
+        assert!(cfg.network.enabled);
+        assert_eq!(cfg.network.allow, vec!["github.com:443", "*.crates.io:443"]);
+        assert!(cfg.network.is_restricted());
+    }
+
+    #[test]
+    fn network_table_with_empty_allowlist_is_open_not_denied() {
+        // The documented first-class default: enabled with no allowlist means
+        // any destination, because host safety comes from the netns rather than
+        // from the allowlist. Asserted so nobody "fixes" this into a deny.
+        let cfg = parse_bind("[network]\nenabled = true");
+        assert!(cfg.network.enabled);
+        assert!(cfg.network.allow.is_empty());
+        assert!(!cfg.network.is_restricted());
+        assert_eq!(cfg.network, NetworkPolicy::open());
+    }
+
+    #[test]
+    fn network_table_rejects_unknown_keys() {
+        // A typo in the table must be an error, not a silently ignored key that
+        // leaves the operator thinking they restricted destinations.
+        let err = toml_edit::de::from_str::<SandboxConfig>(
+            "[network]\nenabled = true\nallowed = [\"x:1\"]",
+        );
+        assert!(err.is_err(), "unknown key under [network] should fail");
+    }
+
+    #[test]
+    fn network_serializes_back_to_the_terse_form() {
+        // Round-tripping must not grow a table for the common cases, so a config
+        // prior rewrites stays diff-friendly.
+        #[derive(Serialize)]
+        struct Wrap<'a> {
+            network: &'a NetworkPolicy,
+        }
+        let ser = |p: &NetworkPolicy| toml_edit::ser::to_string(&Wrap { network: p }).expect("ser");
+        assert_eq!(ser(&NetworkPolicy::disabled()), "network = false\n");
+        assert_eq!(ser(&NetworkPolicy::open()), "network = true\n");
+        let restricted = NetworkPolicy {
+            enabled: true,
+            allow: vec!["a:1".into()],
+        };
+        let out = ser(&restricted);
+        assert!(out.contains("enabled = true"), "{out}");
+        assert!(out.contains("allow = [\"a:1\"]"), "{out}");
+        // And it must parse back to the same value.
+        let back = parse_bind(&out);
+        assert_eq!(back.network, restricted);
+    }
+
     #[test]
     fn bind_simple_ro() {
         // The `ro` list takes bare paths (and `BindPath::Remap`) as read-only.
@@ -1760,7 +1964,7 @@ mod tests {
     fn with_defaults_merges() {
         let raw = SandboxConfig {
             timeout_secs: SandboxTimeoutSecs(Some(5)),
-            network: None,
+            network: NetworkPolicy::disabled(),
             memory_mb: SandboxMemoryMb(Some(512)),
             pid_isolation: None,
             drop_caps: None,
@@ -1772,7 +1976,7 @@ mod tests {
         };
         let d = raw.with_defaults();
         assert_eq!(d.timeout_secs, SandboxTimeoutSecs(Some(5)));
-        assert_eq!(d.network, Some(false));
+        assert_eq!(d.network, NetworkPolicy::disabled());
         assert_eq!(d.memory_mb, SandboxMemoryMb(Some(512)));
         assert_eq!(d.pid_isolation, Some(true));
         assert_eq!(d.drop_caps, Some(true));
@@ -1803,7 +2007,7 @@ mod tests {
         let raw = SandboxConfig::default();
         let d = raw.with_defaults();
         assert_eq!(d.timeout_secs, SandboxTimeoutSecs(Some(120)));
-        assert_eq!(d.network, Some(false));
+        assert_eq!(d.network, NetworkPolicy::disabled());
         assert_eq!(d.pid_isolation, Some(true));
         assert_eq!(d.drop_caps, Some(true));
         assert_eq!(d.tmp_size_mb, SandboxTmpSizeMb(Some(256)));

@@ -81,7 +81,18 @@ timeout_secs = 120
 # Maximum combined stdout+stderr (bytes) to retain from a single command.
 # Output beyond this is truncated with a notice. Default 20480 (20 KiB).
 # max_output_bytes = 20480
-# Give the sandbox network access (default false => network unshared).
+# Network egress policy (default false => no egress, network unshared).
+#
+#   network = false   no egress; the network namespace is unshared.
+#   network = true    OPEN BUT HOST-SAFE: any destination is reachable, but the
+#                     sandbox keeps its own network namespace, so host-local
+#                     services and the abstract X11 socket stay unreachable.
+#   [network]         optionally narrow destinations on top of that.
+#   enabled = true
+#   allow = ["github.com:443", "*.crates.io:443"]
+#
+# An allowlist restricts *destinations*; it is not what makes `true` safe. An
+# empty `allow` means any destination. To permit nothing, use `false`.
 network = false
 # Virtual-memory cap in MB (default none).
 # memory_mb = 1024
