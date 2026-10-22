@@ -992,7 +992,7 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub rw: Vec<BindPath>,
     /// Environment-filter policy. See [`EnvPolicy`]. When unset, a built-in
-    /// deny-secrets default (see [`DEFAULT_ENV_DISALLOW`]) is applied.
+    /// deny-by-default allowlist (see [`DEFAULT_ENV_ALLOW`]) is applied.
     #[serde(default)]
     pub env: Option<EnvPolicy>,
     /// Maximum combined stdout+stderr (bytes) to retain from a single sandboxed
@@ -1048,10 +1048,10 @@ impl SandboxConfig {
 /// one policy.
 ///
 /// - `disallow`: start from the full inherited environment and drop names
-///   matching any pattern (this is also the built-in default when `env` is
-///   unset — see [`DEFAULT_ENV_DISALLOW`]).
+///   matching any pattern.
 /// - `only_allow`: keep only names matching a pattern; everything else is
-///   dropped (deny-by-default).
+///   dropped (deny-by-default). This is the built-in default when `env` is
+///   unset — see [`DEFAULT_ENV_ALLOW`].
 ///
 /// Patterns are matched against variable *names* (not values) and support a
 /// minimal glob: `*` matches any run of characters, `?` matches a single
@@ -1082,23 +1082,102 @@ pub enum EnvMode {
 /// block. Drops common secret shapes (`*_KEY`, `*_SECRET`, `*_TOKEN`, `AWS_*`,
 /// `SSH_AUTH_SOCK`) while leaving the rest of the environment intact, so
 /// ordinary commands (which rely on `PATH`, `HOME`, `TERM`, ...) still work.
+///
+/// This is a *fallback* only, and no longer the effective default: a denylist
+/// only removes the secret shapes it happens to know about and passes
+/// everything else through, so the effective default is the allowlist below.
+/// See `doc/261021_sandbox_env_x11_audit.md` (Finding 2) and `doc/sandbox.md`.
 pub const DEFAULT_ENV_DISALLOW: &[&str] =
     &["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"];
+
+/// Built-in default `env` allowlist, applied when the user configures no `env`
+/// block.
+///
+/// Deny-by-default: the sandboxed command starts from an empty environment and
+/// gets only the variables listed here. A denylist cannot work here, because
+/// it only removes the secret shapes it knows about and passes everything else
+/// through — including the desktop/session variables (`DISPLAY`,
+/// `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_AGENT_PID`, ...) that make
+/// the host's X11 and IPC endpoints reachable.
+///
+/// Notes on individual entries:
+///
+/// - `PATH` is required: bwrap resolves the sandboxed program against the
+///   *command's* `PATH`, so without it no external command runs at all.
+/// - `PWD` is deliberately absent. bwrap's `--clearenv` sets `PWD` to the
+///   in-namespace cwd, which is what the command should see; a host `PWD`
+///   would name a path that need not exist inside the sandbox.
+/// - `TMPDIR` is deliberately absent: `/tmp` is a fresh tmpfs inside the
+///   sandbox, so the host's `TMPDIR` would name a path outside it. The
+///   sandbox sets `TMPDIR=/tmp` itself (see [`DEFAULT_FORCED_ENV`]).
+/// - `GIT_*` is deliberately absent: `GIT_SSH_COMMAND`, `GIT_ASKPASS` and
+///   `GIT_CONFIG_*` are behavioural hooks that *execute* programs, so they
+///   belong on the deny side even though the `GIT_` prefix reads as benign.
+///   Operators who want them can add them to `sandbox.env.patterns`.
+/// - `LC_*` and `TZ` are included for reproducible output; `LANG`/`LC_ALL`
+///   matter to tools that switch on locale.
+pub const DEFAULT_ENV_ALLOW: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TERM",
+    "LANG",
+    "LC_*",
+    "TZ",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "SOURCE_DATE_EPOCH",
+];
+
+/// Environment variables the sandbox sets itself, rather than inheriting them
+/// from the host.
+///
+/// `TMPDIR` points at the sandbox's own `/tmp` — a fresh tmpfs, mounted
+/// read-write and invisible to the host's `/tmp`. The host's `TMPDIR` (if set)
+/// names a directory that is not mapped into the namespace at all, so
+/// inheriting it would point tools at a path that does not exist inside.
+///
+/// Only applied for the built-in default policy: an explicit `sandbox.env`
+/// block is authoritative in full, so an operator who lists `TMPDIR` gets the
+/// host's value, and one who omits it gets none.
+pub const DEFAULT_FORCED_ENV: &[(&str, &str)] = &[("TMPDIR", "/tmp")];
 
 impl SandboxConfig {
     /// Effective environment policy.
     ///
     /// Returns the user's `env` policy if configured, otherwise the built-in
-    /// deny-secrets default ([`DEFAULT_ENV_DISALLOW`]). The default does not
+    /// deny-by-default allowlist ([`DEFAULT_ENV_ALLOW`]). The default does not
     /// depend on `bwrap` presence; it applies whenever the sandbox runs.
     pub fn env_policy(&self) -> EnvPolicy {
         match &self.env {
             Some(p) => p.clone(),
             None => EnvPolicy {
-                mode: EnvMode::Disallow,
-                patterns: DEFAULT_ENV_DISALLOW.iter().map(|s| s.to_string()).collect(),
+                mode: EnvMode::OnlyAllow,
+                patterns: DEFAULT_ENV_ALLOW.iter().map(|s| s.to_string()).collect(),
             },
         }
+    }
+
+    /// Extra `(name, value)` pairs the sandbox sets for the command, beyond
+    /// what the policy selects from the host environment.
+    ///
+    /// Empty when the user configured an explicit `sandbox.env` policy: their
+    /// configuration is authoritative in full, with no defaults mixed in.
+    pub fn env_forced(&self) -> Vec<(String, String)> {
+        if self.env.is_some() {
+            return Vec::new();
+        }
+        DEFAULT_FORCED_ENV
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
     }
 }
 
@@ -1113,6 +1192,36 @@ pub fn env_vars_to_keep(policy: &EnvPolicy, env: &[(String, String)]) -> Vec<(St
         EnvMode::Disallow => env.iter().filter(|(n, _)| !keep(n)).cloned().collect(),
         EnvMode::OnlyAllow => env.iter().filter(|(n, _)| keep(n)).cloned().collect(),
     }
+}
+
+/// The environment `bwrap` itself is spawned with.
+///
+/// This is *not* the environment the sandboxed command sees (that one is
+/// governed by the [`EnvPolicy`]). It is the environment of the bwrap
+/// process, and it matters for a reason that is easy to miss: with
+/// `--unshare-pid`, bwrap is PID 1 inside the namespace, so its own
+/// environment is readable at `/proc/1/environ` by anything running inside
+/// the sandbox. If bwrap inherits the host environment, the command can read
+/// every secret the policy dropped, straight out of `/proc/1/environ`.
+///
+/// So bwrap gets a minimal environment of its own: `PATH`, so the `bwrap`
+/// binary can be found. Nothing else — no API keys, no socket paths.
+///
+/// `PATH` is resolved from the host environment. It is needed for the exec of
+/// the `bwrap` binary itself, and it is harmless: `PATH` is a list of
+/// directories, not a credential, and the same value is separately handed to
+/// the sandboxed command by the policy.
+///
+/// Note that bwrap does *not* need `HOME`: it does not expand `~` in bind
+/// arguments (prior expands those itself, in `resolve_with_home`), and it
+/// reads no other variable from its own environment. Keeping the set to
+/// `PATH` alone means there is one fewer thing to audit.
+pub fn bwrap_scrub_env() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        out.push(("PATH".to_string(), path.to_string_lossy().into_owned()));
+    }
+    out
 }
 
 /// True if `name` matches any of `patterns` (literal or minimal glob).
@@ -1800,14 +1909,14 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_drops_secrets_but_keeps_path() {
-        // No `env` configured => built-in deny-secrets default applies.
+    fn default_policy_is_a_deny_by_default_allowlist() {
+        // No `env` configured => built-in allowlist default applies.
         let cfg = SandboxConfig::default();
         let policy = cfg.env_policy();
-        assert_eq!(policy.mode, EnvMode::Disallow);
+        assert_eq!(policy.mode, EnvMode::OnlyAllow);
         assert_eq!(
             policy.patterns,
-            DEFAULT_ENV_DISALLOW
+            DEFAULT_ENV_ALLOW
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
@@ -1830,11 +1939,97 @@ mod tests {
         assert!(!names.contains(&"HF_TOKEN"));
         assert!(!names.contains(&"AWS_SECRET_ACCESS_KEY"));
         assert!(!names.contains(&"SSH_AUTH_SOCK"));
-        // `*_SECRET` glob catches MY_SECRET too.
         assert!(!names.contains(&"MY_SECRET"));
         // Non-secret vars survive.
         assert!(names.contains(&"PATH"));
         assert!(names.contains(&"HOME"));
+    }
+
+    /// The allowlist default must also drop the host's *desktop* variables.
+    /// A denylist could not: these are not secrets, they are pointers to the
+    /// host's X11 and IPC endpoints, and they are what makes the host's
+    /// display and session bus reachable from inside the sandbox.
+    #[test]
+    fn default_policy_drops_host_desktop_and_session_vars() {
+        let cfg = SandboxConfig::default();
+        let policy = cfg.env_policy();
+        let kept = env_vars_to_keep(
+            &policy,
+            &env(&[
+                ("DISPLAY", ":0"),
+                ("XAUTHORITY", "/home/u/.Xauthority"),
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock"),
+                ("GPG_AGENT_INFO", "/run/user/1000/gnupg/S.gpg-agent"),
+                ("SSH_AGENT_PID", "1234"),
+                ("I3SOCK", "/run/user/1000/i3/ipc-socket.2412"),
+                ("TERM", "xterm-256color"),
+                ("PATH", "/b"),
+            ]),
+        );
+        let names: Vec<&str> = kept.iter().map(|(n, _)| n.as_str()).collect();
+        for leaked in [
+            "DISPLAY",
+            "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "GPG_AGENT_INFO",
+            "SSH_AGENT_PID",
+            "I3SOCK",
+        ] {
+            assert!(
+                !names.contains(&leaked),
+                "{leaked} must not survive the default allowlist"
+            );
+        }
+        // TERM is on the allowlist, so ordinary commands still behave.
+        assert!(names.contains(&"TERM"));
+    }
+
+    /// `PWD` and `TMPDIR` are deliberately *not* on the default allowlist:
+    /// bwrap sets `PWD` to the in-namespace cwd itself, and `/tmp` inside the
+    /// sandbox is a fresh tmpfs that the host's `TMPDIR` does not name. The
+    /// sandbox supplies `TMPDIR=/tmp` itself (see `env_forced`).
+    #[test]
+    fn default_policy_omits_pwd_and_tmpdir_but_sandbox_sets_tmpdir() {
+        let cfg = SandboxConfig::default();
+        assert!(
+            !DEFAULT_ENV_ALLOW.contains(&"PWD"),
+            "PWD is set by bwrap's --clearenv, not inherited"
+        );
+        assert!(
+            !DEFAULT_ENV_ALLOW.contains(&"TMPDIR"),
+            "the host TMPDIR names a path outside the sandbox"
+        );
+
+        let forced = cfg.env_forced();
+        assert_eq!(
+            forced,
+            vec![("TMPDIR".to_string(), "/tmp".to_string())],
+            "the sandbox must point TMPDIR at its own tmpfs"
+        );
+    }
+
+    /// An explicit `sandbox.env` block is authoritative in full: the built-in
+    /// allowlist and the forced `TMPDIR` must not be mixed in behind the
+    /// operator's back.
+    #[test]
+    fn explicit_env_policy_suppresses_the_built_in_defaults() {
+        let cfg = SandboxConfig {
+            env: Some(EnvPolicy {
+                mode: EnvMode::OnlyAllow,
+                patterns: vec!["PATH".into()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(cfg.env_forced(), Vec::new());
+        let kept = env_vars_to_keep(
+            &cfg.env_policy(),
+            &env(&[("TMPDIR", "/host/tmp"), ("PATH", "/b")]),
+        );
+        let names: Vec<&str> = kept.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["PATH"]);
     }
 
     #[test]

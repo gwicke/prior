@@ -8,9 +8,9 @@ use tokio::fs;
 
 #[allow(unused_imports)]
 use crate::config::{
-    env_vars_to_keep, resolve_path_policy, resolve_paths, BashTimeout, ByteLimit, ByteOffset,
-    ContextLines, ReadLimit, ReadOffset, SandboxConfig, SandboxMaxOutputBytes, SandboxMemoryMb,
-    SandboxTimeoutSecs, SandboxTmpSizeMb,
+    bwrap_scrub_env, env_vars_to_keep, resolve_path_policy, resolve_paths, BashTimeout, ByteLimit,
+    ByteOffset, ContextLines, ReadLimit, ReadOffset, SandboxConfig, SandboxMaxOutputBytes,
+    SandboxMemoryMb, SandboxTimeoutSecs, SandboxTmpSizeMb,
 };
 use crate::path_util::relativize_path;
 
@@ -1171,7 +1171,15 @@ pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
     crate::sandbox_state::merge_into(&mut cfg);
     let args = build_bwrap_args(&cfg, true, &[]).ok()?;
 
-    let output = std::process::Command::new("bwrap")
+    // `env_clear` + explicit vars: bwrap must not inherit the host
+    // environment (see `config::bwrap_scrub_env` for why). PATH is included so
+    // the `bwrap` binary itself can be found.
+    let mut cmd = std::process::Command::new("bwrap");
+    cmd.env_clear();
+    for (name, value) in bwrap_scrub_env() {
+        cmd.env(name, value);
+    }
+    let output = cmd
         .args(&args)
         .arg("--")
         .args(["ls", "-lap", "--time-style=+%Y-%m-%dT%H:%M:%S", dir])
@@ -1844,9 +1852,14 @@ fn build_bwrap_args(
     // leak host secrets (API keys, tokens, SSH agent socket, ...) into the
     // LLM-driven command. We start from a clean env (`--clearenv` retains
     // only PWD) and explicitly re-expose exactly the variables the policy
-    // permits. The policy is deny-by-default (secrets) unless the user set an
-    // explicit `env` block. Always emit `--clearenv` (even when nothing is
-    // kept) so the policy is enforced regardless of how many vars survive.
+    // permits. The policy is deny-by-default (an allowlist) unless the user
+    // set an explicit `env` block. Always emit `--clearenv` (even when
+    // nothing is kept) so the policy is enforced regardless of how many vars
+    // survive.
+    //
+    // This governs the environment of the *command*. bwrap's own environment
+    // is scrubbed separately, at spawn time — see `bwrap_scrub_env` and
+    // `build_bwrap_expr`.
     let policy = cfg.env_policy();
     let keep = env_vars_to_keep(&policy, &std::env::vars().collect::<Vec<_>>());
     args.push("--clearenv".into());
@@ -1854,6 +1867,15 @@ fn build_bwrap_args(
         args.push("--setenv".into());
         args.push(name.clone());
         args.push(value.clone());
+    }
+    // Variables the sandbox sets itself (e.g. TMPDIR pointing at the
+    // sandbox's own tmpfs). Emitted after the policy's variables, so they win
+    // the "last --setenv wins" ordering. Only present for the built-in
+    // default policy; an explicit `env` block is authoritative in full.
+    for (name, value) in cfg.env_forced() {
+        args.push("--setenv".into());
+        args.push(name);
+        args.push(value);
     }
 
     Ok(args)
@@ -1889,7 +1911,12 @@ fn build_bwrap_expr(
     args.push("--".into());
     args.extend(post);
 
-    Ok(duct::cmd("bwrap", &args))
+    // `full_env` replaces duct's inherited environment wholesale (duct
+    // otherwise seeds it from the parent process). This is the R1 fix: bwrap
+    // must not inherit the host environment, because with `--unshare-pid`
+    // bwrap is PID 1 inside the namespace and its own environment is readable
+    // at `/proc/1/environ`. See `config::bwrap_scrub_env`.
+    Ok(duct::cmd("bwrap", &args).full_env(bwrap_scrub_env()))
 }
 
 /// Build a `duct` expression that runs a program with an explicit argv list
@@ -1913,7 +1940,7 @@ fn build_bwrap_expr_argv(
     let post = memory_wrapped_target(cfg.memory_mb, argv.to_vec(), false);
     args.push("--".into());
     args.extend(post);
-    Ok(duct::cmd("bwrap", &args))
+    Ok(duct::cmd("bwrap", &args).full_env(bwrap_scrub_env()))
 }
 
 /// Best-effort home directory lookup for `~` expansion in bindings.
@@ -2892,6 +2919,117 @@ mod sandbox_tests {
         );
         assert!(out.contains("PATH_OK="), "PATH missing: {out}");
         std::env::remove_var("PRIOR_TEST_KEY2");
+    }
+
+    /// The R1 fix, tested end-to-end: bwrap must not inherit the host
+    /// environment, because with `--unshare-pid` bwrap is PID 1 inside the
+    /// namespace and its own environment is readable at `/proc/1/environ`.
+    ///
+    /// Before the fix, this printed the secret: `--clearenv` only clears the
+    /// environment of bwrap's *child*, so bwrap itself still carried the host
+    /// env, and the command could read it straight out of `/proc/1/environ`.
+    ///
+    /// `/proc` is bound explicitly: the default sandbox has no procfs, and
+    /// without it there is no `/proc/1/environ` to read and the test would
+    /// pass vacuously. The leak needs procfs to be reachable, so the test
+    /// creates that condition.
+    #[tokio::test]
+    #[serial]
+    async fn bwrap_own_environ_does_not_leak_host_secrets() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(
+            vec![BindPath::Simple("/proc".into())],
+            vec![],
+            Some(30),
+        )));
+        std::env::set_var("PRIOR_R1_LEAK", "r1leakedvalue");
+        // Read the *bwrap* process's own environ (PID 1 under --unshare-pid),
+        // not the command's. The command's environ is the policy's business;
+        // bwrap's is the leak.
+        let out = run_sandboxed(
+            "tr '\\0' '\\n' < /proc/1/environ | grep -a . || echo NO_PROC",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.contains("r1leakedvalue"),
+            "host secret leaked via bwrap's own /proc/1/environ: {out}"
+        );
+        assert!(
+            !out.contains("PRIOR_R1_LEAK"),
+            "host secret name leaked via bwrap's own /proc/1/environ: {out}"
+        );
+        std::env::remove_var("PRIOR_R1_LEAK");
+    }
+
+    /// The same leak, via a name that no env policy would drop: it is not a
+    /// secret, so no value-based policy could ever have caught it. Only
+    /// scrubbing bwrap's own environment closes it.
+    #[tokio::test]
+    #[serial]
+    async fn bwrap_own_environ_is_scrubbed_not_merely_filtered() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(
+            vec![BindPath::Simple("/proc".into())],
+            vec![],
+            Some(30),
+        )));
+        std::env::set_var("PRIOR_R1_BENIGN", "benignvalue");
+        let out = run_sandboxed(
+            "tr '\\0' '\\n' < /proc/1/environ | grep -a . || echo NO_PROC",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.contains("benignvalue"),
+            "non-secret host var survived in bwrap's environ: {out}"
+        );
+        std::env::remove_var("PRIOR_R1_BENIGN");
+    }
+
+    /// bwrap's own environment is minimal: `PATH` (so the bwrap binary can be
+    /// found) and nothing else. A scrub set that grew to include the host's
+    /// `HOME` or any other variable would reintroduce the leak, so pin the
+    /// shape.
+    #[test]
+    fn bwrap_scrub_env_is_minimal() {
+        let scrub = bwrap_scrub_env();
+        let names: Vec<&str> = scrub.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"PATH"),
+            "PATH is required to exec the bwrap binary: {names:?}"
+        );
+        for (name, _) in &scrub {
+            assert!(
+                matches!(name.as_str(), "PATH"),
+                "unexpected var in bwrap's scrub env: {name}"
+            );
+        }
+    }
+
+    /// The `sandbox_list_lines` path spawns bwrap through
+    /// `std::process::Command` rather than duct, so it needs its own scrub.
+    /// This test pins that the scrubbed spawn still works: a `bwrap` that
+    /// could not be found (because `env_clear` left no `PATH` to look it up
+    /// in) would make the listing return `None`.
+    #[test]
+    fn sandbox_list_lines_works_with_a_scrubbed_environment() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
+        let entries = crate::path_complete::list_sandbox("/");
+        assert!(
+            entries.is_some(),
+            "listing / inside the sandbox failed; bwrap may not have been found \
+             with a scrubbed environment"
+        );
     }
 
     #[tokio::test]

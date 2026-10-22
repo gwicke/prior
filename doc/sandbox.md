@@ -278,47 +278,86 @@ bwrap **inherits the parent environment verbatim** by default — it applies no
 env filtering of its own. prior runs with provider API keys in its process
 environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `HF_TOKEN`, `AWS_*`, ...),
 plus any host secrets the operator's shell holds (`SSH_AUTH_SOCK`,
-`GITHUB_TOKEN`, ...). Without explicit sanitization, a sandboxed LLM command
-could read those secrets. The sandbox therefore applies an **environment
-policy** on top of bwrap's filesystem/network/PID/cap isolation.
+`GITHUB_TOKEN`, ...) and the host's desktop session variables (`DISPLAY`,
+`DBUS_SESSION_BUS_ADDRESS`, ...). Without explicit sanitization, a sandboxed
+LLM command could read those secrets. The sandbox therefore applies an
+**environment policy** on top of bwrap's filesystem/network/PID/cap isolation,
+and spawns bwrap itself with a scrubbed environment.
 
 The policy is configured under `sandbox.env` as a single mutually-exclusive
 mode (you cannot combine a blacklist and a whitelist in one block):
 
 ```toml
-# Blacklist (default when `env` is unset): start from the full env,
-# drop names matching any pattern. Glob `*`,`?` plus literal.
+# Whitelist (default when `env` is unset): keep ONLY matching names;
+# everything else dropped. Glob `*`,`?` plus literal.
 [tool_config.bash.sandbox.env]
-mode = "disallow"
-patterns = ["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"]
-# -- or -- Whitelist: keep ONLY matching names; everything else dropped.
+mode = "only_allow"
+patterns = ["PATH", "HOME", "TERM", "LANG", "CARGO_HOME", "RUSTUP_HOME"]
+# -- or -- Blacklist: start from the full env, drop names matching any pattern.
 # [tool_config.bash.sandbox.env]
-# mode = "only_allow"
-# patterns = ["PATH", "HOME", "TERM", "LANG"]
+# mode = "disallow"
+# patterns = ["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"]
 ```
 
-- `disallow` keeps the whole environment minus the matches. An **empty**
-  `patterns` list keeps everything (a debug / allow-all escape hatch).
 - `only_allow` keeps only the matches. An **empty** `patterns` list wipes the
   environment (only `PWD` survives bwrap's `--clearenv`); commands that need
   `PATH` will fail, so whitelists must include it.
+- `disallow` keeps the whole environment minus the matches. An **empty**
+  `patterns` list keeps everything (a debug / allow-all escape hatch).
 
 **Default.** When `sandbox.env` is omitted entirely, prior applies the
-built-in `disallow` policy `["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*",
-"SSH_AUTH_SOCK"]`. This drops common secret shapes while leaving `PATH`,
-`HOME`, `TERM`, `LANG`, ... intact, so ordinary commands keep working. It is a
-defense-in-depth measure: the sandbox already blocks network egress by
-default, so a leaked key cannot be exfiltrated unless `network: true`.
+built-in **allowlist** (`config::DEFAULT_ENV_ALLOW`):
+
+```
+PATH, HOME, TERM, LANG, LC_*, TZ, USER, LOGNAME, SHELL,
+CARGO_HOME, RUSTUP_HOME, RUSTUP_TOOLCHAIN,
+XDG_CACHE_HOME, XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME,
+SOURCE_DATE_EPOCH
+```
+
+A denylist cannot be the default: it only removes the secret shapes it knows
+about and passes everything else through. That includes the host's *desktop*
+variables — `DISPLAY`, `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`,
+`XDG_RUNTIME_DIR`, `GPG_AGENT_INFO`, `SSH_AGENT_PID` — which are not secrets
+but are pointers to the host's X11 and IPC endpoints, and which make those
+endpoints reachable from inside the sandbox. See
+`doc/261021_sandbox_env_x11_audit.md` (Finding 2) for the measurements.
+
+The sandbox additionally sets `TMPDIR=/tmp` itself, pointing at its own tmpfs
+rather than the host's `/tmp` (which is not mapped in). It does not inherit
+the host's `TMPDIR`, and `TMPDIR` is deliberately not on the allowlist.
+`PWD` is likewise absent: bwrap's `--clearenv` sets it to the in-namespace
+cwd, which is what the command should see.
+
+An explicit `sandbox.env` block is authoritative in full — the built-in
+allowlist and the forced `TMPDIR` are not mixed in. An operator who wants the
+old denylist behaviour can ask for it explicitly:
+
+```toml
+[tool_config.bash.sandbox.env]
+mode = "disallow"
+patterns = ["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"]
+```
 
 **Mechanism.** `build_bwrap_expr` always emits `--clearenv` (which retains
 only `PWD`) followed by `--setenv NAME VALUE` for each variable the policy
 permits. This makes the policy explicit and verifiable (inspect the `--setenv`
 args) rather than relying on bwrap's inheritance behavior.
 
-> **Caveat:** env isolation depends on bwrap's `--clearenv`/`--setenv`. `bwrap`
-> is required at startup, so the sandbox is always active when a command runs;
-> the environment is sanitized every time. There is no unsandboxed execution
-> path, so a command is never run with the host environment unsanitized.
+**bwrap's own environment is scrubbed too.** `--clearenv` only clears the
+environment of bwrap's *child*. With `--unshare-pid`, bwrap is PID 1 inside
+the namespace, so its own environment is readable at `/proc/1/environ` by
+anything running in the sandbox — and if bwrap inherited the host
+environment, the command could read every secret the policy dropped, straight
+out of `/proc/1/environ`. prior therefore spawns bwrap with a scrubbed
+environment of its own (`config::bwrap_scrub_env`): `PATH` and nothing else,
+so the `bwrap` binary can be found. The secret never reaches bwrap, so there
+is nothing for `/proc/1/environ` to leak.
+
+> **Caveat:** the `--setenv` values the policy permits are still visible in
+> `/proc/1/cmdline` (bwrap's argument vector). That is host fingerprinting,
+> not secret leakage. A binding that exposes a host *socket* path would make
+> that socket reachable regardless of the env policy.
 
 ### Path-binding special case
 
