@@ -1067,8 +1067,30 @@ netns — which is *after* the argv is built. Two ways out, both used in the ref
 Related: `ALL_PROXY=socks5h://127.0.0.1:<port>` is the variable that matters for a SOCKS-only
 bridge. `HTTPS_PROXY`/`HTTP_PROXY` pointing at a `socks5h://` URL is accepted by `curl` but not
 universally by other clients, so **either set only `ALL_PROXY`, or set all three and document the
-expectation**.
-That choice belongs with R3a's operator-facing consequences.
+expectation**. That choice belongs with R3a's operator-facing consequences.
+
+**Measured (2026-10-22), answering the question above.** All three variables set to
+`socks5h://127.0.0.1:<port>` were exercised against a TCP-loopback SOCKS5 relay — i.e. the *macOS*
+transport shape from R3g, which is also what the Linux bridge presents to clients:
+
+```text
+curl https://example.com/         HTTP 200
+curl http://example.com/          HTTP 200   (plain HTTP also works via socks5h)
+git ls-remote https://github.com/octocat/Hello-World   -> refs/heads/master
+```
+
+So `curl` and `git` both honour `socks5h` for plain HTTP **and** HTTPS; setting all three is the
+right default and needs no per-client carve-out for prior's tool set. Two things this does *not*
+cover, both expected under the design:
+
+- **A client that speaks only `http://` proxy syntax.** `curl --proxy http://…` uses absolute-form
+  `GET` for plain HTTP and `CONNECT` for TLS, and a SOCKS-only bridge answers `405` to the former
+  (measured). Clients given `ALL_PROXY=socks5h://…` are unaffected; only a hand-configured
+  `http_proxy=http://…` is. Worth knowing if an operator overrides the variables.
+- **`curl --proxy socks5h:///path/to/socket`** — SOCKS over a *Unix path* is not supported by
+  libcurl (`Could not resolve proxy: tmp`, measured). This is exactly why the bridge must present a
+  **loopback TCP** endpoint and not a bound socket path. It is an independent confirmation of the
+  R3a design decision, from the client side.
 
 **How it was actually implemented (2026-10-22).** The spike found a simpler shape than the sketch
 above, and the code follows it. Read `src/egress.rs` and `src/bin/prior-egress.rs`; this is the map.
@@ -1628,6 +1650,13 @@ that keeps the policy shared). Everything else is detail.
   proof of R4's premise.
 - Seatbelt needs no bridge on macOS: `(allow network-outbound (remote ip "localhost:3128"))` plus
   two more allow lines is the whole implementation (`srt:macos-sandbox-utils.ts:1318-1344`).
+- **`curl` and `git` both honour `ALL_PROXY=socks5h://127.0.0.1:<port>` for plain HTTP and HTTPS**
+  (measured against a TCP-loopback relay, i.e. R3g's transport shape). No per-client workaround is
+  needed for prior's tool set, and this is the main unknown that stood in the way of R3g. See the
+  "Measured" note under R3b.
+- **SOCKS over a Unix *path* is unsupported by libcurl** (`--proxy socks5h:///path` fails to parse
+  the proxy). Independent confirmation that the bridge must expose loopback TCP, not a bound socket
+  path — so R3a's design is forced from the client side too.
 
 **Open decisions, deliberately not made above:**
 

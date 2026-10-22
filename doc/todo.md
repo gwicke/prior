@@ -7,7 +7,8 @@ and link a doc/ and/or commit hash
       through the `prior-egress` shim + SOCKS5 allowlist (`src/egress.rs`). X11 unreachable by
       construction. Spec + handover: `doc/261021_sandbox_env_x11_audit.md`.
 - [ ] sandbox R3d: seccomp for `AF_VSOCK` + `io_uring`, and `PR_SET_PDEATHSIG` on the shim.
-      Then R3g (macOS: three Seatbelt rules + a profile generator, reusing `egress::host_allowed`).
+      Then R3g (macOS: three Seatbelt rules + a profile generator, reusing `egress::host_allowed`;
+      its main unknown is settled: `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https).
       R4 (Landlock, per-path unix sockets) is independent.
       UDP is deferred; if needed the shape is `pasta`/`slirp4netns` plus in-sandbox nftables,
       not Landlock or host iptables — reasoning in R3h.
