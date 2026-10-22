@@ -1183,6 +1183,7 @@ pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
         .args(&args)
         .arg("--")
         .args(["ls", "-lap", "--time-style=+%Y-%m-%dT%H:%M:%S", dir])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -2144,7 +2145,17 @@ fn build_bwrap_expr(
     // must not inherit the host environment, because with `--unshare-pid`
     // bwrap is PID 1 inside the namespace and its own environment is readable
     // at `/proc/1/environ`. See `config::bwrap_scrub_env`.
-    Ok(duct::cmd("bwrap", &args).full_env(bwrap_scrub_env()))
+    //
+    // `stdin_null` is the R7 fix and must stay paired with `--new-session`.
+    // duct's default stdin is the *parent's* (fd 0 = the user's tty, opened
+    // read-write) and bwrap forwards inherited stdio verbatim, so without this
+    // a command could read the user's keystrokes and paint their terminal.
+    // `--new-session` only denies *acquiring* a controlling terminal; it
+    // cannot revoke an fd that is already inherited. See `doc/sandbox.md`
+    // ("The sandbox has no terminal").
+    Ok(duct::cmd("bwrap", &args)
+        .full_env(bwrap_scrub_env())
+        .stdin_null())
 }
 
 /// Build a `duct` expression that runs a program with an explicit argv list
@@ -2172,7 +2183,11 @@ fn build_bwrap_expr_argv(
     }
     args.push("--".into());
     args.extend(post);
-    Ok(duct::cmd("bwrap", &args).full_env(bwrap_scrub_env()))
+    // Same stdin contract as `build_bwrap_expr` (R7): never inherit the
+    // user's terminal on fd 0.
+    Ok(duct::cmd("bwrap", &args)
+        .full_env(bwrap_scrub_env())
+        .stdin_null())
 }
 
 /// Best-effort home directory lookup for `~` expansion in bindings.
@@ -3633,6 +3648,43 @@ mod sandbox_tests {
             !out.contains(&cwd.to_string_lossy().into_owned()),
             "absolute cwd leaked into grep output: {out}",
         );
+    }
+
+    /// The sandbox must not inherit prior's terminal on fd 0.
+    ///
+    /// `--new-session` only denies *acquiring* a controlling terminal; it cannot
+    /// revoke an fd that bwrap already inherited. duct's default stdin is the
+    /// parent's fd 0 (the user's pty, opened read-write), and bwrap forwards
+    /// inherited stdio verbatim — so without `.stdin_null()` a sandboxed command
+    /// could read the user's keystrokes and paint their terminal. This asserts
+    /// the fd is `/dev/null`, that `/dev/tty` is unreachable, and that reading
+    /// fd 0 cannot block (a live tty would).
+    #[tokio::test]
+    #[serial]
+    async fn sandboxed_commands_get_no_terminal() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
+        // `readlink` needs /proc, which `build_bwrap_args` mounts by default.
+        let fd0 = run_sandboxed("readlink /proc/self/fd/0", None)
+            .await
+            .unwrap();
+        assert_eq!(fd0, "/dev/null", "sandbox inherited prior's stdin on fd 0");
+
+        // No controlling terminal: `--new-session` plus the closed fd 0.
+        // (A subshell: a failed `exec` redirect is fatal to `sh` itself.)
+        let tty = run_sandboxed("(exec 3</dev/tty) 2>/dev/null || echo no-tty", None)
+            .await
+            .unwrap();
+        assert_eq!(tty, "no-tty", "/dev/tty must not be openable, got: {tty}");
+
+        // Reading /dev/null returns EOF immediately; a live tty would block
+        // until the watchdog killed us.
+        let read = run_sandboxed("read -r x <&0 || echo eof", None)
+            .await
+            .unwrap();
+        assert_eq!(read, "eof", "fd 0 must not block (live tty?): {read}");
     }
 }
 
