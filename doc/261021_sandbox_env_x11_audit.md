@@ -1065,9 +1065,10 @@ netns — which is *after* the argv is built. Two ways out, both used in the ref
   more moving parts.
 
 Related: `ALL_PROXY=socks5h://127.0.0.1:<port>` is the variable that matters for a SOCKS-only
-bridge. `HTTPS_PROXY`/`HTTP_PROXY` pointing at a `socks5h://` URL is accepted by `curl` but not
-universally by other clients, so **either set only `ALL_PROXY`, or set all three and document the
-expectation**. That choice belongs with R3a's operator-facing consequences.
+bridge. `HTTPS_PROXY`/`HTTP_PROXY` pointing at a `socks5h://` URL is accepted by `curl`, and (now
+measured) by `git` as well, but not universally by all clients, so **either set only `ALL_PROXY`, or
+set all three and document the expectation**. That choice belongs with R3a's operator-facing
+consequences. The implementation sets all three; see the measurement below.
 
 **Measured (2026-10-22), answering the question above.** All three variables set to
 `socks5h://127.0.0.1:<port>` were exercised against a TCP-loopback SOCKS5 relay — i.e. the *macOS*
