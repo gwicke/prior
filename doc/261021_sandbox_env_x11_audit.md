@@ -7,7 +7,7 @@ reproduced, not inferred.*
 
 ## Status
 
-**R1, R2, R3a/b/c/e/f, R7 and R8 are implemented.** **R3d, R3g, R3h, R4, R5 and R6 are not.** R3 was
+**R1, R2, R3a/b/c/d/e/f, R7 and R8 are implemented.** **R3g, R3h, R4, R5 and R6 are not.** R3 was
 revised on 2026-10-22 after testing the design against four reference implementations and this host:
 it is no longer a Landlock/seccomp ladder but a bridge design (R3a–R3h), with Landlock moved to R4
 where it is the only fix. The Linux half then landed the same day: `--unshare-net` is now
@@ -977,8 +977,9 @@ proxy, a trust store, an audit log) that duplicates policy prior already has. Bu
 
 ## Recommendations
 
-Ordered by priority. **R1, R2, R7, R8, and all of R3 except R3d are implemented** (R3a/b/c/e/f landed
-2026-10-22, in that order). **R3d, and R4/R5/R6, are not.** R3 was revised on 2026-10-22 (bridge
+Ordered by priority. **R1, R2, R7, R8, and all of R3 except R3g/R3h are implemented** (R3a/b/c/d/e/f
+landed 2026-10-22, in that order). **R3g, R3h, and R4/R5/R6, are not.** R3 was revised on 2026-10-22
+(bridge
 design, not a Landlock ladder); R4 absorbed the Landlock work that R3 gave up.
 
 ### R8 — Seal the inherited fd table (implemented 2026-10-22)
@@ -1378,7 +1379,7 @@ layer (R3d) because they route around `connect()`; and set `PR_SET_PDEATHSIG` in
 so a killed prior does not leave a bridge listening into a dead namespace (`zerobox`'s
 `harden_bridge_process`).
 
-#### R3d — seccomp, demoted to the two cases nothing else covers
+#### R3d — seccomp, demoted to the two cases nothing else covers (IMPLEMENTED 2026-10-22)
 
 Not the X11 fix. `bwrap --seccomp FD` (an FD, not a path), denying only:
 
@@ -1391,6 +1392,30 @@ Not the X11 fix. `bwrap --seccomp FD` (an FD, not a path), denying only:
 (`src/tools.rs:2043`) and the bridge's own plumbing, and the netns already removed the abstract
 socket it was meant to protect. `srt` needs that hammer because it does not have the bridge; prior
 does not.
+
+**Implementation** (`src/seccomp.rs`). A hand-written classic-BPF program (12 instructions) is
+serialised in the `struct sock_filter` layout and written to a **fresh memfd per spawn**, passed as
+`--seccomp FD`. The program allows everything except `AF_VSOCK` sockets and the three `io_uring`
+calls, which return `EPERM` (indistinguishable from a socket family the kernel lacks), and kills on a
+non-native `AUDIT_ARCH`. No libseccomp dependency: `bwrap --seccomp` reads a raw program, and the
+jump targets are checked by a unit test that walks the program for each syscall/family.
+
+Measured inside a real sandbox: `socket(AF_VSOCK)` → `EPERM`; `io_uring_setup` → `EPERM`;
+`socket(AF_INET)` and `socket(AF_UNIX)` still succeed. Regression test
+`sandbox_enforces_seccomp_filter` (verified to fail with `--seccomp` removed: `vsock:open`), plus
+unit tests on the program's verdicts and on-wire layout.
+
+Two non-obvious requirements, both measured:
+
+- **A fresh fd per spawn.** `bwrap` reads the `--seccomp` fd sequentially to EOF; a reused descriptor
+  is at EOF on the second spawn and `SECCOMP_SET_MODE_FILTER` then fails `EINVAL`. `rules_fd()` makes
+  a new memfd each time.
+- **The fd must survive R8's seal.** It is `CLOEXEC`-cleared and added to the seal's keep list
+  alongside the egress fd, or R8 would mark it `CLOEXEC` and close it before bwrap reads it.
+
+`PR_SET_PDEATHSIG(SIGKILL)` is also set at the top of `shim_main` (the other half of R3d): the
+bridge shim is bwrap's direct child, so it dies with bwrap rather than lingering with an accept queue
+in a namespace whose supervisor is gone.
 
 #### R3e — Environment hygiene (IMPLEMENTED 2026-10-22)
 
@@ -1646,8 +1671,9 @@ not be installed, and a missing binary looks identical to a blocked one.
   to regress into "allow all").
 - `sandbox_sees_own_loopback` — binding `127.0.0.1:0` inside the sandbox works, so `agent-browser`
   and local test servers keep functioning under the always-on netns.
-- For R3d: `AF_VSOCK` blocked, `io_uring_setup` blocked, `AF_INET`/`AF_UNIX` *not* blocked (the last
-  is the assertion that stops someone re-adding the wholesale Unix-socket deny).
+- R3d (done): `sandbox_enforces_seccomp_filter` asserts `AF_VSOCK` blocked and `AF_INET`/`AF_UNIX`
+  *not* blocked (the last is the assertion that stops someone re-adding the wholesale Unix-socket
+  deny); `io_uring_setup`'s verdict is unit-tested on the program rather than from shell.
 - For R4(b): a socket-shaped binding produces the warning; a directory binding does not.
 
 ---
@@ -1802,9 +1828,10 @@ that keeps the policy shared). Everything else is detail.
    `--new-session` alone left prior's tty on fd 0. See Finding 4.
 3. **R8 (fd table) — DONE** 2026-10-22. The general form of R7: seal every descriptor ≥ 3 before
    `execve`, keep only stdio and the egress bootstrap fd. See Finding 5.
-4. **R3d (seccomp) is the next Linux item**, and it is small and independent: `AF_VSOCK` and
-   `io_uring` only. `PR_SET_PDEATHSIG` on the shim is the other half of the same hardening pass and
-   can ride with it.
+4. **R3d (seccomp) — DONE** 2026-10-22. `AF_VSOCK` + `io_uring` denied via a hand-written BPF
+   program in `src/seccomp.rs` (`--seccomp FD`, fresh memfd per spawn); `PR_SET_PDEATHSIG(SIGKILL)`
+   set in `shim_main`. The Linux sandbox work is now complete apart from R3g (macOS), R3h (UDP) and
+   R4 (Landlock).
 5. **R3g (macOS)** can start any time now: the schema and the SOCKS5 engine are both done, and the
    engine is platform-neutral (`egress::host_allowed`, `serve_socks5`'s decision order). mac needs no
    fd passing — a host-loopback listener plus three Seatbelt allow rules is the whole transport.

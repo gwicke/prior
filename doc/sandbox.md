@@ -255,6 +255,7 @@ bwrap
   --unshare-ipc --unshare-uts --hostname sandbox
   [--cap-drop ALL]                      # if drop_caps (default true)
   --die-with-parent
+  --seccomp <fd>                        # R3d: deny AF_VSOCK + io_uring (fresh memfd per spawn)
   -- prlimit --as=<memory_mb*1024*1024> -- <cmd argv>   # memory cap via direct argv (see below)
 ```
 
@@ -431,6 +432,41 @@ fall back to a single `--ro-bind <cwd> <cwd>` plus a writable tmpfs, so the
 common case "run commands in my project, read-only, with a scratch /tmp" works
 with zero config.
 
+### seccomp: AF_VSOCK and io_uring (R3d)
+
+The network namespace is the network fix, not this. The filter closes the two
+ways a command can reach a socket *around* `connect()` and therefore around both
+the netns and the SOCKS bridge:
+
+- **`socket(AF_VSOCK, …)`** — VM sockets are addressed by CID, not routed
+  through the netns, so the namespace does not fence them.
+- **`io_uring_setup` / `io_uring_enter` / `io_uring_register`** — io_uring
+  builds and connects sockets in kernel context, bypassing a `connect()`-based
+  rule and the socket-path netns check.
+
+Both return `EPERM`, which is indistinguishable from a socket family the kernel
+does not have — a denied call looks like "not supported here", not like a probe.
+Everything else is allowed. **`AF_UNIX` is deliberately not denied**: the netns
+already removed the abstract X11 socket, and the bridge and `agent-browser`
+depend on Unix sockets.
+
+`src/seccomp.rs` assembles a 12-instruction classic-BPF program and writes it to
+a **fresh memfd per spawn**, passed as `--seccomp <fd>`. Two details are
+load-bearing and both are covered by tests:
+
+- **Fresh fd per spawn.** `bwrap` reads the fd to EOF; a reused fd is at EOF on
+  the second spawn and the kernel then rejects the filter with `EINVAL`.
+- **It survives the R8 seal.** The fd is `CLOEXEC`-cleared and added to the
+  seal's keep list, or R8 would close it before bwrap reads it.
+
+No libseccomp dependency: `bwrap --seccomp` takes a raw program, and the jump
+targets are checked by a test that walks the program per syscall and per socket
+family.
+
+The bridge shim also sets `PR_SET_PDEATHSIG(SIGKILL)` at startup, so it dies
+with bwrap instead of holding an accept queue open in a namespace whose
+supervisor is gone. See `doc/261021_sandbox_env_x11_audit.md` (R3d).
+
 ---
 
 ## Fallback & detection
@@ -478,6 +514,10 @@ with zero config.
   inherited descriptor is marked `CLOEXEC` in the child before `execve`, so an
   open session log, memmap or socket cannot be read or written from inside. See
   "The sandbox inherits no other fd" above.
+- **`AF_VSOCK` and `io_uring` cannot reach the network.** Both route around
+  `connect()` and so around the netns and the bridge; the seccomp filter denies
+  them with `EPERM`. `AF_UNIX`/`AF_INET`/`AF_INET6` still work. See "seccomp:
+  AF_VSOCK and io_uring" above.
 - **Not a hardening boundary against root.** bwrap provides isolation, not a
   bulletproof jail; it assumes the sandbox user is unprivileged. It is a
   defense-in-depth measure appropriate for an LLM-driven shell, not a
@@ -509,6 +549,10 @@ with zero config.
   `egress_bridge_carries_traffic_out_of_the_netns`,
   `direct_tcp_egress_is_blocked_even_with_network_enabled`, and
   `egress_allowlist_denies_unlisted_destination` in `src/tools.rs`.
+- **Integration:** the seccomp filter is enforced, not just present:
+  `sandbox_enforces_seccomp_filter` asserts `socket(AF_VSOCK)` fails with
+  `EPERM` while `AF_INET`/`AF_UNIX` still succeed. The program's exact verdicts
+  and on-wire layout are unit-tested in `src/seccomp.rs`.
 - **Fallback:** force bwrap-absent and assert unsandboxed execution still
   enforces the timeout.
 
