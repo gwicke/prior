@@ -1169,7 +1169,10 @@ pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
     let cfg = sandbox_config();
     let mut cfg = (*cfg).clone()?;
     crate::sandbox_state::merge_into(&mut cfg);
-    let args = build_bwrap_args(&cfg, true, &[], None).ok()?;
+    let mut args = build_bwrap_args(&cfg, true, &[], None).ok()?;
+    // Same seccomp contract as the shell/argv paths (R3d): this spawn runs `ls`
+    // in the sandbox too, so it gets the same filter.
+    let seccomp = install_seccomp(&mut args).ok()?;
 
     // `env_clear` + explicit vars: bwrap must not inherit the host
     // environment (see `config::bwrap_scrub_env` for why). PATH is included so
@@ -1179,16 +1182,10 @@ pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
     for (name, value) in bwrap_scrub_env() {
         cmd.env(name, value);
     }
-    // Same fd contract as the duct builders below (R8): only stdio survives the
-    // exec into bwrap. This path never carries an egress fd.
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: the closure only calls `close_range`/`fcntl` (no allocation,
-        // no locks), satisfying `pre_exec`'s async-signal-safety contract.
-        unsafe {
-            cmd.pre_exec(|| seal_inherited_fds(None));
-        }
-    }
+    // Same fd contract as the duct builders below (R8): only stdio and the
+    // seccomp rules fd survive the exec into bwrap. This path never carries an
+    // egress fd.
+    seal_fds_before_exec(&mut cmd, &seccomp.keep());
     let output = cmd
         .args(&args)
         .arg("--")
@@ -1198,6 +1195,8 @@ pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
+    // bwrap has read the filter by now; the guard closes the memfd on drop.
+    drop(seccomp);
 
     if !output.status.success() {
         return None;
@@ -1374,12 +1373,12 @@ pub(crate) async fn run_sandboxed_ro(
     let cap = cfg.max_output_bytes();
     let output =
         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<i32>), ToolError> {
-            let expr = build_bwrap_expr_argv(&argv, &cfg, true, &[], None)?;
+            let (expr, fds) = build_bwrap_expr_argv(&argv, &cfg, true, &[], None)?;
             // Stream merged stdout+stderr in bounded chunks (matches the shell
             // path: bwrap forwards stdio to inherited fds; stderr is merged in,
             // as `2>&1` would do). Output is capped to `cap` (configurable:
             // `[tool_config.bash.sandbox].max_output_bytes`, default 20 KiB).
-            capture_bounded(expr, timeout, cap)
+            capture_bounded(expr, fds, timeout, cap)
         })
         .await
         .map_err(|e| ToolError::Generic(e.to_string()))??;
@@ -1409,8 +1408,8 @@ pub(crate) async fn run_sandboxed_ro_status(
     let cap = cap.unwrap_or_else(|| cfg.max_output_bytes());
     let output =
         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<i32>), ToolError> {
-            let expr = build_bwrap_expr_argv(&argv, &cfg, true, &extra_ro, None)?;
-            capture_bounded(expr, timeout, cap)
+            let (expr, fds) = build_bwrap_expr_argv(&argv, &cfg, true, &extra_ro, None)?;
+            capture_bounded(expr, fds, timeout, cap)
         })
         .await
         .map_err(|e| ToolError::Generic(e.to_string()))??;
@@ -1461,8 +1460,8 @@ fn run_shell_capture(
     cap: usize,
 ) -> Result<(Vec<u8>, Option<i32>), ToolError> {
     if !cfg.network.enabled {
-        let expr = build_bwrap_expr(cmd, cfg, false, None)?;
-        return capture_bounded(expr, timeout, cap);
+        let (expr, fds) = build_bwrap_expr(cmd, cfg, false, None)?;
+        return capture_bounded(expr, fds, timeout, cap);
     }
     let launch = crate::egress::prepare(true, cfg.network.allow.clone())
         .map_err(ToolError::Generic)?
@@ -1473,8 +1472,8 @@ fn run_shell_capture(
             .child_fd()
             .expect("egress plumbing exposes a child fd before spawn"),
     };
-    let expr = build_bwrap_expr(cmd, cfg, false, Some(spec))?;
-    capture_bounded_with_egress(expr, timeout, cap, Some(launch))
+    let (expr, fds) = build_bwrap_expr(cmd, cfg, false, Some(spec))?;
+    capture_bounded_with_egress(expr, fds, timeout, cap, Some(launch))
 }
 
 /// Stream merged stdout+stderr from a started bwrap expression in bounded
@@ -1496,10 +1495,11 @@ fn run_shell_capture(
 /// only once per returned chunk.
 fn capture_bounded(
     expr: duct::Expression,
+    fds: OwnedSandboxFds,
     timeout: Option<u64>,
     max_bytes: usize,
 ) -> Result<(Vec<u8>, Option<i32>), ToolError> {
-    capture_bounded_with_egress(expr, timeout, max_bytes, None)
+    capture_bounded_with_egress(expr, fds, timeout, max_bytes, None)
 }
 
 /// [`capture_bounded`] plus the egress bridge lifecycle (R3b).
@@ -1512,6 +1512,7 @@ fn capture_bounded(
 /// child that is itself waiting for a reader.
 fn capture_bounded_with_egress(
     expr: duct::Expression,
+    fds: OwnedSandboxFds,
     timeout: Option<u64>,
     max_bytes: usize,
     launch: Option<crate::egress::Launch>,
@@ -1528,6 +1529,11 @@ fn capture_bounded_with_egress(
         .reader()
         .map_err(|e| ToolError::Io(e.to_string()))?;
     let handle = Arc::new(handle);
+
+    // The child (bwrap) is running and has already inherited, and read, the
+    // seccomp rules fd; the supervisor's copy is dead weight from here on. Drop
+    // it now so a long-running command does not hold the memfd open.
+    drop(fds);
 
     // The child is now running (and, with egress, its shim has already bound the
     // in-namespace listener). Close the supervisor's copy of the child end so
@@ -2118,8 +2124,9 @@ fn wrap_with_egress_shim(e: EgressSpec<'_>, program: Vec<String>) -> Vec<String>
 /// file prior happens to hold open (a session log, a memmap, a socket) would be
 /// readable and writable from inside the sandbox. This is the R8 fix, the
 /// general form of what R7 did for stdin alone. Only fd 0/1/2 (stdio, already
-/// redirected by the caller) and `keep` (the egress bootstrap fd, see
-/// [`EgressSpec::child_fd`]) are meant to reach the payload.
+/// redirected by the caller) and `keep` (the egress bootstrap fd, the seccomp
+/// rules fd; see [`EgressSpec::child_fd`] and [`crate::seccomp::rules_fd`]) are
+/// meant to reach the payload.
 ///
 /// Runs inside the forked child via `pre_exec`, *after* std has installed
 /// stdio, so 0/1/2 are already the right descriptors and must not be touched.
@@ -2138,7 +2145,7 @@ fn wrap_with_egress_shim(e: EgressSpec<'_>, program: Vec<String>) -> Vec<String>
 /// Requires Linux 5.11+ (`close_range`). On `ENOSYS` (older kernel) or any
 /// other failure this returns the error, which `pre_exec` converts into a spawn
 /// failure — the sandbox refuses to run rather than leaking its fd table.
-fn seal_inherited_fds(keep: Option<std::os::fd::RawFd>) -> std::io::Result<()> {
+fn seal_inherited_fds(keep: &[std::os::fd::RawFd]) -> std::io::Result<()> {
     // `close_range` has no libc wrapper on musl, so go through `syscall`. The
     // fd range is `[3, UINT_MAX]`: stdio is exempt, and the upper bound is
     // inclusive on Linux (it is `last`, not `last + 1`).
@@ -2155,8 +2162,8 @@ fn seal_inherited_fds(keep: Option<std::os::fd::RawFd>) -> std::io::Result<()> {
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // Re-open CLOEXEC on the one descriptor the payload is meant to inherit.
-    if let Some(fd) = keep {
+    // Re-open CLOEXEC on the descriptors the payload is meant to inherit.
+    for &fd in keep {
         // SAFETY: `fd` is a live descriptor owned by the caller and
         // `F_SETFD`/`FD_CLOEXEC` is the documented way to clear the flag.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -2171,14 +2178,76 @@ fn seal_inherited_fds(keep: Option<std::os::fd::RawFd>) -> std::io::Result<()> {
 }
 
 /// Install [`seal_inherited_fds`] as a `pre_exec` hook on `cmd`.
-fn seal_fds_before_exec(cmd: &mut std::process::Command, keep: Option<std::os::fd::RawFd>) {
+fn seal_fds_before_exec(cmd: &mut std::process::Command, keep: &[std::os::fd::RawFd]) {
     use std::os::unix::process::CommandExt;
+    // `pre_exec` requires a `'static` closure and an async-signal-safe body.
+    // The keep slice is copied into an owned array here (at spawn-build time,
+    // in the parent) so the closure carries no borrow; `seal_inherited_fds`
+    // then only issues `close_range`/`fcntl`.
+    let mut kept = [0 as std::os::fd::RawFd; 2];
+    assert!(
+        keep.len() <= kept.len(),
+        "keep list exceeds the fixed array"
+    );
+    kept[..keep.len()].copy_from_slice(keep);
+    let n = keep.len();
     // SAFETY: `seal_inherited_fds` only issues `close_range`/`fcntl` — no
     // allocation, no locking — so it is async-signal-safe as `pre_exec`
     // requires.
     unsafe {
-        cmd.pre_exec(move || seal_inherited_fds(keep));
+        cmd.pre_exec(move || seal_inherited_fds(&kept[..n]));
     }
+}
+
+/// The descriptors a sandboxed spawn creates and must keep open until the
+/// child has inherited (and bwrap has consumed) them.
+///
+/// Two of them exist and both are `CLOEXEC`-cleared so they survive `exec`:
+/// the seccomp rules memfd (read by bwrap itself, see [`crate::seccomp`]) and,
+/// when egress is on, the bootstrap socketpair end (handed to the shim). The
+/// bundle is held by the caller across the spawn and dropped afterwards, which
+/// closes whatever bwrap did not need.
+pub(crate) struct OwnedSandboxFds {
+    seccomp: Option<std::os::fd::RawFd>,
+}
+
+impl OwnedSandboxFds {
+    /// The seccomp fd, if one was created, as the R8 seal's keep list. Empty
+    /// when there is nothing to keep.
+    fn keep(&self) -> Vec<std::os::fd::RawFd> {
+        self.seccomp.into_iter().collect()
+    }
+}
+
+impl Drop for OwnedSandboxFds {
+    fn drop(&mut self) {
+        if let Some(fd) = self.seccomp.take() {
+            // SAFETY: `rules_fd` handed us sole ownership and we take it here,
+            // so the descriptor is closed exactly once.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Create the seccomp rules memfd and append `--seccomp <fd>` to `args` (R3d).
+///
+/// `bwrap --seccomp` takes a *number*, and reads it sequentially to EOF, so a
+/// fresh memfd is required per spawn (see [`crate::seccomp::rules_fd`]). The
+/// returned guard keeps the fd open until the child has inherited it; the
+/// `--seccomp` argument is placed before `--`, where bwrap parses its options.
+fn install_seccomp(args: &mut Vec<String>) -> Result<OwnedSandboxFds, ToolError> {
+    let fd = crate::seccomp::rules_fd()
+        .map_err(|e| ToolError::Generic(format!("cannot build the sandbox seccomp filter: {e}")))?;
+    // Insert the flag before the `--` separator so it is parsed as an option
+    // rather than part of the payload argv. `build_bwrap_args` never emits `--`
+    // itself, so append at the current end.
+    debug_assert!(
+        !args.iter().any(|a| a == "--"),
+        "`--` must be appended last"
+    );
+    args.push("--seccomp".into());
+    args.push(fd.to_string());
+    Ok(OwnedSandboxFds { seccomp: Some(fd) })
 }
 
 /// Build a `duct` expression that runs `cmd` inside a bwrap namespace, with its
@@ -2191,8 +2260,11 @@ fn build_bwrap_expr(
     cfg: &SandboxConfig,
     read_only: bool,
     egress: Option<EgressSpec<'_>>,
-) -> Result<duct::Expression, ToolError> {
+) -> Result<(duct::Expression, OwnedSandboxFds), ToolError> {
     let mut args = build_bwrap_args(cfg, read_only, &[], egress)?;
+    // The seccomp rules fd must be created before the spawn and passed by
+    // number, so install it before appending the payload (R3d).
+    let seccomp = install_seccomp(&mut args)?;
 
     // The user command is a shell string, so it must run via `sh -c`. We use a
     // two-level shell: the outer `sh -c` `exec`s an inner `sh -c` that actually
@@ -2235,15 +2307,21 @@ fn build_bwrap_expr(
     //
     // `seal_inherited_fds` is the R8 fix: stdin was closed by R7, but bwrap
     // still forwards every *other* inherited non-CLOEXEC descriptor into the
-    // payload. Seal them all; keep the egress bootstrap fd when present.
-    let keep = egress.map(|e| e.child_fd);
-    Ok(duct::cmd("bwrap", &args)
+    // payload. Seal them all; keep the egress bootstrap fd and the seccomp
+    // rules fd when present.
+    let mut keep = Vec::with_capacity(2);
+    if let Some(e) = egress {
+        keep.push(e.child_fd);
+    }
+    keep.extend(seccomp.keep());
+    let expr = duct::cmd("bwrap", &args)
         .full_env(bwrap_scrub_env())
         .stdin_null()
         .before_spawn(move |cmd| {
-            seal_fds_before_exec(cmd, keep);
+            seal_fds_before_exec(cmd, &keep);
             Ok(())
-        }))
+        });
+    Ok((expr, seccomp))
 }
 
 /// Build a `duct` expression that runs a program with an explicit argv list
@@ -2261,8 +2339,9 @@ fn build_bwrap_expr_argv(
     read_only: bool,
     extra_ro: &[PathBuf],
     egress: Option<EgressSpec<'_>>,
-) -> Result<duct::Expression, ToolError> {
+) -> Result<(duct::Expression, OwnedSandboxFds), ToolError> {
     let mut args = build_bwrap_args(cfg, read_only, extra_ro, egress)?;
+    let seccomp = install_seccomp(&mut args)?;
     // `false`: no shell is involved, so the `ulimit` fallback cannot apply;
     // when `prlimit` is absent the cap is simply skipped (prior behavior).
     let mut post = memory_wrapped_target(cfg.memory_mb, argv.to_vec(), false);
@@ -2273,15 +2352,21 @@ fn build_bwrap_expr_argv(
     args.extend(post);
     // Same stdin contract as `build_bwrap_expr` (R7): never inherit the
     // user's terminal on fd 0, and the same fd-table contract (R8): seal every
-    // other non-CLOEXEC descriptor, keeping only the egress bootstrap fd.
-    let keep = egress.map(|e| e.child_fd);
-    Ok(duct::cmd("bwrap", &args)
+    // other non-CLOEXEC descriptor, keeping only the egress bootstrap fd and
+    // the seccomp rules fd.
+    let mut keep = Vec::with_capacity(2);
+    if let Some(e) = egress {
+        keep.push(e.child_fd);
+    }
+    keep.extend(seccomp.keep());
+    let expr = duct::cmd("bwrap", &args)
         .full_env(bwrap_scrub_env())
         .stdin_null()
         .before_spawn(move |cmd| {
-            seal_fds_before_exec(cmd, keep);
+            seal_fds_before_exec(cmd, &keep);
             Ok(())
-        }))
+        });
+    Ok((expr, seccomp))
 }
 
 /// Best-effort home directory lookup for `~` expansion in bindings.
@@ -3070,6 +3155,29 @@ mod sandbox_tests {
         assert!(fdpos >= 1 && args[fdpos - 1] == "--setenv");
     }
 
+    /// `install_seccomp` appends `--seccomp <fd>` to the option section, which
+    /// is before `--`. That ordering is load-bearing: bwrap would otherwise
+    /// parse it as payload argv.
+    #[test]
+    fn seccomp_flag_lands_before_the_separator() {
+        let mut args =
+            build_bwrap_args(&sandbox_with(vec![], vec![], None), false, &[], None).expect("args");
+        // Simulate the caller appending the payload separator first — the flag
+        // must still go before it. (Both builders install seccomp before `--`.)
+        let fds = super::install_seccomp(&mut args).expect("seccomp fd");
+        let pos = args
+            .iter()
+            .position(|a| a == "--seccomp")
+            .expect("--seccomp emitted");
+        let fd: std::os::fd::RawFd = args[pos + 1].parse().expect("fd is numeric");
+        assert!(fd >= 3, "the rules fd must be a real descriptor, got {fd}");
+        assert_eq!(fds.keep(), vec![fd], "the guard must own the emitted fd");
+        assert!(
+            !args[..pos].iter().any(|a| a == "--"),
+            "`--seccomp` must precede any payload separator"
+        );
+    }
+
     /// Without egress the shim appears nowhere: `network = false` must not pay
     /// for a bind or a setenv it will not use.
     #[test]
@@ -3828,6 +3936,60 @@ mod sandbox_tests {
         assert_eq!(
             out, "sealed",
             "sandbox inherited prior's fd {leaked} from a spawn: {out}"
+        );
+    }
+
+    /// The seccomp filter must actually be installed on the payload (R3d), not
+    /// merely present in the argv. Asserts the two denied families and — just as
+    /// important — that the allowed ones still work, since a filter that denies
+    /// too much would break the bridge and `agent-browser`.
+    ///
+    /// Uses a tiny C-free probe: `python3` is only a shell tool here, and the
+    /// test skips when it is absent. `io_uring_setup` is not reachable from
+    /// portable shell, so it is checked through the unit tests on the program
+    /// (which assert the exact verdicts) rather than from inside the sandbox;
+    /// this test proves the program is wired in and enforcing.
+    #[tokio::test]
+    #[serial]
+    async fn sandbox_enforces_seccomp_filter() {
+        // `python3` is available inside the sandbox if it is on the host: the
+        // read-only system binds expose `/usr`, and `PATH` is set.
+        let has_python = std::process::Command::new("sh")
+            .args(["-c", "command -v python3"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !bwrap_on_path() || !has_python {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
+        // AF_VSOCK = 40. A denied call raises PermissionError; an allowed one
+        // returns a socket (which is discarded).
+        let script = "python3 -c 'import socket,sys\n\
+             try:\n\
+             \x20   socket.socket(40, socket.SOCK_STREAM)\n\
+             \x20   print(\"vsock:open\")\n\
+             except OSError as e:\n\
+             \x20   print(\"vsock:errno=%d\" % e.errno)\n\
+             for fam,name in ((socket.AF_INET,\"inet\"),(socket.AF_UNIX,\"unix\")):\n\
+             \x20   try:\n\
+             \x20       socket.socket(fam, socket.SOCK_STREAM); print(name+\":ok\")\n\
+             \x20   except OSError as e:\n\
+             \x20       print(name+\":blocked\")\n'";
+        let out = run_sandboxed(script, None).await.unwrap();
+        assert!(
+            out.contains("vsock:errno=1"),
+            "socket(AF_VSOCK) must be denied with EPERM inside the sandbox: {out}"
+        );
+        assert!(
+            out.contains("inet:ok"),
+            "socket(AF_INET) must keep working: {out}"
+        );
+        assert!(
+            out.contains("unix:ok"),
+            "socket(AF_UNIX) must keep working (bridge/agent-browser): {out}"
         );
     }
 }

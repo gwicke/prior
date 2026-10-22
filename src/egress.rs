@@ -438,6 +438,19 @@ fn splice(client: TcpStream, upstream: TcpStream) {
 /// prior received stays alive in prior, not here), so the command cannot
 /// accept on it.
 pub fn shim_main(argv: &[String]) -> i32 {
+    // R3d: die with bwrap. The shim is bwrap's direct child, so if bwrap is
+    // killed (prior died, `--die-with-parent` fired, or the watchdog killed
+    // it) the shim must not linger holding an in-namespace listener that will
+    // never be used — it would keep the accept queue open in a namespace whose
+    // supervisor is gone. `PR_SET_PDEATHSIG` delivers SIGKILL on parent death.
+    // There is a race if the parent died before this call, which `--die-with-
+    // parent` already covers; this is the belt-and-braces half.
+    // SAFETY: `prctl(PR_SET_PDEATHSIG, SIGKILL)` is a plain process attribute
+    // set; no pointers are involved.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+    }
+
     let Some(sep) = argv.iter().position(|a| a == "--") else {
         eprintln!("{EGRESS_BIN}: expected `<vars> -- <program> [args…]`");
         return 2;

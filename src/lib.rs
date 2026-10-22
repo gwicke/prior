@@ -7,6 +7,7 @@ pub mod edit_blocks;
 pub mod edit_match;
 pub mod editor;
 pub mod egress;
+pub mod seccomp;
 
 pub mod persona;
 pub mod platform;
