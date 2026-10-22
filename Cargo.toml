@@ -100,6 +100,14 @@ path = "src/main.rs"
 name = "bsed"
 path = "src/bin/bsed.rs"
 
+# The `prior-egress` shim is bwrap's payload when the sandbox has network
+# egress: it binds a listener inside the sandbox's netns and hands the fd back
+# to prior. Installed alongside prior so the bridge can resolve it absolutely.
+# See `src/egress.rs` and `doc/261021_sandbox_env_x11_audit.md` (R3b).
+[[bin]]
+name = "prior-egress"
+path = "src/bin/prior-egress.rs"
+
 # Test-only binary used by the confirm_raw_mode integration test.
 # Gated behind `test-utils` so `cargo install --path .` does not install it.
 [[bin]]

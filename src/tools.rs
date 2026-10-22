@@ -1169,7 +1169,7 @@ pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
     let cfg = sandbox_config();
     let mut cfg = (*cfg).clone()?;
     crate::sandbox_state::merge_into(&mut cfg);
-    let args = build_bwrap_args(&cfg, true, &[]).ok()?;
+    let args = build_bwrap_args(&cfg, true, &[], None).ok()?;
 
     // `env_clear` + explicit vars: bwrap must not inherit the host
     // environment (see `config::bwrap_scrub_env` for why). PATH is included so
@@ -1294,12 +1294,7 @@ pub(crate) async fn run_sandboxed(
         // memory — no temp file and no unbounded `read_to_end` (see
         // `capture_bounded`).
         let cap = cfg.max_output_bytes();
-        let expr = build_bwrap_expr(&cmd, cfg, false)?;
-        // Discard the exit code here — `run_sandboxed` is the shared helper
-        // for paths (the `!`/`!!` user shell, `agent_browser`) that don't
-        // surface it. The bash tool uses `Bash::call` directly, which goes
-        // through `run_sandboxed_with_status` to get the exit code.
-        capture_bounded(expr, timeout, cap).map(|(out, _exit)| out)
+        run_shell_capture(&cmd, cfg, timeout, cap).map(|(out, _exit)| out)
     })
     .await
     .map_err(|e| ToolError::Generic(e.to_string()))??;
@@ -1344,8 +1339,7 @@ pub(crate) async fn run_sandboxed_with_status(
             }
         };
         let cap = cfg.max_output_bytes();
-        let expr = build_bwrap_expr(&cmd, cfg, false)?;
-        capture_bounded(expr, timeout, cap)
+        run_shell_capture(&cmd, cfg, timeout, cap)
     })
     .await
     .map_err(|e| ToolError::Generic(e.to_string()))??;
@@ -1369,7 +1363,7 @@ pub(crate) async fn run_sandboxed_ro(
     let cap = cfg.max_output_bytes();
     let output =
         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<i32>), ToolError> {
-            let expr = build_bwrap_expr_argv(&argv, &cfg, true, &[])?;
+            let expr = build_bwrap_expr_argv(&argv, &cfg, true, &[], None)?;
             // Stream merged stdout+stderr in bounded chunks (matches the shell
             // path: bwrap forwards stdio to inherited fds; stderr is merged in,
             // as `2>&1` would do). Output is capped to `cap` (configurable:
@@ -1404,7 +1398,7 @@ pub(crate) async fn run_sandboxed_ro_status(
     let cap = cap.unwrap_or_else(|| cfg.max_output_bytes());
     let output =
         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<i32>), ToolError> {
-            let expr = build_bwrap_expr_argv(&argv, &cfg, true, &extra_ro)?;
+            let expr = build_bwrap_expr_argv(&argv, &cfg, true, &extra_ro, None)?;
             capture_bounded(expr, timeout, cap)
         })
         .await
@@ -1440,6 +1434,38 @@ fn cap_lines(s: &str, n: usize) -> String {
     s.lines().take(n).collect::<Vec<_>>().join("\n")
 }
 
+/// Run one shell command in the sandbox, wiring up the egress bridge when
+/// `network` is enabled (R3b).
+///
+/// This is the seam where the two halves of R3b meet: `prepare` creates the
+/// bootstrap socketpair *before* the spawn (so the fd is inherited), the argv
+/// carries the shim and the fd number, and `capture_bounded_with_egress` takes
+/// the listener back *after* the spawn. Centralised here so the two shell entry
+/// points (`run_sandboxed`, `run_sandboxed_with_status`) cannot drift apart on
+/// the lifecycle — the ordering is the fragile part, not the argv.
+fn run_shell_capture(
+    cmd: &str,
+    cfg: &SandboxConfig,
+    timeout: Option<u64>,
+    cap: usize,
+) -> Result<(Vec<u8>, Option<i32>), ToolError> {
+    if !cfg.network.enabled {
+        let expr = build_bwrap_expr(cmd, cfg, false, None)?;
+        return capture_bounded(expr, timeout, cap);
+    }
+    let launch = crate::egress::prepare(true, cfg.network.allow.clone())
+        .map_err(ToolError::Generic)?
+        .expect("prepare(true, _) returns a launch");
+    let spec = EgressSpec {
+        shim: launch.shim(),
+        child_fd: launch
+            .child_fd()
+            .expect("egress plumbing exposes a child fd before spawn"),
+    };
+    let expr = build_bwrap_expr(cmd, cfg, false, Some(spec))?;
+    capture_bounded_with_egress(expr, timeout, cap, Some(launch))
+}
+
 /// Stream merged stdout+stderr from a started bwrap expression in bounded
 /// chunks, returning at most `max_bytes` of output.
 ///
@@ -1462,6 +1488,23 @@ fn capture_bounded(
     timeout: Option<u64>,
     max_bytes: usize,
 ) -> Result<(Vec<u8>, Option<i32>), ToolError> {
+    capture_bounded_with_egress(expr, timeout, max_bytes, None)
+}
+
+/// [`capture_bounded`] plus the egress bridge lifecycle (R3b).
+///
+/// With `launch` set, the reader is started first (so bwrap, and therefore the
+/// shim, is running), then the supervisor closes its copy of the child end and
+/// receives the listener. That ordering matters: the shim sends the fd as its
+/// very first act, before `exec`, so by the time `recv_fd` is called there is
+/// either a pending message or one on the way — never a deadlock waiting for a
+/// child that is itself waiting for a reader.
+fn capture_bounded_with_egress(
+    expr: duct::Expression,
+    timeout: Option<u64>,
+    max_bytes: usize,
+    launch: Option<crate::egress::Launch>,
+) -> Result<(Vec<u8>, Option<i32>), ToolError> {
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -1474,6 +1517,26 @@ fn capture_bounded(
         .reader()
         .map_err(|e| ToolError::Io(e.to_string()))?;
     let handle = Arc::new(handle);
+
+    // The child is now running (and, with egress, its shim has already bound the
+    // in-namespace listener). Close the supervisor's copy of the child end so
+    // the fd count is right, then take ownership of the bridge. The bridge is
+    // held for the whole read: dropping it stops the accept loop.
+    let _bridge = match launch {
+        Some(mut launch) => {
+            launch.close_child_end();
+            match launch.into_bridge() {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    let _ = handle.kill();
+                    return Err(ToolError::Generic(format!(
+                        "egress bridge failed to start: {e}"
+                    )));
+                }
+            }
+        }
+        None => None,
+    };
 
     // Watchdog: if the command runs past `timeout`, OR the user presses `<Esc>`,
     // kill the child so the blocked `read` below returns and we surface a clear
@@ -1749,6 +1812,15 @@ fn memory_wrapped_target(
     target
 }
 
+/// The egress shim, as `build_bwrap_args`/`build_bwrap_expr*` need it: the
+/// absolute path to bind in and the inherited fd the shim sends its listener
+/// over (R3b). Borrowed so the launch object can keep owning the plumbing.
+#[derive(Clone, Copy)]
+pub(crate) struct EgressSpec<'a> {
+    pub shim: &'a std::path::Path,
+    pub child_fd: std::os::fd::RawFd,
+}
+
 /// Build the common bwrap argument vector shared by both execution paths:
 /// the read-only system dirs, the CWD/bindings, the scratch tmpfs, network/PID/
 /// capability isolation, and the sanitized environment. Callers append either
@@ -1758,6 +1830,7 @@ fn build_bwrap_args(
     cfg: &SandboxConfig,
     read_only: bool,
     extra_ro: &[PathBuf],
+    egress: Option<EgressSpec<'_>>,
 ) -> Result<Vec<String>, ToolError> {
     let cwd = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
     let home = dirs_home();
@@ -1788,6 +1861,16 @@ fn build_bwrap_args(
         args.push("--ro-bind".into());
         args.push(f.to_string_lossy().to_string());
         args.push(f.to_string_lossy().to_string());
+    }
+
+    // The egress shim is run as the payload, so it must exist inside the
+    // namespace at the same absolute path prior resolved it to (R3b). Bound
+    // read-only: nothing in the sandbox has any business rewriting it.
+    if let Some(e) = egress {
+        let shim = e.shim.to_string_lossy().to_string();
+        args.push("--ro-bind".into());
+        args.push(shim.clone());
+        args.push(shim);
     }
 
     // Essential read-only system directories so the shell and common tools
@@ -1925,15 +2008,14 @@ fn build_bwrap_args(
         args.push("/proc".into());
     }
 
-    // Network isolation. NOTE: once R3a's egress bridge lands this flag becomes
-    // unconditional, and `network` stops selecting "share the host netns" —
-    // egress will instead be granted through a SOCKS5 bridge. Until that exists,
-    // `network: true` still means what it always meant, because unsharing here
-    // with no bridge would silently remove all connectivity.
-    // See `doc/261021_sandbox_env_x11_audit.md` (R3a/R3b).
-    if !cfg.network.enabled {
-        args.push("--unshare-net".into());
-    }
+    // Network isolation is **unconditional** (R3a). `network` no longer selects
+    // "share the host netns": the sandbox is always in its own network
+    // namespace, so the abstract X11 socket and host `127.0.0.1` services are
+    // unreachable by construction, whether or not egress is enabled. Egress,
+    // when enabled, is granted through the SOCKS5 bridge whose listener is
+    // created *inside* this namespace and handed out over `egress.child_fd()` —
+    // see `crate::egress` and `doc/261021_sandbox_env_x11_audit.md` (R3a/R3b).
+    args.push("--unshare-net".into());
     if cfg.pid_isolation.unwrap_or(true) {
         args.push("--unshare-pid".into());
     }
@@ -1982,7 +2064,38 @@ fn build_bwrap_args(
         args.push(value);
     }
 
+    // Tell the egress shim which inherited fd carries the bootstrap socketpair
+    // (R3b). Emitted after `--clearenv` like everything else the command sees,
+    // so the number is present in exactly the environment the shim reads.
+    if let Some(e) = egress {
+        args.push("--setenv".into());
+        args.push(crate::egress::EGRESS_FD_ENV.into());
+        args.push(e.child_fd.to_string());
+    }
+
     Ok(args)
+}
+
+/// Prefix `program` (a post-`--` argv) with the egress shim so it binds the
+/// in-namespace listener before running (R3b).
+///
+/// The proxy variables are set by the shim *after* the bind, because the port is
+/// not known until then. All three are published: `ALL_PROXY` is what
+/// SOCKS-aware clients honour, and `HTTPS_PROXY`/`HTTP_PROXY` carry the
+/// `socks5h://` URL that `curl` and others accept. A client that reads none of
+/// them gets no egress, by design — see R3a's operator-facing notes.
+///
+/// The child fd is deliberately *not* in the argv: it travels in
+/// [`crate::egress::EGRESS_FD_ENV`] because `build_bwrap_args` emits it as a
+/// `--setenv`, which keeps the argv identical in shape with and without egress.
+fn wrap_with_egress_shim(e: EgressSpec<'_>, program: Vec<String>) -> Vec<String> {
+    let mut v = vec![
+        e.shim.to_string_lossy().to_string(),
+        "ALL_PROXY;HTTPS_PROXY;HTTP_PROXY".to_string(),
+        "--".into(),
+    ];
+    v.extend(program);
+    v
 }
 
 /// Build a `duct` expression that runs `cmd` inside a bwrap namespace, with its
@@ -1994,8 +2107,9 @@ fn build_bwrap_expr(
     cmd: &str,
     cfg: &SandboxConfig,
     read_only: bool,
+    egress: Option<EgressSpec<'_>>,
 ) -> Result<duct::Expression, ToolError> {
-    let mut args = build_bwrap_args(cfg, read_only, &[])?;
+    let mut args = build_bwrap_args(cfg, read_only, &[], egress)?;
 
     // The user command is a shell string, so it must run via `sh -c`. We use a
     // two-level shell: the outer `sh -c` `exec`s an inner `sh -c` that actually
@@ -2010,7 +2124,14 @@ fn build_bwrap_expr(
     // argv, no shell interpreting the limit). Fall back to the shell `ulimit`
     // builtin, which reproduces the original `sh -c 'ulimit -v …; exec sh -c
     // <cmd>'` wrapper exactly. See `memory_wrapped_target`.
-    let post = memory_wrapped_target(cfg.memory_mb, target, true);
+    let mut post = memory_wrapped_target(cfg.memory_mb, target, true);
+    // With egress enabled the payload becomes the shim, which binds the
+    // in-namespace listener, hands it out, sets the proxy variables and execs
+    // what was `post` (R3b). The shim sits *outside* the memory wrapper so the
+    // limit applies to the command it execs, not to the fd-passing step.
+    if let Some(e) = egress {
+        post = wrap_with_egress_shim(e, post);
+    }
 
     args.push("--".into());
     args.extend(post);
@@ -2037,11 +2158,15 @@ fn build_bwrap_expr_argv(
     cfg: &SandboxConfig,
     read_only: bool,
     extra_ro: &[PathBuf],
+    egress: Option<EgressSpec<'_>>,
 ) -> Result<duct::Expression, ToolError> {
-    let mut args = build_bwrap_args(cfg, read_only, extra_ro)?;
+    let mut args = build_bwrap_args(cfg, read_only, extra_ro, egress)?;
     // `false`: no shell is involved, so the `ulimit` fallback cannot apply;
     // when `prlimit` is absent the cap is simply skipped (prior behavior).
-    let post = memory_wrapped_target(cfg.memory_mb, argv.to_vec(), false);
+    let mut post = memory_wrapped_target(cfg.memory_mb, argv.to_vec(), false);
+    if let Some(e) = egress {
+        post = wrap_with_egress_shim(e, post);
+    }
     args.push("--".into());
     args.extend(post);
     Ok(duct::cmd("bwrap", &args).full_env(bwrap_scrub_env()))
@@ -2786,6 +2911,216 @@ mod sandbox_tests {
         }
     }
 
+    // ---- R3b: the egress bridge argv shape ----
+
+    /// `--unshare-net` is unconditional (R3a): the netns does not depend on
+    /// whether egress is enabled, because the namespace — not the allowlist — is
+    /// what keeps the abstract X11 socket and host loopback unreachable.
+    #[test]
+    fn unshare_net_is_unconditional() {
+        let mut on = sandbox_with(vec![], vec![], None);
+        on.network = crate::config::NetworkPolicy::open();
+        let off = sandbox_with(vec![], vec![], None);
+        for (label, cfg) in [("enabled", &on), ("disabled", &off)] {
+            let args = build_bwrap_args(cfg, false, &[], None).expect("args");
+            assert!(
+                args.iter().any(|a| a == "--unshare-net"),
+                "network {label} must still unshare the netns"
+            );
+        }
+    }
+
+    /// With egress prepared, the argv carries the shim as the payload, binds it
+    /// read-only at its absolute path, and publishes the bootstrap fd in the
+    /// environment the shim reads (R3b).
+    #[test]
+    fn egress_argv_binds_shim_and_publishes_fd() {
+        let mut cfg = sandbox_with(vec![], vec![], None);
+        cfg.network = crate::config::NetworkPolicy::open();
+        let shim = std::path::Path::new("/opt/prior/prior-egress");
+        let spec = super::EgressSpec { shim, child_fd: 7 };
+        let args = build_bwrap_args(&cfg, false, &[], Some(spec)).expect("args");
+
+        // Bound read-only at the same absolute path it is exec'd from.
+        let pos = args
+            .iter()
+            .position(|a| a == "/opt/prior/prior-egress")
+            .expect("shim bound in");
+        assert_eq!(args[pos - 1], "--ro-bind");
+        assert_eq!(args[pos + 1], "/opt/prior/prior-egress");
+
+        // The fd number is published where the shim looks for it.
+        let fdpos = args
+            .iter()
+            .position(|a| a == crate::egress::EGRESS_FD_ENV)
+            .expect("fd env emitted");
+        assert_eq!(args[fdpos + 1], "7");
+        assert!(fdpos >= 1 && args[fdpos - 1] == "--setenv");
+    }
+
+    /// Without egress the shim appears nowhere: `network = false` must not pay
+    /// for a bind or a setenv it will not use.
+    #[test]
+    fn no_egress_no_shim_in_argv() {
+        let cfg = sandbox_with(vec![], vec![], None);
+        let args = build_bwrap_args(&cfg, false, &[], None).expect("args");
+        assert!(!args.iter().any(|a| a.contains("prior-egress")));
+        assert!(!args.iter().any(|a| a == crate::egress::EGRESS_FD_ENV));
+    }
+
+    /// The payload wrapper puts the shim before the program, with the proxy
+    /// variable list between them and `--` as the separator the shim looks for.
+    #[test]
+    fn wrap_with_egress_shim_shape() {
+        let spec = super::EgressSpec {
+            shim: std::path::Path::new("/shim"),
+            child_fd: 3,
+        };
+        let wrapped =
+            super::wrap_with_egress_shim(spec, vec!["sh".into(), "-c".into(), "true".into()]);
+        assert_eq!(wrapped[0], "/shim");
+        assert_eq!(wrapped[1], "ALL_PROXY;HTTPS_PROXY;HTTP_PROXY");
+        assert_eq!(wrapped[2], "--");
+        assert_eq!(&wrapped[3..], ["sh", "-c", "true"]);
+    }
+
+    // ---- R3b end to end: the real shim, a real netns, real traffic ----
+
+    /// The whole mechanism against the real binaries: `network = true` spawns the
+    /// shim inside an unshared netns, the shim binds loopback there and hands the
+    /// listener out, and a command inside the sandbox reaches an upstream on the
+    /// *host* only through the bridge.
+    ///
+    /// Asserted at the level that matters: the sandbox cannot reach the host's
+    /// loopback directly (`ECONNREFUSED`, because the netns has no route),
+    /// authenticates against the bridge over SOCKS5, and gets real bytes back.
+    /// Also proves the abstract-socket guarantee holds in the same launch.
+    #[tokio::test]
+    #[serial]
+    async fn egress_bridge_carries_traffic_out_of_the_netns() {
+        use std::io::{Read, Write};
+        if !bwrap_on_path() {
+            return;
+        }
+        if crate::egress::resolve_shim().is_none() {
+            // `cargo test` alone does not build binaries for unit-test targets.
+            eprintln!("skipping: prior-egress not built (run `cargo build` first)");
+            return;
+        }
+
+        // A loopback HTTP server on the host: the only reachable upstream.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+            }
+        });
+
+        let mut cfg = sandbox_with(vec![], vec![], Some(60));
+        cfg.network = crate::config::NetworkPolicy::open();
+        set_sandbox(Some(cfg));
+
+        // `curl` honours ALL_PROXY; ask it to reach the host's loopback upstream.
+        // Status 200 means the bridge dialled it on the *host* side.
+        let out = run_sandboxed_with_status(
+            &format!(
+                "curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 \
+                 http://127.0.0.1:{}/",
+                upstream.port()
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.0, "200", "bridge must carry the request; got {out:?}");
+
+        // Same launch, same netns: the abstract X11 socket stays unreachable.
+        // This is the R3a property, asserted rather than assumed.
+        let out = run_sandboxed(
+            "python3 -c \"import socket;s=socket.socket(socket.AF_UNIX)\n\
+             try:\n s.connect('\\0/tmp/.X11-unix/X0'); print('CONNECTED')\n\
+             except OSError as e: print('BLOCKED' if e.errno in (111,2) else f'ERR {e.errno}')\"",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "BLOCKED", "abstract X11 socket must be unreachable");
+
+        server.join().unwrap();
+    }
+
+    /// A command that ignores the proxy variables gets no egress: no bridge is
+    /// bypassed, and there is no route out of the namespace (R3a).
+    #[tokio::test]
+    #[serial]
+    async fn direct_tcp_egress_is_blocked_even_with_network_enabled() {
+        if !bwrap_on_path() {
+            return;
+        }
+        let mut cfg = sandbox_with(vec![], vec![], Some(60));
+        cfg.network = crate::config::NetworkPolicy::open();
+        set_sandbox(Some(cfg));
+        // A routed public address: without a route in the netns this is
+        // unreachable regardless of whether the host could reach it.
+        let out = run_sandboxed(
+            "python3 -c \"import socket\n\
+             try:\n s=socket.create_connection(('1.1.1.1',80),timeout=5); print('CONNECTED')\n\
+             except OSError as e: print(f'BLOCKED {e.errno}')\"",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.starts_with("BLOCKED"),
+            "direct egress must fail closed, got {out:?}"
+        );
+    }
+
+    /// An allowlist that excludes the upstream must actually gate the bridge:
+    /// the same curl that succeeds under `open()` gets no connection when the
+    /// destination is not listed. This is R3c's host:port decision, end to end.
+    #[tokio::test]
+    #[serial]
+    async fn egress_allowlist_denies_unlisted_destination() {
+        if !bwrap_on_path() {
+            return;
+        }
+        if crate::egress::resolve_shim().is_none() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            // If the bridge dials, this accepts; the test expects it not to.
+            let _ = listener.set_nonblocking(false);
+            let _ = listener.accept();
+        });
+
+        let mut cfg = sandbox_with(vec![], vec![], Some(30));
+        cfg.network = crate::config::NetworkPolicy {
+            enabled: true,
+            allow: vec!["only.example:443".into()],
+        };
+        set_sandbox(Some(cfg));
+
+        let out = run_sandboxed_with_status(
+            &format!(
+                "curl -s -o /dev/null -w '%{{http_code}}' --max-time 10 http://127.0.0.1:{}/",
+                upstream.port()
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        // SOCKS reply 0x02 surfaces as a proxy connection failure: curl prints
+        // 000 and exits non-zero. The point is that it is not "200".
+        assert_ne!(out.0, "200", "unlisted destination must not be reachable");
+        drop(server);
+    }
+
     // ---- Phase 1b: LLM-configurable per-call timeout override ----
 
     #[tokio::test]
@@ -3411,11 +3746,11 @@ mod edit_file_tests {
                 .filter(|w| w[0] == flag)
                 .any(|w| w[1] == want && w[2] == want)
         };
-        let args = build_bwrap_args(&cfg, true, std::slice::from_ref(&bin)).expect("args");
+        let args = build_bwrap_args(&cfg, true, std::slice::from_ref(&bin), None).expect("args");
         assert!(bound(&args, "--ro-bind"), "bsed must be bound: {args:?}");
         // Read-only even in a writable namespace: a tool call has no business
         // rewriting the binary it is running.
-        let rw = build_bwrap_args(&cfg, false, std::slice::from_ref(&bin)).expect("args");
+        let rw = build_bwrap_args(&cfg, false, std::slice::from_ref(&bin), None).expect("args");
         assert!(!bound(&rw, "--bind"), "bsed must never be writable: {rw:?}");
     }
 

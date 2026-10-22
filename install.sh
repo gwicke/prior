@@ -11,8 +11,11 @@ PROJECT_NAME="prior"
 BINARY_NAME="prior"
 GITHUB_OWNER="jondot"
 GITHUB_REPO="prior"
-# Shipped alongside the main binary; a missing one only disables a tool.
-OPTIONAL_BINARIES="bsed"
+# Shipped alongside the main binary; a missing one only disables a feature.
+# `bsed` backs the `sed` tool; `prior-egress` is bwrap's payload when the
+# sandbox has network egress (without it, `network = true` fails with an
+# install hint rather than silently granting no egress).
+OPTIONAL_BINARIES="bsed prior-egress"
 # ============================================================================
 
 # Some Linux distributions don't set HOME
@@ -160,9 +163,9 @@ install_binary() {
         mkdir -p "${INSTALL_DIR}"
     fi
 
-    # ${BINARY_NAME} is required. The optional companions (today just `bsed`,
-    # the block-edit sed behind the agent's `sed` tool) only disable a tool when
-    # missing, so they are a warning rather than a failed install.
+    # ${BINARY_NAME} is required. The optional companions only disable a
+    # feature when missing (`bsed` backs the `sed` tool, `prior-egress` backs
+    # network egress), so they are a warning rather than a failed install.
     for name in "$BINARY_NAME" ${OPTIONAL_BINARIES}; do
         if [ ! -f "$name" ]; then
             if [ "$name" = "$BINARY_NAME" ]; then

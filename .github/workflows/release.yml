@@ -117,12 +117,12 @@ jobs:
         if: matrix.archive_format == 'tar.gz'
         run: |
           # Create tar.gz archive: standard format for Linux and macOS
-          # Both binaries ship in every archive: `bsed` is what the agent's
-          # `sed` tool executes, and it is a two-line shim over the bsed
-          # crate that `cargo build` already built alongside picocode.
+          # All three binaries ship in every archive: `bsed` is what the
+          # agent's `sed` tool executes, and `prior-egress` is bwrap's payload
+          # when the sandbox has network egress.
           tar czf ${{ steps.names.outputs.archive_name }} \
             -C target/${{ matrix.target }}/release \
-            ${{ steps.names.outputs.binary_name }} bsed
+            ${{ steps.names.outputs.binary_name }} bsed prior-egress
         shell: bash
 
       - name: Create archive (Windows)
@@ -136,6 +136,7 @@ jobs:
           # agent simply does not advertise the `sed` tool.
           $paths = @($binaryPath)
           if (Test-Path "$releaseDir\bsed.exe") { $paths += "$releaseDir\bsed.exe" }
+          if (Test-Path "$releaseDir\prior-egress.exe") { $paths += "$releaseDir\prior-egress.exe" }
           Compress-Archive -Path $paths -DestinationPath $archivePath -Force
         shell: pwsh
 
