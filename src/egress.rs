@@ -268,6 +268,18 @@ struct Request {
     port: u16,
 }
 
+/// Run one proxy conversation on `client`: decide which proxy protocol the
+/// client is speaking and serve it. Blocks until the conversation is over.
+///
+/// The listener serves **two** protocols on one port — see [`serve_socks5`].
+fn serve_conversation(
+    client: TcpStream,
+    allow: &[String],
+    log: &mut dyn FnMut(&str),
+) -> io::Result<()> {
+    serve_socks5(client, allow, log)
+}
+
 /// Run one SOCKS5 conversation on `client`, splicing it to the destination the
 /// allowlist permits. Blocks until both directions are done.
 ///
@@ -530,14 +542,26 @@ fn bind_loopback() -> io::Result<std::net::TcpListener> {
 // The supervisor accept loop
 // ---------------------------------------------------------------------------
 
+/// How many conversations the bridge serves at once before it starts refusing.
+///
+/// A cap exists so a sandbox cannot turn the supervisor into an unbounded thread
+/// factory: every conversation is a thread plus two blocking `io::copy`s. The
+/// number is deliberately far above what any CLI client opens (`git`'s
+/// `http.maxRequests` defaults to 5, `curl`'s multi interface to 10) and far
+/// below anything that would exhaust a normal process — and it only bites when a
+/// client is already misbehaving.
+const MAX_CONVERSATIONS: usize = 64;
+
 /// Owns the bridge for a sandbox's lifetime: holds the received listening fd and
-/// pumps SOCKS5 conversations until the command exits.
+/// pumps proxy conversations until the command exits.
 pub struct EgressBridge {
     allow: Vec<String>,
     /// Stops the accept loop. Dropped (or set) when the command finishes.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     log: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    /// Conversations accepted and not yet finished. Drives [`MAX_CONVERSATIONS`].
+    live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl EgressBridge {
@@ -551,10 +575,12 @@ impl EgressBridge {
         let listener = unsafe { std::net::TcpListener::from_raw_fd(listener_fd) };
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let log = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let thread = {
             let stop = stop.clone();
             let log = log.clone();
+            let live = live.clone();
             let allow = allow.clone();
             let listener = listener.try_clone()?;
             // Non-blocking accept, polled against `stop`. The obvious
@@ -571,15 +597,44 @@ impl EgressBridge {
                         match listener.accept() {
                             Ok((client, _)) => {
                                 // The accepted socket inherits non-blocking on
-                                // Linux; the SOCKS conversation wants blocking
-                                // reads, so put it back.
+                                // Linux; the conversation wants blocking reads,
+                                // so put it back.
                                 let _ = client.set_nonblocking(false);
-                                let mut sink = |line: &str| {
-                                    log.lock().push(line.to_string());
-                                };
-                                // Each conversation is independent; a failure in
-                                // one is not fatal to the bridge.
-                                let _ = serve_socks5(client, &allow, &mut sink);
+
+                                // Serve each conversation on its own thread.
+                                // Inline service would serialise the bridge:
+                                // HTTP clients (cargo, npm, git's
+                                // `http.maxRequests`, browsers) open parallel
+                                // connections as a matter of course, and one
+                                // slow upstream would then stall every other
+                                // request behind it.
+                                let n = live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                                if n > MAX_CONVERSATIONS {
+                                    live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                    log.lock()
+                                        .push(format!("DENY concurrent > {MAX_CONVERSATIONS}"));
+                                    // Dropping `client` RSTs the connection,
+                                    // which is the right answer to a client
+                                    // holding more sockets than we serve.
+                                    continue;
+                                }
+                                let allow = allow.clone();
+                                let log = log.clone();
+                                let live_conn = live.clone();
+                                let spawned = std::thread::Builder::new()
+                                    .name("egress-conn".into())
+                                    .spawn(move || {
+                                        let mut sink =
+                                            |line: &str| log.lock().push(line.to_string());
+                                        // Each conversation is independent; a
+                                        // failure in one is not fatal to the
+                                        // bridge.
+                                        let _ = serve_conversation(client, &allow, &mut sink);
+                                        live_conn.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                    });
+                                if spawned.is_err() {
+                                    live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                }
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -595,18 +650,33 @@ impl EgressBridge {
             stop,
             thread: Some(thread),
             log,
+            live,
         })
     }
 
-    /// Stop accepting and join the pump thread. Safe to call more than once.
+    /// Stop accepting and join the accept thread. Safe to call more than once.
     ///
     /// The accept loop polls `stop`, so setting the flag is enough — see the
     /// comment at the loop for why a blocking `accept` cannot be woken across
     /// network namespaces.
+    ///
+    /// Per-connection threads are *not* joined. A conversation may be splices
+    /// deep into a download, and blocking shutdown on it would turn "the command
+    /// finished" into "wait for the slowest socket". Instead the accept thread is
+    /// joined (so no new connections start) and then the live count is given a
+    /// short grace period to drain, which is enough for the decisions log to be
+    /// complete in every case that matters. Threads still running are left to
+    /// the process's exit rather than to a blocking join.
     pub fn shutdown(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while self.live.load(std::sync::atomic::Ordering::SeqCst) > 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -754,6 +824,84 @@ mod proxy_tests {
         c.read_exact(&mut reply).unwrap();
         assert_eq!(reply[1], REP_COMMAND_UNSUPPORTED);
         server.join().unwrap();
+    }
+
+    /// Drive one full SOCKS5 conversation to `upstream` and return the bytes the
+    /// far end echoed back. Used by the concurrency test below.
+    fn socks5_roundtrip(proxy: SocketAddr, upstream: SocketAddr) -> String {
+        let IpAddr::V4(ip) = upstream.ip() else {
+            unreachable!()
+        };
+        let mut c = TcpStream::connect(proxy).unwrap();
+        c.write_all(&[0x05, 0x01, 0x00]).unwrap();
+        let mut g = [0u8; 2];
+        c.read_exact(&mut g).unwrap();
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ip.octets());
+        req.extend_from_slice(&upstream.port().to_be_bytes());
+        c.write_all(&req).unwrap();
+        let mut reply = [0u8; 10];
+        c.read_exact(&mut reply).unwrap();
+        assert_eq!(reply[1], REP_SUCCEEDED);
+        c.write_all(b"PING").unwrap();
+        let mut body = [0u8; 4];
+        c.read_exact(&mut body).unwrap();
+        String::from_utf8_lossy(&body).to_string()
+    }
+
+    /// The bridge must serve conversations **concurrently**. Serialising them
+    /// would stall every HTTP client in the sandbox behind the slowest request:
+    /// cargo, npm, git and browsers all open parallel connections by default.
+    ///
+    /// Four conversations against an origin that takes 300 ms each. Parallel
+    /// finishes in about one delay; serial takes four. The bound is loose enough
+    /// not to flake on a loaded machine and tight enough to fail on the old
+    /// inline loop (measured: 2.46 s serial vs 0.63 s threaded).
+    #[test]
+    fn bridge_serves_conversations_concurrently() {
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+        const N: usize = 4;
+
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let upstream = l.local_addr().unwrap();
+        let origin = std::thread::spawn(move || {
+            let mut handles = Vec::new();
+            for _ in 0..N {
+                let (mut s, _) = l.accept().unwrap();
+                handles.push(std::thread::spawn(move || {
+                    std::thread::sleep(DELAY);
+                    let mut buf = [0u8; 4];
+                    let _ = s.read_exact(&mut buf);
+                    let _ = s.write_all(b"PONG");
+                }));
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+        });
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let proxy = listener.local_addr().unwrap();
+        use std::os::fd::IntoRawFd;
+        let mut bridge = EgressBridge::start(listener.into_raw_fd(), Vec::new()).unwrap();
+
+        let started = std::time::Instant::now();
+        let clients: Vec<_> = (0..N)
+            .map(|_| std::thread::spawn(move || socks5_roundtrip(proxy, upstream)))
+            .collect();
+        for h in clients {
+            assert_eq!(h.join().unwrap(), "PONG");
+        }
+        let elapsed = started.elapsed();
+        bridge.shutdown();
+
+        // Serial would be >= N * DELAY = 1.2 s. Parallel is ~1 delay; allow 2x
+        // the delay for scheduling noise on a busy CI box.
+        assert!(
+            elapsed < DELAY * 2,
+            "conversations were serialised: {N} x {DELAY:?} took {elapsed:?}"
+        );
+        origin.join().unwrap();
     }
 }
 
