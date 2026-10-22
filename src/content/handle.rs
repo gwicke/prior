@@ -3834,16 +3834,46 @@ mod tests {
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
     }
 
-    /// Live paints in provider SSE order; replay groups thinking before text.
+    /// A kind switch whose new content renders **only whitespace** normalizes
+    /// away: text → whitespace-only reasoning → text paints exactly the two
+    /// text paragraphs (one renderer gap between them, as ever), with no
+    /// boundary rows around the whitespace. The `rows_due` / `StripLeading` /
+    /// `restore_empty` half of the boundary rule, pinned for the shapes a
+    /// provider can actually send: spaces, newlines, tab.
+    #[test]
+    fn whitespace_only_kind_switches_normalize_away() {
+        fn run(b_delta: &str) -> String {
+            let (out, reasoning) = capturing_output(60);
+            *reasoning.lock().unwrap() = ShowReasoning::Content;
+            out.begin_capture();
+            out.begin_response();
+            out.stream_text("first line.\n\n");
+            out.stream_thinking(b_delta);
+            out.stream_text("second line.\n\n");
+            out.end_response();
+            let bytes = out.end_capture();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        for b in ["   \n", "\n\n", " \n", "\t\n"] {
+            assert_eq!(
+                run(b),
+                "first line.\n\nsecond line.\n",
+                "whitespace-only reasoning delta {b:?} must leave no trace"
+            );
+        }
+    }
+
+    /// Live paints in provider SSE order; grouped (thinking-first) does not.
     ///
-    /// Characterization of the live/replay spacing divergence: a reasoning part
+    /// Characterization of what an interleaved arrival paints: a reasoning part
     /// that arrives *mid-answer* records `(ResponseReasoning, closes=true)`
     /// between two `ResponseText` chunks, so `boundary_spacer` opens a block
     /// around it — blank row, dim reasoning line, blank row — **inside** the
-    /// open code fence. Replay never interleaves (`render_turn` loops all
-    /// `thinking` before all `text`, and `feed_turn_into` partitions items into
-    /// those two lists), so the same content renders tight there. Pinned as
-    /// today's behavior, not as desirable behavior.
+    /// open code fence. Replay used to regroup thinking-first (hiding exactly
+    /// these rows); it now paints stored arrival order — see
+    /// `replay::tests::replay_keeps_interleaved_reasoning_in_arrival_order`.
+    /// This pins the live half; whether the rows are wanted at every interleave
+    /// is a design question still open.
     #[test]
     fn interleaved_reasoning_inserts_live_only_boundary_rows() {
         fn run(interleaved: bool) -> String {
@@ -3871,16 +3901,14 @@ mod tests {
             String::from_utf8_lossy(&bytes).into_owned()
         }
         let live = run(true);
-        let replay = run(false);
+        let grouped = run(false);
         println!("=== live (interleaved SSE order) ===\n{live:?}");
-        println!("=== replay (thinking grouped first) ===\n{replay:?}");
-        // Characterization of today's live/replay divergence: live paints in
-        // provider SSE order, so a reasoning part that arrives mid-answer
-        // records (Reasoning, closes=true) between two ResponseText chunks and
+        println!("=== grouped (thinking first) ===\n{grouped:?}");
+        // Interleaved, a reasoning part that arrives mid-answer records
+        // (Reasoning, closes=true) between two ResponseText chunks and
         // `boundary_spacer` opens a new block around it — a blank row above and
-        // below the dim reasoning line, INSIDE the open code fence. Replay
-        // groups all thinking before all text (`render_turn`), so the same
-        // content renders tight.
+        // below the dim reasoning line, INSIDE the open code fence. The same
+        // content grouped thinking-first never interleaves, so it renders tight.
         assert!(
             live.contains("add(a, b):\n\n\x1b[2mHmm, add or plus?"),
             "live: blank + reasoning above the fence line: {live:?}"
@@ -3890,12 +3918,12 @@ mod tests {
             "live: blank between code lines after the reasoning interleave: {live:?}"
         );
         assert!(
-            replay.contains("add(a, b):\n      \x1b[35mreturn"),
-            "replay: code lines stay adjacent: {replay:?}"
+            grouped.contains("add(a, b):\n      \x1b[35mreturn"),
+            "grouped: code lines stay adjacent: {grouped:?}"
         );
         assert!(
-            replay.find("Hmm, add or plus?").unwrap() < replay.find("Consider the code").unwrap(),
-            "replay: thinking plays before text: {replay:?}"
+            grouped.find("Hmm, add or plus?").unwrap() < grouped.find("Consider the code").unwrap(),
+            "grouped: thinking plays before text: {grouped:?}"
         );
     }
 
