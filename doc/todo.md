@@ -22,7 +22,9 @@ and link a doc/ and/or commit hash
       persists between two `bash` calls) or, when a binding remaps `/tmp`, one host directory shared
       by every session and cwd. Target: `app_config_dir()/sandbox-tmp/prior-<session-uuid>`, mode
       0700, bound over `/tmp`; keyed on the session id so a cwd change keeps continuity;
-      `PathPolicy` must resolve `/tmp` to the same place. Design in `doc/sandbox.md` -> "`/tmp` is a
+      `PathPolicy` must resolve `/tmp` to the same place. Same change retires `tmp_size_mb` (the
+      field, deserializer, `--size`, example line) and adds cleanup at `/clear`,
+      `/session <id> delete`, plus an mtime sweep. Design in `doc/sandbox.md` -> "`/tmp` is a
       per-session directory".
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing `egress::host_allowed`;
       `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https; HTTP-only clients now come

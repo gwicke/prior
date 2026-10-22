@@ -52,8 +52,8 @@ network = false           # default: false (no egress; netns unshared)
 memory_mb = 1024          # default: none (unlimited)
 pid_isolation = true      # default: true (--unshare-pid --pid)
 drop_caps = true           # default: true (--cap-drop ALL)
-tmp_size_mb = 256         # default: 256 (cap on /tmp when it falls back to a tmpfs;
-                          # ignored once /tmp is a per-session directory — see below)
+tmp_size_mb = 256         # RETIRED once /tmp is a per-session directory (see below);
+                          # still the tmpfs cap in the current build
 # Bindings are split into two lists: `ro` (read-only) and `rw` (read-write).
 # Each entry is a bare PATH (identical host/in-sandbox path) or a remap
 # `{ from = "HOST", to = "SANDBOX" }`.
@@ -97,9 +97,9 @@ pub struct SandboxConfig {
     /// Drop all capabilities. Default true.
     #[serde(default)]
     pub drop_caps: Option<bool>,
-    /// Size cap for `/tmp` when it is a tmpfs (the fallback when no per-session
-    /// directory is used). Default 256 MB. No effect once `/tmp` is a
-    /// per-session directory — see "`/tmp` is a per-session directory".
+    /// Size cap for `/tmp` when it is a tmpfs. Default 256 MB. **Retired** by
+    /// the per-session `/tmp` directory, which removes the tmpfs entirely — see
+    /// "`/tmp` is a per-session directory"; the field goes with it.
     #[serde(default)]
     pub tmp_size_mb: Option<u64>,
     /// Read-only filesystem bindings (bare path or `{ from, to }` remap).
@@ -476,10 +476,34 @@ disposable rather than configuration.
   reach a sibling session's directory by `..` (measured: the bound subdir's
   parent is the sandbox's own namespace root, which contains no other session).
 
-Lifetime follows `/clear`, which deletes the outgoing session file and starts a
-fresh session with a new id. The same moment is the natural point to drop the
-old `/tmp` directory: the id changes, so the old directory is unreachable and its
-files are dead. Deletion is best-effort and must never fail the command.
+#### Lifetime and cleanup
+
+The directory belongs to exactly one session id, so it is dead as soon as that
+session's record is gone. Removal happens at the two points that already destroy
+a session, plus a sweeper for the rest:
+
+- **`/clear`** deletes the outgoing session file and starts a fresh session with
+  a new id. The id changes, so the old directory is unreachable and its files
+  are dead; remove it at the switch.
+- **`/session <id> delete`** removes another session from disk. It already
+  refuses the current session (`SessionDeleteNode::prepare`), so the
+  current-session directory can never be swept out from under a running
+  command. Remove the corresponding directory alongside `repo.delete`.
+- **mtime sweep**, for what neither point reaches: a session deleted while prior
+  was not running, a crash between the file write and the directory removal, a
+  `/tmp` directory whose session file was removed by hand. Once per startup,
+  list `<data_dir>/sandbox-tmp/`, and remove entries older than a generous age
+  (a week is the right order of magnitude — long enough that a session left open
+  overnight is safe, short enough that the directory does not accumulate).
+
+All three are **best-effort and must never fail the operation that triggered
+them.** A failed `unlink` is a leaked directory, which the sweeper will catch; a
+failed `rm -rf` that aborted `/clear` would be a far worse outcome. This
+mirrors the existing contract for session-file deletion.
+
+Only entries matching `prior-<uuid>` are touched, which is the point of the
+prefix: the sweeper removes prior's directories and nothing else, even if
+`sandbox-tmp/` ends up sharing a parent with unrelated files.
 
 #### It replaces the tmpfs, it does not sit on top of it
 
@@ -509,10 +533,18 @@ shadowed and the base directory is silently exposed in its place.
 
 Consequences to document where the old behaviour is described:
 
-- `doc/sandbox.md:55,251,335` all describe `/tmp` as a sized tmpfs. With this
-  change `tmp_size_mb` no longer applies to `/tmp` at all; the size is the
-  host filesystem's. Either the option is retired, or it gains a meaning for
-  the fallback-only path — a decision to make when implementing.
+- **`tmp_size_mb` is retired** (decided). Once `/tmp` is the per-session
+  directory it has no meaning: the size is the host filesystem's, and there is
+  no second mount to cap. It is *not* removed in this doc change — until the
+  new `/tmp` exists, a config with no binding over `/tmp` still gets a real
+  tmpfs and `tmp_size_mb` still bounds it, so deleting the field now would
+  silently unbound a live limit. The field, its `SandboxTmpSizeMb`
+  deserializer, the `--size` emission and the `settings.toml.example` line go
+  in the same change that lands the per-session directory.
+  - The field is `#[serde(default)]` and `SandboxConfig` is **not**
+    `deny_unknown_fields`, so a user config that still has `tmp_size_mb` after
+    the removal parses cleanly and ignores the key. No migration is needed, and
+    no startup warning is owed: it was advisory sizing, not a security control.
 - The default config (no `/tmp` binding) previously gave each *call* a clean
   `/tmp`. It now gives each *session* one. That is the intended change, but it
   means a command can now observe what an earlier command in the same session
