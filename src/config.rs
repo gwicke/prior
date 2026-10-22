@@ -2160,6 +2160,125 @@ model = "claude-3-5-sonnet-20241022"
         assert_eq!(cfg.security_mode.as_deref(), Some("confirm"));
     }
 
+    /// The example's expanded `only_allow` list must agree with the built-in
+    /// default. The example spells `LC_*` out as the individual locale
+    /// variables so an operator can see what is granted; if the two ever
+    /// disagree, the example stops being a safe starting point.
+    #[test]
+    fn example_env_allowlist_matches_the_default() {
+        let content =
+            std::fs::read_to_string("settings.toml.example").expect("example file present");
+
+        // Pull the `patterns = [...]` out of the commented `only_allow` block.
+        // The whole block is commented, so parse only the quoted names.
+        let in_block = content
+            .split("# [tool_config.bash.sandbox.env]")
+            .nth(1)
+            .expect("example should document an `only_allow` env block");
+        let block: &str = in_block.split("# Or the older denylist").next().unwrap();
+        assert!(
+            block.contains("only_allow"),
+            "first env block should be the `only_allow` one"
+        );
+        let example: Vec<String> = block
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("#"))
+            .map(|l| l.trim())
+            .filter(|l| l.starts_with('"'))
+            .flat_map(|l| {
+                l.split(',')
+                    .map(|p| p.trim().trim_matches('"').to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            example.len() > 10,
+            "the example's expanded allowlist looks too short: {example:?}"
+        );
+
+        let default_policy = SandboxConfig::default().env_policy();
+        let example_policy = EnvPolicy {
+            mode: EnvMode::OnlyAllow,
+            patterns: example.clone(),
+        };
+
+        // Names that stand in for every production pattern, including each LC_
+        // variable the example expands. `PWD`/`TMPDIR` are on neither side.
+        let probe: Vec<String> = [
+            "PATH",
+            "HOME",
+            "TERM",
+            "LANG",
+            "TZ",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "SOURCE_DATE_EPOCH",
+            // LC_* expanded, plus a non-standard LC_ name that only the glob
+            // would match — the one intentional difference.
+            "LC_ALL",
+            "LC_CTYPE",
+            "LC_NUMERIC",
+            "LC_TIME",
+            "LC_COLLATE",
+            "LC_MONETARY",
+            "LC_MESSAGES",
+            "LC_PAPER",
+            "LC_NAME",
+            "LC_ADDRESS",
+            "LC_TELEPHONE",
+            "LC_MEASUREMENT",
+            "LC_IDENTIFICATION",
+            "LC_NONSTANDARD",
+            // must be dropped by both
+            "DISPLAY",
+            "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "SSH_AUTH_SOCK",
+            "PWD",
+            "TMPDIR",
+            "ANTHROPIC_API_KEY",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let env: Vec<(String, String)> = probe.iter().cloned().map(|n| (n, "v".into())).collect();
+
+        let kept_by = |policy: &EnvPolicy| -> Vec<String> {
+            let mut k: Vec<String> = env_vars_to_keep(policy, &env)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            k.sort();
+            k
+        };
+        let (by_default, by_example) = (kept_by(&default_policy), kept_by(&example_policy));
+        // The only permitted difference is a non-standard LC_ name: the glob
+        // catches it, the explicit list does not.
+        let diff: Vec<String> = by_default
+            .iter()
+            .filter(|n| !by_example.contains(n))
+            .cloned()
+            .collect();
+        assert_eq!(
+            diff,
+            vec!["LC_NONSTANDARD".to_string()],
+            "the example should differ from the default only on non-standard LC_ names"
+        );
+        assert!(
+            by_example.iter().all(|n| by_default.contains(n)),
+            "the example grants nothing the default does not: {by_example:?}"
+        );
+    }
+
     /// The example's `[models.*]` tables are commented out, so
     /// `example_toml_file_parses` never sees them — and `deny_unknown_fields`
     /// only fires on real content. Uncomment them here and parse, so a typo in
