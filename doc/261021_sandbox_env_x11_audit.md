@@ -7,7 +7,7 @@ reproduced, not inferred.*
 
 ## Status
 
-**R1, R2, and R3a/b/c/e/f are implemented.** **R3d, R3g, R3h, R4, R5 and R6 are not.** R3 was
+**R1, R2, R3a/b/c/e/f and R7 are implemented.** **R3d, R3g, R3h, R4, R5 and R6 are not.** R3 was
 revised on 2026-10-22 after testing the design against four reference implementations and this host:
 it is no longer a Landlock/seccomp ladder but a bridge design (R3a–R3h), with Landlock moved to R4
 where it is the only fix. The Linux half then landed the same day: `--unshare-net` is now
@@ -23,7 +23,7 @@ yes, and both reference implementations already do some version of it — see "C
 
 ## Summary
 
-Three findings, in descending severity:
+Four findings, in descending severity:
 
 1. **The env filter is bypassable whenever `/proc` is mounted.** The bwrap parent's
    `/proc/1/environ` still holds the *host* environment, so a sandboxed command can read every
@@ -37,6 +37,10 @@ Three findings, in descending severity:
    `network: true` is set — full window enumeration, title reads, clipboard read/write and `XTEST`
    synthetic input are all available. CONFIRMED. `DISPLAY`/`XAUTHORITY` survive the env filter, so
    the sandboxed command is *told* where the display is.
+4. **The sandbox inherited prior's terminal on stdin** — a live, read-write pty on fd 0, so a
+   command could read the user's keystrokes (prior runs the terminal raw) and write escape sequences
+   into it. CONFIRMED. `--new-session` (added 2026-10-22) denies *acquiring* a controlling terminal
+   but cannot revoke an inherited fd; the fix is to redirect stdin (R7).
 
 Consequences for the plan of record:
 
@@ -365,6 +369,95 @@ netns". The 2026-10-22 revision draws the line one step earlier: **the netns is 
 the right fix is to stop tying it to the network knob at all, and make `network: true` a bridge
 instead. See "Why `network: true` must not share the network namespace". That is the smallest
 change that satisfies this section's own argument, and it needs no LSM.
+
+---
+
+## Finding 4 — the sandbox inherits prior's terminal on stdin (severity: high)
+
+*Found 2026-10-22 while testing whether `--new-session` closed every tty route. It is unrelated to
+the env filter and to the network: it is fd inheritance, not a socket, so R1/R2/R3 do nothing about
+it.*
+
+### Mechanism
+
+`--new-session` makes bwrap `setsid()`, so the payload has no controlling terminal:
+`open("/dev/tty")` fails with `ENXIO`, and `ioctl(TIOCSCTTY)` fails with `EPERM` (the tty belongs to
+another session).
+That is the whole of what it buys, and it is worth having.
+
+It does **not** touch inherited file descriptors. `duct`'s default stdin is `IoValue::ParentStdin`
+(`os_pipe::dup_stdin()`), and bwrap forwards inherited stdio to the payload verbatim. prior's own
+fd 0 is the user's terminal opened `O_RDWR`, so the sandbox received a live, duplex pty — the same
+device prior reads keystrokes from, in raw mode.
+
+The `ls`-for-completions path (`src/tools.rs:1177`, `sandbox_list_lines`) used
+`std::process::Command`, whose `output()` captures stdout/stderr but leaves stdin inherited, so it
+had the same hole.
+
+### Evidence
+
+Probed from inside the live sandbox prior is running (bwrap 0.13.1, Linux 7.1):
+
+```text
+$ readlink /proc/self/fd/0                       -> /dev/pts/5
+$ ioctl(fd0, TIOCGWINSZ)                         -> 36x107        (the user's terminal)
+$ write(fd0, "\x1b[c"); poll; read               -> \x1b[?65;4;6;18;22;52c   (the emulator
+                                                     answered a device-attribute query)
+
+$ open("/dev/tty")                               -> ENXIO   (--new-session did its job)
+$ ioctl(fd0, TIOCSCTTY)                          -> EPERM   (already another session's)
+$ ioctl(fd0, TIOCSTI)                            -> EIO     (legacy_tiocsti=0 — a kernel
+                                                     setting, not a control prior chose)
+$ ioctl(fd0, TIOCSWINSZ)                         -> OK      (it resized the user's terminal)
+$ tcgetattr/tcsetattr(fd0)                       -> ICANON=0 ECHO=0 ISIG=0; clearing ISIG OK
+```
+
+With the fix (`stdin -> /dev/null`), the same probe from inside the sandbox reports
+`fd0 -> /dev/null`, and both `/dev/fd/0` and `/proc/1/fd/0` return EOF instead of a terminal reply.
+
+### What the two directions give a command
+
+- **Read → keylogging.** prior runs the terminal raw (`ECHO=0 ICANON=0 ISIG=0`), so keystrokes are
+  readable as they are typed. A sandboxed command racing the persistent stdin reader can capture the
+  user's next message, a pasted secret, or a keypress meant for a confirmation dialog.
+- **Write → terminal spoofing.** Any escape sequence. A command can paint what looks like a prior
+  confirmation prompt or a forged assistant message, set the window title, or push an OSC 52
+  clipboard *write*. (OSC 52 *read* was refused by the author's emulator — checked, not assumed —
+  but that is the emulator's policy, not prior's.)
+- **`ioctl` → session damage.** `TIOCSWINSZ` resizes the user's terminal and `tcsetattr` changes its
+  modes; both persist after the tool call returns.
+
+### Why `--new-session` alone is not the fix
+
+The two controls answer different questions, and only closing the fd answers this one:
+
+| control | denies | cannot deny |
+| --- | --- | --- |
+| `--new-session` | *acquiring* a ctty (`/dev/tty`, its pgrp, `SIGHUP`) | an already-inherited fd |
+| stdin to `/dev/null` | *inheriting* the terminal on fd 0 | re-`open`ing a path that names it |
+
+Together they leave no route: the fd is not the tty, and no path inside the sandbox resolves to it
+(`/dev` is a fresh devpts, so `/dev/pts/5` does not exist and `/dev/tty` has no ctty to name).
+
+### Recommendation — R7
+
+**IMPLEMENTED 2026-10-22.** Both bwrap builders end with `.stdin_null()`, and
+`sandbox_list_lines` sets `.stdin(Stdio::null())`. Behaviour-neutral: every sandboxed call is
+non-interactive, `--clearenv` removes anything that would prompt, and the egress bridge uses the
+inherited fd 3, not stdin.
+
+Keep `--new-session` as well. Closing stdin without it still leaves the sandbox able to open
+`/dev/tty` (a fresh devpts' `ptmx` is present, and prior's tty is on the host's devpts, but the
+ctty route is what `--new-session` closes, cheaply).
+
+**Also audit the rest of the fd table.** bwrap passes through every inherited non-`CLOEXEC`
+descriptor. Today the only intentional one is fd 3 (egress bootstrap); everything else prior might
+hold open is inherited by the payload. Closing the set explicitly before `exec` (or documenting the
+invariant) is future work, not part of R7.
+
+**Also record it as its own axis.** "The sandbox has no terminal" is a property, not a consequence
+of the netns or the env filter — it belongs in `doc/sandbox.md`'s security list next to the
+`--unshare-net` bullet, which it now is.
 
 ---
 
@@ -816,9 +909,17 @@ proxy, a trust store, an audit log) that duplicates policy prior already has. Bu
 
 ## Recommendations
 
-Ordered by priority. **R1, R2, and all of R3 except R3d are implemented** (R3a/b/c/e/f landed
+Ordered by priority. **R1, R2, R7, and all of R3 except R3d are implemented** (R3a/b/c/e/f landed
 2026-10-22, in that order). **R3d, and R4/R5/R6, are not.** R3 was revised on 2026-10-22 (bridge
 design, not a Landlock ladder); R4 absorbed the Landlock work that R3 gave up.
+
+### R7 — Close the inherited terminal (implemented 2026-10-22)
+
+**Implemented** — see Finding 4 plus "The sandbox has no terminal" in `doc/sandbox.md`.
+
+`--new-session` is not sufficient by itself: it stops the payload from *acquiring* a controlling
+terminal but cannot revoke the fd it inherited, and duct hands it prior's tty on fd 0. Redirect
+stdin to `/dev/null` on every bwrap spawn. Behaviour-neutral for every current tool.
 
 ### R1 — Scrub bwrap's *own* environment before it spawns the payload (prerequisite for R2/R3)
 
@@ -1622,15 +1723,17 @@ that keeps the policy shared). Everything else is detail.
    `--unshare-net` is unconditional, `network = true` spawns the `prior-egress` shim, the shim binds
    in the netns and hands the listening fd out, and the SOCKS5 engine in `src/egress.rs` applies the
    allowlist. See "How it was actually implemented" under R3b for the shape, and R3c for the engine.
-2. **R3d (seccomp) is the next Linux item**, and it is small and independent: `AF_VSOCK` and
+2. **R7 (inherited terminal) — DONE** 2026-10-22. A finding, not a plan item, until it was measured:
+   `--new-session` alone left prior's tty on fd 0. See Finding 4.
+3. **R3d (seccomp) is the next Linux item**, and it is small and independent: `AF_VSOCK` and
    `io_uring` only. `PR_SET_PDEATHSIG` on the shim is the other half of the same hardening pass and
    can ride with it.
-3. **R3g (macOS)** can start any time now: the schema and the SOCKS5 engine are both done, and the
+4. **R3g (macOS)** can start any time now: the schema and the SOCKS5 engine are both done, and the
    engine is platform-neutral (`egress::host_allowed`, `serve_socks5`'s decision order). mac needs no
    fd passing — a host-loopback listener plus three Seatbelt allow rules is the whole transport.
    Build the profile generator in one module and make the applier a strategy; do **not** back onto
    `zerobox`/`nono` as dependencies.
-4. **R4** is independent of all of the above and can run in parallel with any step. Its (a) and (b)
+5. **R4** is independent of all of the above and can run in parallel with any step. Its (a) and (b)
    parts are documentation and a warning; only (c) needs the `landlock` crate.
 
 **Facts already established, do not re-test:**
@@ -1649,6 +1752,10 @@ that keeps the policy shared). Everything else is detail.
   distinguishable (`0x02`) from dial failures.
 - A single socket *file* can be `--ro-bind`-ed in and connected to — the fallback mechanism, and the
   proof of R4's premise.
+- **`--new-session` does not revoke inherited fds.** It denies acquiring a controlling terminal
+  (`/dev/tty` → `ENXIO`, `TIOCSCTTY` → `EPERM`) but the payload still received prior's tty on fd 0
+  and could read/write it and `ioctl` it. Fixed by R7 (`stdio::null()`); the fd table as a whole
+  (other inherited non-`CLOEXEC` fds) is still unaudited.
 - Seatbelt needs no bridge on macOS: `(allow network-outbound (remote ip "localhost:3128"))` plus
   two more allow lines is the whole implementation (`srt:macos-sandbox-utils.ts:1318-1344`).
 - **`curl` and `git` both honour `ALL_PROXY=socks5h://127.0.0.1:<port>` for plain HTTP and HTTPS**

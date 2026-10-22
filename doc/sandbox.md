@@ -249,6 +249,7 @@ bwrap
   --dev /dev --proc /proc               # fresh instances; skipped if bound explicitly
   --ro-bind /etc/<entry> …              # ESSENTIAL_ETC working set (not all of /etc)
   --tmpfs /tmp  (size from tmp_size_mb, via --size)
+  --new-session                         # ALWAYS: no controlling terminal
   --unshare-net                         # ALWAYS (R3a): egress, if any, is bridged
   [--unshare-pid --pid]                 # if pid_isolation (default true)
   --unshare-ipc --unshare-uts --hostname sandbox
@@ -366,6 +367,36 @@ is nothing for `/proc/1/environ` to leak.
 > not secret leakage. A binding that exposes a host *socket* path would make
 > that socket reachable regardless of the env policy.
 
+### The sandbox has no terminal (R7)
+
+`--new-session` (always emitted) and a redirected stdin (always
+`Stdio::null()`) together keep a sandboxed command away from prior's terminal.
+They are two different controls and neither is sufficient alone:
+
+- **`--new-session` prevents *acquiring* a terminal.** Without it the child
+  could `open("/dev/tty")` and get prior's own terminal device. It also stops
+  the child from becoming a session leader or signalling prior's process group.
+- **The redirected stdin prevents *inheriting* one.** `--new-session` cannot
+  revoke a file descriptor that bwrap already inherited. `duct`'s default stdin
+  is the *parent's* fd 0 — prior's terminal, opened read-write — and bwrap
+  forwards inherited stdio verbatim, so a command would get a live, duplex pty
+  even with `--new-session` set. Both bwrap builders therefore end with
+  `.stdin_null()`, and the `ls`-for-completions path sets
+  `Stdio::null()` explicitly (it uses `std::process::Command`, whose `output()`
+  does not redirect stdin either).
+
+Without this, a sandboxed command could read the user's keystrokes (prior runs
+the terminal in raw mode, so every key typed while a tool call runs is
+readable), paint the terminal with escape sequences to forge a confirmation
+prompt or assistant message, resize it, or change its `termios` flags.
+Measured on a live sandbox: fd 0 was `/dev/pts/5` and answered a device-
+attribute query; `TIOCSWINSZ` and `tcsetattr` both succeeded. See
+`doc/261021_sandbox_env_x11_audit.md` (Finding 4).
+
+No tool needs stdin: every sandboxed call is non-interactive, `--clearenv`
+removes anything that would prompt, and the egress bridge uses fd 3. Closing it
+is therefore behaviour-neutral.
+
 ### Path-binding special case
 
 When either binding list (`cfg.ro` or `cfg.rw`) is **non-empty**, do **not**
@@ -414,6 +445,10 @@ with zero config.
   the bwrap env scrub matters: `/proc/1/environ` is bwrap's own environment.
 - **Capability drop + PID namespace** limit privilege escalation and hide the
   host process tree.
+- **No terminal.** `--new-session` plus a null stdin keep the sandbox away from
+  prior's tty: no keystroke readback, no escape-sequence injection into the
+  user's screen, no `termios`/winsize tampering. See "The sandbox has no
+  terminal" above.
 - **Not a hardening boundary against root.** bwrap provides isolation, not a
   bulletproof jail; it assumes the sandbox user is unprivileged. It is a
   defense-in-depth measure appropriate for an LLM-driven shell, not a

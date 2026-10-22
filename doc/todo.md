@@ -6,6 +6,10 @@ and link a doc/ and/or commit hash
 - [x] sandbox R3a/b/c: done (`4576433`): `--unshare-net` unconditional; `network: true` = egress
       through the `prior-egress` shim + SOCKS5 allowlist (`src/egress.rs`). X11 unreachable by
       construction. Spec + handover: `doc/261021_sandbox_env_x11_audit.md`.
+- [x] sandbox R7: done. `--new-session` alone left prior's tty inherited on fd 0 (readable/writable
+      by a sandboxed command); both bwrap builders now use `.stdin_null()`. Finding 4 in the audit.
+- [ ] sandbox: audit the rest of the inherited fd table (bwrap passes through every non-`CLOEXEC`
+      fd; only fd 3 is intentional).
 - [ ] sandbox R3d: seccomp for `AF_VSOCK` + `io_uring`, and `PR_SET_PDEATHSIG` on the shim.
       Then R3g (macOS: three Seatbelt rules + a profile generator, reusing `egress::host_allowed`;
       its main unknown is settled: `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https).
