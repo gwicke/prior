@@ -2008,6 +2008,9 @@ fn build_bwrap_args(
         args.push("/proc".into());
     }
 
+    // Always start a new session
+    args.push("--new-session".into());
+
     // Network isolation is **unconditional** (R3a). `network` no longer selects
     // "share the host netns": the sandbox is always in its own network
     // namespace, so the abstract X11 socket and host `127.0.0.1` services are
