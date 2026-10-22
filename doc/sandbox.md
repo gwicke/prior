@@ -249,7 +249,7 @@ bwrap
   --dev /dev --proc /proc               # fresh instances; skipped if bound explicitly
   --ro-bind /etc/<entry> …              # ESSENTIAL_ETC working set (not all of /etc)
   --tmpfs /tmp  (size from tmp_size_mb, via --size)
-  [--unshare-net]                       # unless network: true (R3a makes this unconditional)
+  --unshare-net                         # ALWAYS (R3a): egress, if any, is bridged
   [--unshare-pid --pid]                 # if pid_isolation (default true)
   --unshare-ipc --unshare-uts --hostname sandbox
   [--cap-drop ALL]                      # if drop_caps (default true)
@@ -438,8 +438,13 @@ with zero config.
   and assert it returns an error / is killed.
 - **Integration:** with a `rw` remap binding, assert a file written inside the
   sandbox at `to` appears at host `from` (and not at `to` on the host).
-- **Integration:** with `network: false`, assert a command attempting a socket
-  connect fails; with `network: true`, assert it succeeds.
+- **Integration:** with `network: false`, assert a direct socket connect fails;
+  with `network: true`, assert a *direct* connect still fails (the netns is
+  still unshared) but a proxied request succeeds through the `prior-egress`
+  bridge, and the abstract X11 socket stays unreachable in both cases. These are
+  `egress_bridge_carries_traffic_out_of_the_netns`,
+  `direct_tcp_egress_is_blocked_even_with_network_enabled`, and
+  `egress_allowlist_denies_unlisted_destination` in `src/tools.rs`.
 - **Fallback:** force bwrap-absent and assert unsandboxed execution still
   enforces the timeout.
 

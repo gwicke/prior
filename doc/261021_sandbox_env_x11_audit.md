@@ -7,12 +7,14 @@ reproduced, not inferred.*
 
 ## Status
 
-**R1, R2, R3e and R3f are implemented.** **R3's bridge half (R3a–R3d, R3g, R3h), R4, R5 and R6
-are not.** R3 was revised on 2026-10-22 after testing the design against four reference
-implementations and this host: it is no longer a Landlock/seccomp ladder but a bridge design
-(R3a–R3h), with Landlock moved to R4 where it is the only fix. Handover notes — what to read first,
-what order to build it in, and what is already settled — are at the end of the document ("Where to
-start next").
+**R1, R2, and R3a/b/c/e/f are implemented.** **R3d, R3g, R3h, R4, R5 and R6 are not.** R3 was
+revised on 2026-10-22 after testing the design against four reference implementations and this host:
+it is no longer a Landlock/seccomp ladder but a bridge design (R3a–R3h), with Landlock moved to R4
+where it is the only fix. The Linux half then landed the same day: `--unshare-net` is now
+unconditional, and `network = true` grants egress through a SOCKS5 bridge whose listener is created
+inside the sandbox's network namespace (`src/egress.rs`, `src/bin/prior-egress.rs`). Handover notes —
+what to read first, what order to build it in, and what is already settled — are at the end of the
+document ("Where to start next").
 
 The revision was prompted by one question: *can `network: true` keep the network namespace, so that
 the X11 vector disappears by construction instead of needing three layered controls?* The answer is
@@ -814,9 +816,9 @@ proxy, a trust store, an audit log) that duplicates policy prior already has. Bu
 
 ## Recommendations
 
-Ordered by priority. **R1, R2, R3e and R3f are implemented; the rest of R3, and R4/R5/R6, are
-not.** R3 was revised on 2026-10-22 (bridge design, not a Landlock ladder); R4 absorbed the Landlock
-work that R3 gave up.
+Ordered by priority. **R1, R2, and all of R3 except R3d are implemented** (R3a/b/c/e/f landed
+2026-10-22, in that order). **R3d, and R4/R5/R6, are not.** R3 was revised on 2026-10-22 (bridge
+design, not a Landlock ladder); R4 absorbed the Landlock work that R3 gave up.
 
 ### R1 — Scrub bwrap's *own* environment before it spawns the payload (prerequisite for R2/R3)
 
@@ -1004,7 +1006,7 @@ The measurements behind this are in "Why `network: true` must not share the netw
 bridge mechanism is in "Cross-check: `nono`'s passed-listener bridge", and the policy model is in
 "Cross-check: Anthropic's sandbox-runtime". This section is the specification.
 
-#### R3a — The network contract
+#### R3a — The network contract — IMPLEMENTED 2026-10-22
 
 - `--unshare-net` is emitted **always**. `network` no longer controls the netns.
 - `network: true` means: prior starts a bridge, publishes `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`
@@ -1025,7 +1027,7 @@ Consequences to document, because they are operator-visible:
 - **UDP gets nothing.** SOCKS5 `CONNECT` is TCP-only. DNS still works, because resolution happens in
   the bridge (`socks5h` semantics — the sandbox never learns an address it cannot use).
 
-#### R3b — The bridge mechanism (the part that is subtle)
+#### R3b — The bridge mechanism (the part that is subtle) — IMPLEMENTED 2026-10-22
 
 Follow NEP-0004's sequence exactly; the deviations from `zerobox` and `srt` are deliberate and
 explained. There is one unavoidable shape change to prior's spawn path, and it is the main risk in
@@ -1068,7 +1070,48 @@ universally by other clients, so **either set only `ALL_PROXY`, or set all three
 expectation**.
 That choice belongs with R3a's operator-facing consequences.
 
-Two open design questions to settle before writing code:
+**How it was actually implemented (2026-10-22).** The spike found a simpler shape than the sketch
+above, and the code follows it. Read `src/egress.rs` and `src/bin/prior-egress.rs`; this is the map.
+
+- **Where the bind happens: a helper binary, `prior-egress`.** It is bwrap's payload. It binds
+  `127.0.0.1:0` inside the netns, sends the listening fd out, sets the proxy variables, and `exec`s
+  the real command. Resolved and bound absolutely, exactly like `bsed` (`egress::resolve_shim`), with
+  the same `target/<profile>/deps` fallback so the end-to-end test exercises the built binary.
+- **No `pass_fds`, and no fd-number guesswork.** `Command::pass_fds` is still unstable, and `duct`
+  exposes it only via `before_spawn`. Instead the bootstrap socketpair is created **before** the
+  spawn with the child end *not* `CLOEXEC` (parent end is). It survives `exec` into bwrap with the
+  **same fd number on both sides** — measured, not assumed — so the shim learns it from
+  `PRIOR_EGRESS_FD`, which `build_bwrap_args` emits as an ordinary `--setenv`. This is why the fd
+  needs no argv slot and why the argv keeps the same shape with and without egress.
+- **The port is chosen in the shim, not passed in.** The ordering constraint the sketch worried
+  about ("port unknown when the argv is built") disappears: the shim owns both the bind and the
+  `exec`, so it reads the bound port and sets `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY` itself, just
+  before `exec`. No fixed port, no second `--setenv` rewrite over the bootstrap socket.
+- **`prlimit` ordering:** the shim sits *outside* `memory_wrapped_target`, so the memory cap applies
+  to the command the shim execs, not to the fd-passing step.
+- **The supervisor outlives the child without restructuring `duct`.** The reader is started first
+  (`expr.reader()` — bwrap, and thus the shim, is already running), then `recv_fd` takes the
+  listener, and the `EgressBridge` is held for the whole read in `capture_bounded_with_egress`.
+  Dropping it stops the accept loop. The `duct` read-to-completion shape is unchanged; the bridge is
+  just a value alive alongside it.
+- **The accept loop is non-blocking and polled.** The obvious "wake a blocking `accept` by connecting
+  to its address" trick **does not work here**: the listener is bound in the *sandbox's* netns, so
+  the supervisor — in the host netns — cannot reach that address, and `join` hangs forever. This was
+  a real bug during implementation; the loop polls a stop flag instead.
+- **The fallback was not needed.** The socket-file design stays recorded above as the
+  known-inferior alternative (R4 class: a path a binding could re-expose), but the fd-passing design
+  fit the `duct` path cleanly, so it is what shipped.
+
+Tests that pin the mechanism (all in `src/egress.rs` and `src/tools.rs`): `socks5_connect_splices_*`
+and `socks5_denies_*` exercise the protocol with no bwrap; `egress_argv_binds_shim_and_publishes_fd`
+pins the argv; `egress_bridge_carries_traffic_out_of_the_netns` runs the real shim under
+`--unshare-net`, asserts `curl` reaches a host-loopback upstream through the bridge *and* that the
+abstract X11 socket is still unreachable in the same launch;
+`egress_allowlist_denies_unlisted_destination` proves the allowlist actually gates;
+`direct_tcp_egress_is_blocked_even_with_network_enabled` proves a direct socket still fails closed.
+
+Two open design questions (both **answered** by the implementation above, kept for the record):
+
 
 - **Where does the in-namespace bind happen?** bwrap has no "run this before exec" hook, so either
   (a) a tiny shim as bwrap's payload that binds+sends+execs, which is what NEP-0004 does, or
@@ -1086,7 +1129,7 @@ disadvantage is the R4 class — a path exists that a binding could re-expose. S
 design if it fits; record the socket-file design as the known-inferior alternative so the decision
 is not re-litigated after a compaction.
 
-#### R3c — The policy engine (SOCKS5, host+port, ~300 lines)
+#### R3c — The policy engine (SOCKS5, host+port, ~300 lines) — IMPLEMENTED 2026-10-22
 
 SOCKS5 `CONNECT` only. No HTTP proxy, no TLS MITM, no credential masking — those are 1439 + 1514
 lines in `srt` and exist for a feature prior does not have.
@@ -1115,6 +1158,22 @@ route:
 [4] direct TCP   -> blocked      [Errno 101] Network is unreachable
 [5] X11 abstract -> blocked      [Errno 111] Connection refused
 ```
+
+**Implemented in `src/egress.rs`.** Notes on the parts the spec left open:
+
+- **Allowlist matching** (`egress::host_allowed`): entry is `host` or `host:port`; empty list ⇒ any
+  destination (the `network = true` default); a leading `*.` matches subdomains *and only*
+  subdomains (`*.crates.io` matches `static.crates.io`, not `crates.io`, and not
+  `a.crates.io.evil`). Case-insensitive. This is the only place the policy is applied, which is what
+  R3g wants: the macOS backend reuses it unchanged.
+- **Attribution** is the bridge's decision log (`EgressBridge::decisions`), lines `ALLOW h:p`,
+  `DENY h:p`, `FAIL h:p`, `DENY-RESOLVE h:p`. Per the ordering above there is no SOCKS auth token;
+  one bridge per tool call makes the call the unit.
+- **A CONNECT is denied before dialling**, so a refused destination never learns the sandbox tried —
+  and the denial is recorded, which is what makes it actionable.
+- **Hardening deferred:** `PR_SET_PDEATHSIG` on the shim and `AF_VSOCK`/`io_uring` seccomp are R3d,
+  not this item. They do not affect correctness of the bridge; they harden a killed-prior or
+  hostile-syscall edge.
 
 Two hardening details to copy from `srt`/`zerobox`: deny `AF_VSOCK` and `io_uring` at the seccomp
 layer (R3d) because they route around `connect()`; and set `PR_SET_PDEATHSIG` in any helper process
@@ -1535,29 +1594,20 @@ that keeps the policy shared). Everything else is detail.
 
 **Order of work, and why:**
 
-1. **R3e (hygiene) — DONE**, and **R3f (schema) — DONE.** Both landed 2026-10-22. R3f settled the
-   bare-`network = true` question as *open but host-safe* rather than deny-all; see that section for
-   why, and note that it is what promotes R3b ahead of R3c.
-2. **R3b (the bridge) is now the next item, and it is the risk.** The 2026-10-22 decision made
-   "open but host-safe" the default meaning of `network = true`, and that meaning does not exist
-   until there is a path out of the unshared namespace. The flag cannot be flipped unconditional
-   before the bridge lands, so these are one change. It is also the only item that changes prior's
-   spawn path: the supervisor must outlive the child, and `build_bwrap_expr` returns a
-   `duct::Expression` the caller reads to completion (`src/tools.rs:1399`, `:1889`). Spike the
-   smallest thing that proves: listener bound in-ns → fd out → accepted on outside → one SOCKS
-   handshake answered. If the lifetime change does not fit, the fallback is the socket-file design
-   (R3b's last paragraph) and the rest of the plan is unaffected.
-3. **R3c (the policy engine) after R3b, not before.** R3b lands with a pass-through bridge that
-   carries any destination; R3c then adds the SOCKS5 host:port allowlist inside it. The original
-   order had R3c first so the engine could be tested against host loopback with no bwrap, and that
-   testing strategy still holds — it is just no longer the critical path, because the *default*
-   behaviour (`open`) needs the bridge and does not need the engine at all.
-4. **R3d (seccomp)** last of the Linux work; it is small and independent.
-5. **R3g (macOS)** only when the schema from step 1 exists, and it is genuinely three rules plus a
-   profile generator — do not start it earlier, because the point of the schema is that mac consumes
-   it unchanged. It does **not** block on R3b: mac needs no fd passing, so R3c's engine plus a
-   host-loopback listener is a complete macOS implementation.
-6. **R4** is independent of all of the above and can run in parallel with any step. Its (a) and (b)
+1. **R3e (hygiene) — DONE**, **R3f (schema) — DONE**, **R3a (contract) — DONE**, **R3b (bridge) —
+   DONE**, **R3c (policy engine) — DONE.** All landed 2026-10-22. The full chain is in place:
+   `--unshare-net` is unconditional, `network = true` spawns the `prior-egress` shim, the shim binds
+   in the netns and hands the listening fd out, and the SOCKS5 engine in `src/egress.rs` applies the
+   allowlist. See "How it was actually implemented" under R3b for the shape, and R3c for the engine.
+2. **R3d (seccomp) is the next Linux item**, and it is small and independent: `AF_VSOCK` and
+   `io_uring` only. `PR_SET_PDEATHSIG` on the shim is the other half of the same hardening pass and
+   can ride with it.
+3. **R3g (macOS)** can start any time now: the schema and the SOCKS5 engine are both done, and the
+   engine is platform-neutral (`egress::host_allowed`, `serve_socks5`'s decision order). mac needs no
+   fd passing — a host-loopback listener plus three Seatbelt allow rules is the whole transport.
+   Build the profile generator in one module and make the applier a strategy; do **not** back onto
+   `zerobox`/`nono` as dependencies.
+4. **R4** is independent of all of the above and can run in parallel with any step. Its (a) and (b)
    parts are documentation and a warning; only (c) needs the `landlock` crate.
 
 **Facts already established, do not re-test:**
@@ -1568,7 +1618,10 @@ that keeps the policy shared). Everything else is detail.
   `ioctl` dance needed (this is what makes ~60 lines of `zerobox` unnecessary).
 - A listening fd created inside the netns can be sent to a process outside it and will carry real
   traffic. Verified with `send_fds`/`recv_fds`.
-- `duct` can pass fds via `before_spawn`, verified with a standalone crate.
+- A non-`CLOEXEC` fd from a `socketpair` survives `exec` into `bwrap` **and** into the payload with
+  the *same number* on both sides — measured through `duct`. This is why the implementation needs
+  neither `pass_fds` (still unstable) nor a `before_spawn` hook: the number travels in
+  `PRIOR_EGRESS_FD`. `duct` *can* pass fds via `before_spawn`, but the simpler route is used.
 - SOCKS5 `CONNECT` relay with host+port filtering works under `--unshare-net`, and denials are
   distinguishable (`0x02`) from dial failures.
 - A single socket *file* can be `--ro-bind`-ed in and connected to — the fallback mechanism, and the
@@ -1580,8 +1633,9 @@ that keeps the policy shared). Everything else is detail.
 
 - ~~Bare `network = true`~~ — **settled 2026-10-22**: open destinations, still netns-unshared
   ("open but host-safe"). An allowlist narrows; it is not the safety mechanism. See R3f.
-- Bridge as a helper *binary* bound into the sandbox, or an `sh -c` fragment? (R3b — a binary is
-  cleaner and matches `bsed`'s absolute-path treatment, but it must be bound in.)
+- ~~Bridge as a helper binary or an `sh -c` fragment?~~ — **settled by implementation**: a helper
+  binary, `prior-egress`, bound in and resolved absolutely like `bsed`. An `sh -c` fragment cannot
+  carry the fd plumbing cleanly and would need a shell in the payload.
 - Does R4's socket-binding warning default to warn, or require an opt-in flag? (R4b)
 - Should `agent-browser`'s control socket stay on AF_UNIX (needs no seccomp carve-out under this
   design) or move to TCP over the namespace loopback? (R3d/R3e — currently it works either way,

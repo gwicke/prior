@@ -3,11 +3,12 @@
 NOTE: Keep things tight - normally no more than 1-2 lines per bullet point. More detail -> create
 and link a doc/ and/or commit hash
 
-- [ ] sandbox R3b/R3c: `network: true` becomes an egress bridge (SOCKS5, host:port allowlist) and
-      `--unshare-net` stays on always, so X11 is unreachable by construction instead of via a
-      Landlock/seccomp ladder. R4 absorbs the Landlock work (per-path unix sockets).
-      Spec + handover: `doc/261021_sandbox_env_x11_audit.md` ("Where to start next").
-      R1/R2/R3e/R3f are done; R3b (bridge) is next, then R3c (allowlist) inside it.
+- [x] sandbox R3a/b/c: done (`4576433`): `--unshare-net` unconditional; `network: true` = egress
+      through the `prior-egress` shim + SOCKS5 allowlist (`src/egress.rs`). X11 unreachable by
+      construction. Spec + handover: `doc/261021_sandbox_env_x11_audit.md`.
+- [ ] sandbox R3d: seccomp for `AF_VSOCK` + `io_uring`, and `PR_SET_PDEATHSIG` on the shim.
+      Then R3g (macOS: three Seatbelt rules + a profile generator, reusing `egress::host_allowed`).
+      R4 (Landlock, per-path unix sockets) is independent.
       UDP is deferred; if needed the shape is `pasta`/`slirp4netns` plus in-sandbox nftables,
       not Landlock or host iptables — reasoning in R3h.
 - [ ] `--quiet` with no positional prompt spins: the non-REPL input arm (`repl == None`) pairs
