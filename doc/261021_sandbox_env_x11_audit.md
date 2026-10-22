@@ -1213,6 +1213,12 @@ Notes for whoever implements it:
   (subpath …)))`), which Linux cannot do below Landlock ABI 9 (`srt` documents `allowUnixSockets` as
   macOS-only for this reason). mac is *ahead* of Linux on that axis; do not design the policy model
   around Linux's weak spot.
+- **UDP on mac is already available**, and needs no architecture: Seatbelt is mediation-based and
+  deny-default, so `(allow network-outbound (remote udp "*:443"))` is just another rule, with no
+  bridge and no abstract namespace to protect. If a UDP tier is ever wanted, macOS *is* that tier;
+  the only question is policy breadth — an enumerated allowlist, or a wildcard that has to be
+  justified. Do not let the Linux deferral in R3h imply a mac limitation; the asymmetry runs the
+  other way.
 
 #### R3h — What is deferred, and why
 
@@ -1222,7 +1228,31 @@ Notes for whoever implements it:
   expectation SOCKS5 cannot meet.
 - **Credential masking** (`srt`'s sentinel substitution) is out of scope. It is the right design for
   "the agent may use the key, only here", but it is strictly more machinery than prior needs now.
-- **UDP** is out of scope; see R3a.
+- **UDP** is out of scope; see R3a. If it is ever genuinely demanded, the shape to build is
+  **`--unshare-net` plus a user-mode IP stack** (`pasta` or `slirp4netns`), not Landlock mediation.
+  Reasons, recorded so the option is not re-derived:
+  - *Why not Landlock.* Keeping the host netns and closing the abstract vector with
+    `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` (ABI 6 / Linux 6.12) plus `ResolveUnix` (ABI 9 /
+    Linux 7.1) does work, and was verified on a 7.1 host. But it trades unreachability for
+    mediation, which is the property R3 was written to stop depending on: a coverage gap degrades
+    silently to "X11 reachable" instead of failing closed. A 6.12 floor is ~2027 on ordinary hosts;
+    a 7.1 floor is much worse.
+  - *Why not iptables/nftables alone.* Netfilter filters IP packets and is blind to `AF_UNIX`, so
+    it contributes nothing to the X11 finding — the netns already covers that. Worse, there is no
+    interface to filter on until one exists, and creating one unprivileged is the hard part: a veth
+    pair can be created inside `unshare -Urn`, but its peer cannot be moved to the host netns
+    (`ip link set v1 netns 1` fails), so a veth uplink means host root. Once `pasta`/`slirp4netns`
+    does provide the interface, **in-sandbox nftables rules are the clean unprivileged way to get
+    per-sandbox egress ACLs** and are worth remembering. They filter by IP, though, while the policy
+    is written in hostnames; resolve-and-pin breaks on CDNs, round-robin and TTL churn. The SOCKS5
+    bridge sees names at the layer the policy is expressed in.
+  - *Why not SOCKS5 `UDP ASSOCIATE`.* Specified, but implemented by almost nothing outside a couple
+    of browsers. It is a protocol that can be written and will not be used.
+  - The cost of the user-mode stack is real: an external helper binary, host-side stack attack
+    surface, and no per-destination allowlist unless the tool grows one — so the tier may be worse
+    than having no UDP at all. Check first what actually needs UDP: QUIC falls back to TCP, DNS is
+    resolved proxy-side, which leaves peer-to-peer, WebRTC and mDNS. prior's tool surface plausibly
+    never touches those.
 
 ### R4 — The Unix-socket surface: document it, then constrain it with Landlock
 
