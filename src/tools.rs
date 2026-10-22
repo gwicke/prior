@@ -1179,6 +1179,16 @@ pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
     for (name, value) in bwrap_scrub_env() {
         cmd.env(name, value);
     }
+    // Same fd contract as the duct builders below (R8): only stdio survives the
+    // exec into bwrap. This path never carries an egress fd.
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure only calls `close_range`/`fcntl` (no allocation,
+        // no locks), satisfying `pre_exec`'s async-signal-safety contract.
+        unsafe {
+            cmd.pre_exec(|| seal_inherited_fds(None));
+        }
+    }
     let output = cmd
         .args(&args)
         .arg("--")
@@ -2102,6 +2112,75 @@ fn wrap_with_egress_shim(e: EgressSpec<'_>, program: Vec<String>) -> Vec<String>
     v
 }
 
+/// Close every non-stdio descriptor in the process being spawned, except `keep`.
+///
+/// bwrap forwards every inherited non-`CLOEXEC` descriptor into the payload: a
+/// file prior happens to hold open (a session log, a memmap, a socket) would be
+/// readable and writable from inside the sandbox. This is the R8 fix, the
+/// general form of what R7 did for stdin alone. Only fd 0/1/2 (stdio, already
+/// redirected by the caller) and `keep` (the egress bootstrap fd, see
+/// [`EgressSpec::child_fd`]) are meant to reach the payload.
+///
+/// Runs inside the forked child via `pre_exec`, *after* std has installed
+/// stdio, so 0/1/2 are already the right descriptors and must not be touched.
+///
+/// # Why `CLOSE_RANGE_CLOEXEC` and not a plain close
+///
+/// `close_range(3, …, 0)` here would close std's own exec-error pipe (a
+/// `CLOEXEC` pipe on fd ≥ 3 that std writes to when `execve` fails), turning a
+/// clean `ENOENT` into a runtime abort. `CLOSE_RANGE_CLOEXEC` only *marks* the
+/// descriptors, so std's pipe survives until `execve` — by which point it is
+/// closed by the kernel's own `CLOEXEC` handling — and the payload still sees
+/// only what we kept.
+///
+/// # Errors
+///
+/// Requires Linux 5.11+ (`close_range`). On `ENOSYS` (older kernel) or any
+/// other failure this returns the error, which `pre_exec` converts into a spawn
+/// failure — the sandbox refuses to run rather than leaking its fd table.
+fn seal_inherited_fds(keep: Option<std::os::fd::RawFd>) -> std::io::Result<()> {
+    // `close_range` has no libc wrapper on musl, so go through `syscall`. The
+    // fd range is `[3, UINT_MAX]`: stdio is exempt, and the upper bound is
+    // inclusive on Linux (it is `last`, not `last + 1`).
+    // SAFETY: `syscall` with these arguments (`close_range` takes three
+    // `c_uint`/`c_int`-width values) is just the close_range syscall.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3 as libc::c_uint,
+            libc::c_uint::MAX,
+            libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Re-open CLOEXEC on the one descriptor the payload is meant to inherit.
+    if let Some(fd) = keep {
+        // SAFETY: `fd` is a live descriptor owned by the caller and
+        // `F_SETFD`/`FD_CLOEXEC` is the documented way to clear the flag.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Install [`seal_inherited_fds`] as a `pre_exec` hook on `cmd`.
+fn seal_fds_before_exec(cmd: &mut std::process::Command, keep: Option<std::os::fd::RawFd>) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `seal_inherited_fds` only issues `close_range`/`fcntl` — no
+    // allocation, no locking — so it is async-signal-safe as `pre_exec`
+    // requires.
+    unsafe {
+        cmd.pre_exec(move || seal_inherited_fds(keep));
+    }
+}
+
 /// Build a `duct` expression that runs `cmd` inside a bwrap namespace, with its
 /// combined stdout/stderr captured directly by duct (bwrap forwards the child's
 /// stdio to its inherited fds — the same mechanism the read-only argv path uses
@@ -2153,9 +2232,18 @@ fn build_bwrap_expr(
     // `--new-session` only denies *acquiring* a controlling terminal; it
     // cannot revoke an fd that is already inherited. See `doc/sandbox.md`
     // ("The sandbox has no terminal").
+    //
+    // `seal_inherited_fds` is the R8 fix: stdin was closed by R7, but bwrap
+    // still forwards every *other* inherited non-CLOEXEC descriptor into the
+    // payload. Seal them all; keep the egress bootstrap fd when present.
+    let keep = egress.map(|e| e.child_fd);
     Ok(duct::cmd("bwrap", &args)
         .full_env(bwrap_scrub_env())
-        .stdin_null())
+        .stdin_null()
+        .before_spawn(move |cmd| {
+            seal_fds_before_exec(cmd, keep);
+            Ok(())
+        }))
 }
 
 /// Build a `duct` expression that runs a program with an explicit argv list
@@ -2184,10 +2272,16 @@ fn build_bwrap_expr_argv(
     args.push("--".into());
     args.extend(post);
     // Same stdin contract as `build_bwrap_expr` (R7): never inherit the
-    // user's terminal on fd 0.
+    // user's terminal on fd 0, and the same fd-table contract (R8): seal every
+    // other non-CLOEXEC descriptor, keeping only the egress bootstrap fd.
+    let keep = egress.map(|e| e.child_fd);
     Ok(duct::cmd("bwrap", &args)
         .full_env(bwrap_scrub_env())
-        .stdin_null())
+        .stdin_null()
+        .before_spawn(move |cmd| {
+            seal_fds_before_exec(cmd, keep);
+            Ok(())
+        }))
 }
 
 /// Best-effort home directory lookup for `~` expansion in bindings.
@@ -3685,6 +3779,56 @@ mod sandbox_tests {
             .await
             .unwrap();
         assert_eq!(read, "eof", "fd 0 must not block (live tty?): {read}");
+    }
+
+    /// The sandbox must not inherit *any* of prior's fds beyond stdio (R8).
+    ///
+    /// bwrap forwards every inherited non-`CLOEXEC` descriptor into the
+    /// payload, so a file prior happens to hold open (session log, memmap,
+    /// socket) would be readable inside the sandbox. This leaks one such fd
+    /// into the test process — the same one prior would hold — and asserts it
+    /// is absent inside the namespace. Without `seal_inherited_fds` the
+    /// `readlink` below resolves and the test fails.
+    ///
+    /// The fd must be non-`CLOEXEC` to model the leak: std opens files
+    /// `CLOEXEC` by default, so clear the flag explicitly (what a library that
+    /// clears it, or a raw `libc::open`, would leave behind).
+    #[tokio::test]
+    #[serial]
+    async fn sandboxed_commands_inherit_no_stray_fds() {
+        use std::os::fd::AsRawFd;
+
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
+
+        // A would-be secret prior holds open across the spawn.
+        let marker = std::env::temp_dir().join("prior_r8_fd_marker");
+        std::fs::write(&marker, "SECRET").unwrap();
+        let file = std::fs::File::open(&marker).unwrap();
+        let leaked = file.as_raw_fd();
+        // SAFETY: `leaked` is a live descriptor we own; clearing `FD_CLOEXEC`
+        // is exactly the leak we are modelling.
+        unsafe {
+            assert!(libc::fcntl(leaked, libc::F_SETFD, 0) >= 0);
+        }
+
+        // The same host file is visible inside the sandbox, so a surviving fd
+        // would resolve to something other than "absent".
+        let host_marker = marker.to_string_lossy().into_owned();
+        let script = format!("readlink /proc/self/fd/{leaked} 2>/dev/null || echo sealed");
+        let out = run_sandboxed(&script, None).await.unwrap();
+
+        // Drop the fd before asserting, so a failure does not leak into later
+        // tests (each `#[serial]` sandbox test shares this process).
+        drop(file);
+        let _ = std::fs::remove_file(&host_marker);
+
+        assert_eq!(
+            out, "sealed",
+            "sandbox inherited prior's fd {leaked} from a spawn: {out}"
+        );
     }
 }
 
