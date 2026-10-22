@@ -863,10 +863,11 @@ pub struct SandboxConfig {
     ///
     /// - `network = false` / absent — no egress; the network namespace is
     ///   unshared and nothing is reachable.
-    /// - `network = true` — **open but host-safe**: destinations are
+    /// - `network = true` — **open but host-safe**: public destinations are
     ///   unrestricted, but the sandbox still does not share the host's network
-    ///   namespace, so host-local services and the abstract X11 socket stay
-    ///   unreachable. Requires the egress bridge.
+    ///   namespace, so the abstract X11 socket stays unreachable. Local,
+    ///   link-local and private/metadata ranges are additionally denied unless
+    ///   an `allow` entry names them (R3j). Requires the egress bridge.
     /// - `[network] allow = ["host:port", …]` — additionally restrict
     ///   destinations to the listed host[:port] pairs.
     #[serde(default, deserialize_with = "deserialize_network")]
@@ -919,23 +920,28 @@ pub struct SandboxConfig {
 ///
 /// The distinction that matters is between *destination* policy and *namespace*
 /// policy. Both of the enabled forms keep the sandbox in its own network
-/// namespace — that is what makes `network = true` **host-safe** rather than a
-/// bypass: the abstract X11 socket and host `127.0.0.1` services are unreachable
-/// because nothing routes to them, not because a rule filters them. The
-/// allowlist then narrows *destinations* on top of that, and an empty or absent
-/// `allow` means "any destination".
+/// namespace — that is what makes `network = true` a namespace guarantee rather
+/// than a bypass: the abstract X11 socket is unreachable because nothing routes
+/// to it. Destination policy is a **second** layer on top, and it has two parts
+/// (R3j):
 ///
-/// This is deliberately not fail-closed on an empty allowlist. The reachability
-/// guarantee comes from the namespace, so `enabled = true, allow = []` is "open
-/// but safe", which is the documented first-class default. An operator who wants
-/// nothing reachable sets `enabled = false` (or omits the block), which is the
-/// actual closed state.
+/// - **Local/non-public ranges are denied by default.** Loopback, RFC 1918,
+///   CGNAT, link-local (including cloud metadata `169.254.169.254`), IPv6 ULA,
+///   multicast and unspecified are not network egress but local IPC to host
+///   daemons (CUPS, a dev server, a database on `127.0.0.1`). They are reachable
+///   only when an `allow` entry names the destination literally, e.g.
+///   `allow = ["127.0.0.1:5432"]`. The check is applied to the resolved address
+///   too, so a public name that rebinds to loopback is refused.
+/// - **Everything else is open** when `allow` is empty. So `enabled = true,
+///   allow = []` is "public internet, no host daemons", the first-class default.
+///   An operator who wants nothing reachable sets `enabled = false`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetworkPolicy {
     /// Whether egress is permitted at all. Default `false`.
     pub enabled: bool,
-    /// Optional destination allowlist, each entry `host` or `host:port`.
-    /// Empty means any destination. Only meaningful when `enabled`.
+    /// Optional destination allowlist, each entry `host` or `host:port`. Empty
+    /// means any **public** destination; local/non-public ranges require an
+    /// explicit entry (R3j). Only meaningful when `enabled`.
     pub allow: Vec<String>,
 }
 
@@ -945,8 +951,10 @@ impl NetworkPolicy {
         NetworkPolicy::default()
     }
 
-    /// Egress to any destination, still inside the sandbox's own netns — the
-    /// meaning of a bare `network = true`.
+    /// Egress to any **public** destination, still inside the sandbox's own
+    /// netns — the meaning of a bare `network = true`. Local/non-public ranges
+    /// are denied by [`crate::egress::local_or_nonpublic`] until explicitly
+    /// listed (R3j).
     pub fn open() -> NetworkPolicy {
         NetworkPolicy {
             enabled: true,
@@ -1708,7 +1716,7 @@ mod tests {
         assert!(cfg.network.enabled);
         assert!(
             !cfg.network.is_restricted(),
-            "a bare true grants any destination"
+            "a bare true grants any public destination (local ranges are still denied, R3j)"
         );
 
         let cfg = parse_bind("network = false");
@@ -1732,8 +1740,8 @@ mod tests {
     #[test]
     fn network_table_with_empty_allowlist_is_open_not_denied() {
         // The documented first-class default: enabled with no allowlist means
-        // any destination, because host safety comes from the netns rather than
-        // from the allowlist. Asserted so nobody "fixes" this into a deny.
+        // any *public* destination. Local/non-public ranges are denied
+        // separately by R3j, not by this check, so `is_restricted()` stays false.
         let cfg = parse_bind("[network]\nenabled = true");
         assert!(cfg.network.enabled);
         assert!(cfg.network.allow.is_empty());

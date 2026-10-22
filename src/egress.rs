@@ -199,38 +199,140 @@ pub fn recv_fd(
 // Allowlist matching
 // ---------------------------------------------------------------------------
 
-/// Decides whether a `CONNECT` to `host:port` is permitted.
+/// Decides whether a `CONNECT` to `host:port` is permitted, **by textual host**.
 ///
-/// An empty allowlist permits any destination (`network = true`); that is the
-/// documented "open but host-safe" default, and the safety comes from the
-/// namespace, not from this check. Entries are `host` or `host:port`, and a
-/// leading `*.` matches any subdomain (`*.crates.io` matches `static.crates.io`
-/// but not `crates.io` itself).
+/// This is the first of two gates. It answers the allowlist question and rejects
+/// a *literal* non-public address; it cannot police a name that resolves into a
+/// private range, because that only becomes known after [`resolve`]. The second
+/// gate, [`addr_permitted`], runs on the resolved address and is the authority
+/// (R3j). Both must pass.
+///
+/// Policy:
+/// - An entry that matches (`host` or `host:port`, a leading `*.` matching
+///   subdomains only — `*.crates.io` matches `static.crates.io`, not
+///   `crates.io`) permits the destination.
+/// - A non-empty allowlist with no matching entry denies.
+/// - An **empty** allowlist (`network = true` with no narrowing) permits public
+///   unicast only: a literal loopback/private/link-local/… address is denied
+///   even here. A *name* is permitted at this gate and settled by
+///   [`addr_permitted`] after resolution.
 pub fn host_allowed(allow: &[String], host: &str, port: u16) -> bool {
-    if allow.is_empty() {
-        return true;
-    }
     let host_lc = host.to_ascii_lowercase();
-    allow
+    if allow
         .iter()
         .any(|entry| entry_matches(entry.trim(), &host_lc, port))
+    {
+        return true;
+    }
+    if !allow.is_empty() {
+        return false;
+    }
+    // Empty allowlist: public unicast only. A name cannot be judged here.
+    let literal = host_lc
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(&host_lc);
+    match literal.parse::<IpAddr>() {
+        Ok(ip) => !local_or_nonpublic(ip),
+        Err(_) => true,
+    }
+}
+
+/// True for destinations that are **not public unicast**: loopback, RFC 1918
+/// private, CGNAT, link-local, IPv6 ULA, multicast, unspecified and broadcast
+/// (R3j).
+///
+/// These are the destinations that are *local IPC to host daemons* rather than
+/// network egress — CUPS on `127.0.0.1:631`, a dev server, a database bound to
+/// loopback, cloud metadata at `169.254.169.254`. Reaching them from the sandbox
+/// must be an explicit choice, not the price of `network = true`.
+///
+/// IPv4-mapped IPv6 (`::ffff:127.0.0.1`) unwraps first, so it cannot smuggle a
+/// local v4 destination past the v6 match arms.
+pub fn local_or_nonpublic(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4_is_nonpublic(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4_is_nonpublic(v4),
+            None => v6_is_nonpublic(v6),
+        },
+    }
+}
+
+fn v4_is_nonpublic(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 0                                   // 0.0.0.0/8 "this network"
+        || a == 10                           // 10.0.0.0/8 private
+        || a == 127                          // 127.0.0.0/8 loopback
+        || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10 CGNAT
+        || (a == 169 && b == 254)            // 169.254.0.0/16 link-local + metadata
+        || (a == 172 && (16..=31).contains(&b)) // 172.16.0.0/12 private
+        || (a == 192 && b == 168)            // 192.168.0.0/16 private
+        || a >= 224 // 224/4 multicast + 240/4 reserved + broadcast
+}
+
+fn v6_is_nonpublic(ip: Ipv6Addr) -> bool {
+    let head = ip.segments()[0];
+    ip.is_loopback()                         // ::1
+        || ip.is_unspecified()               // ::
+        || (head & 0xffc0) == 0xfe80         // fe80::/10 link-local
+        || (head & 0xfe00) == 0xfc00         // fc00::/7 unique-local
+        || (head & 0xff00) == 0xff00 // ff00::/8 multicast
+}
+
+/// The second gate (R3j): decides whether a **resolved** destination may be
+/// dialled. Public unicast always may. A non-public address may only when the
+/// allowlist names its literal form (`127.0.0.1:5432`), never by the name that
+/// happened to resolve to it — a public name whose A-record points at
+/// `127.0.0.1` (DNS rebinding) is therefore denied even if that name is
+/// allowlisted.
+///
+/// Called after [`resolve`] and before `connect` in all three engines, so the
+/// check and the dial see the same address.
+pub fn addr_permitted(allow: &[String], addr: SocketAddr) -> bool {
+    if !local_or_nonpublic(addr.ip()) {
+        return true;
+    }
+    let ip = addr.ip().to_string();
+    allow
+        .iter()
+        .any(|entry| entry_matches(entry.trim(), &ip, addr.port()))
 }
 
 fn entry_matches(entry: &str, host: &str, port: u16) -> bool {
     if entry.is_empty() {
         return false;
     }
-    // Split an optional `:port`. IPv6 literals arrive in `host` without
-    // brackets, so an entry that is a bare IPv6 address has no port suffix; a
-    // trailing `:<digits>` which also parses as a port is treated as one.
-    let (ehost, eport) = match entry.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-            match p.parse::<u16>() {
-                Ok(p) => (h, Some(p)),
-                Err(_) => (entry, None),
+    // Three entry shapes: `host[:port]`, a bare IP literal (any port), and a
+    // bracketed IPv6 literal `[addr][:port]`. The bare-IP and bracketed forms
+    // matter for R3j, where an operator names a local destination literally
+    // (`127.0.0.1:5432`, `::1`, `[::1]:3000`); without them `::1` would rsplit
+    // to host `::` port `1`.
+    let (ehost, eport) = if let Some(inner) = entry.strip_prefix('[') {
+        let Some((addr, rest)) = inner.split_once(']') else {
+            return false; // malformed bracket
+        };
+        let eport = match rest.strip_prefix(':') {
+            Some(p) => match p.parse::<u16>() {
+                Ok(p) => Some(p),
+                Err(_) => return false,
+            },
+            None if rest.is_empty() => None,
+            None => return false, // junk after `]`
+        };
+        (addr, eport)
+    } else if entry.parse::<IpAddr>().is_ok() {
+        (entry, None)
+    } else {
+        match entry.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+                match p.parse::<u16>() {
+                    Ok(p) => (h, Some(p)),
+                    Err(_) => (entry, None),
+                }
             }
+            _ => (entry, None),
         }
-        _ => (entry, None),
     };
     if let Some(p) = eport {
         if p != port {
@@ -253,9 +355,87 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_allowlist_permits_anything() {
+    fn empty_allowlist_permits_public_and_names_only() {
+        // A name cannot be judged before resolution; a public literal is fine.
         assert!(host_allowed(&[], "example.com", 80));
-        assert!(host_allowed(&[], "127.0.0.1", 1));
+        assert!(host_allowed(&[], "1.1.1.1", 443));
+        // R3j: a literal non-public address is denied even with no allowlist.
+        assert!(!host_allowed(&[], "127.0.0.1", 1));
+        assert!(!host_allowed(&[], "169.254.169.254", 80));
+        assert!(!host_allowed(&[], "10.0.0.1", 80));
+        assert!(!host_allowed(&[], "[::1]", 80));
+    }
+
+    #[test]
+    fn local_and_nonpublic_ranges() {
+        let deny = |s: &str| local_or_nonpublic(s.parse::<IpAddr>().unwrap());
+        for s in [
+            "127.0.0.1",
+            "127.255.255.255",
+            "0.0.0.0",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "169.254.169.254",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "ff02::1",
+            "::ffff:127.0.0.1", // v4-mapped
+            "::ffff:10.0.0.1",  // v4-mapped
+        ] {
+            assert!(deny(s), "{s} must be non-public");
+        }
+        for s in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "172.15.0.1", // just below the /12
+            "172.32.0.1", // just above the /12
+            "100.63.255.255",
+            "100.128.0.0",
+            "192.169.0.1",
+            "2606:4700::1111",
+            "::ffff:1.1.1.1", // v4-mapped, still public
+        ] {
+            assert!(!deny(s), "{s} must be public");
+        }
+    }
+
+    #[test]
+    fn explicit_entry_repermits_a_local_destination() {
+        let a = vec!["127.0.0.1:5432".to_string()];
+        assert!(host_allowed(&a, "127.0.0.1", 5432));
+        assert!(!host_allowed(&a, "127.0.0.1", 5433)); // right host, wrong port
+                                                       // Bare literal entry matches any port; bracketed v6 too.
+        let a = vec!["127.0.0.1".to_string()];
+        assert!(host_allowed(&a, "127.0.0.1", 631));
+        let a = vec!["[::1]:3000".to_string()];
+        assert!(host_allowed(&a, "::1", 3000));
+        let a = vec!["::1".to_string()];
+        assert!(host_allowed(&a, "::1", 3000));
+    }
+
+    #[test]
+    fn explicit_entry_cannot_admit_a_rebinding_name() {
+        // The name is allowlisted, but it resolves to loopback: the resolved
+        // gate refuses. This is the reason the check is not textual alone.
+        let a = vec!["evil.example:80".to_string()];
+        assert!(host_allowed(&a, "evil.example", 80));
+        let rebound = SocketAddr::from((Ipv4Addr::LOCALHOST, 80));
+        assert!(
+            !addr_permitted(&a, rebound),
+            "resolution must be re-checked"
+        );
+        // A literal entry does permit the resolved loopback.
+        let a = vec!["127.0.0.1:80".to_string()];
+        assert!(addr_permitted(&a, rebound));
     }
 
     #[test]
@@ -399,6 +579,13 @@ fn serve_socks5(
             return Ok(());
         }
     };
+    // R3j: the resolved address is the authority. A public name that resolves
+    // into a private range (rebinding) is refused here, not at `host_allowed`.
+    if !addr_permitted(allow, target) {
+        log(&format!("DENY-LOCAL {}:{}", request.host, request.port));
+        let _ = send_reply(&mut client, REP_NOT_ALLOWED);
+        return Ok(());
+    }
     let upstream = match TcpStream::connect(target) {
         Ok(s) => s,
         Err(e) => {
@@ -618,6 +805,11 @@ fn serve_http_connect(
         let _ = write_http_error(&mut client, 502, "Bad Gateway");
         return Ok(());
     };
+    if !addr_permitted(allow, target) {
+        log(&format!("DENY-LOCAL {host}:{port}"));
+        let _ = write_http_error(&mut client, 403, "Forbidden");
+        return Ok(());
+    }
     let upstream = match TcpStream::connect(target) {
         Ok(s) => s,
         Err(e) => {
@@ -674,6 +866,11 @@ fn serve_http_forward(
         let _ = write_http_error(&mut client, 502, "Bad Gateway");
         return Ok(());
     };
+    if !addr_permitted(allow, addr) {
+        log(&format!("DENY-LOCAL {host}:{port}"));
+        let _ = write_http_error(&mut client, 403, "Forbidden");
+        return Ok(());
+    }
     let mut upstream = match TcpStream::connect(addr) {
         Ok(s) => s,
         Err(e) => {
@@ -1112,7 +1309,9 @@ mod proxy_tests {
 
         let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
-        let allow: Vec<String> = vec![];
+        // R3j: loopback is non-public, so it needs an explicit entry even though
+        // this is a splice test. The entry is the literal address being dialled.
+        let allow: Vec<String> = vec![upstream.to_string()];
         let server = std::thread::spawn(move || {
             let (client, _) = proxy_listener.accept().unwrap();
             let mut log = |_s: &str| {};
@@ -1269,7 +1468,10 @@ mod proxy_tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let proxy = listener.local_addr().unwrap();
         use std::os::fd::IntoRawFd;
-        let mut bridge = EgressBridge::start(listener.into_raw_fd(), Vec::new()).unwrap();
+        // R3j: the concurrency harness dials a loopback upstream, so it must be
+        // allowed explicitly; the point here is parallelism, not policy.
+        let mut bridge =
+            EgressBridge::start(listener.into_raw_fd(), vec![upstream.to_string()]).unwrap();
 
         let started = std::time::Instant::now();
         let clients: Vec<_> = (0..N)
@@ -1334,7 +1536,7 @@ mod proxy_tests {
         let (upstream, up) = http_upstream("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let proxy = listener.local_addr().unwrap();
-        let server = one_conversation(listener, Vec::new());
+        let server = one_conversation(listener, vec![upstream.to_string()]);
 
         let mut c = TcpStream::connect(proxy).unwrap();
         write!(
@@ -1382,7 +1584,7 @@ mod proxy_tests {
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let proxy = listener.local_addr().unwrap();
-        let server = one_conversation(listener, Vec::new());
+        let server = one_conversation(listener, vec![upstream.to_string()]);
 
         let mut c = TcpStream::connect(proxy).unwrap();
         write!(

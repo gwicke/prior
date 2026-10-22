@@ -89,14 +89,20 @@ timeout_secs = 120
 # bridge (the `prior-egress` shim, which must be installed alongside prior).
 #
 #   network = false   no egress; the network namespace is unshared.
-#   network = true    OPEN BUT HOST-SAFE: any destination is reachable, but only
-#                     through the bridge; the sandbox keeps its own namespace.
-#   [network]         optionally narrow destinations on top of that.
+#   network = true    PUBLIC destinations only, through the bridge; the sandbox
+#                     keeps its own namespace. Local/private/link-local ranges
+#                     (loopback, RFC 1918, cloud metadata, IPv6 ULA, multicast)
+#                     are denied by default — they are host IPC, not egress.
+#   [network]         optionally narrow or widen destinations on top of that.
 #   enabled = true
 #   allow = ["github.com:443", "*.crates.io:443"]
 #
-# An allowlist restricts *destinations*; it is not what makes `true` safe. An
-# empty `allow` means any destination. To permit nothing, use `false`.
+# An allowlist restricts *destinations*; it is not what makes `true` safe (the
+# unshared netns is). An empty `allow` means any *public* destination. To reach a
+# host-local service (a dev server, a DB on 127.0.0.1), name it explicitly, e.g.
+# allow = ["127.0.0.1:5432"]; the check also runs on the resolved address, so a
+# public name that rebinds to loopback is still refused. To permit nothing, use
+# `false`.
 #
 # Operators that ignore the proxy variables (ALL_PROXY/HTTPS_PROXY/HTTP_PROXY)
 # and open raw sockets get no egress; UDP is not carried (SOCKS5 CONNECT is

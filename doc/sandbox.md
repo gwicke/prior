@@ -45,7 +45,7 @@ auto_allow = ["^cargo test"]
 # (and `bwrap` is required at startup, so prior fails closed without it).
 timeout_secs = 120        # default: 120
 network = false           # default: false (no egress; netns unshared)
-# network = true          # open destinations, STILL netns-unshared (host-safe)
+# network = true          # public destinations only, STILL netns-unshared
 # [network]               # optional narrowing on top of `true`
 # enabled = true
 # allow = ["github.com:443"]
@@ -677,7 +677,9 @@ case, because no client reads them all):
 
 `NO_PROXY` is deliberately **not** set: inside the netns `127.0.0.1` is the
 bridge itself, so bypassing it would route a client to nothing — and it would
-remove the one route to a host-loopback service the allowlist is meant to permit.
+remove the one route to a host-loopback service an explicit allowlist entry is
+meant to permit (that reach is otherwise denied by default; see R3j in the
+security properties).
 
 The HTTP engine handles the two request forms a proxy sees:
 
@@ -722,9 +724,16 @@ everything behind it.
 - **The network namespace is never shared.** `--unshare-net` is emitted
   regardless of `network`, and `network = true` means "egress *through the
   bridge*", not "join the host's namespace" (R3a). This is what makes
-  `network = true` host-safe: the abstract X11 socket
-  (`\0/tmp/.X11-unix/X0`) and host `127.0.0.1` services are unreachable because
-  nothing routes to them, independent of whether an allowlist is set.
+  `network = true` a namespace guarantee: the abstract X11 socket
+  (`\0/tmp/.X11-unix/X0`) is unreachable because nothing routes to it.
+  - **Local and non-public destinations are denied by default (R3j).** The
+    bridge reaches *host* loopback (it is the one route to a host service), so
+    "empty allowlist" would otherwise mean "any host daemon": loopback, RFC 1918,
+    CGNAT, link-local (cloud metadata `169.254.169.254`), IPv6 ULA, multicast.
+    These are refused unless an `allow` entry names the destination literally
+    (`allow = ["127.0.0.1:5432"]`), and the check runs on the *resolved* address,
+    so a public name rebinding to loopback is refused too. An empty allowlist
+    therefore means *public internet only*.
   - Two socket kinds, two mechanisms. *Abstract* sockets live in the network
     namespace, so unsharing is necessary and sufficient. *Pathname* sockets
     (`/run/user/*/bus`) live in the filesystem, which the netns does not

@@ -3314,8 +3314,14 @@ mod sandbox_tests {
             }
         });
 
+        // R3j: loopback is denied to an empty allowlist, so the host upstream must
+        // be named explicitly. The port is only known now, which is exactly the
+        // operator story this test encodes.
         let mut cfg = sandbox_with(vec![], vec![], Some(60));
-        cfg.network = crate::config::NetworkPolicy::open();
+        cfg.network = crate::config::NetworkPolicy {
+            enabled: true,
+            allow: vec![format!("127.0.0.1:{}", upstream.port())],
+        };
         set_sandbox(Some(cfg));
 
         // `curl` honours ALL_PROXY; ask it to reach the host's loopback upstream.
@@ -3345,6 +3351,52 @@ mod sandbox_tests {
         assert_eq!(out, "BLOCKED", "abstract X11 socket must be unreachable");
 
         server.join().unwrap();
+    }
+
+    /// R3j end to end: with an **empty** allowlist (`network = true`), the same
+    /// host-loopback upstream the previous test reaches is now refused. The
+    /// refusal is the bridge's, so the client sees the tunnel denied — proof the
+    /// default no longer reaches host-local daemons.
+    #[tokio::test]
+    #[serial]
+    async fn empty_allowlist_denies_host_loopback() {
+        if !bwrap_on_path() {
+            return;
+        }
+        if crate::egress::resolve_shim().is_none() {
+            eprintln!("skipping: prior-egress not built (run `cargo build` first)");
+            return;
+        }
+
+        // An upstream that would answer if reached. It must stay uncontacted.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            // Any accepted connection is a policy failure; report it.
+            listener.accept().is_ok()
+        });
+
+        let mut cfg = sandbox_with(vec![], vec![], Some(60));
+        cfg.network = crate::config::NetworkPolicy::open(); // empty allowlist
+        set_sandbox(Some(cfg));
+
+        let out = run_sandboxed(
+            &format!(
+                "curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 \
+                 http://127.0.0.1:{}/",
+                upstream.port()
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_ne!(out, "200", "empty allowlist must not reach host loopback");
+        assert!(
+            !server.join().unwrap(),
+            "the bridge must not have dialled the local upstream at all"
+        );
     }
 
     /// A command that ignores the proxy variables gets no egress: no bridge is
@@ -3454,8 +3506,14 @@ mod sandbox_tests {
             }
         });
 
+        // R3j: the loopback origin must be named explicitly; an empty allowlist
+        // no longer reaches host loopback. The point here is the HTTP front end,
+        // not the policy.
         let mut cfg = sandbox_with(vec![], vec![], Some(60));
-        cfg.network = crate::config::NetworkPolicy::open();
+        cfg.network = crate::config::NetworkPolicy {
+            enabled: true,
+            allow: vec![format!("127.0.0.1:{}", upstream.port())],
+        };
         set_sandbox(Some(cfg));
 
         // wget: reads only the lower-case `http_proxy` here, and has no SOCKS.

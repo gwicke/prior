@@ -7,7 +7,9 @@ reproduced, not inferred.*
 
 ## Status
 
-**R1, R2, R3a/b/c/d/e/f/i, R7 and R8 are implemented.** **R3g, R3h, R4, R5 and R6 are not.** R3 was
+**R1, R2, R3a/b/c/d/e/f/i/j, R7 and R8 are implemented.** **R3g, R3h, R4, R5 and R6 are not.**
+R3j (deny local destination ranges by default) is the one finding the post-implementation re-audit
+added, and it is implemented; see "Re-audit — 2026-10-22" and the R3j spec. R3 was
 revised on 2026-10-22 after testing the design against four reference implementations and this host:
 it is no longer a Landlock/seccomp ladder but a bridge design (R3a–R3h), with Landlock moved to R4
 where it is the only fix. The Linux half then landed the same day: `--unshare-net` is now
@@ -20,6 +22,41 @@ The revision was prompted by one question: *can `network: true` keep the network
 the X11 vector disappears by construction instead of needing three layered controls?* The answer is
 yes, and both reference implementations already do some version of it — see "Cross-check:
 `nono`'s passed-listener bridge" and "Why `network: true` must not share the network namespace".
+
+### Re-audit — 2026-10-22 (escape test against the implemented sandbox)
+
+A live escape probe of this session's own sandbox, after R1/R2/R3/R7/R8 landed, confirms the
+controls hold and found nothing that bypasses them. The two residual items are *policy*, not
+isolation, and are recorded below — R3j is the one that changes the design.
+
+```text
+fd 0 / /proc/1/fd/0    -> /dev/null          open("/dev/tty") -> ENXIO   TIOCSTI -> ENOTTY
+/dev/pts/{0,5}         absent (fresh devpts) /proc/1/root/dev/tty -> ENXIO  /dev/console absent
+/proc/1/environ        PATH only (R1)        env seen: 15 vars, no DISPLAY/XAUTHORITY/SSH_AUTH_SOCK
+abstract X11/i3/wezterm -> ECONNREFUSED      fs X11/bus/i3/gpg sockets absent (fresh /tmp, not bound)
+pidfd_getfd(1, *)      only bwrap's own fds   unshare/mount/chroot/open_tree/io_uring -> EPERM
+```
+
+**1. Host loopback is reachable through the bridge (this is R3j).** With `network: true` and an
+**empty** allowlist — the documented "open but host-safe" default — the proxy reaches *host*
+loopback services: `http://localhost:631` (host CUPS) answered `200` from inside the sandbox, and a
+raw SOCKS `CONNECT 127.0.0.1:22` completed. This is a deliberate design property
+(`egress.rs::proxy_var_specs`, "the one way to reach a *host* loopback service through the bridge
+when the allowlist permits it"), but it means the default open policy also reaches CUPS, any dev
+server, and any database bound to loopback — a far larger surface than "egress to the internet".
+**Fix: R3j, deny local ranges by default.** This narrows R3f's "empty allowlist ⇒ any destination".
+
+**2. A host secret sits in a `ro`-bound directory.** `/home/gabriel/.cargo/credentials.toml` (a
+crates.io token) is readable from inside the sandbox, because `~/.cargo` is `ro`-bound for the
+toolchain, and exfiltratable whenever egress is open. Not a sandbox defect — `~/.cargo` must be
+visible to build — but the token's protection then rests entirely on the egress policy. Mitigated
+operationally in the author's config; a finer binding (`~/.cargo/{registry,git,bin}` rather than the
+whole directory) is the code-side option if it ever matters.
+
+Non-findings, recorded so they are not re-chased: `/` and `/etc` are writable but are the
+per-session tmpfs (`stat -f` → `tmpfs`), so nothing persists to the host; `/proc/1/cmdline` still
+exposes bwrap's argv (bind sources, `--setenv` pairs), which with R1 is fingerprinting only, not
+secret disclosure.
 
 ## Summary
 
@@ -1460,12 +1497,15 @@ enabled = true
 allow   = ["github.com:443", "*.crates.io:443"]
 ```
 
-- **`enabled = true, allow = []` is "open but host-safe", not deny-all** (decided 2026-10-22).
-  Rationale: the reachability guarantee comes from the *namespace*, not the allowlist, so an empty
-  allowlist is not a bypass. The safety property — abstract X11 socket and host `127.0.0.1`
-  unreachable — holds for every enabled form, because `--unshare-net` is unconditional and egress
-  goes through the bridge. "Open but safe for the host" is the intended first-class default;
-  operators narrow with `allow` when they want to. To permit nothing, use `false`.
+- **`enabled = true, allow = []` is "open but host-safe" for *public* destinations only** (decided
+  2026-10-22, narrowed by R3j). Rationale: the reachability guarantee comes from the *namespace*,
+  not the allowlist, so an empty allowlist is not a bypass of the netns. But "host-safe" is **not**
+  true of an empty allowlist as first written: the bridge reaches *host* loopback (measured: CUPS
+  `:631` → 200), which is local IPC, not network egress. **R3j corrects this**: an empty allowlist
+  denies local/link-local/private/metadata ranges and permits only public unicast, with local
+  destinations re-permitted by an explicit entry. The netns still guarantees the abstract X11 socket
+  and a *bound* host `127.0.0.1` are unreachable; R3j makes the *bridge* stop being an exception.
+  To permit nothing at all, use `false`.
 - Consequence for ordering: "host-safe" has no meaning until the bridge exists, so **R3b must land
   before the flag can be flipped unconditional**. Until then `build_bwrap_args` keeps
   `--unshare-net` conditional on `enabled`, because unsharing with no path out would silently remove
@@ -1644,6 +1684,72 @@ back to `socks5h://` (verified).
 speaking plaintext, exactly where SOCKS saw it. The allowlist still governs `host:port`, not a URL
 (R3h). And absolute-form traffic still pays one connection per request, which is the price of not
 having a body parser.
+
+#### R3j — Deny local destination ranges by default (IMPLEMENTED 2026-10-22)
+
+The re-audit (below) showed the gap R3f left open: "empty allowlist ⇒ any destination" reaches *host*
+loopback — CUPS (`:631` → 200), sshd, every dev server, every DB bound to `127.0.0.1`. That is not
+network egress; it is local IPC to host daemons, and it is exactly the class Finding 3 removed for
+X11. It must be denied by default and opt-in per entry.
+
+**Contract.** An empty (`or unset`) allowlist means *public unicast only*. Local, link-local and
+otherwise non-public destinations are refused unless an allowlist entry names them explicitly. The
+check is the *combination* of the textual host and its resolved address:
+
+- Deny when the requested host, or **any** address it resolves to, is in a non-public range:
+  `127.0.0.0/8`, `::1`, `0.0.0.0/8`, `::/128`, the RFC 1918 blocks (`10/8`, `172.16/12`,
+  `192.168/16`), CGNAT `100.64/10`, link-local `169.254/16` + `fe80::/10` (this closes **cloud
+  metadata `169.254.169.254`**), IPv6 ULA `fc00::/7`, multicast `224/4` + `ff00::/8`, broadcast
+  `255.255.255.255`, and IPv4-mapped/-compatible IPv6 that unwrap into any of the above.
+- An explicit allowlist entry that names the destination (e.g. `127.0.0.1:5432`,
+  `192.168.1.50:8080`, `[::1]:3000`) **re-permits it**. So the check is: deny-by-range *first*, then
+  the entry match, where an entry that *is* the local destination satisfies both. Concretely,
+  `host_allowed` gains a range gate and the empty-list fast path is replaced by a range test — never
+  a blanket `true`.
+
+**Where it goes.** One function, `egress::local_or_nonpublic(ip: IpAddr) -> bool` plus a
+`host_is_local(host, port)` for the literal case, called in `host_allowed`. It runs on the **textual
+host** (below) *and* again on the **resolved address** — the check must survive resolution, or a
+public name that resolves to `127.0.0.1` is a trivial bypass. `resolve()` is the one place the
+address is known before `connect`, so the resolved-address check lives just after `resolve()` and
+before `TcpStream::connect` in all three engines (SOCKS `serve_socks5`, HTTP `serve_http_connect`,
+`serve_http_forward`). Both default-allow paths and allowlisted paths re-check, because the
+allowlist is textual and cannot see a rebinding.
+
+**Why both ends.** A name like `metadata.google.internal` or an attacker A-record can resolve into a
+private range after the textual check passed; and a literal `[::ffff:127.0.0.1]` or `0x7f000001` in
+the request line can dodge a naive string match. The resolved-address gate is the authority; the
+textual gate is the early rejection and the better log line.
+
+**Behaviour on denial.** Same as any other allowlist miss — SOCKS `0x02`, HTTP `403`, log
+`DENY-LOCAL host:port` (distinct from `DENY`/`DENY-RESOLVE` so an operator scanning the log can tell
+"you asked for the internet and hit loopback" from "you were filtered").
+
+**Consequences to document (operator-visible).**
+- The `network = true` default **no longer reaches a local dev server / CUPS / DB**. That is the
+  point, but anyone who relied on the current behaviour (R3a called it out as "a change"; this makes
+  it a real one) must add `allow = ["127.0.0.1:<port>"]`.
+- `agent-browser` and test suites are unaffected: they listen on the sandbox's **own** namespace
+  loopback (`127.0.0.1` inside the netns), not through the bridge, so no range check touches them.
+- DNS is unaffected: the bridge resolves (`socks5h`), so the range check runs on the supervisor side
+  on the resolved address. A denial here is a *dial* refusal, not a resolver change.
+- The macOS backend (R3g) reuses the same function on the same values, so the rule is one line's
+  worth of platform-neutral code — which is the reason to put it in `egress.rs` and not in the
+  bridge's Linux transport.
+
+**Implemented as specified**, in `src/egress.rs` (`local_or_nonpublic`, `addr_permitted`,
+`host_allowed`) with the second gate called after `resolve` and before `connect` in all three
+engines. `entry_matches` also gained the bare-IP and bracketed-IPv6 entry forms, so `::1` is not
+mis-split at its colons.
+
+**Tests.** `local_and_nonpublic_ranges` walks each range's edges and the IPv4-mapped unwrap;
+`empty_allowlist_permits_public_and_names_only`, `explicit_entry_repermits_a_local_destination` and
+`explicit_entry_cannot_admit_a_rebinding_name` pin the policy (the last is the resolved-address gate:
+a name allowlisted but resolving to loopback is refused). End to end,
+`sandboxed::empty_allowlist_denies_host_loopback` asserts a real sandbox with an empty allowlist does
+not reach a host-loopback upstream (verified load-bearing: it fails with both gates removed), and the
+existing host-loopback tests
+now name the upstream explicitly.
 
 ### R4 — The Unix-socket surface: document it, then constrain it with Landlock
 
@@ -1922,7 +2028,13 @@ that keeps the policy shared). Everything else is detail.
    preserved, so `git https` costs one setup RTT and nothing more), absolute-form `GET` forced to
    `Connection: close`, and `HTTP_PROXY`/`HTTPS_PROXY` republished as `http://` while `ALL_PROXY`
    stays `socks5h://`. The accept loop also serves conversations concurrently now. See R3i.
-6. **R3g (macOS)** can start any time now: the schema and the SOCKS5 engine are both done, and the
+6. **R3j (deny local ranges) — DONE** 2026-10-22. `egress::local_or_nonpublic` + `addr_permitted`
+   deny loopback/private/link-local/metadata by default and re-permit on an explicit literal entry;
+   both gates run in the bridge (`host_allowed` on the textual host, `addr_permitted` on the
+   resolved address). `network = true` is now "public internet only". See the R3j spec and the
+   "Re-audit — 2026-10-22" section.
+
+**R3g (macOS)** can start any time now: the schema and the SOCKS5 engine are both done, and the
    engine is platform-neutral (`egress::host_allowed`, `serve_socks5`'s decision order). mac needs no
    fd passing — a host-loopback listener plus three Seatbelt allow rules is the whole transport.
    Build the profile generator in one module and make the applier a strategy; do **not** back onto
@@ -1968,6 +2080,9 @@ that keeps the policy shared). Everything else is detail.
 - ~~Bridge as a helper binary or an `sh -c` fragment?~~ — **settled by implementation**: a helper
   binary, `prior-egress`, bound in and resolved absolutely like `bsed`. An `sh -c` fragment cannot
   carry the fd plumbing cleanly and would need a shell in the payload.
+- ~~Does an empty allowlist reach host loopback?~~ — **settled by the 2026-10-22 re-audit: yes, and
+  that is wrong.** R3j denies local/non-public ranges by default. `network = true` with no allowlist
+  no longer reaches host `127.0.0.1`; an explicit entry re-permits it.
 - Does R4's socket-binding warning default to warn, or require an opt-in flag? (R4b)
 - Should `agent-browser`'s control socket stay on AF_UNIX (needs no seccomp carve-out under this
   design) or move to TCP over the namespace loopback? (R3d/R3e — currently it works either way,
