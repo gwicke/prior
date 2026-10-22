@@ -3834,6 +3834,71 @@ mod tests {
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
     }
 
+    /// Live paints in provider SSE order; replay groups thinking before text.
+    ///
+    /// Characterization of the live/replay spacing divergence: a reasoning part
+    /// that arrives *mid-answer* records `(ResponseReasoning, closes=true)`
+    /// between two `ResponseText` chunks, so `boundary_spacer` opens a block
+    /// around it — blank row, dim reasoning line, blank row — **inside** the
+    /// open code fence. Replay never interleaves (`render_turn` loops all
+    /// `thinking` before all `text`, and `feed_turn_into` partitions items into
+    /// those two lists), so the same content renders tight there. Pinned as
+    /// today's behavior, not as desirable behavior.
+    #[test]
+    fn interleaved_reasoning_inserts_live_only_boundary_rows() {
+        fn run(interleaved: bool) -> String {
+            let (out, reasoning) = capturing_output(60);
+            *reasoning.lock().unwrap() = ShowReasoning::Content;
+            out.begin_capture();
+            out.begin_response();
+            if interleaved {
+                out.stream_text("Consider the code:\n\n");
+                out.stream_text("```python\n");
+                out.stream_text("def add(a, b):\n");
+                out.stream_thinking("Hmm, add or plus? Let me weigh that.\n");
+                out.stream_text("    return a + b\n");
+                out.stream_thinking("Also consider subtraction while here.\n");
+                out.stream_text("```\n");
+            } else {
+                out.stream_thinking("Hmm, add or plus? Let me weigh that.\n");
+                out.stream_thinking("Also consider subtraction while here.\n");
+                out.stream_text(
+                    "Consider the code:\n\n```python\ndef add(a, b):\n    return a + b\n```\n",
+                );
+            }
+            out.end_response();
+            let bytes = out.end_capture();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        let live = run(true);
+        let replay = run(false);
+        println!("=== live (interleaved SSE order) ===\n{live:?}");
+        println!("=== replay (thinking grouped first) ===\n{replay:?}");
+        // Characterization of today's live/replay divergence: live paints in
+        // provider SSE order, so a reasoning part that arrives mid-answer
+        // records (Reasoning, closes=true) between two ResponseText chunks and
+        // `boundary_spacer` opens a new block around it — a blank row above and
+        // below the dim reasoning line, INSIDE the open code fence. Replay
+        // groups all thinking before all text (`render_turn`), so the same
+        // content renders tight.
+        assert!(
+            live.contains("add(a, b):\n\n\x1b[2mHmm, add or plus?"),
+            "live: blank + reasoning above the fence line: {live:?}"
+        );
+        assert!(
+            live.contains("weigh that.\x1b[0m\n\n      \x1b[35mreturn"),
+            "live: blank between code lines after the reasoning interleave: {live:?}"
+        );
+        assert!(
+            replay.contains("add(a, b):\n      \x1b[35mreturn"),
+            "replay: code lines stay adjacent: {replay:?}"
+        );
+        assert!(
+            replay.find("Hmm, add or plus?").unwrap() < replay.find("Consider the code").unwrap(),
+            "replay: thinking plays before text: {replay:?}"
+        );
+    }
+
     /// A content batch defers the frame's re-emit to the guard's drop instead
     /// of paying one per write (ui_draw_v2 R5).
     ///
