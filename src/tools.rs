@@ -2100,10 +2100,12 @@ fn build_bwrap_args(
 /// in-namespace listener before running (R3b).
 ///
 /// The proxy variables are set by the shim *after* the bind, because the port is
-/// not known until then. All three are published: `ALL_PROXY` is what
-/// SOCKS-aware clients honour, and `HTTPS_PROXY`/`HTTP_PROXY` carry the
-/// `socks5h://` URL that `curl` and others accept. A client that reads none of
-/// them gets no egress, by design — see R3a's operator-facing notes.
+/// not known until then. The list comes from [`crate::egress::proxy_var_specs`],
+/// which documents why `ALL_PROXY` is `socks5h://` while the per-scheme
+/// variables are `http://`: the bridge serves both protocols on one port, and
+/// only `http://` is parseable by HTTP-proxy-only clients (`w3m`, `wget`). A
+/// client that reads no proxy variable gets no egress, by design — see R3a's
+/// operator-facing notes.
 ///
 /// The child fd is deliberately *not* in the argv: it travels in
 /// [`crate::egress::EGRESS_FD_ENV`] because `build_bwrap_args` emits it as a
@@ -2111,7 +2113,7 @@ fn build_bwrap_args(
 fn wrap_with_egress_shim(e: EgressSpec<'_>, program: Vec<String>) -> Vec<String> {
     let mut v = vec![
         e.shim.to_string_lossy().to_string(),
-        "ALL_PROXY;HTTPS_PROXY;HTTP_PROXY".to_string(),
+        crate::egress::proxy_var_specs().join(";"),
         "--".into(),
     ];
     v.extend(program);
@@ -3189,7 +3191,8 @@ mod sandbox_tests {
     }
 
     /// The payload wrapper puts the shim before the program, with the proxy
-    /// variable list between them and `--` as the separator the shim looks for.
+    /// variable spec list between them and `--` as the separator the shim looks
+    /// for.
     #[test]
     fn wrap_with_egress_shim_shape() {
         let spec = super::EgressSpec {
@@ -3199,7 +3202,7 @@ mod sandbox_tests {
         let wrapped =
             super::wrap_with_egress_shim(spec, vec!["sh".into(), "-c".into(), "true".into()]);
         assert_eq!(wrapped[0], "/shim");
-        assert_eq!(wrapped[1], "ALL_PROXY;HTTPS_PROXY;HTTP_PROXY");
+        assert_eq!(wrapped[1], crate::egress::proxy_var_specs().join(";"));
         assert_eq!(wrapped[2], "--");
         assert_eq!(&wrapped[3..], ["sh", "-c", "true"]);
     }
@@ -3338,6 +3341,79 @@ mod sandbox_tests {
         // SOCKS reply 0x02 surfaces as a proxy connection failure: curl prints
         // 000 and exits non-zero. The point is that it is not "200".
         assert_ne!(out.0, "200", "unlisted destination must not be reachable");
+        drop(server);
+    }
+
+    /// R3i end to end: tools with **no SOCKS support** reach the bridge.
+    ///
+    /// `w3m` has no SOCKS code at all (verified: no `socks` string in the
+    /// binary) and `wget` here ignores the upper-case spelling, so both depend on
+    /// the HTTP-proxy front end and the `http://` value in `HTTP_PROXY`. This
+    /// launches the real sandbox with `network = true` and fetches a host-loopback
+    /// upstream from inside it through the bridge — the same upstream that
+    /// `direct_tcp_egress_is_blocked…` proves is otherwise unreachable.
+    #[tokio::test]
+    #[serial]
+    async fn http_only_clients_reach_the_bridge() {
+        if !bwrap_on_path() {
+            return;
+        }
+        if crate::egress::resolve_shim().is_none() {
+            eprintln!("skipping: prior-egress not built (run `cargo build` first)");
+            return;
+        }
+
+        // A tiny origin that answers a handful of requests, one per connection
+        // (the absolute-form path forces `Connection: close`).
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut s, _)) = listener.accept() else {
+                    return;
+                };
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\
+                      Connection: close\r\n\r\nHELLO",
+                );
+            }
+        });
+
+        let mut cfg = sandbox_with(vec![], vec![], Some(60));
+        cfg.network = crate::config::NetworkPolicy::open();
+        set_sandbox(Some(cfg));
+
+        // wget: reads only the lower-case `http_proxy` here, and has no SOCKS.
+        let out = run_sandboxed(
+            &format!(
+                "wget -q -O - --timeout=10 http://127.0.0.1:{}/ 2>&1 || echo WGET_FAILED",
+                upstream.port()
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "HELLO", "wget must fetch through the HTTP front end");
+
+        // w3m: no SOCKS code, only the upper-case `HTTP_PROXY`, no fallthrough.
+        // `-dump` prints the rendered page to stdout.
+        let out = run_sandboxed(
+            &format!(
+                "w3m -dump -T text/plain http://127.0.0.1:{}/ 2>&1 || echo W3M_FAILED",
+                upstream.port()
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.contains("HELLO"),
+            "w3m must fetch through the HTTP front end; got {out:?}"
+        );
+
         drop(server);
     }
 

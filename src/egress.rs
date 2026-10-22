@@ -32,6 +32,57 @@ pub const EGRESS_FD_ENV: &str = "PRIOR_EGRESS_FD";
 /// The shim binary name. Kept in one place so the resolver and the argv agree.
 pub const EGRESS_BIN: &str = "prior-egress";
 
+/// The proxy environment a sandbox gets, as `NAME=template` entries for the
+/// shim. `%p` is the bound `127.0.0.1:<port>`.
+///
+/// # Why the uppercase variables are `http://` and `ALL_PROXY` is not
+///
+/// The bridge speaks **two** protocols on one port (SOCKS5 and HTTP proxy; see
+/// [`serve_conversation`]), so either scheme reaches it. The split is about
+/// clients, not capability:
+///
+/// - `ALL_PROXY` is the variable SOCKS-aware clients read (curl, git, python
+///   `requests`) and where `socks5h://` carries real meaning: the `h` resolves
+///   the name at the proxy, so the sandbox never learns an address it cannot
+///   route to. Keep it `socks5h://`.
+/// - `HTTP_PROXY`/`HTTPS_PROXY` are the variables *everything* reads, including
+///   clients with no SOCKS support at all — `w3m` has no SOCKS code (verified),
+///   and `wget` here honours only the lowercase spelling. A client that cannot
+///   parse the scheme **fails rather than falling through** (measured: w3m given
+///   `HTTP_PROXY=socks5h://…` dies, it does not try `http_proxy`). So these must
+///   hold a value every client can parse: `http://`.
+///
+/// Each name is also set in lower case, because clients disagree on spelling and
+/// several (wget) read only the lower-case form. Where both are set, the
+/// upper-case one wins in every client measured, so they must agree — which they
+/// do, being generated from the same template.
+///
+/// # Why there is no `NO_PROXY`
+///
+/// Deliberately unset. Inside the netns `127.0.0.1` is the sandbox's own
+/// loopback, and the only thing listening there is the bridge — so bypassing the
+/// proxy for it would route a client to nothing, not to a local server. Worse,
+/// excluding it would remove the one way to reach a *host* loopback service
+/// through the bridge when the allowlist permits it, which is a use `network =
+/// true` is documented to support.
+pub fn proxy_var_specs() -> Vec<String> {
+    // Every variable is published in both the upper- and lower-case spelling.
+    // That is not redundancy: no client reads all of them (wget here reads only
+    // `http_proxy`; w3m reads the upper-case form first and does not fall
+    // through), so a missing spelling is a client with no egress.
+    let mut v = Vec::with_capacity(6);
+    for &(upper, scheme) in &[
+        ("ALL_PROXY", "socks5h"),
+        ("HTTP_PROXY", "http"),
+        ("HTTPS_PROXY", "http"),
+    ] {
+        let url = format!("{scheme}://%p");
+        v.push(format!("{upper}={url}"));
+        v.push(format!("{}={url}", upper.to_lowercase()));
+    }
+    v
+}
+
 // ---------------------------------------------------------------------------
 // SCM_RIGHTS fd passing
 // ---------------------------------------------------------------------------
@@ -271,13 +322,33 @@ struct Request {
 /// Run one proxy conversation on `client`: decide which proxy protocol the
 /// client is speaking and serve it. Blocks until the conversation is over.
 ///
-/// The listener serves **two** protocols on one port — see [`serve_socks5`].
+/// # One port, two protocols
+///
+/// The listener speaks both SOCKS5 and HTTP-proxy on the same port, told apart
+/// by the first byte the client sends (peeked, not consumed):
+///
+/// - `0x05` — the SOCKS5 greeting version, so [`serve_socks5`].
+/// - anything else — an HTTP request (`C`/`G`/`P`/…), so [`serve_http_proxy`].
+///
+/// A single port is why the proxy variables can name one endpoint and satisfy
+/// every client: SOCKS-aware tools get `socks5h://`, while `w3m`, `wget` and
+/// anything else that speaks only HTTP-proxy get the same port over `http://`.
+/// The two never collide, because a SOCKS5 greeting version byte is not an ASCII
+/// letter.
 fn serve_conversation(
     client: TcpStream,
     allow: &[String],
     log: &mut dyn FnMut(&str),
 ) -> io::Result<()> {
-    serve_socks5(client, allow, log)
+    // Peek so the byte is still there for whichever protocol takes over.
+    let mut first = [0u8; 1];
+    match client.peek(&mut first) {
+        // Zero bytes means the client already hung up; nothing to do.
+        Ok(0) => Ok(()),
+        Ok(_) if first[0] == 0x05 => serve_socks5(client, allow, log),
+        Ok(_) => serve_http_proxy(client, allow, log),
+        Err(_) => Ok(()),
+    }
 }
 
 /// Run one SOCKS5 conversation on `client`, splicing it to the destination the
@@ -405,6 +476,28 @@ fn resolve(host: &str, port: u16) -> Option<SocketAddr> {
     (host, port).to_socket_addrs().ok()?.next()
 }
 
+/// Relay a `Connection: close` request/response pair. Unlike [`splice`] this does
+/// not wait for the client to half-close: an HTTP client sends its request (and
+/// any body) and then *waits*, keeping its socket open for the response, so
+/// joining the client→upstream pump would deadlock. The client→upstream
+/// direction is pumped on a detached thread that ends when `client` is dropped,
+/// and the caller blocks only on the response direction, which terminates on the
+/// upstream's EOF — the delimiter `Connection: close` guarantees.
+fn splice_response(client: TcpStream, upstream: TcpStream) {
+    if let (Ok(mut c_read), Ok(mut u_write)) = (client.try_clone(), upstream.try_clone()) {
+        let _ = std::thread::Builder::new()
+            .name("egress-req".into())
+            .spawn(move || {
+                let _ = io::copy(&mut c_read, &mut u_write);
+                let _ = u_write.shutdown(std::net::Shutdown::Write);
+            });
+    }
+    let mut c_write = client;
+    let mut u_read = upstream;
+    let _ = io::copy(&mut u_read, &mut c_write);
+    let _ = c_write.shutdown(std::net::Shutdown::Write);
+}
+
 /// Copy bytes in both directions until EOF. Runs the client→upstream direction
 /// on a thread (both sides are blocking `std` sockets) and returns when both are
 /// done, so a half-closed connection does not leak a thread per request.
@@ -430,6 +523,290 @@ fn splice(client: TcpStream, upstream: TcpStream) {
     if let Ok(h) = pump {
         let _ = h.join();
     }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP-proxy engine (R3i)
+// ---------------------------------------------------------------------------
+
+/// Largest request head we will parse. A proxy request is a request line plus
+/// headers; anything larger is abuse, not a request. 16 KiB is well above any
+/// real head (browsers stay under 8 KiB) and small enough to bound memory per
+/// connection.
+const MAX_REQUEST_HEAD: usize = 16 * 1024;
+
+/// Serve one HTTP-proxy conversation on `client`.
+///
+/// Two request forms matter, and they are handled differently:
+///
+/// - `CONNECT host:port HTTP/1.x` — a tunnel request, used by every client for
+///   `https://`. We reply `200 Connection established` and then [`splice`]
+///   raw bytes: no TLS involvement, no header rewriting, and **keep-alive is
+///   preserved inside the tunnel** because we never look at what flows through.
+///   This is the path `git`, `cargo`, `curl` and `wget` all take for HTTPS.
+/// - `GET http://host/path HTTP/1.x` (absolute-form) — plain HTTP, the form
+///   `w3m`/`wget`/old clients use for `http://`. We dial, rewrite the request
+///   line to origin-form and force `Connection: close`, then splice to EOF.
+///
+/// ## Why absolute-form forces `Connection: close`
+///
+/// Splitting a response from the next one on a kept-alive connection needs the
+/// body framing (`Content-Length` or chunked). Rather than implement an HTTP/1.1
+/// message parser — a large, security-sensitive surface for no benefit — we ask
+/// for one request per connection and use EOF as the delimiter, which is what
+/// every CLI client here already does for plain HTTP. Measured cost: one extra
+/// RTT per `http://` resource. HTTPS, the case that matters, is unaffected: it
+/// goes through `CONNECT`, which stays keep-alive.
+///
+/// ## Routing decision is the request line, and only the request line
+///
+/// For absolute-form the authority in the request line decides the allowlist
+/// answer, and a disagreeing `Host:` header is *ignored*, not honoured. Trusting
+/// the header while dialling one destination and forwarding the other is a
+/// request-smuggling vector: the decision and the dial must be the same value.
+fn serve_http_proxy(
+    mut client: TcpStream,
+    allow: &[String],
+    log: &mut dyn FnMut(&str),
+) -> io::Result<()> {
+    client.set_nodelay(true).ok();
+
+    let head = match read_request_head(&mut client) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = write_http_error(&mut client, 400, "Bad Request");
+            return Ok(());
+        }
+    };
+    let Some(line_end) = head.find("\r\n") else {
+        let _ = write_http_error(&mut client, 400, "Bad Request");
+        return Ok(());
+    };
+    let request_line = &head[..line_end];
+    let mut parts = request_line.split(' ');
+    let (Some(method), Some(target), Some(_version)) = (parts.next(), parts.next(), parts.next())
+    else {
+        let _ = write_http_error(&mut client, 400, "Bad Request");
+        return Ok(());
+    };
+
+    if method.eq_ignore_ascii_case("CONNECT") {
+        return serve_http_connect(client, target, allow, log);
+    }
+    serve_http_forward(client, method, target, &head[line_end + 2..], allow, log)
+}
+
+/// The `CONNECT host:port` half: dial, acknowledge, splice. The client keeps
+/// its own TLS handshake, so this is opaque to the bridge.
+fn serve_http_connect(
+    mut client: TcpStream,
+    authority: &str,
+    allow: &[String],
+    log: &mut dyn FnMut(&str),
+) -> io::Result<()> {
+    let Some((host, port)) = split_authority(authority, 443) else {
+        let _ = write_http_error(&mut client, 400, "Bad Request");
+        return Ok(());
+    };
+    if !host_allowed(allow, &host, port) {
+        log(&format!("DENY {host}:{port}"));
+        let _ = write_http_error(&mut client, 403, "Forbidden");
+        return Ok(());
+    }
+    let Some(target) = resolve(&host, port) else {
+        log(&format!("DENY-RESOLVE {host}:{port}"));
+        let _ = write_http_error(&mut client, 502, "Bad Gateway");
+        return Ok(());
+    };
+    let upstream = match TcpStream::connect(target) {
+        Ok(s) => s,
+        Err(e) => {
+            log(&format!("FAIL {host}:{port} ({e})"));
+            let _ = write_http_error(&mut client, 502, "Bad Gateway");
+            return Ok(());
+        }
+    };
+    upstream.set_nodelay(true).ok();
+    log(&format!("ALLOW {host}:{port}"));
+    // The canonical CONNECT success line. The client treats everything after it
+    // as tunnel bytes, so this must be flushed before the splice begins.
+    client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
+    splice(client, upstream);
+    Ok(())
+}
+
+/// The absolute-form `GET http://host/path` half: dial the request-line
+/// authority, rewrite to origin-form, force `Connection: close`, splice.
+fn serve_http_forward(
+    mut client: TcpStream,
+    method: &str,
+    target: &str,
+    rest_of_head: &str,
+    allow: &[String],
+    log: &mut dyn FnMut(&str),
+) -> io::Result<()> {
+    let Some(host_and_path) = target
+        .strip_prefix("http://")
+        .or_else(|| target.strip_prefix("HTTP://"))
+    else {
+        // https:// never arrives here (clients use CONNECT), and a bare
+        // origin-form request means the client is not using us as a proxy.
+        let _ = write_http_error(&mut client, 400, "Bad Request");
+        return Ok(());
+    };
+    // Split authority from path at the first '/'. `w3m` sends a bare authority
+    // for `http://host` (no trailing slash at all); normalise to `/`.
+    let (authority, path) = match host_and_path.find('/') {
+        Some(i) => (&host_and_path[..i], &host_and_path[i..]),
+        None => (host_and_path, "/"),
+    };
+    let Some((host, port)) = split_authority(authority, 80) else {
+        let _ = write_http_error(&mut client, 400, "Bad Request");
+        return Ok(());
+    };
+    if !host_allowed(allow, &host, port) {
+        log(&format!("DENY {host}:{port}"));
+        let _ = write_http_error(&mut client, 403, "Forbidden");
+        return Ok(());
+    }
+    let Some(addr) = resolve(&host, port) else {
+        log(&format!("DENY-RESOLVE {host}:{port}"));
+        let _ = write_http_error(&mut client, 502, "Bad Gateway");
+        return Ok(());
+    };
+    let mut upstream = match TcpStream::connect(addr) {
+        Ok(s) => s,
+        Err(e) => {
+            log(&format!("FAIL {host}:{port} ({e})"));
+            let _ = write_http_error(&mut client, 502, "Bad Gateway");
+            return Ok(());
+        }
+    };
+    upstream.set_nodelay(true).ok();
+    log(&format!("ALLOW {host}:{port}"));
+
+    let rewritten = rewrite_forward_request(method, path, rest_of_head, &host, port);
+    upstream.write_all(rewritten.as_bytes())?;
+    splice_response(client, upstream);
+    Ok(())
+}
+
+/// Rewrite an absolute-form request head into origin-form for the origin server.
+///
+/// - the request line loses the scheme and authority (`GET http://h/p` →
+///   `GET /p`),
+/// - `Connection:` is forced to `close` (see [`serve_http_forward`]),
+/// - `Proxy-Connection:` is dropped: it is a client→proxy hop header, and
+///   forwarding it to the origin would make the origin think it is the proxy.
+fn rewrite_forward_request(
+    method: &str,
+    path: &str,
+    rest_of_head: &str,
+    host: &str,
+    port: u16,
+) -> String {
+    let mut out = String::with_capacity(rest_of_head.len() + 64);
+    out.push_str(method);
+    out.push(' ');
+    out.push_str(path);
+    out.push_str(" HTTP/1.1\r\n");
+
+    let mut saw_host = false;
+    for line in rest_of_head.split("\r\n") {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, _) = match line.split_once(':') {
+            Some(p) => p,
+            None => continue,
+        };
+        let lname = name.trim();
+        if lname.eq_ignore_ascii_case("connection")
+            || lname.eq_ignore_ascii_case("proxy-connection")
+        {
+            continue;
+        }
+        if lname.eq_ignore_ascii_case("host") {
+            saw_host = true;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    if !saw_host {
+        // The origin needs a `Host`, and the request-line authority is the
+        // truthful one, so synthesise it from there rather than from a header we
+        // deliberately do not trust.
+        if port == 80 {
+            out.push_str(&format!("Host: {host}\r\n"));
+        } else {
+            out.push_str(&format!("Host: {host}:{port}\r\n"));
+        }
+    }
+    out.push_str("Connection: close\r\n\r\n");
+    out
+}
+
+/// Split `host:port` / `[v6]:port` / bare `host`, applying `default_port`.
+/// Returns `None` on an empty host or a malformed port.
+fn split_authority(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    if authority.is_empty() {
+        return None;
+    }
+    // `[::1]:8080` — bracketed IPv6.
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None => default_port,
+        };
+        return Some((host.to_string(), port));
+    }
+    // A bare IPv6 literal without brackets cannot carry a port unambiguously;
+    // treat the whole thing as the host.
+    if authority.matches(':').count() > 1 {
+        return Some((authority.to_string(), default_port));
+    }
+    match authority.split_once(':') {
+        Some((host, port)) => {
+            if host.is_empty() {
+                return None;
+            }
+            Some((host.to_string(), port.parse().ok()?))
+        }
+        None => Some((authority.to_string(), default_port)),
+    }
+}
+
+/// Read a request head up to and including the terminating `\r\n\r\n`.
+///
+/// Reads byte by byte from `client`, so nothing past the head is consumed — the
+/// body (for a POST) and any pipelined bytes stay in the socket for [`splice`].
+fn read_request_head(client: &mut TcpStream) -> io::Result<String> {
+    let mut buf = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    loop {
+        client.read_exact(&mut byte)?;
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > MAX_REQUEST_HEAD {
+            return Err(io::Error::other("request head too large"));
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// Write a minimal HTTP error response and close. Used for every refusal so the
+/// client sees a status rather than a bare connection reset — `w3m` in
+/// particular surfaces the status line to the user.
+fn write_http_error(client: &mut TcpStream, code: u16, reason: &str) -> io::Result<()> {
+    let body = format!("{code} {reason}\n");
+    let resp = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    client.write_all(resp.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +850,7 @@ pub fn shim_main(argv: &[String]) -> i32 {
     }
     let var_pack = &argv[1..sep];
     let program = &argv[sep + 1..];
-    let vars: Vec<&str> = var_pack
+    let specs: Vec<&str> = var_pack
         .iter()
         .flat_map(|s| s.split(';'))
         .filter(|s| !s.is_empty())
@@ -518,8 +895,17 @@ pub fn shim_main(argv: &[String]) -> i32 {
     // SAFETY: fd ownership passed to prior; closing our copy is a plain close.
     unsafe { libc::close(boot_fd) };
 
-    for var in vars {
-        std::env::set_var(var, format!("socks5h://127.0.0.1:{port}"));
+    // Each spec is `NAME=template`; `%p` is replaced with the bound
+    // `127.0.0.1:<port>`. A template (rather than a fixed `scheme://` prefix) is
+    // what lets the pack carry `NO_PROXY` alongside the proxy URLs, and lets the
+    // scheme differ per variable — see [`proxy_var_specs`] for why it does.
+    let endpoint = format!("127.0.0.1:{port}");
+    for spec in specs {
+        let Some((name, template)) = spec.split_once('=') else {
+            eprintln!("{EGRESS_BIN}: malformed proxy var spec {spec:?} (want NAME=template)");
+            return 2;
+        };
+        std::env::set_var(name, template.replace("%p", &endpoint));
     }
 
     use std::os::unix::process::CommandExt;
@@ -902,6 +1288,216 @@ mod proxy_tests {
             "conversations were serialised: {N} x {DELAY:?} took {elapsed:?}"
         );
         origin.join().unwrap();
+    }
+
+    // ---- R3i: the HTTP-proxy front end ----
+
+    /// Start a one-shot upstream that reads a request head and answers with a
+    /// fixed body. Returns its address and a handle yielding the raw head it
+    /// received, so a test can assert what the bridge actually forwarded.
+    fn http_upstream(body: &'static str) -> (SocketAddr, std::thread::JoinHandle<String>) {
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = l.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut head = Vec::new();
+            let mut b = [0u8; 1];
+            // Read exactly the head; the client sends `Connection: close` with no
+            // body, so this terminates cleanly.
+            while s.read_exact(&mut b).is_ok() {
+                head.push(b[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = s.write_all(body.as_bytes());
+            String::from_utf8_lossy(&head).to_string()
+        });
+        (addr, h)
+    }
+
+    /// Serve exactly one conversation through `serve_conversation` — the same
+    /// entry point the accept loop uses, so the protocol sniff is exercised too.
+    fn one_conversation(listener: TcpListener, allow: Vec<String>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (c, _) = listener.accept().unwrap();
+            let mut sink = |_s: &str| {};
+            let _ = serve_conversation(c, &allow, &mut sink);
+        })
+    }
+
+    /// Absolute-form `GET` through the bridge: the request line is rewritten to
+    /// origin-form, `Connection: close` forced, and the body relayed back.
+    /// This is the `w3m`/`wget` plain-HTTP path.
+    #[test]
+    fn http_absolute_get_is_forwarded_and_rewritten() {
+        let (upstream, up) = http_upstream("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let server = one_conversation(listener, Vec::new());
+
+        let mut c = TcpStream::connect(proxy).unwrap();
+        write!(
+            c,
+            "GET http://127.0.0.1:{}/a/b?q=1 HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
+            upstream.port()
+        )
+        .unwrap();
+
+        let mut resp = Vec::new();
+        c.read_to_end(&mut resp).unwrap();
+        assert!(resp.ends_with(b"\r\n\r\nOK"), "body relayed: {resp:?}");
+
+        server.join().unwrap();
+        let head = up.join().unwrap();
+        // Origin-form request line, no scheme or authority.
+        assert!(
+            head.starts_with("GET /a/b?q=1 HTTP/1.1\r\n"),
+            "request line rewritten to origin-form: {head:?}"
+        );
+        // `Connection: close` forced regardless of what the client sent.
+        assert!(
+            head.to_lowercase().contains("connection: close"),
+            "connection forced closed: {head:?}"
+        );
+        // The client's `HTTP/1.0` must not leave the client keep-alive guesswork
+        // in place: we emit exactly one `Connection:` header.
+        assert_eq!(head.to_lowercase().matches("connection:").count(), 1);
+    }
+
+    /// `CONNECT` through the bridge is an opaque tunnel: the bridge replies
+    /// `200`, then relays bytes untouched. This is the `git https` path.
+    #[test]
+    fn http_connect_is_an_opaque_tunnel() {
+        // Upstream echoes whatever it receives, standing in for a TLS peer.
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let upstream = l.local_addr().unwrap();
+        let up = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"HELO", "tunnel bytes arrive unmodified");
+            let _ = s.write_all(b"BYTE!");
+        });
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let server = one_conversation(listener, Vec::new());
+
+        let mut c = TcpStream::connect(proxy).unwrap();
+        write!(
+            c,
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            upstream.port()
+        )
+        .unwrap();
+
+        // The success line, then everything is tunnel bytes.
+        let mut line = Vec::new();
+        let mut b = [0u8; 1];
+        while c.read_exact(&mut b).is_ok() {
+            line.push(b[0]);
+            if line.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let status = String::from_utf8_lossy(&line);
+        assert!(
+            status.starts_with("HTTP/1.1 200"),
+            "CONNECT accepted: {status:?}"
+        );
+
+        c.write_all(b"HELO").unwrap();
+        let mut reply = [0u8; 4];
+        c.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"BYTE", "the tunnel is byte-transparent");
+        drop(c);
+        up.join().unwrap();
+        server.join().unwrap();
+    }
+
+    /// A denied host is refused with a status line, decided on the request-line
+    /// authority — and a disagreeing `Host:` header does not override it.
+    #[test]
+    fn http_proxy_denies_by_request_line_authority() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let allow = vec!["allowed.example:80".to_string()];
+        let logs = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let server = {
+            let logs = logs.clone();
+            std::thread::spawn(move || {
+                let (c, _) = listener.accept().unwrap();
+                let mut sink = |line: &str| logs.lock().push(line.to_string());
+                let _ = serve_conversation(c, &allow, &mut sink);
+            })
+        };
+
+        let mut c = TcpStream::connect(proxy).unwrap();
+        // Request line says evil.invalid; `Host:` lies and says allowed.example.
+        // The allowlist must key on the request line.
+        write!(
+            c,
+            "GET http://evil.invalid/ HTTP/1.0\r\nHost: allowed.example\r\n\r\n"
+        )
+        .unwrap();
+        let mut resp = Vec::new();
+        c.read_to_end(&mut resp).unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 403"),
+            "must be denied by the request line, not the header: {text:?}"
+        );
+        server.join().unwrap();
+        assert_eq!(logs.lock().as_slice(), ["DENY evil.invalid:80"]);
+    }
+
+    /// `split_authority` handles the shapes a request line can carry, including
+    /// bracketed IPv6 and a default port.
+    #[test]
+    fn split_authority_cases() {
+        assert_eq!(
+            split_authority("example.com:8080", 80),
+            Some(("example.com".into(), 8080))
+        );
+        assert_eq!(
+            split_authority("example.com", 80),
+            Some(("example.com".into(), 80))
+        );
+        assert_eq!(split_authority("[::1]:443", 80), Some(("::1".into(), 443)));
+        assert_eq!(split_authority("[::1]", 80), Some(("::1".into(), 80)));
+        assert_eq!(split_authority("::1", 80), Some(("::1".into(), 80)));
+        assert_eq!(split_authority("", 80), None);
+        assert_eq!(split_authority(":80", 80), None);
+        assert_eq!(split_authority("h:notaport", 80), None);
+    }
+
+    /// The published proxy spec list is the contract clients see. Assert the
+    /// properties that make it work for both client families, not an exact
+    /// string (the string is `proxy_var_specs`'s own business).
+    #[test]
+    fn proxy_var_specs_cover_both_client_families() {
+        let specs = proxy_var_specs();
+        let get = |name: &str| {
+            specs
+                .iter()
+                .find_map(|s| s.strip_prefix(&format!("{name}=")).map(str::to_string))
+        };
+        // `ALL_PROXY` stays SOCKS: the only spelling that carries remote-DNS
+        // (`socks5h`). Losing it would make curl/git resolve names in the sandbox.
+        assert_eq!(get("ALL_PROXY").as_deref(), Some("socks5h://%p"));
+        // The per-scheme variables must be `http://`: `w3m` cannot parse socks5h
+        // and `wget` here honours only the lower-case spelling.
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            assert_eq!(
+                get(name).as_deref(),
+                Some("http://%p"),
+                "{name} must be an http:// URL every client can parse"
+            );
+        }
+        // `wget` reads only the lower case; its absence is silent egress loss.
+        assert!(get("http_proxy").is_some());
+        assert!(get("all_proxy").is_some());
     }
 }
 
