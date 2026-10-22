@@ -14,8 +14,13 @@ and link a doc/ and/or commit hash
 - [x] sandbox R3d: done. `src/seccomp.rs` assembles a 12-insn BPF program denying `AF_VSOCK` +
       `io_uring` (`--seccomp FD`, fresh memfd per spawn, kept through the R8 seal);
       `PR_SET_PDEATHSIG(SIGKILL)` in `shim_main`.
+- [x] sandbox R3i: done. The bridge now serves SOCKS5 **and** HTTP proxy on one port (first-byte
+      sniff), so `w3m`/`wget` (no SOCKS code) get egress; `HTTP_PROXY`/`HTTPS_PROXY` are `http://`,
+      `ALL_PROXY` stays `socks5h://`. Accept loop is now concurrent (was one-at-a-time). R3i in the
+      audit.
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing `egress::host_allowed`;
-      its main unknown is settled: `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https).
+      `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https; HTTP-only clients now come
+      through R3i's front end instead).
       R4 (Landlock, per-path unix sockets) is independent.
       UDP is deferred; if needed the shape is `pasta`/`slirp4netns` plus in-sandbox nftables,
       not Landlock or host iptables — reasoning in R3h.

@@ -467,6 +467,55 @@ The bridge shim also sets `PR_SET_PDEATHSIG(SIGKILL)` at startup, so it dies
 with bwrap instead of holding an accept queue open in a namespace whose
 supervisor is gone. See `doc/261021_sandbox_env_x11_audit.md` (R3d).
 
+### Egress: one port, two proxy protocols (R3i)
+
+`network = true` gives the sandbox exactly one route out: the `prior-egress`
+bridge listening on the namespace loopback. The listener speaks **both** SOCKS5
+and HTTP proxy on the same port, told apart by the first byte — `0x05` is a
+SOCKS5 greeting, anything else is an HTTP request. The two cannot collide,
+because a SOCKS version byte is not an ASCII letter.
+
+Serving both is what makes a single proxy variable work for every client.
+SOCKS-aware tools (`curl`, `git`, `cargo`, python `requests`) can use SOCKS5;
+many others cannot, and a client that cannot parse a variable's scheme **fails
+rather than falling through** (measured: `w3m` given `HTTP_PROXY=socks5h://…`
+dies, it does not try `http_proxy`).
+
+The published variables (`egress::proxy_var_specs`, each in upper and lower
+case, because no client reads them all):
+
+| variable | value | why |
+|---|---|---|
+| `ALL_PROXY`, `all_proxy` | `socks5h://127.0.0.1:<port>` | the only spelling that resolves the name proxy-side, so the sandbox never learns an unroutable address |
+| `HTTP_PROXY`, `http_proxy` | `http://127.0.0.1:<port>` | must be parseable by clients with no SOCKS code (`w3m`, `wget`) |
+| `HTTPS_PROXY`, `https_proxy` | `http://127.0.0.1:<port>` | same; HTTPS still arrives as `CONNECT` |
+
+`NO_PROXY` is deliberately **not** set: inside the netns `127.0.0.1` is the
+bridge itself, so bypassing it would route a client to nothing — and it would
+remove the one route to a host-loopback service the allowlist is meant to permit.
+
+The HTTP engine handles the two request forms a proxy sees:
+
+- **`CONNECT host:port`** (used by every client for `https://`) — reply
+  `200 Connection established`, then splice bytes untouched. No TLS involvement,
+  so **keep-alive inside the tunnel is preserved**. A `git https` clone is only
+  two requests on one connection, so the bridge costs one RTT at setup and
+  nothing after.
+- **absolute-form `GET http://host/path`** (plain `http://`, the `w3m`/`wget`
+  path) — dial the request-line authority, rewrite to origin-form, force
+  `Connection: close`, relay to EOF. Forcing close avoids writing an HTTP/1.1
+  body parser to find the end of a response; the cost is one connection per
+  plain-HTTP resource, which every CLI client here already does.
+
+For absolute-form the **request-line authority** is the allowlist input, and a
+disagreeing `Host:` header is ignored — deciding on one name while dialling
+another is a request-smuggling vector.
+
+The accept loop serves conversations **concurrently** (thread per connection,
+capped at 64 live). Serving inline previously serialised the bridge; HTTP
+clients open parallel connections by default, so one slow upstream would stall
+everything behind it.
+
 ---
 
 ## Fallback & detection
@@ -514,6 +563,10 @@ supervisor is gone. See `doc/261021_sandbox_env_x11_audit.md` (R3d).
   inherited descriptor is marked `CLOEXEC` in the child before `execve`, so an
   open session log, memmap or socket cannot be read or written from inside. See
   "The sandbox inherits no other fd" above.
+- **One route out, two proxy protocols.** Egress is only through the bridge, and
+  the bridge speaks SOCKS5 and HTTP proxy so that clients with no SOCKS support
+  (`w3m`, `wget`) are not silently cut off. The allowlist governs `host:port` in
+  both paths. See "Egress: one port, two proxy protocols" above.
 - **`AF_VSOCK` and `io_uring` cannot reach the network.** Both route around
   `connect()` and so around the netns and the bridge; the seccomp filter denies
   them with `EPERM`. `AF_UNIX`/`AF_INET`/`AF_INET6` still work. See "seccomp:
@@ -549,6 +602,14 @@ supervisor is gone. See `doc/261021_sandbox_env_x11_audit.md` (R3d).
   `egress_bridge_carries_traffic_out_of_the_netns`,
   `direct_tcp_egress_is_blocked_even_with_network_enabled`, and
   `egress_allowlist_denies_unlisted_destination` in `src/tools.rs`.
+- **Integration:** clients with **no SOCKS support** reach the bridge over the
+  HTTP-proxy front end: `http_only_clients_reach_the_bridge` fetches a
+  host-loopback upstream with real `wget` and `w3m` from inside the sandbox.
+  The HTTP engine's rewrite, `CONNECT` tunnel, request-line routing and
+  `split_authority` are unit-tested in `src/egress.rs`.
+- **Integration:** the bridge serves conversations concurrently —
+  `bridge_serves_conversations_concurrently` asserts four requests against an
+  origin with a 300 ms delay finish in well under the serial 4×300 ms.
 - **Integration:** the seccomp filter is enforced, not just present:
   `sandbox_enforces_seccomp_filter` asserts `socket(AF_VSOCK)` fails with
   `EPERM` while `AF_INET`/`AF_UNIX` still succeed. The program's exact verdicts

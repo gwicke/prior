@@ -7,7 +7,7 @@ reproduced, not inferred.*
 
 ## Status
 
-**R1, R2, R3a/b/c/d/e/f, R7 and R8 are implemented.** **R3g, R3h, R4, R5 and R6 are not.** R3 was
+**R1, R2, R3a/b/c/d/e/f/i, R7 and R8 are implemented.** **R3g, R3h, R4, R5 and R6 are not.** R3 was
 revised on 2026-10-22 after testing the design against four reference implementations and this host:
 it is no longer a Landlock/seccomp ladder but a bridge design (R3a–R3h), with Landlock moved to R4
 where it is the only fix. The Linux half then landed the same day: `--unshare-net` is now
@@ -977,8 +977,9 @@ proxy, a trust store, an audit log) that duplicates policy prior already has. Bu
 
 ## Recommendations
 
-Ordered by priority. **R1, R2, R7, R8, and all of R3 except R3g/R3h are implemented** (R3a/b/c/d/e/f
-landed 2026-10-22, in that order). **R3g, R3h, and R4/R5/R6, are not.** R3 was revised on 2026-10-22
+Ordered by priority. **R1, R2, R7, R8, and all of R3 except R3g/R3h are implemented**
+(R3a/b/c/d/e/f landed 2026-10-22, in that order; R3i landed 2026-10-22). **R3g, R3h, and R4/R5/R6,
+are not.** R3 was revised on 2026-10-22
 (bridge
 design, not a Landlock ladder); R4 absorbed the Landlock work that R3 gave up.
 
@@ -1256,14 +1257,17 @@ curl http://example.com/          HTTP 200   (plain HTTP also works via socks5h)
 git ls-remote https://github.com/octocat/Hello-World   -> refs/heads/master
 ```
 
-So `curl` and `git` both honour `socks5h` for plain HTTP **and** HTTPS; setting all three is the
-right default and needs no per-client carve-out for prior's tool set. Two things this does *not*
-cover, both expected under the design:
+So `curl` and `git` both honour `socks5h` for plain HTTP **and** HTTPS; for SOCKS-aware clients that
+needs no per-client carve-out. What this measurement did *not* establish is clients with no SOCKS
+code — see the first bullet below, now fixed by R3i. Two things this does *not* cover, both expected
+under the design:
 
 - **A client that speaks only `http://` proxy syntax.** `curl --proxy http://…` uses absolute-form
-  `GET` for plain HTTP and `CONNECT` for TLS, and a SOCKS-only bridge answers `405` to the former
-  (measured). Clients given `ALL_PROXY=socks5h://…` are unaffected; only a hand-configured
-  `http_proxy=http://…` is. Worth knowing if an operator overrides the variables.
+  `GET` for plain HTTP and `CONNECT` for TLS, and the SOCKS-only bridge answered `405` to the former
+  (measured). Clients given `ALL_PROXY=socks5h://…` were unaffected; only a hand-configured
+  `http_proxy=http://…` was. **This gap is closed by R3i**: the listener now serves HTTP proxy too,
+  and `HTTP_PROXY`/`HTTPS_PROXY` are published as `http://` for exactly these clients, while
+  `ALL_PROXY` keeps `socks5h://` for the remote-DNS spelling.
 - **`curl --proxy socks5h:///path/to/socket`** — SOCKS over a *Unix path* is not supported by
   libcurl (`Could not resolve proxy: tmp`, measured). This is exactly why the bridge must present a
   **loopback TCP** endpoint and not a bound socket path. It is an independent confirmation of the
@@ -1330,8 +1334,9 @@ is not re-litigated after a compaction.
 
 #### R3c — The policy engine (SOCKS5, host+port, ~300 lines) — IMPLEMENTED 2026-10-22
 
-SOCKS5 `CONNECT` only. No HTTP proxy, no TLS MITM, no credential masking — those are 1439 + 1514
-lines in `srt` and exist for a feature prior does not have.
+SOCKS5 `CONNECT` here; the HTTP-proxy front end was added later in R3i, because SOCKS-only turned out
+to exclude clients with no SOCKS code at all (`w3m`). Still no TLS MITM and no credential masking —
+those are 1439 + 1514 lines in `srt` and exist for a feature prior does not have.
 
 Decision order, modelled on `srt`'s `socks-proxy.ts`:
 
@@ -1559,6 +1564,86 @@ Notes for whoever implements it:
     than having no UDP at all. Check first what actually needs UDP: QUIC falls back to TCP, DNS is
     resolved proxy-side, which leaves peer-to-peer, WebRTC and mDNS. prior's tool surface plausibly
     never touches those.
+
+#### R3i — The other half of "the bridge is the only route": HTTP-proxy clients — IMPLEMENTED 2026-10-22
+
+R3c built a SOCKS5 engine, and R3b measured that `curl` and `git` are satisfied by
+`ALL_PROXY=socks5h://…`. That measurement was correct and still is, but it only covers clients that
+*speak* SOCKS5. It says nothing about the ones that do not, and the gap turned out to be total
+rather than degraded.
+
+**The problem, split into two coupled axes.**
+
+1. **Transport.** The bridge understood SOCKS5 only. A client that speaks only HTTP proxy —
+   absolute-form `GET` for `http://`, `CONNECT` for `https://` — gets no egress even when the
+   allowlist would permit the destination.
+2. **Variable naming and precedence.** Clients disagree on which of `ALL_PROXY` / `HTTP_PROXY` /
+   `http_proxy` they read, and where two are set, the upper-case one wins with **no fallthrough**.
+
+Neither is fixable alone. Publishing a lowercase `http_proxy` does not help while the uppercase
+`HTTP_PROXY` still holds a scheme the client cannot parse; and pointing a client at an `http://`
+endpoint does not help while there is no HTTP engine behind it.
+
+**Measured root cause: `w3m` has no SOCKS code at all.** `strings /usr/bin/w3m` contains no `socks`
+symbol, and the only proxy names in its table are three spellings each of `HTTP_PROXY`,
+`HTTPS_PROXY`, `GOPHER_PROXY`, `FTP_PROXY`, `NO_PROXY` — `ALL_PROXY` is not among them. So the
+variable pickiness and the "no SOCKS" fact are the same fact: w3m speaks **only** HTTP proxy.
+
+```text
+http://  -> GET  http://example.com/ HTTP/1.0     (absolute-form)
+https:// -> CONNECT example.com:443 HTTP/1.0      (then its own TLS)
+
+HTTP_PROXY=socks5h://…  no lowercase      -> fails, cannot parse the scheme
+HTTP_PROXY=http://…     no lowercase      -> works
+HTTP_PROXY=http://… dead, http_proxy=http://… live -> fails, uppercase wins, no fallthrough
+```
+
+`wget` on this host is the same story from the other side: no SOCKS strings, and it ignores the
+upper-case `HTTP_PROXY` for plain `GET`, reading only `http_proxy`.
+
+**The fix, both axes together.**
+
+- **One port, two protocols.** The listener sniffs the first byte (peeked, not consumed): `0x05` is
+  a SOCKS5 greeting version, anything else is an HTTP request. The two cannot collide, because a
+  SOCKS version byte is not an ASCII letter. A single port is what lets one proxy variable satisfy
+  every client, and it means SOCKS clients needed no change.
+- **`CONNECT` is a tunnel, not a rewrite.** Reply `200 Connection established`, then splice bytes
+  untouched. No TLS involvement, and **keep-alive is preserved inside the tunnel** because nothing
+  inspects what flows through. Measured against a real `git-http-backend` behind TLS: one connection,
+  two requests (`info/refs` + `git-upload-pack`), clone succeeded. So for `git https` — the workload
+  that matters — the bridge costs one RTT at setup and nothing thereafter.
+- **Absolute-form `GET` forces `Connection: close`.** Splitting responses on a kept-alive connection
+  needs HTTP body framing (`Content-Length`/chunked), i.e. a real HTTP/1.1 parser. Rather than write
+  one, prior asks for one request per connection and uses EOF as the delimiter. Cost: one extra RTT
+  per plain-`http://` resource. All the CLI clients here already behave this way, and HTTPS — which is
+  where the cost would matter — never takes this path.
+- **Routing keys on the request-line authority, and only on it.** For absolute-form, a disagreeing
+  `Host:` header is ignored. Honouring the header while dialling the request-line authority is a
+  request-smuggling vector: the allowlist decision and the dial must be the same value.
+- **`ALL_PROXY` stays `socks5h://`; `HTTP_PROXY`/`HTTPS_PROXY` become `http://`.** `socks5h` is the
+  only spelling that resolves the name proxy-side, so it stays on the variable SOCKS-aware clients
+  read. The per-scheme variables must hold a value *every* client can parse, which is `http://`.
+  Both case spellings are published for each, because no client reads them all. `NO_PROXY` is
+  deliberately **not** set: inside the netns `127.0.0.1` is the bridge itself, and excluding it would
+  remove the one route to a host-loopback service the allowlist is meant to permit.
+- **The accept loop now serves conversations concurrently.** It previously ran the engine inline, so
+  the bridge handled one connection at a time. Measured with 4 concurrent requests to a 0.6 s origin:
+  2.46 s serial vs 0.63 s threaded. This predates R3i and affected SOCKS too, but HTTP clients open
+  parallel connections by default (`git`'s `http.maxRequests`, cargo, npm, browsers), so it is part of
+  making the front end usable. Capped at 64 live conversations so a misbehaving client cannot turn the
+  supervisor into a thread factory.
+
+**Tests.** `egress::proxy_tests` covers the request-line rewrite, the `CONNECT` tunnel, the
+request-line-vs-`Host:` routing, `split_authority`, and the variable spec list. The end-to-end test
+`sandboxed/test http_only_clients_reach_the_bridge` launches the real sandbox with `network = true`
+and fetches a host-loopback upstream with real `wget` and `w3m` — the same upstream
+`direct_tcp_egress_is_blocked…` proves is otherwise unreachable. It fails if `HTTP_PROXY` is flipped
+back to `socks5h://` (verified).
+
+**What this does not do.** No TLS MITM: the bridge sees plaintext only where the client was already
+speaking plaintext, exactly where SOCKS saw it. The allowlist still governs `host:port`, not a URL
+(R3h). And absolute-form traffic still pays one connection per request, which is the price of not
+having a body parser.
 
 ### R4 — The Unix-socket surface: document it, then constrain it with Landlock
 
@@ -1832,12 +1917,17 @@ that keeps the policy shared). Everything else is detail.
    program in `src/seccomp.rs` (`--seccomp FD`, fresh memfd per spawn); `PR_SET_PDEATHSIG(SIGKILL)`
    set in `shim_main`. The Linux sandbox work is now complete apart from R3g (macOS), R3h (UDP) and
    R4 (Landlock).
-5. **R3g (macOS)** can start any time now: the schema and the SOCKS5 engine are both done, and the
+5. **R3i (HTTP-proxy front end) — DONE** 2026-10-22. `w3m`/`wget` and anything else that speaks only
+   HTTP proxy reach the bridge. Protocol sniff on the first byte, `CONNECT` tunnels (keep-alive
+   preserved, so `git https` costs one setup RTT and nothing more), absolute-form `GET` forced to
+   `Connection: close`, and `HTTP_PROXY`/`HTTPS_PROXY` republished as `http://` while `ALL_PROXY`
+   stays `socks5h://`. The accept loop also serves conversations concurrently now. See R3i.
+6. **R3g (macOS)** can start any time now: the schema and the SOCKS5 engine are both done, and the
    engine is platform-neutral (`egress::host_allowed`, `serve_socks5`'s decision order). mac needs no
    fd passing — a host-loopback listener plus three Seatbelt allow rules is the whole transport.
    Build the profile generator in one module and make the applier a strategy; do **not** back onto
    `zerobox`/`nono` as dependencies.
-6. **R4** is independent of all of the above and can run in parallel with any step. Its (a) and (b)
+7. **R4** is independent of all of the above and can run in parallel with any step. Its (a) and (b)
    parts are documentation and a warning; only (c) needs the `landlock` crate.
 
 **Facts already established, do not re-test:**
@@ -1863,9 +1953,10 @@ that keeps the policy shared). Everything else is detail.
 - Seatbelt needs no bridge on macOS: `(allow network-outbound (remote ip "localhost:3128"))` plus
   two more allow lines is the whole implementation (`srt:macos-sandbox-utils.ts:1318-1344`).
 - **`curl` and `git` both honour `ALL_PROXY=socks5h://127.0.0.1:<port>` for plain HTTP and HTTPS**
-  (measured against a TCP-loopback relay, i.e. R3g's transport shape). No per-client workaround is
-  needed for prior's tool set, and this is the main unknown that stood in the way of R3g. See the
-  "Measured" note under R3b.
+  (measured against a TCP-loopback relay, i.e. R3g's transport shape). See the "Measured" note under
+  R3b. But **that covers only SOCKS-aware clients**: `w3m` has no SOCKS code at all (no `socks` string
+  in the binary) and `wget` here ignores the upper-case spelling, so both need the HTTP-proxy front end
+  R3i added. The bridge now sniffs the protocol on the first byte and serves both on one port.
 - **SOCKS over a Unix *path* is unsupported by libcurl** (`--proxy socks5h:///path` fails to parse
   the proxy). Independent confirmation that the bridge must expose loopback TCP, not a bound socket
   path — so R3a's design is forced from the client side too.
