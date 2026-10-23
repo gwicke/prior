@@ -602,6 +602,9 @@ pub(crate) struct LoggingHook {
     /// Hooks and the prompt loop both append under this mutex in stream
     /// order, so the transcript mirrors rig's own `new_messages`.
     pub(crate) transcript: Arc<Mutex<TurnTranscript>>,
+    /// The session to persist each completed completion turn into, if any.
+    /// `None` for `run_once` (sessionless) and tests.
+    pub(crate) session: Option<Arc<crate::session::Session>>,
     /// Resolved placements of successful edits this run, shared with the
     /// persist path so model history and disk both use the compact anchored
     /// form. Keyed by durable tool-call id.
@@ -699,6 +702,28 @@ impl AgentHook for LoggingHook {
         _ctx: &HookContext,
         event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
+        // Persist the completion turn that just finished, *before* the cancel
+        // check below so a cancel-stop still writes it. The turn whose response
+        // is about to be requested is complete and valid (every tool call
+        // answered), so this is the incremental persist point: mid-turn
+        // progress reaches disk by the start of the next call.
+        {
+            let anchors = self
+                .edit_anchors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let _ = crate::agent::transcript::commit(
+                &self.transcript,
+                self.session.as_deref(),
+                &anchors,
+                crate::agent::transcript::RunState::Ongoing,
+            )
+            .await;
+            if let Ok(mut t) = self.transcript.lock() {
+                t.start_live();
+            }
+        }
         if self.user_cancel.load(Ordering::SeqCst) {
             return CompletionCallAction::Stop("cancelled by user".into());
         }
@@ -774,7 +799,7 @@ impl AgentHook for LoggingHook {
             // returns `Continue`, i.e. the turn was accepted — matching rig's
             // own history commit for the same content.
             if let Ok(mut t) = self.transcript.lock() {
-                t.push_assistant_turn(event.identity.response_id.clone(), event.content.clone());
+                t.accept(event.identity.response_id.clone(), event.content.clone());
             }
             ModelTurnAction::Continue
         }
@@ -1503,6 +1528,7 @@ mod tests {
                 reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
                 provider: "test".to_string(),
                 model: "test-model".to_string(),
+                session: None,
                 transcript: Arc::new(std::sync::Mutex::new(super::TurnTranscript::default())),
                 edit_anchors: Arc::new(std::sync::Mutex::new(Default::default())),
             })

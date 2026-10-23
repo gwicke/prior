@@ -1256,27 +1256,213 @@ impl Session {
         // per-file results, paired with those calls by the same derived id.
         // The two halves are separate messages and separate calls, so they
         // cannot see each other — see `split_edit_tool_results`.
+        // Repair a dangling trailing assistant turn (crash residue) before
+        // appending a *non-answer* message, so a new turn never inherits an
+        // unanswered call. A message that carries tool results is itself the
+        // answer and must be appended untouched (this is also the shape a
+        // test or a manual two-step append uses).
+        let msg_is_results = matches!(msg, Message::User { content }
+            if content.iter().any(|c| matches!(c, UserContent::ToolResult(_))));
+        if !msg_is_results {
+            self.repair_tail_unanswered().await?;
+        }
         let canonical = canonicalize_edit_tool_calls(msg);
         let split_results = split_edit_tool_results(msg);
         let msg: &Message = canonical.as_ref().or(split_results.as_ref()).unwrap_or(msg);
         let entry_id = uuid::Uuid::now_v7().to_string();
+        self.write_messages(&[(msg, &entry_id)]).await?;
+        Ok(entry_id)
+    }
+
+    /// Append several messages as **one batch**: every entry plus a single
+    /// trailing leaf, in one storage-lock window and one index update.
+    ///
+    /// `seed` names the batch, so entry ids are `{seed}-{i}`. A retried batch
+    /// (a failed append retried by the transcript) writes identical ids, and
+    /// the index skips an id already present, making re-append idempotent
+    /// rather than a duplicated turn.
+    ///
+    /// `messages` are already prepared — minimized, canonicalized, split — so
+    /// this applies none of those transforms; it is a pure serializer.
+    pub async fn append_messages(
+        &self,
+        messages: &[Message],
+        seed: &uuid::Uuid,
+    ) -> crate::Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        self.ensure_persisted().await?;
+        // Persistent direction-A repair: if the branch tail is an assistant
+        // turn whose calls were never answered (a crash between the call entry
+        // and its result entries), write the synthesized "did not execute"
+        // results first so the new batch does not inherit a dangling call.
+        // One-way: afterwards the tail ends on results.
+        self.repair_tail_unanswered().await?;
+        let refs: Vec<(&Message, String)> = messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m, content_entry_id(&seed.to_string(), i)))
+            .collect();
+        let refs: Vec<(&Message, &String)> = refs.iter().map(|(m, id)| (*m, id)).collect();
+        self.write_messages(&refs).await
+    }
+
+    /// Persistent repair of a dangling trailing assistant turn: if the branch
+    /// leaf ends on an assistant message carrying a `toolCall` with no matching
+    /// `toolResult` entry, write one "did not execute" `toolResult` per
+    /// unanswered call. Fixes crash residue so the next request is valid; the
+    /// `toolName` comes from the dangling call itself (a fresh load has no
+    /// `tool_name_by_call_id` map yet).
+    async fn repair_tail_unanswered(&self) -> crate::Result<()> {
+        let (leaf, untracked): (Option<String>, Vec<SessionEntry>) = {
+            let index = self.index.lock().await;
+            let Some(leaf) = index.leaf_id.clone() else {
+                return Ok(());
+            };
+            let path = index.get_path_to_root(&leaf);
+            // The last assistant entry is the only one that can dangle; its
+            // results are every toolResult entry after it.
+            let Some(asst_idx) = path.iter().rposition(|e| {
+                matches!(&e.content, SessionEntryContent::Message { message }
+                    if message.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            }) else {
+                return Ok(());
+            };
+            let SessionEntryContent::Message { message } = &path[asst_idx].content else {
+                return Ok(());
+            };
+            // A content-bearing (non-call) assistant turn ends the run; only a
+            // turn with tool calls can dangle.
+            let calls: Vec<(String, String)> = message
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|item| {
+                            item.get("type").and_then(|t| t.as_str()) == Some("toolCall")
+                        })
+                        .filter_map(|item| {
+                            let id = item.get("id").and_then(|v| v.as_str())?.to_string();
+                            let name = item
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("tool")
+                                .to_string();
+                            Some((id, name))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if calls.is_empty() {
+                return Ok(());
+            }
+            // Ids already answered by a toolResult entry after the assistant.
+            let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for entry in &path[asst_idx + 1..] {
+                if let SessionEntryContent::Message { message } = &entry.content {
+                    if message.get("role").and_then(|r| r.as_str()) == Some("toolResult") {
+                        if let Some(id) = message.get("toolCallId").and_then(|v| v.as_str()) {
+                            answered.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+            let missing: Vec<&(String, String)> = calls
+                .iter()
+                .filter(|(id, _)| !answered.contains(id))
+                .collect();
+            if missing.is_empty() {
+                return Ok(());
+            }
+            let base = uuid::Uuid::now_v7().to_string();
+            let mut entries: Vec<SessionEntry> = Vec::new();
+            for (i, (id, name)) in missing.iter().enumerate() {
+                let message = serde_json::json!({
+                    "role": "toolResult",
+                    "toolCallId": id,
+                    "toolName": name,
+                    "content": [{
+                        "type": "text",
+                        "text": format!(
+                            "[tool call `{name}` was interrupted before execution; \
+                             it did not run. Continue from the conversation above.]"
+                        ),
+                    }],
+                    "isError": false,
+                });
+                entries.push(SessionEntry {
+                    id: content_entry_id(&base, i),
+                    parent_id: content_entry_parent(&base, i, &Some(leaf.clone())),
+                    timestamp: chrono::Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    content: SessionEntryContent::Message { message },
+                });
+            }
+            (Some(leaf), entries)
+        };
+        let last_id = untracked.last().map(|e| e.id.clone());
+        let storage = self.storage.lock().await;
+        for entry in &untracked {
+            storage.append_entry(entry).await?;
+        }
+        storage
+            .append_entry(&SessionEntry::new_leaf(last_id.clone(), None))
+            .await?;
+        drop(storage);
+        {
+            let mut index = self.index.lock().await;
+            for entry in untracked {
+                if index.entries.contains_key(&entry.id) {
+                    continue;
+                }
+                if let Some(ref pid) = entry.parent_id {
+                    index
+                        .children
+                        .entry(pid.clone())
+                        .or_default()
+                        .push(entry.id.clone());
+                }
+                index.order.push(entry.id.clone());
+                index.entries.insert(entry.id.clone(), Arc::new(entry));
+            }
+            index.leaf_id = last_id;
+        }
+        let _ = leaf;
+        Ok(())
+    }
+
+    /// The shared append core: write each `(message, base_id)` as pi entries
+    /// (chained linearly) plus one trailing leaf, then advance the in-memory
+    /// index. Callers own any canonicalize/split transform.
+    async fn write_messages(&self, messages: &[(&Message, &String)]) -> crate::Result<()> {
         let parent_id = {
             let index = self.index.lock().await;
             index.leaf_id.clone()
         };
 
-        // Before serialising, extract tool call names from an Assistant message
+        // Before serialising, extract tool call names from Assistant messages
         // so tool result entries can carry the correct "toolName".
         {
             let mut map = self.tool_name_by_call_id.lock().unwrap();
-            for item in assistant_content(msg).iter() {
-                if let AssistantContent::ToolCall(tc) = item {
-                    map.insert(tc.id.to_string(), tc.function.name.to_string());
+            for (msg, _) in messages {
+                for item in assistant_content(msg).iter() {
+                    if let AssistantContent::ToolCall(tc) = item {
+                        map.insert(tc.id.to_string(), tc.function.name.to_string());
+                    }
                 }
             }
         }
 
-        let mut pi_entries = rig_message_to_pi_entries(msg, &entry_id, &parent_id);
+        let mut pi_entries: Vec<SessionEntry> = Vec::new();
+        let mut parent = parent_id;
+        for (msg, base_id) in messages {
+            let entries = rig_message_to_pi_entries(msg, base_id, &parent);
+            if let Some(last) = entries.last() {
+                parent = Some(last.id.clone());
+            }
+            pi_entries.extend(entries);
+        }
 
         // Post-process tool result entries: set "toolName" from the call_id
         // lookup map instead of the placeholder "tool".
@@ -1310,9 +1496,15 @@ impl Session {
         // in-memory `entries` map becomes stale and `get_branch()` /
         // `build_context()` cannot follow the parent chain — every
         // subsequent turn would see an empty conversation history.
+        //
+        // An id already present (a retried batch) is skipped rather than
+        // duplicated in `order`/`children`, so a re-append is idempotent.
         {
             let mut index = self.index.lock().await;
             for pi_entry in pi_entries {
+                if index.entries.contains_key(&pi_entry.id) {
+                    continue;
+                }
                 if let Some(ref pid) = pi_entry.parent_id {
                     index
                         .children
@@ -1328,7 +1520,7 @@ impl Session {
             index.leaf_id = last_id.clone();
         }
 
-        Ok(last_id.unwrap_or(entry_id))
+        Ok(())
     }
 
     /// Append a model/provider change entry.
@@ -4137,6 +4329,51 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn append_messages_writes_a_batch_once_and_is_idempotent() {
+        // A batch (assistant + its results) is written in one call, and a
+        // retried batch under the same seed writes identical ids — the index
+        // skips them, so the turn is not duplicated.
+        let _tmp = tempfile::tempdir().unwrap();
+        let path = _tmp.path().join(session_filename(&chrono::Utc::now()));
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        storage
+            .write_header(&SessionHeader::new(std::path::Path::new("/test")))
+            .await
+            .unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+        let asst = assistant_message(
+            None,
+            vec![AssistantContent::ToolCall(tool_call(
+                "call_1",
+                "read",
+                serde_json::json!({}),
+            ))],
+        );
+        let results = Message::User {
+            content: vec![UserContent::ToolResult(text_tool_result(
+                rig_core::message::CallId::from_wire("call_1"),
+                "read",
+                "ok",
+            ))],
+        };
+        let batch = vec![asst, results];
+        let seed = uuid::Uuid::now_v7();
+        session.append_messages(&batch, &seed).await.unwrap();
+        let first_count = session.get_branch().await.len();
+        // Same seed: re-append is a no-op.
+        session.append_messages(&batch, &seed).await.unwrap();
+        assert_eq!(
+            session.get_branch().await.len(),
+            first_count,
+            "a retried batch must not duplicate entries"
+        );
+        cleanup(&path);
     }
 
     #[tokio::test]

@@ -852,7 +852,7 @@ impl Interactive {
                     .unwrap()
                     .prompt(
                         &next_input,
-                        session.as_deref(),
+                        session.clone(),
                         &turn,
                         &turn_params,
                         // The key branch exists only where there is a session

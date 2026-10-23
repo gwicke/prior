@@ -79,8 +79,14 @@ pub(crate) async fn session_context_messages(
     model: &str,
 ) -> crate::Result<Vec<rig_core::message::Message>> {
     let ctx = session.build_context().await?;
+    // A resumed session's tail may end on a dangling call (a crash residue) or
+    // carry orphan results — repair it in memory so the first request is valid
+    // before anything is written. `Session::append_messages` repairs direction A
+    // persistently on the next append; this is prior's own guard, independent of
+    // rig's `pairing::repair` on load.
+    let repaired = crate::agent::transcript::repair_pairing(ctx.messages);
     Ok(maybe_strip_reasoning(
-        ctx.messages,
+        repaired,
         reasoning_in_context,
         provider,
         model,

@@ -18,6 +18,7 @@ use rig_core::message::{
     Api, AssistantContent, AssistantMessage, CallId, Message, Origin, Text, ToolFunction, ToolName,
     ToolResult, ToolResultContent, UserContent,
 };
+use rig_core::streaming::{Part, PartKind, StreamEvent};
 use std::collections::HashMap;
 
 use bsed_blockedit::EditOp;
@@ -102,125 +103,598 @@ pub(crate) fn assistant_content(msg: &Message) -> &[AssistantContent] {
     }
 }
 
-/// Canonical transcript of the in-flight run, mirroring rig's `new_messages`
-/// shape: `[assistant, user(tool-results), assistant, …]` (the user prompt is
-/// added at persist time by `prompt()`, which owns `input`). prior
-/// accumulates this from the stream events so a mid-turn failure can persist
-/// exactly what completed — and nothing more — before the REPL retries.
+/// Whether the run is still going (a completion-call boundary) or has ended
+/// (a turn exit). It is the one thing `prepare` reads to decide whether an
+/// unanswered call may be persisted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunState {
+    /// A completion call is about to be dispatched; the run continues. A
+    /// call without a result is a violation, never a call "about to run".
+    Ongoing,
+    /// The turn is ending — normal, aborted, or errored. Every unanswered call
+    /// is answered with a "did not execute" result so the tail stays valid.
+    Ended,
+}
+
+/// One completion call's live unit: the assistant half as it streams, the
+/// accepted turn once rig commits it, and the results that answer it.
 ///
-/// * [`LoggingHook::on_model_turn_finished`] appends each *accepted* assistant
-///   turn (`event.content` is the canonical, provider-normalized
-///   `AssistantContent` rig parked for the turn — the same content a
-///   successful run persists via `FinalResponse.messages()`).
-/// * Tool-result stream items (`StreamUserItem(ToolResult)`) are batched into
-///   one `Message::User` and flushed on the next assistant turn or at
-///   [`finalize`](Self::finalize) — matching rig, which pushes each completed
-///   batch as a single `Message::User`.
+/// Separate fields keep **order observed rather than assumed**: a provider may
+/// interleave text and tool calls (Gemini, Ollama), so a flat `String` per kind
+/// would silently reorder a turn. A part's `End` supersedes its fragments, and
+/// `accepted` supersedes the whole `streaming` list wholesale.
+#[derive(Default)]
+pub(crate) struct LiveUnit {
+    /// Parts in provider order, keyed by their stream `Part`. A part's `End`
+    /// supersedes its fragments; fragments survive only for a part that never
+    /// ended (a cut stream).
+    parts: Vec<LivePart>,
+    /// `event.content` from `on_model_turn_finished`: canonical, provider
+    /// order, supersedes `streaming` wholesale.
+    accepted: Option<Message>,
+    /// One `ToolResult` per answered call of the batch.
+    results: Vec<UserContent>,
+}
+
+struct LivePart {
+    part: Part,
+    kind: Option<PartKind>,
+    /// Fragments for a part that never ended (text/reasoning/argument JSON).
+    fragments: String,
+    /// The finalized content this part ended with.
+    ended: Option<AssistantContent>,
+}
+
+impl LiveUnit {
+    /// The part's slot, created on first mention so start order is preserved.
+    fn slot(&mut self, part: Part) -> &mut LivePart {
+        let idx = match self.parts.iter().position(|p| p.part == part) {
+            Some(i) => i,
+            None => {
+                self.parts.push(LivePart {
+                    part,
+                    kind: None,
+                    fragments: String::new(),
+                    ended: None,
+                });
+                self.parts.len() - 1
+            }
+        };
+        &mut self.parts[idx]
+    }
+
+    /// Whether the unit holds anything at all (its own content, not the
+    /// transcript's already-persisted messages).
+    fn is_empty(&self) -> bool {
+        self.accepted.is_none()
+            && self.results.is_empty()
+            && self
+                .parts
+                .iter()
+                .all(|p| p.ended.is_none() && p.fragments.is_empty())
+    }
+
+    /// Whether the unit is a complete pair: every tool call the assistant half
+    /// carries has a result. A unit with no accepted turn but with results
+    /// (`TurnAbandoned`) counts as complete — direction B rebuilds the
+    /// assistant half from exactly those results, so it is answered by
+    /// construction.
+    fn answered_all(&self) -> bool {
+        let calls: Vec<CallId> = match &self.accepted {
+            Some(Message::Assistant(turn)) => turn
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                    _ => None,
+                })
+                .collect(),
+            // No accepted turn: only the results are known. If there are any,
+            // direction B makes a matching assistant; if there are none there
+            // is nothing to answer.
+            _ => return !self.results.is_empty(),
+        };
+        let answered: std::collections::HashSet<&CallId> = self
+            .results
+            .iter()
+            .filter_map(|c| match c {
+                UserContent::ToolResult(tr) => Some(&tr.call),
+                _ => None,
+            })
+            .collect();
+        calls.iter().all(|id| answered.contains(id))
+    }
+
+    /// The assistant half: `accepted` when present, else the streamed parts
+    /// flattened in provider order. A tool-call part that never ended is
+    /// dropped (its argument JSON is incomplete — a fabricated call would
+    /// enter the session as a real, answered request for a tool that never
+    /// ran). `None` when nothing visible streamed.
+    fn finish(&self) -> Option<Message> {
+        if let Some(turn) = &self.accepted {
+            return Some(turn.clone());
+        }
+        let mut content: Vec<AssistantContent> = Vec::new();
+        for part in &self.parts {
+            if let Some(ended) = &part.ended {
+                content.push(ended.clone());
+                continue;
+            }
+            if part.fragments.is_empty() {
+                continue;
+            }
+            match part.kind {
+                Some(PartKind::Text) => {
+                    content.push(AssistantContent::Text(Text::new(&part.fragments)));
+                }
+                Some(PartKind::Reasoning) => {
+                    content.push(AssistantContent::Reasoning(
+                        rig_core::message::Reasoning::new(&part.fragments),
+                    ));
+                }
+                // An unfinished call, image or opaque part: nothing to write.
+                _ => {}
+            }
+        }
+        assistant_content_is_visible(&content).then(|| assistant_message(None, content))
+    }
+}
+
+/// The canonical transcript of the in-flight run, and the incremental
+/// persistence that turns each completion call into one durable batch.
 ///
-/// [`finalize`](Self::finalize) returns a canonical transcript for
-/// persistence: a trailing assistant turn whose tool calls were never answered
-/// (the run was interrupted mid-batch) is *completed* with synthesized text
-/// tool results — one per unanswered call, marked "did not execute" — so
-/// nothing is dropped or truncated and rig's `validate_canonical` passes.
-/// This mirrors rig's own `invalid_tool_retry_user_message`
-/// (`rig-run/src/transcript.rs`), which answers rejected calls with text
-/// results rather than removing them.
+/// `messages` holds only *prepared*, durable messages: every element is on
+/// disk. The one mutable thing is the current [`LiveUnit`], which is not a
+/// `Message` yet and never a half-unit — it is shaped by
+/// [`prepare`](Self::prepare) before it enters `messages`.
 #[derive(Default)]
 pub(crate) struct TurnTranscript {
-    /// Completed messages in canonical order.
-    committed: Vec<Message>,
-    /// Accepted assistant turns. `> 0` means the run got past the first model
-    /// call — i.e. there is progress worth persisting on a mid-turn failure.
-    assistant_turns: usize,
-    /// Tool results of the in-flight batch (following an assistant tool
-    /// turn); flushed as one `Message::User` on the next assistant turn or at
-    /// finalize.
-    pending_results: Vec<UserContent>,
+    /// Prepared messages: every element is on disk. Append-only, never
+    /// rewritten.
+    messages: Vec<Message>,
+    /// The prepared batch awaiting its append; retried verbatim on failure.
+    prepared: Option<PreparedBatch>,
+    /// The current completion call: the only accumulating state.
+    live: LiveUnit,
+}
+
+/// A whole completion turn ready to persist: one to three messages plus the
+/// batch id seed, so entry ids are `{seed}-{i}` and a retried append is
+/// idempotent instead of a duplicated turn.
+#[derive(Clone)]
+pub(crate) struct PreparedBatch {
+    pub(crate) messages: Vec<Message>,
+    pub(crate) seed: uuid::Uuid,
 }
 
 impl TurnTranscript {
-    /// Append an accepted assistant turn. Any pending tool-result batch is
-    /// flushed first so the transcript stays canonical (assistant → user
-    /// results → …). Turns with no visible content (rig curates empty turns
-    /// out of history) are skipped.
-    pub(crate) fn push_assistant_turn(
-        &mut self,
-        response_id: Option<String>,
-        content: Vec<AssistantContent>,
-    ) {
-        self.flush_results();
-        if !assistant_content_is_visible(&content) {
-            return;
-        }
-        self.committed.push(assistant_message(response_id, content));
-        self.assistant_turns += 1;
+    /// Begin a new completion call: the live unit is empty for it.
+    pub(crate) fn start_live(&mut self) {
+        self.live = LiveUnit::default();
     }
 
-    /// Accumulate one tool result of the in-flight batch.
+    /// Feed one streamed part event into the live unit. Each fragment exists
+    /// once, in the current poll's `StreamAssistantItem`, so the loop is the
+    /// single drain site — the hook only ever sees the accepted turn.
+    pub(crate) fn push_event(&mut self, event: &StreamEvent) {
+        let part = event.part();
+        let lp = self.live.slot(part);
+        match event {
+            StreamEvent::Start { kind, name, .. } => {
+                lp.kind = Some(*kind);
+                let _ = name;
+            }
+            StreamEvent::Text { text, .. } | StreamEvent::Reasoning { text, .. } => {
+                lp.fragments.push_str(text);
+            }
+            StreamEvent::Arguments { json, .. } => lp.fragments.push_str(json),
+            StreamEvent::End { content, .. } => lp.ended = Some(content.clone()),
+        }
+    }
+
+    /// Record the accepted assistant turn from `on_model_turn_finished`.
+    /// Empty turns (curated out by rig) are dropped; either way the streamed
+    /// fragments are superseded.
+    pub(crate) fn accept(&mut self, response_id: Option<String>, content: Vec<AssistantContent>) {
+        self.live.parts.clear();
+        self.live.accepted =
+            assistant_content_is_visible(&content).then(|| assistant_message(response_id, content));
+    }
+
+    /// Accumulate one tool result of the batch.
     pub(crate) fn push_tool_result(&mut self, result: rig_core::message::ToolResult) {
-        self.pending_results.push(UserContent::ToolResult(result));
+        self.live.results.push(UserContent::ToolResult(result));
     }
 
-    /// Whether any model turn completed (progress worth persisting).
-    pub(crate) fn has_progress(&self) -> bool {
-        self.assistant_turns > 0
+    /// Whether there is anything to write (drives the back-off reset): any
+    /// persisted message, a pending batch, or live content.
+    pub(crate) fn has_content(&self) -> bool {
+        !self.messages.is_empty() || self.prepared.is_some() || !self.live.is_empty()
     }
 
-    /// The canonical transcript to persist on interruption. Flushes any
-    /// pending tool-result batch, then — if the transcript still ends on an
-    /// assistant turn with tool calls that never ran — answers each call with
-    /// a synthesized text result. Never truncates or drops progress.
-    pub(crate) fn finalize(&mut self) -> Vec<Message> {
-        self.flush_results();
-        let calls: Vec<&rig_core::message::ToolCall> = match self.committed.last() {
-            Some(msg)
-                if assistant_content(msg)
-                    .iter()
-                    .any(|c| matches!(c, AssistantContent::ToolCall(_))) =>
-            {
-                assistant_content(msg)
-                    .iter()
-                    .filter_map(|c| match c {
-                        AssistantContent::ToolCall(tc) => Some(tc),
-                        _ => None,
-                    })
-                    .collect()
-            }
-            _ => Vec::new(),
+    /// Shape the live unit into a batch, in memory only. Retry-first: while a
+    /// prepared batch is pending (a failed append), it is returned unchanged,
+    /// so a later turn cannot overtake it and ordering on disk is preserved.
+    /// `None` when there is nothing to write.
+    ///
+    /// `state` decides whether an unanswered call is filled with a "did not
+    /// execute" result. At a completion-call boundary the run is ongoing: a
+    /// dangling call there is a violation to log, never a call "about to run",
+    /// so the unit is left in place and not written (it is written at the next
+    /// boundary or the exit, once its results have arrived). At an exit it is
+    /// `Ended` and every unanswered call is answered — the tail must stay a
+    /// valid prefix.
+    pub(crate) fn prepare(
+        &mut self,
+        anchors: &EditAnchorLedger,
+        state: RunState,
+    ) -> Option<PreparedBatch> {
+        if let Some(batch) = &self.prepared {
+            return Some(batch.clone());
+        }
+        if self.live.is_empty() {
+            return None;
+        }
+        if state == RunState::Ongoing && !self.live.answered_all() {
+            // Mid-run: a call without a result is not yet a complete unit.
+            return None;
+        }
+        let live = std::mem::take(&mut self.live);
+        let assistant = live.finish();
+        let results = live.results;
+
+        // Direction B: results with no accepted turn (`TurnAbandoned`, a
+        // repaired-name turn) — rebuild the assistant half from what each
+        // result carries (call id + name, args `{}`).
+        let assistant = match assistant {
+            Some(a) => a,
+            None if !results.is_empty() => assistant_from_results(&results),
+            // Nothing visible streamed and no results: a whitespace-only cut.
+            // There is nothing to write (an empty assistant message would be
+            // noise); drop the unit.
+            None => return None,
         };
-        if !calls.is_empty() {
-            let synthesized: Vec<UserContent> = calls
-                .iter()
-                .map(|tc| {
-                    UserContent::ToolResult(rig_core::message::ToolResult {
-                        call: tc.id.clone(),
-                        name: tc.function.name.clone(),
-                        content: vec![ToolResultContent::text(format!(
-                            "[tool call `{}` was interrupted before execution; \
-                             it did not run. Continue from the conversation above.]",
-                            tc.function.name
-                        ))],
-                        is_error: false,
-                    })
-                })
-                .collect();
-            if !synthesized.is_empty() {
-                self.committed.push(Message::User {
-                    content: synthesized,
-                });
-            }
-        }
-        self.committed.clone()
+        let assistant = minimize_one(assistant, anchors);
+
+        let (assistant, results) = if has_edit_call(&assistant) {
+            shape_pair(assistant, results)
+        } else {
+            (assistant, results)
+        };
+
+        let messages = assemble(assistant, results, state);
+        let batch = PreparedBatch {
+            messages,
+            seed: uuid::Uuid::now_v7(),
+        };
+        self.prepared = Some(batch.clone());
+        Some(batch)
     }
 
-    /// Flush a pending tool-result batch as one `Message::User`.
-    fn flush_results(&mut self) {
-        if self.pending_results.is_empty() {
-            return;
+    /// Fold the prepared batch into `messages` after a successful append.
+    fn mark_committed(&mut self) {
+        if let Some(batch) = self.prepared.take() {
+            self.messages.extend(batch.messages);
         }
-        let results = std::mem::take(&mut self.pending_results);
-        self.committed.push(Message::User { content: results });
     }
+}
+
+/// Persist the transcript's pending batch to `session`, if any.
+///
+/// A free async fn because a `std::sync::Mutex` guard cannot cross the
+/// `await`: prepare under the lock, append with the lock dropped, re-lock to
+/// fold. Failure leaves the transcript untouched (the batch stays `prepared`)
+/// so a retry re-emits a byte-identical batch under the same ids — idempotent,
+/// not a duplicated turn — and is logged rather than swallowed.
+pub(crate) async fn commit(
+    transcript: &std::sync::Mutex<TurnTranscript>,
+    session: Option<&crate::session::Session>,
+    anchors: &EditAnchorLedger,
+    state: RunState,
+) -> crate::Result<()> {
+    // Loop so a pending batch (a failed append) is written first, then any
+    // live content that accumulated meanwhile — preserving order. In the
+    // common case live is empty at the boundary and this runs once.
+    loop {
+        let batch = {
+            let mut t = transcript
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            t.prepare(anchors, state)
+        };
+        let Some(batch) = batch else {
+            return Ok(());
+        };
+        // The append is the only session-gated step. Without a session the
+        // batch is still folded into `messages`, so `has_content` reflects the
+        // progress a sessionless run made (it drives the back-off reset).
+        if let Some(session) = session {
+            if let Err(e) = session.append_messages(&batch.messages, &batch.seed).await {
+                eprintln!("Warning: failed to persist session batch: {e}");
+                return Err(e);
+            }
+        }
+        let mut t = transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        t.mark_committed();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Load-path repair
+// ---------------------------------------------------------------------------
+
+/// Repair call/result pairing on a *loaded* `Vec<Message>` (pure, idempotent).
+///
+/// The write path never needs this — `prepare()` shapes both halves of the
+/// live unit together, so a half-unit never reaches `messages`. This is for
+/// what a file already holds: a crash residue or a legacy session.
+///
+/// - **Direction A** — an assistant turn with unanswered calls (a torn write
+///   between the call entry and its result entries): answers each with the
+///   synthesized "did not execute" result, matching rig's `NO_RESULT_PROVIDED`.
+/// - **Direction B** — `ToolResult` items whose `CallId` appears in no
+///   assistant part: inserts a synthesized assistant turn, rebuilt from each
+///   result's `call` + `name` (arguments `{}`), *before* the results.
+pub(crate) fn repair_pairing(messages: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        match msg {
+            Message::User { content } => {
+                // Direction B: answer orphan results (their `CallId` is in no
+                // preceding assistant turn) with a synthesized assistant turn
+                // placed *before* them, rebuilt from the results themselves.
+                let known: std::collections::HashSet<CallId> = out
+                    .last()
+                    .map(|m| {
+                        assistant_content(m)
+                            .iter()
+                            .filter_map(|c| match c {
+                                AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let orphans: Vec<UserContent> = content
+                    .iter()
+                    .filter(|c| match c {
+                        UserContent::ToolResult(tr) => !known.contains(&tr.call),
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect();
+                if !orphans.is_empty() {
+                    out.push(assistant_from_results(&orphans));
+                }
+                out.push(Message::User { content });
+            }
+            other => out.push(other),
+        }
+    }
+    // Direction A: answer a trailing assistant turn's unanswered calls. The
+    // tail may be the assistant alone (torn before any result) or the
+    // assistant followed by a *partial* result batch; either way, any call id
+    // no result answers gets a synthesized "did not execute" result.
+    let asst_idx = out.iter().rposition(|m| matches!(m, Message::Assistant(_)));
+    if let Some(idx) = asst_idx {
+        let calls: Vec<rig_core::message::ToolCall> = assistant_content(&out[idx])
+            .iter()
+            .filter_map(|c| match c {
+                AssistantContent::ToolCall(tc) => Some(tc.clone()),
+                _ => None,
+            })
+            .collect();
+        // Results only count if nothing intervenes between the assistant and
+        // them (a later assistant turn starts a new unit).
+        let results_start = idx + 1;
+        let answered: std::collections::HashSet<CallId> = out[results_start..]
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } => Some(content.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|c| match c {
+                UserContent::ToolResult(tr) => Some(tr.call.clone()),
+                _ => None,
+            })
+            .collect();
+        let missing: Vec<UserContent> = calls
+            .into_iter()
+            .filter(|tc| !answered.contains(&tc.id))
+            .map(|tc| UserContent::ToolResult(synthesized_result(&tc)))
+            .collect();
+        if !missing.is_empty() {
+            // Extend a trailing results message, or append a new one.
+            match out.last_mut() {
+                Some(Message::User { content }) => content.extend(missing),
+                _ => out.push(Message::User { content: missing }),
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Batch shaping
+// ---------------------------------------------------------------------------
+
+/// Minimize successful `edit` calls in a single message (a no-op for any
+/// other shape).
+fn minimize_one(msg: Message, anchors: &EditAnchorLedger) -> Message {
+    minimize_edit_tool_calls(vec![msg], anchors)
+        .pop()
+        .expect("one message in, one out")
+}
+
+fn has_edit_call(msg: &Message) -> bool {
+    assistant_content(msg)
+        .iter()
+        .any(|c| matches!(c, AssistantContent::ToolCall(tc) if tc.function.name == "edit"))
+}
+
+/// Rebuild the assistant half from the results that answered it, for a turn
+/// rig committed without firing `on_model_turn_finished` (`TurnAbandoned`,
+/// a repaired-name turn). A `ToolResult` carries both `call` and `name`, so
+/// the ids and tools are exact; the arguments are lost and left `{}`.
+fn assistant_from_results(results: &[UserContent]) -> Message {
+    let content = results
+        .iter()
+        .filter_map(|c| match c {
+            UserContent::ToolResult(tr) => Some(AssistantContent::ToolCall(
+                rig_core::message::ToolCall::new(
+                    tr.call.clone(),
+                    ToolFunction::new(tr.name.clone(), serde_json::json!({})),
+                ),
+            )),
+            _ => None,
+        })
+        .collect();
+    assistant_message(None, content)
+}
+
+/// The "did not execute" result rig answers an unanswered call with
+/// (`NO_RESULT_PROVIDED` semantics).
+fn synthesized_result(tc: &rig_core::message::ToolCall) -> ToolResult {
+    ToolResult {
+        call: tc.id.clone(),
+        name: tc.function.name.clone(),
+        content: vec![ToolResultContent::text(format!(
+            "[tool call `{}` was interrupted before execution; \
+             it did not run. Continue from the conversation above.]",
+            tc.function.name
+        ))],
+        is_error: false,
+    }
+}
+
+/// Assemble `[assistant]` and, when there are results, `[assistant, user]`.
+/// Every unanswered call is answered with a synthesized "did not execute"
+/// result — safe at a boundary (there are none) and required at a run exit —
+/// so the on-disk tail is always a valid prefix.
+fn assemble(assistant: Message, mut results: Vec<UserContent>, state: RunState) -> Vec<Message> {
+    if state == RunState::Ended {
+        let answered: std::collections::HashSet<CallId> = results
+            .iter()
+            .filter_map(|c| match c {
+                UserContent::ToolResult(tr) => Some(tr.call.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut derived: Vec<UserContent> = Vec::new();
+        for c in assistant_content(&assistant) {
+            if let AssistantContent::ToolCall(tc) = c {
+                if !answered.contains(&tc.id) {
+                    derived.push(UserContent::ToolResult(synthesized_result(tc)));
+                }
+            }
+        }
+        results.extend(derived);
+    }
+
+    let mut out = vec![assistant];
+    if !results.is_empty() {
+        out.push(Message::User { content: results });
+    }
+    out
+}
+
+/// Split a multi-file `edit` call and its result into per-file halves, and
+/// canonicalize every `edit` call. The call and result halves are decided
+/// **once, together**, so a blob that parses but whose result is a plain
+/// argument-error string stays one call and one result — never N calls and
+/// one result (which direction B cannot see and a provider rejects on reload).
+fn shape_pair(assistant: Message, results: Vec<UserContent>) -> (Message, Vec<UserContent>) {
+    let Message::Assistant(turn) = assistant else {
+        return (assistant, results);
+    };
+    let response = response_id(&turn).map(str::to_string);
+
+    let mut result_by_id: HashMap<CallId, UserContent> = HashMap::new();
+    let mut others: Vec<UserContent> = Vec::new();
+    for c in results {
+        match &c {
+            UserContent::ToolResult(tr) => {
+                result_by_id.insert(tr.call.clone(), c);
+            }
+            _ => others.push(c),
+        }
+    }
+
+    let mut out_calls: Vec<AssistantContent> = Vec::new();
+    let mut out_results: Vec<UserContent> = Vec::new();
+    for c in turn.content {
+        match c {
+            AssistantContent::ToolCall(tc) if tc.function.name == "edit" => {
+                let id = tc.id.clone();
+                let args = tc.function.arguments_value();
+                let text = result_by_id.get(&id).and_then(|c| match c {
+                    UserContent::ToolResult(tr) => tool_result_text(tr),
+                    _ => None,
+                });
+                let split = text
+                    .as_deref()
+                    .and_then(|t| split_edit_call_and_result(&args, t));
+                match split {
+                    Some(split) => {
+                        result_by_id.remove(&id);
+                        let n = split.per_file.len();
+                        for (i, blocks) in split.per_file.iter().enumerate() {
+                            let sid = crate::edit_blocks::split_id(&id, i, n);
+                            out_calls.push(AssistantContent::ToolCall(
+                                rig_core::message::ToolCall {
+                                    id: sid.clone(),
+                                    function: ToolFunction::new(
+                                        tc.function.name.clone(),
+                                        crate::edit_blocks::canonicalize_edit_value(
+                                            &serde_json::json!({ "blocks": blocks }),
+                                        ),
+                                    ),
+                                    native: None,
+                                },
+                            ));
+                            out_results.push(UserContent::ToolResult(ToolResult {
+                                call: sid,
+                                name: tc.function.name.clone(),
+                                content: vec![ToolResultContent::text(split.results[i].clone())],
+                                is_error: false,
+                            }));
+                        }
+                    }
+                    None => {
+                        out_calls.push(AssistantContent::ToolCall(rig_core::message::ToolCall {
+                            id: id.clone(),
+                            function: ToolFunction::new(
+                                tc.function.name.clone(),
+                                crate::edit_blocks::canonicalize_edit_value(&args),
+                            ),
+                            native: None,
+                        }));
+                        if let Some(r) = result_by_id.remove(&id) {
+                            out_results.push(r);
+                        }
+                    }
+                }
+            }
+            AssistantContent::ToolCall(tc) => {
+                if let Some(r) = result_by_id.remove(&tc.id) {
+                    out_results.push(r);
+                }
+                out_calls.push(AssistantContent::ToolCall(tc));
+            }
+            other => out_calls.push(other),
+        }
+    }
+
+    // Any results whose call was not found (an orphan) and any non-tool
+    // content ride after, in their original spirit; `assemble` then checks
+    // for unanswered calls.
+    out_results.extend(result_by_id.into_values());
+    out_results.extend(others);
+
+    (assistant_message(response, out_calls), out_results)
 }
 
 /// Whether an accepted assistant turn carries anything the user/model should
@@ -567,59 +1041,6 @@ pub(crate) fn split_multi_file_edit_calls(messages: Vec<Message>) -> Vec<Message
         }
     }
     out
-}
-
-/// No-op in rig ≥1c2f440: `ToolResult::call` (rig's correlation handle) is
-/// always present — minted at the provider boundary when the provider
-/// issued no id — so the old cross-provider `call_id` normalisation is
-/// inherently satisfied. Kept as a named passthrough so the persist path
-/// reads the same. See doc/pi_steering_rig.md §6.5.4.
-pub(crate) fn normalize_call_ids(messages: Vec<Message>) -> Vec<Message> {
-    messages
-}
-
-/// Merge a finished (or aborted) turn into the session `history`.
-///
-/// * `final_history` — messages for a *successfully completed* turn (`[user,
-///   assistant]`). Appended, because `history` already holds the prior turns;
-///   this mirrors rig's blocking `chat()`, which does `chat_history.extend(
-///   messages)`. This is the root-cause-#1 fix: the previous code *replaced*
-///   the whole history with just this turn, so earlier context was lost every
-///   turn.
-/// * `cancelled_history` — the in-flight *full* history rig attaches to a
-///   `PromptCancelled` error (prior turns + the aborted user prompt + any
-///   partial assistant text). Replaces `history` rather than appending, since
-///   it already contains the prior turns; appending would duplicate them. This
-///   is the root-cause-#2 fix.
-/// * `reasoning_in_context` — when `false`, `Reasoning` blocks are stripped
-///   from assistant messages before they enter the stored context (a cheap,
-///   deterministic "Level 0" compaction that saves tokens). Ignored for
-///   Anthropic-family providers (`provider`/`model` satisfy
-///   [`is_anthropic_family`]) **on turns that contain tool calls**, which
-///   require the leading reasoning to be replayed verbatim on the next turn
-///   (thinking+tool_use contract); reasoning is force-kept there. On
-///   Anthropic turns *without* tool calls, and on all other providers when
-///   the flag is `false`, reasoning is stripped normally.
-#[allow(dead_code)]
-pub(crate) fn persist_turn(
-    history: &mut Option<&mut Vec<Message>>,
-    final_history: Option<Vec<Message>>,
-    cancelled_history: Option<Vec<Message>>,
-    reasoning_in_context: crate::settings::ReasoningInContextMode,
-    provider: &str,
-    model: &str,
-) {
-    if let Some(h) = history {
-        if let Some(fh) = final_history {
-            let to_commit = maybe_strip_reasoning(fh, reasoning_in_context, provider, model);
-            let to_commit = normalize_call_ids(to_commit);
-            h.extend(to_commit);
-        } else if let Some(ch) = cancelled_history {
-            let to_commit = maybe_strip_reasoning(ch, reasoning_in_context, provider, model);
-            let to_commit = normalize_call_ids(to_commit);
-            **h = to_commit;
-        }
-    }
 }
 
 /// Strip `AssistantContent::Reasoning` blocks based on the
@@ -1213,17 +1634,17 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let turn2 = TurnPersistence::new();
         assert_eq!(turn2.sent(), 0);
     }
-    // ---- TurnTranscript accumulation & finalization ----
+    // ---- TurnTranscript: live unit, prepare, commit batches ----
     //
-    // The transcript mirrors rig's `new_messages` shape so a mid-turn failure
-    // can persist exactly what completed (doc/tool_error_handling.md
-    // §Mid-turn failure). These tests pin the accumulation order and the
-    // no-truncation finalization: unanswered trailing tool calls are answered
-    // with synthesized text results, never dropped.
+    // The transcript is the persistence source of truth: one `LiveUnit` per
+    // completion call is shaped by `prepare()` into a batch of one to three
+    // messages, and `commit()` writes each completion turn rather than the
+    // whole run. These tests pin the accumulation order, the batch shape, and
+    // the no-truncation `Ended` synthesis.
 
     #[test]
-    fn transcript_batches_tool_results_between_assistant_turns() {
-        use super::TurnTranscript;
+    fn transcript_iteration_one_batch_per_completion_call() {
+        use super::{RunState, TurnTranscript};
         use rig_core::message::{ToolCall, ToolFunction};
 
         let tc = ToolCall::from_wire(
@@ -1232,24 +1653,27 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         );
         let call_id = tc.id.clone();
         let mut t = TurnTranscript::default();
-        // Assistant turn with a tool call.
-        t.push_assistant_turn(None, vec![AssistantContent::ToolCall(tc)]);
-        assert!(t.has_progress());
-        // Tool result streams back (batch accumulates).
+        t.start_live();
+        t.accept(None, vec![AssistantContent::ToolCall(tc)]);
         t.push_tool_result(text_tool_result(call_id, "read", "ok"));
-        // Next assistant turn flushes the batch as one Message::User.
-        t.push_assistant_turn(None, vec![AssistantContent::text("done")]);
-        let f = t.finalize();
-        assert_eq!(f.len(), 3, "assistant + user(results) + assistant: {f:?}");
+        // An `Ongoing` boundary (call start) writes the pair as one batch.
+        let anchors = EditAnchorLedger::default();
+        let batch = t.prepare(&anchors, RunState::Ongoing).expect("batch");
+        assert_eq!(
+            batch.messages.len(),
+            2,
+            "assistant + one user: {:?}",
+            batch.messages
+        );
         assert!(
-            matches!(&f[1], Message::User { .. }),
-            "batch must be one user msg"
+            matches!(&batch.messages[1], Message::User { .. }),
+            "batch must be one user message"
         );
     }
 
     #[test]
-    fn transcript_finalize_answers_interrupted_calls_with_text_results() {
-        use super::TurnTranscript;
+    fn transcript_ended_synthesizes_interrupted_calls() {
+        use super::{RunState, TurnTranscript};
         use rig_core::message::{ToolCall, ToolFunction, ToolResultContent, UserContent};
 
         let tc = ToolCall::from_wire(
@@ -1257,12 +1681,13 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             ToolFunction::new(tool_name("read"), serde_json::json!({})),
         );
         let mut t = TurnTranscript::default();
-        t.push_assistant_turn(None, vec![AssistantContent::ToolCall(tc)]);
-        // Run interrupted before any tool result: finalize must synthesize a
-        // text result per unanswered call — never truncate.
-        let f = t.finalize();
-        assert_eq!(f.len(), 2, "assistant + synthesized user: {f:?}");
-        let Message::User { content } = &f[1] else {
+        t.start_live();
+        t.accept(None, vec![AssistantContent::ToolCall(tc)]);
+        // Interrupted before any result: `Ended` synthesizes one per call.
+        let anchors = EditAnchorLedger::default();
+        let batch = t.prepare(&anchors, RunState::Ended).expect("batch");
+        assert_eq!(batch.messages.len(), 2, "assistant + synthesized user");
+        let Message::User { content } = &batch.messages[1] else {
             panic!("expected a user message");
         };
         let UserContent::ToolResult(tr) = &content[0] else {
@@ -1276,17 +1701,82 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
     }
 
     #[test]
+    fn transcript_ongoing_leaves_dangling_call_unwritten() {
+        use super::{RunState, TurnTranscript};
+        use rig_core::message::{ToolCall, ToolFunction};
+
+        let tc = ToolCall::from_wire(
+            "call_1",
+            ToolFunction::new(tool_name("read"), serde_json::json!({})),
+        );
+        let mut t = TurnTranscript::default();
+        t.start_live();
+        t.accept(None, vec![AssistantContent::ToolCall(tc)]);
+        // No result yet: at an ongoing boundary the unit is incomplete, so
+        // there is nothing to write (the tail never gets a dangling call).
+        let anchors = EditAnchorLedger::default();
+        assert!(t.prepare(&anchors, RunState::Ongoing).is_none());
+    }
+
+    #[test]
     fn transcript_skips_turns_without_visible_content() {
-        use super::TurnTranscript;
+        use super::{RunState, TurnTranscript};
 
         let mut t = TurnTranscript::default();
-        t.push_assistant_turn(None, vec![AssistantContent::text("   ")]);
-        assert!(
-            !t.has_progress(),
-            "blank-text turn must not count as progress"
-        );
-        assert!(t.finalize().is_empty());
+        t.start_live();
+        t.accept(None, vec![AssistantContent::text("   ")]);
+        let anchors = EditAnchorLedger::default();
+        assert!(!t.has_content(), "blank-text turn is not content");
+        assert!(t.prepare(&anchors, RunState::Ended).is_none());
     }
+
+    #[test]
+    fn repair_pairing_answers_a_dangling_call() {
+        // Direction A: an assistant turn with an unanswered call gets a
+        // synthesized "did not execute" result, so the tail is a valid prefix.
+        use super::repair_pairing;
+        use rig_core::message::{ToolCall, ToolFunction};
+        let tc = ToolCall::from_wire(
+            "c1",
+            ToolFunction::new(tool_name("read"), serde_json::json!({})),
+        );
+        let msgs = vec![assistant_message(
+            None,
+            vec![AssistantContent::ToolCall(tc)],
+        )];
+        let repaired = repair_pairing(msgs);
+        assert_eq!(repaired.len(), 2, "assistant + synthesized results");
+        let Message::User { content } = &repaired[1] else {
+            panic!("expected user results");
+        };
+        assert!(matches!(content[0], UserContent::ToolResult(_)));
+        // Idempotent: the repaired tail ends on results, so a second pass is a
+        // no-op.
+        assert_eq!(repair_pairing(repaired.clone()).len(), 2);
+    }
+
+    #[test]
+    fn repair_pairing_rebuilds_an_orphan_results_assistant() {
+        // Direction B: orphan results (no preceding assistant carried their id)
+        // get a synthesized assistant turn placed before them.
+        use super::repair_pairing;
+        let orphan = Message::User {
+            content: vec![UserContent::ToolResult(text_tool_result(
+                rig_core::message::CallId::from_wire("c9"),
+                "read",
+                "ok",
+            ))],
+        };
+        let repaired = repair_pairing(vec![orphan]);
+        assert_eq!(repaired.len(), 2, "synthesized assistant + results");
+        assert!(matches!(repaired[0], Message::Assistant(_)));
+        let content = assistant_content(&repaired[0]);
+        let AssistantContent::ToolCall(tc) = &content[0] else {
+            panic!("expected a synthesized call");
+        };
+        assert_eq!(&*tc.id.wire(), "c9");
+    }
+
     #[test]
     fn reasoning_text_extracts_text_block() {
         let r = Reasoning::new("think step by step");
@@ -1300,77 +1790,6 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let r = Reasoning::new("with sig");
         assert_eq!(reasoning_text(&r), "with sig");
     }
-    // Regression test for root cause #1: a successful turn must *append* to the
-    // existing history, preserving prior turns. The old code replaced the whole
-    // history with just the latest turn, so earlier exchanges were lost every
-    // turn.
-    #[test]
-    fn successful_turn_appends_to_history() {
-        let mut hist: Vec<Message> = vec![Message::user("prior-1")];
-        persist_turn(
-            &mut Some(&mut hist),
-            Some(vec![
-                Message::user("turn-2-prompt"),
-                Message::assistant("turn-2-reply"),
-            ]),
-            None,
-            crate::settings::ReasoningInContextMode::Always,
-            "openai",
-            "",
-        );
-
-        // Prior turn preserved, new turn appended (not wiped/replaced).
-        assert_eq!(hist.len(), 3);
-        assert!(hist.contains(&Message::user("prior-1")));
-        assert!(hist.contains(&Message::user("turn-2-prompt")));
-        assert!(hist.contains(&Message::assistant("turn-2-reply")));
-        // Prior must come before the new turn.
-        let prior_idx = hist
-            .iter()
-            .position(|m| *m == Message::user("prior-1"))
-            .unwrap();
-        let new_idx = hist
-            .iter()
-            .position(|m| *m == Message::user("turn-2-prompt"))
-            .unwrap();
-        assert!(prior_idx < new_idx);
-    }
-
-    // Regression test for root cause #2: an aborted turn must keep the prior
-    // turns and commit the in-flight full history *without* duplicating the
-    // priors (rig's cancellation error already includes them).
-    #[test]
-    fn aborted_turn_keeps_prior_and_no_duplication() {
-        let mut hist: Vec<Message> = vec![Message::user("prior-1")];
-        // rig's `PromptCancelled.chat_history` == full_history() == prior + this turn.
-        let cancelled = vec![
-            Message::user("prior-1"),
-            Message::user("aborted-prompt"),
-            Message::assistant("aborted-partial"),
-        ];
-        use crate::settings::ReasoningInContextMode;
-        persist_turn(
-            &mut Some(&mut hist),
-            None,
-            Some(cancelled),
-            ReasoningInContextMode::Always,
-            "openai",
-            "",
-        );
-
-        // Replaced (not appended): exactly the in-flight full history, with no
-        // duplicate of `prior-1`.
-        assert_eq!(hist.len(), 3);
-        assert_eq!(
-            hist.iter()
-                .filter(|m| **m == Message::user("prior-1"))
-                .count(),
-            1
-        );
-        assert!(hist.contains(&Message::user("aborted-prompt")));
-        assert!(hist.contains(&Message::assistant("aborted-partial")));
-    }
-
     // `reasoning_in_context=Never` must drop reasoning blocks from assistant
     // messages for non-Anthropic providers, while keeping text (and keeping
     // reasoning entirely for Anthropic-family turns that involve tool calls, or

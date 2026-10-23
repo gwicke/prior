@@ -1218,6 +1218,13 @@ session.
       context + no persistence
 - [x] **3.6 Regression tests** — All 9 existing agent tests pass unchanged
 
+> **Superseded in part (2026):** persistence is now *incremental* — the user
+> prompt is written at dispatch, each completion turn is written by the start of
+> the next call, and only the in-flight response waits for a turn exit. The
+> transcript (`TurnTranscript`) is the single source of truth; `persist_turn`,
+> `normalize_call_ids`, and the `final_history`/`cancelled_history` branches are
+> gone. See `doc/261022_incremental_session_write.md`.
+
 ### Lessons Learned
 
 1. **`prompt()` signature change was clean.** `&mut Vec<Message>` → `&Session`

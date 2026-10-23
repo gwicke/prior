@@ -3,28 +3,28 @@
 //! `prompt` runs one user input through the rig agent and reconciles the
 //! session: it pumps the stream (assistant turns, tool results, reasoning)
 //! into a [`TurnTranscript`], drives the auto-retry/back-off/Esc-cancel loop on
-//! a classifiable provider error, and persists whatever actually completed —
-//! nothing more — before the REPL retries. `run_once` is the one-shot variant
+//! a classifiable provider error, and persists incrementally — each completion
+//! turn reaches disk by the start of the next call, the prompt at dispatch, and
+//! only the in-flight response waits for a turn exit
+//! (doc/261022_incremental_session_write.md). `run_once` is the one-shot variant
 //! for piped/batch input; `summarize` and `summarize_with_session_context` are
 //! the plain and session-scoped summarization requests.
 //!
 //! The turn-pump primitives (`dispatch_in_turn_event`, the back-off sleep) live
-//! in `pumps`; the message shaping (`persist_turn`, `maybe_strip_reasoning`,
-//! the edit-call splits) in `transcript`; error classification in `errors`.
-//! This module is where they come together against a live `CodeAgent`.
+//! in `pumps`; the transcript, its `prepare`/`commit` and the message shaping
+//! (`maybe_strip_reasoning`, the edit-call splits) in `transcript`; error
+//! classification in `errors`. This module is where they come together against
+//! a live `CodeAgent`.
 
 use super::errors::{classify_prompt_error, classify_stream_error};
 use super::pumps::dispatch_in_turn_event;
-use super::transcript::{
-    assistant_message, minimize_edit_tool_calls, normalize_call_ids, EditAnchorLedger,
-    TurnTranscript,
-};
+use super::transcript::{EditAnchorLedger, TurnTranscript};
 use crate::Result;
 use futures::StreamExt;
 use rig_agent::agent::MultiTurnStreamItem;
 use rig_agent::completion::PromptError;
 use rig_agent::streaming::{Item, StreamEvent};
-use rig_core::message::{AssistantContent, Message, Reasoning, Text, UserContent};
+use rig_core::message::Message;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -71,7 +71,7 @@ impl CodeAgent {
     pub async fn prompt(
         &self,
         input: &str,
-        session: Option<&Session>,
+        session: Option<Arc<Session>>,
         turn: &TurnPersistence,
         params: &crate::params::ModelParams,
         in_turn: Option<crate::repl::InTurnInput<'_>>,
@@ -90,10 +90,10 @@ impl CodeAgent {
         // Capture this turn's base frame (session user-prompt count at entry)
         // once, so retries of the same turn keep the same reference point for
         // the persistence de-dup decision. Idempotent.
-        turn.initialize_base(session).await;
+        turn.initialize_base(session.as_deref()).await;
 
         // Build prior context from session, or use empty vec as fallback.
-        let prior: Vec<Message> = match session {
+        let prior: Vec<Message> = match session.as_deref() {
             Some(s) => match session_context_messages(
                 s,
                 self.reasoning_in_context,
@@ -114,6 +114,20 @@ impl CodeAgent {
             },
             None => Vec::new(),
         };
+        // Persist the user prompt at dispatch, after `prior` is read (so it is
+        // not duplicated into context) and before the first request goes out,
+        // so grepping the session finds the prompt the moment it is submitted.
+        // Gated by the existing `TurnPersistence` count check so a retry/steer
+        // that re-sends the same prompt is not duplicated.
+        if let Some(s) = session.as_deref() {
+            let session_user_count = s.count_persisted_user_prompts().await;
+            if turn.this_turn_persisted(session_user_count) < turn.sent() {
+                if let Err(e) = s.append_message(&Message::user(input)).await {
+                    eprintln!("Warning: failed to persist user prompt: {e}");
+                }
+            }
+        }
+
         // The first turn has no reported usage at all (the first completion
         // call is still in flight), so the status line would have no context
         // number for exactly the turn a new session is most likely to be
@@ -176,6 +190,7 @@ impl CodeAgent {
                 provider: self.provider.clone(),
                 model: self.model.clone(),
                 transcript: transcript.clone(),
+                session: session.clone(),
                 edit_anchors: edit_anchors.clone(),
             })
             .max_turns(self.tool_call_limit)
@@ -190,13 +205,12 @@ impl CodeAgent {
             .history(prior)
             .stream();
 
+        // `output` is the returned assistant text (what `prompt()` yields);
+        // the transcript owns everything that reaches disk. `final_history`
+        // and `cancelled_history` are no longer persistence sources — the
+        // transcript is the single source of truth (see
+        // doc/261022_incremental_session_write.md).
         let mut output = String::new();
-        let mut reasoning_buffer = String::new(); // Accumulate reasoning for aborted/errored turns
-        let mut final_history: Option<Vec<Message>> = None;
-        // Captured when the run is cancelled via `<Esc>`; rig's error carries the
-        // in-flight *full* history (prior turns + this turn's user prompt + any
-        // partial assistant text). Persisting it is root cause #2's fix.
-        let mut cancelled_history: Option<Vec<Message>> = None;
         let mut aborted = false;
         // The transient status line (doc/row_accounting.md zone 2) is set before
         // the turn's first content write, because that is where the output
@@ -255,34 +269,43 @@ impl CodeAgent {
                 item = stream.next() => {
                     match item {
 
-                        Some(Ok(MultiTurnStreamItem::StreamAssistantItem(item))) => match item {
-                            // rig 0.45 streams text and reasoning as
-                            // *fragments*; the part's `End` carries the
-                            // finalized block, which the transcript picks up
-                            // from the turn hook, so only fragments are
-                            // painted and accumulated here.
-                            Item::Event(StreamEvent::Text { text, .. }) => {
-                                if let Some(logger) = &self.message_logger {
-                                    logger
-                                        .log_delta("text", &text, logger.current_turn_id())
-                                        .await;
+                        Some(Ok(MultiTurnStreamItem::StreamAssistantItem(item))) => {
+                            // Feed every part event into the live unit: the
+                            // transcript owns the streamed fragments (they
+                            // exist once, in this poll) and the accepted turn
+                            // supersedes them. Painting and the `--log-messages`
+                            // deltas ride the same arm.
+                            if let Item::Event(event) = &item {
+                                if let Ok(mut t) = transcript.lock() {
+                                    t.push_event(event);
                                 }
-                                output.push_str(&text);
-                                self.content.stream_text(&text);
                             }
-                            Item::Event(StreamEvent::Reasoning { text, .. })
-                                if !text.is_empty() =>
-                            {
-                                if let Some(logger) = &self.message_logger {
-                                    logger
-                                        .log_delta("reasoning", &text, logger.current_turn_id())
-                                        .await;
+                            match item {
+                                // rig 0.45 streams text and reasoning as
+                                // *fragments*; the part's `End` carries the
+                                // finalized block.
+                                Item::Event(StreamEvent::Text { text, .. }) => {
+                                    if let Some(logger) = &self.message_logger {
+                                        logger
+                                            .log_delta("text", &text, logger.current_turn_id())
+                                            .await;
+                                    }
+                                    output.push_str(&text);
+                                    self.content.stream_text(&text);
                                 }
-                                reasoning_buffer.push_str(&text); // Accumulate for partial persistence
-                                self.content.stream_thinking(&text);
+                                Item::Event(StreamEvent::Reasoning { text, .. })
+                                    if !text.is_empty() =>
+                                {
+                                    if let Some(logger) = &self.message_logger {
+                                        logger
+                                            .log_delta("reasoning", &text, logger.current_turn_id())
+                                            .await;
+                                    }
+                                    self.content.stream_thinking(&text);
+                                }
+                                _ => {}
                             }
-                            _ => {}
-                        },
+                        }
                         Some(Ok(MultiTurnStreamItem::ToolResult { tool_result })) => {
                             // Tool-result stream items are the canonical
                             // `Message::User` content rig committed to its own
@@ -331,208 +354,58 @@ impl CodeAgent {
                             self.log_pump_event("segment_end").await;
                             self.content.end_response_segment();
                         }
-                        Some(Ok(MultiTurnStreamItem::FinalResponse(resp))) => {
-                            final_history = Some(resp.messages.clone());
+                        Some(Ok(MultiTurnStreamItem::FinalResponse(_resp))) => {
+                            // The final assistant turn is the in-flight response.
+                            // It gets no following completion call, so it is
+                            // persisted by the exit `commit()` below, not here —
+                            // the transcript's accepted turn already holds it.
                         }
                         Some(Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. })) => {}
                         Some(Ok(MultiTurnStreamItem::ModelTurnRetried { .. })) => {}
                         Some(Err(e)) => {
-                            // `<Esc>` (or any hook Stop/Terminate) terminates the rig run
-                            // as a terminal `PromptCancelled` error that carries the
-                            // in-flight full history (`prior + new_messages`). We do NOT
-                            // persist that full history because (a) prior messages are
-                            // already in the session — appending them again duplicates
-                            // them, and (b) `new_messages` may end with an assistant
-                            // message containing `tool_calls` without matching tool
-                            // results (cancellation happened between model response and
-                            // tool execution). Persisting such an incomplete turn would
-                            // make the next LLM call fail with "assistant message with
-                            // 'tool_calls' must be followed by tool messages".
-                            //
-                            // Instead, persist the user prompt and any partial
-                            // assistant content (text + reasoning) that was streamed
-                            // before the cancellation. Tool calls are not accumulated
-                            // in `output` (they arrive as separate stream events), so
-                            // the partial assistant message is safe for the next turn's
-                            // context. When reasoning is enabled, include it so the
-                            // model can resume its train of thought on a steering
-                            // message (controlled by `reasoning_in_context` mode).
+                            // Every exit persists through one path: the
+                            // transcript delta (completed turns) plus an `Ended`
+                            // synthesis of any unanswered call. rig's error may
+                            // carry the in-flight full history, but prior does
+                            // not use it — the transcript is the single source
+                            // of truth, and it never yields a dangling call.
                             if let PromptError::Cancelled { .. } = &e {
-                                    // Cancelled mid-run (Esc or a hook Stop).
-                                    // Persist the user prompt plus whatever
-                                    // completed: the finalized transcript
-                                    // (accepted turns + completed tool batches
-                                    // + synthesized answers for interrupted
-                                    // calls), or the streamed content when no
-                                    // turn completed yet. The leading
-                                    // `user(input)` is included only if this
-                                    // turn's fresh dispatch isn't already in
-                                    // the session (count vs. `turn.sent()`); a
-                                    // resend whose prompt is already persisted
-                                    // is skipped so we never duplicate it.
-                                    let mut partial: Vec<Message> = Vec::new();
-                                    let session_has_prompt = match session {
-                                        Some(s) => {
-                                            let c = s.count_persisted_user_prompts().await;
-                                            turn.this_turn_persisted(c) >= turn.sent()
-                                        }
-                                        None => false,
-                                    };
-                                    if !session_has_prompt {
-                                        partial.push(Message::user(input));
-                                    }
-                                    {
-                                        let mut t = transcript
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                        let has_progress = t.has_progress();
-                                        if has_progress {
-                                            partial.extend(t.finalize());
-                                        }
-                                        // Always include current turn's partial content (text + reasoning)
-                                        // even when there was prior progress. This captures reasoning
-                                        // from the current incomplete turn (e.g., after a tool call).
-                                        if !output.is_empty() || !reasoning_buffer.is_empty() {
-                                            let mut content = Vec::new();
-                                            if !output.is_empty() {
-                                                content.push(AssistantContent::Text(Text::new(std::mem::take(&mut output))));
-                                            }
-                                            if !reasoning_buffer.is_empty() {
-                                                let reasoning_text = std::mem::take(&mut reasoning_buffer);
-                                                content.push(AssistantContent::Reasoning(Reasoning::new(&reasoning_text)));
-                                            }
-                                            // No response id marks an aborted turn.
-                                            partial.push(assistant_message(None, content));
-                                        }
-                                    }
-                                    cancelled_history = Some(partial);
-                                    aborted = true;
-                                    break;
-                                }
-                            // Phase 2a: preserve user prompt on non-cancellation
-                            // errors. Commit the partial turn so the next prompt or
-                            // steering message sees the user's input and any partial
-                            // assistant text, rather than having it silently dropped.
-                            // See doc/pi_steering_rig.md §6.5.3.
-                            //
-                            // EXCEPTION (auto-retryable errors): when the classified
-                            // error is one the REPL will auto-retry (429, transport,
-                            // upstream 5xx, stream protocol, malformed tool call),
-                            // the SAME logical turn is re-attempted — the retry calls
-                            // `prompt()` again with the same input, and rig re-sends
-                            // the full context history for the turn (the same way it
-                            // does for a tool-result continuation). Naively
-                            // pre-persisting `user(input)` here would therefore
-                            // duplicate the user's message in the session on every
-                            // retry.
-                            //
-                            // De-dup strategy: the per-turn `TurnPersistence`
-                            // record is the single source of truth for "was
-                            // `user(input)` already written to the session
-                            // within THIS turn, and with what text?" The REPL
-                            // resets it (`TurnPersistence::new()`) at the start
-                            // of every user prompt and reuses it across
-                            // retries. The first failure of a turn persists
-                            // `user(input)` and records the text; later
-                            // failures that repeat the SAME text (and the
-                            // cancel branch) skip. A retry that switches to a
-                            // DIFFERENT prompt text (the steering message)
-                            // persists that new text too. On success, `prompt()`
-                            // drops the leading `user(input)` from
-                            // `final_history` when the recorded text matches.
-                            //
-                            // This is strictly SAFER than deduping by comparing
-                            // against the session's last user message: two
-                            // successive turns with an IDENTICAL input (e.g.
-                            // the user types "continue" twice) must NOT
-                            // collide. A session-level comparison cannot tell
-                            // "same turn, retry" from "different turn, same
-                            // text", and would wrongly suppress the second
-                            // turn's user prompt. The in-memory record is
-                            // reset per turn, so it never conflates them.
-                            //
-                            //   * retryable-no-progress (the lost-context bug):
-                            //     `user(input)` is persisted on the FIRST failure,
-                            //     so a give-up after 50 retries still leaves the
-                            //     turn visible in the session.
-                            //   * retryable-with-progress: same — `user(input)` is
-                            //     persisted if not already there.
-                            //   * non-retryable: same as the original Phase 2a.
-                            //   * retry-then-success: the success branch drops the
-                            //     duplicate leading `user(input)` from
-                            //     `final_history`.
+                                // Cancelled mid-run (Esc or a hook Stop): the
+                                // turn is aborted. Persistence is uniform — the
+                                // exit `commit()` below writes the transcript
+                                // delta plus an `Ended` synthesis of any
+                                // unanswered calls. `has_content` (checked after
+                                // the loop) drives the back-off reset.
+                                aborted = true;
+                                break;
+                            }
+                            // A non-cancellation error (provider mid-stream,
+                            // tool-dispatch failure): persist the completed
+                            // transcript delta plus an `Ended` synthesis, so the
+                            // turn so far is never lost, then classify and
+                            // return. A retryable error with no progress is a
+                            // blind retry: the prompt was already persisted at
+                            // dispatch, so nothing else is written.
                             let classified = classify_stream_error(&e);
                             let retryable = classified.is_auto_retryable();
-                            // Finalize what completed (accepted turns + tool
-                            // batches; never truncates). `has_accepted` is
-                            // computed independently of the session: it drives
-                            // the consecutive-failure back-off reset in the
-                            // REPL, so a mid-turn failure *after* progress is
-                            // not treated as a "consecutive failure" even when
-                            // there is no session to persist to.
-                            let (transcript_msgs, has_accepted) = {
-                                let mut t = transcript
+                            let made_progress = {
+                                let t = transcript
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                let has_accepted = t.has_progress();
-                                let msgs = if has_accepted { t.finalize() } else { Vec::new() };
-                                (msgs, has_accepted)
+                                t.has_content()
                             };
-                            let made_progress = has_accepted || !output.is_empty();
-                            // Persist completed work into the session when one
-                            // exists. Non-retryable errors always persist (so
-                            // the user's turn is never lost on give-up);
-                            // retryable errors persist only when progress
-                            // exists, to avoid duplicating the user's input on
-                            // a blind retry.
-                            if let Some(s) = session {
-                                // Persist-decision (session is the source of
-                                // truth): `this_turn_persisted` is how many of
-                                // this turn's *new* dispatches are recorded in
-                                // the session (current count minus the base
-                                // frame captured at turn start). If it is
-                                // LOWER than `turn.sent()`, the fresh dispatch
-                                // for this turn is not yet persisted (first
-                                // failure, or a steering dispatch whose prompt
-                                // hasn't landed) — persist `user(input)` now.
-                                // If it is already EQUAL, the prompt is
-                                // persisted (this is a resend of a prior
-                                // attempt) — skip.
-                                let session_user_count =
-                                    s.count_persisted_user_prompts().await;
-                                let should_persist_input =
-                                    turn.this_turn_persisted(session_user_count)
-                                        < turn.sent();
-                                let should_persist_progress =
-                                    !retryable || has_accepted || !output.is_empty();
-                                if should_persist_input {
-                                    let _ = s.append_message(&Message::user(input)).await;
-                                }
-                                if should_persist_progress {
-                                    if has_accepted {
-                                        let anchors = edit_anchors
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .clone();
-                                        let transcript_msgs =
-                                            minimize_edit_tool_calls(transcript_msgs, &anchors);
-                                        for m in &transcript_msgs {
-                                            let _ = s.append_message(m).await;
-                                        }
-                                    } else if !output.is_empty() || !reasoning_buffer.is_empty() {
-                                        let mut content = Vec::new();
-                                        if !output.is_empty() {
-                                            content.push(AssistantContent::Text(Text::new(std::mem::take(&mut output))));
-                                        }
-                                        if !reasoning_buffer.is_empty() {
-                                            let reasoning_text = std::mem::take(&mut reasoning_buffer);
-                                            content.push(AssistantContent::Reasoning(Reasoning::new(&reasoning_text)));
-                                        }
-                                        let _ = s
-                                            .append_message(&assistant_message(None, content))
-                                            .await;
-                                    }
-                                }
+                            if !retryable || made_progress {
+                                let anchors = edit_anchors
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .clone();
+                                let _ = crate::agent::transcript::commit(
+                                    &transcript,
+                                    session.as_deref(),
+                                    &anchors,
+                                    crate::agent::transcript::RunState::Ended,
+                                )
+                                .await;
                             }
                             self.log_pump_event("response_end").await;
                             self.content.end_response();
@@ -557,40 +430,13 @@ impl CodeAgent {
                 }
                 _ = self.cancel_notify.notified() => {
                     if self.user_cancel.load(Ordering::SeqCst) {
-                        // User pressed `<Esc>` — stop rendering and return control
-                        // to the REPL immediately. The stream is dropped, which
-                        // closes the HTTP connection; any running tool was already
-                        // killed by the watchdog (Phase 1a-d tool-cancel channel).
-                        //
-                        // Capture partial turn for persistence: user prompt +
-                        // finalized transcript (or streamed text + reasoning when no
-                        // turn completed).
-                        let mut partial = vec![Message::user(input)];
-                        {
-                            let mut t = transcript
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let has_progress = t.has_progress();
-                            if has_progress {
-                                partial.extend(t.finalize());
-                            }
-                            // Always include current turn's partial content (text + reasoning)
-                            // even when there was prior progress. This captures reasoning
-                            // from the current incomplete turn (e.g., after a tool call).
-                            if !output.is_empty() || !reasoning_buffer.is_empty() {
-                                let mut content = Vec::new();
-                                if !output.is_empty() {
-                                    content.push(AssistantContent::Text(Text::new(std::mem::take(&mut output))));
-                                }
-                                if !reasoning_buffer.is_empty() {
-                                    let reasoning_text = std::mem::take(&mut reasoning_buffer);
-                                    content.push(AssistantContent::Reasoning(Reasoning::new(&reasoning_text)));
-                                }
-                                // No response id marks an aborted turn.
-                                partial.push(assistant_message(None, content));
-                            }
-                        }
-                        cancelled_history = Some(partial);
+                        // User pressed `<Esc>` — stop rendering and return
+                        // control to the REPL immediately. The stream is
+                        // dropped, closing the HTTP connection; any running
+                        // tool was already killed by the watchdog. Persistence
+                        // is the uniform exit path: the prompt is already on
+                        // disk (dispatch), and the exit `commit()` below writes
+                        // the transcript delta plus an `Ended` synthesis.
                         aborted = true;
                         break;
                     }
@@ -676,50 +522,22 @@ impl CodeAgent {
         self.log_pump_event("response_end").await;
         self.content.end_response();
 
-        // Persist the turn into the session (or fallback to no persistence).
-        if let Some(s) = session {
-            // Store pre-strip messages (strip is applied to LLM context above,
-            // not at storage time — see doc/session_storage.md §4).
-            if let Some(fh) = final_history {
-                let mut to_commit = normalize_call_ids(fh);
-                let anchors = edit_anchors
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                to_commit = minimize_edit_tool_calls(to_commit, &anchors);
-                // De-dup against the session (persistence source of truth).
-                // When the session already holds this turn's fresh dispatch
-                // prompt (`session_user_count >= turn.sent()`, e.g. a prior
-                // failed attempt pre-persisted it), `final_history[0]` is a
-                // re-sent duplicate of that same prompt — drop it so the user
-                // prompt appears exactly once. When the session count is
-                // LOWER (the fresh dispatch's prompt isn't persisted yet — a
-                // genuinely new user message/stear directive), keep
-                // `final_history[0]` so it is committed.
-                let session_user_count = s.count_persisted_user_prompts().await;
-                if turn.this_turn_persisted(session_user_count) >= turn.sent() {
-                    // Only drop when the leading message is this turn's user
-                    // prompt (a plain text User message), never a tool-result
-                    // batch or an assistant message.
-                    if matches!(to_commit.first(), Some(Message::User { content }) if content.iter().any(|c| matches!(c, UserContent::Text(_))))
-                    {
-                        to_commit.remove(0);
-                    }
-                }
-                for msg in to_commit {
-                    let _ = s.append_message(&msg).await;
-                }
-            } else if let Some(ch) = cancelled_history {
-                let mut to_commit = normalize_call_ids(ch);
-                let anchors = edit_anchors
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                to_commit = minimize_edit_tool_calls(to_commit, &anchors);
-                for msg in to_commit {
-                    let _ = s.append_message(&msg).await;
-                }
-            }
+        // The uniform exit persistence: write the transcript's remaining
+        // delta (the final assistant turn, or whatever completed before an
+        // abort) plus an `Ended` synthesis of any unanswered call. The prompt
+        // is already on disk (dispatch). Failure is logged inside `commit`.
+        {
+            let anchors = edit_anchors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let _ = crate::agent::transcript::commit(
+                &transcript,
+                session.as_deref(),
+                &anchors,
+                crate::agent::transcript::RunState::Ended,
+            )
+            .await;
         }
 
         if aborted {

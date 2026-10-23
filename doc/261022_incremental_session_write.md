@@ -1,6 +1,6 @@
 # Incremental session writes — persist each completion turn, not just the whole turn
 
-Status: design, pre-impl.
+Status: implemented.
 
 Decisions confirmed:
 
