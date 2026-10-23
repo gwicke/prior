@@ -516,8 +516,15 @@ pub fn paint_row(content: &str, style: RowStyle, tw: usize) -> String {
         ),
     };
     let content_w = tw.saturating_sub(marker.len()).max(1);
-    let mut out: Vec<String> = Vec::new();
-    for (i, piece) in split_to_width(content, content_w).iter().enumerate() {
+    // One buffer for the whole block: each visual row is appended in place
+    // (style, lead, piece, padding, reset) instead of being formatted, collected
+    // and joined.
+    let pieces = split_to_width(content, content_w);
+    let mut out = String::with_capacity(content.len() + pieces.len() * (tw / 2 + 16));
+    for (i, piece) in pieces.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
         // A marker-less (detail) row carries no lead at all — nothing to line
         // up under — so it is neither marked nor indented.
         let lead = if marker.is_empty() {
@@ -527,14 +534,21 @@ pub fn paint_row(content: &str, style: RowStyle, tw: usize) -> String {
         } else {
             "  "
         };
-        let text = format!("{}{}", lead, piece);
-        // OSC-aware: the splitter already measured `piece` with the same
-        // rules (escape_end), so the pad adds up to exactly `tw` columns for
-        // hyperlink-bearing content too.
-        let pad = tw.saturating_sub(display_width_ansi(&text));
-        out.push(format!("{bg}{fg}{text}{}\x1b[0m", " ".repeat(pad)));
+        out.push_str(bg);
+        out.push_str(fg);
+        out.push_str(lead);
+        out.push_str(piece);
+        // OSC-aware: the splitter already measured `piece` with the same rules
+        // (escape_end), and the lead is plain ASCII (one column per byte), so
+        // the pad adds up to exactly `tw` columns for hyperlink-bearing content
+        // too. `display_width_ansi` is the leaner measure for one isolated
+        // slice — `width_of`'s classification pays off across whole lines, not
+        // here.
+        let pad = tw.saturating_sub(display_width_ansi(piece) + lead.len());
+        out.extend(std::iter::repeat_n(' ', pad));
+        out.push_str("\x1b[0m");
     }
-    out.join("\n")
+    out
 }
 
 /// Visual rows a `LogicalLine` occupies *as the engine wrote it*: its
@@ -671,10 +685,13 @@ fn paint_section(
     let mut heights = Vec::with_capacity(lines.len());
     for (i, line) in lines.iter().enumerate() {
         let block = paint_row(&line.0, style(i), tw);
-        heights.push(block.split('\n').count());
+        // One split for both the height and the rows: the count is the number
+        // of pieces this loop already pushes.
+        let before = rows.len();
         for r in block.split('\n') {
             rows.push(r.to_string());
         }
+        heights.push(rows.len() - before);
     }
     PaintedSection { rows, heights }
 }

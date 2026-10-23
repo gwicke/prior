@@ -12,8 +12,18 @@
 //! Extracted from `output.rs`.
 
 use std::io;
+use std::ops::Range;
 
 use unicode_width::UnicodeWidthChar;
+
+/// Printable ASCII: one column per byte, and no decoding or width-table
+/// lookup needed. `unicode_width`'s `single_char_width` answers exactly
+/// `Some(1)` over this range and `None` (zero) outside it, so a run of these
+/// bytes measures as its own length.
+#[inline]
+pub(crate) const fn is_printable_ascii(b: u8) -> bool {
+    b >= 0x20 && b < 0x7f
+}
 
 /// A finished block with its trailing blank lines stripped, so what is emitted
 /// ends at a line boundary with **no** blank row.
@@ -238,7 +248,7 @@ impl<W: io::Write + ?Sized> io::Write for LineClear<'_, W> {
                 out.extend_from_slice(b"\x1b[K");
                 self.pending = false;
             }
-            let take = match rest.iter().position(|&b| b == b'\n') {
+            let take = match memchr::memchr(b'\n', rest) {
                 Some(i) => i + 1, // include the newline itself
                 None => rest.len(),
             };
@@ -502,18 +512,130 @@ pub fn display_width_ansi(s: &str) -> usize {
     let mut width = 0;
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == 0x1b {
+        let b = bytes[i];
+        if b == 0x1b {
             i = escape_end(bytes, i);
+            continue;
+        }
+        if is_printable_ascii(b) {
+            // Printable ASCII is one column per byte: take the whole run
+            // without decoding or consulting the width table.
+            let from = i;
+            while i < bytes.len() && is_printable_ascii(bytes[i]) {
+                i += 1;
+            }
+            width += i - from;
             continue;
         }
         // Multi-byte UTF-8: decode one char so a wide glyph counts as one
         // character with width 2, not two characters of width 1.
-        let rest = &s[i..];
-        let ch = rest.chars().next().unwrap_or('\0');
+        let ch = s[i..].chars().next().unwrap_or('\0');
         i += ch.len_utf8();
         width += UnicodeWidthChar::width(ch).unwrap_or(0);
     }
     width
+}
+
+/// One line found by [`scan_line`]: its byte range, where the next one starts,
+/// and the width the same walk measured.
+pub struct LineScan {
+    /// The line's bytes, `\n` terminator excluded.
+    pub line: Range<usize>,
+    /// Offset just past the line — the next line's start, or the text's end.
+    pub next: usize,
+    /// The line's display width, measured exactly as [`display_width_ansi`]
+    /// measures a single-line slice.
+    pub width: usize,
+}
+
+/// Find and measure one `\n`-terminated line of `text` in a **single** pass
+/// from `start`: the walk that discovers the terminator is the walk that
+/// measures the width, so a caller that only needs "does this line fit?" never
+/// traverses the bytes twice.
+///
+/// Escape sequences are skipped by [`escape_end_line`], which is bounded by the
+/// line — a sequence left unterminated at the line's end is truncated there, so
+/// a CSI cannot swallow the following line. `\n` itself is zero width.
+pub fn scan_line(text: &str, start: usize) -> LineScan {
+    let bytes = text.as_bytes();
+    let mut i = start;
+    let mut width = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' {
+            return LineScan {
+                line: start..i,
+                next: i + 1,
+                width,
+            };
+        }
+        if b == 0x1b {
+            i = escape_end_line(bytes, i);
+            continue;
+        }
+        if is_printable_ascii(b) {
+            let from = i;
+            while i < bytes.len() && is_printable_ascii(bytes[i]) {
+                i += 1;
+            }
+            width += i - from;
+            continue;
+        }
+        // Multi-byte UTF-8 (or a control byte, which measures zero).
+        let ch = text[i..].chars().next().unwrap_or('\0');
+        i += ch.len_utf8();
+        width += UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    LineScan {
+        line: start..bytes.len(),
+        next: bytes.len(),
+        width,
+    }
+}
+
+/// [`escape_end`] bounded by the line: the terminator search stops at the `\n`
+/// that ends it, so an unterminated sequence is truncated *at the line end*
+/// (exactly as it would be if the line were measured as its own slice) and
+/// never consumes the next line's bytes.
+pub(crate) fn escape_end_line(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    if i < bytes.len() && bytes[i] == b'[' {
+        // CSI: parameters/intermediates, then one final byte in 0x40..=0x7e.
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'\n' && !(0x40..=0x7e).contains(&bytes[i]) {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'\n' {
+            return i; // truncated at the line end
+        }
+        return (i + 1).min(bytes.len());
+    }
+    if i < bytes.len() && bytes[i] == b']' {
+        // OSC: terminated by BEL, or by ST (the two bytes ESC \).
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != 0x07 && bytes[i] != 0x1b {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'\n' {
+            return i;
+        }
+        if i < bytes.len() && bytes[i] == 0x1b {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                return i + 1; // a truncated ST ends with the line
+            }
+            return (i + 2).min(bytes.len());
+        }
+        return (i + 1).min(bytes.len());
+    }
+    // Any other two-character escape (ESC + a final byte): zero width.
+    if start + 1 < bytes.len()
+        && bytes[start + 1] != b'\n'
+        && (0x20..=0x7e).contains(&bytes[start + 1])
+    {
+        return start + 2;
+    }
+    // Truncated at the line end: the ESC alone, holding no column.
+    start + 1
 }
 
 /// Index just past the escape sequence starting at `start` (which must be an
@@ -570,25 +692,40 @@ pub fn wrap_to_width(text: &str, width: usize) -> String {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
+    let mut at = 0usize;
+    let mut first = true;
+    loop {
+        if !first {
             out.push('\n');
         }
-        let mut rest = line;
-        while display_width_ansi(rest) > width {
-            let (head, tail) = split_at_width(rest, width);
-            out.push_str(head);
-            if tail.is_empty() {
-                // The head swallowed the remainder — a glyph wider than the
-                // budget. The line ends here; a break after it would invent
-                // an empty row the terminal never shows.
-                rest = "";
-                break;
+        first = false;
+        // One walk finds the line and measures it: a fitting line (the common
+        // case) is emitted with no second measurement.
+        let scan = scan_line(text, at);
+        let terminated = scan.next > scan.line.end;
+        if scan.width <= width {
+            out.push_str(&text[scan.line]);
+        } else {
+            let mut rest = &text[scan.line];
+            while display_width_ansi(rest) > width {
+                let (head, tail) = split_at_width(rest, width);
+                out.push_str(head);
+                if tail.is_empty() {
+                    // The head swallowed the remainder — a glyph wider than the
+                    // budget. The line ends here; a break after it would invent
+                    // an empty row the terminal never shows.
+                    rest = "";
+                    break;
+                }
+                out.push('\n');
+                rest = tail;
             }
-            out.push('\n');
-            rest = tail;
+            out.push_str(rest);
         }
-        out.push_str(rest);
+        if !terminated {
+            break;
+        }
+        at = scan.next;
     }
     out
 }
@@ -659,6 +796,43 @@ mod tests {
             "green link caf\u{e9}\n",
             "visible bytes and multi-byte chars survive; escapes do not"
         );
+    }
+
+    /// `scan_line` measures each line exactly as `display_width_ansi` measures
+    /// the same slice — the contract every fused caller relies on. The styled
+    /// rows that dominate content are the case it is fast for.
+    #[test]
+    fn scan_line_agrees_with_display_width_ansi() {
+        let text = "plain\n\x1b[1;36mhighlighted words\x1b[0m here\n日本語 and ascii\n";
+        let mut at = 0;
+        let mut lines = 0;
+        while at < text.len() {
+            let scan = scan_line(text, at);
+            assert_eq!(
+                scan.width,
+                display_width_ansi(&text[scan.line.clone()]),
+                "line {:?}",
+                &text[scan.line.clone()]
+            );
+            at = scan.next;
+            lines += 1;
+        }
+        assert_eq!(lines, 3, "the trailing terminator adds no line");
+    }
+
+    /// The escape skip is bounded by the line: a sequence left unterminated at
+    /// the `\n` is truncated *there*, so it can never swallow the next line's
+    /// text or its width — which is what measuring a line as its own slice does.
+    #[test]
+    fn scan_line_does_not_let_a_truncated_escape_eat_the_next_line() {
+        // A CSI with no final byte before the newline.
+        let text = "a\x1b[1\nbcd";
+        let first = scan_line(text, 0);
+        assert_eq!(&text[first.line.clone()], "a\x1b[1");
+        assert_eq!(first.width, 1, "the truncated sequence holds no column");
+        let second = scan_line(text, first.next);
+        assert_eq!(&text[second.line.clone()], "bcd");
+        assert_eq!(second.width, 3, "the next line is measured whole");
     }
 
     /// The width guard's own edges: escape bytes never count as cells, and a

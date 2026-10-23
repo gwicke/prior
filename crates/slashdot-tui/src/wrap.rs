@@ -40,7 +40,7 @@ use std::ops::Range;
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::ansi::{display_width_ansi, escape_end};
+use crate::ansi::{display_width_ansi, escape_end, escape_end_line, is_printable_ascii};
 
 /// Spaces a tab is normalized to. Fixed rather than tab-stop-aligned: a tab
 /// stop depends on the column it renders at, and wrapping changes that
@@ -54,56 +54,117 @@ enum Class {
     /// chars. Width equals byte length — no decoding needed.
     Ascii(usize),
     /// No control characters needing replacement (but has escapes and/or
-    /// multi-byte chars). Measure with [`display_width_ansi`].
-    Plain,
+    /// multi-byte chars). The carried width is `Some` when every byte is
+    /// printable ASCII or escape payload — the width [`classify_line`] already
+    /// counted — and `None` when multi-byte chars need [`display_width_ansi`].
+    Plain(Option<usize>),
     /// Contains a tab or another control character outside an escape
     /// sequence: must be normalized before measurement.
     Dirty,
 }
 
-/// Single byte pass answering "does this line need attention, and how wide
-/// is it if it doesn't?". Escape sequences are skipped whole (their payload
-/// is not classified — control bytes inside an OSC belong to the sequence).
+/// One line as the classification walk saw it: where it ends and what it is.
+struct LineClass {
+    /// The line's bytes, `\n` terminator excluded.
+    line: Range<usize>,
+    /// Offset just past the line — the next line's start, or the text's end.
+    next: usize,
+    class: Class,
+}
+
+/// Single byte pass over the line starting at `start`: **finds** the line's end
+/// and classifies it in the same walk, so a caller that needs both never
+/// traverses the bytes twice.
 ///
-/// `Class::Ascii` carries the *width* of the line: its printable-ASCII byte
-/// count, which equals its display width (each such byte is one column).
-/// `\n` separators are excluded — they render as nothing.
-fn classify(line: &str) -> Class {
-    let bytes = line.as_bytes();
-    let mut i = 0;
+/// Escape sequences are skipped whole (their payload is not classified —
+/// control bytes inside an OSC belong to the sequence), and the skip is bounded
+/// by the line: an unterminated sequence ends at the `\n` rather than eating
+/// the next line. `\n` separators render as nothing.
+fn classify_line(text: &str, start: usize) -> LineClass {
+    let bytes = text.as_bytes();
+    let mut i = start;
     let mut len = 0;
     let mut has_esc = false;
     let mut non_ascii = false;
-    while i < bytes.len() {
+    let class = loop {
+        if i >= bytes.len() {
+            break finish(len, has_esc, non_ascii);
+        }
         let b = bytes[i];
-        if b < 0x80 {
-            if b == 0x1b {
-                has_esc = true;
-                i = escape_end(bytes, i);
-                continue;
+        if b == b'\n' {
+            break finish(len, has_esc, non_ascii);
+        }
+        if is_printable_ascii(b) {
+            // A run of printable ASCII: one column per byte, no per-byte work.
+            let from = i;
+            while i < bytes.len() && is_printable_ascii(bytes[i]) {
+                i += 1;
             }
-            if b == b'\n' {
-                i += 1; // line separator — zero width, untouched by normalization
-                continue;
-            }
-            if b < 0x20 || b == 0x7f {
-                return Class::Dirty; // tab, CR, BEL, BS, ...
-            }
-            i += 1; // printable ASCII
-            len += 1;
+            len += i - from;
+        } else if b == 0x1b {
+            has_esc = true;
+            i = escape_end_line(bytes, i);
+        } else if b < 0x20 || b == 0x7f {
+            // tab, CR, BEL, BS, ...: the line is dirty, so stop classifying —
+            // but its *range* still has to be found, and the rest of a dirty
+            // line is the rare case a SIMD `memchr` is for.
+            i = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |n| i + n);
+            break Class::Dirty;
         } else {
             // C1 controls encode as U+0080..=U+009F: 0xc2 0x80..=0x9f.
             if b == 0xc2 && i + 1 < bytes.len() && (0x80..=0x9f).contains(&bytes[i + 1]) {
-                return Class::Dirty;
+                i = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |n| i + n);
+                break Class::Dirty;
             }
             non_ascii = true;
             i += 1; // continuation bytes are all >= 0x80; byte-wise is safe
         }
+    };
+    let terminated = i < bytes.len();
+    LineClass {
+        line: start..i,
+        next: if terminated { i + 1 } else { i },
+        class,
     }
+}
+
+/// `Class::Ascii` carries the *width* of the line: its printable-ASCII byte
+/// count, which equals its display width (each such byte is one column). An
+/// escape-only line is `Plain` with the same number, since escapes hold no
+/// width — so a styled row is measured by the scan that classified it.
+fn finish(len: usize, has_esc: bool, non_ascii: bool) -> Class {
     if has_esc || non_ascii {
-        Class::Plain
+        Class::Plain(if non_ascii { None } else { Some(len) })
     } else {
         Class::Ascii(len)
+    }
+}
+
+/// Whole-text classification — the fold of [`classify_line`] over every line.
+/// `\n` separators are excluded (they render as nothing), and one dirty line
+/// makes the whole text dirty.
+fn classify(text: &str) -> Class {
+    let mut at = 0;
+    let mut total = 0;
+    let mut has_esc = false;
+    let mut non_ascii = false;
+    loop {
+        let scan = classify_line(text, at);
+        match scan.class {
+            Class::Dirty => return Class::Dirty,
+            Class::Ascii(w) => total += w,
+            Class::Plain(w) => {
+                has_esc = true;
+                match w {
+                    Some(w) => total += w,
+                    None => non_ascii = true,
+                }
+            }
+        }
+        if scan.next >= text.len() {
+            return finish(total, has_esc, non_ascii);
+        }
+        at = scan.next;
     }
 }
 
@@ -207,7 +268,10 @@ pub fn char_widths(text: &str) -> Vec<usize> {
 pub fn width_of(s: &str) -> usize {
     match classify(s) {
         Class::Ascii(len) => len,
-        Class::Plain => display_width_ansi(s),
+        // The scan already measured it when the line is ASCII plus escapes —
+        // the common shape of a styled row — so no second pass.
+        Class::Plain(Some(w)) => w,
+        Class::Plain(None) => display_width_ansi(s),
         Class::Dirty => display_width_ansi(&normalize_dirty(s)),
     }
 }
@@ -277,47 +341,59 @@ fn render<'a>(text: &'a str, atoms: &[Atom]) -> &'a str {
     }
 }
 
-/// Cut `rest` into (head, head-tail) at `width` display columns. Escapes
-/// immediately preceding the overflowing char ride to the next line with it
-/// (matching [`atoms`]: a cut never splits an escape run from its char).
-/// Never returns an empty head for non-empty input.
-fn cut_at(rest: &str, width: usize) -> (&str, &str) {
-    let bytes = rest.as_bytes();
-    let mut i = 0;
+/// One cut of an over-wide line: the piece's byte range and how far the walk
+/// got — so the next cut **resumes** instead of re-measuring the remainder.
+/// Escapes immediately preceding the overflowing char ride to the next line
+/// with it (matching [`atoms`]: a cut never splits an escape run from its
+/// char). Never returns an empty piece for non-empty input.
+fn cut_once(bytes: &[u8], start: usize, width: usize) -> Range<usize> {
+    let mut i = start;
     let mut used = 0;
     let mut run: Option<usize> = None; // start of the current escape run
     while i < bytes.len() {
         if bytes[i] == 0x1b {
             run.get_or_insert(i);
-            i = escape_end_at(rest, i);
+            i = escape_end(bytes, i);
             continue;
         }
-        let ch = rest[i..].chars().next().unwrap_or('\u{fffd}');
-        let cw = char_width(ch);
-        if used + cw > width && used > 0 {
-            let at = run.unwrap_or(i);
-            return (&rest[..at], &rest[at..]);
+        let ch = char_width_of(bytes, i);
+        if used + ch.1 > width && used > 0 {
+            return start..run.unwrap_or(i);
         }
-        used += cw;
-        i += ch.len_utf8();
+        used += ch.1;
+        i += ch.0;
         run = None;
     }
-    (rest, "")
+    start..bytes.len()
+}
+
+/// The char at `i` and its width, without slicing the `str` — the walk in
+/// [`cut_once`] only ever needs the two.
+fn char_width_of(bytes: &[u8], i: usize) -> (usize, usize) {
+    let len = crate::ansi::utf8_len(bytes[i]);
+    let w = std::str::from_utf8(&bytes[i..(i + len).min(bytes.len())])
+        .ok()
+        .and_then(|s| s.chars().next())
+        .map(char_width)
+        .unwrap_or(0);
+    (len, w)
 }
 
 /// Whole-line pieces of `line` at `width` columns — the cold path, reached
-/// only after the caller's cheap check says the line overflows.
+/// only after the caller's cheap check says the line overflows. Each cut
+/// resumes where the last one stopped: the line is walked once, not once per
+/// piece.
 fn split_pieces(line: &str, width: usize) -> Vec<&str> {
     let mut out = Vec::new();
-    let mut rest = line;
-    while !rest.is_empty() {
-        let (head, tail) = cut_at(rest, width);
-        if head.is_empty() {
-            out.push(rest);
-            break;
-        }
-        out.push(head);
-        rest = tail;
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        let range = cut_once(bytes, at, width);
+        out.push(&line[range.clone()]);
+        at = range.end;
+    }
+    if out.is_empty() {
+        out.push(line);
     }
     out
 }
@@ -468,21 +544,28 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 pub fn split_to_width(text: &str, width: usize) -> Vec<Cow<'_, str>> {
     let width = width.max(1);
     let mut out: Vec<Cow<'_, str>> = Vec::new();
-    for logical in text.split('\n') {
-        match classify(logical) {
+    let mut at = 0;
+    loop {
+        // One walk per line: it finds the line's end *and* classifies it (and
+        // measures it when the line is ASCII plus escapes), so a fitting line
+        // costs a single traversal and no second pass.
+        let scan = classify_line(text, at);
+        let terminated = scan.next > scan.line.end;
+        let logical = &text[scan.line.clone()];
+        match scan.class {
             // Pure printable ASCII: width is byte length. Fits → one borrow;
             // overflows → cut at byte offsets, no decoding at all.
             Class::Ascii(len) => {
                 if len <= width {
                     out.push(Cow::Borrowed(logical));
-                    continue;
-                }
-                let bytes = logical.as_bytes();
-                let mut i = 0;
-                while i < bytes.len() {
-                    let end = (i + width).min(bytes.len());
-                    out.push(Cow::Borrowed(&logical[i..end]));
-                    i = end;
+                } else {
+                    let bytes = logical.as_bytes();
+                    let mut i = 0;
+                    while i < bytes.len() {
+                        let end = (i + width).min(bytes.len());
+                        out.push(Cow::Borrowed(&logical[i..end]));
+                        i = end;
+                    }
                 }
             }
             // Has tabs / control chars: replace first (rare), split the
@@ -493,18 +576,29 @@ pub fn split_to_width(text: &str, width: usize) -> Vec<Cow<'_, str>> {
                     out.push(Cow::Owned(piece.to_string()));
                 }
             }
-            // Escapes and/or multi-byte chars: one ANSI-aware measure, and
-            // only if that overflows does the line get cut.
-            Class::Plain => {
-                if display_width_ansi(logical) <= width {
+            // Escapes and/or multi-byte chars: the classification scan already
+            // measured an ASCII-plus-escape line, so the fit check is free; only
+            // a real multi-byte line is measured again, and only an overflowing
+            // line is ever cut.
+            Class::Plain(known) => {
+                let w = known.unwrap_or_else(|| display_width_ansi(logical));
+                if w <= width {
                     out.push(Cow::Borrowed(logical));
-                    continue;
-                }
-                for piece in split_pieces(logical, width) {
-                    out.push(Cow::Borrowed(piece));
+                } else {
+                    for piece in split_pieces(logical, width) {
+                        out.push(Cow::Borrowed(piece));
+                    }
                 }
             }
         }
+        // A `\n`-terminated line has a successor: the next line, even if it is
+        // the empty one a trailing terminator implies (the `split('\n')` shape
+        // callers rely on — blank lines are preserved). Only the unterminated
+        // last line ends the walk.
+        if !terminated {
+            break;
+        }
+        at = scan.next;
     }
     out
 }
@@ -556,6 +650,16 @@ mod tests {
         assert_eq!(split_to_width("a\n\nb", 10), vec!["a", "", "b"]);
     }
 
+    /// `split('\n')` bounds N+1 lines for N separators: a trailing newline
+    /// therefore implies a final empty line, and the fused walk must reproduce
+    /// that exactly (it stops at the last terminator, not at the text's end).
+    #[test]
+    fn split_keeps_the_empty_line_a_trailing_newline_implies() {
+        assert_eq!(split_to_width("a\n", 10), vec!["a", ""]);
+        assert_eq!(split_to_width("\n", 10), vec!["", ""]);
+        assert_eq!(split_to_width("a\n\n", 10), vec!["a", "", ""]);
+    }
+
     #[test]
     fn split_measures_display_width_not_chars() {
         // Three wide chars are 6 columns: 5 per line means 2 then 1.
@@ -576,6 +680,33 @@ mod tests {
         // the whole atom, so the escape stays with "wor" on line two.
         let parts = split_to_width("abcd\x1b[1mwor", 4);
         assert_eq!(parts, vec!["abcd", "\x1b[1mwor"]);
+    }
+
+    /// The fused walk keeps a dirty line's *range* whole: the classification
+    /// bails at the offending byte, but the line still ends at its `\n` — so a
+    /// tab mid-line never truncates the text the normalizer then sees.
+    #[test]
+    fn split_keeps_a_dirty_line_whole_before_normalizing() {
+        assert_eq!(split_to_width("a\tb", 10), vec!["a    b"]);
+        assert_eq!(split_to_width("a\tb\nc\td", 10), vec!["a    b", "c    d"]);
+        // A dirty byte after a styled run: the escape is not re-classified, and
+        // the line's end is still found.
+        assert_eq!(
+            split_to_width("\x1b[1ma\tb\x1b[0m", 10),
+            vec!["\x1b[1ma    b\x1b[0m"]
+        );
+    }
+
+    /// A fitting styled line — the shape most content rows have — is one
+    /// borrow: the classification walk already measured it, so nothing is
+    /// re-measured and nothing is copied.
+    #[test]
+    fn split_borrows_a_fitting_styled_line() {
+        let s = "\x1b[1;36mhighlighted\x1b[0m and plain";
+        let parts = split_to_width(s, 80);
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0], Cow::Borrowed(_)));
+        assert_eq!(parts[0], s);
     }
 
     #[test]

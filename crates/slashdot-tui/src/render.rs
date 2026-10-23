@@ -33,7 +33,7 @@
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use crate::ansi::{display_width, display_width_ansi, split_at_width};
+use crate::ansi::{display_width, display_width_ansi, scan_line, split_at_width};
 use crate::draw::{el_if_short, Draw};
 use crate::termio::{CaretEvent, TermHandles, TermIO, TermSize};
 use tokio::sync::watch;
@@ -578,31 +578,49 @@ fn repair(w: &mut ContentWrite, term_w: usize) -> usize {
     let text = String::from_utf8_lossy(&w.bytes);
     let mut out = String::with_capacity(text.len() + 1);
     let mut rows = 0usize;
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-            rows += 1;
-        }
-        let mut rest = line;
-        while display_width_ansi(rest) > term_w {
-            let (head, tail) = split_at_width(rest, term_w);
-            out.push_str(head);
-            if tail.is_empty() {
-                // A glyph wider than the budget: the head swallowed the
-                // remainder, so the row ends here (no invented break).
-                rest = "";
-                break;
-            }
-            out.push('\n');
-            rows += 1;
-            out.push_str("\x1b[K"); // the continuation clears on entry
-            rest = tail;
-        }
-        out.push_str(rest);
-    }
     // A block ends at a line boundary: a text that did not carry its
-    // terminator gets one here, and it counts as the row it moves to.
-    if !text.ends_with('\n') {
+    // terminator gets one here, and it counts as the row it moves to. Appended
+    // after the loop so the row count is the newline count of the result.
+    let needs_terminator = !text.ends_with('\n');
+    let mut at = 0usize;
+    let mut first = true;
+    loop {
+        if !first {
+            out.push('\n');
+            rows += 1;
+        }
+        first = false;
+        // One walk finds the line and measures it; a fitting line — the replay
+        // common case — is copied without a second measurement.
+        let scan = scan_line(&text, at);
+        let terminated = scan.next > scan.line.end;
+        let line = &text[scan.line.clone()];
+        if scan.width <= term_w {
+            out.push_str(line);
+        } else {
+            let mut rest = line;
+            while display_width_ansi(rest) > term_w {
+                let (head, tail) = split_at_width(rest, term_w);
+                out.push_str(head);
+                if tail.is_empty() {
+                    // A glyph wider than the budget: the head swallowed the
+                    // remainder, so the row ends here (no invented break).
+                    rest = "";
+                    break;
+                }
+                out.push('\n');
+                rows += 1;
+                out.push_str("\x1b[K"); // the continuation clears on entry
+                rest = tail;
+            }
+            out.push_str(rest);
+        }
+        if !terminated {
+            break;
+        }
+        at = scan.next;
+    }
+    if needs_terminator {
         out.push('\n');
         rows += 1;
     }
