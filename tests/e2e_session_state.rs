@@ -15,6 +15,8 @@
 //! Test 2 smokes resume: replay renders the seeded history and the model
 //! decision lands in the input line as a `/model …` prefill.
 
+mod child_env;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use child_env::clear_proxy_vars;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use prior::session::types::{encode_cwd, session_filename};
 use tempfile::TempDir;
@@ -205,6 +208,7 @@ fn spawn_prior(
         .expect("open pty");
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
+    clear_proxy_vars(&mut cmd);
     cmd.args(["-p", "llamacpp", "-m", "test"]);
     cmd.cwd(fx.work.path());
     cmd.env("XDG_CONFIG_HOME", fx._xdg.path());

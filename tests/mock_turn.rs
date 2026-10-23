@@ -7,6 +7,7 @@
 //! exact number of empty lines between the last message of a turn and the
 //! horizontal separator — including the error path (429 on the second request).
 
+mod child_env;
 mod common;
 
 use std::io::{Read, Write};
@@ -15,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use child_env::clear_proxy_vars;
 use common::Dumps;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use vt100::Parser;
@@ -299,6 +301,7 @@ fn run_turn_typing(
         .expect("open pty");
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
+    clear_proxy_vars(&mut cmd);
     let mut args: Vec<String> = vec![
         "-p".into(),
         "llamacpp".into(),

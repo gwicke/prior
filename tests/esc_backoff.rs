@@ -16,12 +16,15 @@
 //! Both assertions are deadline-based, and the back-off floor (30s) sits
 //! far above them, so the test is red without the pump and green with it.
 
+mod child_env;
+
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use child_env::clear_proxy_vars;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 const ROWS: u16 = 40;
@@ -236,6 +239,7 @@ fn esc_cuts_retry_backoff_and_keys_dispatch_during_it() {
         .expect("open pty");
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
+    clear_proxy_vars(&mut cmd);
     cmd.args(["-p", "llamacpp", "-m", "test", "--yolo", "true"]);
     // Keep the test off the developer's real config (and its sessions).
     let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");

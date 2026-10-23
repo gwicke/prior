@@ -7,12 +7,15 @@
 //! reaches the mock, and reconstruct the observed back-off sequence from
 //! the inter-request gaps.
 
+mod child_env;
+
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use child_env::clear_proxy_vars;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 const ROWS: u16 = 40;
@@ -242,6 +245,7 @@ fn run_one(pattern: &str, label: &str, need: usize) -> (Vec<u64>, Vec<(u64, usiz
         .expect("openpty");
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
+    clear_proxy_vars(&mut cmd);
     let args: Vec<String> = vec![
         "-p".into(),
         "llamacpp".into(),
@@ -463,6 +467,7 @@ fn no_session_still_resets_backoff_after_progress() {
         })
         .expect("openpty");
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_prior"));
+    clear_proxy_vars(&mut cmd);
     let args: Vec<String> = vec![
         "-p".into(),
         "llamacpp".into(),
