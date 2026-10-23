@@ -57,20 +57,28 @@ pub const EGRESS_BIN: &str = "prior-egress";
 /// upper-case one wins in every client measured, so they must agree — which they
 /// do, being generated from the same template.
 ///
-/// # Why there is no `NO_PROXY`
+/// # Why `NO_PROXY` covers loopback
 ///
-/// Deliberately unset. Inside the netns `127.0.0.1` is the sandbox's own
-/// loopback, and the only thing listening there is the bridge — so bypassing the
-/// proxy for it would route a client to nothing, not to a local server. Worse,
-/// excluding it would remove the one way to reach a *host* loopback service
-/// through the bridge when the allowlist permits it, which is a use `network =
-/// true` is documented to support.
+/// Published as `localhost,127.0.0.1,::1` in both spellings, so a client whose
+/// destination is one of those names connects *directly* instead of via the
+/// bridge. Inside the netns, direct means the **sandbox's own** loopback:
+/// `--unshare-net` is unconditional (R3a), so 127.0.0.1 there is not the host's
+/// loopback — it is only ever the services the sandbox itself starts (a test's
+/// mock provider, a dev server), or a refused connect. What NO_PROXY gives up
+/// is the literal-destination route to *host* loopback (`127.0.0.1:5432`
+/// allowlist entries dialled by prior on the host side); that reach is R3j's
+/// business and is denied by default, and services on the host that are meant
+/// to be reachable listen on a non-loopback address, which NO_PROXY does not
+/// cover. So bypass here trades nothing for fail-closed.
+///
+/// Destination matching only: NO_PROXY does not affect clients reaching the
+/// bridge itself (its address is the proxy variable's, not the destination's).
 pub fn proxy_var_specs() -> Vec<String> {
     // Every variable is published in both the upper- and lower-case spelling.
     // That is not redundancy: no client reads all of them (wget here reads only
     // `http_proxy`; w3m reads the upper-case form first and does not fall
     // through), so a missing spelling is a client with no egress.
-    let mut v = Vec::with_capacity(6);
+    let mut v = Vec::with_capacity(8);
     for &(upper, scheme) in &[
         ("ALL_PROXY", "socks5h"),
         ("HTTP_PROXY", "http"),
@@ -79,6 +87,11 @@ pub fn proxy_var_specs() -> Vec<String> {
         let url = format!("{scheme}://%p");
         v.push(format!("{upper}={url}"));
         v.push(format!("{}={url}", upper.to_lowercase()));
+    }
+    // `NO_PROXY` carries no `%p` template and no scheme: it is a name list, the
+    // same value in both spellings for the same reason the proxy URLs are.
+    for upper in ["NO_PROXY", "no_proxy"] {
+        v.push(format!("{upper}=localhost,127.0.0.1,::1"));
     }
     v
 }
@@ -1700,6 +1713,15 @@ mod proxy_tests {
         // `wget` reads only the lower case; its absence is silent egress loss.
         assert!(get("http_proxy").is_some());
         assert!(get("all_proxy").is_some());
+        // NO_PROXY in both spellings: bypass for loopback destinations, i.e. the
+        // netns's own loopback — see the doc section for why that trades nothing.
+        for name in ["NO_PROXY", "no_proxy"] {
+            assert_eq!(
+                get(name).as_deref(),
+                Some("localhost,127.0.0.1,::1"),
+                "{name} must bypass the proxy for loopback destinations"
+            );
+        }
     }
 }
 

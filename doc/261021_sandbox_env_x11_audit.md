@@ -1663,9 +1663,12 @@ upper-case `HTTP_PROXY` for plain `GET`, reading only `http_proxy`.
 - **`ALL_PROXY` stays `socks5h://`; `HTTP_PROXY`/`HTTPS_PROXY` become `http://`.** `socks5h` is the
   only spelling that resolves the name proxy-side, so it stays on the variable SOCKS-aware clients
   read. The per-scheme variables must hold a value *every* client can parse, which is `http://`.
-  Both case spellings are published for each, because no client reads them all. `NO_PROXY` is
-  deliberately **not** set: inside the netns `127.0.0.1` is the bridge itself, and excluding it would
-  remove the one route to a host-loopback service the allowlist is meant to permit.
+  Both case spellings are published for each, because no client reads them all. `NO_PROXY` /
+  `no_proxy` is set to `localhost,127.0.0.1,::1`, both spellings, so a loopback destination is
+  reached directly on the netns's own loopback (fail-closed toward the host) instead of via the
+  bridge; the literal-destination host-loopback route it gives up is R3j-denied by default, and
+  host services meant to be reached listen non-loopback. This replaced the earlier "deliberately not
+  set" rationale, which conflated netns loopback with host loopback.
 - **The accept loop now serves conversations concurrently.** It previously ran the engine inline, so
   the bridge handled one connection at a time. Measured with 4 concurrent requests to a 0.6 s origin:
   2.46 s serial vs 0.63 s threaded. This predates R3i and affected SOCKS too, but HTTP clients open

@@ -3325,10 +3325,14 @@ mod sandbox_tests {
         set_sandbox(Some(cfg));
 
         // `curl` honours ALL_PROXY; ask it to reach the host's loopback upstream.
-        // Status 200 means the bridge dialled it on the *host* side.
+        // Status 200 means the bridge dialled it on the *host* side. The pack
+        // sets NO_PROXY for loopback destinations (the netns's own), which would
+        // bypass the bridge entirely — clear it, since this test exists to
+        // exercise the proxy path.
         let out = run_sandboxed_with_status(
             &format!(
-                "curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 \
+                "env -u no_proxy -u NO_PROXY \
+                 curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 \
                  http://127.0.0.1:{}/",
                 upstream.port()
             ),
@@ -3382,9 +3386,13 @@ mod sandbox_tests {
         cfg.network = crate::config::NetworkPolicy::open(); // empty allowlist
         set_sandbox(Some(cfg));
 
+        // The refusal must be the bridge's (the R3j gates), not a NO_PROXY
+        // bypass — otherwise this test would keep passing without exercising
+        // host_allowed/addr_permitted at all.
         let out = run_sandboxed(
             &format!(
-                "curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 \
+                "env -u no_proxy -u NO_PROXY \
+                 curl -s -o /dev/null -w '%{{http_code}}' --max-time 20 \
                  http://127.0.0.1:{}/",
                 upstream.port()
             ),
@@ -3453,9 +3461,12 @@ mod sandbox_tests {
         };
         set_sandbox(Some(cfg));
 
+        // NO_PROXY cleared as above: without it the client would never reach the
+        // bridge, and the refusal would not be the allowlist's.
         let out = run_sandboxed_with_status(
             &format!(
-                "curl -s -o /dev/null -w '%{{http_code}}' --max-time 10 http://127.0.0.1:{}/",
+                "env -u no_proxy -u NO_PROXY \
+                 curl -s -o /dev/null -w '%{{http_code}}' --max-time 10 http://127.0.0.1:{}/",
                 upstream.port()
             ),
             None,
@@ -3517,9 +3528,13 @@ mod sandbox_tests {
         set_sandbox(Some(cfg));
 
         // wget: reads only the lower-case `http_proxy` here, and has no SOCKS.
+        // NO_PROXY is cleared for both commands below: the loopback destination
+        // is precisely what the pack would bypass, and these tests exist to
+        // prove the HTTP front end carries the request.
         let out = run_sandboxed(
             &format!(
-                "wget -q -O - --timeout=10 http://127.0.0.1:{}/ 2>&1 || echo WGET_FAILED",
+                "env -u no_proxy -u NO_PROXY \
+                 wget -q -O - --timeout=10 http://127.0.0.1:{}/ 2>&1 || echo WGET_FAILED",
                 upstream.port()
             ),
             None,
@@ -3532,7 +3547,8 @@ mod sandbox_tests {
         // `-dump` prints the rendered page to stdout.
         let out = run_sandboxed(
             &format!(
-                "w3m -dump -T text/plain http://127.0.0.1:{}/ 2>&1 || echo W3M_FAILED",
+                "env -u no_proxy -u NO_PROXY \
+                 w3m -dump -T text/plain http://127.0.0.1:{}/ 2>&1 || echo W3M_FAILED",
                 upstream.port()
             ),
             None,

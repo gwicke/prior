@@ -674,12 +674,18 @@ case, because no client reads them all):
 | `ALL_PROXY`, `all_proxy` | `socks5h://127.0.0.1:<port>` | the only spelling that resolves the name proxy-side, so the sandbox never learns an unroutable address |
 | `HTTP_PROXY`, `http_proxy` | `http://127.0.0.1:<port>` | must be parseable by clients with no SOCKS code (`w3m`, `wget`) |
 | `HTTPS_PROXY`, `https_proxy` | `http://127.0.0.1:<port>` | same; HTTPS still arrives as `CONNECT` |
+| `NO_PROXY`, `no_proxy` | `localhost,127.0.0.1,::1` | bypass for loopback destinations: `--unshare-net` is unconditional, so a direct loopback connect lands on the **netns's own** loopback (the sandbox's services or a refused connect), never the host's |
 
-`NO_PROXY` is deliberately **not** set: inside the netns `127.0.0.1` is the
-bridge itself, so bypassing it would route a client to nothing — and it would
-remove the one route to a host-loopback service an explicit allowlist entry is
-meant to permit (that reach is otherwise denied by default; see R3j in the
-security properties).
+`NO_PROXY` bypasses for loopback destinations only, and the bypass is
+fail-closed toward the host: direct means the netns loopback, so the sandbox
+reaches its own services — a test's mock provider, a dev server — or nothing.
+The one thing given up is the literal-destination route to *host* loopback
+(`127.0.0.1:5432` allowlist entries dialled by prior on the host side); that
+reach is denied by default anyway (R3j, see the security properties), and
+services on the host meant to be reachable listen on a non-loopback address,
+which `NO_PROXY` does not cover. Destination matching only: the variable never
+affects a client reaching the bridge itself, whose address arrives in the proxy
+variables rather than as a destination.
 
 The HTTP engine handles the two request forms a proxy sees:
 
