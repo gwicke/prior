@@ -157,13 +157,16 @@ impl MessageLogger {
 
     /// Write a JSON line to the file.
     async fn write_line(&self, entry: &serde_json::Value) -> Result<()> {
-        let guard = self.ensure_file_open().await?;
-        if let Some(file) = guard.as_ref() {
-            let line = serde_json::to_string(entry)?;
-            let mut file = file.try_clone().await?;
+        // One buffer, one write, no fd clone: this runs per streamed delta
+        // when logging is on, so the per-line overhead is a single write
+        // syscall rather than dup + two writes (the guard already owns the
+        // `&mut File`; a `try_clone` was paying for one it didn't need).
+        let mut guard = self.ensure_file_open().await?;
+        if let Some(file) = guard.as_mut() {
+            let mut line = serde_json::to_string(entry)?;
+            line.push('\n');
             use tokio::io::AsyncWriteExt;
             file.write_all(line.as_bytes()).await?;
-            file.write_all(b"\n").await?;
         }
         Ok(())
     }
