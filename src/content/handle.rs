@@ -1387,10 +1387,21 @@ impl Content {
         if self.quiet {
             return;
         }
+        // `closes = false`: a streamed delta is never a block end. The thinking
+        // renderer's state carries across deltas — a list or fence inside the
+        // reasoning is still open between two `stream_thinking` calls — so
+        // declaring each chunk closed would make every following chunk an
+        // opener (`old == kind && closed`) and `boundary_spacer` would draw a
+        // blank row between consecutive lines of one continuous stream, live
+        // only: replay feeds the whole reasoning in one call and never sees
+        // those interior boundaries. The genuine ends declare themselves
+        // where they happen: `write_segment_tail` (segment/turn), the
+        // supersession commit in `stream_text` (thinking → answer), and
+        // `end_tool_block` for tool panels.
         self.write_content_block_as(
             &bytes,
             Some(ContentDisplayKind::ResponseReasoning),
-            true,
+            false,
             crate::termio::Stream::Reasoning,
         );
     }
@@ -2471,6 +2482,34 @@ mod tests {
                 "[{}] painted differently from the one-call version",
                 chunk.name()
             );
+        }
+    }
+
+    /// Streamed reasoning is one continuous block: no interior boundary, any
+    /// chunking. Regression for the `26d2119` fallout, where every
+    /// `commit_reasoning` delta declared `closes=true` — each following delta
+    /// then opened a new block and `boundary_spacer` drew a blank row between
+    /// consecutive lines of one open list (live only; replay feeds the whole
+    /// reasoning in one call). `assert_no_doubled_blank` cannot see this — the
+    /// inserted rows are single and content-separated — so the pin is
+    /// byte-equality against the one-call version, with structures whose
+    /// interior the renderer must keep tight: a list and a fence.
+    #[test]
+    fn reasoning_chunking_is_not_visible() {
+        for text in [
+            "1. First item\n2. Second item\n3. Third item\n",
+            "Let's think.\n\n1. First item\n2. Second item\n\nMore reasoning.\n",
+            "reasoning before\n\n```python\ndef add(a, b):\n    return a + b\n```\n\nafter\n",
+        ] {
+            let whole = run_script(&[Step::Think(text), Step::ResponseEnd], Chunking::Whole);
+            for chunk in [Chunking::Bytes, Chunking::Words] {
+                assert_eq!(
+                    run_script(&[Step::Think(text), Step::ResponseEnd], chunk),
+                    whole,
+                    "[{}] reasoning painted differently from the one-call version for {text:?}",
+                    chunk.name()
+                );
+            }
         }
     }
 
