@@ -91,6 +91,49 @@ impl MessageLogger {
         }
     }
 
+    /// Log one exact content chunk as the live pump sends it.
+    ///
+    /// `direction: "delta"`; `kind` names the chunk's stream (`text` /
+    /// `reasoning`), `delta` is the raw fragment — JSON-escaped, so a `\n`
+    /// vs `\n\n` vs `\r` question is answerable from the log alone, and an
+    /// empty delta is logged as `""` (a write that rendered nothing is
+    /// exactly what a boundary-spacing investigation needs to see). Every
+    /// `stream_text` / `stream_thinking` argument is logged, which makes the
+    /// record the input side of the content layer's boundary decisions.
+    pub async fn log_delta(&self, kind: &str, delta: &str, turn_id: u64) {
+        let entry = serde_json::json!({
+            "timestamp": Utc::now().to_rfc3339(),
+            "direction": "delta",
+            "kind": kind,
+            "delta": delta,
+            "turn_id": turn_id,
+            "provider": self.provider,
+            "model": self.model,
+        });
+        if let Err(e) = self.write_line(&entry).await {
+            eprintln!("Warning: failed to write to message log: {}", e);
+        }
+    }
+
+    /// Log a live-pump lifecycle marker: `begin_response`, `segment_end`,
+    /// `response_end`. These are the points where the content boundary state
+    /// changes (`closed` flips), so deltas can be read against them and a
+    /// reconstructable trace of what `boundary_spacer` saw falls out of one
+    /// file.
+    pub async fn log_event(&self, event: &str, turn_id: u64) {
+        let entry = serde_json::json!({
+            "timestamp": Utc::now().to_rfc3339(),
+            "direction": "event",
+            "event": event,
+            "turn_id": turn_id,
+            "provider": self.provider,
+            "model": self.model,
+        });
+        if let Err(e) = self.write_line(&entry).await {
+            eprintln!("Warning: failed to write to message log: {}", e);
+        }
+    }
+
     /// Ensure the file handle is open, creating the file if needed.
     async fn ensure_file_open(
         &self,
@@ -114,13 +157,16 @@ impl MessageLogger {
 
     /// Write a JSON line to the file.
     async fn write_line(&self, entry: &serde_json::Value) -> Result<()> {
-        let guard = self.ensure_file_open().await?;
-        if let Some(file) = guard.as_ref() {
-            let line = serde_json::to_string(entry)?;
-            let mut file = file.try_clone().await?;
+        // One buffer, one write, no fd clone: this runs per streamed delta
+        // when logging is on, so the per-line overhead is a single write
+        // syscall rather than dup + two writes (the guard already owns the
+        // `&mut File`; a `try_clone` was paying for one it didn't need).
+        let mut guard = self.ensure_file_open().await?;
+        if let Some(file) = guard.as_mut() {
+            let mut line = serde_json::to_string(entry)?;
+            line.push('\n');
             use tokio::io::AsyncWriteExt;
             file.write_all(line.as_bytes()).await?;
-            file.write_all(b"\n").await?;
         }
         Ok(())
     }

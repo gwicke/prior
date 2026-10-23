@@ -1387,10 +1387,21 @@ impl Content {
         if self.quiet {
             return;
         }
+        // `closes = false`: a streamed delta is never a block end. The thinking
+        // renderer's state carries across deltas — a list or fence inside the
+        // reasoning is still open between two `stream_thinking` calls — so
+        // declaring each chunk closed would make every following chunk an
+        // opener (`old == kind && closed`) and `boundary_spacer` would draw a
+        // blank row between consecutive lines of one continuous stream, live
+        // only: replay feeds the whole reasoning in one call and never sees
+        // those interior boundaries. The genuine ends declare themselves
+        // where they happen: `write_segment_tail` (segment/turn), the
+        // supersession commit in `stream_text` (thinking → answer), and
+        // `end_tool_block` for tool panels.
         self.write_content_block_as(
             &bytes,
             Some(ContentDisplayKind::ResponseReasoning),
-            true,
+            false,
             crate::termio::Stream::Reasoning,
         );
     }
@@ -2471,6 +2482,34 @@ mod tests {
                 "[{}] painted differently from the one-call version",
                 chunk.name()
             );
+        }
+    }
+
+    /// Streamed reasoning is one continuous block: no interior boundary, any
+    /// chunking. Regression for the `26d2119` fallout, where every
+    /// `commit_reasoning` delta declared `closes=true` — each following delta
+    /// then opened a new block and `boundary_spacer` drew a blank row between
+    /// consecutive lines of one open list (live only; replay feeds the whole
+    /// reasoning in one call). `assert_no_doubled_blank` cannot see this — the
+    /// inserted rows are single and content-separated — so the pin is
+    /// byte-equality against the one-call version, with structures whose
+    /// interior the renderer must keep tight: a list and a fence.
+    #[test]
+    fn reasoning_chunking_is_not_visible() {
+        for text in [
+            "1. First item\n2. Second item\n3. Third item\n",
+            "Let's think.\n\n1. First item\n2. Second item\n\nMore reasoning.\n",
+            "reasoning before\n\n```python\ndef add(a, b):\n    return a + b\n```\n\nafter\n",
+        ] {
+            let whole = run_script(&[Step::Think(text), Step::ResponseEnd], Chunking::Whole);
+            for chunk in [Chunking::Bytes, Chunking::Words] {
+                assert_eq!(
+                    run_script(&[Step::Think(text), Step::ResponseEnd], chunk),
+                    whole,
+                    "[{}] reasoning painted differently from the one-call version for {text:?}",
+                    chunk.name()
+                );
+            }
         }
     }
 
@@ -3832,6 +3871,99 @@ mod tests {
         out.end_response();
         let bytes = sink.bytes();
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
+    }
+
+    /// A kind switch whose new content renders **only whitespace** normalizes
+    /// away: text → whitespace-only reasoning → text paints exactly the two
+    /// text paragraphs (one renderer gap between them, as ever), with no
+    /// boundary rows around the whitespace. The `rows_due` / `StripLeading` /
+    /// `restore_empty` half of the boundary rule, pinned for the shapes a
+    /// provider can actually send: spaces, newlines, tab.
+    #[test]
+    fn whitespace_only_kind_switches_normalize_away() {
+        fn run(b_delta: &str) -> String {
+            let (out, reasoning) = capturing_output(60);
+            *reasoning.lock().unwrap() = ShowReasoning::Content;
+            out.begin_capture();
+            out.begin_response();
+            out.stream_text("first line.\n\n");
+            out.stream_thinking(b_delta);
+            out.stream_text("second line.\n\n");
+            out.end_response();
+            let bytes = out.end_capture();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        for b in ["   \n", "\n\n", " \n", "\t\n"] {
+            assert_eq!(
+                run(b),
+                "first line.\n\nsecond line.\n",
+                "whitespace-only reasoning delta {b:?} must leave no trace"
+            );
+        }
+    }
+
+    /// Live paints in provider SSE order; grouped (thinking-first) does not.
+    ///
+    /// Characterization of what an interleaved arrival paints: a reasoning part
+    /// that arrives *mid-answer* records `(ResponseReasoning, closes=true)`
+    /// between two `ResponseText` chunks, so `boundary_spacer` opens a block
+    /// around it — blank row, dim reasoning line, blank row — **inside** the
+    /// open code fence. Replay used to regroup thinking-first (hiding exactly
+    /// these rows); it now paints stored arrival order — see
+    /// `replay::tests::replay_keeps_interleaved_reasoning_in_arrival_order`.
+    /// This pins the live half; whether the rows are wanted at every interleave
+    /// is a design question still open.
+    #[test]
+    fn interleaved_reasoning_inserts_live_only_boundary_rows() {
+        fn run(interleaved: bool) -> String {
+            let (out, reasoning) = capturing_output(60);
+            *reasoning.lock().unwrap() = ShowReasoning::Content;
+            out.begin_capture();
+            out.begin_response();
+            if interleaved {
+                out.stream_text("Consider the code:\n\n");
+                out.stream_text("```python\n");
+                out.stream_text("def add(a, b):\n");
+                out.stream_thinking("Hmm, add or plus? Let me weigh that.\n");
+                out.stream_text("    return a + b\n");
+                out.stream_thinking("Also consider subtraction while here.\n");
+                out.stream_text("```\n");
+            } else {
+                out.stream_thinking("Hmm, add or plus? Let me weigh that.\n");
+                out.stream_thinking("Also consider subtraction while here.\n");
+                out.stream_text(
+                    "Consider the code:\n\n```python\ndef add(a, b):\n    return a + b\n```\n",
+                );
+            }
+            out.end_response();
+            let bytes = out.end_capture();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        let live = run(true);
+        let grouped = run(false);
+        println!("=== live (interleaved SSE order) ===\n{live:?}");
+        println!("=== grouped (thinking first) ===\n{grouped:?}");
+        // Interleaved, a reasoning part that arrives mid-answer records
+        // (Reasoning, closes=true) between two ResponseText chunks and
+        // `boundary_spacer` opens a new block around it — a blank row above and
+        // below the dim reasoning line, INSIDE the open code fence. The same
+        // content grouped thinking-first never interleaves, so it renders tight.
+        assert!(
+            live.contains("add(a, b):\n\n\x1b[2mHmm, add or plus?"),
+            "live: blank + reasoning above the fence line: {live:?}"
+        );
+        assert!(
+            live.contains("weigh that.\x1b[0m\n\n      \x1b[35mreturn"),
+            "live: blank between code lines after the reasoning interleave: {live:?}"
+        );
+        assert!(
+            grouped.contains("add(a, b):\n      \x1b[35mreturn"),
+            "grouped: code lines stay adjacent: {grouped:?}"
+        );
+        assert!(
+            grouped.find("Hmm, add or plus?").unwrap() < grouped.find("Consider the code").unwrap(),
+            "grouped: thinking plays before text: {grouped:?}"
+        );
     }
 
     /// A content batch defers the frame's re-emit to the guard's drop instead

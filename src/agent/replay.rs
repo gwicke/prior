@@ -11,7 +11,12 @@
 //! two screens.
 //!
 //! `AssistantSegment` is the unit of grouping: the content between tool
-//! executions. A turn is a user prompt followed by a chain of them.
+//! executions. A turn is a user prompt followed by a chain of them. Its
+//! thinking and text blocks keep **arrival order** (see [`AssistantSegment`]):
+//! live paints whatever interleaving the provider sent, so replay has to paint
+//! the same interleaving — regrouping thinking-first would hide the boundary
+//! rows around mid-answer reasoning from exactly the comparison that needs to
+//! see them.
 
 use crate::content::Content;
 use rig_core::message::{AssistantContent, Message, ToolResultContent, UserContent};
@@ -21,13 +26,26 @@ use std::borrow::Borrow;
 // Session replay helpers
 // ---------------------------------------------------------------------------
 
+/// One thinking/text block of a segment, in the order the provider sent it.
+#[derive(Clone)]
+pub(crate) enum SegmentPart {
+    /// A reasoning/thinking block.
+    Thinking(String),
+    /// An answer text block.
+    Text(String),
+}
+
 /// One assistant segment: the content streamed between tool executions (or the
 /// whole final answer when there are no more tools to run in this turn).
 pub(crate) struct AssistantSegment {
-    /// Reasoning/thinking blocks in message order.
-    thinking: Vec<String>,
-    /// Answer text blocks in message order.
-    text: Vec<String>,
+    /// Thinking and text blocks in **arrival order** — interleaved if the
+    /// provider interleaved them.
+    ///
+    /// Not two grouped lists: live renders reasoning blocks exactly where the
+    /// stream put them, and the boundary rows around a mid-answer reasoning
+    /// block are part of what was on screen. Regrouping thinking-first would
+    /// make `/replay` silently disagree with the turn it replays.
+    parts: Vec<SegmentPart>,
     /// Tool calls from the assistant message: `(call_id, name, args)`.
     /// Populated during grouping; matched against results when the following
     /// `User { ToolResult }` message is processed.
@@ -40,8 +58,7 @@ pub(crate) struct AssistantSegment {
 impl AssistantSegment {
     fn new() -> Self {
         Self {
-            thinking: Vec::new(),
-            text: Vec::new(),
+            parts: Vec::new(),
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
         }
@@ -236,11 +253,11 @@ fn feed_turn_into(open: &mut Option<ConversationTurn>, msg: &Message) {
             AssistantContent::Reasoning(r) => {
                 let t = r.text.clone();
                 if !t.is_empty() {
-                    seg.thinking.push(t);
+                    seg.parts.push(SegmentPart::Thinking(t));
                 }
             }
             AssistantContent::Text(t) if !t.text.is_empty() => {
-                seg.text.push(t.text.clone());
+                seg.parts.push(SegmentPart::Text(t.text.clone()));
             }
             AssistantContent::ToolCall(tc) => {
                 seg.tool_calls.push((
@@ -277,11 +294,11 @@ fn render_turn(content: &Content, turn: &ConversationTurn) {
     for (seg_idx, segment) in turn.segments.iter().enumerate() {
         let is_last_segment = seg_idx + 1 == seg_count;
 
-        for thinking in &segment.thinking {
-            content.stream_thinking(thinking);
-        }
-        for text in &segment.text {
-            content.stream_text(text);
+        for part in &segment.parts {
+            match part {
+                SegmentPart::Thinking(t) => content.stream_thinking(t),
+                SegmentPart::Text(t) => content.stream_text(t),
+            }
         }
 
         if !segment.tool_calls.is_empty() {
@@ -711,8 +728,10 @@ mod tests {
             user_text: "what is the answer?".into(),
             segments: vec![
                 AssistantSegment {
-                    thinking: vec!["Weighing the options.".into()],
-                    text: vec!["Let me check.".into()],
+                    parts: vec![
+                        SegmentPart::Thinking("Weighing the options.".into()),
+                        SegmentPart::Text("Let me check.".into()),
+                    ],
                     tool_calls: vec![(
                         "c1".into(),
                         "Bash".into(),
@@ -721,8 +740,7 @@ mod tests {
                     tool_results: vec![("c1".into(), "hi\n".into())],
                 },
                 AssistantSegment {
-                    thinking: vec![],
-                    text: vec!["The answer is 42.".into()],
+                    parts: vec![SegmentPart::Text("The answer is 42.".into())],
                     tool_calls: vec![],
                     tool_results: vec![],
                 },
@@ -749,18 +767,21 @@ mod tests {
         let live = Content::with_size(reasoning.clone(), size);
         live.begin_capture();
         live.begin_response();
-        for thinking in &turn.segments[0].thinking {
-            live.stream_thinking(thinking);
-        }
-        for text in &turn.segments[0].text {
-            live.stream_text(text);
+        for part in &turn.segments[0].parts {
+            match part {
+                crate::agent::replay::SegmentPart::Thinking(t) => live.stream_thinking(t),
+                crate::agent::replay::SegmentPart::Text(t) => live.stream_text(t),
+            }
         }
         live.end_response_segment();
         live.display_tool_call("Bash", &serde_json::json!({"command": "echo hi"}));
         live.display_tool_result("hi\n");
         live.end_response_segment();
-        for text in &turn.segments[1].text {
-            live.stream_text(text);
+        for part in &turn.segments[1].parts {
+            match part {
+                crate::agent::replay::SegmentPart::Thinking(t) => live.stream_thinking(t),
+                crate::agent::replay::SegmentPart::Text(t) => live.stream_text(t),
+            }
         }
         live.end_response();
         let live_bytes = live.end_capture();
@@ -782,6 +803,65 @@ mod tests {
         assert!(
             replay_text.contains("Weighing the options"),
             "replay lost the reasoning; the two render paths diverged again"
+        );
+    }
+
+    /// Arrival order is replay order: a stored message that interleaves
+    /// reasoning with text replays interleaved — reasoning between the two
+    /// text blocks, with its own boundary rows — the same shape live painted.
+    ///
+    /// The live half is pinned by
+    /// `content::handle::tests::interleaved_reasoning_inserts_live_only_boundary_rows`.
+    /// Before `SegmentPart`, `feed_turn_into` partitioned items into
+    /// thinking-first lists, so this content replayed grouped (and the
+    /// divergence was invisible).
+    #[test]
+    fn replay_keeps_interleaved_reasoning_in_arrival_order() {
+        let branch = vec![
+            pi_user_entry("m0", None, "q1"),
+            crate::session::SessionEntry {
+                id: "a0".into(),
+                parent_id: Some("m0".into()),
+                timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+                content: crate::session::SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "Before the reasoning.\n\n"},
+                            {"type": "thinking", "thinking": "Wait, reconsider the approach."},
+                            {"type": "text", "text": "After the reasoning.\n\n"}
+                        ]
+                    }),
+                },
+            },
+        ];
+        let units = build_replay_units(&branch);
+        let content = Content::for_test();
+        content.begin_capture();
+        replay_units(&content, &units, 0);
+        let captured = String::from_utf8_lossy(&content.end_capture()).into_owned();
+
+        let before = captured
+            .find("Before the reasoning.")
+            .expect("first text block replays");
+        let think = captured
+            .find("Wait, reconsider")
+            .expect("interleaved reasoning replays");
+        let after = captured
+            .find("After the reasoning.")
+            .expect("second text block replays");
+        assert!(
+            before < think && think < after,
+            "reasoning must replay between the text blocks, in arrival order: {captured:?}"
+        );
+        // The reasoning block is its own boundary block between two
+        // ResponseText writes — live paints the blank rows around it, so
+        // replay must too (blank line before the dim row, after the first
+        // text's line terminator).
+        let dim_row = &captured[before..after];
+        assert!(
+            dim_row.contains("\n\n\x1b[2m"),
+            "the reasoning block opens with its boundary row: {dim_row:?}"
         );
     }
 }

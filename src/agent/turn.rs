@@ -37,6 +37,16 @@ use crate::session::Session;
 use std::sync::Mutex;
 
 impl CodeAgent {
+    /// `--log-messages`: a live-pump lifecycle marker — the points where the
+    /// content boundary state changes (`closed` flips). Logged beside the raw
+    /// deltas so a spacing investigation can reconstruct exactly what
+    /// `boundary_spacer` saw from one file. A no-op without the flag.
+    async fn log_pump_event(&self, event: &str) {
+        if let Some(logger) = &self.message_logger {
+            logger.log_event(event, logger.current_turn_id()).await;
+        }
+    }
+
     /// `params` are the params to send *for this request*: the live ones, or
     /// the live ones with this turn's per-turn overrides applied. Passing them
     /// in rather than reading them off `AppState` is what makes an override
@@ -194,6 +204,7 @@ impl CodeAgent {
         // is not in it: the agent carries none (it went with the hold-back in
         // B3b) and it only changes on an explicit commit, so it belongs to the
         // prompt-side carrier.
+        self.log_pump_event("begin_response").await;
         self.content.begin_response();
         // U4.3: the turn's second pump, split out of `in_turn` into bindings the
         // two new futures below can borrow *disjointly* — one future per
@@ -251,12 +262,22 @@ impl CodeAgent {
                             // from the turn hook, so only fragments are
                             // painted and accumulated here.
                             Item::Event(StreamEvent::Text { text, .. }) => {
+                                if let Some(logger) = &self.message_logger {
+                                    logger
+                                        .log_delta("text", &text, logger.current_turn_id())
+                                        .await;
+                                }
                                 output.push_str(&text);
                                 self.content.stream_text(&text);
                             }
                             Item::Event(StreamEvent::Reasoning { text, .. })
                                 if !text.is_empty() =>
                             {
+                                if let Some(logger) = &self.message_logger {
+                                    logger
+                                        .log_delta("reasoning", &text, logger.current_turn_id())
+                                        .await;
+                                }
                                 reasoning_buffer.push_str(&text); // Accumulate for partial persistence
                                 self.content.stream_thinking(&text);
                             }
@@ -307,6 +328,7 @@ impl CodeAgent {
                                 }
                             }
                             // Commit the text so far before the tool call / result line.
+                            self.log_pump_event("segment_end").await;
                             self.content.end_response_segment();
                         }
                         Some(Ok(MultiTurnStreamItem::FinalResponse(resp))) => {
@@ -512,6 +534,7 @@ impl CodeAgent {
                                     }
                                 }
                             }
+                            self.log_pump_event("response_end").await;
                             self.content.end_response();
                             // A retryable error that interrupted the run AFTER
                             // progress: signal the REPL (via `LlmInterrupted`)
@@ -650,6 +673,7 @@ impl CodeAgent {
                 }
             }
         }
+        self.log_pump_event("response_end").await;
         self.content.end_response();
 
         // Persist the turn into the session (or fallback to no persistence).

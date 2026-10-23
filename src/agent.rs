@@ -1704,4 +1704,63 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
+
+    /// `log_delta`/`log_event` write the pump's exact input trace: raw
+    /// fragments (JSON-escaped, so `\n` vs `\n\n` vs `\r` stays answerable
+    /// from the log) and the lifecycle markers the boundary state changes
+    /// at — the record a boundary-spacing investigation reads back.
+    #[tokio::test]
+    async fn message_logger_writes_raw_deltas_and_events() {
+        let _tmp = tempfile::tempdir().unwrap();
+        let dir = _tmp.path().to_path_buf();
+        let path = dir.join("deltas.jsonl");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let logger = MessageLogger::new(
+            path.display().to_string(),
+            "test".to_string(),
+            "test-model".to_string(),
+        );
+
+        logger.log_event("begin_response", 0).await;
+        let turn = logger.advance_turn();
+        logger.log_delta("text", "def f():\n", turn).await;
+        logger.log_delta("reasoning", "hmm\n\n", turn).await;
+        logger.log_delta("text", "", turn).await;
+        logger.log_event("segment_end", turn).await;
+
+        let raw = tokio::fs::read_to_string(&path).await.expect("file");
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 5, "five records: {raw}");
+
+        let begin: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(begin["direction"], "event");
+        assert_eq!(begin["event"], "begin_response");
+
+        let delta: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(delta["direction"], "delta");
+        assert_eq!(delta["kind"], "text");
+        assert_eq!(delta["delta"], "def f():\n");
+        assert_eq!(delta["turn_id"], 1);
+
+        let reasoning: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(reasoning["kind"], "reasoning");
+        // The exact bytes, escaped by JSON: the blank line between the two
+        // newlines is what a spacing investigation has to be able to see.
+        assert_eq!(reasoning["delta"], "hmm\n\n");
+        assert!(
+            lines[2].contains(r#"\n\n"#),
+            "raw line shows the escaped blank line: {}",
+            lines[2]
+        );
+
+        let empty: serde_json::Value = serde_json::from_str(lines[3]).unwrap();
+        assert_eq!(empty["delta"], "", "empty deltas are logged too");
+
+        let seg: serde_json::Value = serde_json::from_str(lines[4]).unwrap();
+        assert_eq!(seg["event"], "segment_end");
+        assert_eq!(seg["turn_id"], 1);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 }
