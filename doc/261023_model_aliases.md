@@ -88,10 +88,14 @@ It is called from three places:
   client, and `request_additional_params`; `CodeAgent::new` takes and stores both pairs.
 - `agent/turn.rs` / `agent/transcript.rs` / `agent/build.rs::LoggingHook`: the reasoning strip and
   the per-request params recompute switch from `self.provider`/`self.model` to the wire pair.
-- `v25_reasoning`: the remap disclosure must describe the *wire* model, or an alias would read as
-  "no data". Add `AppState::active_reasoning_support()` (identity → wire via the record → raw
-  catalog lookup) and use it, keeping disclosure and backend remap in lockstep exactly as they are
-  today.
+- `v25_reasoning`: the remap disclosure must describe the *wire* pair, or an alias reads as "no
+  data". Catalog injection cannot fix this: the injected entry lives only in `overlay` /
+  `resolved_entry` (the display paths), while `reasoning_support` reads the raw `catalog_cached()`
+  — a store-free, non-blocking reader by design — and the **provider** half, which picks the effort
+  vocabulary (`mapping`, `provider_effort_mapping_summary`, `resolve_effort_for`), changes under a
+  cross-vendor alias anyway. So instead of a dedicated support lookup, the node resolves the wire
+  `provider:model` (via `AppState::wire_model()`, the same `wire_id` the backend uses) and hands it
+  to `reasoning_support`, keeping disclosure and backend remap in lockstep.
 - `v25_model`: the `/model <alias>` header and row show `alias for: <upstream>`; the alias's
   `routing` inert-note keys off the **wire** provider.
 
@@ -139,6 +143,11 @@ the recipe/CLI plumbing. An alias is an ordinary catalog row plus one remap at b
 
 - Should aliases sort/filter specially in the picker (an `.alias` modifier, or hoisted near the
   top), or is the `alias for …` description enough to find them by fuzzy match?
+  - Decision: No special treatment needed. Users can use model slug patterns that make it easy to
+    identify / search for aliases.
 - Is a cross-provider alias (`openrouter:x` → `anthropic:y`) wanted, or should the alias and its
   upstream share a provider? Nothing in the design prevents it; the wire pair is already
   provider-independent.
+  - Decision: Cross-vendor aliasing should be allowed, e.g. for direct vendor vs. openrouter model
+    access. I doubt it will be very common, but should be possible since it does not seem to cost
+    anything to support.
