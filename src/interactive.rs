@@ -22,7 +22,7 @@ use crate::model_catalog;
 use crate::params;
 use crate::repl::{History, InputAction, ModelFilter, PromptSession, Repl, ReplCtx};
 use crate::session::repo::JsonlSessionRepo;
-use crate::settings::SettingsStore;
+use crate::settings::{SettingKey, SettingsStore};
 use crate::termio::InputEvent;
 use crate::tools::set_sandbox;
 use crate::Result;
@@ -172,6 +172,12 @@ struct Interactive {
     prompt_str: String,
     confirm_bridge: ConfirmBridge,
     repl: Option<Repl>,
+    /// Event-driven watch of `settings.toml` (doc/settings_reload.md). Armed
+    /// only for a real REPL: piped/batch input has no prompt to wake, and an
+    /// unattended run does not need live reloads. `None` also covers "the
+    /// watch could not be armed" — every use degrades to today's
+    /// restart-to-see-edits behaviour.
+    settings_watch: Option<crate::settings_watch::SettingsWatch>,
     repo: Option<JsonlSessionRepo>,
     line_history: History,
     cancel: Arc<AtomicBool>,
@@ -201,8 +207,9 @@ pub async fn run_interactive(
     config: AgentConfig,
     settings: SettingsStore,
     auto_resume: bool,
+    settings_pins: Vec<SettingKey>,
 ) -> Result<()> {
-    let mut interactive = Interactive::new(config, settings, auto_resume).await;
+    let mut interactive = Interactive::new(config, settings, auto_resume, settings_pins).await;
     let result = interactive.run().await;
     // Teardown: the loop's exits (`/quit`, an error mid-turn) leave raw mode
     // on, and the `TermGuard` drop backstop can never fire — the persistent
@@ -217,7 +224,12 @@ impl Interactive {
     /// Build the session state: publish the sandbox config, open the REPL and
     /// session repo, seed the initial session and model params, and arm the
     /// cancel flags. Runs once, before the input loop.
-    async fn new(config: AgentConfig, settings: SettingsStore, auto_resume: bool) -> Self {
+    async fn new(
+        config: AgentConfig,
+        settings: SettingsStore,
+        auto_resume: bool,
+        settings_pins: Vec<SettingKey>,
+    ) -> Self {
         let mut config = config;
 
         // Store the original (non-merged) sandbox config so the remove overlay
@@ -357,6 +369,21 @@ impl Interactive {
         // Seed the model switch from the configured default model so it appears
         // in the recent list on first run (if present and available).
         app_state.seed_recent_model(&config.qualified_model_id());
+        // Both live-reload pieces belong to the real REPL only: piped/batch
+        // input has no prompt to wake, and a one-shot run is over before an
+        // external edit could land (doc/settings_reload.md).
+        let settings_watch = use_repl
+            .then(|| {
+                app_state
+                    .settings()
+                    .path
+                    .as_deref()
+                    .and_then(crate::settings_watch::SettingsWatch::spawn)
+            })
+            .flatten();
+        if settings_watch.is_some() {
+            app_state.pin_settings_overrides(settings_pins);
+        }
         // Rebuild gate state: fingerprint of the last target we ATTEMPTED to
         // apply. A failed attempt (bad id, missing key) stays silent and
         // un-retried until the target changes — one error per distinct target,
@@ -446,6 +473,7 @@ impl Interactive {
             prompt_str,
             confirm_bridge,
             repl,
+            settings_watch,
             repo,
             line_history,
             cancel,
@@ -1126,6 +1154,7 @@ impl Interactive {
                         &self.app_state,
                         self.config.content.as_ref(),
                         &mut self.input,
+                        self.settings_watch.as_ref(),
                     )
                     .await
                 }
@@ -1589,7 +1618,7 @@ mod tests {
         // `create_agent` (and its `set_sandbox`) is never called — exactly the
         // pre-fix condition where `!` would otherwise run unsandboxed.
         content.begin_capture();
-        super::run_interactive(config, settings, false)
+        super::run_interactive(config, settings, false, Vec::new())
             .await
             .unwrap();
 
@@ -1661,7 +1690,7 @@ mod tests {
         let settings = SettingsStore::from_agent_config(&config, &Default::default(), None);
 
         content.begin_capture();
-        super::run_interactive(config, settings, false)
+        super::run_interactive(config, settings, false, Vec::new())
             .await
             .unwrap();
 

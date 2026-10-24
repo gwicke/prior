@@ -160,6 +160,11 @@ pub struct State {
     /// change rebuilds the list, which is cheaper than proving the change was
     /// not a per-model record.
     pub(crate) models_revision: u64,
+    /// Managed keys the CLI resolved at startup (`--yolo`, `--model`, …).
+    /// A disk reload re-applies these from the pre-reload store, so an
+    /// external file edit can never clobber an explicit flag for the rest
+    /// of the session (doc/settings_reload.md).
+    pub(crate) settings_pins: Vec<SettingKey>,
     /// Memo for `AppState::resolved_models`, keyed by
     /// `(catalog generation, models_revision)`.
     pub(crate) resolved_cache: Option<(u64, u64, Arc<Vec<crate::model_catalog::ModelEntry>>)>,
@@ -322,6 +327,7 @@ impl AppState {
                 // reads the map before one of them.
                 model_param_map: HashMap::new(),
                 models_revision: 0,
+                settings_pins: Vec::new(),
                 resolved_cache: None,
                 config,
                 settings,
@@ -660,6 +666,100 @@ impl AppState {
     /// await against the private copy (rule 3).
     pub fn settings(&self) -> SettingsStore {
         self.state.lock().settings.clone()
+    }
+
+    /// Pin the managed keys the CLI resolved at startup (`--yolo`,
+    /// `--provider`/`--model`, `--tool-call-limit`, `--persona`). A disk
+    /// reload re-applies their in-session values over the freshly loaded
+    /// file, so an external edit can never clobber an explicit flag for the
+    /// rest of the session (doc/settings_reload.md). Called once from
+    /// `run_interactive` before the loop starts.
+    pub fn pin_settings_overrides(&self, keys: Vec<SettingKey>) {
+        self.state.lock().settings_pins = keys;
+    }
+
+    /// Re-read `settings.toml` after an external edit (the `notify` watch's
+    /// reload; doc/settings_reload.md). Takes the same door as the menu
+    /// writers so a file edit and the equivalent in-app edit are
+    /// indistinguishable downstream:
+    ///
+    /// * the store is replaced — `/model`, `/set`, `/stat` and the Ctrl-E
+    ///   prefill all read it fresh at render/submit time, so listings are
+    ///   current on the next settle;
+    /// * `models_revision` bumps, invalidating the `resolved_models` memo;
+    /// * the active model's record propagates to the target config
+    ///   (routing / context window / alias) exactly as
+    ///   [`Self::update_settings`] does, so `converge()` rebuilds the agent
+    ///   once when those moved.
+    ///
+    /// What it deliberately does **not** do, matching today's menu semantics:
+    /// session-scoped live params are not re-seeded (A.6: a record edited
+    /// while the model sits in `model_param_map` is not re-read), the running
+    /// model never switches because `default_model` moved, and scalars live
+    /// where `/set` puts them — in the store.
+    ///
+    /// Carried over from the pre-reload store instead of read from the file:
+    /// the pinned CLI keys, `session_resume_replay_turns` (persisted
+    /// nowhere — `save()` skips it and `Config` has no field for it), and a
+    /// `default_model` the file omits (the session's resolved id survives
+    /// rather than blanking; see the doc).
+    ///
+    /// The read and parse run outside the lock (rule: no file IO under the
+    /// coarse lock). On a missing or unparseable file the in-memory store is
+    /// untouched and the returned message is ready to show the user — a
+    /// mid-write TOML must never wipe live settings.
+    pub fn reload_settings(&self) -> Result<(), String> {
+        // One short acquisition for everything the reload needs from the
+        // current state; the file IO below happens with no lock held.
+        let (path, pins, prev) = {
+            let st = self.state.lock();
+            (
+                st.settings.path.clone(),
+                st.settings_pins.clone(),
+                st.settings.clone(),
+            )
+        };
+        let Some(path) = path else {
+            return Ok(()); // no persistent location — nothing to watch
+        };
+        // Existence check before the read so a deleted file reads as a
+        // notice, not an IO error; the TOCTOU window below degrades to the
+        // same `read_to_string` error either way.
+        if !path.exists() {
+            return Err(
+                "settings file was deleted externally — keeping the in-session settings"
+                    .to_string(),
+            );
+        }
+        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let cfg = crate::Config::parse(&content).map_err(|e| e.to_string())?;
+        let mut fresh = crate::settings::SettingsStore::from_config(&cfg, Some(&path));
+        // Session-only state the file cannot answer for.
+        fresh.carry_keys_from(&prev, &pins);
+        fresh.session_resume_replay_turns = prev.session_resume_replay_turns;
+        if fresh.default_model.is_empty() {
+            // An omitted key keeps the session's resolved id rather than
+            // blanking `/set`'s row (the startup store is never empty).
+            fresh.default_model = prev.default_model;
+        }
+        let mut st = self.state.lock();
+        st.settings = fresh;
+        st.models_revision += 1;
+        // The active model's record → target config, the three fields
+        // `update_settings` propagates. Resolved before the assignments
+        // (borrow of `st.settings` ends at `alias_for`), params untouched:
+        // A.6 keeps runtime values for a model already visited.
+        let qualified = st.config.qualified_model_id();
+        let record = st.settings.models.get(&qualified);
+        let limit = Self::resolved_entry_locked(&st, &qualified)
+            .and_then(|e| e.context_length)
+            .filter(|max| *max > 0);
+        let routing = record.and_then(|r| r.routing.clone());
+        let alias_for = record.and_then(|r| r.alias_for.clone());
+        st.config.context_limit = limit;
+        st.config.routing = routing;
+        st.config.alias_for = alias_for;
+        Ok(())
     }
 
     // --- session slot (menu-facing view) ---
@@ -1333,5 +1433,165 @@ mod tests {
         );
         // Peeking writes nothing.
         assert!(!app.state.lock().model_param_map.contains_key("test:other"));
+    }
+
+    // ---- settings reload from disk (doc/settings_reload.md) ----
+
+    /// A reload installs a hand-edited file: new scalar values appear in the
+    /// store, `models_revision` bumps (so `/model`/`/set` re-derive their
+    /// rows), and the active model's routing reaches the target config the
+    /// way a Ctrl-E would — one rebuild via `converge`.
+    #[test]
+    fn reload_installs_a_hand_edited_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            r#"
+tool_call_limit = 7
+
+[models."test:model"]
+routing = { only = ["deepinfra/fp8/flex"], allow_fallbacks = false }
+"#,
+        )
+        .unwrap();
+        let mut store = test_settings();
+        store.path = Some(path.clone());
+        let app = AppState::for_test(store);
+        let before = app.with_settings(|s| s.tool_call_limit);
+        assert_eq!(before, 10);
+
+        app.reload_settings().expect("a valid file reloads");
+
+        assert_eq!(app.with_settings(|s| s.tool_call_limit), 7);
+        assert_eq!(app.with_config(|c| c.routing.clone()), Some(routing()));
+    }
+
+    /// A mid-edit TOML keeps the in-memory store and reports a message — the
+    /// live session must never be wiped by an unparseable file.
+    #[test]
+    fn reload_of_a_broken_file_keeps_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mut store = test_settings();
+        store.path = Some(path.clone());
+        store.tool_call_limit = 33;
+        let app = AppState::for_test(store);
+
+        std::fs::write(
+            &path,
+            "tool_call_limit = = oops
+",
+        )
+        .unwrap();
+        let err = app.reload_settings().expect_err("broken TOML is an error");
+        assert!(!err.is_empty());
+        assert_eq!(
+            app.with_settings(|s| s.tool_call_limit),
+            33,
+            "the in-session value survives a bad file"
+        );
+    }
+
+    /// A deleted file is a notice, not a wipe: the store keeps its values and
+    /// the next save recreates the file.
+    #[test]
+    fn reload_of_a_deleted_file_keeps_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mut store = test_settings();
+        store.path = Some(path.clone());
+        store.tool_call_limit = 44;
+        let app = AppState::for_test(store);
+
+        let err = app
+            .reload_settings()
+            .expect_err("a missing file is a notice");
+        assert!(err.contains("deleted"), "message names the deletion: {err}");
+        assert_eq!(app.with_settings(|s| s.tool_call_limit), 44);
+    }
+
+    /// A pinned CLI key survives a reload: the file's value is overridden by
+    /// the in-session one, everything else reloads (doc/settings_reload.md).
+    #[test]
+    fn reload_keeps_cli_pinned_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "tool_call_limit = 5\nsecurity_mode = \"confirm\"\n").unwrap();
+        let mut store = test_settings();
+        store.path = Some(path.clone());
+        store.security_mode = "yolo".to_string();
+        store.tool_call_limit = 99;
+        let app = AppState::for_test(store);
+        app.pin_settings_overrides(vec![SettingKey::SecurityMode]);
+
+        app.reload_settings().expect("reloads");
+
+        assert_eq!(
+            app.with_settings(|s| s.security_mode.clone()),
+            "yolo",
+            "the pinned key keeps the CLI's value"
+        );
+        assert_eq!(
+            app.with_settings(|s| s.tool_call_limit),
+            5,
+            "an unpinned key takes the file's value"
+        );
+    }
+
+    /// `session_resume_replay_turns` is persisted nowhere, so a reload must
+    /// carry it from memory rather than reset it to the built-in default.
+    #[test]
+    fn reload_carries_the_unpersisted_replay_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "tool_call_limit = 5\n").unwrap();
+        let mut store = test_settings();
+        store.path = Some(path.clone());
+        store.session_resume_replay_turns = 9;
+        let app = AppState::for_test(store);
+
+        app.reload_settings().expect("reloads");
+
+        assert_eq!(app.with_settings(|s| s.session_resume_replay_turns), 9);
+    }
+
+    /// A file that omits `default_model` does not blank the session's id — the
+    /// startup store never has an empty one, so neither should a reload.
+    #[test]
+    fn reload_keeps_the_resolved_default_model_when_the_file_omits_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "tool_call_limit = 5\n").unwrap();
+        let mut store = test_settings();
+        store.path = Some(path.clone());
+        store.default_model = "test:model".to_string();
+        let app = AppState::for_test(store);
+
+        app.reload_settings().expect("reloads");
+
+        assert_eq!(app.with_settings(|s| s.default_model.clone()), "test:model");
+    }
+
+    /// The live session's params are runtime state (A.6): a reload does not
+    /// re-seed them from a repositioned record.
+    #[test]
+    fn reload_leaves_session_live_params_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "[models.\"test:model\"]\nreasoning = \"max\"\n").unwrap();
+        let mut store = test_settings();
+        store.path = Some(path.clone());
+        let app = AppState::for_test(store);
+        app.activate_model_params("test:model");
+        app.set_reasoning(Some(ReasoningLevel::Low));
+
+        app.reload_settings().expect("reloads");
+
+        assert_eq!(
+            app.params().reasoning,
+            Some(ReasoningLevel::Low),
+            "a visited model keeps its runtime level"
+        );
     }
 }

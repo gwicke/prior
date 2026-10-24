@@ -78,6 +78,9 @@ chrono = { version = "0.4", features = ["serde"] }
 urlencoding = "2.1"
 memmap2 = "0.9"
 memchr = "2.7"
+# Event-driven watch of settings.toml's directory, so external edits reach the
+# running session without mtime polling (src/settings_watch.rs).
+notify = "8"
 
 [features]
 default = []

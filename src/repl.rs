@@ -525,6 +525,19 @@ pub(crate) fn paint_prompt(content: &Content) {
     content.manager.lock().unwrap().render(None);
 }
 
+/// Install an externally edited `settings.toml`, surfacing a failure as one
+/// dim notice. Shared by the settings watch's three wake points in
+/// [`Repl::read_input`] so they cannot drift (doc/settings_reload.md).
+///
+/// The write goes through the normal content path (it consumes the live frame
+/// and brings it back below), so the prompt survives the notice; the settle
+/// that follows the `break None` repaints it with the reloaded store behind it.
+fn reload_after_edit(app_state: &Arc<crate::app_state::AppState>, content: &Content) {
+    if let Err(msg) = app_state.reload_settings() {
+        content.display_text(&msg);
+    }
+}
+
 /// Editor content: the prompt on row 0, the wrapped buffer below it.
 ///
 /// Holds the session's editor *handle* and content's streaming flag — the
@@ -1473,6 +1486,11 @@ impl Repl {
         // the sole stdin owner; this loop consumes what it forwards rather
         // than calling `event::poll`/`event::read` itself.
         keys: &mut UnboundedReceiver<InputEvent>,
+        // Event-driven watch of `settings.toml` (doc/settings_reload.md), when
+        // one in the caller armed it. `None` in piped/batch runs and whenever
+        // the watch could not be armed — every use below then degrades to a
+        // plain block on `keys`, today's behaviour.
+        settings_watch: Option<&crate::settings_watch::SettingsWatch>,
     ) -> Option<InputAction> {
         // Re-anchor the draw cache to the real cursor (DSR) before the first
         // paint (plan §4.2).
@@ -1643,6 +1661,19 @@ impl Repl {
                 session.prose.poll_timeout()
             };
             let ev: Option<InputEvent> = loop {
+                // An external `settings.toml` edit that landed while we were
+                // busy (this cycle's settle, an $EDITOR round-trip, a turn)
+                // wins over any key queued with it: reload before dispatching
+                // so the key handler reads the fresh store
+                // (doc/settings_reload.md). `break None` re-evaluates — the
+                // settle below re-derives every open overlay's rows from the
+                // reloaded store, so an already-open `/model` or `/set`
+                // repaints. The key, if any, stays on the channel and lands on
+                // the next iteration, against the reloaded store.
+                if settings_watch.is_some_and(|w| w.take_pending()) {
+                    reload_after_edit(app_state, content);
+                    break None;
+                }
                 // Keys a window pump parked while the REPL loop was
                 // suspended inside an LLM window (the compaction
                 // summarization — `WindowPump`) dispatch exactly as if they
@@ -1659,18 +1690,49 @@ impl Repl {
                         e => break Some(e),
                     }
                 }
-                // One event off the reader's queue. A deadline when a prose
-                // request may wake us; a block otherwise. The reader is the
-                // sole sender and lives for the process, so a `None` here means
-                // it is gone — treated as a read error, as `event::read`'s `Err`
-                // was.
-                let e: Option<InputEvent> = match prose_wait {
-                    Some(d) => match tokio::time::timeout(d, keys.recv()).await {
-                        Ok(Some(ev)) => Some(ev),
-                        Ok(None) => return None,
-                        Err(_) => break None, // prose wake: re-eval
-                    },
-                    None => keys.recv().await,
+                // One event off the reader's queue, a prose-completion wake,
+                // and the settings watch. A `None` off the key channel means
+                // the reader (sole sender, process lifetime) is gone — a read
+                // error, as `event::read`'s `Err` was.
+                //
+                // `biased` and the watch arm first: when an edit and a key
+                // become ready in the same poll, the reload must win, so the
+                // key that follows reads the fresh store. A poked-but-not-yet-
+                // drained event is already handled at the loop top above.
+                let e: Option<InputEvent> = if let Some(watch) = settings_watch {
+                    match prose_wait {
+                        Some(d) => tokio::select! {
+                            biased;
+                            _ = watch.notified() => {
+                                // Drain the flag too, or the loop-top check
+                                // above would reload a second time next round.
+                                if watch.take_pending() {
+                                    reload_after_edit(app_state, content);
+                                }
+                                break None;
+                            }
+                            e = keys.recv() => e,
+                            _ = tokio::time::sleep(d) => break None, // prose wake
+                        },
+                        None => tokio::select! {
+                            biased;
+                            _ = watch.notified() => {
+                                if watch.take_pending() {
+                                    reload_after_edit(app_state, content);
+                                }
+                                break None;
+                            }
+                            e = keys.recv() => e,
+                        },
+                    }
+                } else {
+                    match prose_wait {
+                        Some(d) => match tokio::time::timeout(d, keys.recv()).await {
+                            Ok(e) => e,
+                            Err(_) => break None, // prose wake: re-eval
+                        },
+                        None => keys.recv().await,
+                    }
                 };
                 match e {
                     // The reader's forwarded Resize: republish —

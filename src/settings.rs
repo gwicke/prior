@@ -556,6 +556,20 @@ impl SettingsStore {
         Ok(())
     }
 
+    /// Re-apply `other`'s values for `keys` onto `self`, bypassing
+    /// validation — the values were validated when they entered the store,
+    /// and a round-trip through `value`/`apply` is canonical for every key.
+    /// Used by
+    /// [`AppState::reload_settings`](crate::app_state::AppState::reload_settings)
+    /// to keep session-pinned keys (scalars the CLI resolved at startup)
+    /// across a disk reload, so a file edit cannot clobber `--yolo` &c.
+    pub(crate) fn carry_keys_from(&mut self, other: &SettingsStore, keys: &[SettingKey]) {
+        for key in keys {
+            let v = other.value(*key);
+            self.apply(*key, &v);
+        }
+    }
+
     /// Validate, apply, and persist a new value for `key`.
     pub fn set_value(&mut self, key: SettingKey, value: &str) -> Result<(), String> {
         self.apply_value(key, value)?;
@@ -819,6 +833,25 @@ mod tests {
             models: std::collections::HashMap::new(),
             path: Some(path.to_path_buf()),
         }
+    }
+
+    /// `carry_keys_from` re-applies exactly the listed keys from `other`,
+    /// leaving every other value as the (freshly loaded) file had it. This is
+    /// the pinned-CLI-key rule a reload rests on (doc/settings_reload.md).
+    #[test]
+    fn carry_keys_from_copies_only_the_listed_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fresh = store(&tmp.path().join("settings.toml"));
+        fresh.security_mode = "confirm".into();
+        fresh.tool_call_limit = 5;
+        let mut prev = store(&tmp.path().join("settings.toml"));
+        prev.security_mode = "yolo".into();
+        prev.tool_call_limit = 99;
+
+        fresh.carry_keys_from(&prev, &[SettingKey::SecurityMode]);
+
+        assert_eq!(fresh.security_mode, "yolo", "the pinned key is carried");
+        assert_eq!(fresh.tool_call_limit, 5, "an unlisted key keeps the file");
     }
 
     #[test]

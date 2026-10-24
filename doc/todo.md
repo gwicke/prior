@@ -51,6 +51,8 @@ and link a doc/ and/or commit hash
     - highlighting often char-wise - not helpful. require runs or tight clusters of matches?
 - [ ] tool errors: split the operator's view from the model's, then unredact — path_leak_risks.md
       (`edit` done; `read`/`write`/`glob`/`grep`/`list`/`sed` open)
+- [x] settings.toml live reload: `notify` watch re-reads the file on external edits so `/model`/`/set`
+      listings and the Ctrl-E dialog are current without a restart. `doc/settings_reload.md`.
 - [x] Status bar context usage stale after compaction — `apply_compaction` drops the last
       completion's report (`last_input_tokens: Option<u64>`); the figure falls back to the on-demand
       estimate (turn-boundary write) until the next completion reports. `/stat` shows the same

@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use prior::termio::TermIO;
-use prior::{config::Config, create_agent, AgentConfig, Content, SettingsStore};
+use prior::{config::Config, create_agent, AgentConfig, Content, SettingKey, SettingsStore};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -225,6 +225,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .and_then(|name| config.recipes.get(name).cloned());
 
+    // Keys whose in-session value came from a CLI flag or recipe rather than
+    // the settings file. A live reload (doc/settings_reload.md) re-applies
+    // these over the freshly loaded file, so an external edit can never
+    // clobber an explicit `--yolo`/`--model`/… for the rest of the session.
+    // Everything not listed here reloads from disk as written. Computed here,
+    // before the resolution below consumes the `args` fields.
+    let mut settings_pins: Vec<SettingKey> = Vec::new();
+    if args.yolo.is_some() || recipe.as_ref().is_some_and(|r| r.yolo.is_some()) {
+        settings_pins.push(SettingKey::SecurityMode);
+    }
+    if args.tool_call_limit.is_some() {
+        settings_pins.push(SettingKey::ToolCallLimit);
+    }
+    if args.provider.is_some()
+        || args.model.is_some()
+        || recipe
+            .as_ref()
+            .is_some_and(|r| r.provider.is_some() || r.model.is_some())
+    {
+        settings_pins.push(SettingKey::DefaultModel);
+    }
+    if args.persona.is_some() || recipe.as_ref().is_some_and(|r| r.persona.is_some()) {
+        settings_pins.push(SettingKey::DefaultPersona);
+    }
+
     // Provider/model precedence (CLI > recipe > file `default_model` > built-in):
     // `settings.toml`'s `default_model = "provider:model"` is the file-level
     // fallback that the `/set default_model` menu writes. `default_model` is a
@@ -412,7 +437,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", response);
                 }
             } else {
-                prior::run_interactive(agent_config, settings, args.resume).await?;
+                prior::run_interactive(agent_config, settings, args.resume, settings_pins).await?;
             }
         }
     }
