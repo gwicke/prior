@@ -29,8 +29,8 @@ record; only the request is remapped to the upstream. Aliases may be cross-vendo
 
 ## One composition
 
-`AppState::resolved_models()` is the single catalog+settings composition, and every path that shows
-or describes a model reads it:
+`AppState::resolved_models()` is the single catalog+settings composition ("resolution"), and every
+path that shows or describes a model reads it:
 
 - `overlay()` gains the alias step above.
 - `resolved_entry()` stops being a second composition and becomes a lookup into `resolved_models()`
@@ -46,27 +46,31 @@ they already hold.
 
 ## What an entry carries
 
-Two new `ModelEntry` fields, both filled by `overlay`:
+One new `ModelEntry` field, filled by `overlay`:
 
-- `alias_for: Option<String>` — for display and to derive the wire provider.
-- `reasoning_map: [Option<String>; 5]` — the resolved reasoning disclosure, indexed by prior rank.
+- `reasoning_map: [Option<String>; 5]` — the resolved reasoning mapping, indexed by prior rank.
+
+Nothing else. An entry does not need to know it is an alias: the wire provider is used *inside*
+`overlay` to build the map step, and the alias's display label comes from the record's description.
 
 ## Reasoning, resolved
 
-`reasoning_map[rank]` is the effort a preset **lands on** — what the header shows today (`med →
-high` on DeepSeek), not the spelling sent. Those differ, and the user cares about what they get.
-`off` is `None`, as is every level when the provider has no effort vocabulary.
+`reasoning_map[rank]` is the **provider spelling** the preset maps to — the string the backend puts
+on the wire (`med → medium` on DeepSeek). It is *total* over the five prior levels: a provider that
+publishes only `["max","high","low"]` still maps `med`, because the provider's request table says
+what `med` becomes. `off` is `None` (absence of reasoning is not an effort), and every level is
+`None` when the provider has no vocabulary.
 
-Because a flat level resolves to itself when the model publishes it, the value set is exactly the
-levels the user can reach, so it doubles as the "supports" line and the `/model` `efforts` fact;
-`reasoning_levels` stops being displayed. The map is populated whenever the provider has a
-vocabulary, published levels or not — even the table alone tells the user where a preset lands.
+`overlay` fills it with one call per level to `params::resolve_effort_for(wire_provider, level, support)`
+— the same function the backend calls to build its request. So the menu and the wire share one
+implementation of the mapping: the entry holds the answer, and the backend recomputes it per request
+because a `/reasoning` override can change the level between turns. Neither re-derives the tables.
+The five calls can build one table per provider rather than scanning per level.
 
-`overlay` builds it by calling the same two `params.rs` helpers the backend calls — `resolve_effort_for`
-and `provider_served_effort` — so there is one implementation of the mapping with two consumers: the
-entry keeps the landing, the backend reads the spelling it sends. Neither re-derives, so disclosure
-and wire cannot drift. `model_catalog` already depends on `params`; the cost is one call per entry
-under the existing memo. The provider is the **wire** provider, taken from `alias_for` when set.
+Everything downstream is pure formatting: `/reasoning`'s rows and header print each preset's
+spelling. The provider's own request table (`deepseek maps: medium→high`) is disclosed alongside, so
+"what we send" and "what it runs as" are both visible — a spelling we send can differ from the effort
+the service actually runs.
 
 `reasoning_support` stays on the backend path and keeps no menu caller.
 
@@ -87,13 +91,13 @@ bar, `/stat` and `default_model`, while `plan_rebuild` fingerprints the wire —
 
 - `model_settings`: `alias_for` key — `KEYS`, `key_hint`, `coerce` (quoted `provider:model`, both
   halves non-empty), `apply_one`, `value_of`, `is_empty`, the fragment renderer.
-- `model_catalog`: `overlay` injects alias entries and appends record-only entries; `resolved_entry`
-  delegates to `resolved_models`; `ModelEntry` gains `alias_for` and `reasoning_map`.
-- `params`: `reasoning_map(provider, support) -> [Option<String>; 5]`.
+- `model_catalog`: `overlay` injects alias entries and appends record-only entries, filling
+  `reasoning_map`; `resolved_entry` delegates to `resolved_models`; `ModelEntry` gains
+  `reasoning_map`.
+- `params`: `reasoning_map(wire_provider, support) -> [Option<String>; 5]`.
 - `agent/build.rs`: `AgentConfig.alias_for`; `create_agent` derives and uses the wire pair.
 - `app_state`: activation and `update_settings` seed `alias_for`; a lock-free `resolve_entry` inner.
-- `v25_model`: always `AppState` + `show_recents`; the header shows `alias for: …`; the routing
-  inert-note keys off the wire provider.
+- `v25_model`: always `AppState` + `show_recents`.
 - `v25_reasoning`: renders `reasoning_map` from the active resolved entry.
 - `v25_stat` / `status.rs`: `session_stats_lines` takes the resolved entry rather than `stored`.
 
@@ -119,8 +123,7 @@ recipe/CLI plumbing. An alias is an ordinary catalog row plus one remap at build
 ## Display
 
 - Picker row: description defaults to `alias for <upstream>` when the record sets none.
-- `/model <alias>` header: an `alias for: <upstream>` line, plus the target's facts (from the
-  upstream entry) and the alias's own settings.
+- `/model <alias>` header: the alias's own settings over the upstream's facts, as for any model.
 - Status bar / `/stat` / session: the identity.
 
 ## Tests
@@ -129,11 +132,11 @@ recipe/CLI plumbing. An alias is an ordinary catalog row plus one remap at build
   `write_to_doc` / `read_from_doc`; malformed target, self-alias and alias-of-alias are loud;
   `is_empty` counts `alias_for`.
 - `model_catalog`: `overlay` yields an alias row with the upstream's facts and the alias's
-  overrides, carrying `alias_for` and a `reasoning_map` computed from the **wire** provider; an
-  uncatalogued upstream falls back to the record alone; `resolved_entry(alias)` matches the list
-  row; a colliding alias does not duplicate.
-- `params`: `reasoning_map` matches the header's current landings for deepseek/openai; `off` and a
-  vocabulary-less provider give all-`None`.
+  overrides, carrying a `reasoning_map` computed from the **wire** provider; an uncatalogued upstream
+  falls back to the record alone; `resolved_entry(alias)` matches the list row; a colliding alias
+  does not duplicate.
+- `params`: `reasoning_map` is total and matches `resolve_effort_for` for every level; `off` and a
+  vocabulary-less provider give all-`None`; DeepSeek maps `med → medium`.
 - Build/rebuild: activating an alias seeds `alias_for`; `create_agent` matches the **wire** provider;
   `plan_rebuild` fires once when `alias_for` changes.
 - Interactive: switching to an alias leaves the identity in `AppState::model()`, the session header
