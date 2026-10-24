@@ -1,6 +1,7 @@
 [workspace]
 members = [".", "crates/slashdot-menu", "crates/slashdot-tui", "crates/bsed-blockedit", "crates/bsed"]
 resolver = "3"
+package = { version = "0.1.0" }
 
 # Two lints that fire on shape rather than on correctness. Both are answered by
 # "extract a type", and here the extraction would cost more than it buys: the
@@ -16,6 +17,13 @@ resolver = "3"
 [workspace.lints.clippy]
 type_complexity = "allow"
 too_many_arguments = "allow"
+
+[workspace.dependencies]
+# Sub-crates: versions inherited from workspace.package
+bsed = { path = "crates/bsed" }
+bsed-blockedit = { path = "crates/bsed-blockedit" }
+slashdot-menu = { path = "crates/slashdot-menu" }
+slashdot-tui = { path = "crates/slashdot-tui" }
 
 [package]
 name = "prior-agent"
@@ -39,9 +47,9 @@ workspace = true
 # `reqwest` gives the concrete provider clients their `from_env` / `client`
 # constructors on the shared `rig-reqwest` transport.
 rig-core = { version = "0.45.0", features = ["derive", "reqwest"] }
-slashdot-menu = { version = "0.1.0", path = "crates/slashdot-menu" }
-slashdot-tui = { version = "0.1.0", path = "crates/slashdot-tui" }
-bsed-blockedit = { version = "0.1.0", path = "crates/bsed-blockedit" }
+slashdot-menu = { workspace = true }
+slashdot-tui = { workspace = true }
+bsed-blockedit = { workspace = true }
 rig-agent = { version = "0.45.0", features = ["derive"] }
 rig-reqwest = { version = "0.45.0" }
 tokio = { version = "1.0", features = ["full"] }
