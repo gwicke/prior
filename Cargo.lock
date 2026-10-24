@@ -1701,7 +1701,6 @@ name = "prior-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bsed",
  "bsed-blockedit",
  "chrono",
  "clap",

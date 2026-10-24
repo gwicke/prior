@@ -17,7 +17,7 @@ Injecting priors into your code since 2026.
 ## Quick start
 
 ```bash
-cargo install prior-agent
+cargo install prior-agent bsed
 export DEEPSEEK_API_KEY="..."
 prior --help
 ```

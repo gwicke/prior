@@ -35,7 +35,12 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build project
-        run: cargo build --verbose
+        # `--workspace` is load-bearing: `bsed` is a `[[bin]]` of the `bsed`
+        # crate, not of prior-agent, so a root-only build would not produce
+        # `target/debug/bsed`. The `sed` tool tests resolve that binary from the
+        # target profile dir and *skip* when it is absent — which would let the
+        # whole sed/bsed path go untested while the job stays green.
+        run: cargo build --workspace --verbose
 
       - name: Install cargo-nextest
         # Needed because `cargo test` runs test binaries one at a time, and the
