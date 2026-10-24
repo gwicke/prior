@@ -103,7 +103,10 @@ jobs:
 
       # Deterministic release build: optimized, stripped of debug info
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        # `-p` both: a plain `cargo build` in a workspace root that is also a
+        # package builds only that package, so `bsed` (owned by the `bsed`
+        # crate) would be missing from the archive.
+        run: cargo build --release --target ${{ matrix.target }} -p prior-agent -p bsed
         env:
           # Cross-compilation linker: use aarch64 gcc for Linux ARM builds
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc

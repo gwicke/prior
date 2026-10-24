@@ -484,7 +484,7 @@ identical to the grep/`rg` path:
   reason: the namespace starts from a cleared environment, so there is no
   `$PATH` to resolve `bsed` by even if the host has one, and the default
   bindings cover only the workspace plus `/usr`, `/bin`, `/lib`, `/lib64` — not
-  `~/.cargo/bin`, where `cargo install --path .` puts it. Passing the bare name
+  `~/.cargo/bin`, where `cargo install bsed` puts it. Passing the bare name
   therefore works on a developer's machine (where a `bsed` may be on `/usr`) and
   fails for everyone who installed it the documented way. Resolve the absolute
   path once via `$PATH` on the host (`bsed_path`), pass that in argv, and add it
@@ -901,28 +901,21 @@ multi-file batch into per-file, pi-compatible tool calls for session storage is
 the same operation, and it now has one tested implementation to call rather than
 a second one to write.
 
-**Distribution: one `cargo install --path .`, two binaries.** Cargo installs
-every `[[bin]]` target of the package you point it at, so the only question is
-whether `bsed` is a target of the `prior` package or of a different one. It
-should be a target of `prior`, as a two-line shim that delegates to the
-crate:
+**Distribution: two crates, one `cargo install` command.** The `bsed` binary is
+owned by the `bsed` crate (crates/bsed), which is the **sole** package in the
+workspace that declares a `[[bin]] name = "bsed"`. This is not arbitrary: cargo
+emits an `output filename collision` warning (cargo#6313, "may become a hard
+error") when two workspace members declare the same binary name on any
+workspace-wide build. By keeping the declaration in `crates/bsed`, the
+standalone installability is preserved (`cargo install bsed` from the registry,
+or `cargo install --path crates/bsed` from source) and the collision is avoided.
 
-```rust
-// prior/src/bin/bsed.rs
-fn main() -> std::process::ExitCode { bsed::cli::main() }
-```
-
-with `bsed = { path = "crates/bsed" }` as a dependency.
-
-Then `cargo install --path .` installs **both** binaries, while `crates/bsed`
-stays self-contained and separately installable later
-(`cargo install --path crates/bsed`, or published and installed by name). The
-release build already produces both, so `release.yml` needs only the archive
-step updated and `install.sh` only two names. The cost is honest and small:
-`prior` gains a compile-time dependency on `sed-rs`, and the tarball grows by
-one binary — worth paying for "the tool is simply there after a normal install",
-which is what turns the conditional advertisement in §9 into graceful
-degradation rather than a feature most users never get.
+For users installing from the registry, `cargo install prior-agent bsed` is a
+single command that installs both crates (multi-crate install is stable since
+cargo 1.87). For source installs, two `--path` invocations are required
+(`cargo install --path . && cargo install --path crates/bsed`), since
+`--path` cannot be repeated. The release archives continue to ship both
+binaries, and `install.sh` installs both from the extracted archive.
 
 ## 8. Crate layout
 
@@ -958,10 +951,9 @@ with no behaviour change, and it de-risks the crate work.
 ## 9. Integration in prior
 
 - **Where**: `Cargo.toml`
-  - **Change**:
-    `members = [".", "crates/slashdot_menu", "crates/bsed_blockedit", "crates/bsed"]`;
-    `bsed_blockedit = { path = … }`. add `bsed` as a dep, purely for the `bsed` shim
-    binary (§7).
+  - **Change**: `bsed` is **not** a dependency. The `bsed` binary comes from the
+    `bsed` crate; prior shells out to it. `bsed-blockedit` remains the only dep
+    from the bsed family (for the `edit` tool's block parsing / apply).
 - **Where**: `src/tools.rs`
   - **Change**:
     `#[rig_tool(name = "sed", required(path, expressions))] async fn sed_preview(path, expressions, context: ContextLines)`:
@@ -998,9 +990,8 @@ with no behaviour change, and it de-risks the crate work.
   - **Change**: extract and install both names from the one archive; warn when
     the second is missing.
 - **Where**: `.github/workflows/release.yml`
-  - **Change**: `cargo build --release --target …` already builds every
-    workspace member, so the archive step just needs both binaries:
-    `tar … prior bsed`.
+  - **Change**: `cargo build --release --target … -p prior-agent -p bsed`
+    (explicit packages; a root-only build does not build `bsed`).
 
 ## 10. Worked example (real prototype output)
 
@@ -1105,8 +1096,10 @@ row points to.
   - **Where**: §6.1
 - **#**: 5
   - **Question**: Distribution
-  - **Decision**: one `cargo install --path .` installs both, via a `[[bin]]`
-    shim; `crates/bsed` stays independently installable
+  - **Decision**: `crates/bsed` is the **sole** declarer of the `bsed` binary in the
+    workspace (avoiding cargo#6313 collision). Standalone `cargo install bsed`
+    works. Registry installs: `cargo install prior-agent bsed` (one command).
+    Source installs require two `--path` invocations. Release archives ship both.
   - **Where**: §7
 - **#**: 6
   - **Question**: `crates/bsed_blockedit`

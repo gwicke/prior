@@ -132,8 +132,8 @@ impl Out {
     }
 }
 
-/// Entry point shared by the standalone binary and prior's shim, so both
-/// resolve the same arguments the same way.
+/// Entry point of the standalone binary. Kept in the library (rather than in
+/// `src/bin/bsed.rs`) so the argv handling is reachable from tests.
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {

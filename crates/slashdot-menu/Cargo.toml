@@ -1,6 +1,6 @@
 [package]
 name = "slashdot-menu"
-version = "0.1.0"
+version = { workspace = true }
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Data-driven slash-menu engine: descriptors, path grammar, filter/sort, and overlay interpreter."
@@ -14,8 +14,8 @@ workspace = true
 fuzzy-matcher = "0.3"
 unicode-width = "0.2"
 async-trait = "0.1"
-slashdot-tui = { version = "0.1.0", path = "../slashdot-tui" }
+slashdot-tui = { workspace = true }
 
 [dev-dependencies]
 futures = "0.3"
-slashdot-tui = { version = "0.1.0", path = "../slashdot-tui", features = ["test-helpers"] }
+slashdot-tui = { workspace = true, features = ["test-helpers"] }

@@ -1,6 +1,6 @@
 [package]
 name = "slashdot-tui"
-version = "0.1.0"
+version = { workspace = true }
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Drawing stack for composing scrollback above raw / frame content: RenderElement/RenderManager, Draw, TermIO, ANSI/width utilities."

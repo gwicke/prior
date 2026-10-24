@@ -773,7 +773,7 @@ const SED_CAPTURE_SLACK: usize = 8 * 1024;
 /// Resolved rather than passed by name, because the tool call goes through
 /// Bubblewrap, and the namespace does not inherit `$PATH` (it starts from a
 /// cleared environment) and only binds the workspace plus `/usr`, `/bin`,
-/// `/lib`, `/lib64`. A `cargo install --path .` puts `bsed` in `~/.cargo/bin`,
+/// `/lib`, `/lib64`. A `cargo install bsed` puts it in `~/.cargo/bin`,
 /// which is neither on the namespace's default exec path nor bound — so by name
 /// it resolves on the host and then fails to exec inside the sandbox. The
 /// absolute path is also handed to the sandbox as an extra read-only bind, so the
@@ -839,13 +839,12 @@ fn test_bsed_path() -> Option<std::path::PathBuf> {
 ///
 /// The binary is found next to the running test executable
 /// (`target/<profile>/deps/<test>` -> `target/<profile>/bsed`). It has to have
-/// been built: these are unit tests in the crate that declares the `[[bin]]`,
-/// and Cargo does not build binaries for unit-test targets, so `cargo test`
-/// alone leaves it missing. That is why this returns `None` rather than
-/// asserting — a CI job that only runs `cargo test` should not go red over a
-/// binary it was never asked to build. The cost is that such a run does not
-/// exercise the `sed` tool at all, so CI should `cargo build` first; the skip
-/// message says so.
+/// been built. `bsed` is a `[[bin]]` of the *`bsed` crate*, not of this one, so
+/// Cargo builds it only for a workspace-wide build — a root-only `cargo build`
+/// or a `cargo test` leaves it missing. That is why this returns `None` rather
+/// than asserting — a CI job that never asked for the binary should not go red
+/// over it. The cost is that such a run does not exercise the `sed` tool at
+/// all, so CI should `cargo build --workspace` first; the skip message says so.
 #[cfg(test)]
 pub(crate) fn use_internal_bsed() -> Option<impl Drop> {
     let exe = std::env::current_exe().expect("path of the running test");
@@ -911,7 +910,7 @@ pub async fn sed_preview(
     if !bsed_available() {
         return Err(ToolError::Generic(format!(
             "the `{BSED_BIN}` binary is not on PATH, so the sed tool cannot run. \
-             Install it with `cargo install --path .` (it ships alongside prior)."
+             Install it with `cargo install bsed`."
         )));
     }
     // The path is bounds-checked against the sandbox policy, and the *check*
@@ -947,7 +946,7 @@ pub async fn sed_preview(
     let bin = bsed_path().ok_or_else(|| {
         ToolError::Generic(format!(
             "the `{BSED_BIN}` binary is not on PATH, so the sed tool cannot run. \
-             Install it with `cargo install --path .` (it ships alongside prior)."
+             Install it with `cargo install bsed`."
         ))
     })?;
     // The script leads, then the flags. `bsed` now takes options anywhere, but
@@ -4412,7 +4411,7 @@ mod edit_file_tests {
     }
 
     /// The regression that matters for anyone who installed with
-    /// `cargo install --path .`: `bsed` lands in `~/.cargo/bin`, which is
+    /// `cargo install bsed`: `bsed` lands in `~/.cargo/bin`, which is
     /// neither on the namespace's default exec path (the environment starts
     /// cleared, so there is no `$PATH`) nor bound. Resolving the absolute path is
     /// only half the fix — the file has to be bound in, or `execvp` still fails.
@@ -4422,7 +4421,7 @@ mod edit_file_tests {
         // a missing install would skip this, and an older one would test a
         // resolver this checkout does not have.
         let Some(_bsed) = super::use_internal_bsed() else {
-            eprintln!("skipping: no workspace bsed; run `cargo build` first");
+            eprintln!("skipping: no workspace bsed; run `cargo build --workspace` first");
             return;
         };
         let Some(bin) = super::bsed_path() else {
@@ -4477,7 +4476,7 @@ mod edit_file_tests {
         // resolve whatever is installed and the test would be back to testing
         // that instead.
         let Some(_bsed) = super::use_internal_bsed() else {
-            eprintln!("skipping: no workspace bsed; run `cargo build` first");
+            eprintln!("skipping: no workspace bsed; run `cargo build --workspace` first");
             return;
         };
         assert!(
@@ -4657,7 +4656,7 @@ mod edit_file_tests {
         let _cwd = CwdGuard::new();
         tokio::fs::write("a.txt", "x\n").await.unwrap();
         let Some(_bsed) = super::use_internal_bsed() else {
-            eprintln!("skipping: no workspace bsed; run `cargo build` first");
+            eprintln!("skipping: no workspace bsed; run `cargo build --workspace` first");
             return;
         };
         let script = format!("1w {}", canary_path.display());

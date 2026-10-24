@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "bsed"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "bsed-blockedit",
  "globset",
@@ -1777,7 +1777,6 @@ name = "prior-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bsed",
  "bsed-blockedit",
  "chrono",
  "clap",
