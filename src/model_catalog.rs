@@ -85,6 +85,16 @@ pub struct ModelEntry {
     /// and the disclosure in `/reasoning`'s header. Empty = no data, never
     /// remap.
     pub reasoning_levels: Vec<String>,
+    /// The resolved reasoning disclosure: for each of prior's five presets, the
+    /// provider spelling the request maps to, indexed by
+    /// [`crate::params::ReasoningLevel::rank`] (`off` is always `None`).
+    ///
+    /// Filled by [`overlay`] from the *wire* provider and this entry's effort
+    /// list, via the same `params::reasoning_map` the backend's spelling is
+    /// derived from. Runtime-only and never stored: it is a presentation of the
+    /// mapping, so a menu renders it without knowing the provider — or that a
+    /// row is an alias (doc/261023_model_aliases.md).
+    pub reasoning_map: [Option<String>; crate::params::LEVEL_COUNT],
     /// The provider's *own* default, when OpenRouter publishes one
     /// (`default_parameters`). Display only — see the note in
     /// `params::ModelParams`: knowing a default must never turn into sending
@@ -122,19 +132,108 @@ impl ModelEntry {
 /// `AppState::resolved_models` is the one caller holding both, and every model
 /// path reads the list it returns, so no path can show OpenRouter's numbers
 /// where another shows the user's overrides.
+///
+/// Three jobs, in order:
+///
+/// 1. **Metadata overlay** — each record's `where set` fields win over the
+///    catalog's.
+/// 2. **Alias injection** — a record with `alias_for` contributes a *synthetic*
+///    row under its own id, based on the upstream's catalog facts (so a bare
+///    alias still shows real numbers) with the alias's own overrides on top. A
+///    key that collides with a real catalog id keeps the catalog row.
+/// 3. **Record-only entries** — a stored model the catalog does not cover gets
+///    an entry built from the record alone, so a configured model always has a
+///    row (previously only `resolved_entry` could produce one).
+///
+/// Finally every entry's `reasoning_map` is resolved, because this is the point
+/// where both the record and the wire provider are in hand.
 pub fn overlay(
     entries: Vec<ModelEntry>,
     stored: &std::collections::HashMap<String, crate::model_settings::ModelSettings>,
 ) -> Vec<ModelEntry> {
-    entries
-        .into_iter()
-        .map(|mut entry| {
-            if let Some(settings) = stored.get(&entry.qualified()) {
-                settings.apply_to_entry(&mut entry);
+    let mut out: Vec<ModelEntry> = Vec::with_capacity(entries.len() + stored.len());
+    let mut seen: HashSet<String> = HashSet::with_capacity(entries.len());
+    for mut entry in entries {
+        if let Some(settings) = stored.get(&entry.qualified()) {
+            settings.apply_to_entry(&mut entry);
+        }
+        seen.insert(entry.qualified());
+        out.push(entry);
+    }
+    // Alias rows and record-only rows, both keyed by the record's own id. Done
+    // after the catalog pass so a key that names a real model keeps that row.
+    for (id, settings) in stored {
+        if seen.contains(id) {
+            continue;
+        }
+        let mut entry = settings
+            .alias_for
+            .as_deref()
+            .and_then(|target| find_entry(&out, target).cloned())
+            .map(|mut upstream| {
+                // The row is the *alias*: its own id and provider namespace are
+                // what the picker, the session and the settings key use. Only
+                // the upstream's facts are borrowed.
+                let (provider, model) = id.split_once(':').unwrap_or((id.as_str(), id.as_str()));
+                upstream.provider = provider.to_string();
+                upstream.id = format!("{provider}:{model}");
+                upstream.display = upstream.id.clone();
+                upstream
+            })
+            .unwrap_or_else(|| {
+                let mut e = ModelEntry::default();
+                if let Some((provider, model)) = id.split_once(':') {
+                    e.provider = provider.to_string();
+                    e.id = format!("{provider}:{model}");
+                    e.display = e.id.clone();
+                } else {
+                    e.provider = id.clone();
+                    e.id = id.clone();
+                    e.display = id.clone();
+                }
+                e
+            });
+        settings.apply_to_entry(&mut entry);
+        // An alias describes *itself*, never as the upstream's prose: the two
+        // rows would then read identically in the picker. The record's own
+        // description wins; otherwise the row says what it is.
+        if let Some(target) = settings.alias_for.as_deref() {
+            if settings.description.is_none() {
+                entry.description = Some(format!("alias for {target}"));
             }
-            entry
-        })
-        .collect()
+        }
+        out.push(entry);
+    }
+    for entry in &mut out {
+        let support = crate::params::ReasoningSupport::new(entry.reasoning_levels.clone());
+        entry.reasoning_map = crate::params::reasoning_map(&wire_provider(entry, stored), &support);
+    }
+    out
+}
+
+/// The provider whose effort vocabulary governs this entry's requests: the
+/// alias target's when it is one, else its own. Used only here, to resolve the
+/// map — nothing downstream sees it.
+fn wire_provider(
+    entry: &ModelEntry,
+    stored: &std::collections::HashMap<String, crate::model_settings::ModelSettings>,
+) -> String {
+    stored
+        .get(&entry.qualified())
+        .and_then(|s| s.alias_for.as_deref())
+        .and_then(|target| target.split_once(':'))
+        .map(|(provider, _)| provider.to_string())
+        .unwrap_or_else(|| entry.provider.clone())
+}
+
+/// Find an entry by `provider:model`, case-insensitively, the way
+/// [`lookup`] matches.
+fn find_entry<'a>(entries: &'a [ModelEntry], qualified: &str) -> Option<&'a ModelEntry> {
+    let (provider, model) = qualified.split_once(':')?;
+    entries.iter().find(|e| {
+        let (p, m) = e.qualified_parts();
+        p.eq_ignore_ascii_case(provider) && m.eq_ignore_ascii_case(model)
+    })
 }
 
 /// Curated fallback: **direct-access** pricing per million tokens.
@@ -402,6 +501,7 @@ pub fn parse_openrouter(value: &Value) -> Vec<ModelEntry> {
             supports_temperature,
             supports_top_p,
             reasoning_levels,
+            reasoning_map: [const { None }; crate::params::LEVEL_COUNT],
             default_temperature,
             default_top_p,
         });
@@ -525,6 +625,7 @@ fn extrapolate(or_entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
                         supports_temperature: e.supports_temperature,
                         supports_top_p: e.supports_top_p,
                         reasoning_levels: e.reasoning_levels.clone(),
+                        reasoning_map: [const { None }; crate::params::LEVEL_COUNT],
                         default_temperature: e.default_temperature,
                         default_top_p: e.default_top_p,
                     });
@@ -989,27 +1090,27 @@ pub fn resolved_entry(
     qualified_id: &str,
     stored: Option<&crate::model_settings::ModelSettings>,
 ) -> Option<ModelEntry> {
-    let (provider, model) = qualified_id.split_once(':')?;
-    match lookup(provider, model) {
-        Some(mut entry) => {
-            if let Some(settings) = stored {
-                settings.apply_to_entry(&mut entry);
-            }
-            Some(entry)
-        }
-        // The catalog does not cover this model, but a stored record still
-        // states facts about it — and those are the ones the user wrote
-        // themselves. Returning `None` here would throw them away, so a model
-        // OpenRouter has not published would silently lose every Ctrl-E
-        // override. The record alone, overlaid onto an empty entry, is the
-        // resolved answer: worse than a full catalog entry, never worse than
-        // nothing.
-        None => stored.map(|settings| {
-            let mut entry = ModelEntry::default();
-            settings.apply_to_entry(&mut entry);
-            entry
-        }),
+    let mut records = std::collections::HashMap::new();
+    if let Some(settings) = stored {
+        records.insert(qualified_id.to_string(), settings.clone());
     }
+    resolve(qualified_id, &records)
+}
+
+/// [`resolved_entry`] over the whole record set, so an alias can resolve its
+/// upstream's facts and a record-only model still gets an entry.
+///
+/// The single composition, delegated to by [`crate::AppState::resolved_entry`]
+/// — which hands in the store's records — and by [`resolved_entry`] for the
+/// callers that hold one record and no store. An absent id resolves to `None`
+/// (nothing is stored and the catalog does not know it).
+pub fn resolve(
+    qualified_id: &str,
+    stored: &std::collections::HashMap<String, crate::model_settings::ModelSettings>,
+) -> Option<ModelEntry> {
+    overlay(catalog_cached(), stored)
+        .into_iter()
+        .find(|e| e.qualified().eq_ignore_ascii_case(qualified_id))
 }
 
 /// The reasoning efforts this model accepts, for backend effort remapping and
@@ -1604,5 +1705,151 @@ mod tests {
         let out = overlay(entries.clone(), &Default::default());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].prompt_cost, entries[0].prompt_cost);
+    }
+
+    // ---- alias injection (doc/261023_model_aliases.md) ----
+
+    fn alias_overlay_catalog() -> Vec<ModelEntry> {
+        vec![ModelEntry {
+            provider: "openrouter".into(),
+            id: "openrouter:anthropic/claude-sonnet-4".into(),
+            display: "openrouter:anthropic/claude-sonnet-4".into(),
+            context_length: Some(200_000),
+            prompt_cost: Some(3.0),
+            completion_cost: Some(15.0),
+            description: Some("Claude Sonnet 4".into()),
+            reasoning_levels: vec!["max".into(), "high".into(), "low".into()],
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn overlay_injects_an_alias_row_from_its_upstream_facts() {
+        use crate::model_settings::ModelSettings;
+        let mut stored = std::collections::HashMap::new();
+        stored.insert(
+            "openrouter:claude-fast".to_string(),
+            ModelSettings {
+                alias_for: Some("openrouter:anthropic/claude-sonnet-4".into()),
+                ..Default::default()
+            },
+        );
+        let out = overlay(alias_overlay_catalog(), &stored);
+        let alias = out
+            .iter()
+            .find(|e| e.qualified() == "openrouter:claude-fast")
+            .expect("the alias must get a row");
+        // Its own id, the upstream's numbers.
+        assert_eq!(alias.provider, "openrouter");
+        assert_eq!(alias.context_length, Some(200_000));
+        assert_eq!(alias.prompt_cost, Some(3.0));
+        // A bare alias describes itself as one.
+        assert_eq!(
+            alias.description.as_deref(),
+            Some("alias for openrouter:anthropic/claude-sonnet-4")
+        );
+    }
+
+    #[test]
+    fn overlay_alias_own_overrides_win_over_the_upstream() {
+        use crate::model_settings::ModelSettings;
+        let mut stored = std::collections::HashMap::new();
+        stored.insert(
+            "openrouter:claude-fast".to_string(),
+            ModelSettings {
+                alias_for: Some("openrouter:anthropic/claude-sonnet-4".into()),
+                prompt_cost: Some(0.5),
+                description: Some("cheap sonnet".into()),
+                ..Default::default()
+            },
+        );
+        let out = overlay(alias_overlay_catalog(), &stored);
+        let alias = out
+            .iter()
+            .find(|e| e.qualified() == "openrouter:claude-fast")
+            .unwrap();
+        assert_eq!(alias.prompt_cost, Some(0.5));
+        assert_eq!(alias.description.as_deref(), Some("cheap sonnet"));
+        // Untouched facts still come from upstream.
+        assert_eq!(alias.completion_cost, Some(15.0));
+    }
+
+    /// The reasoning map is resolved from the **wire** provider, so a
+    /// cross-vendor alias discloses the upstream's vocabulary.
+    #[test]
+    fn overlay_resolves_the_alias_map_from_the_wire_provider() {
+        use crate::model_settings::ModelSettings;
+        // An opengroq-model aliased to deepseek: DeepSeek has its own spelling
+        // table (`med` -> `medium`) while `groq` has none.
+        let catalog = vec![ModelEntry {
+            provider: "deepseek".into(),
+            id: "deepseek:deepseek-v4.1-flash".into(),
+            display: "deepseek:deepseek-v4.1-flash".into(),
+            reasoning_levels: vec!["max".into(), "high".into(), "low".into()],
+            ..Default::default()
+        }];
+        let mut stored = std::collections::HashMap::new();
+        stored.insert(
+            "groq:cheap".to_string(),
+            ModelSettings {
+                alias_for: Some("deepseek:deepseek-v4.1-flash".into()),
+                ..Default::default()
+            },
+        );
+        let out = overlay(catalog, &stored);
+        let alias = out.iter().find(|e| e.qualified() == "groq:cheap").unwrap();
+        assert_eq!(
+            alias.reasoning_map[crate::params::ReasoningLevel::Med.rank() as usize].as_deref(),
+            Some("medium"),
+            "the wire provider (deepseek) governs the mapping"
+        );
+    }
+
+    /// An uncatalogued upstream still yields a row (record-only), so a
+    /// configured alias is always selectable.
+    #[test]
+    fn overlay_gives_an_uncatalogued_store_a_row() {
+        use crate::model_settings::ModelSettings;
+        let mut stored = std::collections::HashMap::new();
+        stored.insert(
+            "groq:my-alias".to_string(),
+            ModelSettings {
+                alias_for: Some("nowhere:ghost".into()),
+                context_length: Some(8_192),
+                ..Default::default()
+            },
+        );
+        let out = overlay(vec![], &stored);
+        let alias = out
+            .iter()
+            .find(|e| e.qualified() == "groq:my-alias")
+            .unwrap();
+        assert_eq!(alias.context_length, Some(8_192));
+        assert_eq!(
+            alias.description.as_deref(),
+            Some("alias for nowhere:ghost")
+        );
+    }
+
+    /// A key that names a real catalog id keeps the catalog row — no duplicate.
+    #[test]
+    fn overlay_does_not_duplicate_a_colliding_alias_key() {
+        use crate::model_settings::ModelSettings;
+        let mut stored = std::collections::HashMap::new();
+        stored.insert(
+            "openrouter:anthropic/claude-sonnet-4".to_string(),
+            ModelSettings {
+                alias_for: Some("openrouter:other".into()),
+                ..Default::default()
+            },
+        );
+        let out = overlay(alias_overlay_catalog(), &stored);
+        assert_eq!(
+            out.iter()
+                .filter(|e| e.qualified() == "openrouter:anthropic/claude-sonnet-4")
+                .count(),
+            1,
+            "the catalog row is kept, not duplicated"
+        );
     }
 }

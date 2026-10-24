@@ -105,6 +105,10 @@ pub(crate) struct RebuildFingerprint {
     /// dedupe it away — the user edited something, which is exactly the signal
     /// the dedupe is meant to wait for.
     pub context_limit: Option<u64>,
+    /// The wire alias. A Ctrl-E that repoints `alias_for`, or an alias/upstream
+    /// switch with an unchanged id, is a different request — so it belongs to
+    /// the fingerprint, and the rebuild is how it reaches the wire.
+    pub alias_for: Option<String>,
 }
 
 /// Decide whether the convergence step should rebuild the agent this cycle.
@@ -138,7 +142,8 @@ pub(crate) fn plan_rebuild(
         // The window is compared because it reaches the mid-turn status bar
         // only through a rebuild, and a per-model `context_length` override
         // moves nothing else here.
-        || applied.context_limit != target.context_limit;
+        || applied.context_limit != target.context_limit
+        || applied.alias_for != target.alias_for;
     if !changed {
         return None;
     }
@@ -148,6 +153,7 @@ pub(crate) fn plan_rebuild(
         routing: target.routing.clone(),
         persona: target.persona_name.clone(),
         context_limit: target.context_limit,
+        alias_for: target.alias_for.clone(),
     };
     if last_attempt == Some(&attempt) {
         return None;
@@ -505,6 +511,9 @@ impl Interactive {
             // target already holds the record's value, so copy it whenever the
             // agent is rebuilt (a no-op when it did not change).
             new_cfg.routing = target.routing.clone();
+            // The wire alias moves with the target like routing: it has no
+            // runtime mutation path, so a rebuild is how an edit reaches it.
+            new_cfg.alias_for = target.alias_for.clone();
             if persona_changed {
                 new_cfg.persona_name = target.persona_name.clone();
                 new_cfg.persona_prompt = target
@@ -1188,6 +1197,7 @@ mod tests {
             params,
             routing: None,
             context_limit: None,
+            alias_for: None,
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
@@ -1223,9 +1233,36 @@ mod tests {
                 routing: None,
                 persona: None,
                 context_limit: None,
+                alias_for: None,
             })
         )
         .is_none());
+    }
+
+    /// Repointing `alias_for` (or switching alias <-> upstream) is a different
+    /// request, so it must rebuild — and once. Same distinct-target rule as the
+    /// other fields.
+    #[test]
+    fn plan_rebuild_fires_once_when_alias_for_changes() {
+        let p = crate::params::ModelParams {
+            reasoning: Some(crate::params::ReasoningLevel::Med),
+            temperature: None,
+            top_p: None,
+        };
+        let mut base = gate_cfg("openrouter", "claude-fast", p);
+        base.alias_for = Some("openrouter:anthropic/claude-sonnet-4".into());
+        let mut repointed = base.clone();
+        repointed.alias_for = Some("openrouter:anthropic/claude-opus-4".into());
+
+        let first = plan_rebuild(&base, &repointed, None).expect("a new target rebuilds");
+        assert!(
+            plan_rebuild(&base, &repointed, Some(&first)).is_none(),
+            "once"
+        );
+        // Dropping the alias (alias -> upstream) is a change too.
+        let mut plain = base.clone();
+        plain.alias_for = None;
+        assert!(plan_rebuild(&base, &plain, None).is_some());
     }
 
     /// A temperature-only change rebuilds: it is baked into the agent's request
@@ -1531,6 +1568,7 @@ mod tests {
             params: Default::default(),
             routing: None,
             context_limit: None,
+            alias_for: None,
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
@@ -1605,6 +1643,7 @@ mod tests {
             params: Default::default(),
             routing: None,
             context_limit: None,
+            alias_for: None,
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,

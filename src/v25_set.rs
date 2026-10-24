@@ -157,7 +157,10 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
         let child = crate::v25_model::ModelNode::new(
             Box::new(move || reader.with_settings(|s| s.default_model.clone())),
             Box::new(move |model| writer.set_setting(SettingKey::DefaultModel, model)),
-            None, // no recent models for /set
+            app_state.clone(),
+            // A settings write is not a model change: no recents, and the
+            // action leaf below writes `default_model` rather than switching.
+            false,
         );
         // Same catalog listing as the live `/model`, but its own action leaf:
         // here "activate" writes `default_model` in settings.toml. It must not
@@ -217,7 +220,7 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
             }),
             // A *default* is not the running model, so there is nothing to
             // report effort mappings for.
-            active_model_fn: None,
+            app: None,
         };
         let mut wrapper: SlashDotMenuNode = ListingNode::new(
             app_state,

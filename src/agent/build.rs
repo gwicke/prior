@@ -90,6 +90,16 @@ pub struct AgentConfig {
     /// Carried but unused on every provider but `openrouter`
     /// (doc/261017_openrouter_provider_selection.md §1).
     pub routing: Option<crate::model_settings::Routing>,
+    /// The `provider:model` this config's model is an *alias* for, if any
+    /// (doc/261023_model_aliases.md). Seeded at activation like `routing` and
+    /// refreshed by a Ctrl-E of the active model.
+    ///
+    /// `provider`/`model` stay the *identity* — the session header,
+    /// `ModelChange`, the status bar and `default_model` all speak of the alias
+    /// — while [`create_agent`] derives the *wire* pair from this with
+    /// [`Self::wire_id`]. Settings are never inherited from the upstream: the
+    /// alias's own params and routing are what is sent.
+    pub alias_for: Option<String>,
     /// The target model's context window, *resolved* — the catalog overlaid
     /// with any stored per-model override.
     ///
@@ -149,6 +159,19 @@ impl AgentConfig {
     pub fn qualified_model_id(&self) -> String {
         format!("{}:{}", self.provider, self.model)
     }
+
+    /// The `provider:model` that actually goes on the wire: the alias target
+    /// when one is set, else the identity.
+    ///
+    /// One derivation, used by [`create_agent`] for the client, the params and
+    /// the message logger — the same rule the menus apply to a resolved entry's
+    /// implicit wire provider, so disclosure and request agree.
+    pub fn wire_id(&self) -> (String, String) {
+        match self.alias_for.as_deref().and_then(|t| t.split_once(':')) {
+            Some((p, m)) => (p.to_string(), m.to_string()),
+            None => (self.provider.clone(), self.model.clone()),
+        }
+    }
 }
 
 /// Sentinel env-var value that triggers the interactive device-code OAuth
@@ -184,7 +207,10 @@ pub(crate) fn effective_params(
     }
     let mut notes = Vec::new();
     if let Some(requested) = overrides.reasoning {
-        let (provider, model) = app_state.with_config(|c| (c.provider.clone(), c.model.clone()));
+        // The *wire* pair: an alias's reasoning is governed by its upstream's
+        // effort list, so the note must describe the model the request actually
+        // names (doc/261023_model_aliases.md).
+        let (provider, model) = app_state.with_config(|c| c.wire_id());
         let support = crate::model_catalog::reasoning_support(&provider, &model);
         notes.extend(reasoning_remap_note(requested, &support));
     }
@@ -259,15 +285,20 @@ fn merge_openrouter_params(
 }
 
 pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
-    let provider = config.provider.to_lowercase();
-    let model = config.model.clone();
+    // The identity (`provider`/`model`) is what the session, the status bar and
+    // `default_model` speak of; the *wire* pair is what the client, the params
+    // and the message logger use. They differ only for an alias, whose own
+    // settings (params, routing) are sent unchanged to the upstream model.
+    let (wire_provider, wire_model) = config.wire_id();
+    let provider = wire_provider.to_lowercase();
+    let model = wire_model.clone();
     // What this model accepts, so a level it cannot serve is remapped instead
     // of sent and rejected. One shared composition, so the per-request path
     // (a `/reasoning` override) cannot produce a different shape than a normal
     // turn.
     let reasoning_json = request_additional_params(
-        &config.provider,
-        &model,
+        &wire_provider,
+        &wire_model,
         &config.params,
         config.routing.as_ref(),
     );
@@ -332,7 +363,11 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
             );
 
             let message_logger = if let Some(path) = &config.message_log_path {
-                Some(Arc::new(MessageLogger::new(path.clone(), config.provider.clone(), model.clone())))
+                Some(Arc::new(MessageLogger::new(
+                    path.clone(),
+                    wire_provider.clone(),
+                    wire_model.clone(),
+                )))
             } else {
                 None
             };
@@ -341,8 +376,12 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
                 rig_agent,
                 config.content,
                 config.tool_call_limit,
-                config.provider,
-                model,
+                // The agent carries the *wire* pair: it is what the per-turn
+                // params, the Anthropic-family replay rule and the message log
+                // all act on. Identity lives on `AgentConfig`, the session and
+                // `AppState`.
+                wire_provider,
+                wire_model,
                 config.params,
                 config.routing.clone(),
                 config.yolo,
@@ -1170,6 +1209,61 @@ mod tests {
 
     use crate::agent::msglog::MessageLogger;
     use crate::agent::transcript::reasoning_remap_note;
+    // ---- the wire alias (doc/261023_model_aliases.md) ----
+
+    fn cfg_with_alias(alias_for: Option<&str>) -> AgentConfig {
+        AgentConfig {
+            provider: "openrouter".into(),
+            model: "claude-fast".into(),
+            content: Arc::new(crate::content::Content::quiet()),
+            yolo: false,
+            quiet: true,
+            confirm_port: None,
+            params: Default::default(),
+            routing: None,
+            alias_for: alias_for.map(str::to_string),
+            context_limit: None,
+            tool_call_limit: 10,
+            system_message_extension: None,
+            persona_prompt: None,
+            persona_name: None,
+            bash_auto_allow: None,
+            agent_prompt: None,
+            user_cancel: Arc::new(AtomicBool::new(false)),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            sandbox: None,
+            show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
+            message_log_path: None,
+            sessions_dir: None,
+        }
+    }
+
+    /// With no alias the wire pair is the identity.
+    #[test]
+    fn wire_id_is_the_identity_without_an_alias() {
+        let cfg = cfg_with_alias(None);
+        assert_eq!(cfg.wire_id(), ("openrouter".into(), "claude-fast".into()));
+    }
+
+    /// With an alias the identity stays put and only the wire moves — split at
+    /// the first colon so a model id's own colons survive.
+    #[test]
+    fn wire_id_is_the_alias_target() {
+        let cfg = cfg_with_alias(Some("openrouter:anthropic/claude-sonnet-4"));
+        assert_eq!(cfg.qualified_model_id(), "openrouter:claude-fast");
+        assert_eq!(
+            cfg.wire_id(),
+            ("openrouter".into(), "anthropic/claude-sonnet-4".into())
+        );
+        // Cross-vendor: the provider moves too.
+        let cfg = cfg_with_alias(Some("anthropic:claude-sonnet-4"));
+        assert_eq!(
+            cfg.wire_id(),
+            ("anthropic".into(), "claude-sonnet-4".into())
+        );
+    }
+
     // ---- per-turn overrides: the request path (doc/model_settings_v2.md A.10) ----
 
     /// prior serves model ids rig's catalog does not list (its Copilot default

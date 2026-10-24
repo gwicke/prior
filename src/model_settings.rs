@@ -96,6 +96,15 @@ pub struct ModelSettings {
     /// describing the model — so it stays out of [`Self::apply_to_entry`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<Routing>,
+    /// `provider:model` of the model this record *aliases*: the row keeps its
+    /// own id (and its own settings) but every request is remapped to the
+    /// upstream (doc/261023_model_aliases.md). Settings are never inherited —
+    /// only the identity on the wire moves.
+    ///
+    /// Kept out of [`Self::apply_to_entry`]: it is a request-shaping fact, not
+    /// a catalog fact, so it never becomes a field of the resolved entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_for: Option<String>,
 
     // --- metadata overrides: used only where set ---
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,6 +187,7 @@ impl ModelSettings {
         "temperature",
         "top_p",
         "routing",
+        "alias_for",
         "context_length",
         "prompt_cost",
         "completion_cost",
@@ -200,6 +210,7 @@ impl ModelSettings {
                 "OpenRouter provider preferences: only / order / ignore / allow_fallbacks \
                  / require_parameters"
             }
+            "alias_for" => "provider:model to send requests to, while keeping this row's own id",
             "context_length" => "context window in tokens",
             "prompt_cost" => "USD per million input tokens",
             "completion_cost" => "USD per million output tokens",
@@ -220,6 +231,7 @@ impl ModelSettings {
             && self.temperature.is_none()
             && self.top_p.is_none()
             && self.routing().is_none()
+            && self.alias_for.is_none()
             && self.context_length.is_none()
             && self.prompt_cost.is_none()
             && self.completion_cost.is_none()
@@ -549,6 +561,15 @@ fn coerce_value(key: &str, item: &toml_edit::Item) -> Result<(), String> {
                 type_of(value)
             )
         }),
+        "alias_for" => {
+            let s = value.as_str().ok_or_else(|| {
+                format!(
+                    "'alias_for' must be a quoted \"provider:model\", found {}",
+                    type_of(value)
+                )
+            })?;
+            validate_target(s).map(|_| ())
+        }
         "temperature" => in_range(key, value, 0.0, 2.0),
         "top_p" => in_range(key, value, 0.0, 1.0),
         "context_length" => u64_field(key, value).map(|_| ()),
@@ -655,6 +676,22 @@ fn coerce_routing(item: &toml_edit::Item) -> Result<(), CoerceError> {
     Ok(())
 }
 
+/// A quoted `provider:model` with both halves present, or a loud error naming
+/// what was wrong. Split at the *first* colon only: model ids carry their own
+/// (`openrouter:tencent/hy3:free`).
+fn validate_target(s: &str) -> Result<(&str, &str), String> {
+    let (provider, model) = s
+        .split_once(':')
+        .ok_or_else(|| format!("'alias_for' must be \"provider:model\", found {s:?} (no ':')"))?;
+    if provider.trim().is_empty() {
+        return Err(format!("'alias_for' has an empty provider: {s:?}"));
+    }
+    if model.trim().is_empty() {
+        return Err(format!("'alias_for' has an empty model: {s:?}"));
+    }
+    Ok((provider, model))
+}
+
 fn in_range(key: &str, value: &toml_edit::Value, lo: f64, hi: f64) -> Result<(), String> {
     let n = f64_field(key, value)?;
     if !n.is_finite() || n < lo || n > hi {
@@ -721,6 +758,7 @@ fn apply_one(out: &mut ModelSettings, key: &str, item: &toml_edit::Item) {
                 .map(routing_from_table)
                 .filter(|r| !r.is_empty());
         }
+        "alias_for" => out.alias_for = v.as_str().map(str::to_string),
         "context_length" => out.context_length = v.as_integer().and_then(|i| u64::try_from(i).ok()),
         "prompt_cost" => out.prompt_cost = num(v),
         "completion_cost" => out.completion_cost = num(v),
@@ -908,6 +946,7 @@ impl ModelSettings {
             "temperature" => num(self.temperature?),
             "top_p" => num(self.top_p?),
             "routing" => format_routing(self.routing()?),
+            "alias_for" => quote(self.alias_for.as_ref()?),
             "context_length" => self.context_length?.to_string(),
             "prompt_cost" => num(self.prompt_cost?),
             "completion_cost" => num(self.completion_cost?),
@@ -1024,6 +1063,27 @@ pub fn read_from_doc(
                 out.insert(id.to_string(), settings);
             }
             Err(msg) => errors.push(format!("[{MODELS_TABLE}.{id:?}]: {msg}")),
+        }
+    }
+    // Cross-record rules, checked once the whole table is in hand: an alias
+    // must point somewhere other than itself, and one hop only (no chained
+    // aliases), so resolution never needs a loop and can't silently show an
+    // intermediate's facts.
+    for (id, record) in &out {
+        let Some(target) = record.alias_for.as_deref() else {
+            continue;
+        };
+        if target.eq_ignore_ascii_case(id) {
+            errors.push(format!(
+                "[{MODELS_TABLE}.{id:?}]: 'alias_for' points at itself ({target:?})"
+            ));
+            continue;
+        }
+        if let Some(next) = out.get(target).and_then(|r| r.alias_for.as_deref()) {
+            errors.push(format!(
+                "[{MODELS_TABLE}.{id:?}]: 'alias_for' target {target:?} is itself an alias \
+                 (for {next:?}); an alias must point at a real model, one hop only"
+            ));
         }
     }
     if !errors.is_empty() {
@@ -1711,5 +1771,70 @@ mod tests {
         assert_eq!(suggest_key("descripion"), Some("description"));
         // Nothing close enough: better to say nothing than to guess wrong.
         assert_eq!(suggest_key("banana"), None);
+    }
+
+    // ---- alias_for (doc/261023_model_aliases.md) ----
+
+    #[test]
+    fn alias_for_round_trips_through_the_file_and_the_fragment() {
+        let id = "openrouter:claude-fast";
+        let record = ModelSettings {
+            alias_for: Some("openrouter:anthropic/claude-sonnet-4".into()),
+            ..Default::default()
+        };
+        let mut d = doc("");
+        write_to_doc(&mut d, id, &record).unwrap();
+        assert_eq!(
+            read_from_doc(&d).unwrap().get(id).unwrap().alias_for,
+            record.alias_for
+        );
+
+        let text = render_fragment(id, &record, &ModelSettings::default());
+        assert!(text.contains("alias_for ="), "{text}");
+        let parsed = parse_fragment(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        assert_eq!(parsed.alias_for, record.alias_for);
+    }
+
+    /// `alias_for` counts as content: a record that sets only it must be
+    /// written, not treated as an unconfigured model.
+    #[test]
+    fn alias_for_alone_is_not_an_empty_record() {
+        let record = ModelSettings {
+            alias_for: Some("openrouter:x".into()),
+            ..Default::default()
+        };
+        assert!(!record.is_empty());
+        assert!(ModelSettings::default().is_empty());
+    }
+
+    #[test]
+    fn a_malformed_alias_target_is_loud() {
+        let err = parse_fragment("alias_for = \"no-colon\"\n").unwrap_err();
+        assert!(err.contains("provider:model"), "{err}");
+        let err = parse_fragment("alias_for = \":model\"\n").unwrap_err();
+        assert!(err.contains("empty provider"), "{err}");
+        let err = parse_fragment("alias_for = \"provider:\"\n").unwrap_err();
+        assert!(err.contains("empty model"), "{err}");
+        // The split is at the first colon, so a model id's own colons survive.
+        let ok = parse_fragment("alias_for = \"openrouter:tencent/hy3:free\"\n").unwrap();
+        assert_eq!(ok.alias_for.as_deref(), Some("openrouter:tencent/hy3:free"));
+    }
+
+    /// A record whose `alias_for` names itself, or another alias, is refused at
+    /// load time — one hop only, so resolution can never loop.
+    #[test]
+    fn self_and_chained_aliases_are_refused_at_load() {
+        let selfref = doc("[models.\"openrouter:a\"]\nalias_for = \"openrouter:a\"\n");
+        let err = read_from_doc(&selfref).unwrap_err();
+        assert!(err.contains("itself"), "{err}");
+
+        let chained = doc("[models.\"openrouter:a\"]\nalias_for = \"openrouter:b\"\n\
+             [models.\"openrouter:b\"]\nalias_for = \"openrouter:c\"\n");
+        let err = read_from_doc(&chained).unwrap_err();
+        assert!(err.contains("one hop only"), "{err}");
+
+        // A plain alias at a real model is fine.
+        let good = doc("[models.\"openrouter:a\"]\nalias_for = \"openrouter:real/model\"\n");
+        assert!(read_from_doc(&good).unwrap().contains_key("openrouter:a"));
     }
 }

@@ -78,15 +78,24 @@ impl SlashDotNode for StatNode {
             }
         };
 
+        let qualified = format!("{provider}:{model}");
+        let entry = self.app_state.resolved_entry(&qualified);
+        let routing = self.app_state.with_settings(|s| {
+            s.model_settings(&qualified)
+                .and_then(|r| r.routing().cloned())
+        });
+        // The wire provider (the alias target's when this is an alias) decides
+        // whether the routing table is inert.
+        let wire_provider = self.app_state.with_config(|c| c.wire_id().0).to_lowercase();
         crate::agent::status::session_stats_lines(
             &provider,
+            &wire_provider,
             &model,
             usage,
             session_info,
             context_figure,
-            self.app_state
-                .with_settings(|s| s.model_settings(&format!("{provider}:{model}")).cloned())
-                .as_ref(),
+            entry.as_ref(),
+            routing.as_ref(),
             &self.app_state.params(),
         )
     }

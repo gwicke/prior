@@ -783,9 +783,11 @@ fn compact_tokens(n: u64) -> String {
 
 /// The `/stat` lines for a session.
 ///
-/// `stored` is the model's per-model record and `live` its current params;
-/// both are `None`/empty when unavailable. Together they make this the place
-/// you look when a request is rejected: the provider's error names the limit it
+/// `entry` is the *resolved* catalog entry (the `resolved_models` row) and
+/// `routing` the model's stored provider preferences — neither is in the
+/// catalog, so the caller hands it in. `live` is the current params. All are
+/// `None`/empty when unavailable. Together they make this the place you look
+/// when a request is rejected: the provider's error names the limit it
 /// enforced, and these say what was actually sent and what the resolved
 /// context window is — the two facts needed to see why.
 ///
@@ -799,19 +801,22 @@ fn compact_tokens(n: u64) -> String {
 /// surfaces cannot disagree and a post-compaction `/stat` is fresh too.
 pub fn session_stats_lines(
     provider: &str,
+    wire_provider: &str,
     model: &str,
     usage: SessionUsage,
     session: Option<SessionStatsInfo>,
     context_tokens: u64,
-    stored: Option<&crate::model_settings::ModelSettings>,
+    entry: Option<&model_catalog::ModelEntry>,
+    routing: Option<&crate::model_settings::Routing>,
     live: &crate::params::ModelParams,
 ) -> Vec<String> {
-    // The *resolved* view, not the raw catalog entry: a Ctrl-E'd
+    // `entry` is the *resolved* view, handed in by the caller: a Ctrl-E'd
     // `context_length` override is what the app actually enforces, so quoting
     // OpenRouter's published number here would contradict the `/model` header
-    // on the same fact with nothing to explain the difference.
-    let entry = model_catalog::resolved_entry(&format!("{provider}:{model}"), stored);
-    let ctx_len = entry.as_ref().and_then(|e| e.context_length);
+    // on the same fact with nothing to explain the difference. Passing it in
+    // (rather than looking it up) keeps `/stat` and `resolved_models` on one
+    // composition, alias rows included.
+    let ctx_len = entry.and_then(|e| e.context_length);
 
     let mut lines: Vec<String> = Vec::new();
 
@@ -872,13 +877,15 @@ pub fn session_stats_lines(
 
     // The stored provider routing, when there is one. A non-openrouter model
     // can carry the table (the record is keyed by model, not provider), but
-    // it is inert there — say so rather than letting it look applied.
-    if let Some(r) = stored.and_then(|s| s.routing()) {
+    // it is inert there — say so rather than letting it look applied. Judged
+    // against the *wire* provider: a cross-vendor alias's routing is sent to
+    // its upstream, so it is inert when that upstream is not OpenRouter.
+    if let Some(r) = routing {
         let mut line = format!(
             "  routing: {}",
             crate::settings_editor::summarize_routing(r)
         );
-        if !provider.eq_ignore_ascii_case("openrouter") {
+        if !wire_provider.eq_ignore_ascii_case("openrouter") {
             line.push_str(" (ignored: not an OpenRouter model)");
         }
         lines.push(line);
@@ -984,10 +991,12 @@ mod stat_tests {
         let usage = SessionUsage::default();
         let lines = session_stats_lines(
             "openrouter",
+            "openrouter",
             "minimax/minimax-m3:free",
             usage,
             Some(info),
             42_000,
+            None,
             None,
             &Default::default(),
         );
@@ -1038,45 +1047,48 @@ mod stat_tests {
         use super::super::SessionUsage;
         use super::session_stats_lines;
 
-        let stored = crate::model_settings::ModelSettings {
-            routing: Some(crate::model_settings::Routing {
-                only: Some(vec!["deepinfra/fp8".into()]),
-                allow_fallbacks: Some(false),
-                ..Default::default()
-            }),
+        let routing = crate::model_settings::Routing {
+            only: Some(vec!["deepinfra/fp8".into()]),
+            allow_fallbacks: Some(false),
             ..Default::default()
         };
         let lines = session_stats_lines(
+            "openrouter",
             "openrouter",
             "some/model",
             SessionUsage::default(),
             None,
             0,
-            Some(&stored),
+            None,
+            Some(&routing),
             &Default::default(),
         );
-        let routing = lines
+        let line = lines
             .iter()
             .find(|l| l.contains("routing:"))
             .expect("routing line");
-        assert!(routing.contains("only=deepinfra/fp8"), "{routing}");
-        assert!(routing.contains("allow_fallbacks=false"), "{routing}");
-        assert!(!routing.contains("ignored"), "{routing}");
+        assert!(line.contains("only=deepinfra/fp8"), "{line}");
+        assert!(line.contains("allow_fallbacks=false"), "{line}");
+        assert!(!line.contains("ignored"), "{line}");
 
+        // A cross-vendor alias: the identity provider is openrouter but the
+        // request goes to anthropic, where the routing table is inert.
         let lines = session_stats_lines(
+            "openrouter",
             "anthropic",
             "some/model",
             SessionUsage::default(),
             None,
             0,
-            Some(&stored),
+            None,
+            Some(&routing),
             &Default::default(),
         );
-        let routing = lines
+        let line = lines
             .iter()
             .find(|l| l.contains("routing:"))
             .expect("routing line");
-        assert!(routing.contains("ignored"), "{routing}");
+        assert!(line.contains("ignored"), "{line}");
     }
 
     /// A session with no recorded cwd drops the line. `cwd` is a required
@@ -1100,10 +1112,12 @@ mod stat_tests {
             };
             let lines = session_stats_lines(
                 "openrouter",
+                "openrouter",
                 "some/model",
                 SessionUsage::default(),
                 Some(info),
                 0,
+                None,
                 None,
                 &Default::default(),
             );
@@ -1140,10 +1154,12 @@ mod stat_tests {
             };
             let lines = session_stats_lines(
                 "openrouter",
+                "openrouter",
                 "some/model",
                 SessionUsage::default(),
                 Some(info),
                 0,
+                None,
                 None,
                 &Default::default(),
             );
@@ -1164,10 +1180,12 @@ mod stat_tests {
 
         let lines = session_stats_lines(
             "openrouter",
+            "openrouter",
             "minimax/minimax-m3:free",
             SessionUsage::default(),
             None,
             0,
+            None,
             None,
             &Default::default(),
         );
@@ -1196,17 +1214,24 @@ mod stat_tests {
     #[test]
     fn stat_quotes_a_stored_context_length_not_the_catalogs() {
         let override_len = 4_096u64;
-        let stored = crate::model_settings::ModelSettings {
-            context_length: Some(override_len),
-            ..Default::default()
-        };
+        let mut records = std::collections::HashMap::new();
+        records.insert(
+            "openrouter:some/model".to_string(),
+            crate::model_settings::ModelSettings {
+                context_length: Some(override_len),
+                ..Default::default()
+            },
+        );
+        let entry = crate::model_catalog::resolve("openrouter:some/model", &records);
         let lines = session_stats_lines(
+            "openrouter",
             "openrouter",
             "some/model",
             SessionUsage::default(),
             None,
             0,
-            Some(&stored),
+            entry.as_ref(),
+            None,
             &Default::default(),
         );
         let joined = lines.join("\n");
@@ -1221,17 +1246,27 @@ mod stat_tests {
     /// every Ctrl-E override on an uncatalogued model invisible.
     #[test]
     fn stat_uses_a_stored_record_for_a_model_the_catalog_lacks() {
-        let stored = crate::model_settings::ModelSettings {
-            context_length: Some(8_192),
-            ..Default::default()
-        };
+        let mut records = std::collections::HashMap::new();
+        records.insert(
+            "openrouter:vendor/uncatalogued".to_string(),
+            crate::model_settings::ModelSettings {
+                context_length: Some(8_192),
+                ..Default::default()
+            },
+        );
+        // The record alone is enough now: `resolve` appends a record-only
+        // entry for a model the catalog does not cover.
+        let entry = crate::model_catalog::resolve("openrouter:vendor/uncatalogued", &records);
+        assert!(entry.is_some(), "a configured model must resolve");
         let lines = session_stats_lines(
+            "openrouter",
             "openrouter",
             "vendor/uncatalogued",
             SessionUsage::default(),
             None,
             0,
-            Some(&stored),
+            entry.as_ref(),
+            None,
             &Default::default(),
         );
         let joined = lines.join("\n");
@@ -1250,10 +1285,12 @@ mod stat_tests {
         };
         let lines = session_stats_lines(
             "anthropic",
+            "anthropic",
             "claude-sonnet-4",
             SessionUsage::default(),
             None,
             0,
+            None,
             None,
             &live,
         );

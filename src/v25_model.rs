@@ -22,11 +22,14 @@ pub struct ModelNode {
     active_fn: Box<dyn Fn() -> String>,
     /// Write the selected model id on submit. `Ok(())` on success.
     submit_fn: crate::SubmitFn,
-    /// The live `/model` node's app handle: recency ordering in `data()`
-    /// AND the journal record in `submit()`. `None` for
-    /// `/set default_model` — a settings write is not a model change and
-    /// must not journal a `ModelChange`.
-    live: Option<Arc<AppState>>,
+    /// The app handle: the resolved model list (alias rows included) and the
+    /// journal record in `submit()`. Always present — `/set default_model`
+    /// differs only in [`Self::show_recents`] and its action leaf, so it too
+    /// resolves models through the one composition.
+    live: Arc<AppState>,
+    /// Whether recent models may be hoisted in `data()`. False for
+    /// `/set default_model`, whose listing is not about this session's usage.
+    show_recents: bool,
     /// A Ctrl-E edit awaiting the confirm's accept arm, keyed by epoch and
     /// model id like the compaction draft. A stale stash means the data epoch
     /// moved under us, and writing it would store settings against a model
@@ -146,12 +149,14 @@ impl ModelNode {
     pub fn new(
         active_fn: Box<dyn Fn() -> String>,
         submit_fn: crate::SubmitFn,
-        live: Option<Arc<AppState>>,
+        live: Arc<AppState>,
+        show_recents: bool,
     ) -> Self {
         ModelNode {
             active_fn,
             submit_fn,
             live,
+            show_recents,
             cached_response: None,
             // `u64::MAX` is unreachable as a generation, so the first build
             // always misses the cache.
@@ -173,12 +178,12 @@ impl SlashDotNode for ModelNode {
         // revision), so this is a cheap identity read in the common case.
         let gen = crate::model_catalog::catalog_generation();
         let active_id = (self.active_fn)();
-        let recent: Vec<String> = self
-            .live
-            .as_ref()
-            .map(|r| r.recent_models())
-            .unwrap_or_default();
-        let resolved = self.live.as_ref().map(|r| r.resolved_models());
+        let recent: Vec<String> = if self.show_recents {
+            self.live.recent_models()
+        } else {
+            Vec::new()
+        };
+        let resolved = self.live.resolved_models();
 
         // Reuse only while every input the rows derive from still holds. The
         // generation is not enough on its own: `order_models` also hoists the
@@ -192,11 +197,10 @@ impl SlashDotNode for ModelNode {
         // 0 — stale, but self-consistent enough to look like a stray marker
         // rather than a missing one.
         if let Some(ref cached) = self.cached_response {
-            let overlay_same = match (&self.cached_resolved, &resolved) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                _ => false,
-            };
+            let overlay_same = self
+                .cached_resolved
+                .as_ref()
+                .is_some_and(|a| Arc::ptr_eq(a, &resolved));
             if self.cached_generation == gen
                 && self.cached_active == active_id
                 && self.cached_recent == recent
@@ -209,14 +213,9 @@ impl SlashDotNode for ModelNode {
         // An input changed (or first call) — rebuild rows.
         //
         // The *resolved* list, so a Ctrl-E'd override of cost or an index shows
-        // in the row rather than only in the `/model <id>` header. `live` is
-        // `None` under `/set default_model`, which has no store to read, so
-        // that node keeps the raw catalog — the same trade it already makes
-        // for recency.
-        let entries: Vec<crate::model_catalog::ModelEntry> = match &resolved {
-            Some(list) => list.as_ref().clone(),
-            None => crate::model_catalog::catalog_cached(),
-        };
+        // in the row rather than only in the `/model <id>` header — and so an
+        // alias gets its own row here as well as under `/model`.
+        let entries: Vec<crate::model_catalog::ModelEntry> = resolved.as_ref().clone();
         let active = if active_id.is_empty() {
             None
         } else {
@@ -240,7 +239,7 @@ impl SlashDotNode for ModelNode {
         self.cached_generation = gen;
         self.cached_active = active_id;
         self.cached_recent = recent;
-        self.cached_resolved = resolved;
+        self.cached_resolved = Some(resolved);
         Ok(response)
     }
 
@@ -263,9 +262,8 @@ impl SlashDotNode for ModelNode {
         };
         let stored = self
             .live
-            .as_ref()
-            .and_then(|app| app.with_settings(|s| s.model_settings(&model).cloned()));
-        let entry = crate::model_catalog::resolved_entry(&model, stored.as_ref());
+            .with_settings(|s| s.model_settings(&model).cloned());
+        let entry = self.live.resolved_entry(&model);
         let indent = "  ";
         let width = render_ctx.term_width.max(40);
         let mut lines = vec![format!("model: {model}")];
@@ -326,7 +324,8 @@ impl SlashDotNode for ModelNode {
 
         // Current settings: live for the active model, stored for an inactive
         // one, since "what would using this do" is the question being asked.
-        if let Some(app) = self.live.as_ref() {
+        {
+            let app = &self.live;
             if app.model() == model {
                 let p = app.params();
                 let mut live: Vec<(String, String)> = vec![(
@@ -378,10 +377,16 @@ impl SlashDotNode for ModelNode {
         // model used under two providers — but a silent no-op setting is a
         // footgun, so the detail view says so. The editor fragment stays
         // neutral: it is provider-agnostic by design (design doc §5, §8.1).
+        // The provider that actually receives the request is the alias target's
+        // when one is set, so a cross-vendor alias is judged by its upstream.
+        let wire_provider = stored
+            .as_ref()
+            .and_then(|s| s.alias_for.as_deref())
+            .and_then(|t| t.split_once(':'))
+            .map(|(p, _)| p.to_string())
+            .or_else(|| model.split_once(':').map(|(p, _)| p.to_string()));
         let inert_routing = stored.as_ref().is_some_and(|s| s.routing().is_some())
-            && !model
-                .split_once(':')
-                .is_some_and(|(provider, _)| provider.eq_ignore_ascii_case("openrouter"));
+            && !wire_provider.is_some_and(|p| p.eq_ignore_ascii_case("openrouter"));
         if inert_routing {
             lines.push(format!(
                 "{indent}note: routing only applies to openrouter models — ignored here"
@@ -399,9 +404,7 @@ impl SlashDotNode for ModelNode {
     /// and a model not yet activated this session simply has no live values to
     /// be overwritten.
     async fn edit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let Some(app) = self.live.as_ref() else {
-            return SubmitResult::Handled;
-        };
+        let app = &self.live;
         let Some(model) = drilled_model(path_args, 1) else {
             return SubmitResult::Handled;
         };
@@ -443,9 +446,7 @@ impl SlashDotNode for ModelNode {
                     "the model list changed while editing — nothing was saved".to_string(),
                 );
             }
-            let Some(app) = self.live.as_ref() else {
-                return SubmitResult::Handled;
-            };
+            let app = &self.live;
             return match app.update_settings(|s| {
                 s.apply_model_settings(&pending.model, &pending.settings);
                 Ok(())
@@ -467,10 +468,8 @@ impl SlashDotNode for ModelNode {
                 // `ModelChange` record corrects the journal. The record
                 // helper skips a value the session already holds, so
                 // re-commits stay idempotent.
-                if let Some(app) = self.live.as_ref() {
-                    if let Some(s) = app.session() {
-                        crate::agent::record_model_change(&s, &qualified).await;
-                    }
+                if let Some(s) = self.live.session() {
+                    crate::agent::record_model_change(&s, &qualified).await;
                 }
                 SubmitResult::Done(None)
             }
@@ -746,7 +745,8 @@ pub fn build_model_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu
             writer.set_model(model);
             Ok(())
         }),
-        Some(app_state.clone()),
+        app_state.clone(),
+        true,
     )
     .into();
     add_live_model_actions(&mut model_menu, app_state);
@@ -1118,7 +1118,8 @@ mod tests {
                 writer.set_model(model);
                 Ok(())
             }),
-            Some(app_state.clone()),
+            app_state.clone(),
+            true,
         )
     }
 
@@ -1727,7 +1728,8 @@ mod tests {
                 writer.set_model(m);
                 Ok(())
             }),
-            Some(app_state.clone()),
+            app_state.clone(),
+            true,
         );
         let lines = futures::executor::block_on(node.header(
             &PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " "),
@@ -1751,7 +1753,8 @@ mod tests {
         let mut node = ModelNode::new(
             Box::new(move || reader.model()),
             Box::new(|_| Ok(())),
-            Some(app_state.clone()),
+            app_state.clone(),
+            true,
         );
         let lines = futures::executor::block_on(node.header(
             &PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " "),
@@ -1788,7 +1791,8 @@ mod tests {
         let mut node = ModelNode::new(
             Box::new(move || reader.model()),
             Box::new(|_| Ok(())),
-            Some(app_state.clone()),
+            app_state.clone(),
+            true,
         );
         let header = |node: &mut ModelNode, model: &str| {
             futures::executor::block_on(node.header(
@@ -1837,7 +1841,8 @@ mod tests {
         let mut node = ModelNode::new(
             Box::new(move || reader.model()),
             Box::new(|_| Ok(())),
-            Some(app_state.clone()),
+            app_state.clone(),
+            true,
         );
         let lines = futures::executor::block_on(node.header(
             &PathArgs::new(vec!["model".into(), model.into()], " "),
@@ -1861,7 +1866,8 @@ mod tests {
                 writer.set_model(m);
                 Ok(())
             }),
-            Some(app_state.clone()),
+            app_state.clone(),
+            true,
         );
         let outcome = futures::executor::block_on(node.edit(
             1,
@@ -1892,7 +1898,8 @@ mod tests {
                 writer.set_model(m);
                 Ok(())
             }),
-            Some(app_state.clone()),
+            app_state.clone(),
+            true,
         );
         *node.pending_edit.borrow_mut() = Some(PendingEdit {
             epoch: 7,
@@ -1926,7 +1933,8 @@ mod tests {
         let mut node = ModelNode::new(
             Box::new(move || reader.model()),
             Box::new(|_| Ok(())),
-            Some(app_state.clone()),
+            app_state.clone(),
+            true,
         );
         *node.pending_edit.borrow_mut() = Some(PendingEdit {
             epoch: 3,
@@ -1959,7 +1967,8 @@ mod tests {
                 writer.set_model(m);
                 Ok(())
             }),
-            Some(app_state.clone()),
+            app_state.clone(),
+            true,
         );
         let pa = PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " ");
         let outcome = futures::executor::block_on(node.submit(1, &pa));
@@ -2276,7 +2285,8 @@ mod tests {
                 writer.set_model(m);
                 Ok(())
             }),
-            Some(app_state.clone()),
+            app_state.clone(),
+            true,
         );
         futures::executor::block_on(node.header(
             &PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " "),
@@ -2426,6 +2436,96 @@ mod tests {
             ctx_of(&futures::executor::block_on(node.data(1, &pa)).unwrap()),
             Some(4242421.0),
             "the reused node must rebuild after the edit"
+        );
+    }
+
+    /// An alias is an ordinary picker row: `/model` lists it (with its own
+    /// id), and `/set default_model` sees it too — the listing that used to
+    /// bypass resolution entirely.
+    #[test]
+    fn an_alias_appears_in_both_model_listings() {
+        let app_state = test_app_state();
+        app_state
+            .update_settings(|s| {
+                s.apply_model_settings(
+                    "anthropic:claude-fast",
+                    &crate::model_settings::ModelSettings {
+                        alias_for: Some("anthropic:claude-3-5-sonnet-20241022".into()),
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let rows_for = |show_recents: bool| {
+            let reader = app_state.clone();
+            let writer = app_state.clone();
+            let mut node = ModelNode::new(
+                Box::new(move || reader.model()),
+                Box::new(move |m| {
+                    writer.set_model(m);
+                    Ok(())
+                }),
+                app_state.clone(),
+                show_recents,
+            );
+            let resp =
+                futures::executor::block_on(node.data(1, &PathArgs::new(vec![], ""))).unwrap();
+            resp.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+        };
+
+        assert!(
+            rows_for(true)
+                .iter()
+                .any(|id| id == "anthropic:claude-fast"),
+            "live /model must list the alias"
+        );
+        assert!(
+            rows_for(false)
+                .iter()
+                .any(|id| id == "anthropic:claude-fast"),
+            "/set default_model must list the alias too"
+        );
+    }
+
+    /// The `/model <id>` header for an alias describes the *alias* row, not the
+    /// upstream's prose — the two must be distinguishable in the picker.
+    #[test]
+    fn the_alias_header_describes_the_alias() {
+        let app_state = test_app_state();
+        app_state
+            .update_settings(|s| {
+                s.apply_model_settings(
+                    "anthropic:claude-fast",
+                    &crate::model_settings::ModelSettings {
+                        alias_for: Some("anthropic:claude-3-5-sonnet-20241022".into()),
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let reader = app_state.clone();
+        let writer = app_state.clone();
+        let mut node = ModelNode::new(
+            Box::new(move || reader.model()),
+            Box::new(move |m| {
+                writer.set_model(m);
+                Ok(())
+            }),
+            app_state.clone(),
+            true,
+        );
+        let pa = PathArgs::new(vec!["model".into(), "anthropic:claude-fast".into()], " ");
+        let lines = futures::executor::block_on(node.header(
+            &pa,
+            &crate::slashdot_menu::node_impl::RenderContext { term_width: 80 },
+        ));
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("alias for anthropic:claude-3-5-sonnet-20241022"),
+            "{joined}"
         );
     }
 }

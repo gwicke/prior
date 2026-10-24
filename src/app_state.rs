@@ -420,6 +420,13 @@ impl AppState {
             return;
         }
         let mut st = self.state.lock();
+        // The wire alias, like routing: stored settings, read fresh on every
+        // activation, cleared when the record has none. `create_agent` derives
+        // the upstream pair from it.
+        st.config.alias_for = st
+            .settings
+            .model_settings(id)
+            .and_then(|record| record.alias_for.clone());
         // Routing is *stored settings*, not runtime state: nothing mutates it
         // mid-session (`/reasoning` has no counterpart here), so unlike the
         // params it has no session memory and is read fresh from the record on
@@ -561,7 +568,7 @@ impl AppState {
             // Resolved before either assignment: the record borrows the
             // settings out of the guard, and the writes below borrow it
             // mutably.
-            let limit = crate::model_catalog::resolved_entry(&qualified, record)
+            let limit = Self::resolved_entry_locked(&st, &qualified)
                 .and_then(|e| e.context_length)
                 .filter(|max| *max > 0);
             // Routing is a request-shaping fact like the params, so an edit
@@ -570,8 +577,10 @@ impl AppState {
             // Editing another model's record leaves this untouched; that
             // record is read on its next activation.
             let routing = record.and_then(|r| r.routing.clone());
+            let alias_for = record.and_then(|r| r.alias_for.clone());
             st.config.context_limit = limit;
             st.config.routing = routing;
+            st.config.alias_for = alias_for;
             st.settings.clone()
         };
         snapshot.save().map_err(|e| e.to_string())
@@ -596,13 +605,40 @@ impl AppState {
                 return Arc::clone(list);
             }
         }
-        let entries = crate::model_catalog::overlay(
-            crate::model_catalog::catalog_cached(),
-            &st.settings.models,
-        );
-        let list = Arc::new(entries);
+        let list = Arc::new(Self::resolve_models(&st));
         st.resolved_cache = Some((gen, st.models_revision, Arc::clone(&list)));
         list
+    }
+
+    /// The composition itself, against an already-held guard.
+    ///
+    /// Split out because callers inside the lock cannot call
+    /// [`Self::resolved_models`], which would deadlock on the mutex it is
+    /// about to take.
+    fn resolve_models(st: &State) -> Vec<crate::model_catalog::ModelEntry> {
+        crate::model_catalog::overlay(crate::model_catalog::catalog_cached(), &st.settings.models)
+    }
+
+    /// The resolved entry for one model — the `resolved_models` row, by id.
+    ///
+    /// The single composition, so `/stat`, the `/model` header and the editor
+    /// prefill describe a model exactly as the picker lists it (alias rows
+    /// included). Lock-free against a held guard, which is why
+    /// [`Self::update_settings`] can use it.
+    pub fn resolved_entry(&self, qualified_id: &str) -> Option<crate::model_catalog::ModelEntry> {
+        let st = self.state.lock();
+        Self::resolved_entry_locked(&st, qualified_id)
+    }
+
+    /// [`Self::resolved_entry`] against a held guard, for callers inside the
+    /// lock.
+    fn resolved_entry_locked(
+        st: &State,
+        qualified_id: &str,
+    ) -> Option<crate::model_catalog::ModelEntry> {
+        Self::resolve_models(st)
+            .into_iter()
+            .find(|e| e.qualified().eq_ignore_ascii_case(qualified_id))
     }
 
     /// Mutate + persist a setting. Validate + in-memory apply under the
@@ -869,6 +905,7 @@ impl AppState {
             params: Default::default(),
             routing: None,
             context_limit: None,
+            alias_for: None,
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
@@ -1006,6 +1043,42 @@ mod tests {
 
     fn seeded_app(record: crate::model_settings::ModelSettings) -> Arc<AppState> {
         AppState::for_test(store_with_model_record(record))
+    }
+
+    /// `alias_for` seeds onto the target config on activation and clears for a
+    /// model that has none — the wire half of an alias record.
+    #[test]
+    fn activation_seeds_and_clears_alias_for() {
+        let app = seeded_app(crate::model_settings::ModelSettings {
+            alias_for: Some("openrouter:upstream/model".into()),
+            ..Default::default()
+        });
+        app.activate_model_params("test:model");
+        assert_eq!(
+            app.with_config(|c| c.alias_for.clone()).as_deref(),
+            Some("openrouter:upstream/model")
+        );
+        // A model with no record clears it, like routing.
+        app.activate_model_params("test:other");
+        assert_eq!(app.with_config(|c| c.alias_for.clone()), None);
+    }
+
+    /// `resolved_entry` is a lookup into `resolved_models`, so an alias row is
+    /// reachable by its own id — the `/stat` and header path.
+    #[test]
+    fn resolved_entry_finds_an_alias_row() {
+        let app = seeded_app(crate::model_settings::ModelSettings {
+            alias_for: Some("test:upstream".into()),
+            ..Default::default()
+        });
+        let entry = app
+            .resolved_entry("test:model")
+            .expect("the alias row resolves");
+        assert_eq!(entry.qualified(), "test:model");
+        assert_eq!(
+            entry.description.as_deref(),
+            Some("alias for test:upstream")
+        );
     }
 
     /// The reported bug: `save` wrote `reasoning = "max"`, but a new session

@@ -271,6 +271,35 @@ pub fn resolve_effort_for(
     support.resolve(level).or(Some(canonical))
 }
 
+/// The number of prior presets on the ladder (`off | low | med | high | max`).
+pub const LEVEL_COUNT: usize = 5;
+
+/// The preset at `rank`, in ladder order.
+pub const LADDER: [ReasoningLevel; LEVEL_COUNT] = [
+    ReasoningLevel::Off,
+    ReasoningLevel::Low,
+    ReasoningLevel::Med,
+    ReasoningLevel::High,
+    ReasoningLevel::Max,
+];
+
+/// Map **every** prior preset onto the effort spelling this provider recommends,
+/// indexed by [`ReasoningLevel::rank`].
+///
+/// This is the resolved disclosure: one answer per preset, computed once where
+/// the *wire* provider is known, so a menu can render the ladder without
+/// consulting the catalog or knowing the provider. Total over the five presets
+/// by construction — a model that publishes only `["max","high","low"]` still
+/// maps `med`, because the provider's own request table says what `medium`
+/// becomes. `off` is `None` (the absence of reasoning is not an effort), and
+/// every preset is `None` when the provider has no effort vocabulary.
+///
+/// Built from [`resolve_effort_for`] — the same function the backend calls to
+/// build a request — so the menu's disclosure and the wire cannot disagree.
+pub fn reasoning_map(provider: &str, support: &ReasoningSupport) -> [Option<String>; LEVEL_COUNT] {
+    std::array::from_fn(|i| resolve_effort_for(provider, LADDER[i], support))
+}
+
 /// The effort a reasoning payload names, whatever shape the provider uses:
 /// `reasoning: {effort}` (OpenRouter) or a bare `reasoning_effort`
 /// (OpenAI, DeepSeek).
@@ -929,5 +958,56 @@ mod tests {
         assert!(ModelParams::default().is_empty());
         assert!(!params(None, Some(0.5), None).is_empty());
         assert!(!params(Some(ReasoningLevel::Off), None, None).is_empty());
+    }
+
+    // ---- reasoning_map: the resolved disclosure ----
+
+    /// The map is *total* over the five presets and equals what
+    /// `resolve_effort_for` says for each — the same function the backend
+    /// calls — so a menu and the wire cannot disagree.
+    #[test]
+    fn reasoning_map_is_total_and_matches_resolve_effort_for() {
+        let s = support(&["low", "high", "max"]);
+        let map = reasoning_map("openrouter", &s);
+        assert_eq!(map.len(), LEVEL_COUNT);
+        for (i, level) in LADDER.iter().enumerate() {
+            assert_eq!(
+                map[i],
+                resolve_effort_for("openrouter", *level, &s),
+                "ladder position {i} ({})",
+                level.as_str()
+            );
+        }
+        // `off` is never an effort.
+        assert_eq!(map[0], None);
+    }
+
+    /// A provider table covers a preset the model does not publish: DeepSeek
+    /// publishes `max/high/low` but maps `med` to `medium` anyway — the same
+    /// spelling the request would send.
+    #[test]
+    fn reasoning_map_covers_presets_the_model_does_not_publish() {
+        let s = support(&["max", "high", "low"]);
+        let map = reasoning_map("deepseek", &s);
+        assert_eq!(
+            map[ReasoningLevel::Med.rank() as usize].as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            map[ReasoningLevel::Low.rank() as usize].as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            map[ReasoningLevel::Max.rank() as usize].as_deref(),
+            Some("max")
+        );
+    }
+
+    /// A provider with no effort vocabulary maps nothing: every preset `None`,
+    /// so a menu shows no disclosure at all.
+    #[test]
+    fn reasoning_map_is_empty_for_a_provider_without_a_vocabulary() {
+        let s = support(&["low", "high"]);
+        assert!(reasoning_map("groq", &s).iter().all(Option::is_none));
     }
 }

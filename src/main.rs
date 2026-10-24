@@ -332,6 +332,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_defaults(),
     );
 
+    // The one-shot paths build without an `AppState`, so the alias target is
+    // resolved from the parsed config directly — the same record the activation
+    // path would read. `provider`/`model` stay the identity the user asked for.
+    let startup_alias_for = config
+        .models
+        .get(&format!("{provider}:{model}"))
+        .and_then(|r| r.alias_for.clone());
     let agent_config = AgentConfig {
         provider: provider.clone(),
         model,
@@ -350,6 +357,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // consulted — the same reason `params` here is the resolved global
         // rather than the model's stored defaults.
         routing: None,
+        alias_for: startup_alias_for,
         system_message_extension,
         persona_prompt,
         persona_name,

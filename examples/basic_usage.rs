@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         confirm_port: None,
         context_limit: None,
         routing: None,
+        alias_for: None,
         tool_call_limit: 10,
         quiet: false,
         params: Default::default(),

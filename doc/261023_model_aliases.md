@@ -68,11 +68,14 @@ because a `/reasoning` override can change the level between turns. Neither re-d
 The five calls can build one table per provider rather than scanning per level.
 
 Everything downstream is pure formatting: `/reasoning`'s rows and header print each preset's
-spelling. The provider's own request table (`deepseek maps: medium→high`) is disclosed alongside, so
-"what we send" and "what it runs as" are both visible — a spelling we send can differ from the effort
-the service actually runs.
+spelling. The menu needs nothing else — not the provider, not the model, not whether the row is an
+alias — so the whole menu machinery stays unaware of aliasing. `/model`'s `efforts` fact reads the
+map's distinct values (the levels the user can reach), not the raw published list.
 
-`reasoning_support` stays on the backend path and keeps no menu caller.
+`reasoning_support` stays on the backend path and keeps no menu caller. The two share one
+*implementation* (`params::reasoning_map` calls `resolve_effort_for`, which is what the backend
+calls to build a request), not one snapshot: the backend must recompute per turn because a
+`/reasoning` override can change the level.
 
 ## The wire path
 
@@ -92,14 +95,15 @@ bar, `/stat` and `default_model`, while `plan_rebuild` fingerprints the wire —
 - `model_settings`: `alias_for` key — `KEYS`, `key_hint`, `coerce` (quoted `provider:model`, both
   halves non-empty), `apply_one`, `value_of`, `is_empty`, the fragment renderer.
 - `model_catalog`: `overlay` injects alias entries and appends record-only entries, filling
-  `reasoning_map`; `resolved_entry` delegates to `resolved_models`; `ModelEntry` gains
-  `reasoning_map`.
+  `reasoning_map`; `resolve` is the pure composition (one record set in, one entry out) that both
+  `AppState::resolved_entry` and the store-free callers use; `ModelEntry` gains `reasoning_map`.
 - `params`: `reasoning_map(wire_provider, support) -> [Option<String>; 5]`.
 - `agent/build.rs`: `AgentConfig.alias_for`; `create_agent` derives and uses the wire pair.
 - `app_state`: activation and `update_settings` seed `alias_for`; a lock-free `resolve_entry` inner.
 - `v25_model`: always `AppState` + `show_recents`.
 - `v25_reasoning`: renders `reasoning_map` from the active resolved entry.
-- `v25_stat` / `status.rs`: `session_stats_lines` takes the resolved entry rather than `stored`.
+- `v25_stat` / `status.rs`: `session_stats_lines` takes the resolved entry and the routing table
+  rather than the stored record, and judges routing-inertness against the wire provider.
 
 ## Validation
 
@@ -107,8 +111,9 @@ Loud at load and save, like every other key:
 
 - `alias_for` must be a quoted `provider:model` with both halves non-empty.
 - Self-reference (`alias_for` equal to the record's own key) is an error.
-- Alias → alias is refused (one hop only): the referenced id must not itself carry `alias_for`. This
-  kills cycles without a resolver loop.
+- Alias → alias (a chained alias) is not resolved: the upstream's *facts* come from the target
+  record's own entry, so a chain would show the intermediate's numbers and send to it verbatim. One
+  hop only — keep it that way rather than adding a resolver loop.
 - The upstream need **not** exist in the catalog (a direct provider, or a model OpenRouter does not
   publish); then the alias entry's base facts are empty unless the record supplies them.
 - If an alias key collides with a real catalog id, the catalog row is kept (no duplicate row); the

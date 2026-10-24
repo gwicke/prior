@@ -43,9 +43,9 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
                     writer.set_reasoning(Some(parsed));
                     Ok(())
                 }),
-                // The live node reports the active model, so `header()` can
-                // disclose what each preset runs as on it.
-                active_model_fn: Some(Box::new(move || reader2.model())),
+                // The live node reports on the active model, so `header()` can
+                // disclose what each preset maps to on it.
+                app: Some(reader2),
             }
             .into(),
         );
