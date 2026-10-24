@@ -622,7 +622,7 @@ fn settings_string_hierarchy_saves_and_errors() {
         "-p",
         "openrouter",
         "-m",
-        "tencent/hy3:free",
+        "openrouter/free",
         "-c",
         cfg.to_str().unwrap(),
     ]);

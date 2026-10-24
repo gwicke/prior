@@ -1723,7 +1723,7 @@ const ESSENTIAL_RO_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64"];
 
 /// Read-only `/etc` entries bound into every sandbox that configures no `/etc`
 /// binding of its own. The whole directory used to be bound, which exposed
-/// `/etc/hosts`, `/etc/passwd`, `/etc/ssl` and `/etc/localtime` — mild host
+/// `/etc/passwd`, `/etc/ssl` and `/etc/localtime` — mild host
 /// fingerprinting, and with `--unshare-uts` there is no reason to hand over the
 /// host's identity. This is the working set a normal command needs:
 ///
@@ -1734,11 +1734,7 @@ const ESSENTIAL_RO_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64"];
 /// - `/etc/ld.so.cache` + `/etc/ld.so.preload` are how the dynamic loader
 ///   finds libraries; `/etc/ssl` is the CA store (TLS clients), `/etc/localtime`
 ///   the timezone.
-/// - NSS: `/etc/nsswitch.conf` names the resolution order and `/etc/gai.conf`,
-///   `/etc/host.conf` tune it; `/etc/hosts` is the local static table.
-///   `/etc/resolv.conf` is normally a symlink (NetworkManager, systemd-resolved)
-///   and bwrap dereferences symlink sources, so listing it plainly picks up the
-///   resolved target with no host-specific remap.
+/// - NSS: Not needed, name resolution is via proxy only.
 /// - `bash.bashrc` + `profile` are read by interactive/`sh -c` shells;
 ///   `mime.types`/`mailcap` cover tools that sniff file types; `w3m` is for the
 ///   `w3m` text browser used for docs.
@@ -1749,19 +1745,14 @@ const ESSENTIAL_RO_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64"];
 const ESSENTIAL_ETC: &[&str] = &[
     "/etc/alternatives",
     "/etc/bash.bashrc",
-    "/etc/gai.conf",
     "/etc/group",
-    "/etc/host.conf",
-    "/etc/hosts",
     "/etc/ld.so.cache",
     "/etc/ld.so.preload",
     "/etc/localtime",
     "/etc/mailcap",
     "/etc/mime.types",
-    "/etc/nsswitch.conf",
     "/etc/passwd",
     "/etc/profile",
-    "/etc/resolv.conf",
     "/etc/ssl",
     "/etc/w3m",
 ];
@@ -1938,6 +1929,8 @@ fn build_bwrap_args(
     // bwrap auto-creates missing parent directories for a bind target and
     // dereferences a symlink *source*, which is what lets `/etc/resolv.conf`
     // (a symlink into `/run/...` on most hosts) be listed plainly.
+    // However, since we are using proxying and do not support DNS resolution
+    // in the sandbox, we can omit all DNS related files by default.
     let etc_exact = binds.iter().any(|b| b.to == std::path::Path::new("/etc"));
     let etc_sub = binds.iter().any(|b| b.to.starts_with("/etc/"));
     if etc_exact {
@@ -3163,10 +3156,6 @@ mod sandbox_tests {
             .await
             .unwrap();
         assert_eq!(out, "CACHE_OK");
-        let out = run_sandboxed("test -f /etc/hosts && echo HOSTS_OK", None)
-            .await
-            .unwrap();
-        assert_eq!(out, "HOSTS_OK");
 
         // A file that exists on the host but is not in `ESSENTIAL_ETC` must be
         // absent, proving this is a working set rather than the old whole-`/etc`
