@@ -16,6 +16,10 @@
 //! into one reload — and a reload is idempotent, so over-signalling costs one
 //! extra re-read, never a wrong state.
 //!
+//! Only *content* events count ([`is_content_change`]): an access event is
+//! dropped, because the reload's own `read` raises one and counting it would
+//! make each reload trigger the next.
+//!
 //! Failure to arm (no parent directory, no inotify budget) degrades to `None`:
 //! the caller simply never wakes, which is today's restart-to-see-edits
 //! behaviour. Nothing else changes.
@@ -24,7 +28,18 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use notify::{RecursiveMode, Watcher};
+use notify::{event::EventKind, RecursiveMode, Watcher};
+
+/// Whether an event kind can mean "the settings file's contents changed".
+///
+/// The one thing that must be excluded is [`EventKind::Access`]: `inotify`
+/// reports an `Open` for every `read`, and the reload itself reads the file —
+/// so treating an access as a change makes each reload trigger the next one,
+/// forever (this was a live lock-up, not a theoretical one). A read never
+/// changes contents; only a write, create, rename or delete does.
+fn is_content_change(kind: &EventKind) -> bool {
+    !matches!(kind, EventKind::Access(_))
+}
 
 /// Armed watch of one settings file. Owns the `notify` watcher (keep-alive —
 /// dropping it unregisters the watch) and the change flag it feeds.
@@ -53,10 +68,11 @@ impl SettingsWatch {
         let (p, n) = (Arc::clone(&pending), Arc::clone(&notify));
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(event) = res else { return };
-            if event
-                .paths
-                .iter()
-                .any(|p| p.file_name() == Some(&file_name))
+            if is_content_change(&event.kind)
+                && event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name() == Some(&file_name))
             {
                 p.store(true, Ordering::SeqCst);
                 n.notify_one();
@@ -181,5 +197,46 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(watch.take_pending(), "the burst was signalled");
         assert!(!watch.take_pending(), "drained: nothing left pending");
+    }
+
+    /// Reading the file is not a change. This is the self-trigger regression:
+    /// the reload reads the file it was woken for, inotify reports that read as
+    /// `Access(Open)`, and counting it made every reload schedule the next one —
+    /// an endless reload loop that starved the REPL (it never repainted, so an
+    /// integration test saw only the pre-edit screen).
+    #[tokio::test]
+    async fn reading_the_file_does_not_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "x = 1\n").unwrap();
+        // Arm *after* the write above so only the reads below are in scope.
+        let watch = SettingsWatch::spawn(&path).expect("watch arms");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        for _ in 0..5 {
+            std::fs::read_to_string(&path).unwrap();
+        }
+        let woke =
+            tokio::time::timeout(std::time::Duration::from_millis(300), watch.notified()).await;
+        assert!(woke.is_err(), "a read must not wake the watch");
+        assert!(!watch.take_pending(), "a read must not be pending");
+    }
+
+    /// The kind filter itself: access excluded, everything else a change.
+    #[test]
+    fn access_events_are_not_content_changes() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
+        assert!(!is_content_change(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!is_content_change(&EventKind::Access(AccessKind::Read)));
+        assert!(!is_content_change(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        assert!(is_content_change(&EventKind::Create(CreateKind::File)));
+        assert!(is_content_change(&EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Content
+        ))));
+        assert!(is_content_change(&EventKind::Remove(RemoveKind::File)));
     }
 }

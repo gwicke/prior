@@ -20,6 +20,12 @@ delete+recreate) emits an event naming the file inside a directory watch, while
 a watch pinned to the file's inode dies on rename. The config dir also holds
 `sessions/`, `token/`, `recent_models.txt`, hence the basename filter.
 
+Events of kind `Access` are dropped (`is_content_change`): inotify reports an
+`Open` for every `read`, and the reload itself reads the file, so counting an
+access would make each reload trigger the next one — an endless reload loop that
+starves the REPL (it never gets to repaint). Only `Create`/`Modify`/`Remove`
+change contents.
+
 The watcher thread sets an `AtomicBool` and pokes a `tokio::sync::Notify` per
 matching event. The flag, not the notify, is the source of truth: notify pokes
 may coalesce, but `take_pending` reports "an event arrived since the last check"
