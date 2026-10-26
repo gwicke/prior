@@ -68,6 +68,18 @@ for code that has an operator-facing sink; it is not prose.
    `no_edit_failure_shows_the_model_a_host_path` runs the tool under a remapping
    policy and asserts no host path appears in any of them.
 
+4. **Host-path aliasing closed in the file tools.** `PathPolicy` no longer
+   passes a non-matching path through the remap table unchanged: an argument is
+   first expanded to an absolute *sandbox* path (`~` against the effective
+   sandbox `HOME`, relative against the sandbox cwd), then it must match a
+   binding's `to` prefix. A host path (covered by a binding's `from` but not its
+   `to`) is rejected exactly as the shell would refuse to open it — closing the
+   hole where a guessed `/home/me/...` reached the filesystem through the
+   identity remap. Denials echo the supplied (in-sandbox) path; the
+   `PolicyDenied::host_path` for a `NotCovered` denial is now the sandbox path,
+   so both `model_message` and `operator_message` are safe for it. See
+   `doc/sandbox.md` → "New contract for `validate_path`".
+
 ## Open
 
 - **Redaction/guard gap, six tools remaining.** `sed`, `read`, `write`,

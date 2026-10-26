@@ -842,27 +842,48 @@ a path that is not bound at all must be rejected (deny-by-default).
 ### New contract for `validate_path`
 
 `validate_path(base, path, policy)` gains a `policy` argument derived from the
-resolved `paths` config. It performs, in order:
+resolved `paths` config. It proceeds in two clearly separated phases — *expand
+to a sandbox path* (`PathPolicy::resolve_sandbox`), then *authorize and
+translate to a host path* (`PathPolicy::resolve_host_arg`):
 
-0. **Remap rewrite.** Rewrite the requested path through `policy.remap`
-   (`to → from` table); see "Path translation via `RemapTable`" below. A request
-   for `/tmp/x` becomes the host `from` that bwrap mounts at `/tmp`, so the
-   non-shell tool and the shell address the same file.
-1. **Resolve** the (rewritten) path against `base` (CWD), expanding `~`, and
-   normalize components (existing `ParentDir`/`CurDir` logic).
-2. **Existence/binding check.** The path (or its nearest bound ancestor) must
-   fall under a declared `paths` entry. If no entry covers it →
-   `ToolError::Generic("Access denied: path is not within a permitted binding")`.
-   (This realizes deny-by-default for the non-shell tools, matching the sandbox
-   root.)
-3. **Mode check** based on the operation:
+1. **Expand to an absolute sandbox path.** This is what the shell would compute
+   for the same argument, and it is the only place argument semantics live:
+   - `~` / `~/` expands to the **sandbox `HOME`** — the value the sandboxed
+     shell will expand it to (`sandbox.env` policy; see below), *not* the host
+     process's `HOME` unconditionally. If the sandbox has no `HOME`, `~` is left
+     unexpanded, matching a shell with no `HOME`.
+   - a relative path joins the **sandbox CWD** — the host CWD mapped through the
+     remap table (`to` side). For an unremapped cwd this is the cwd itself; for
+     a remapped cwd it is the namespace path, so a relative argument still lands
+     under what the shell sees.
+   - `..` / `.` are normalized (existing `ParentDir`/`CurDir` logic).
+2. **Namespace check + remap rewrite.** The absolute sandbox path must match a
+   binding's `to` prefix; the suffix is appended to that binding's host `from`.
+   A path with no `to` match is **rejected** — it is not in the sandbox
+   namespace. This is what makes the non-shell tools and the shell agree: a host
+   path (`/home/me/projects/f.txt`) is not something the shell can open either,
+   so the tool refuses it rather than passing it through a no-op remap and
+   checking the binding's `from`. A request for `/tmp/x` becomes the host `from`
+   that bwrap mounts at `/tmp`, so the non-shell tool and the shell address the
+   same file.
+3. **Mode check** on the covering binding:
    - Read operations (`read_file`, `glob_files`, `grep_text`, `list_dir`) are
      allowed under any `ro` or `rw` binding that covers the path.
    - Write operations (`write_file`, `edit_file`, `make_dir`, `remove`,
      `move_file`, `copy_file`, and the *destination* of move/copy) require the
      covering binding to be `rw`. A write under an `ro` binding →
      `ToolError::Generic("Access denied: path is read-only")`.
-4. **Traversal guard** (keep existing): reject escapes above `base`.
+
+On any denial the error echoes the path the **caller supplied** (an in-sandbox
+path it can act on); the host form never appears in a model-visible string. See
+`doc/path_leak_risks.md`.
+
+> **`~` is not a leak.** `HOME` is in `DEFAULT_ENV_ALLOW` and is forwarded to the
+> sandbox verbatim, so the model already sees it (`echo $HOME`) and can already
+> write `$HOME/...`. Expanding `~` against that same value gives it nothing new:
+> the namespace + mode checks still gate access. The expansion source is the
+> *effective sandbox* `HOME` (`sandbox_home`), so tools and shell cannot disagree
+> about what `~` means even under a custom `sandbox.env`.
 
 ### How `paths` maps to the policy
 
@@ -897,26 +918,25 @@ view — no extra processes.
 
 ### Path translation via `RemapTable` (the consistency mechanism)
 
-`validate_path` performs, in order (steps 1–4 above, plus a rewrite step):
+`validate_path` performs, in order:
 
-0. **Remap rewrite.** Before coverage/mode checks, rewrite the requested path
-   through `RemapTable`: if it (or an ancestor) matches a `to` prefix, replace
-   that prefix with the corresponding host `from`. So a non-shell write to
-   `/tmp/x` is transparently redirected to the host `from` that bwrap mounts at
-   `/tmp` (e.g. `./scratch/x`). The shell command writing `/tmp/x` lands on the
-   *same* host file. **This is what makes `/tmp` (and any remap) mean the same
-   thing to both tool kinds.**
-1. **Resolve** against `base` (CWD), expand `~`, normalize components.
-2. **Coverage check** against the *resolved host* path (post-rewrite) using
-   `from`/`mode` of each binding; unbound → deny.
+1. **Expand to an absolute sandbox path** (`~` against the sandbox `HOME`,
+   relative against the sandbox CWD, normalize). This is the `to`-side form.
+2. **Namespace check + rewrite.** Match a binding's `to` prefix; unbound →
+   deny (not in the sandbox namespace). On a match, replace the `to` prefix with
+   the binding's host `from`. A non-shell write to `/tmp/x` is thereby
+   redirected to the host `from` that bwrap mounts at `/tmp` (e.g.
+   `./scratch/x`); the shell command writing `/tmp/x` lands on the *same* host
+   file. **This is what makes `/tmp` (and any remap) mean the same thing to both
+   tool kinds** — and why no `to` match must be a denial: a host path the model
+   happens to guess is not a namespace path, so the shell could not open it
+   either.
 3. **Mode check** (read vs write) on the covering binding.
-4. **Traversal guard** (keep existing).
 
 For non-remapped bindings (`from == to`) the rewrite is a no-op and the host
 path matches `from` directly. For remapped bindings, the rewrite maps the
 agent-visible `to` back to the host `from`, then the normal `from`/`mode` policy
-applies. The doc string on `ResolvedBind`/`RemapTable` must state that
-non-shell enforcement keys off the *rewritten host* path.
+applies.
 
 > **Consequence:** remapping is consistent across *both* tool kinds, not a
 > shell-only convenience. A non-shell tool addressing `/tmp` touches the exact
@@ -945,6 +965,13 @@ non-shell enforcement keys off the *rewritten host* path.
   file (`./scratch/x`); a read of `/tmp/x` via either tool sees the same bytes.
 - Empty `paths` + sandbox on keeps the CWD-visible default (read-only) behavior
   for non-shell tools, matching the sandboxed shell path.
+- **`~` expands to the sandbox `HOME`** (`tilde_and_relative_args_resolve_in_the_sandbox_namespace`),
+  and a relative argument joins the sandbox cwd.
+- **A host path is not addressable** (`a_host_path_is_not_addressable_in_the_sandbox`,
+  `nonshell_host_path_alias_rejected`): a path covered by a binding's `from`
+  but not its `to` is rejected — the alias hole is closed.
+- **`/tmp` scratch stays writable under an `ro`-only config**
+  (`nonshell_tmp_scratch_is_writable_under_ro_policy`).
 
 ---
 

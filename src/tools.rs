@@ -12,7 +12,7 @@ use crate::config::{
     ByteOffset, ContextLines, ReadLimit, ReadOffset, SandboxConfig, SandboxMaxOutputBytes,
     SandboxMemoryMb, SandboxTimeoutSecs,
 };
-use crate::path_util::relativize_path;
+use crate::path_util::{expand_tilde, relativize_path};
 
 // The block-edit core moved to the `bsed_blockedit` crate so the `bsed` binary
 // previews and applies in exactly the format the `edit` tool consumes. These
@@ -101,34 +101,66 @@ fn get_path(path: &str) -> Result<PathBuf, ToolError> {
 fn get_path_with(path: &str, is_write: bool) -> Result<PathBuf, ToolError> {
     let base = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
 
-    // `/tmp` is the session's scratch directory, not the host's (and not a
-    // path outside the cwd). When a policy is active its remap already covers
-    // this (built from the same resolver `resolve_path_policy`); with no
-    // policy the permissive default has no remap, so map `/tmp` here or the
-    // shell and the file tools would disagree about where `/tmp/f` lives.
-    if !has_path_policy() {
-        if let Some(host) = crate::sandbox_tmp::tool_path(path) {
-            return Ok(host);
-        }
-    }
-
-    // When a path policy is active (sandbox active with explicit bindings),
-    // rewrite via the remap table, then enforce coverage + mode.
+    // When a path policy is active (sandbox active with explicit bindings), the
+    // argument is expanded to an absolute *sandbox* path (`~` via the sandbox
+    // HOME, relative via the sandbox CWD, both matching the shell), then must
+    // rewrite through a `to → from` binding and pass the mode check. A path
+    // with no `to` prefix is rejected rather than passed through, so a host path
+    // the model happens to guess cannot sidestep the remap.
     if let Some(policy) = current_path_policy() {
-        let host = policy.resolve(path);
-        return policy
-            .check(&host, is_write)
-            .map(|_| host)
-            .map_err(|denied| {
-                // Show the caller the path *it* supplied — already an in-sandbox
-                // path, so it can act on it without needing to know the remap
-                // table. The host form is the operator's datum and never goes in
-                // this string; see `doc/path_leak_risks.md`.
-                ToolError::Generic(denied.model_message(path))
-            });
+        // `/tmp` needs no special case here: `resolve_path_policy` adds the
+        // session scratch directory as a writable `/tmp` binding (and honours an
+        // operator `/tmp` remap), so the remap below maps it to the same host
+        // directory the shell's `/tmp` is bound to.
+        return policy.resolve_host_arg(path, is_write).map_err(|denied| {
+            // Show the caller the path *it* supplied — already an
+            // in-sandbox path, so it can act on it without needing to know
+            // the remap table. The host form is the operator's datum and
+            // never goes in this string; see `doc/path_leak_risks.md`.
+            ToolError::Generic(denied.model_message(path))
+        });
     }
 
-    validate_path(&base, path)
+    // `/tmp` is the session's scratch directory, not the host's (and not a
+    // path outside the cwd). With no policy the permissive default has no
+    // remap, so map `/tmp` here or the shell and the file tools would disagree
+    // about where `/tmp/f` lives. Expanded first so `~` behaves as it does
+    // elsewhere; a `~` path never matches `/tmp`, so the order is only for
+    // consistency.
+    let expanded = expand_arg_tilde(path);
+    if let Some(host) = crate::sandbox_tmp::tool_path(&expanded.to_string_lossy()) {
+        return Ok(host);
+    }
+
+    validate_path(&base, &expanded.to_string_lossy())
+}
+
+/// Expand a leading `~` in a tool argument against the **effective sandbox
+/// `HOME`** — the value the sandboxed shell expands it to — falling back to the
+/// host `HOME` only when no sandbox is configured at all.
+///
+/// This is the no-policy (`get_path_with`/`get_sandbox_path` permissive
+/// branches) counterpart to `PathPolicy::resolve_sandbox`, which does the same
+/// expansion when bindings are present. Using the sandbox home keeps the two
+/// branches agreeing on `~` even under a custom `sandbox.env`.
+fn expand_arg_tilde(path: &str) -> PathBuf {
+    match sandbox_config().as_ref().as_ref() {
+        Some(cfg) => match crate::config::sandbox_home(cfg) {
+            Some(home) => {
+                // `~` / `~/x` only (the shell leaves `~user` alone too).
+                if path == "~" {
+                    home
+                } else if let Some(rest) = path.strip_prefix("~/") {
+                    home.join(rest)
+                } else {
+                    PathBuf::from(path)
+                }
+            }
+            // No sandbox `HOME`: leave `~` unexpanded, as a shell would.
+            None => PathBuf::from(path),
+        },
+        None => expand_tilde(path),
+    }
 }
 
 /// Resolve `path` to an absolute sandbox path **without remapping**.
@@ -139,12 +171,15 @@ fn get_sandbox_path(path: &str) -> Result<PathBuf, ToolError> {
         Ok(policy.resolve_sandbox(path))
     } else {
         // `/tmp` maps to the session's scratch directory on the host, but the
-        // agent named it `/tmp/f` and should be shown it that way.
-        if crate::sandbox_tmp::tool_path(path).is_some() {
-            return Ok(std::path::Path::new(path).to_path_buf());
+        // agent named it `/tmp/f` and should be shown it that way. Expanded
+        // like `get_path_with`, but *not* remapped: with no policy the two
+        // forms coincide anyway.
+        let expanded = expand_arg_tilde(path);
+        if crate::sandbox_tmp::tool_path(&expanded.to_string_lossy()).is_some() {
+            return Ok(expanded);
         }
         let base = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
-        validate_path(&base, path)
+        validate_path(&base, &expanded.to_string_lossy())
     }
 }
 
@@ -1229,15 +1264,10 @@ fn current_path_policy() -> Option<crate::config::PathPolicy> {
     let cfg = sandbox_config();
     let c = cfg.as_ref().as_ref()?;
     let cwd = std::env::current_dir().ok()?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // Bindings' own `~` uses the *host* home (the operator wrote them on the
+    // host, and `build_bwrap_args`/`resolve_paths` expand them the same way).
+    let home = dirs_home();
     resolve_path_policy(c, &cwd, home.as_deref())
-}
-
-/// Whether a [`PathPolicy`](crate::config::PathPolicy) is active. The
-/// permissive default (no explicit bindings) has none, so `get_path_with` maps
-/// `/tmp` itself there ([`crate::sandbox_tmp::tool_path`]).
-fn has_path_policy() -> bool {
-    current_path_policy().is_some()
 }
 
 /// Maximum per-command timeout (seconds) an LLM may request via the bash
@@ -3600,6 +3630,15 @@ mod sandbox_tests {
         set_sandbox(Some(sandbox_with(ro, rw, Some(30))));
     }
 
+    /// Restores the global sandbox to `None` on drop, panic or not — the policy
+    /// is process-global, so a leaked binding would poison later tests.
+    struct SandboxReset;
+    impl Drop for SandboxReset {
+        fn drop(&mut self) {
+            set_sandbox(None);
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn nonshell_ro_write_rejected() {
@@ -3618,6 +3657,117 @@ mod sandbox_tests {
         let res = super::write_file("should_fail.txt".to_string(), "x".to_string()).await;
         assert!(res.is_err(), "write under ro binding should be denied");
         assert!(res.unwrap_err().to_string().contains("read-only"));
+    }
+
+    /// `/tmp` is the writable scratch area even under an all-`ro` config — the
+    /// shell's `/tmp` is writable too — so a file tool must not reject it just
+    /// because no binding covers it.
+    #[tokio::test]
+    #[serial]
+    async fn nonshell_tmp_scratch_is_writable_under_ro_policy() {
+        let _reset = SandboxReset;
+        // A session id is what names the scratch directory, and
+        // `app_config_dir` (its base) needs a config location; set both so this
+        // does not depend on what earlier tests left in the environment.
+        let cfgdir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", cfgdir.path());
+        crate::sandbox_tmp::set_session_id("nonshell-tmp-scratch");
+        let dir = tempfile::tempdir().unwrap();
+        // Everything under the temp dir is read-only; nothing else is bound.
+        sandbox_with_paths(
+            vec![BindPath::Remap {
+                from: dir.path().to_string_lossy().to_string(),
+                to: dir.path().to_string_lossy().to_string(),
+            }],
+            vec![],
+        );
+        super::write_file("/tmp/scratch.txt".to_string(), "x".to_string())
+            .await
+            .expect("/tmp is writable scratch, even under an ro-only policy");
+    }
+
+    /// A host path is not in the sandbox namespace: no binding `to` covers it,
+    /// so it is rejected. The model may know the host path (from `$HOME`), but
+    /// the tool refuses it exactly as the shell would — the alias hole is gone.
+    #[tokio::test]
+    #[serial]
+    async fn nonshell_host_path_alias_rejected() {
+        let _reset = SandboxReset;
+        let dir = tempfile::tempdir().unwrap();
+        // Remap the temp dir to /proj; the host location is *not* addressable.
+        sandbox_with_paths(
+            vec![],
+            vec![BindPath::Remap {
+                from: dir.path().to_string_lossy().to_string(),
+                to: "/proj".to_string(),
+            }],
+        );
+        // The sandbox path works.
+        super::write_file("/proj/ok.txt".to_string(), "x".to_string())
+            .await
+            .unwrap();
+        // The host path (which the remap's `from` covers!) must be rejected:
+        // it is not a sandbox path.
+        let host = dir.path().join("alias.txt").to_string_lossy().to_string();
+        let err = super::write_file(host.clone(), "x".to_string())
+            .await
+            .expect_err("a host path is not in the sandbox namespace");
+        assert!(
+            err.to_string().contains("not within a permitted binding"),
+            "{err}"
+        );
+    }
+
+    /// `~` expands to the sandbox `HOME` (the value the shell would use), so
+    /// `~/f` addresses the same file as the absolute sandbox form. We pin `HOME`
+    /// to a known path, bind another host dir *at* it, and check the write lands
+    /// on the host side of that binding.
+    #[tokio::test]
+    #[serial]
+    async fn nonshell_tilde_expands_to_the_sandbox_home() {
+        let _reset = SandboxReset;
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        // The sandbox HOME the shell will see, and the host dir bound at it.
+        let sbx_home = dir.path().join("sbx-home");
+        let _home = HomeGuard::set(&sbx_home);
+        sandbox_with_paths(
+            vec![],
+            vec![BindPath::Remap {
+                from: host.to_string_lossy().to_string(),
+                to: sbx_home.to_string_lossy().to_string(),
+            }],
+        );
+
+        // The model names `~/a.txt`; the tool must expand it to the sandbox
+        // HOME and land the write on the binding's host side.
+        super::write_file("~/a.txt".to_string(), "hello".to_string())
+            .await
+            .expect("`~/a.txt` should resolve under the bound sandbox HOME");
+        assert_eq!(
+            std::fs::read_to_string(host.join("a.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    /// Sets `HOME` for a test and restores it on drop — process-global, so the
+    /// test must be `#[serial]`.
+    struct HomeGuard(Option<std::ffi::OsString>);
+    impl HomeGuard {
+        fn set(home: &std::path::Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", home);
+            HomeGuard(prev)
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(p) => std::env::set_var("HOME", p),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     #[tokio::test]

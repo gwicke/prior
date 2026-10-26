@@ -1345,6 +1345,11 @@ impl RemapTable {
 
     /// Rewrite `path` through the table: if it (or an ancestor) matches a `to`
     /// prefix, replace that prefix with the corresponding host `from`.
+    ///
+    /// Returns the input unchanged when no `to` prefix matches. Used for paths
+    /// that are *already* host paths (the caller extracted a host path from a
+    /// directory listing) and is therefore **not** an authorization check — see
+    /// [`PathPolicy::resolve_host`] for the enforcing entry point.
     pub fn rewrite(&self, path: &Path) -> PathBuf {
         for (to, from) in &self.entries {
             if let Ok(suffix) = path.strip_prefix(to) {
@@ -1354,6 +1359,48 @@ impl RemapTable {
             }
         }
         path.to_path_buf()
+    }
+
+    /// Invert the table: turn a raw argument into the absolute **sandbox** path
+    /// the namespace would see, by expanding `~` against the sandbox `home` and
+    /// joining a still-relative result to `cwd` (which must already be the
+    /// *sandbox* cwd).
+    ///
+    /// The inverse of [`rewrite`](Self::rewrite): `rewrite` maps a sandbox path
+    /// to its host location via the `to → from` table, while this maps a raw
+    /// argument to the absolute sandbox path that table is keyed on.
+    pub fn resolve_sandbox(&self, path: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
+        // Expand `~` only when a sandbox `home` is known. `resolve_with_home`
+        // would fall back to the *host* HOME on `None`, which is exactly the
+        // value we must not use here — the sandbox may run with no `HOME`, in
+        // which case `~` stays literal, as a shell would have it.
+        let expanded = match home {
+            Some(h) if path == "~" => h.to_path_buf(),
+            Some(h) if path.starts_with("~/") => h.join(&path[2..]),
+            _ => PathBuf::from(path),
+        };
+        // `cwd` is already the *sandbox* cwd, so a relative path joins to the
+        // location the shell would resolve it against.
+        let joined = if expanded.is_absolute() {
+            expanded
+        } else {
+            cwd.join(expanded)
+        };
+        normalize(&joined)
+    }
+
+    /// The sandbox location of `cwd`: the `to` a binding maps `cwd` to, or
+    /// `cwd` itself when no binding covers it (a non-remapped cwd is its own
+    /// sandbox path).
+    pub fn sandbox_cwd(&self, cwd: &Path) -> PathBuf {
+        for (to, from) in &self.entries {
+            if let Ok(suffix) = cwd.strip_prefix(from) {
+                let mut rewritten = to.clone();
+                rewritten.push(suffix);
+                return rewritten;
+            }
+        }
+        cwd.to_path_buf()
     }
 }
 
@@ -1368,6 +1415,14 @@ impl RemapTable {
 pub struct PathPolicy {
     binds: Vec<ResolvedBind>,
     remap: RemapTable,
+    /// The sandbox `HOME` (if any), used to expand `~` in the arguments the
+    /// model supplies. This is the same value the sandboxed shell expands `~`
+    /// to — it is derived from the effective `sandbox.env` policy (see
+    /// [`resolve_path_policy`]), not read straight from the host, so the two
+    /// worlds cannot disagree about what `~` means.
+    home: Option<PathBuf>,
+    /// The host CWD. Relative arguments are joined to its sandbox location
+    /// ([`RemapTable::sandbox_cwd`]), not to this directly.
     root: PathBuf,
 }
 
@@ -1402,8 +1457,10 @@ impl PolicyDeniedKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDenied {
     pub kind: PolicyDeniedKind,
-    /// The resolved **host** path. Never put this in a message a model can
-    /// read; it is data for callers that have an operator-facing sink.
+    /// The resolved path. For a [`PolicyDeniedKind::ReadOnly`] denial this is
+    /// the **host** path (a binding's `from` subtree) and must never reach a
+    /// model. For [`PolicyDeniedKind::NotCovered`] it is the *sandbox* path the
+    /// argument named — already the form the model spoke, so it is safe.
     pub host_path: PathBuf,
 }
 
@@ -1415,37 +1472,75 @@ impl PolicyDenied {
         format!("{}: {supplied}", self.kind.reason())
     }
 
-    /// Operator-facing: keeps the absolute host path, which is what makes a
-    /// misconfigured binding diagnosable — that path is the one that *would*
-    /// have matched a binding.
+    /// Operator-facing: prints `host_path` in full, which is what makes a
+    /// misconfigured binding diagnosable. For a `ReadOnly` denial that is the
+    /// host path that *would* have matched; for `NotCovered` it is the sandbox
+    /// path that did not — either way the operator sees the path verbatim.
     pub fn operator_message(&self) -> String {
         format!("{}: {}", self.kind.reason(), self.host_path.display())
     }
 }
 
 impl PathPolicy {
-    /// Rewrite an agent-visible path to its host location (via the remap
-    /// table), then resolve it against the root and normalize components.
-    pub fn resolve(&self, path: &str) -> PathBuf {
-        let rewritten = self.remap.rewrite(Path::new(path));
-        let joined = if rewritten.is_absolute() {
-            rewritten
-        } else {
-            self.root.join(rewritten)
-        };
-        normalize(&joined)
+    /// The absolute **sandbox** path an argument names: `~` is expanded against
+    /// the sandbox `home`, a relative argument is joined to the sandbox CWD (the
+    /// host CWD mapped through the remap table, so a remapped cwd still resolves
+    /// under the path the shell sees), and components are normalized.
+    ///
+    /// This is the display / namespace form. It performs no filesystem IO and
+    /// no authorization — pair it with [`resolve_host`](Self::resolve_host).
+    pub fn resolve_sandbox(&self, path: &str) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| self.root.clone());
+        self.expand_to_sandbox(path, &cwd)
     }
 
-    /// Resolve a path to an absolute sandbox path **without remapping** to host.
-    /// This is used for display purposes so the agent sees sandbox-relative paths.
-    pub fn resolve_sandbox(&self, path: &str) -> PathBuf {
-        let p = Path::new(path);
-        let joined = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            self.root.join(p)
-        };
-        normalize(&joined)
+    /// [`resolve_sandbox`](Self::resolve_sandbox) against an explicit host
+    /// `cwd`, for callers that already hold it.
+    fn expand_to_sandbox(&self, path: &str, cwd: &Path) -> PathBuf {
+        let sandbox_cwd = self.remap.sandbox_cwd(cwd);
+        self.remap
+            .resolve_sandbox(path, &sandbox_cwd, self.home.as_deref())
+    }
+
+    /// Map an absolute sandbox path to the host path it denotes.
+    ///
+    /// Fails when no binding's `to` covers the path: the model asked for
+    /// something outside the sandbox namespace, so it is not addressable — the
+    /// same answer the shell gives ("No such file or directory"). This is what
+    /// closes the aliasing hole where a host path (`/home/me/projects/f.txt`)
+    /// slipped through `check` via the binding's `from` without a `to → from`
+    /// rewrite; a host path is simply not in the sandbox namespace and is now
+    /// rejected.
+    pub fn resolve_host(&self, sandbox_path: &Path) -> std::result::Result<PathBuf, PolicyDenied> {
+        for (to, from) in &self.remap.entries {
+            if let Ok(suffix) = sandbox_path.strip_prefix(to) {
+                let mut host = from.clone();
+                host.push(suffix);
+                return Ok(normalize(&host));
+            }
+        }
+        Err(PolicyDenied {
+            kind: PolicyDeniedKind::NotCovered,
+            host_path: sandbox_path.to_path_buf(),
+        })
+    }
+
+    /// Resolve a model-supplied argument to its host path, authorizing it end to
+    /// end: absolute sandbox path (expand `~`, join sandbox CWD, normalize) →
+    /// sandbox-namespace check → binding mode check.
+    ///
+    /// Returns the host path on success. On denial the returned [`PolicyDenied`]
+    /// carries the *sandbox* path (the form the model and the shell both speak),
+    /// so `model_message` and `operator_message` degrade to the same safe string.
+    pub fn resolve_host_arg(
+        &self,
+        path: &str,
+        write: bool,
+    ) -> std::result::Result<PathBuf, PolicyDenied> {
+        let sandbox = self.resolve_sandbox(path);
+        let host = self.resolve_host(&sandbox)?;
+        self.check(&host, write)?;
+        Ok(host)
     }
 
     /// Check that `host_path` (already resolved against the root) is covered by
@@ -1521,8 +1616,34 @@ pub fn resolve_path_policy(
     Some(PathPolicy {
         remap: RemapTable::build(&binds),
         binds,
+        home: sandbox_home(cfg),
         root: cwd.to_path_buf(),
     })
+}
+
+/// The `HOME` the sandboxed shell will see for `cfg`, used to expand `~` in
+/// model-supplied arguments so the tools and the shell agree on its meaning.
+///
+/// Mirrors [`build_bwrap_args`](crate::tools) exactly: the forced variables win
+/// (they are emitted after the policy's `--setenv`s, so "last wins"), otherwise
+/// `HOME` is whatever the effective [`EnvPolicy`] keeps from the host. `None`
+/// when the sandbox runs without a `HOME`; `~` is then left unexpanded, matching
+/// a shell with no `HOME`.
+pub fn sandbox_home(cfg: &SandboxConfig) -> Option<PathBuf> {
+    if let Some((_, v)) = cfg
+        .env_forced()
+        .into_iter()
+        .rev()
+        .find(|(n, _)| n == "HOME")
+    {
+        return Some(PathBuf::from(v));
+    }
+    let host_env: Vec<(String, String)> = std::env::vars().collect();
+    env_vars_to_keep(&cfg.env_policy(), &host_env)
+        .into_iter()
+        .rev()
+        .find(|(n, _)| n == "HOME")
+        .map(|(_, v)| PathBuf::from(v))
 }
 
 /// Resolve a possibly-relative or `~`-prefixed path against `cwd`/`home`.
@@ -1839,7 +1960,9 @@ mod tests {
         // the host path (`/home/me/...`) and the supplied path (`/tmp/...`)
         // are genuinely different strings.
         let supplied = "/tmp/f.txt";
-        let host = policy.resolve(supplied);
+        let host = policy
+            .resolve_host(&policy.resolve_sandbox(supplied))
+            .expect("supplied path is in the sandbox namespace");
         assert_ne!(host, Path::new(supplied), "test needs a real remap");
         let denied = policy.check(&host, true).unwrap_err();
         assert_eq!(denied.host_path, host);
@@ -1866,11 +1989,103 @@ mod tests {
         // Not covered by any binding at all: same split, no path fallback to
         // a string built from `host_path`.
         let uncovered = "/var/data/f.txt";
-        let denied = policy.check(&policy.resolve(uncovered), false).unwrap_err();
+        let denied = policy
+            .resolve_host(&policy.resolve_sandbox(uncovered))
+            .expect_err("a path outside every binding is not in the namespace");
         assert_eq!(
             denied.model_message(uncovered),
             format!("path is not within a permitted binding: {uncovered}")
         );
+    }
+
+    /// `~` expands against the *sandbox* `HOME` — the value the sandboxed shell
+    /// will expand it to — while a relative argument joins the *sandbox* cwd.
+    /// That agreement between the two meanings is the point of the expansion.
+    #[test]
+    fn tilde_and_relative_args_resolve_in_the_sandbox_namespace() {
+        // Bindings expand their own `~` against the *host* home (`/host/me`),
+        // but an argument's `~` must use the sandbox home. We cannot set the
+        // process `HOME`, so drive it through `sandbox_home` by inspecting a
+        // policy built with an explicit forced HOME via the env policy below.
+        let cfg = SandboxConfig {
+            rw: vec![BindPath::Remap {
+                from: "/sbx/home".to_string(),
+                to: "/home".to_string(),
+            }],
+            ..Default::default()
+        };
+        let policy = resolve_path_policy(&cfg, Path::new("/host/me"), Some(Path::new("/host/me")))
+            .expect("policy is active");
+        // No host HOME is forced, so let `sandbox_home` fall through to env; if
+        // the process has one, `~` must resolve under it.
+        if let Some(home) = crate::config::sandbox_home(&cfg) {
+            assert_eq!(
+                policy.resolve_sandbox("~/f.txt"),
+                home.join("f.txt"),
+                "`~` must expand to the sandbox HOME"
+            );
+        }
+        // A relative argument joins the sandbox cwd — the process CWD mapped
+        // through the remap table. `/host/me` matches no binding's `from`, so
+        // its sandbox form is itself and the join is under it.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(policy.resolve_sandbox("f.txt"), cwd.join("f.txt"));
+    }
+
+    /// A host path is *not* in the sandbox namespace: no binding's `to` covers
+    /// it, so it is rejected rather than passed through the (identity) remap.
+    /// This is what makes the tools and the shell agree — the shell cannot open
+    /// a host path either.
+    #[test]
+    fn a_host_path_is_not_addressable_in_the_sandbox() {
+        let cfg = SandboxConfig {
+            rw: vec![BindPath::Remap {
+                from: "/host/projects".to_string(),
+                to: "/projects".to_string(),
+            }],
+            ..Default::default()
+        };
+        let policy =
+            resolve_path_policy(&cfg, Path::new("/host/projects"), None).expect("policy is active");
+        let err = policy
+            .resolve_host(Path::new("/host/projects/f.txt"))
+            .expect_err("a host path is not in the sandbox namespace");
+        assert_eq!(err.kind, PolicyDeniedKind::NotCovered);
+        // The sandbox path *is* addressable and maps back to the host `from`.
+        assert_eq!(
+            policy.resolve_host(Path::new("/projects/f.txt")).unwrap(),
+            Path::new("/host/projects/f.txt")
+        );
+    }
+
+    /// When the effective sandbox env carries no `HOME`, `~` is left as a
+    /// literal component — never silently expanded to the *host* home, which the
+    /// sandbox may not even mount.
+    #[test]
+    fn tilde_is_literal_when_the_sandbox_has_no_home() {
+        let cfg = SandboxConfig {
+            // OnlyAllow with no patterns keeps nothing, so no HOME survives.
+            env: Some(EnvPolicy {
+                mode: EnvMode::OnlyAllow,
+                patterns: vec![],
+            }),
+            rw: vec![BindPath::Remap {
+                from: "/host/p".to_string(),
+                to: "/p".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            sandbox_home(&cfg).is_none(),
+            "precondition: no sandbox HOME"
+        );
+        let policy =
+            resolve_path_policy(&cfg, Path::new("/host/p"), None).expect("policy is active");
+        // A `~` argument stays literal (joined to cwd), not host-home-expanded.
+        assert!(policy
+            .resolve_sandbox("~/f.txt")
+            .to_string_lossy()
+            .ends_with("/~/f.txt"));
     }
 
     #[test]
