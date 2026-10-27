@@ -129,6 +129,10 @@ pub(crate) fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
             }
             (s, Vec::new())
         }
+        "write" | "write_file" => {
+            let path = get_str("path").unwrap_or("");
+            (format!("write {}", path), Vec::new())
+        }
         "bash" => {
             // Show the *entire* command line; never shorten it. Prefix with `$`
             // so it reads like a shell prompt. The canonical field is "command";

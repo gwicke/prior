@@ -1046,27 +1046,19 @@ impl Content {
         // Handle structured write result: {"path": "...", "content": "...", "lines": N, "bytes": N}
         if is_write {
             if let Ok(v) = serde_json::from_str::<Value>(result) {
-                if let (Some(path), Some(content), Some(total_lines)) = (
+                if let (Some(path), Some(content), Some(_total_lines)) = (
                     v.get("path").and_then(|x| x.as_str()),
                     v.get("content").and_then(|x| x.as_str()),
                     v.get("lines").and_then(|x| x.as_u64()),
                 ) {
-                    // Show the path as a header with line count. Like any
-                    // command label it sits flush; the content below is the
-                    // result, indented by the fence gutter.
-                    let lang = guess_lang(path);
-                    let width = self.width();
-                    let header = format!("write {} [{} lines]", path, total_lines);
-                    for row in highlight_label_fg(&header, "bash", width).split('\n') {
-                        self.paint_panel(row, false);
-                    }
-
                     // Render the content with syntax highlighting (like
                     // read_file): a whole block in one fenced render, wrapped
                     // by the formatter. Tab-expanded up front so indentation is
                     // measured in the columns the terminal will draw. The
                     // fence gutter *is* the row's indent, so the rows are
                     // painted flush.
+                    let lang = guess_lang(path);
+                    let width = self.width();
                     let show_max = 10; // Limit preview to 10 lines (match read_file)
                     let content_lines: Vec<_> = content.lines().collect();
                     let shown: Vec<String> = content_lines
@@ -4579,13 +4571,13 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         let captured = out.end_capture();
         let output = strip_ansi(&String::from_utf8_lossy(&captured));
 
-        // Should contain the path header with line count
+        // Should contain the call panel header (from get_preview)
         assert!(
-            output.contains("write ./test.rs [4 lines]"),
-            "missing path header with line count: {}",
+            output.contains("write test.rs"),
+            "missing call panel header: {}",
             output
         );
-        // Should contain syntax-highlighted content (first 10 lines)
+        // Should contain syntax-highlighted content (first 10 lines) - NO result panel header
         assert!(output.contains("fn main()"), "missing fn main: {}", output);
         assert!(
             output.contains("let x = 42"),
@@ -4593,6 +4585,12 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
             output
         );
         assert!(output.contains("println!"), "missing println!: {}", output);
+        // Should NOT contain the old "write ./test.rs [4 lines]" header
+        assert!(
+            !output.contains("write ./test.rs [4 lines]"),
+            "should not contain duplicate result panel header: {}",
+            output
+        );
         // Should NOT contain line numbers (unlike read_file which has them in raw result but stripped for display)
         assert!(
             !output.contains("|"),
