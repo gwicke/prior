@@ -95,13 +95,49 @@ pub(crate) fn relativize_arg(arg: &str, ctx: &PathContext) -> Option<String> {
     } else if arg.starts_with('/') {
         PathBuf::from(arg)
     } else {
-        return None;
+        // Already relative: no `cwd` to relativize against, but the lexical
+        // tidying still applies (`./a` → `a`, `a/./b` → `a/b`).
+        return tidy_relative(arg);
     };
     let resolved = crate::path_util::normalize(&resolved);
     // `relativize_path` gives an absolute string back for a path outside `cwd`
     // (and `.` for `cwd` itself); only a relative answer is worth keeping.
     let rel = crate::path_util::relativize_path(&resolved, &ctx.cwd);
     (!rel.starts_with('/')).then_some(rel)
+}
+
+/// The short spelling of an already-relative path argument, or `None` when it
+/// is already short.
+///
+/// Only the components that cannot change what the path denotes are touched:
+/// `.` components (`./a`, `a/./b`) and a trailing `/` are dropped, because `.`
+/// is a no-op to every filesystem call, and `..` is preserved verbatim since
+/// collapsing it lexically is wrong across a symlink (`relativize_path`
+/// documents the same deliberate choice). A `-`-prefixed result keeps its `./`
+/// prefix for the reason `bsed_blockedit::path::render_child` documents:
+/// `rg`/`bsed` take the path as a later argv element, where a bare `-x` reads as
+/// a flag.
+fn tidy_relative(arg: &str) -> Option<String> {
+    let mut kept: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in Path::new(arg).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            other => kept.push(other.as_os_str()),
+        }
+    }
+    let mut tidy = kept
+        .iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if tidy.is_empty() {
+        // The argument was `.`, `./`, or `a/..`-free only of `./` parts: the
+        // cwd itself, which has exactly one spelling.
+        tidy = ".".to_string();
+    } else if tidy.starts_with('-') {
+        tidy.insert_str(0, "./");
+    }
+    (tidy != arg).then_some(tidy)
 }
 
 /// Rewrite the path-carrying arguments of one tool call in place. Returns
@@ -433,9 +469,13 @@ mod tests {
         // Under the home but not the cwd: `~` spelling is kept.
         assert_eq!(relativize_arg("~/notes.txt", &cf), None);
         assert_eq!(relativize_arg("/home/u/notes.txt", &cf), None);
-        // Already relative, empty, and `..` are all non-goals.
+        // Already relative: only the `.` components are dropped (`../` is kept
+        // verbatim, a non-goal).
         assert_eq!(relativize_arg("src/x.rs", &cf), None);
-        assert_eq!(relativize_arg("./src/x.rs", &cf), None);
+        assert_eq!(
+            relativize_arg("./src/x.rs", &cf).as_deref(),
+            Some("src/x.rs")
+        );
         assert_eq!(relativize_arg("../x.rs", &cf), None);
         assert_eq!(relativize_arg("", &cf), None);
         // `~` with no known home is left alone rather than guessed.
@@ -487,5 +527,40 @@ mod tests {
         let out = rewrite_messages(vec![msg], &cf);
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], Message::User { .. }));
+    }
+
+    /// The regression that made relativization silently do nothing for a whole
+    /// run: an operator binding `"."` (the ordinary way to make the project
+    /// directory visible) resolved to `<cwd>/.`, and `PathContext::cwd` then
+    /// carried that spelling. `relativize_path` compares by **string** prefix,
+    /// so no absolute argument ever matched and every `read`/`grep` path stayed
+    /// absolute — while `Path` equality in `config`'s own tests held, because
+    /// `Path` compares components and `"."` is not one.
+    ///
+    /// The context here is built the way the binary builds it (a policy from a
+    /// real `SandboxConfig`), not with `PathContext::new`, because the bug lived
+    /// in that construction.
+    #[test]
+    fn a_dot_binding_still_relativizes_arguments() {
+        let cwd = PathBuf::from("/home/u/project");
+        let cfg = crate::config::SandboxConfig {
+            ro: vec![crate::config::BindPath::Simple(".".into())],
+            ..Default::default()
+        };
+        let policy = crate::config::resolve_path_policy(&cfg, &cwd, Some(Path::new("/home/u")))
+            .expect("a binding means a policy");
+        assert_eq!(
+            policy.sandbox_cwd(&cwd).to_string_lossy(),
+            "/home/u/project"
+        );
+
+        let ctx = PathContext {
+            cwd: policy.sandbox_cwd(&cwd),
+            home: Some(PathBuf::from("/home/u")),
+        };
+        assert_eq!(
+            relativize_arg("/home/u/project/src/x.rs", &ctx).as_deref(),
+            Some("src/x.rs")
+        );
     }
 }

@@ -1395,9 +1395,16 @@ impl RemapTable {
     pub fn sandbox_cwd(&self, cwd: &Path) -> PathBuf {
         for (to, from) in &self.entries {
             if let Ok(suffix) = cwd.strip_prefix(from) {
+                // `Path::push` treats an empty suffix as `.`, so pushing it
+                // unconditionally would turn an exact match into `<to>/.` — and
+                // this result is the base of every string-prefix comparison in
+                // `relativize_path`, where such a spelling matches nothing.
+                if suffix.as_os_str().is_empty() {
+                    return normalize(to);
+                }
                 let mut rewritten = to.clone();
                 rewritten.push(suffix);
-                return rewritten;
+                return normalize(&rewritten);
             }
         }
         cwd.to_path_buf()
@@ -1689,16 +1696,20 @@ pub fn resolve_paths(
 /// Resolve a single [`BindPath`] (simple or remap) into a [`ResolvedBind`] with
 /// the given `mode` (which list the entry lives in).
 fn resolve_one(cwd: &Path, home: Option<&Path>, spec: &BindPath, mode: BindMode) -> ResolvedBind {
+    // Lexically clean, because a binding written `"."` resolves to `<cwd>/.`
+    // and `Path` equality is component-based while every consumer that
+    // compares *strings* — `relativize_path` above all — is not. Left unclean,
+    // the sandbox cwd carries the `/.`, no path ever matches it as a prefix,
+    // and path relativization silently does nothing.
+    let clean = |p: &str| crate::path_util::normalize(&resolve_path(cwd, home, p));
     let (from, to) = match spec {
         // Simple form: mounted at the same in-sandbox location as the host.
         BindPath::Simple(p) => {
-            let from = resolve_path(cwd, home, p);
+            let from = clean(p);
             (from.clone(), from)
         }
         // Remap form: explicit host (`from`) and in-sandbox (`to`) paths.
-        BindPath::Remap { from, to } => {
-            (resolve_path(cwd, home, from), resolve_path(cwd, home, to))
-        }
+        BindPath::Remap { from, to } => (clean(from), clean(to)),
     };
     ResolvedBind { mode, from, to }
 }
@@ -2200,6 +2211,35 @@ mod tests {
         assert_eq!(binds[2].mode, BindMode::Rw);
         assert_eq!(binds[2].from, Path::new("/home/u/.cargo"));
         assert_eq!(binds[2].to, Path::new("/opt/cargo"));
+    }
+
+    /// A `.` binding is the common case (the operator binds the project dir),
+    /// and `Path` equality is component-based, so the assertions above cannot
+    /// see that the *string* is `<cwd>/.`. That form defeats the string-prefix
+    /// comparison in `relativize_path`, silently disabling path
+    /// relativization for the whole run — so pin the bytes here.
+    #[test]
+    fn resolved_bindings_have_no_dot_or_dotdot_components() {
+        let binds = resolve_paths(
+            Path::new("/work"),
+            Some(Path::new("/home/u")),
+            &[BindPath::Simple(".".to_string())],
+            &[BindPath::Remap {
+                from: "./sub/../cache".to_string(),
+                to: "~/x/.".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(binds[0].from.to_string_lossy(), "/work");
+        assert_eq!(binds[1].from.to_string_lossy(), "/work/cache");
+        assert_eq!(binds[1].to.to_string_lossy(), "/home/u/x");
+        // The sandbox cwd derived from the table is clean too, which is what
+        // `PathContext::cwd` (and therefore `relativize_arg`) uses as its base.
+        let table = RemapTable::build(&binds);
+        assert_eq!(
+            table.sandbox_cwd(Path::new("/work")).to_string_lossy(),
+            "/work"
+        );
     }
 
     #[test]

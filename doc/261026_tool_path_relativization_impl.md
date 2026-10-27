@@ -219,7 +219,35 @@ then `content.display_tool_pair("edit", &prepared)` instead of
 - `FileResult::path` in `edit_files_with` relativized for the multi-file result
   array (single-file already goes through `edit_file_inner`).
 
-### 8. Verify
+### 8. Verify — DONE, with two bugs found by hand-testing
+
+Manual checks caught two defects the unit tests could not see, both in how the
+`PathContext` base is *built* rather than in the rewriting:
+
+1. **A relative argument kept its `./`.** `relativize_arg` bailed out early on
+   anything not starting with `/` or `~`, so the model's `./AGENTS.md` survived
+   while `AGENTS.md` would not have. Fixed by `tidy_relative`, which drops `.`
+   components and a trailing `/` (never `..`, which cannot be collapsed
+   lexically) and re-adds `./` only for a `-`-prefixed result, matching
+   `bsed_blockedit::path::render_child`.
+2. **Every path argument stayed absolute whenever the operator bound `"."`.**
+   `resolve_one` resolved a binding with `path_util::resolve`, which joins
+   without normalizing, so `"."` became `<cwd>/.`; `RemapTable::sandbox_cwd`
+   then pushed the empty suffix, producing `<cwd>/./`. That spelling was
+   `PathContext::cwd`, and `relativize_path` compares by **string** prefix, so
+   nothing matched and relativization was a no-op for the entire run. `edit`
+   still looked right because `prepare_edit_call` relativizes through the
+   `FileEdit` paths, which took a different route. Fixed at the source:
+   `resolve_one` normalizes both sides of every binding and `sandbox_cwd`
+   normalizes its result. Regression tests pin the string form (a `Path`
+   comparison hides it, since `Path` compares components and `"."` is not one)
+   and `a_dot_binding_still_relativizes_arguments` exercises the construction
+   the binary uses.
+
+Lesson for the next egress: a `Path`-typed assertion in a test will not catch a
+bad *spelling*, and every consumer downstream compares strings.
+
+### 9. Verify (checklist)
 
 ```
 cargo fmt && cargo clippy --all-targets
