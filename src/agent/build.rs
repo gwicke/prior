@@ -43,14 +43,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::agent::msglog::MessageLogger;
 use crate::agent::transcript::{
-    assistant_message, blob_edit_tool_calls, is_tool_available, maybe_strip_reasoning,
-    minimize_edit_tool_calls, model_facing_tool_text, reasoning_remap_note,
-    split_multi_file_edit_calls, EditAnchorLedger, TurnTranscript,
+    assistant_message, blob_edit_tool_calls, maybe_strip_reasoning, minimize_edit_tool_calls,
+    model_facing_tool_text, reasoning_remap_note, split_multi_file_edit_calls, EditAnchorLedger,
+    TurnTranscript,
 };
 use crate::agent::CodeAgent;
 use crate::tools::{
-    bsed_available, set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText,
-    ListDir, MakeDir, MoveFile, ReadFile, Remove, SedPreview, WriteFile,
+    bsed_available, set_sandbox, Bash, EditFile, GrepText, ReadFile, SedPreview, WriteFile,
 };
 
 #[derive(Clone)]
@@ -959,7 +958,11 @@ const DEFAULT_AGENT_PROMPT: &str = r#"You are prior, a software engineering agen
 Your mission is to assist the user in their development tasks by utilizing a set of specialized tools. You operate within a specific codebase and must maintain its integrity while delivering high-quality solutions.
 
 ### WORKFLOW & STRATEGY
-1. **Understand Before Acting**: Always ground your responses in verified facts. Use `ls` to see the structure and `read` or `grep` to understand existing logic and patterns.
+1. **Understand Before Acting**: Always ground your responses in verified facts. Use `bash` to explore —
+   `ls` for structure, `rg --files` (or `rg -l <pattern>`) to enumerate files, `rg`/`git log` to find
+   references — and `read`/`grep` for a single known file. Directory listing, recursive search and
+   file mutation are shell operations here, not tools: they run inside the sandbox, so the bindings
+   are what gate them.
 2. **Be Precise**: When editing files, use `edit`. Leverage its block syntax, batch support, and
    line anchoring. For batch edits, use the `sed preview` tool - it gives you clean, disambiguated
    blocks to review and modify, which you then feed to the edit tool. Avoid editing with ad-hoc sed or
@@ -969,7 +972,9 @@ Your mission is to assist the user in their development tasks by utilizing a set
 4. **Tool Mastery**:
    - `read`: Use to read code. Note that it provides line numbers (e.g., `  10| code`). These are for
      your reference only; do not include them in your output or when writing files.
-   - `bash`: Your window to the system. Use it for compilation, testing, and complex automation.
+   - `bash`: Your window to the system: compilation, testing, tree traversal (`ls`, `rg --files`,
+     `find`), and every mutation other than `write`/`edit` (`mkdir`, `mv`, `cp`, `rm`). Prefer
+     `rg --files | rg <pattern>` over `find`; it is .gitignore-aware and much faster.
    - `w3m in the shell`: Use for external documentation, searching for solutions using
      duckduckgo.com. Use `pdftotext` for viewing PDF content.
 5. **Context**: You are working in the directory provided below. All paths are relative to this directory. Use relative paths in bash and other tools for token economy and session portability.
@@ -1044,12 +1049,18 @@ fn build_rig_agent(
         // gateways that emit their own codes, and has always treated an
         // unrecognised stop as a normal one, so keep that leniency.
         .accept_unknown_finish_reasons(true)
+        // Every surviving tool does a *point* lookup: one path in, resolved
+        // through `PathPolicy::resolve_host_arg`, so the sandbox bindings are
+        // enforced by construction. Tree traversal is not a tool: it belongs
+        // to `bash`, where the namespace makes the bindings authoritative
+        // (doc/sandbox.md -> "Tree traversal belongs to the shell"). That
+        // removed `ls`, `find`, `remove`, `make_dir`, `move_file` and
+        // `copy_file` -- their in-process walkers saw host truth, which under
+        // a remapping binding is not what the shell sees.
         .tool(ReadFile)
         .tool(WriteFile)
         .tool(EditFile)
-        .tool(GlobFiles)
-        .tool(GrepText)
-        .tool(ListDir);
+        .tool(GrepText);
 
     // `sed` previews changes; it never writes. Advertised only when the `bsed`
     // binary is present, because that binary is what runs the script -- a tool
@@ -1071,13 +1082,6 @@ fn build_rig_agent(
         builder = builder.temperature(t);
     }
 
-    let confirm_port = confirm_port.clone();
-    builder = builder
-        .tool(guard(MakeDir, yolo, None, confirm_port.clone()))
-        .tool(guard(Remove, yolo, None, confirm_port.clone()))
-        .tool(guard(MoveFile, yolo, None, confirm_port.clone()))
-        .tool(guard(CopyFile, yolo, None, confirm_port.clone()));
-
     let auto_allow = bash_auto_allow.clone();
     // Publish the resolved sandbox config for the shell tools. prior runs a
     // single agent per process, so a process-wide slot is sufficient and keeps
@@ -1087,18 +1091,10 @@ fn build_rig_agent(
         Bash,
         yolo,
         Some(Arc::new(move |args| {
-            auto_allow.iter().any(|pattern| {
-                regex::Regex::new(pattern)
-                    .map(|re| re.is_match(&args.command))
-                    .unwrap_or(false)
-            })
+            bash_auto_allowed(&auto_allow, &args.command)
         })),
         confirm_port.clone(),
     ));
-
-    if is_tool_available("agent-browser") {
-        builder = builder.tool(guard(AgentBrowser, yolo, None, confirm_port.clone()));
-    }
     builder.build()
 }
 
@@ -1187,6 +1183,31 @@ impl<T: Tool<Error = crate::tools::ToolError>> Tool for Guard<T> {
         }
         self.tool.call(context, args).await
     }
+}
+
+/// Whether `command` is covered by the operator's `auto_allow` patterns.
+///
+/// Each pattern is a regex that must match the **whole** command. Anchoring is
+/// deliberate: `ToolSettings::auto_allow` is an *allow*list, so a partial match
+/// would approve a command that merely starts with an approved prefix —
+/// `^ls -la` would approve `ls -la; rm -rf ~`, which is the opposite of what an
+/// operator writing that pattern intends. Patterns are therefore wrapped as
+/// `\A(?:…)\z`, so `^`/`$` inside a pattern keep their usual line meaning
+/// while the whole string must still be consumed.
+///
+/// An empty command, a malformed pattern, or a non-match all deny: the failure
+/// direction of an allowlist is "ask".
+fn bash_auto_allowed(patterns: &[String], command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    patterns.iter().any(
+        |pattern| match regex::Regex::new(&format!("\\A(?:{pattern})\\z")) {
+            Ok(re) => re.is_match(command),
+            Err(_) => false,
+        },
+    )
 }
 
 fn guard<T: Tool>(
@@ -1682,5 +1703,69 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- `auto_allow` is a whole-command allowlist ----
+
+    fn pats(p: &[&str]) -> Vec<String> {
+        p.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A pattern must cover the command *entirely*. Approving on a prefix is
+    /// the bug this guards: `^ls -la` approving `ls -la; rm -rf ~` would turn
+    /// a read-only-looking allowlist into unrestricted shell.
+    #[test]
+    fn auto_allow_requires_a_whole_command_match() {
+        let allow = pats(&["^ls -la$"]);
+        assert!(bash_auto_allowed(&allow, "ls -la"));
+        assert!(
+            bash_auto_allowed(&allow, "  ls -la  "),
+            "outer space is trimmed"
+        );
+        assert!(
+            !bash_auto_allowed(&allow, "ls -la; rm -rf ~"),
+            "a trailing injection must not ride an approved prefix"
+        );
+        assert!(!bash_auto_allowed(&allow, "ls -la /etc"));
+    }
+
+    /// The historical example spelling `^cmd` keeps working, but as an *exact*
+    /// match: the wrapper's `\z` still applies, so `^` no longer smuggles in
+    /// "matches at the start". Operators who want a family spell it out
+    /// (`^cargo (test|check|build)`).
+    #[test]
+    fn auto_allow_anchors_a_pattern_that_looks_partial() {
+        let allow = pats(&["^git status"]);
+        assert!(bash_auto_allowed(&allow, "git status"));
+        assert!(
+            !bash_auto_allowed(&allow, "git status --short"),
+            "`^git status` is exact; a prefix match is not what it means"
+        );
+        assert!(!bash_auto_allowed(&allow, "git status && curl evil"));
+
+        // A family is expressible, still exactly.
+        let family = pats(&["^cargo (test|check|build)( .*)?$"]);
+        assert!(bash_auto_allowed(&family, "cargo test"));
+        assert!(bash_auto_allowed(&family, "cargo test --lib"));
+        assert!(!bash_auto_allowed(&family, "cargo test; rm -rf ~"));
+    }
+
+    /// Failing direction is "ask": no patterns, an empty command, or a
+    /// malformed regex all deny.
+    #[test]
+    fn auto_allow_fails_closed() {
+        assert!(!bash_auto_allowed(&[], "ls"));
+        assert!(!bash_auto_allowed(&pats(&["^ls$"]), "   "));
+        assert!(!bash_auto_allowed(&pats(&["^ls("]), "ls"));
+    }
+
+    /// Alternation must not escape the wrapper: `a|b` stays inside the
+    /// non-capturing group, so it means "a or b", not "… or b…anything".
+    #[test]
+    fn auto_allow_alternation_stays_grouped() {
+        let allow = pats(&["^ls$|^pwd$"]);
+        assert!(bash_auto_allowed(&allow, "ls"));
+        assert!(bash_auto_allowed(&allow, "pwd"));
+        assert!(!bash_auto_allowed(&allow, "ls; curl evil"));
     }
 }

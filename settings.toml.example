@@ -4,7 +4,13 @@
 # All optional; sensible built-in defaults are used when omitted. These are
 # root-level keys, so they must appear before any `[table]` header below.
 default_model = "anthropic:claude-3-5-sonnet-20241022"  # provider:model
-security_mode = "confirm"          # yolo | confirm
+# Tool execution policy. The default is `yolo` (no per-call prompts): the
+# containment boundary is the sandbox below, whose bindings are deny-by-default
+# and mandatory, and approving every `ls`/`cat` in a long session is friction an
+# operator learns to click through without reading. `"confirm"` asks before each
+# `bash` call; the other tools (read, write, edit, grep, sed) are point
+# operations already bounded by the bindings, so they never prompt.
+security_mode = "yolo"             # yolo | confirm
 tool_call_limit = 50
 default_persona = "architect"      # built-in name or file path; omit for none
 # Default reasoning level. Optional: omit it (or set "off" — the same thing)
@@ -63,14 +69,22 @@ reasoning_in_context = "never"     # always | never | aborted_turns_only
 
 # Tool-specific configurations
 [tool_config.bash]
-# Commands that will be automatically allowed without prompting (when yolo is false)
+# Commands that will be automatically allowed without prompting (only used when
+# security_mode = "confirm"). Each entry is a regex that must match the WHOLE
+# command: `^ls$` approves `ls` but not `ls -la`, and never `ls; rm -rf ~`. The
+# wrapper anchors with `\A(?:…)\z`, so a pattern can never approve a command
+# that merely begins with the approved text. Spell out a family when you want
+# one:
+#   "^cargo (test|check|build)( .*)?$"
+# An empty or malformed pattern denies (the failure direction of an allowlist
+# is "ask").
 auto_allow = [
-  "^ls -la",
-  "^git status",
-  "^cargo test",
-  "^npm test",
+  "^ls( -[a-zA-Z]+)*$",
+  "^git (status|diff|log|show)( .*)?$",
+  "^rg( .*)?$",
+  "^cargo (test|check|build|clippy|fmt)( .*)?$",
 ]
-# Sandbox for the `bash` (and `agent-browser`) tools. Requires `bwrap`
+# Sandbox for the `bash` tool. Requires `bwrap`
 # (bubblewrap) on PATH; prior fails closed at startup if it is absent. An
 # unset sandbox config causes commands to be refused rather than run unsandboxed
 # (there is no plain-shell fallback and no enable switch — the sandbox is

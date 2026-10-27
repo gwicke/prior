@@ -1144,15 +1144,6 @@ pub(crate) fn is_anthropic_family(provider: &str, model: &str) -> bool {
         || (provider.eq_ignore_ascii_case("openrouter") && model.starts_with("anthropic/"))
 }
 
-pub(crate) fn is_tool_available(tool: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(tool)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 /// The note to show when a `/reasoning` override asks for a level `support`
 /// cannot serve, or `None` when it can.
 ///

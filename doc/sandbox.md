@@ -1,7 +1,8 @@
 # Sandbox Design (`bwrap`)
 
-This document specifies the shell-execution sandbox for the `bash` (and
-`agent-browser`) tools. It fixes two problems in the current implementation:
+This document specifies the shell-execution sandbox for the `bash` tool — the
+only tool that runs a child process. It fixes two problems in the current
+implementation:
 
 1. **Blocking on the tokio runtime.** Commands currently run via
    `tokio::task::spawn_blocking` + duct's synchronous `.read()`. A hung command
@@ -201,7 +202,7 @@ Typical remap uses:
 
 ## `run_sandboxed(cmd)` — the execution helper
 
-Single function used by `Bash` and `agent_browser`. Pseudocode:
+The single entry point behind `Bash`. Pseudocode:
 
 ```rust
 fn run_sandboxed(cmd: &str, cfg: &SandboxConfig) -> Result<String, ToolError> {
@@ -632,8 +633,8 @@ the netns and the SOCKS bridge:
 Both return `EPERM`, which is indistinguishable from a socket family the kernel
 does not have — a denied call looks like "not supported here", not like a probe.
 Everything else is allowed. **`AF_UNIX` is deliberately not denied**: the netns
-already removed the abstract X11 socket, and the bridge and `agent-browser`
-depend on Unix sockets.
+already removed the abstract X11 socket, and the egress bridge depends on Unix
+sockets.
 
 `src/seccomp.rs` assembles a 12-instruction classic-BPF program and writes it to
 a **fresh memfd per spawn**, passed as `--seccomp <fd>`. Two details are
@@ -827,11 +828,39 @@ everything behind it.
 ## Path enforcement for non-shell tools
 
 The `paths` policy must apply to **every** filesystem-accessing tool, not just
-the shell. The non-shell tools (`read_file`, `write_file`, `edit_file`,
-`glob_files`, `grep_text`, `list_dir`, `make_dir`, `remove`, `move_file`,
-`copy_file`) all funnel through `get_path` → `validate_path` in `tools.rs`. That
-function is the single chokepoint, so path policy is enforced **once** there
-rather than per-tool.
+the shell. The surviving file tools (`read`, `write`, `edit`, `grep`, `sed`) all
+funnel through `get_path` → `validate_path` in `tools.rs`. That function is the
+single chokepoint, so path policy is enforced **once** there rather than
+per-tool.
+
+### Tree traversal belongs to the shell
+
+Each of those tools is a **point lookup**: one path in, resolved by
+`PathPolicy::resolve_host_arg`, so the binding is enforced by construction.
+Tree traversal is the one operation this cannot express, and
+`ls`/`find`/`remove`/`make_dir`/`move_file`/`copy_file` were retired rather than
+kept (renamed `--` in the commit that added this section). The reason is that an
+in-process walk descends **host** truth, which is not what the namespace holds:
+
+- a masked subtree (an `rw` child bound from a different host dir, over a `ro`
+  parent) resolves per-path through the remap but is walked as the parent's host
+  content, wrong inode and all;
+- sandbox-only content (a binding whose `from` is outside the walked host
+  subtree, e.g. `{from: /cache, to: /scratch/deep}`) is invisible to a host walk
+  and cannot be recovered by post-filtering;
+- an implicitly created parent (bwrap `ensure_dir`s the parents of every bind
+  destination) exists inside the namespace but matches no binding, so it is
+  denied — a fail-closed divergence from the shell, not a leak;
+- the special mounts (`--dev /dev`, `--proc /proc`, the session `/tmp`) exist
+  only inside.
+
+Recursive search, listing, and every mutation other than `write`/`edit`/`sed`
+therefore go through `bash`, where the namespace is the authority — the shell
+already runs confined, so the bindings gate it with no extra machinery. The
+system prompt points the model at `ls` and `rg --files` accordingly. Retired tool
+names still render in `/tree` for pre-retirement sessions
+(`src/content/preview.rs`), and `CANONICAL_NAMES` in `src/session/storage.rs`
+keeps the old→canonical mapping so a resumed session replays unchanged.
 
 ### What `validate_path` enforces today
 
@@ -867,12 +896,11 @@ translate to a host path* (`PathPolicy::resolve_host_arg`):
    that bwrap mounts at `/tmp`, so the non-shell tool and the shell address the
    same file.
 3. **Mode check** on the covering binding:
-   - Read operations (`read_file`, `glob_files`, `grep_text`, `list_dir`) are
-     allowed under any `ro` or `rw` binding that covers the path.
-   - Write operations (`write_file`, `edit_file`, `make_dir`, `remove`,
-     `move_file`, `copy_file`, and the *destination* of move/copy) require the
-     covering binding to be `rw`. A write under an `ro` binding →
-     `ToolError::Generic("Access denied: path is read-only")`.
+   - Read operations (`read`, `grep`) are allowed under any `ro` or `rw`
+     binding that covers the path.
+   - Write operations (`write`, `edit`, and `sed`'s read of the file it
+     previews) require the covering binding to be `rw`. A write under an `ro`
+     binding → `ToolError::Generic("Access denied: path is read-only")`.
 
 On any denial the error echoes the path the **caller supplied** (an in-sandbox
 path it can act on); the host form never appears in a model-visible string. See
@@ -1001,14 +1029,14 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
 
 - [ ] Add `run_sandboxed(cmd, &SandboxConfig) -> Result<String, ToolError>` in
       `tools.rs`.
-- [ ] Route `Bash::call` and `agent_browser` through `run_sandboxed`.
+- [ ] Route `Bash::call` through `run_sandboxed`.
 - [ ] Apply `duct` `.timeout(Duration::from_secs(timeout_secs))` inside the
       helper (skip when `timeout_secs == 0/None`).
 - [ ] The sandbox is always active when a config is present (bwrap required at
       startup); the helper refuses only when no sandbox config is set.
 - [ ] Unit/integration tests: `echo` works; `sleep 30` with 1s timeout is
       killed/errors; an unset sandbox config is refused.
-- [ ] Verify existing `Bash`/`agent_browser` behavior unchanged when sandboxed.
+- [ ] Verify existing `Bash` behavior unchanged when sandboxed.
 
 ### Phase 2 — bwrap sandboxing (shell tools)
 

@@ -495,7 +495,7 @@ Refinements from the recent work:
 # settings.toml (additions; all optional, defaulted)
 # Managed by the /set menu — safe to edit by hand.
 default_model = "anthropic:claude-3-5-sonnet-20241022"
-security_mode = "confirm"          # yolo | confirm
+security_mode = "yolo"             # yolo | confirm (default: yolo)
 tool_call_limit = 50
 default_persona = "architect"      # omit for no persona
 default_thinking_level = "off"     # off | low | med | high

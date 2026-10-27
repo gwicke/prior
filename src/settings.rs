@@ -375,10 +375,7 @@ impl SettingsStore {
     pub fn from_config(cfg: &crate::Config, path: Option<&Path>) -> Self {
         SettingsStore {
             default_model: cfg.default_model.clone().unwrap_or_default(),
-            security_mode: cfg
-                .security_mode
-                .clone()
-                .unwrap_or_else(|| "confirm".to_string()),
+            security_mode: cfg.resolve_security_mode().to_string(),
             tool_call_limit: cfg.tool_call_limit.unwrap_or(50),
             default_persona: cfg.default_persona.clone(),
             default_reasoning_level: cfg.default_reasoning_level.clone(),
@@ -793,7 +790,14 @@ impl SettingsStore {
     }
 }
 
-fn normalize_security(v: &str) -> &'static str {
+/// Canonical spelling of a `security_mode` value.
+///
+/// Only `"yolo"` and `"confirm"` are meaningful; the `ask`/`safe` aliases
+/// accepted by [`SettingsStore::validate`] normalize to `"confirm"`, and an
+/// unrecognised spelling does too — a typo must not silently *weaken* the
+/// mode. Omitted keys resolve to `"yolo"` at the call site
+/// ([`crate::Config::resolve_security_mode`]), not here.
+pub(crate) fn normalize_security(v: &str) -> &'static str {
     match v.trim().to_ascii_lowercase().as_str() {
         "yolo" => "yolo",
         _ => "confirm",

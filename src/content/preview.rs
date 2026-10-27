@@ -167,10 +167,47 @@ pub(crate) fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
             let path = get_str("path").unwrap_or("");
             (format!("grep {} {}", pat, path), Vec::new())
         }
+        // Retired tools (doc/sandbox.md -> "Tree traversal belongs to the
+        // shell"): no session records new calls, but old ones must still render
+        // with the shape they had, so `/tree` on a pre-retirement session reads
+        // the same as it did.
         s if s == "ls" || s.starts_with("list") => {
-            // `ls` (canonical) or `list_dir` / `List*` (old): shorten to `ls`.
             let path = get_str("path").unwrap_or("");
             (format!("ls {}", path), Vec::new())
+        }
+        "find" | "glob_files" => {
+            let pattern = get_str("pattern").unwrap_or("");
+            let path = get_str("path").unwrap_or("");
+            (format!("find {pattern} {path}"), Vec::new())
+        }
+        "make_dir" | "mkdir" => {
+            let path = get_str("path").unwrap_or("");
+            (format!("mkdir -p {}", path), Vec::new())
+        }
+        "remove" | "rm" => {
+            let path = get_str("path").unwrap_or("");
+            let recursive = args
+                .get("recursive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (
+                format!("rm {}{}", if recursive { "-r " } else { "" }, path),
+                Vec::new(),
+            )
+        }
+        "move_file" | "mv" => {
+            let src = get_str("src").unwrap_or("");
+            let dst = get_str("dst").unwrap_or("");
+            (format!("mv {} {}", src, dst), Vec::new())
+        }
+        "copy_file" | "cp" => {
+            let src = get_str("src").unwrap_or("");
+            let dst = get_str("dst").unwrap_or("");
+            (format!("cp {} {}", src, dst), Vec::new())
+        }
+        "agent_browser" | "agent-browser" => {
+            let args_str = get_str("args").unwrap_or("");
+            (format!("agent-browser {}", args_str), Vec::new())
         }
         "edit" | "edit_file" => {
             // The canonical form (`edits` array) is what `on_tool_call` hands us;

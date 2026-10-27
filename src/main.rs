@@ -275,10 +275,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| file_default.as_ref().map(|(_, m)| m.clone()))
         .unwrap_or_else(|| default_model(&provider));
 
+    // The default is `yolo`; see `Config::resolve_security_mode` for why. An
+    // explicit `--yolo` (or a recipe's `yolo`) still wins over the file.
     let yolo = if let Some(y) = args.yolo {
         y
     } else {
-        config.security_mode.as_deref() == Some("yolo")
+        config.resolve_security_mode() == "yolo"
     };
     let tool_call_limit = args
         .tool_call_limit

@@ -848,7 +848,7 @@ pub struct ToolSettings {
     pub sandbox: Option<SandboxConfig>,
 }
 
-/// Sandbox configuration for the `bash` (and `agent-browser`) tools.
+/// Sandbox configuration for the `bash` tool.
 ///
 /// See `doc/sandbox.md` for the full design. All fields are optional and
 /// merged with built-in defaults by [`SandboxConfig::with_defaults`].
@@ -1061,7 +1061,7 @@ impl SandboxConfig {
 /// Environment-filter policy for the sandbox.
 ///
 /// Controls which of the parent process's environment variables are visible
-/// to the sandboxed `bash`/`agent_browser` command. Modeled as a single
+/// to the sandboxed `bash` command. Modeled as a single
 /// mutually-exclusive mode: you cannot combine a blacklist and a whitelist in
 /// one policy.
 ///
@@ -1790,6 +1790,24 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// The effective security mode, `"yolo"` or `"confirm"`.
+    ///
+    /// This is the single resolver for the default. `security_mode` omitted
+    /// from the file means **yolo**: the sandbox is the containment boundary
+    /// (bindings are deny-by-default and mandatory), and per-command approval
+    /// does not scale in practice — a long session means hundreds of dialogs,
+    /// which trains the operator to say yes without reading. Operators who
+    /// want prompts write `security_mode = "confirm"` and get them.
+    ///
+    /// An unrecognised spelling normalizes to `confirm` (see
+    /// [`crate::settings::normalize_security`]): that is the *safe* direction,
+    /// so keeping it avoids ever widening access on a typo.
+    /// `SettingsStore::validate` rejects the spelling outright in the menu
+    /// path, so it reaches here only from a hand-edited file.
+    pub fn resolve_security_mode(&self) -> &'static str {
+        crate::settings::normalize_security(self.security_mode.as_deref().unwrap_or("yolo"))
+    }
+
     /// Returns the raw (user-provided) sandbox config for the `bash` tool, if any.
     pub fn bash_sandbox_raw(&self) -> Option<&SandboxConfig> {
         self.tool_config
@@ -2409,7 +2427,7 @@ default_persona = "architect"
 default_reasoning_level = "off"
 
 [tool_config.bash]
-auto_allow = ["^ls -la"]
+auto_allow = ["^ls -la$"]
 
 [recipes.review-security]
 prompt = "Review the codebase."
@@ -2439,6 +2457,44 @@ model = "claude-3-5-sonnet-20241022"
         assert!(cfg.tool_call_limit.is_none());
         assert!(cfg.default_persona.is_none());
         assert!(cfg.default_reasoning_level.is_none());
+    }
+
+    /// The security mode defaults to `yolo`, not `confirm`.
+    ///
+    /// The containment boundary is the sandbox (bindings are deny-by-default
+    /// and mandatory), not a per-call dialog: approving every `ls` and `cat`
+    /// in a long session is friction the operator learns to click through
+    /// without reading, which is strictly worse than not asking.
+    /// `security_mode = "confirm"` opts back in, and `--yolo`/`--yolo=false`
+    /// still win over the file.
+    #[test]
+    fn security_mode_defaults_to_yolo() {
+        let cfg: Config =
+            toml_edit::de::from_str("recipes = {}").expect("minimal TOML should parse");
+        assert!(cfg.security_mode.is_none(), "the key is still absent");
+        assert_eq!(cfg.resolve_security_mode(), "yolo");
+        assert_eq!(
+            Config::default().resolve_security_mode(),
+            "yolo",
+            "an empty config resolves to yolo"
+        );
+
+        // An explicit value is honoured, in either direction.
+        let confirm: Config =
+            toml_edit::de::from_str("security_mode = \"confirm\"").expect("parses");
+        assert_eq!(confirm.resolve_security_mode(), "confirm");
+        let yolo: Config = toml_edit::de::from_str("security_mode = \"yolo\"").expect("parses");
+        assert_eq!(yolo.resolve_security_mode(), "yolo");
+    }
+
+    /// A misspelled `security_mode` fails *safe*: it resolves to `confirm`,
+    /// which tightens rather than widens access. The menu path rejects the
+    /// spelling outright (`SettingsStore::validate`), so this only applies to a
+    /// hand-edited file.
+    #[test]
+    fn unknown_security_mode_fails_safe() {
+        let cfg: Config = toml_edit::de::from_str("security_mode = \"yoloo\"").expect("parses");
+        assert_eq!(cfg.resolve_security_mode(), "confirm");
     }
 
     // ---- the /thinking -> /reasoning rename (doc/model_settings_v2.md A.11) ----
@@ -2503,7 +2559,12 @@ model = "claude-3-5-sonnet-20241022"
             "example should include a sandbox block"
         );
         assert_eq!(cfg.tool_call_limit, Some(50));
-        assert_eq!(cfg.security_mode.as_deref(), Some("confirm"));
+        assert_eq!(
+            cfg.security_mode.as_deref(),
+            Some("yolo"),
+            "the shipped example states the default explicitly"
+        );
+        assert_eq!(cfg.resolve_security_mode(), "yolo");
     }
 
     /// The example's expanded `only_allow` list must agree with the built-in

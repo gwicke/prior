@@ -211,15 +211,6 @@ fn validate_path(base: &std::path::Path, path: &str) -> Result<PathBuf, ToolErro
     }
 }
 
-fn walk_files(base: &std::path::Path) -> impl Iterator<Item = ignore::DirEntry> {
-    ignore::WalkBuilder::new(base)
-        .hidden(false)
-        .require_git(false)
-        .build()
-        .filter_map(|r| r.ok())
-        .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
-}
-
 #[rig_tool(
     name = "read",
     description = "Read file with line numbers. One read returns at most 500 lines \
@@ -1023,44 +1014,6 @@ pub async fn sed_preview(
             cap_lines(raw.trim(), 40)
         ))),
     }
-}
-
-#[rig_tool(
-    name = "find",
-    description = "Find files by pattern, sorted by mtime",
-    required(pattern, path)
-)]
-pub async fn glob_files(pattern: String, path: String) -> Result<String, ToolError> {
-    let base = get_path(&path)?;
-    let matcher = globset::Glob::new(&pattern)
-        .map_err(|e| ToolError::Generic(e.to_string()))?
-        .compile_matcher();
-    let entries = tokio::task::spawn_blocking(move || {
-        walk_files(&base)
-            .filter(|e| matcher.is_match(e.path().strip_prefix(&base).unwrap_or(e.path())))
-            .map(|e| e.into_path())
-            .collect::<Vec<_>>()
-    })
-    .await?;
-
-    let mut files = Vec::new();
-    for e in entries {
-        let mtime = fs::metadata(&e).await.and_then(|m| m.modified()).ok();
-        files.push((e, mtime));
-    }
-    files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
-    // Format matches as paths relative to cwd (when under cwd). This keeps
-    // the model-facing output portable across checkouts of the same repo
-    // and avoids burning tokens on the absolute cwd prefix. We resolve cwd
-    // here (after the walker has returned and `base` is no longer in use)
-    // and reuse it for every entry.
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let res = files
-        .iter()
-        .map(|(f, _)| relativize_path(f, &cwd))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(if res.is_empty() { "none".into() } else { res })
 }
 
 #[rig_tool(
@@ -2471,106 +2424,9 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-#[rig_tool(
-    name = "ls",
-    description = "List files and directories in a path",
-    required(path)
-)]
-pub async fn list_dir(path: String) -> Result<String, ToolError> {
-    let base = get_path(&path)?;
-
-    let entries = tokio::task::spawn_blocking(move || {
-        ignore::WalkBuilder::new(&base)
-            .hidden(false)
-            .require_git(false)
-            .max_depth(Some(1))
-            .build()
-            .filter_map(|r| r.ok())
-            .filter(|e| e.depth() > 0) // Skip the root directory itself
-            .map(|e| {
-                let name = e.file_name().to_string_lossy();
-                let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                format!("{}{}", name, if is_dir { "/" } else { "" })
-            })
-            .collect::<Vec<String>>()
-    })
-    .await?;
-
-    let mut res = entries;
-    res.sort();
-    Ok(if res.is_empty() {
-        "(empty)".into()
-    } else {
-        res.join("\n")
-    })
-}
-
-#[rig_tool(
-    description = "Create a directory (including parent directories)",
-    required(path)
-)]
-pub async fn make_dir(path: String) -> Result<String, ToolError> {
-    fs::create_dir_all(get_path_with(&path, true)?).await?;
-    Ok("ok".into())
-}
-
-#[rig_tool(description = "Remove a file or directory", required(path, recursive))]
-pub async fn remove(path: String, recursive: bool) -> Result<String, ToolError> {
-    let p = get_path_with(&path, true)?;
-    if p.is_dir() {
-        if recursive {
-            fs::remove_dir_all(p).await?;
-        } else {
-            fs::remove_dir(p).await?;
-        }
-    } else {
-        fs::remove_file(p).await?;
-    }
-    Ok("ok".into())
-}
-
-#[rig_tool(description = "Move or rename a file or directory", required(src, dst))]
-pub async fn move_file(src: String, dst: String) -> Result<String, ToolError> {
-    fs::rename(get_path_with(&src, true)?, get_path_with(&dst, true)?).await?;
-    Ok("ok".into())
-}
-
-#[rig_tool(
-    description = "Copy a file (does not support directories yet)",
-    required(src, dst)
-)]
-pub async fn copy_file(src: String, dst: String) -> Result<String, ToolError> {
-    fs::copy(get_path_with(&src, true)?, get_path_with(&dst, true)?).await?;
-    Ok("ok".into())
-}
-
-#[rig_tool(
-    description = "Browser automation CLI for AI agents.
-Core workflow:
-1. Navigate: agent-browser open <url>
-2. Snapshot: agent-browser snapshot -i (returns elements with refs like @e1, @e2)
-3. Interact: click @e1, fill @e2 \"text\", etc.
-4. Re-snapshot after navigation or significant DOM changes
-
-Commands:
-- Navigation: open <url>, back, forward, reload, close
-- Snapshot: snapshot (full tree), snapshot -i (interactive only), snapshot -c (compact)
-- Interactions: click, dblclick, fill, type, press <key>, hover, check, uncheck, select, scroll, scrollintoview
-- Information: get text, get value, get title, get url
-- Screenshots: screenshot [path] [--full]
-- Wait: wait @e1, wait <ms>, wait --text <text>, wait --load networkidle
-- Sessions: --session <name> (parallel browsers)
-- Output: Add --json for machine-readable output",
-    required(args)
-)]
-pub async fn agent_browser(args: String) -> Result<String, ToolError> {
-    run_sandboxed(&format!("agent-browser {}", args), None).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use std::path::Path;
 
     /// A result's first-line indentation is content, not padding: only whole
@@ -2680,61 +2536,6 @@ mod tests {
 
         // Root path
         assert!(validate_path(base, "/").is_err());
-    }
-
-    /// RAII helper that chdirs into a fresh tempdir and restores the
-    /// original cwd on drop. Required by `glob_files` tests because
-    /// `get_path` enforces the result is inside cwd (and the global cwd
-    /// races across parallel tests if mutated inline).
-    struct TempCwd {
-        _dir: tempfile::TempDir,
-        prev: std::path::PathBuf,
-    }
-
-    impl TempCwd {
-        fn new() -> Self {
-            crate::tools::set_sandbox(None);
-            let dir = tempfile::tempdir().unwrap();
-            let prev = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir.path()).unwrap();
-            TempCwd { _dir: dir, prev }
-        }
-    }
-
-    impl Drop for TempCwd {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.prev);
-        }
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn glob_files_results_are_relative_to_cwd() {
-        // The model passes an absolute path to glob_files; the matched
-        // file paths in the tool result must come back as `./x` (or
-        // `./sub/x`), not `<tempdir>/x`. Otherwise the absolute cwd prefix
-        // burns tokens on every result and breaks session portability
-        // across checkouts of the same repo.
-        let guard = TempCwd::new();
-        tokio::fs::create_dir_all("sub").await.unwrap();
-        tokio::fs::write("a.txt", "x").await.unwrap();
-        tokio::fs::write("sub/b.txt", "y").await.unwrap();
-
-        let cwd = std::env::current_dir().unwrap();
-        let search_root = cwd.to_string_lossy().into_owned();
-        let res = glob_files("*.txt".to_string(), search_root).await.unwrap();
-
-        // The matched path must appear in relative form.
-        assert!(
-            res.contains("./a.txt"),
-            "expected `./a.txt` in glob output, got: {res}",
-        );
-        // And the absolute tempdir path must NOT leak.
-        let tempdir_str = guard._dir.path().to_string_lossy().into_owned();
-        assert!(
-            !res.contains(&tempdir_str),
-            "absolute tempdir leaked into glob output: {res}",
-        );
     }
 }
 
