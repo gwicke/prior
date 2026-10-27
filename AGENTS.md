@@ -9,3 +9,4 @@
 ## Formatting
 
 - Code: Always run `cargo fmt` and `cargo clippy` before commit. Fix all warnings.
+- Markdown: `rumdl fmt <file>`

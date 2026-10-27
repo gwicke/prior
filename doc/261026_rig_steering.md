@@ -34,13 +34,18 @@ pub struct CompletionCallEvent<'a> {
 }
 ```
 
+> **Note**: `CompletionCallEvent` does **not** expose `additional_params` or the merged
+> `RequestPatch`. Hooks only see `prompt`, `history`, and `turn`. To pass retry context to a hook,
+> use `HookContext::scratchpad()` (in-memory, same run) or `HookContext::entries()` (persisted,
+> survives process restart via pi session).
+
 ### `CompletionCallAction` — Hook Output
 
-| Variant               | Effect                                                           |
-| --------------------- | ---------------------------------------------------------------- |
-| `Continue`            | Send the baseline request unchanged                              |
-| `Patch(RequestPatch)` | **Merge a per-turn patch** into the request (steering injection) |
-| `Stop(String)`        | Stop the run entirely with a reason                              |
+|Variant              |Effect                                                                      |
+|---------------------|----------------------------------------------------------------------------|
+|`Continue`           |Send the baseline request unchanged                                         |
+|`Patch(RequestPatch)`|**Merge a per-turn patch** into the request (history transform, context injection, param override)|
+|`Stop(String)`       |Stop the run entirely with a reason                                         |
 
 ### `RequestPatch` — What Can Be Injected
 
@@ -92,6 +97,12 @@ From `HookStack` and `CompletionCallEvent` docs:
 3. After next tool results → turn 3
 4. ...
 
+> **Internal rig retry detail**: When `ModelTurnAction::Retry` is returned from
+> `on_model_turn_finished`, the run state resets to `READY` (`PreparingRequest`). The next
+> `next_step()` call increments `current_turn` (see `rig-agent/src/run/mod.rs:867`). Thus the hook
+> sees an **incremented `turn` value** on retry — not the same `turn` number. The retry consumes the
+> total model-call budget (`max_turns`).
+
 ## Hook Registration
 
 Hooks are attached to a run via:
@@ -107,7 +118,11 @@ let agent = AgentBuilder::new(client).hook(MySteeringHook).build();
 Multiple hooks form a `HookStack` — they run in **registration order**; their `RequestPatch`es merge
 per the rules above.
 
-## Example: Injecting a Steering Message
+## Example: Generic rig Steering Hook (Not Used by Prior)
+
+The following shows a typical rig steering pattern using `extra_context` —
+**Prior does not use this**. Prior's `LoggingHook` transforms history via `RequestPatch::history()`
+instead.
 
 ```rust
 use rig_agent::agent::hook::{AgentHook, CompletionCallEvent, CompletionCallAction, HookContext};
@@ -141,7 +156,7 @@ impl AgentHook for SteeringHook {
 ## The AgentRun State Machine
 
 rig's execution is driven by a sans-I/O `AgentRun` state machine. Understanding it is essential for
-steering behavior on retries and resumes.
+steering behavior on retries and in-memory continuation.
 
 ### CommittedLog — Append-Only Canonical History
 
@@ -161,20 +176,32 @@ impl CommittedLog {
 - **Append-only** — no rewrite, delete, or modify of committed messages
 - **Canonical** — stores provider-exact messages (full reasoning, raw tool calls, exact tool
   results)
-- **Source of truth** for resume, display, and tool execution
+- **Source of truth** for in-memory continuation, display, and tool execution
 
-The run commits at fixed protocol points (all inside `next_step()`):
+The run commits at fixed protocol points:
 
-| Trigger                    | What Gets Committed                              |
-| -------------------------- | ------------------------------------------------ |
-| Turn accepted (tool-free)  | `assistant_turn(head, items)`                    |
-| Turn accepted (with tools) | `assistant_turn(head, items)`                    |
-| Tool results complete      | `ToolResult` messages (user role)                |
-| Invalid tool call retry    | `assistant_message` + `user_message` (feedback)  |
-| Output tool reprompt       | `assistant_message` + `user_message` (feedback)  |
-| Cancellation/abort         | `closure` (synthetic user message closing batch) |
+- **Trigger**: Turn accepted (tool-free)
+  - **Where Committed**: `next_step()` → `AwaitingAdvance`
+  - **What Gets Committed**: `assistant_turn(head, items)`
+- **Trigger**: Turn accepted (with tools)
+  - **Where Committed**: `next_step()` → `AwaitingAdvance`
+  - **What Gets Committed**: `assistant_turn(head, items)`
+- **Trigger**: Tool results complete
+  - **Where Committed**: `answer_all()` → `ExecutingTools` complete
+  - **What Gets Committed**: `ToolResult` messages (user role)
+- **Trigger**: Invalid tool call retry
+  - **Where Committed**: `resolve_invalid_tool_call()`
+  - **What Gets Committed**: `assistant_message` + `user_message` (feedback)
+- **Trigger**: Output tool reprompt
+  - **Where Committed**: `reprompt_for_output()`
+  - **What Gets Committed**: `assistant_message` + `user_message` (feedback)
+- **Trigger**: Cancellation/abort
+  - **Where Committed**: `fail()` / `cancel_error()`
+  - **What Gets Committed**: `closure` (synthetic user message closing batch)
 
-**Prior does NOT call `commit()`** — the `AgentRun` owns all commits internally.
+**Prior does NOT call `commit()`** — the `AgentRun` owns all commits internally. Prior's
+`LoggingHook` calls its own `transcript::commit()` for session persistence (pi-format JSONL),
+separate from rig's `CommittedLog`.
 
 ### History Transformation: Canonical → Model-Facing
 
@@ -227,10 +254,12 @@ async fn on_model_turn_finished(&self, ctx: &HookContext, event: ModelTurnFinish
 
 **Behavior:**
 
-- Resets `AgentRun` state to `READY` (same `turn` number)
-- **Same `AgentRun` instance** — turn counter does NOT increment
-- `on_completion_call` fires again with **identical `event.turn`, `prompt`, `history`**
-- Hook **cannot distinguish** retry from first attempt without external state
+- Resets `AgentRun` state to `READY` (`PreparingRequest { rollback_owed: false }`)
+- **Same `AgentRun` instance** — but `next_step()` increments `current_turn` when leaving
+  `PreparingRequest` (see `mod.rs:867`)
+- `on_completion_call` fires again with **incremented `event.turn`**, same `prompt`, same `history`
+- Hook **can distinguish** retry from first attempt via `turn` value (but not "is this a retry?")
+- The retry consumes the total model-call budget (`max_turns`)
 
 **Constraint:** Only works for **tool-free turns**. Tool-bearing turns cannot be retried this way
 (would create unanswered calls in provider history).
@@ -246,7 +275,7 @@ Err(LlmInterrupted { cause }) => {
     next_input = if session.is_none() {
         input.clone()                      // No session: re-send original
     } else if steer_delivered {
-        "continue".to_string()             // Already steered once: short continue
+        "continue".to_string()             // Already steered once: short nudge
     } else {
         steer_delivered = true;
         cause.synthetic_retry_feedback()   // First retry: full feedback
@@ -259,150 +288,57 @@ Err(LlmInterrupted { cause }) => {
 
 **Behavior:**
 
-- Creates **fresh `AgentRunner`** each retry → fresh `AgentRun` → **turn counter resets to 1**
+- Creates **fresh `AgentRunner`** each retry → fresh `AgentRun` → **turn counter starts at 1**
+  (first `next_step()` increments to 1)
 - Sends **different prompt** (steering/feedback message)
 - May have **different params** (e.g., temperature dropped for corrective feedback)
-- Is a **new user dispatch** — distinct from rig's internal retry
+- Is a **new user dispatch** (`turn.mark_new_dispatch()`) — distinct from rig's internal retry
+- Prior's `LoggingHook` transforms history unconditionally on every turn (no `turn > 1` check)
 
 ---
 
-## The Double-Steering Problem
+## In-Memory Continuation (Same AgentRun)
 
-Prior's steering hook (pattern: `if event.turn > 1 { inject }`) fires incorrectly on external
-retries:
-
-| Attempt               | `AgentRunner` | `event.turn` | Hook Sees  | Injects?                   |
-| --------------------- | ------------- | ------------ | ---------- | -------------------------- |
-| First                 | #1            | 1            | Turn 1     | No (turn ≤ 1)              |
-| Tool call             | #1            | 2            | Turn 2     | **Yes** ("continue")       |
-| **External retry**    | **#2 (new)**  | **1**        | **Turn 1** | **No** (turn ≤ 1)          |
-| Retry makes tool call | #2            | 2            | Turn 2     | **Yes AGAIN** ("continue") |
-
-The hook injects on **every retry's turn 2+** because each `prompt()` call creates a fresh runner
-with turn counter starting at 1.
-
----
-
-## Rig's Native Resume (`Agent::resume`)
-
-Rig provides proper resume via persisted `AgentRun`:
+For mid-stream failures **within the same turn** (network error, timeout), the `AgentRun` is already
+in `AwaitingModel { recorded: false }`. Calling `next_step()` again **re-issues the same attempt**
+without incrementing `turn`:
 
 ```rust
-// First run
-let runner = agent.prompt("Fix the bug").add_hook(MyHook).run().await?;
-
-// On error, get the AgentRun (requires API change to expose it)
-// Later: resume the EXACT same run
-let runner = agent.resume(persisted_run).add_hook(MyHook).run().await?;
-```
-
-### What Resume Preserves
-
-|Component                           |Source               |Resume Behavior                        |
-|------------------------------------|---------------------|---------------------------------------|
-|`CommittedLog` (canonical history)  |Serialized `AgentRun`|**Loaded as-is**                       |
-|`chat_history` (input context)      |Serialized `AgentRun`|**Loaded as-is**                       |
-|`current_turn`                      |Serialized `AgentRun`|**Restored**                           |
-|`previous_model`                    |Serialized `AgentRun`|**Restored**                           |
-|`turn_tools` (advertised tool names)|Serialized `AgentRun`|**Restored**                           |
-|Hook `entries` (asides)      |Serialized `AgentRun`|**Restored via `HookContext::seed_entries()`**|
-
-### What Is Fresh on Resume
-
-|Component             |Source                                       |Resume Behavior              |
-|----------------------|---------------------------------------------|-----------------------------|
-|Tool implementations|`ToolServerHandle` (current process registry)|**Fresh snapshot** at `CallTools` by name|
-|Run config (`RunSpec`)|`AgentRunner.config.spec`                    |**Fresh** from new runner    |
-|Hook instances        |`AgentRunner.config.hooks`           |**Fresh** — state from `entries` only|
-|Model client          |`AgentRunner.config.handlers`                |**Fresh** from new runner    |
-
-### Parameter Changes Across Resume — Supported
-
-|Parameter                                             |Can Change on Resume?                      |
-|------------------------------------------------------|-------------------------------------------|
-|`preamble`, `temperature`, `tool_choice`, `max_tokens`|✅ Yes — runner config applied fresh       |
-|`additional_params`                                   |✅ Yes — merged fresh per request          |
-|`active_tools`                                        |✅ Yes — intersected fresh                 |
-|Tool implementations                             |✅ Always fresh — rebound by name at `CallTools`|
-
-**The runner config is applied fresh on every resume** — `build_run()` only uses persisted
-`AgentRun` for history/turn state; config comes from the new `AgentRunner`.
-
----
-
-## Why Prior Doesn't Use Rig Resume Today
-
-- **Blocker**: **API Access**
-  - **Details**: `prompt()` returns `String`, not `AgentRun`. Need to extract run from driver or
-    error.
-- **Blocker**: **Dual Persistence**
-  - **Details**: Prior persists pi-format JSONL. Would need to also persist rig's `AgentRun`
-    envelope.
-- **Blocker**: **Hook Reconstruction**
-  - **Details**: `LoggingHook` has `Arc<Mutex<TurnTranscript>>`, `Arc<Mutex<EditAnchorLedger>>`,
-    `Arc<Session>`, `Arc<MessageLogger>` — must reconstruct from `entries` or session.
-- **Blocker**: **Semantic Mismatch**
-  - **Details**: Prior's retries = **new prompts** (corrective). Rig resume =
-    **re-issue same request**.
-
-Prior's external retries are fundamentally "corrective re-prompt," not "request re-issue." The
-current architecture (reconstruct agent, send new steering prompt) matches the intent better.
-
----
-
-## Solutions for Prior
-
-### Option A: Use Rig Resume (Architecture Change)
-
-Persist `AgentRun` on error, resume it. Requires API changes, dual persistence, hook reconstruction.
-**Not recommended** — semantic mismatch.
-
-### Option B: Track "Logical Turn" in Hook Scratchpad
-
-```rust
-async fn on_completion_call(&self, ctx: &HookContext, event: CompletionCallEvent<'_>) -> CompletionCallAction {
-    let key = format!("logical_turn_{}_{}", session_id, user_prompt_count);
-    let logical_turn = ctx.scratchpad().get::<u32>(&key).unwrap_or(0) + 1;
-    ctx.scratchpad().insert(&key, logical_turn);
-    
-    if logical_turn > 1 && !already_steered_this_logical_turn { ... }
+// mod.rs:856-867 — re-issue path
+RunState::PreparingRequest { .. } | RunState::AwaitingModel { .. } => {
+    if let RunState::PreparingRequest { .. } = state {
+        self.current_turn += 1;  // Only increments when LEAVING PreparingRequest
+    }
+    let step = self.call_model_step()?;  // Same turn, same prompt, same history
+    self.state = RunState::AwaitingModel { recorded: false };
+    Ok(step)
 }
 ```
 
-Works but fragile — scratchpad is in-memory only, lost on process restart.
+This is the **preferred way to handle mid-stream retries**: keep the `AgentRun` alive and call
+`next_step()` again. No new history sent, no turn budget consumed, no steering re-applied.
 
-### Option C: Pass Retry Context via `additional_params` (Recommended)
+### When to Use Which Retry
 
-```rust
-// In prompt(), when retrying:
-let request = if is_retry {
-    self.agent.prompt(input)
-        .replace_additional_params(json!({"prior_retry": true, "logical_turn": 3}))
-} else {
-    self.agent.prompt(input)
-};
+- **Failure Type**: Mid-stream (network, timeout)
+  - **Mechanism**: Re-issue `next_step()` on same `AgentRun`
+  - **Turn Counter**: Same
+  - **History Re-sent**: No
+- **Failure Type**: Tool-free turn rejected by hook
+  - **Mechanism**: `ModelTurnAction::Retry` → `retry_model_turn()`
+  - **Turn Counter**: Increments
+  - **History Re-sent**: No (same prompt/history)
+- **Failure Type**: Mid-stream with progress (`LlmInterrupted`)
+  - **Mechanism**: Fresh `AgentRunner` + steering feedback
+  - **Turn Counter**: Resets to 1
+  - **History Re-sent**: Yes (with pi session context)
+- **Failure Type**: New user prompt after `Done`
+  - **Mechanism**: Fresh `AgentRun` (required)
+  - **Turn Counter**: Starts at 1
+  - **History Re-sent**: Yes (full pi session)
 
-// In hook:
-let is_retry = event.additional_params
-    .get("prior_retry").and_then(|v| v.as_bool()).unwrap_or(false);
-let logical_turn = event.additional_params
-    .get("logical_turn").and_then(|v| v.as_u64()).unwrap_or(event.turn as u64);
-
-if logical_turn > 1 && !is_retry { inject }  // Skip on retry
-```
-
-Clean, explicit, survives process restart via `additional_params` in request.
-
-### Option D: Disable Rig Steering, Use Prior's Explicit Steering (Simplest)
-
-Prior already implements steering at application level (lines 961-992 in `interactive.rs`):
-
-- Sends "continue" / synthetic feedback as **explicit user messages**
-- Model sees them in history naturally
-- No rig hook needed → no double-injection
-
-**Remove the steering hook entirely.** The `extra_context` injection is redundant when Prior
-controls the conversation flow explicitly.
+**`AgentRun` is designed for ONE user prompt** — it reaches `Done` and stops. A follow-up user
+prompt always requires a fresh `AgentRun` seeded with the pi session.
 
 ---
 
@@ -414,43 +350,51 @@ controls the conversation flow explicitly.
 pub struct HookContext {
     // Shared run scratchpad (in-memory, not persisted)
     scratchpad: Scratchpad,
-    // Persisted entries (serialized in AgentRun, survive resume)
+    // Persisted entries (serialized in AgentRun, survive in-memory resume)
     entries: Vec<Aside>,
 }
 
 impl HookContext {
-    // Scratchpad: in-memory key-value, lost on process exit
+    // Scratchpad: in-memory key-value, lost when AgentRun drops
     pub fn scratchpad(&self) -> &Scratchpad { ... }
     // Scratchpad methods: insert<T>(), get<T>(), update<T, R>(), contains<T>(), remove<T>()
     
-    // Entries: persisted asides, survive resume
+    // Entries: persisted asides, survive in-memory continuation
     pub fn append_entry<T: Serialize>(&self, kind: impl Into<String>, value: &T) -> Result<()>
     pub fn entries(&self, kind: &str) -> Vec<Aside>
     pub fn last_entry(&self, kind: &str) -> Option<Aside>
 }
 ```
 
-**Use `entries` for resume-surviving state** (e.g., "which turns already steered"), `scratchpad` for
-in-memory tracking within a run.
+**Use `entries` for state that must survive rig-internal retries and in-memory continuation** (e.g.,
+"which turns already steered"), `scratchpad` for ephemeral in-memory tracking within a single
+`next_step()` cycle.
+
+> **Important**: `CompletionCallEvent` does not expose `additional_params`. To pass context to hooks
+> across retries/continuation, use `HookContext::entries()` (survives rig retries) or `scratchpad()`
+> (single step only).
 
 ---
 
 ## Key Takeaways for Prior
 
-|Goal                                           |Mechanism                                         |
-|-----------------------------------------------|--------------------------------------------------|
-|Inject steering before *every* model call    |`on_completion_call` + `RequestPatch::extra_context`|
-|Inject only after tool results                 |Check `event.turn > 1`                            |
-|Replace history entirely (per-request)         |`RequestPatch::history(Some(new_history))`        |
-|Pass provider-specific params (e.g., reasoning)|`RequestPatch::additional_params`                 |
-|Stop the run mid-stream                        |`CompletionCallAction::Stop("reason")`            |
-|**Retry without re-injecting steering**|**Option C: `additional_params` flags** or **Option D: no rig hook**|
-|**Resume without re-injecting**      |**Option C** or **Option D** (rig resume works but overkill)|
-|Track state across turns/resumes |`HookContext::entries()` (persisted) or `scratchpad` (in-memory)|
+|Goal                                           |Mechanism                                        |
+|-----------------------------------------------|-------------------------------------------------|
+|Transform canonical → model-facing history     |`on_completion_call` + `RequestPatch::history()` |
+|Inject per-turn context documents              |`RequestPatch::extra_context` (appended in order)|
+|Replace history entirely (per-request)         |`RequestPatch::history(Some(new_history))`       |
+|Pass provider-specific params (e.g., reasoning)|`RequestPatch::additional_params`                |
+|Stop the run mid-stream                        |`CompletionCallAction::Stop("reason")`           |
+|Retry tool-free turn with feedback             |`ModelTurnAction::Retry(RetryRequest::Feedback)` |
+|Retry mid-stream failure (same turn)           |Re-issue `next_step()` on same `AgentRun`        |
+|Retry after progress with steering             |Fresh `AgentRunner` + pi session + feedback      |
+|Track state across rig retries/continuation    |`HookContext::entries()`                         |
+|Track state within one `next_step()` cycle     |`HookContext::scratchpad()`                      |
 
-The `extra_context` field is the intended mechanism for "steering messages" — documents appended
-before the chat history on each turn, merged in hook registration order, non-sticky (only for the
-current turn).
+The `extra_context` field is the intended mechanism for **steering documents** — appended before the
+chat history on each turn, merged in hook registration order, non-sticky (only for the current
+turn). **Prior does not use this for steering**; it sends steering as explicit user messages at the
+application layer.
 
 ---
 
@@ -460,11 +404,16 @@ Prior's design aligns with rig's intended pattern:
 
 1. **Session stores canonical pi-format messages** (with reasoning, full tool calls)
 2. `session_context_messages()` builds input history (may strip reasoning for context)
-3. `LoggingHook::on_completion_call` builds **model-facing history** (strip → blob → minimize →
-   split)
+3. `LoggingHook::on_completion_call` builds **model-facing history** (strip reasoning → normalize
+   tool calls → render `edit` blocks)
 4. Sent via `RequestPatch::history()` — **run's canonical log untouched**
 
-**On resume**: Same flow. Canonical history loaded → hook transforms fresh → request sent.
+**On in-memory continuation**: Same flow. Canonical history from `AgentRun` → hook transforms fresh
+→ request sent.
 
-The run is the **source of truth**; hooks provide **per-request views**. The double-steering on
-external retries is a consequence of Prior's corrective-reprompt retry model, not a rig bug.
+**On fresh run for new prompt/steering**: Pi session loaded → fresh `AgentRun` with `with_history()`
+→ hook transforms fresh → request sent.
+
+The run is the **source of truth** for its prompt; hooks provide **per-request views**. Prior's
+external retries are corrective re-prompts (new user messages), not rig-internal retries. No
+double-injection occurs because Prior does not use conditional `extra_context` injection.
