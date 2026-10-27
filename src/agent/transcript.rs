@@ -355,6 +355,14 @@ impl TurnTranscript {
             None => return None,
         };
         let assistant = minimize_one(assistant, anchors);
+        // Drop a redundant `cd <cwd> && …` prefix from `bash` calls, so what
+        // gets persisted is the compact form. `crate::bash_cmd` is the single
+        // implementation the execution path and the model-facing history use,
+        // so all three views of one call agree.
+        let assistant = match std::env::current_dir() {
+            Ok(cwd) => crate::bash_cmd::rewrite_in_message(assistant, &cwd),
+            Err(_) => assistant,
+        };
 
         let (assistant, results) = if has_edit_call(&assistant) {
             shape_pair(assistant, results)
@@ -1659,6 +1667,36 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         assert!(
             matches!(&batch.messages[1], Message::User { .. }),
             "batch must be one user message"
+        );
+    }
+
+    #[test]
+    fn transcript_strips_a_redundant_cd_prefix_from_bash_calls() {
+        use super::{RunState, TurnTranscript};
+        use rig_core::message::{ToolCall, ToolFunction};
+
+        let cwd = std::env::current_dir().unwrap();
+        let tc = ToolCall::from_wire(
+            "call_1",
+            ToolFunction::new(
+                tool_name("bash"),
+                serde_json::json!({ "command": format!("cd {} && ls", cwd.display()) }),
+            ),
+        );
+        let call_id = tc.id.clone();
+        let mut t = TurnTranscript::default();
+        t.start_live();
+        t.accept(None, vec![AssistantContent::ToolCall(tc)]);
+        t.push_tool_result(text_tool_result(call_id, "bash", "ok"));
+        let batch = t
+            .prepare(&EditAnchorLedger::default(), RunState::Ongoing)
+            .expect("batch");
+        // The persisted call is the compact form, matching what the shell ran
+        // and what the next turn is shown.
+        let calls = tool_calls_of(&batch.messages[0]);
+        assert_eq!(
+            calls[0].function.arguments_value()["command"],
+            serde_json::json!("ls")
         );
     }
 

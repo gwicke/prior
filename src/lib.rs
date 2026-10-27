@@ -18,6 +18,7 @@ pub use slashdot_menu;
 // (`confirm_probe`, examples) keep their names.
 pub use slashdot_tui::{ansi, draw, render, termio};
 pub mod app_state;
+pub mod bash_cmd;
 pub mod confirm;
 pub mod interactive;
 pub mod model_catalog;

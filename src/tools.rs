@@ -1120,8 +1120,17 @@ impl rig_core::tool::Tool for Bash {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> std::result::Result<Self::Output, Self::Error> {
-        let (out, exit_code) =
-            run_sandboxed_with_status(&args.command, args.timeout.into()).await?;
+        // Strip a redundant `cd <cwd> && …` prefix: the shell already starts in
+        // the working directory the model was told about, so running the command
+        // as written is a no-op that only costs tokens. The same rewrite is
+        // applied to the persisted call and to the next turn's history, so all
+        // three views agree (see `crate::bash_cmd`).
+        let command = match std::env::current_dir() {
+            Ok(cwd) => crate::bash_cmd::strip_cwd_prefix(&args.command, &cwd),
+            Err(_) => None,
+        };
+        let command = command.as_deref().unwrap_or(&args.command);
+        let (out, exit_code) = run_sandboxed_with_status(command, args.timeout.into()).await?;
         // The bash tool result is shown verbatim to the user (via
         // `LoggingHook::on_tool_result` → `display_tool_result`) AND handed
         // straight back to the LLM as the tool message. An empty stdout
@@ -2865,6 +2874,34 @@ mod sandbox_tests {
         .unwrap();
         let out = Bash.call(&mut ctx, args).await.unwrap();
         assert_eq!(out, "hi");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_tool_strips_a_redundant_cd_prefix() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
+        use rig_core::tool::Tool;
+        let cwd = std::env::current_dir().unwrap();
+        let mut ctx = rig_core::tool::ToolContext::default();
+        // The shell already starts in the working directory, so the prefix is a
+        // no-op; the tool runs the rest and reports no trace of it.
+        let args = serde_json::from_value::<BashArgs>(serde_json::json!({
+            "command": format!("cd {} && echo stripped", cwd.display()),
+        }))
+        .unwrap();
+        let out = Bash.call(&mut ctx, args).await.unwrap();
+        assert_eq!(out, "stripped");
+
+        // A `cd` somewhere else is a real change of directory and must survive.
+        let args = serde_json::from_value::<BashArgs>(serde_json::json!({
+            "command": "cd / && pwd",
+        }))
+        .unwrap();
+        let out = Bash.call(&mut ctx, args).await.unwrap();
+        assert_eq!(out, "/");
     }
 
     #[tokio::test]

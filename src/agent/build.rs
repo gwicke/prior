@@ -788,8 +788,12 @@ impl AgentHook for LoggingHook {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // `strip -> blob -> minimize -> split`, then drop the redundant
+        // `cd <cwd> && …` prefix on `bash` calls. The prefix rewrite is the same
+        // function the execution path and the transcript use
+        // (`crate::bash_cmd`), so the model sees the command that actually ran.
         let history = split_multi_file_edit_calls(minimize_edit_tool_calls(
-            blob_edit_tool_calls(stripped_history),
+            blob_edit_tool_calls(crate::bash_cmd::rewrite_bash_calls(stripped_history)),
             &anchors,
         ));
 
@@ -977,7 +981,7 @@ Your mission is to assist the user in their development tasks by utilizing a set
      `rg --files | rg <pattern>` over `find`; it is .gitignore-aware and much faster.
    - `w3m in the shell`: Use for external documentation, searching for solutions using
      duckduckgo.com. Use `pdftotext` for viewing PDF content.
-5. **Context**: You are working in the directory provided below. All paths are relative to this directory. Use relative paths in bash and other tools for token economy and session portability.
+5. **Context**: You are working in the directory provided below. All paths are relative to this directory. Use relative paths in bash and other tools for token economy and session portability. Never prefix a command with `cd <that directory>`: the shell already starts there, and any such prefix is stripped before execution.
 6. Ask questions and propose plans and changes. Do not change plans / designs without approval.
 7. Do not repeat yourself. The code and git commit messages are the source of truth for done work.
    Commit after each logical piece of work. Describe the what and why in commit messages.

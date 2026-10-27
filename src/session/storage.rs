@@ -42,6 +42,21 @@ fn normalize_args_in_place(name: &str, args: &mut serde_json::Value) {
             if let Some(cmd) = obj.remove("cmd") {
                 obj.insert("command".into(), cmd);
             }
+            // Drop a redundant `cd <cwd> && …` prefix, the same rewrite the
+            // execution path and the model-facing history apply, so a replayed
+            // call reads like the compact form that actually ran. A `cd` to a
+            // different directory is left alone.
+            if let Some(stripped) =
+                obj.get("command")
+                    .and_then(|c| c.as_str())
+                    .and_then(|command| {
+                        std::env::current_dir()
+                            .ok()
+                            .and_then(|cwd| crate::bash_cmd::strip_cwd_prefix(command, &cwd))
+                    })
+            {
+                obj.insert("command".into(), serde_json::Value::String(stripped));
+            }
         }
         "grep" => {
             // Canonical is "pattern". Accept both "pat" (old) and "pattern" (pi).
@@ -536,6 +551,22 @@ mod tests {
         let mut v = orig.clone();
         normalize_args_in_place("edit", &mut v);
         assert_eq!(v, orig);
+    }
+
+    #[test]
+    fn normalize_bash_args_strips_a_redundant_cd_prefix() {
+        let cwd = std::env::current_dir().unwrap();
+        // A `cd` into the working directory is dropped, as on the live path.
+        let mut v = serde_json::json!({
+            "command": format!("cd {} && cargo test", cwd.display())
+        });
+        normalize_args_in_place("bash", &mut v);
+        assert_eq!(v, serde_json::json!({"command": "cargo test"}));
+
+        // A `cd` elsewhere is a real directory change and survives replay.
+        let mut v = serde_json::json!({"command": "cd /tmp && ls"});
+        normalize_args_in_place("bash", &mut v);
+        assert_eq!(v, serde_json::json!({"command": "cd /tmp && ls"}));
     }
 
     /// Helper: create a JsonlSessionStorage backed by a temp file.

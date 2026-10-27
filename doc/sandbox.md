@@ -236,6 +236,30 @@ fn run_sandboxed(cmd: &str, cfg: &SandboxConfig) -> Result<String, ToolError> {
 }
 ```
 
+### A redundant `cd <cwd> && …` prefix is stripped
+
+Models habitually open every command with `cd /full/path/to/cwd && …` although
+the sandboxed shell already starts in that directory. The prefix costs tokens
+and, because it reappears in history, reinforces itself on the next turn.
+
+`crate::bash_cmd::strip_cwd_prefix` removes it — repeatedly, and in both the
+`&&` and `;` forms, with quoted or bare targets, and after normalizing a
+trailing `/` or `..`. A `cd` to any *other* directory is a real directory change
+and is left alone. The rewrite is applied at the three points that must agree:
+
+- **execution** (`Bash::call`), so the shell runs the command that was meant;
+- **the transcript** (`TurnTranscript::prepare`), so the persisted call is the
+  compact form;
+- **session replay** (`normalize_args_in_place`), so an old session's call reads
+  the same way after a reload;
+- **the model-facing history** (`LoggingHook::on_completion_call`), so the next
+  turn sees the call without the prefix.
+
+All four call the same function with the same process working directory, so the
+four views of one call cannot disagree. The system prompt also tells the model
+not to write the prefix, so the rewrite is a backstop rather than the only
+teaching signal.
+
 ### bwrap command construction
 
 ```text
