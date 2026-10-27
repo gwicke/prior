@@ -30,7 +30,7 @@ use crate::content;
 use crate::content::markdown::{
     answer_theme, command_lang, guess_lang, highlight_code_fg, highlight_label_fg, render_markdown,
 };
-use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno};
+use crate::content::preview::{get_preview, sed_preview_body, strip_read_lineno};
 use crate::content::text::expand_tabs;
 use crate::render::ContentWrite;
 
@@ -863,37 +863,6 @@ impl Content {
         }
     }
 
-    /// Per-file call arguments for the multi-file `edit` recorded in `last_tool`
-    /// and the given result, paired by index, or `None` when this result is not
-    /// a multi-file pair.
-    ///
-    /// The pairing is by index because both halves are produced from the same
-    /// file list, in first-seen order, by `edit_files` — the same derivation the
-    /// persist and model-facing splits use. A length mismatch means the two
-    /// halves disagree, which is not something to guess at, so it degrades to
-    /// rendering the result alone.
-    pub(crate) fn multi_file_pairs(&self, result: &str) -> Option<Vec<(String, Value, String)>> {
-        let files = bsed_blockedit::parse_file_results(result)?;
-        let (name, args) = self.last_tool.lock().unwrap().clone()?;
-        if !name.eq_ignore_ascii_case("edit") {
-            return None;
-        }
-        let blobs = multi_file_blobs(&args)?;
-        (blobs.len() == files.len()).then(|| {
-            blobs
-                .into_iter()
-                .zip(files)
-                .map(|(blob, fr)| {
-                    let single = match &fr.result {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    (name.clone(), blob, single)
-                })
-                .collect()
-        })
-    }
-
     /// The call half of one tool call-result pair: boundary, label, and the
     /// trailing diff/preview lines.
     ///
@@ -1486,31 +1455,62 @@ impl Content {
         // language). The hook always fires the call immediately before its
         // result, so this is safe to read back on the result.
         *self.last_tool.lock().unwrap() = Some((name.to_string(), args.clone()));
-        // A multi-file `edit` renders nothing here: its pair is not complete
-        // until the result arrives, and splitting it into "all labels now, all
-        // notes later" would produce two runs rather than one block per file.
-        // `display_tool_result` renders the whole sequence of pairs then, which
-        // is what makes a multi-file batch byte-identical to N single-file ones.
-        if name.eq_ignore_ascii_case("edit") && multi_file_blobs(args).is_some() {
-            return;
-        }
         self.render_call_panel(name, args);
     }
 
-    pub(crate) fn display_tool_result(&self, result: &str) {
-        // A multi-file result renders as N complete call-result pairs — label,
-        // diff, note — one per file, through the very same renderers a
-        // sequence of single-file calls uses. The call half is deferred to here
-        // because it is not complete until the result exists: rendering the
-        // labels at the call event would give two contiguous runs instead of
-        // one block per file, and the block is the unit.
-        if let Some(pairs) = self.multi_file_pairs(result) {
-            for (name, args, single) in &pairs {
-                self.render_call_panel(name, args);
-                self.render_result_panel(single);
+    /// Paint one whole prepared `edit` call: one call-result pair per file.
+    ///
+    /// The call half is deferred to the result because the pair is not complete
+    /// until execution says where the edits landed — and because N files must
+    /// render as N complete pairs, not "all labels, then all results", which
+    /// would be two contiguous runs instead of one block per file. Rendering
+    /// each file through [`Self::render_call_panel`] and
+    /// [`Self::render_result_panel`] is what makes a multi-file call
+    /// byte-identical to N genuine single-file ones.
+    ///
+    /// `result` is the call's result text verbatim. It is painted per file only
+    /// when the producer could pair it — a per-file array of the same length —
+    /// because a plain success note (every single-file call) or a pre-array
+    /// error is one report about the whole call, not N. In that case each file
+    /// is labelled from its own array and the report follows once, which is the
+    /// honest rendering of a call whose halves do not decompose.
+    pub(crate) fn display_prepared_edit(
+        &self,
+        prepared: &crate::agent::transcript::PreparedEdit,
+        result: &str,
+    ) {
+        match &prepared.results {
+            Some(results) if results.len() == prepared.arrays.len() => {
+                for (args, result) in prepared.arrays.iter().zip(results) {
+                    self.render_call_panel("edit", args);
+                    self.render_result_panel(result);
+                }
             }
-            return;
+            _ => {
+                for args in &prepared.arrays {
+                    self.render_call_panel("edit", args);
+                }
+                self.render_result_panel(result);
+            }
         }
+    }
+
+    /// Paint one `edit` call from its stored-canonical arguments and its
+    /// result, for replay.
+    ///
+    /// The same renderer the live path uses, so a replayed panel cannot drift
+    /// from the one the user saw when the call ran. Unlike
+    /// [`Self::display_prepared_edit`] this has no prepared form to work from —
+    /// replay reads the session as written — so it renders the call and then
+    /// the result through the ordinary result path (which already splits a
+    /// per-file array into per-file reports).
+    pub(crate) fn display_tool_pair(&self, name: &str, args: &Value, result: &str) {
+        *self.last_tool.lock().unwrap() = Some((name.to_string(), args.clone()));
+        self.render_call_panel(name, args);
+        self.display_tool_result(result);
+    }
+
+    pub(crate) fn display_tool_result(&self, result: &str) {
         // A result with no matching call context (replayed on its own): the
         // call half, and so the diff, is gone, but the report is still per
         // file and still needs its path to attribute a failure.
@@ -3007,16 +3007,31 @@ mod tests {
         assert!(diff.is_empty(), "no fabricated diff: {diff:?}");
     }
 
-    /// The mirror: a blob that *does* canonicalize renders fully, and takes
-    /// `path` from the blob's own header even though the args carry none.
+    /// The canonical array — the only form persist and display produce — renders
+    /// fully, from `path` plus `edits[]`.
     #[test]
-    fn a_resolvable_blob_renders_its_diff_and_its_header_path() {
+    fn a_canonical_array_renders_its_label_and_diff() {
         let args = serde_json::json!({
-            "blocks": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
+            "path": "src/x.rs",
+            "edits": [{"oldText": "a", "newText": "b"}]
         });
         let (label, diff) = get_preview("edit", &args);
         assert_eq!(label, "edit src/x.rs");
         assert!(!diff.is_empty(), "expected a diff: {diff:?}");
+    }
+
+    /// A raw blob renders its label from the `path` argument and no diff:
+    /// display does not parse, because parsing is the producer's job and a
+    /// second parser is how the panel and the stored call drift apart.
+    #[test]
+    fn a_raw_blob_renders_from_the_path_argument_and_no_diff() {
+        let args = serde_json::json!({
+            "path": "src/x.rs",
+            "blocks": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
+        });
+        let (label, diff) = get_preview("edit", &args);
+        assert_eq!(label, "edit src/x.rs");
+        assert!(diff.is_empty(), "a raw blob shows no diff: {diff:?}");
     }
 
     #[test]
@@ -4323,17 +4338,20 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     }
 
     /// The other half of the guard above: gating the result-side `sed` renderer
-    /// must not cost the `edit` tool its own blocks-as-diff rendering. That is
-    /// the *call* half — `get_preview` → `edit_preview`, fed from the arguments —
-    /// and it is a different function on a different input, which is why the two
+    /// must not cost the `edit` tool its own diff rendering. That is the *call*
+    /// half — `get_preview` → `edit_preview`, fed from the canonical array — and
+    /// it is a different function on a different input, which is why the two
     /// renderings can be gated independently.
     #[test]
-    fn an_edit_call_still_renders_its_blocks_as_a_diff() {
+    fn an_edit_call_still_renders_its_edits_as_a_diff() {
         let (out, _reasoning) = capturing_output(80);
         out.begin_capture();
         out.display_tool_call(
             "edit",
-            &serde_json::json!({"blocks": "src/x.rs:5\n@@@OLD\n    run();\n@@@NEW\n    walk();\n@@@END"}),
+            &serde_json::json!({
+                "path": "src/x.rs",
+                "edits": [{"oldText": "    run();", "newText": "    walk();", "startLine": 5}],
+            }),
         );
         let bytes = out.end_capture();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
@@ -4416,21 +4434,38 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     }
 
     /// The invariant: a multi-file batch must render exactly as N single-file
-    /// batches would. The call halves come from the same split the multi-file
-    /// path uses, so the only thing under test is that the view layer treats
-    /// them as the same sequence of call-result pairs.
+    /// batches would. Both paths paint through the same pair renderers — the
+    /// single-file path call-then-result, the multi-file path
+    /// `display_prepared_edit` over N arrays — so the only thing under test is
+    /// that the view layer treats them as the same sequence of pairs.
     #[test]
     fn a_multi_file_batch_renders_identically_to_n_single_file_batches() {
-        let blob = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
-                    b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
-        let multi_args = serde_json::json!({ "blocks": blob });
-        let singles = multi_file_blobs(&multi_args).expect("multi-file blob");
-        assert_eq!(singles.len(), 2);
+        let blocks = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
+                      b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
+        let prepared = crate::agent::transcript::prepare_edit_call(
+            &rig_core::message::CallId::from_wire("m1"),
+            &serde_json::json!({ "blocks": blocks }),
+            None,
+            None,
+            &crate::tool_args::PathContext::sandbox(),
+        )
+        .expect("a multi-file call");
+        assert_eq!(prepared.arrays.len(), 2);
 
-        let notes = [
-            "Replaced 1 block(s) in ./a.rs",
-            "Replaced 1 block(s) in ./b.rs",
-        ];
+        let notes = ["Replaced 1 block(s) in a.rs", "Replaced 1 block(s) in b.rs"];
+
+        // A: two single-file pairs, as a sequence of real calls would render.
+        let (a, _) = capturing_output(40);
+        a.begin_capture();
+        for (args, note) in prepared.arrays.iter().zip(notes) {
+            a.display_tool_call("edit", args);
+            a.display_tool_result(note);
+        }
+        let a = strip_ansi(&String::from_utf8_lossy(&a.end_capture()));
+
+        // B: one prepared multi-file call, whose result rides the same arrays.
+        let mut prepared = prepared;
+        prepared.results = Some(notes.iter().map(|n| (*n).to_string()).collect());
         let array = bsed_blockedit::render_file_results(
             &["a.rs", "b.rs"]
                 .iter()
@@ -4441,21 +4476,9 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
                 })
                 .collect::<Vec<_>>(),
         );
-
-        // A: two single-file pairs, as a sequence of real calls would render.
-        let (a, _) = capturing_output(40);
-        a.begin_capture();
-        for (i, single) in singles.iter().enumerate() {
-            a.display_tool_call("edit", single);
-            a.display_tool_result(notes[i]);
-        }
-        let a = strip_ansi(&String::from_utf8_lossy(&a.end_capture()));
-
-        // B: one multi-file pair.
         let (b, _) = capturing_output(40);
         b.begin_capture();
-        b.display_tool_call("edit", &multi_args);
-        b.display_tool_result(&array);
+        b.display_prepared_edit(&prepared, &array);
         let b = strip_ansi(&String::from_utf8_lossy(&b.end_capture()));
 
         assert_eq!(
@@ -4470,17 +4493,97 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         for part in [
             "edit a.rs",
             "@@ -1 +1 @@",
-            "Replaced 1 block(s) in ./a.rs",
+            "Replaced 1 block(s) in a.rs",
             "edit b.rs",
-            "Replaced 1 block(s) in ./b.rs",
+            "Replaced 1 block(s) in b.rs",
         ] {
-            assert!(a.contains(part), "expected {part:?} in:\\n{a}");
+            assert!(a.contains(part), "expected {part:?} in:\n{a}");
         }
         assert_eq!(
             a.matches("Replaced 1 block(s) in").count(),
             2,
-            "one note per file:\\n{a}"
+            "one note per file:\n{a}"
         );
+    }
+
+    /// A single-file call is one pair: label, diff, then the note verbatim. The
+    /// result here is a plain success note, not a per-file array, so it is
+    /// painted once — the case a multi-file call never has.
+    #[test]
+    fn a_single_file_prepared_edit_paints_one_pair_with_its_plain_result() {
+        let prepared = crate::agent::transcript::prepare_edit_call(
+            &rig_core::message::CallId::from_wire("s1"),
+            &serde_json::json!({
+                "path": "src/x.rs",
+                "edits": [{"oldText": "a", "newText": "b"}],
+            }),
+            None,
+            None,
+            &crate::tool_args::PathContext::sandbox(),
+        )
+        .expect("a single-file call");
+        let (out, _) = capturing_output(60);
+        out.begin_capture();
+        out.display_prepared_edit(&prepared, "Replaced 1 block(s) in src/x.rs");
+        let text = strip_ansi(&String::from_utf8_lossy(&out.end_capture()));
+        assert!(text.contains("edit src/x.rs"), "no label:\n{text}");
+        assert!(text.contains("@@ -1 +1 @@"), "no diff:\n{text}");
+        assert!(
+            text.contains("Replaced 1 block(s) in src/x.rs"),
+            "the note must survive: \n{text}"
+        );
+        assert_eq!(text.matches("Replaced 1 block(s)").count(), 1, "{text}");
+    }
+
+    /// Live and replay paint one single-file `edit` identically: live goes
+    /// through `display_prepared_edit` (deferred, from the prepared form),
+    /// replay through `display_tool_pair` (from the stored args and result).
+    /// The two are separate call sites, so this is the drift guard.
+    #[test]
+    fn a_single_file_edit_paints_the_same_live_and_replayed() {
+        let args = serde_json::json!({
+            "path": "src/x.rs",
+            "edits": [{"oldText": "a", "newText": "b"}]
+        });
+        let result = "Replaced 1 block(s) in src/x.rs";
+        let prepared = crate::agent::transcript::prepare_edit_call(
+            &rig_core::message::CallId::from_wire("s1"),
+            &args,
+            None,
+            None,
+            &crate::tool_args::PathContext::sandbox(),
+        )
+        .expect("a call");
+
+        let (live, _) = capturing_output(60);
+        live.begin_capture();
+        live.display_prepared_edit(&prepared, result);
+        let live = strip_ansi(&String::from_utf8_lossy(&live.end_capture()));
+
+        let (replay, _) = capturing_output(60);
+        replay.begin_capture();
+        replay.display_tool_pair("edit", &args, result);
+        let replay = strip_ansi(&String::from_utf8_lossy(&replay.end_capture()));
+
+        assert_eq!(live, replay, "live and replay must not diverge");
+    }
+
+    /// A raw blob renders its label from `path` with no diff — a call the tool
+    /// rejected, stored untouched.
+    #[test]
+    fn a_rejected_blob_renders_its_label_from_path_and_no_diff() {
+        let (out, _) = capturing_output(60);
+        out.begin_capture();
+        // The stored args are the blob the tool could not parse (a bad marker).
+        out.display_tool_pair(
+            "edit",
+            &serde_json::json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@END"}),
+            "Invalid block: malformed `@@@OLD`",
+        );
+        let text = strip_ansi(&String::from_utf8_lossy(&out.end_capture()));
+        assert!(text.contains("edit src/x.rs"), "no label:\n{text}");
+        assert!(!text.contains("@@ -"), "no fabricated diff:\n{text}");
+        assert!(text.contains("Invalid block"), "{text}");
     }
 
     #[test]

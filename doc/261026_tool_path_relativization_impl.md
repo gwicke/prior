@@ -4,8 +4,8 @@ Companion to [`261026_tool_path_relativization.md`](261026_tool_path_relativizat
 the design (what and why) lives there, this is the ordered how. Resume from
 the first section not marked DONE.
 
-Ordered so the tree compiles and tests pass at every step. Steps 1–3 are done;
-resume at step 4.
+Ordered so the tree compiles and tests pass at every step. Steps 1–7 are DONE
+(see `git log`); the manual verification in step 8 is outstanding.
 
 ### 1. The primitive — DONE
 
@@ -82,21 +82,31 @@ on `true` rebuilds `tc.function = ToolFunction::new(name.clone(), args)`.
 it replaces `blob_edit_tool_calls` + `minimize_edit_tool_calls` +
 `split_multi_file_edit_calls` at the history egress (step 6).
 
-### 4. `prepare_edit_call` — the one producer
+### 4. `prepare_edit_call` — the one producer — DONE
 
 New function in `src/agent/transcript.rs` (it owns `EditResolutions`-shaped
 state already), signature as in *One producing function*:
 
 ```
+pub(crate) fn prepare_edit_call(
+    call_id: &CallId, args: &Value,
+    resolutions: Option<&EditResolutions>, result_text: Option<&str>,
+    ctx: &PathContext,
+) -> Option<PreparedEdit>   // None = arguments do not parse
+
 pub(crate) struct PreparedEdit {
-    pub call_id: CallId,             // the original id
-    pub files:  Vec<FileEdit>,       // minimized + relativized, host form
-    pub arrays: Vec<Value>,          // `{path, edits:[…]}` per file → persist+display
-    pub blocks: Vec<String>,         // render_blob per file → model history
-    pub results: Option<Vec<String>>,// per file, paired by index, when split
-    pub ids: Vec<CallId>,            // split_id per file
+    pub arrays:  Vec<Value>,          // `{path, edits:[…]}` per file → persist+display
+    pub blocks:  Vec<String>,         // render_blob per file → model history
+    pub results: Option<Vec<String>>, // per file, paired by index, when split
+    pub ids:     Vec<CallId>,         // split_id per file
 }
 ```
+
+The call id is a parameter rather than a field: it is rig's, not the argument
+JSON's, and no consumer needs it back. `files` is not kept either — `arrays` and
+`blocks` are the two renderings every consumer wants, and retaining the
+intermediate invites a third. `None` (unparsable arguments) is the "leave the
+call alone" answer: every egress keeps the model's own bytes.
 
 Steps, in this exact order (each depends on the previous):
 
@@ -127,7 +137,7 @@ Steps, in this exact order (each depends on the previous):
 
 `ids` = `(0..n).map(|i| split_id(&call_id, i, n))`.
 
-### 5. Widen the ledger; call the producer from `on_outcome`
+### 5. Widen the ledger; call the producer from `on_outcome` — DONE
 
 `src/agent/transcript.rs`: replace
 `pub(crate) type EditAnchorLedger = HashMap<String, EditResolutions>` with
@@ -152,7 +162,7 @@ then `content.display_tool_pair("edit", &prepared)` instead of
 `display_tool_result`. Non-`edit` tools keep the existing
 `display_tool_call`/`display_tool_result` path.
 
-### 6. Consumers, one at a time (compile + test between each)
+### 6. Consumers, one at a time (compile + test between each) — DONE
 
 1. **Persist.** `TurnTranscript::prepare`: delete `minimize_one`,
    `minimize_edit_tool_calls`, `blob_edit_tool_calls`, `shape_pair`,
@@ -190,7 +200,7 @@ then `content.display_tool_pair("edit", &prepared)` instead of
 5. **Replay.** `src/agent/replay.rs::render_turn` uses the new pair renderer,
    so live and replay share one path.
 
-### 7. Remaining removals and fixtures
+### 7. Remaining removals and fixtures — DONE
 
 - `src/edit_blocks.rs::per_file_blocks` — keep only if `bsed`/`session` still
   call it; after step 6 nothing in-crate does, so move it to

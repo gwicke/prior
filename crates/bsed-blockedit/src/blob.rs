@@ -546,9 +546,9 @@ fn same_path(a: &str, b: &str) -> bool {
 /// rendered as `path:LINE`.
 ///
 /// Anchors are part of the round trip: if you change this, also check
-/// `parse_blocks`, `edits_to_value`, `array_to_blob_value`,
-/// `canonicalize_edit_value`, and `src/edit_blocks::per_file_blocks` — all of
-/// them must preserve `startLine`/`path:LINE` together.
+/// `parse_blocks`, [`edits_to_canonical_value`], [`to_parsed`],
+/// [`array_to_blob_value`] and [`canonicalize_edit_value`] — all of them must
+/// preserve `startLine`/`path:LINE` together.
 ///
 /// The path is repeated because the tool *requires* a header on every block —
 /// the model-facing form has to be a form the tool accepts, or the agent is
@@ -591,28 +591,79 @@ pub fn render_blob(path: &str, edits: &[ParsedEdit]) -> String {
     out
 }
 
-/// Build the canonical `edits` array value from parsed blocks.
+/// The execution form of one file's blocks: [`EditOp`]s computed against the
+/// original file, anchors carried through as the matching hint.
 ///
-/// Keep the `startLine` round trip in sync with `render_blob`,
-/// `array_to_blob_value`, `canonicalize_edit_value`, `wire::from_wire`, and
-/// `src/session/storage::normalize_args_in_place`.
+/// The single conversion every consumer of a parsed blob needs. It lives here
+/// rather than in each caller because there were already two copies (this
+/// crate's `from_wire`, and a private one in `bsed`), which drift the moment a
+/// field is added to either type.
+pub fn to_ops(edits: &[ParsedEdit]) -> Vec<crate::types::EditOp> {
+    edits
+        .iter()
+        .map(|e| crate::types::EditOp {
+            old_text: e.old_text.clone(),
+            new_text: e.new_text.clone(),
+            start_line: e.start_line.map(crate::types::EditStartLine),
+            origin: e.raw_header.clone(),
+        })
+        .collect()
+}
+
+/// The inverse of [`to_ops`]: the render form of an execution-form batch.
+///
+/// `origin` has no `ParsedEdit` field of its own — it is the header the model
+/// spelled, which only `render_blob` reproduces through `path:LINE` — so it is
+/// dropped here. Nothing that renders a batch needs it.
+pub fn to_parsed(edits: &[crate::types::EditOp]) -> Vec<ParsedEdit> {
+    edits
+        .iter()
+        .map(|e| ParsedEdit {
+            old_text: e.old_text.clone(),
+            new_text: e.new_text.clone(),
+            start_line: e.start_line.map(|s| s.0),
+            header: None,
+            rejected_header: None,
+            raw_header: None,
+            // Rendering is canonical regardless of the order the call arrived
+            // in, so the re-rendered block is always old-first.
+            order: BlockOrder::OldFirst,
+        })
+        .collect()
+}
+
+/// The canonical-array entry for one edit.
 ///
 /// `startLine` is included when known. pi's schema tolerates the extra field
 /// (it does not set `additionalProperties: false`) and ignores it during
 /// application, so this is both safe and what lets a later turn re-render the
 /// same compact anchored block after the file has changed.
-fn edits_to_value(edits: &[ParsedEdit]) -> Value {
-    Value::Array(
-        edits
-            .iter()
-            .map(|e| match e.start_line {
-                Some(line) => {
-                    json!({ "oldText": e.old_text, "newText": e.new_text, "startLine": line })
-                }
-                None => json!({ "oldText": e.old_text, "newText": e.new_text }),
-            })
-            .collect(),
-    )
+fn edit_to_value(edit: &crate::types::EditOp) -> Value {
+    match edit.start_line {
+        Some(line) => json!({
+            "oldText": edit.old_text,
+            "newText": edit.new_text,
+            "startLine": line.0,
+        }),
+        None => json!({ "oldText": edit.old_text, "newText": edit.new_text }),
+    }
+}
+
+/// The canonical array form of one file's edits: `{path, edits:[…]}`.
+///
+/// **The** writer of the canonical array, for both ingress directions: the
+/// producing function (`prepare_edit_call`) calls it with the minimized,
+/// relativized [`EditOp`]s it is about to persist **and** display, and
+/// [`canonicalize_edit_value`] calls it after parsing a blob. One writer means
+/// the stored array and the rendered one cannot disagree about `startLine`.
+///
+/// Keep the `startLine` round trip in sync with `render_blob`,
+/// [`array_to_blob_value`], [`canonicalize_edit_value`], and `wire::from_wire`.
+pub fn edits_to_canonical_value(path: &str, edits: &[crate::types::EditOp]) -> Value {
+    json!({
+        "path": path,
+        "edits": Value::Array(edits.iter().map(edit_to_value).collect()),
+    })
 }
 
 /// Canonicalize a raw edit-call `arguments` value to the canonical array form,
@@ -651,10 +702,7 @@ pub fn canonicalize_edit_value(args: &Value) -> Value {
                 // single-file blob canonicalizes; a multi-file one is stored
                 // raw (degrades gracefully) until the storage axis splits it.
                 if let [one] = files.as_slice() {
-                    return json!({
-                        "path": one.path,
-                        "edits": edits_to_value(&one.edits),
-                    });
+                    return edits_to_canonical_value(&one.path, &to_ops(&one.edits));
                 }
             }
         }
@@ -701,8 +749,8 @@ pub fn canonicalize_edit_value(args: &Value) -> Value {
 /// **Idempotent** — a value that is not a canonical array is returned unchanged,
 ///
 /// `startLine` must survive in both directions; if you touch that mapping, also
-/// touch `edits_to_value`, `render_blob`, `canonicalize_edit_value`, and
-/// `src/agent/transcript.rs::minimize_edit_tool_calls`.
+/// touch [`edits_to_canonical_value`], [`render_blob`], [`to_parsed`] and
+/// [`canonicalize_edit_value`].
 /// so a value already in blob form passes straight through.
 pub fn array_to_blob_value(args: &Value) -> Value {
     let Some(obj) = args.as_object() else {
@@ -1482,25 +1530,6 @@ pub fn group_by_file(
             FileBatch { path, edits }
         })
         .collect())
-}
-
-/// The execution form of one file's blocks: [`EditOp`]s computed against the
-/// original file, anchors carried through as the matching hint.
-///
-/// The single conversion every consumer of a parsed blob needs. It lives here
-/// rather than in each caller because there were already two copies (this
-/// crate's `from_wire`, and a private one in `bsed`), which drift the moment a
-/// field is added to either type.
-pub fn to_ops(edits: &[ParsedEdit]) -> Vec<crate::types::EditOp> {
-    edits
-        .iter()
-        .map(|e| crate::types::EditOp {
-            old_text: e.old_text.clone(),
-            new_text: e.new_text.clone(),
-            start_line: e.start_line.map(crate::types::EditStartLine),
-            origin: e.raw_header.clone(),
-        })
-        .collect()
 }
 
 /// The path each block names, keyed for grouping, in first-seen order.

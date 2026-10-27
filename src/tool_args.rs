@@ -180,13 +180,6 @@ pub(crate) fn normalize_messages(msgs: &mut [Message], ctx: &PathContext) {
     }
 }
 
-/// [`normalize_messages`] for an owned message list: the shape the
-/// model-facing history hook works with.
-pub(crate) fn rewrite_messages(mut msgs: Vec<Message>, ctx: &PathContext) -> Vec<Message> {
-    normalize_messages(&mut msgs, ctx);
-    msgs
-}
-
 /// The command with every leading `cd <cwd> &&` / `cd <cwd>;` removed, or
 /// `None` when there is nothing to strip (so callers can leave the original
 /// value — and its exact bytes — untouched).
@@ -338,6 +331,12 @@ mod tests {
     /// `strip_cwd_prefix` against the fixture cwd.
     fn strip(command: &str) -> Option<String> {
         strip_cwd_prefix(command, &ctx())
+    }
+
+    /// [`normalize_messages`] on one owned message list, the shape tests build.
+    fn rewrite_messages(mut msgs: Vec<Message>, ctx: &PathContext) -> Vec<Message> {
+        normalize_messages(&mut msgs, ctx);
+        msgs
     }
 
     /// The arguments of the first call in a message, as JSON text.

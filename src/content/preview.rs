@@ -82,21 +82,6 @@ pub(crate) fn strip_read_lineno(line: &str) -> &str {
     line
 }
 
-/// Per-file call arguments for a multi-file `edit` block, or `None` if the
-/// arguments are not one.
-///
-/// Each entry is a complete single-file argument value in the same form a
-/// genuine single-file call would carry, so passing it to the normal renderers
-/// yields exactly what that call would have rendered.
-pub(crate) fn multi_file_blobs(args: &Value) -> Option<Vec<Value>> {
-    crate::edit_blocks::per_file_blocks(args).map(|blocks| {
-        blocks
-            .into_iter()
-            .map(|b| Value::Object([("blocks".into(), Value::String(b))].into_iter().collect()))
-            .collect()
-    })
-}
-
 pub(crate) fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
     let obj = args.as_object();
     let get_str = |key: &str| obj.and_then(|o| o.get(key)).and_then(|v| v.as_str());
@@ -210,26 +195,21 @@ pub(crate) fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
             (format!("agent-browser {}", args_str), Vec::new())
         }
         "edit" | "edit_file" => {
-            // The canonical form (`edits` array) is what `on_tool_call` hands us;
-            // the model-facing blob (`blocks` string) is what we get when
-            // canonicalization failed, so resolve that here rather than printing
-            // a phantom diff. A blob that still won't resolve (malformed, or
-            // spanning files) yields no edits at all, and the label below then
-            // carries no range and no diff — which is the honest rendering.
+            // Two shapes reach here, and both come from
+            // `bsed_blockedit::edits_to_canonical_value`: the persisted and
+            // displayed form is `{path, edits:[…]}`, one file per call. Reading
+            // `path` and `edits[]` directly is deliberate — a blob is *not*
+            // parsed here, because parsing is the producer's job
+            // (`prepare_edit_call`) and doing it twice is how the panel and the
+            // stored call drift apart.
             //
-            // Display must also tolerate a persisted `startLine`; the preview
-            // consumes it below. Keep this in sync with
-            // `LoggingHook::on_tool_call` and `canonicalize_edit_value`.
-            let canonical = crate::edit_blocks::canonicalize_edit_value(args);
-            // Prefer the canonical `path`: resolving a blob can *supply* one
-            // from a header line, which the raw args may not carry at all.
-            let path = canonical
-                .get("path")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .or_else(|| get_str("path"))
-                .unwrap_or("");
-            let obj = canonical.as_object();
+            // A raw blob (a call the tool rejected, stored untouched) has no
+            // `path` and no array: the label then renders empty and there is no
+            // diff, which is the honest rendering of a call nothing could
+            // resolve. The legacy single-edit scalars are still read, since the
+            // preview is also reached for arguments that never went through the
+            // producer.
+            let path = get_str("path").unwrap_or("");
             let edits: Vec<EditOp> = if let Some(edits_array) =
                 obj.and_then(|o| o.get("edits")).and_then(|v| v.as_array())
             {
@@ -274,7 +254,13 @@ pub(crate) fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                     }],
                 )
             };
-            let mut s = format!("edit {}", path);
+            let mut s = if path.is_empty() {
+                // A raw blob: no path is known without parsing, which display
+                // does not do.
+                "edit".to_string()
+            } else {
+                format!("edit {path}")
+            };
             if let Some(r) = range {
                 s.push_str(&format!(" [{}]", r));
             }

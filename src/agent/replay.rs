@@ -304,11 +304,25 @@ fn render_turn(content: &Content, turn: &ConversationTurn) {
         if !segment.tool_calls.is_empty() {
             content.end_response_segment();
             for (call_id, name, args) in &segment.tool_calls {
-                content.display_tool_call(name, args);
-                if let Some((_, result_text)) =
-                    segment.tool_results.iter().find(|(rid, _)| rid == call_id)
-                {
-                    content.display_tool_result(result_text);
+                let result_text = segment
+                    .tool_results
+                    .iter()
+                    .find(|(rid, _)| rid == call_id)
+                    .map(|(_, text)| text.as_str());
+                match result_text {
+                    // `edit` defers its call half to the result (see
+                    // `Content::display_prepared_edit`), so replay must paint it
+                    // through the same pair renderer the live path uses —
+                    // otherwise the two diverge in exactly the way this module's
+                    // doc warns about.
+                    Some(text) if name.eq_ignore_ascii_case("edit") => {
+                        content.display_tool_pair(name, args, text);
+                    }
+                    Some(text) => {
+                        content.display_tool_call(name, args);
+                        content.display_tool_result(text);
+                    }
+                    None => content.display_tool_call(name, args),
                 }
             }
             // Mirror the live path, where each `CompletionCall` — including one

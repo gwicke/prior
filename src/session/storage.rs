@@ -76,14 +76,14 @@ fn normalize_args_in_place(name: &str, args: &mut serde_json::Value, ctx: &PathC
         }
         "edit" => {
             // Canonical is `edits:[{oldText,newText}]` (pi-compatible). Fold the
-            // model's block form (a string), the legacy single `oldText`/`newText`
-            // shape, and the very old `old`/`new` shape all into it. Best-effort:
-            // an unparseable blob is left as-is so replay degrades gracefully.
+            // legacy block-string form, the single `oldText`/`newText` shape and
+            // the very old `old`/`new` shape into it, so an old session replays
+            // through the same display code a new one does. Best-effort: an
+            // unparseable blob is left as-is so replay degrades gracefully.
             //
-            // This is the reload counterpart of `Session::append_message` and
-            // `LoggingHook::on_tool_call`; all three must preserve `startLine`
-            // via `canonicalize_edit_value` so an anchored edit survives a
-            // round trip through disk.
+            // This is the reload counterpart of `prepare_edit_call`, which
+            // always writes the array — so for anything persisted since, this is
+            // the array-identity branch of `canonicalize_edit_value`.
             *args = crate::edit_blocks::canonicalize_edit_value(args);
         }
         _ => {}

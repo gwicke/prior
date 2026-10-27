@@ -24,10 +24,10 @@ and link a doc/ and/or commit hash
       same resolver. `tmp_size_mb` retired (one-shot runs keep a fixed 256 MB tmpfs). Cleanup at
       `/clear`, `/session <id> delete`, plus a 7-day mtime sweep on startup. Design in
       `doc/sandbox.md` -> "`/tmp` is a per-session directory".
-- [ ] tool path relativization: store/display/send cwd sub-paths (`src/tools.rs`, not
-      `/home/u/proj/src/tools.rs`) across persist and history, from one producing pass in
-      `TurnTranscript::prepare`. Design: `doc/261026_tool_path_relativization.md`; ordered steps
-      (steps 1–3 done): `doc/261026_tool_path_relativization_impl.md`.
+- [ ] tool path relativization: done except manual verification (one single-file turn, one
+      multi-file, one rejected blob, `/replay` of each — stored JSONL and next history must both
+      show `src/x.rs`). Design: `doc/261026_tool_path_relativization.md`; steps 1–7 done:
+      `doc/261026_tool_path_relativization_impl.md`.
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing `egress::host_allowed`;
       `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https; HTTP-only clients now come
       through R3i's front end instead).
