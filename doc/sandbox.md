@@ -242,7 +242,7 @@ Models habitually open every command with `cd /full/path/to/cwd && …` although
 the sandboxed shell already starts in that directory. The prefix costs tokens
 and, because it reappears in history, reinforces itself on the next turn.
 
-`crate::bash_cmd::strip_cwd_prefix` removes it — repeatedly, and in both the
+`crate::tool_args::strip_cwd_prefix` removes it — repeatedly, and in both the
 `&&` and `;` forms, with quoted or bare targets, and after normalizing a
 trailing `/` or `..`. A `cd` to any *other* directory is a real directory change
 and is left alone. The rewrite is applied at the three points that must agree:

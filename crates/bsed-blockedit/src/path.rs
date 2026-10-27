@@ -83,7 +83,13 @@ pub fn normalize(p: &Path) -> PathBuf {
 /// `path` is under `cwd` (lexically — we use string-prefix matching to stay
 /// consistent with the cwd reported in the system prompt and with the path
 /// bounds already enforced by `validate_path`), the absolute prefix is
-/// dropped: paths equal to `cwd` become `.`; children become `./child`.
+/// dropped: paths equal to `cwd` become `.`; children become `child`, with
+/// **no `./` prefix** — the shortest spelling, and the one the model should
+/// learn to write.
+///
+/// The single exception is a child whose first component begins with `-`:
+/// that keeps the `./` (`./-weird.txt`), because a bare `-weird.txt` reads as
+/// a flag to `rg` and `bsed`, which take the path as a later argv element.
 ///
 /// Paths that are NOT under `cwd` are returned as-is. This is deliberate:
 /// the policy is "sub-paths of cwd become relative", not "all absolute
@@ -95,7 +101,8 @@ pub fn normalize(p: &Path) -> PathBuf {
 /// Examples (cwd = `/home/u/proj`):
 ///
 /// * `/home/u/proj`             -> `.`
-/// * `/home/u/proj/src/main.rs` -> `./src/main.rs`
+/// * `/home/u/proj/src/main.rs` -> `src/main.rs`
+/// * `/home/u/proj/-x.txt`      -> `./-x.txt`         (`-x.txt` would read as a flag)
 /// * `/home/u/proj2/x`          -> `/home/u/proj2/x`  (sibling, common prefix — NOT under cwd)
 /// * `/etc/passwd`              -> `/etc/passwd`
 ///
@@ -125,7 +132,7 @@ pub fn relativize_path(path: &Path, cwd: &Path) -> String {
     // return the original absolute form.
     if let Some(rest) = p.strip_prefix(&*cwd_str) {
         if let Some(child) = rest.strip_prefix('/') {
-            return format!("./{child}");
+            return render_child(child);
         }
         if rest.is_empty() {
             // Defensive: should have been caught by the `p == cwd_str`
@@ -136,6 +143,16 @@ pub fn relativize_path(path: &Path, cwd: &Path) -> String {
         }
     }
     path_str.into_owned()
+}
+
+/// The relative spelling of a child path: the sub-path itself, except one
+/// that would read as a flag.
+fn render_child(child: &str) -> String {
+    if child.starts_with('-') {
+        format!("./{child}")
+    } else {
+        child.to_string()
+    }
 }
 
 /// Render `path` for human-readable display: cwd-relative, then
@@ -162,6 +179,8 @@ pub fn relativize_for_display(path: &Path) -> String {
                 if rel == "." {
                     return "~".to_string();
                 }
+                // `relativize_path` keeps `./` only for a child that would read
+                // as a flag; under `~/` there is nothing to confuse, so drop it.
                 let stripped = rel.strip_prefix("./").unwrap_or(&rel);
                 return format!("~/{stripped}");
             }
@@ -188,13 +207,30 @@ mod relativize_tests {
     }
 
     #[test]
-    fn child_path_becomes_dot_slash() {
+    fn child_path_has_no_dot_slash() {
         let cwd = cwd("/home/u/proj");
         assert_eq!(
             relativize_path(Path::new("/home/u/proj/src/main.rs"), &cwd),
-            "./src/main.rs",
+            "src/main.rs",
         );
-        assert_eq!(relativize_path(Path::new("/home/u/proj/a"), &cwd), "./a",);
+        assert_eq!(relativize_path(Path::new("/home/u/proj/a"), &cwd), "a",);
+    }
+
+    #[test]
+    fn a_child_that_would_read_as_a_flag_keeps_dot_slash() {
+        // `-weird.txt` as an argv element is a flag to `rg`/`bsed`, so the
+        // `./` is load-bearing and cannot be dropped with the rest.
+        let cwd = cwd("/home/u/proj");
+        assert_eq!(
+            relativize_path(Path::new("/home/u/proj/-weird.txt"), &cwd),
+            "./-weird.txt",
+        );
+        // Only the *first* component matters: a `-` deeper in the path is a
+        // filename character, not a flag.
+        assert_eq!(
+            relativize_path(Path::new("/home/u/proj/src/-x.txt"), &cwd),
+            "src/-x.txt",
+        );
     }
 
     #[test]
@@ -202,7 +238,7 @@ mod relativize_tests {
         let cwd = cwd("/home/u/proj");
         assert_eq!(
             relativize_path(Path::new("/home/u/proj/src/sub/mod.rs"), &cwd),
-            "./src/sub/mod.rs",
+            "src/sub/mod.rs",
         );
     }
 

@@ -1494,6 +1494,17 @@ impl PathPolicy {
         self.expand_to_sandbox(path, &cwd)
     }
 
+    /// The **sandbox** location of the host `cwd`: what the shell calls its
+    /// working directory, and therefore the base every argument's relative
+    /// spelling is measured against.
+    ///
+    /// This is the cwd half of [`resolve_sandbox`](Self::resolve_sandbox), split
+    /// out for callers (path argument rewriting) that need the base without a
+    /// path to resolve.
+    pub fn sandbox_cwd(&self, cwd: &Path) -> PathBuf {
+        self.remap.sandbox_cwd(cwd)
+    }
+
     /// [`resolve_sandbox`](Self::resolve_sandbox) against an explicit host
     /// `cwd`, for callers that already hold it.
     fn expand_to_sandbox(&self, path: &str, cwd: &Path) -> PathBuf {

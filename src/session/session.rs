@@ -19,158 +19,16 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use rig_core::message::{
-    AssistantContent, CallId, Message, Reasoning, Text, ToolFunction, ToolResult,
-    ToolResultContent, UserContent,
+    AssistantContent, CallId, Message, Reasoning, Text, ToolResult, ToolResultContent, UserContent,
 };
 
-use crate::agent::transcript::{
-    assistant_content, assistant_message, response_id, tool_call, tool_name,
-};
+#[cfg(test)]
+use crate::agent::transcript::assistant_message;
+use crate::agent::transcript::{assistant_content, response_id, tool_call, tool_name};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::session::storage::{JsonlSessionStorage, SessionStorage};
 use crate::session::types::*;
-
-/// Rewrite the arguments of any `edit` tool call in `msg` to the canonical
-/// array form, so what is persisted (and rendered) stays pi-compatible even
-/// though the model may have emitted the block-string form. Best-effort and
-/// idempotent. Returns `Some` only when the message is an assistant message
-/// that actually carries an `edit` tool call (so the common path does not
-/// clone); otherwise `None` and the caller keeps the original.
-/// Split a multi-file `edit` call into N single-file calls, and canonicalize.
-///
-/// The split runs **before** canonicalization, and that order is the whole
-/// mechanism: `canonicalize_edit_value` only rewrites a *single*-file blob (it
-/// deliberately stores a multi-file one raw, "until the storage axis splits
-/// it"), so splitting first means each per-file call canonicalizes to the
-/// ordinary `{path, edits}` shape. The on-disk JSONL is then N pi-canonical
-/// single-path tool calls with nothing downstream needing to know multi-file
-/// editing exists — including `collect_touched_files`, which keeps reading
-/// `arguments.path` and so now yields every file because there is one call per
-/// file.
-///
-/// Ids are derived (`{orig}_f{i}n{n}`), and derived by the *same* function the
-/// model-facing transform uses, so the call half stored here pairs with the
-/// result half stored by [`split_edit_tool_results`] even though the two never
-/// see each other. `provider` and `signature` are cleared for the same reason
-/// as in the model-facing half: the provider issued one of each, and N copies
-/// of one provider id would be unmatchable on a wire that keys results on it.
-///
-/// Minimization happens *before* this function, in `src/agent/turn.rs`, so the
-/// blob arriving here is already compact and anchored. Keep the
-/// `startLine`-preserving split in sync with `per_file_blocks`,
-/// `render_blob`, `canonicalize_edit_value`, and
-/// `normalize_args_in_place` (the reload path).
-fn canonicalize_edit_tool_calls(msg: &Message) -> Option<Message> {
-    let Message::Assistant(turn) = msg else {
-        return None;
-    };
-    let content = &turn.content;
-    let needs = content
-        .iter()
-        .any(|c| matches!(c, AssistantContent::ToolCall(tc) if tc.function.name == "edit"));
-    if !needs {
-        return None;
-    }
-    let mut new_content = Vec::with_capacity(content.len());
-    for c in content {
-        let AssistantContent::ToolCall(tc) = &c else {
-            new_content.push(c.clone());
-            continue;
-        };
-        if tc.function.name != "edit" {
-            new_content.push(c.clone());
-            continue;
-        }
-        match crate::edit_blocks::per_file_blocks(&tc.function.arguments_value()) {
-            Some(per_file) => {
-                let n = per_file.len();
-                for (i, blocks) in per_file.iter().enumerate() {
-                    let mut single = tc.clone();
-                    single.id = crate::edit_blocks::split_id(&tc.id, i, n);
-                    single.native = None;
-                    single.function = ToolFunction::new(
-                        tc.function.name.clone(),
-                        crate::edit_blocks::canonicalize_edit_value(
-                            &serde_json::json!({ "blocks": blocks }),
-                        ),
-                    );
-                    new_content.push(AssistantContent::ToolCall(single));
-                }
-            }
-            // Single-file, unparseable, or over the file cap: canonicalize as
-            // before, so a multi-file blob that `split_by_file` rejects still
-            // degrades to being stored raw rather than being lost.
-            None => {
-                let mut tc = tc.clone();
-                tc.function = ToolFunction::new(
-                    tc.function.name.clone(),
-                    crate::edit_blocks::canonicalize_edit_value(&tc.function.arguments_value()),
-                );
-                new_content.push(AssistantContent::ToolCall(tc));
-            }
-        }
-    }
-    Some(assistant_message(
-        response_id(turn).map(str::to_string),
-        new_content,
-    ))
-}
-
-/// Split a multi-file `edit` result into N per-file results, so the stored
-/// `toolResult` entries pair one-to-one with the stored `toolCall` entries.
-///
-/// The sibling of [`canonicalize_edit_tool_calls`], on the result half, and
-/// matching it on the one thing both halves are guaranteed to share: a derived
-/// id. Neither side can see the other's message, so agreement has to come from
-/// the derivation, not from coordination.
-///
-/// A result that is not a multi-file array (a single-file call, or an argument
-/// error, which is plain text) passes through untouched.
-fn split_edit_tool_results(msg: &Message) -> Option<Message> {
-    let Message::User { content } = msg else {
-        return None;
-    };
-    let mut new_content = Vec::with_capacity(content.len());
-    let mut changed = false;
-    for c in content {
-        let UserContent::ToolResult(tr) = &c else {
-            new_content.push(c.clone());
-            continue;
-        };
-        let text = tr
-            .content
-            .iter()
-            .filter_map(|rc| match rc {
-                ToolResultContent::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let Some(files) = bsed_blockedit::parse_file_results(&text).filter(|f| f.len() > 1) else {
-            new_content.push(c.clone());
-            continue;
-        };
-        changed = true;
-        let n = files.len();
-        for (i, f) in files.iter().enumerate() {
-            let mut single = tr.clone();
-            single.call = crate::edit_blocks::split_id(&tr.call, i, n);
-            // Each result is that file's single-file result verbatim: a success
-            // note, or the full `{ui_view, model_view}` envelope. Re-serializing
-            // the object is deliberate — the file's outcome must survive the
-            // split, and the model reads `model_view`.
-            single.content = vec![ToolResultContent::text(match &f.result {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })];
-            new_content.push(UserContent::ToolResult(single));
-        }
-    }
-    changed.then_some(Message::User {
-        content: new_content,
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Compaction summary message (pi-compatible wrapper)
@@ -1239,23 +1097,15 @@ impl Session {
 
     /// Append a user or assistant message to the session.
     ///
-    /// Converts the rig `Message` to pi's `AgentMessage` format before storage.
+    /// A **serializer**: converts the rig `Message` to pi's `AgentMessage`
+    /// format and writes it. Every transform an `edit` call needs (parse,
+    /// minimize, relativize, split, canonicalize) happens once, in
+    /// `agent::transcript::prepare_edit_call`, before the message reaches here —
+    /// so this function does not rewrite arguments it cannot see the context
+    /// for.
     pub async fn append_message(&self, msg: &Message) -> crate::Result<String> {
         self.ensure_persisted().await?;
 
-        // Canonicalize `edit` tool-call arguments before persisting: the model
-        // emits the block-string form, but the on-disk JSONL must be the
-        // canonical array. Successful calls were minimized and anchored by
-        // `src/agent/turn.rs` before this call; do not re-minimize here (there
-        // is no ledger), only split and canonicalize. The result is the pi-
-        // canonical array so pi can read the session. A multi-file call is
-        // split into N single-file calls first, so the on-disk form never
-        // needs to know multi-file editing exists. No-op for other messages.
-        //
-        // The result half is the sibling: a multi-file result array becomes N
-        // per-file results, paired with those calls by the same derived id.
-        // The two halves are separate messages and separate calls, so they
-        // cannot see each other — see `split_edit_tool_results`.
         // Repair a dangling trailing assistant turn (crash residue) before
         // appending a *non-answer* message, so a new turn never inherits an
         // unanswered call. A message that carries tool results is itself the
@@ -1266,9 +1116,6 @@ impl Session {
         if !msg_is_results {
             self.repair_tail_unanswered().await?;
         }
-        let canonical = canonicalize_edit_tool_calls(msg);
-        let split_results = split_edit_tool_results(msg);
-        let msg: &Message = canonical.as_ref().or(split_results.as_ref()).unwrap_or(msg);
         let entry_id = uuid::Uuid::now_v7().to_string();
         self.write_messages(&[(msg, &entry_id)]).await?;
         Ok(entry_id)
@@ -3124,115 +2971,21 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_multi_file_call_is_persisted_as_n_pi_canonical_single_path_calls() {
-        let out = canonicalize_edit_tool_calls(&multi_call("t1")).expect("assistant message");
-        let calls = calls_of(&out);
-        assert_eq!(calls.len(), 2, "{calls:?}");
-
-        for (i, name) in ["a.rs", "b.rs"].iter().enumerate() {
-            let args = &calls[i].function.arguments;
-            // The pi-canonical single-file shape: a top-level `path` and an
-            // `edits` array. This is what lets the rest of the persistence
-            // layer, including collect_touched_files, stay unaware of
-            // multi-file editing.
-            assert_eq!(args.get("path").and_then(|v| v.as_str()), Some(*name));
-            assert!(args.get("edits").unwrap().is_array(), "{args:?}");
-            assert!(
-                args.get("blocks").is_none(),
-                "block form must not persist: {args:?}"
-            );
-            // The derived id is the same one the result half uses.
-            if i == 0 {
-                assert_eq!(calls[i].id.to_string(), "t1".to_string());
-            } else {
-                assert_eq!(calls[i].id.to_string(), format!("t1_f{i}n2"));
-            }
-            assert!(calls[i].native.is_none());
-        }
-    }
-
-    #[test]
-    fn the_call_and_result_halves_pair_by_the_same_derived_id() {
-        // The two halves are separate messages appended in separate calls and
-        // never see each other, so agreement comes only from the derivation.
-        let call = canonicalize_edit_tool_calls(&multi_call("t1")).unwrap();
-        let result = split_edit_tool_results(&multi_result("t1")).unwrap();
-        let call_ids: Vec<String> = calls_of(&call).iter().map(|c| c.id.to_string()).collect();
-        let result_ids: Vec<String> = results_of(&result)
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect();
-        assert_eq!(call_ids, result_ids, "every call needs exactly one result");
-
-        // A failing file keeps its whole envelope, so the outcome survives.
-        let r = results_of(&result);
-        assert!(r[0].1.contains("Replaced 1 block(s) in ./a.rs"));
-        assert!(r[1].1.contains("long diff"), "{}", r[1].1);
-    }
-
-    #[test]
-    fn a_single_file_call_and_a_plain_result_are_untouched() {
-        let solo = assistant_message(
-            None,
-            vec![AssistantContent::ToolCall(tool_call(
-                "s1",
-                "edit",
-                serde_json::json!({"blocks": "solo.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END"}),
-            ))],
-        );
-        let out = canonicalize_edit_tool_calls(&solo).expect("assistant message");
-        let calls = calls_of(&out);
-        assert_eq!(calls.len(), 1, "a single-file call is never split into N");
-        // Canonicalized (the pre-existing job), not split: still one call, with
-        // the ordinary single-path shape.
-        assert_eq!(
-            calls[0]
-                .function
-                .arguments
-                .get("path")
-                .and_then(|v| v.as_str()),
-            Some("solo.rs")
-        );
-        assert_eq!(calls[0].id.to_string(), "s1", "the id must not be derived");
-        // A plain-text result (an argument error, say) is not an array and
-        // passes through whole.
-        let plain = Message::User {
-            content: vec![UserContent::ToolResult(rig_core::message::ToolResult {
-                call: rig_core::message::CallId::from_wire("s1"),
-                name: tool_name("edit"),
-                content: vec![rig_core::message::ToolResultContent::text(
-                    "Invalid block: bad",
-                )],
-                is_error: false,
-            })],
-        };
-        assert_eq!(split_edit_tool_results(&plain), None);
-    }
-
-    #[test]
-    fn a_non_edit_tool_result_is_never_split() {
-        let bash = Message::User {
-            content: vec![UserContent::ToolResult(rig_core::message::ToolResult {
-                call: rig_core::message::CallId::from_wire("b1"),
-                name: tool_name("bash"),
-                // An array result from another tool must not be mistaken for
-                // ours: it has no `path` per entry, so parse_file_results
-                // rejects it.
-                content: vec![rig_core::message::ToolResultContent::text(
-                    r#"[{"stdout":"hi"}]"#,
-                )],
-                is_error: false,
-            })],
-        };
-        assert_eq!(split_edit_tool_results(&bash), None);
-    }
-
+    /// One turn of a multi-file `edit` call and its per-file result, prepared by
+    /// the one producer and serialized to disk: the stored contract is N
+    /// pi-canonical single-path calls, each paired with its own result.
+    ///
+    /// `append_messages` is a pure serializer, so this pins the seam: everything
+    /// `edit`-specific happened in `prepare`, and what reaches the file is
+    /// already the final form. `collect_touched_files` and pi both read
+    /// `arguments.path`, which is why there is one call per file.
     #[tokio::test]
     async fn the_saved_jsonl_holds_n_calls_and_n_results_pairing_by_id() {
+        use crate::agent::transcript::{prepare_edit_call, EditLedger, RunState, TurnTranscript};
+        use crate::tool_args::PathContext;
+
         let _tmp = tempfile::tempdir().unwrap();
-        let dir = _tmp.path().to_path_buf();
-        let path = dir.join(session_filename(&chrono::Utc::now()));
+        let path = _tmp.path().join(session_filename(&chrono::Utc::now()));
         let storage = JsonlSessionStorage::open_or_create(path.clone())
             .await
             .unwrap();
@@ -3243,8 +2996,36 @@ mod tests {
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        session.append_message(&multi_call("t1")).await.unwrap();
-        session.append_message(&multi_result("t1")).await.unwrap();
+        let call = multi_call("t1");
+        let calls_of_call = calls_of(&call);
+        let args = calls_of_call[0].function.arguments_value();
+        let result_text = results_of(&multi_result("t1"))[0].1.clone();
+        let prepared = prepare_edit_call(
+            &CallId::from_wire("t1"),
+            &args,
+            None,
+            Some(&result_text),
+            &PathContext::sandbox(),
+        )
+        .expect("a parseable call");
+        let mut ledger = EditLedger::default();
+        ledger.insert_prepared("t1", prepared);
+
+        let mut t = TurnTranscript::default();
+        t.start_live();
+        t.accept(None, assistant_content(&call).to_vec());
+        t.push_tool_result(rig_core::message::ToolResult {
+            call: CallId::from_wire("t1"),
+            name: tool_name("edit"),
+            content: vec![rig_core::message::ToolResultContent::text(result_text)],
+            is_error: false,
+        });
+        let batch = t.prepare(&ledger, RunState::Ongoing).expect("a batch");
+        let seed = uuid::Uuid::now_v7();
+        session
+            .append_messages(&batch.messages, &seed)
+            .await
+            .unwrap();
 
         // Read the raw JSONL back: the persisted form is the contract.
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
@@ -3275,6 +3056,7 @@ mod tests {
         assert_eq!(call_ids.len(), 2, "two calls on disk: {raw}");
         assert_eq!(result_ids.len(), 2, "two results on disk: {raw}");
         assert_eq!(call_ids, result_ids, "pi correlates on these ids");
+        assert_eq!(call_ids, vec!["t1".to_string(), "t1_f1n2".to_string()]);
         // Every persisted call carries the pi-canonical single-path shape, and
         // every result names its tool (resolved from the call it answers, not
         // the "tool" placeholder).
@@ -3282,6 +3064,8 @@ mod tests {
             for c in e["message"]["content"].as_array().unwrap_or(&vec![]) {
                 if c["type"] == "toolCall" {
                     assert!(c["arguments"]["path"].is_string(), "{c}");
+                    assert!(c["arguments"]["edits"].is_array(), "{c}");
+                    assert!(c["arguments"].get("blocks").is_none(), "{c}");
                     assert_eq!(c["name"], "edit", "{c}");
                 }
             }
@@ -3290,8 +3074,8 @@ mod tests {
             }
         }
 
-        // Reloading and re-persisting is a no-op: the split form is already
-        // single-file, so a second pass finds nothing to split.
+        // Reloading reads the same ids: the split form is already per-file, so
+        // nothing downstream has to know multi-file editing exists.
         let ro = JsonlSessionStorage::open_readonly(path.clone())
             .await
             .unwrap();
@@ -4191,31 +3975,33 @@ mod tests {
         let _ = tokio::fs::remove_file(&path).await;
     }
 
+    /// `append_message` is a pure serializer: the `edit` arguments it is handed
+    /// are written verbatim. Canonicalizing, minimizing and splitting all happen
+    /// once in `agent::transcript::prepare_edit_call`, which can see the call id,
+    /// the resolutions and the result — none of which this layer has.
     #[tokio::test]
-    async fn test_edit_block_form_persisted_as_canonical_array() {
-        // The model emits the Aider block string; the persisted JSONL must be
-        // the canonical pi-compatible array.
+    async fn append_message_serializes_edit_arguments_verbatim() {
         let _tmp = tempfile::tempdir().unwrap();
-        let dir = _tmp.path().to_path_buf();
-        let filename = session_filename(&chrono::Utc::now());
-        let path = dir.join(&filename);
-
+        let path = _tmp.path().join(session_filename(&chrono::Utc::now()));
         let storage = JsonlSessionStorage::open_or_create(path.clone())
             .await
             .unwrap();
-        let header = SessionHeader::new(std::path::Path::new("/test"));
-        storage.write_header(&header).await.unwrap();
+        storage
+            .write_header(&SessionHeader::new(std::path::Path::new("/test")))
+            .await
+            .unwrap();
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        let blob = "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END";
+        let args = serde_json::json!({
+            "path": "src/x.rs",
+            "edits": [{"oldText": "a", "newText": "b", "startLine": 7}],
+        });
         session
             .append_message(&assistant_message(
                 None,
                 vec![AssistantContent::ToolCall(tool_call(
-                    "tc_edit",
-                    "edit",
-                    serde_json::json!({"path": "src/x.rs", "blocks": blob}),
+                    "tc_edit", "edit", args,
                 ))],
             ))
             .await
@@ -4226,23 +4012,14 @@ mod tests {
             .lines()
             .find(|l| l.contains("\"name\":\"edit\""))
             .expect("edit call persisted");
-        // Canonical array form (key order is not significant).
+        // Byte-for-byte what the producer rendered, `startLine` included.
         assert!(
-            line.contains("\"edits\":[")
-                && line.contains("\"oldText\":\"a\"")
-                && line.contains("\"newText\":\"b\""),
-            "edit args should be persisted as the canonical array, got: {line}"
-        );
-        assert!(
-            !line.contains(SEARCH_MARKER_TEST),
-            "block-string form must not be persisted: {line}"
+            line.contains("\"edits\":[{") && line.contains("\"startLine\":7"),
+            "arguments must be serialized as given, got: {line}"
         );
 
         let _ = tokio::fs::remove_file(&path).await;
     }
-
-    /// Local copy of the search marker so the assertion above is explicit.
-    const SEARCH_MARKER_TEST: &str = "@@@OLD";
 
     #[tokio::test]
     async fn test_toolname_multiple_tools() {

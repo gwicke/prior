@@ -14,6 +14,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::session::types::*;
+use crate::tool_args::PathContext;
 
 // ---------------------------------------------------------------------------
 // In-place normalisation helpers (called during build_index)
@@ -31,8 +32,12 @@ const CANONICAL_NAMES: &[(&str, &str)] = &[
     ("sed_preview", "sed"),
 ];
 
-/// Rename argument fields in `args` from old/pi names to canonical names.
-fn normalize_args_in_place(name: &str, args: &mut serde_json::Value) {
+/// Rename argument fields in `args` from old/pi names to canonical names, and
+/// apply the same `bash`-prefix / path-argument rewrites the live paths apply
+/// ([`crate::tool_args::normalize`]), so a replayed call reads exactly like the
+/// call that ran. Idempotent, so re-normalizing an already-stored call is a
+/// no-op.
+fn normalize_args_in_place(name: &str, args: &mut serde_json::Value, ctx: &PathContext) {
     let Some(obj) = args.as_object_mut() else {
         return;
     };
@@ -42,21 +47,7 @@ fn normalize_args_in_place(name: &str, args: &mut serde_json::Value) {
             if let Some(cmd) = obj.remove("cmd") {
                 obj.insert("command".into(), cmd);
             }
-            // Drop a redundant `cd <cwd> && …` prefix, the same rewrite the
-            // execution path and the model-facing history apply, so a replayed
-            // call reads like the compact form that actually ran. A `cd` to a
-            // different directory is left alone.
-            if let Some(stripped) =
-                obj.get("command")
-                    .and_then(|c| c.as_str())
-                    .and_then(|command| {
-                        std::env::current_dir()
-                            .ok()
-                            .and_then(|cwd| crate::bash_cmd::strip_cwd_prefix(command, &cwd))
-                    })
-            {
-                obj.insert("command".into(), serde_json::Value::String(stripped));
-            }
+            // The `bash` prefix strip, applied by `normalize` below.
         }
         "grep" => {
             // Canonical is "pattern". Accept both "pat" (old) and "pattern" (pi).
@@ -85,24 +76,28 @@ fn normalize_args_in_place(name: &str, args: &mut serde_json::Value) {
         }
         "edit" => {
             // Canonical is `edits:[{oldText,newText}]` (pi-compatible). Fold the
-            // model's block form (a string), the legacy single `oldText`/`newText`
-            // shape, and the very old `old`/`new` shape all into it. Best-effort:
-            // an unparseable blob is left as-is so replay degrades gracefully.
+            // legacy block-string form, the single `oldText`/`newText` shape and
+            // the very old `old`/`new` shape into it, so an old session replays
+            // through the same display code a new one does. Best-effort: an
+            // unparseable blob is left as-is so replay degrades gracefully.
             //
-            // This is the reload counterpart of `Session::append_message` and
-            // `LoggingHook::on_tool_call`; all three must preserve `startLine`
-            // via `canonicalize_edit_value` so an anchored edit survives a
-            // round trip through disk.
+            // This is the reload counterpart of `prepare_edit_call`, which
+            // always writes the array — so for anything persisted since, this is
+            // the array-identity branch of `canonicalize_edit_value`.
             *args = crate::edit_blocks::canonicalize_edit_value(args);
         }
         _ => {}
     }
+    // Path arguments and the `bash` prefix, in the same pass every live view
+    // uses. After the field renames above, so `edit`'s canonical array is in
+    // place for whatever display code reads `path` from it.
+    crate::tool_args::normalize(name, args, ctx);
 }
 
 /// Normalise tool-call entries in a `SessionEntry` in place, so that the
 /// in-memory representation uses canonical tool names and argument fields.
 /// Operates on the raw `serde_json::Value` inside `Message` entries.
-fn normalize_entry_in_place(entry: &mut SessionEntry) {
+fn normalize_entry_in_place(entry: &mut SessionEntry, ctx: &PathContext) {
     let message = match &mut entry.content {
         SessionEntryContent::Message { message } => message,
         _ => return,
@@ -125,7 +120,7 @@ fn normalize_entry_in_place(entry: &mut SessionEntry) {
             .unwrap_or(name.as_str());
         item["name"] = serde_json::Value::String(canonical.to_string());
         if let Some(args) = item.get_mut("arguments") {
-            normalize_args_in_place(canonical, args);
+            normalize_args_in_place(canonical, args, ctx);
         }
     }
 }
@@ -404,6 +399,9 @@ impl SessionStorage for JsonlSessionStorage {
 
         // First line is always the header.
         let header: SessionHeader = serde_json::from_str(lines[0])?;
+        // One context for the whole file: the rewrites are pure and every entry
+        // resolves against the same cwd/home.
+        let ctx = PathContext::sandbox();
 
         // Subsequent lines are entries.
         let line_count = lines.len();
@@ -421,7 +419,7 @@ impl SessionStorage for JsonlSessionStorage {
                     // downstream consumer sees canonical names.  This happens
                     // at the storage boundary (JSONL -> in-memory) so there is
                     // exactly one obvious place for the transformation.
-                    normalize_entry_in_place(&mut entry);
+                    normalize_entry_in_place(&mut entry, &ctx);
 
                     // Chronological position: the file is append-only, so the
                     // scan order is the display order.
@@ -525,7 +523,7 @@ mod tests {
             "path": "src/x.rs",
             "blocks": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
         });
-        normalize_args_in_place("edit", &mut v);
+        normalize_args_in_place("edit", &mut v, &PathContext::sandbox());
         assert_eq!(
             v,
             serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]})
@@ -533,7 +531,7 @@ mod tests {
 
         // Legacy `old`/`new` -> canonical array.
         let mut v = serde_json::json!({"path": "src/x.rs", "old": "a", "new": "b"});
-        normalize_args_in_place("edit", &mut v);
+        normalize_args_in_place("edit", &mut v, &PathContext::sandbox());
         assert_eq!(
             v,
             serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]})
@@ -543,30 +541,47 @@ mod tests {
         let orig =
             serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]});
         let mut v = orig.clone();
-        normalize_args_in_place("edit", &mut v);
+        normalize_args_in_place("edit", &mut v, &PathContext::sandbox());
         assert_eq!(v, orig);
 
         // Malformed blob is left as-is (graceful degradation).
         let orig = serde_json::json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@END"});
         let mut v = orig.clone();
-        normalize_args_in_place("edit", &mut v);
+        normalize_args_in_place("edit", &mut v, &PathContext::sandbox());
         assert_eq!(v, orig);
     }
 
     #[test]
     fn normalize_bash_args_strips_a_redundant_cd_prefix() {
         let cwd = std::env::current_dir().unwrap();
+        let ctx = PathContext::sandbox();
         // A `cd` into the working directory is dropped, as on the live path.
         let mut v = serde_json::json!({
             "command": format!("cd {} && cargo test", cwd.display())
         });
-        normalize_args_in_place("bash", &mut v);
+        normalize_args_in_place("bash", &mut v, &ctx);
         assert_eq!(v, serde_json::json!({"command": "cargo test"}));
 
         // A `cd` elsewhere is a real directory change and survives replay.
         let mut v = serde_json::json!({"command": "cd /tmp && ls"});
-        normalize_args_in_place("bash", &mut v);
+        normalize_args_in_place("bash", &mut v, &ctx);
         assert_eq!(v, serde_json::json!({"command": "cd /tmp && ls"}));
+    }
+
+    #[test]
+    fn normalize_path_args_shortens_cwd_subpaths() {
+        let ctx = PathContext::sandbox();
+        let sub = ctx.cwd.join("src/x.rs");
+        let mut v = serde_json::json!({ "path": sub.to_string_lossy() });
+        normalize_args_in_place("read", &mut v, &ctx);
+        assert_eq!(v, serde_json::json!({"path": "src/x.rs"}));
+        // Outside the cwd (the parent directory): spelling kept.
+        let outside = ctx.cwd.parent().map(|p| p.join("x.rs"));
+        if let Some(outside) = outside {
+            let mut v = serde_json::json!({ "path": outside.to_string_lossy() });
+            normalize_args_in_place("read", &mut v, &ctx);
+            assert_eq!(v, serde_json::json!({"path": outside.to_string_lossy()}));
+        }
     }
 
     /// Helper: create a JsonlSessionStorage backed by a temp file.

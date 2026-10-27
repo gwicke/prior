@@ -18,7 +18,7 @@
 
 use super::errors::{classify_prompt_error, classify_stream_error};
 use super::pumps::dispatch_in_turn_event;
-use super::transcript::{EditAnchorLedger, TurnTranscript};
+use super::transcript::{EditLedger, TurnTranscript};
 use crate::Result;
 use futures::StreamExt;
 use rig_agent::agent::MultiTurnStreamItem;
@@ -147,14 +147,10 @@ impl CodeAgent {
         // The run-scoped transcript is shared with the hook and the stream
         // loop so a mid-turn failure can persist exactly what completed.
         let transcript = Arc::new(Mutex::new(TurnTranscript::default()));
-        // Resolved edit placements, shared with the hook. Persist applies the
-        // same minimizer as `on_completion_call` so the session and the model
-        // history agree, then `append_message` splits/canonicalizes as usual.
-        //
-        // If you change this order or the ledger shape, also touch
-        // `LoggingHook::on_completion_call`/`on_tool_result`, `minimize_edit_tool_calls`,
-        // and `Session::canonicalize_edit_tool_calls` (persist-side split).
-        let edit_anchors = Arc::new(Mutex::new(EditAnchorLedger::default()));
+        // What the `edit` producer saw and rendered this run, shared with the
+        // hook. Persist and the model-facing history both read it, so the
+        // session and the next request use one shape (`EditLedger`).
+        let edit_anchors = Arc::new(Mutex::new(EditLedger::default()));
         // Per-request params, set unconditionally from `params`.
         //
         // `replace_additional_params`, not `merge_`: a `/reasoning` override
@@ -395,14 +391,14 @@ impl CodeAgent {
                                 t.has_content()
                             };
                             if !retryable || made_progress {
-                                let anchors = edit_anchors
+                                let ledger = edit_anchors
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .clone();
                                 let _ = crate::agent::transcript::commit(
                                     &transcript,
                                     session.as_deref(),
-                                    &anchors,
+                                    &ledger,
                                     crate::agent::transcript::RunState::Ended,
                                 )
                                 .await;
@@ -527,14 +523,14 @@ impl CodeAgent {
         // abort) plus an `Ended` synthesis of any unanswered call. The prompt
         // is already on disk (dispatch). Failure is logged inside `commit`.
         {
-            let anchors = edit_anchors
+            let ledger = edit_anchors
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             let _ = crate::agent::transcript::commit(
                 &transcript,
                 session.as_deref(),
-                &anchors,
+                &ledger,
                 crate::agent::transcript::RunState::Ended,
             )
             .await;
