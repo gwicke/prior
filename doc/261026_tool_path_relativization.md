@@ -1,5 +1,8 @@
 # Tool path relativization
 
+Ordered implementation steps: [`261026_tool_path_relativization_impl.md`](
+261026_tool_path_relativization_impl.md).
+
 ## Problem
 
 `4821776` made tool arguments resolve `~` and enforce the sandbox namespace. A
