@@ -354,15 +354,13 @@ impl TurnTranscript {
             // noise); drop the unit.
             None => return None,
         };
-        let assistant = minimize_one(assistant, anchors);
-        // Drop a redundant `cd <cwd> && …` prefix from `bash` calls, so what
-        // gets persisted is the compact form. `crate::bash_cmd` is the single
+        let mut assistant = minimize_one(assistant, anchors);
+        // The `bash` prefix strip and path relativization, so what gets
+        // persisted is the compact form. `crate::tool_args` is the single
         // implementation the execution path and the model-facing history use,
-        // so all three views of one call agree.
-        let assistant = match std::env::current_dir() {
-            Ok(cwd) => crate::bash_cmd::rewrite_in_message(assistant, &cwd),
-            Err(_) => assistant,
-        };
+        // so every view of one call agrees.
+        let ctx = crate::tool_args::PathContext::sandbox();
+        crate::tool_args::normalize_in_message(&mut assistant, &ctx);
 
         let (assistant, results) = if has_edit_call(&assistant) {
             shape_pair(assistant, results)

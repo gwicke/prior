@@ -27,7 +27,7 @@ and link a doc/ and/or commit hash
 - [ ] tool path relativization: store/display/send cwd sub-paths (`src/tools.rs`, not
       `/home/u/proj/src/tools.rs`) across persist and history, from one producing pass in
       `TurnTranscript::prepare`. Design: `doc/261026_tool_path_relativization.md`; ordered steps
-      (step 1 done): `doc/261026_tool_path_relativization_impl.md`.
+      (steps 1–3 done): `doc/261026_tool_path_relativization_impl.md`.
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing `egress::host_allowed`;
       `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https; HTTP-only clients now come
       through R3i's front end instead).

@@ -12,7 +12,7 @@ use crate::config::{
     ByteOffset, ContextLines, ReadLimit, ReadOffset, SandboxConfig, SandboxMaxOutputBytes,
     SandboxMemoryMb, SandboxTimeoutSecs,
 };
-use crate::path_util::{expand_tilde, relativize_path};
+use crate::path_util::relativize_path;
 
 // The block-edit core moved to the `bsed_blockedit` crate so the `bsed` binary
 // previews and applies in exactly the format the `edit` tool consumes. These
@@ -144,22 +144,17 @@ fn get_path_with(path: &str, is_write: bool) -> Result<PathBuf, ToolError> {
 /// expansion when bindings are present. Using the sandbox home keeps the two
 /// branches agreeing on `~` even under a custom `sandbox.env`.
 fn expand_arg_tilde(path: &str) -> PathBuf {
-    match sandbox_config().as_ref().as_ref() {
-        Some(cfg) => match crate::config::sandbox_home(cfg) {
-            Some(home) => {
-                // `~` / `~/x` only (the shell leaves `~user` alone too).
-                if path == "~" {
-                    home
-                } else if let Some(rest) = path.strip_prefix("~/") {
-                    home.join(rest)
-                } else {
-                    PathBuf::from(path)
-                }
-            }
-            // No sandbox `HOME`: leave `~` unexpanded, as a shell would.
+    // `~` / `~/x` only (the shell leaves `~user` alone too). With no known
+    // home — a sandbox run without `HOME` — `~` stays literal, as a shell would
+    // have it, so there is no fallback to `env::var("HOME")` here (unlike
+    // `path_util::expand_tilde`).
+    match crate::tool_args::PathContext::sandbox().home {
+        Some(home) if path == "~" => home,
+        Some(home) => match path.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
             None => PathBuf::from(path),
         },
-        None => expand_tilde(path),
+        None => PathBuf::from(path),
     }
 }
 
@@ -1123,12 +1118,12 @@ impl rig_core::tool::Tool for Bash {
         // Strip a redundant `cd <cwd> && …` prefix: the shell already starts in
         // the working directory the model was told about, so running the command
         // as written is a no-op that only costs tokens. The same rewrite is
-        // applied to the persisted call and to the next turn's history, so all
-        // three views agree (see `crate::bash_cmd`).
-        let command = match std::env::current_dir() {
-            Ok(cwd) => crate::bash_cmd::strip_cwd_prefix(&args.command, &cwd),
-            Err(_) => None,
-        };
+        // applied to the persisted call and to the next turn's history, so every
+        // view agrees (see `crate::tool_args`).
+        let command = crate::tool_args::strip_cwd_prefix(
+            &args.command,
+            &crate::tool_args::PathContext::sandbox(),
+        );
         let command = command.as_deref().unwrap_or(&args.command);
         let (out, exit_code) = run_sandboxed_with_status(command, args.timeout.into()).await?;
         // The bash tool result is shown verbatim to the user (via
@@ -1222,7 +1217,7 @@ pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
 /// when the sandbox is disabled, bwrap is absent, or no explicit bindings are
 /// configured (permissive default). Mirrors the shell-sandboxing activation
 /// condition so the two worlds stay consistent.
-fn current_path_policy() -> Option<crate::config::PathPolicy> {
+pub(crate) fn current_path_policy() -> Option<crate::config::PathPolicy> {
     let cfg = sandbox_config();
     let c = cfg.as_ref().as_ref()?;
     let cwd = std::env::current_dir().ok()?;
@@ -4693,10 +4688,10 @@ mod edit_file_tests {
     async fn success_string_uses_relative_path() {
         // Inside `CwdGuard::new()` the tool resolves cwd to the tempdir it
         // chdir'd into. The file is `a.txt` *in that tempdir*, so the
-        // success string must render the path as `./a.txt` — not the
-        // absolute tempdir prefix. This keeps the model-facing output
-        // portable (no cwd leakage) and token-efficient (no wasted cwd
-        // prefix on every tool result).
+        // success string must render the path as `a.txt` — not the absolute
+        // tempdir prefix. This keeps the model-facing output portable (no cwd
+        // leakage) and token-efficient (no wasted cwd prefix on every tool
+        // result, and no `./` either: the shortest spelling).
         let guard = CwdGuard::new();
         tokio::fs::write("a.txt", "hello\n").await.unwrap();
         let res = edit_file(
@@ -4711,7 +4706,7 @@ mod edit_file_tests {
         .await
         .unwrap();
         assert!(
-            res.starts_with("Replaced 1 block(s) in ./a.txt"),
+            res.starts_with("Replaced 1 block(s) in a.txt"),
             "expected relative path in success string, got: {res}",
         );
         // Defensive: the absolute tempdir path must not appear in the

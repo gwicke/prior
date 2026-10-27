@@ -4,8 +4,8 @@ Companion to [`261026_tool_path_relativization.md`](261026_tool_path_relativizat
 the design (what and why) lives there, this is the ordered how. Resume from
 the first section not marked DONE.
 
-Ordered so the tree compiles and tests pass at every step. Step 1 is done
-(uncommitted); resume at step 2.
+Ordered so the tree compiles and tests pass at every step. Steps 1–3 are done;
+resume at step 4.
 
 ### 1. The primitive — DONE
 
@@ -15,25 +15,30 @@ Ordered so the tree compiles and tests pass at every step. Step 1 is done
 renamed/extended in the same module. **Already committed in the working tree** —
 do not redo; re-run `cargo test -p bsed-blockedit path::` to confirm.
 
-### 2. `PathContext` — NOT DONE, do it with step 3
+### 2. `PathContext` — DONE
 
-Add to `src/tool_args.rs` (created in step 3). Order 2 and 3 together; there is
-no point creating the type in a module that does not exist yet.
+Added to `src/tool_args.rs`, with two deviations worth knowing: a
+`#[cfg(test)] new(cwd, home)` for explicit contexts, and `cwd` from a new
+`PathPolicy::sandbox_cwd(cwd)` accessor rather than reaching into `remap`.
+`tools::current_path_policy` is now `pub(crate)`. `tools::expand_arg_tilde` also
+delegates to `PathContext::sandbox().home` now, so the tools' `~` and every
+egress's `~` are one value.
 
-```
-pub(crate) struct PathContext { pub cwd: PathBuf, pub home: Option<PathBuf> }
-impl PathContext {
-    /// The one constructor: reads the sandbox view, not the host's.
-    pub(crate) fn sandbox() -> Self   // via `current_path_policy()` or current_dir()
-}
-```
+`cwd` = `PathPolicy::sandbox_cwd(host_cwd)` when a policy exists, else
+`current_dir()`. `home` = `config::sandbox_home(cfg)` when a sandbox config
+exists, else `env::var_os("HOME")`. This is identity with today's behaviour; the
+point is that there is one function to change later.
 
-`cwd` = `remap.sandbox_cwd(&host_cwd)` when a policy exists, else
-`std::env::current_dir()`. `home` = `config::sandbox_home(cfg)` when a sandbox
-config exists, else `env::var_os("HOME")`. This is identity with today's
-behaviour; the point is that there is one function to change later.
+### 3. `src/bash_cmd.rs` → `src/tool_args.rs` — DONE
 
-### 3. `src/bash_cmd.rs` → `src/tool_args.rs`
+Renamed with `git mv`; module doc rewritten to cover both rewrites. The old
+`rewrite_bash_calls{,_in}` / `rewrite_in_message` / `rewrite_content` are gone,
+replaced by `normalize` / `normalize_in_message` / `normalize_messages` /
+`rewrite_messages`. All four egresses are wired: `tools.rs` (execution),
+`transcript.rs::prepare` (persist), `session/storage.rs::build_index` (replay,
+which now also applies the full `normalize`, after its field renames), and
+`build.rs::on_completion_call` (history). `render_model_facing` is **not** written
+yet — it lands with step 6.2, once `EditLedger` exists.
 
 Rename the module (`git mv`), update `src/lib.rs` (`pub mod tool_args;`) and
 every `crate::bash_cmd::…` caller (`src/agent/transcript.rs:363`,

@@ -784,12 +784,15 @@ impl AgentHook for LoggingHook {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        // `strip -> blob -> minimize -> split`, then drop the redundant
-        // `cd <cwd> && …` prefix on `bash` calls. The prefix rewrite is the same
-        // function the execution path and the transcript use
-        // (`crate::bash_cmd`), so the model sees the command that actually ran.
+        // `strip -> normalize -> blob -> minimize -> split`: drop the redundant
+        // `cd <cwd> && …` prefix on `bash` calls and shorten path arguments, in
+        // the same pass the execution path and the transcript use
+        // (`crate::tool_args`), then render `edit` calls the model should see.
         let history = split_multi_file_edit_calls(minimize_edit_tool_calls(
-            blob_edit_tool_calls(crate::bash_cmd::rewrite_bash_calls(stripped_history)),
+            blob_edit_tool_calls(crate::tool_args::rewrite_messages(
+                stripped_history,
+                &crate::tool_args::PathContext::sandbox(),
+            )),
             &anchors,
         ));
 
