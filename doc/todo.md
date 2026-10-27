@@ -24,6 +24,9 @@ and link a doc/ and/or commit hash
       same resolver. `tmp_size_mb` retired (one-shot runs keep a fixed 256 MB tmpfs). Cleanup at
       `/clear`, `/session <id> delete`, plus a 7-day mtime sweep on startup. Design in
       `doc/sandbox.md` -> "`/tmp` is a per-session directory".
+- [ ] tool path relativization: store/display/send cwd sub-paths (`src/tools.rs`, not
+      `/home/u/proj/src/tools.rs`) across persist, history, replay and display. Plan:
+      `doc/261026_tool_path_relativization.md`.
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing `egress::host_allowed`;
       `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https; HTTP-only clients now come
       through R3i's front end instead).
