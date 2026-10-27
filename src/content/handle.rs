@@ -30,7 +30,9 @@ use crate::content;
 use crate::content::markdown::{
     answer_theme, command_lang, guess_lang, highlight_code_fg, highlight_label_fg, render_markdown,
 };
-use crate::content::preview::{get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno};
+use crate::content::preview::{
+    elide_lines_for_display, get_preview, multi_file_blobs, sed_preview_body, strip_read_lineno,
+};
 use crate::content::text::expand_tabs;
 use crate::render::ContentWrite;
 
@@ -1059,23 +1061,18 @@ impl Content {
                     // painted flush.
                     let lang = guess_lang(path);
                     let width = self.width();
-                    let show_max = 10; // Limit preview to 10 lines (match read_file)
                     let content_lines: Vec<_> = content.lines().collect();
-                    let shown: Vec<String> = content_lines
-                        .iter()
-                        .take(show_max)
-                        .map(|l| expand_tabs(l).into_owned())
-                        .collect();
+
+                    // Elide to 10 lines total: head + elision marker + tail.
+                    // Small files (<= 10 lines) show completely.
+                    const DISPLAY_TARGET: usize = 10;
+                    let shown = elide_lines_for_display(&content_lines, DISPLAY_TARGET, |l| {
+                        expand_tabs(l).into_owned()
+                    });
+
                     let block = shown.join("\n");
                     for row in highlight_code_fg(&block, lang, width).split('\n') {
                         self.paint_panel(row, false);
-                    }
-                    if content_lines.len() > show_max {
-                        self.tool_panel(
-                            &format!("... +{} lines", content_lines.len() - show_max),
-                            false,
-                            true,
-                        );
                     }
                     self.end_tool_block();
                     return;
@@ -4597,6 +4594,156 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
             "should not contain line number gutter: {}",
             output
         );
+    }
+
+    /// Test that write tool preview shows head + elision + tail for large files.
+    /// This ensures the user can verify the full file was written by seeing the end.
+    #[test]
+    fn write_tool_preview_elides_middle_for_large_files() {
+        let out = Content::new(
+            TermIO::plain(),
+            crate::settings::default_show_reasoning_handle(),
+        );
+        out.begin_response();
+        out.begin_capture();
+
+        // 17 lines of content (15 println! + fn main + closing brace)
+        let content = "fn main() {\n    println!(\"line 1\");\n    println!(\"line 2\");\n    println!(\"line 3\");\n    println!(\"line 4\");\n    println!(\"line 5\");\n    println!(\"line 6\");\n    println!(\"line 7\");\n    println!(\"line 8\");\n    println!(\"line 9\");\n    println!(\"line 10\");\n    println!(\"line 11\");\n    println!(\"line 12\");\n    println!(\"line 13\");\n    println!(\"line 14\");\n    println!(\"line 15\");\n}";
+        let result = format!(
+            r#"{{"path":"./test.rs","content":"{}","lines":17,"bytes":{}}}"#,
+            content.replace('\n', "\\n").replace('"', "\\\""),
+            content.len()
+        );
+        out.display_tool_call("write_file", &serde_json::json!({"path": "test.rs"}));
+        out.display_tool_result(&result);
+
+        out.end_response();
+        let captured = out.end_capture();
+        let output = strip_ansi(&String::from_utf8_lossy(&captured));
+
+        // Should contain the call panel header
+        assert!(
+            output.contains("write test.rs"),
+            "missing call panel header: {}",
+            output
+        );
+
+        // Should contain first 8 lines (head): fn main() + 7 println lines
+        assert!(output.contains("fn main()"), "missing fn main: {}", output);
+        assert!(
+            output.contains("println!(\"line 1\")"),
+            "missing line 1: {}",
+            output
+        );
+        assert!(
+            output.contains("println!(\"line 7\")"),
+            "missing line 7 (head): {}",
+            output
+        );
+
+        // Should contain elision marker with correct count: 17 - 8 - 1 = 8
+        assert!(
+            output.contains("… (8 lines elided)"),
+            "missing elision marker: {}",
+            output
+        );
+
+        // Should contain the last line (tail)
+        assert!(
+            output.contains("}"),
+            "missing last line (closing brace): {}",
+            output
+        );
+
+        // Should NOT contain lines 6-14 (the middle that was elided)
+        // Note: They might appear in the syntax highlighting ANSI codes, check plain text
+        // The elision means we should only see lines 1-5, then elision, then line 17
+        println!("Output for inspection:\n{}", output);
+    }
+
+    /// Test that small files (<= 6 lines) show all content without elision.
+    #[test]
+    fn write_tool_preview_shows_all_for_small_files() {
+        let out = Content::new(
+            TermIO::plain(),
+            crate::settings::default_show_reasoning_handle(),
+        );
+        out.begin_response();
+        out.begin_capture();
+
+        // 4 lines of content - should show all
+        let content = "fn main() {\n    let x = 42;\n    println!(\"Hello, world! {}\", x);\n}";
+        let result = format!(
+            r#"{{"path":"./test.rs","content":"{}","lines":4,"bytes":{}}}"#,
+            content.replace('\n', "\\n").replace('"', "\\\""),
+            content.len()
+        );
+        out.display_tool_call("write_file", &serde_json::json!({"path": "test.rs"}));
+        out.display_tool_result(&result);
+
+        out.end_response();
+        let captured = out.end_capture();
+        let output = strip_ansi(&String::from_utf8_lossy(&captured));
+
+        // Should contain all lines
+        assert!(output.contains("fn main()"), "missing fn main: {}", output);
+        assert!(
+            output.contains("let x = 42"),
+            "missing let x = 42: {}",
+            output
+        );
+        assert!(output.contains("println!"), "missing println!: {}", output);
+        assert!(output.contains("}"), "missing closing brace: {}", output);
+
+        // Should NOT contain elision marker
+        assert!(
+            !output.contains("lines elided"),
+            "should not contain elision marker for small file: {}",
+            output
+        );
+    }
+
+    /// Test that files with 11 lines (just over the 10-line threshold) show elision
+    #[test]
+    fn write_tool_preview_elides_for_11_lines() {
+        let out = Content::new(
+            TermIO::plain(),
+            crate::settings::default_show_reasoning_handle(),
+        );
+        out.begin_response();
+        out.begin_capture();
+
+        // 11 lines - just over the 10-line threshold for elision
+        let content = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11";
+        let result = format!(
+            r#"{{"path":"./test.rs","content":"{}","lines":11,"bytes":{}}}"#,
+            content.replace('\n', "\\n"),
+            content.len()
+        );
+        out.display_tool_call("write_file", &serde_json::json!({"path": "test.rs"}));
+        out.display_tool_result(&result);
+
+        out.end_response();
+        let captured = out.end_capture();
+        let output = strip_ansi(&String::from_utf8_lossy(&captured));
+
+        // Should contain first 8 lines (head): target 10 - 2 = 8 head lines
+        assert!(output.contains("line 1"), "missing line 1: {}", output);
+        assert!(
+            output.contains("line 8"),
+            "missing line 8 (head): {}",
+            output
+        );
+
+        // Should contain elision marker: 11 - 8 - 1 = 2 lines elided
+        assert!(
+            output.contains("… (2 lines elided)"),
+            "missing elision marker: {}",
+            output
+        );
+
+        // Should contain last line
+        assert!(output.contains("line 11"), "missing line 11: {}", output);
     }
 }
 

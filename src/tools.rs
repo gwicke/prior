@@ -447,20 +447,23 @@ fn read_byte_window(
 pub async fn write_file(path: String, content: String) -> Result<String, ToolError> {
     let p = get_path_with(&path, true)?;
     fs::write(&p, &content).await?;
-    // Return a structured result similar to read_file: include the path and
-    // content preview so display_tool_result can render it with syntax
-    // highlighting and the user sees what was written.
+    // Return a structured result: include the path and full content for
+    // display_tool_result to render with syntax highlighting. The model gets
+    // a minimal confirmation via model_preview: just the line count and the
+    // last line. The display path in handle.rs will elide to 5 head + elision + tail.
     // Use the sandbox path (not the remapped host path) for the response.
     let sandbox_path = get_sandbox_path(&path)?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| sandbox_path.clone());
     let shown = crate::path_util::relativize_path(&sandbox_path, &cwd);
-    // Limit preview to first 50 lines, without line numbers (display handles formatting)
-    let preview = content.lines().take(50).collect::<Vec<_>>().join("\n");
+    let content_lines: Vec<&str> = content.lines().collect();
+    let total = content_lines.len();
+    let last_line = content_lines.last().copied().unwrap_or("");
     Ok(serde_json::json!({
         "path": shown,
-        "content": preview,
-        "lines": content.lines().count(),
+        "content": content,
+        "lines": total,
         "bytes": content.len(),
+        "model_preview": format!("Wrote {total} lines ending in:\n{last_line}"),
     })
     .to_string())
 }

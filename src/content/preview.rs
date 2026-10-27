@@ -7,6 +7,37 @@ use crate::tools::EditOp;
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 
+/// Elide a slice of lines for display, showing head + elision marker + tail
+/// to fit within `target` total lines.
+///
+/// - If `lines.len() <= target`: returns all lines mapped through `format_line`.
+/// - Otherwise: shows `target - 2` head lines, then `… (N lines elided)`, then the last line.
+///   The `-2` accounts for the elision marker line and the tail line.
+pub(crate) fn elide_lines_for_display<F>(
+    lines: &[&str],
+    target: usize,
+    format_line: F,
+) -> Vec<String>
+where
+    F: Fn(&str) -> String + Copy,
+{
+    let total = lines.len();
+    if total <= target {
+        return lines.iter().copied().map(format_line).collect();
+    }
+    let head_count = target.saturating_sub(2);
+    let mut shown: Vec<String> = lines
+        .iter()
+        .copied()
+        .take(head_count)
+        .map(format_line)
+        .collect();
+    let elided = total - head_count - 1;
+    shown.push(format!("… ({elided} lines elided)"));
+    shown.push(format_line(lines[total - 1]));
+    shown
+}
+
 pub(crate) fn truncate(s: &str, max_len: usize) -> String {
     if s.chars().count() > max_len {
         format!("{}...", s.chars().take(max_len).collect::<String>())
