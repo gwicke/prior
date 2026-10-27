@@ -25,7 +25,8 @@ and link a doc/ and/or commit hash
       `/clear`, `/session <id> delete`, plus a 7-day mtime sweep on startup. Design in
       `doc/sandbox.md` -> "`/tmp` is a per-session directory".
 - [ ] tool path relativization: store/display/send cwd sub-paths (`src/tools.rs`, not
-      `/home/u/proj/src/tools.rs`) across persist, history, replay and display. Plan:
+      `/home/u/proj/src/tools.rs`) across persist and history, from one producing pass in
+      `TurnTranscript::prepare`. Plan (one open question: `~` spelling):
       `doc/261026_tool_path_relativization.md`.
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing `egress::host_allowed`;
       `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https; HTTP-only clients now come
