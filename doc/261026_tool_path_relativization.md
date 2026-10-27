@@ -39,22 +39,21 @@ Only *arguments* and *results that name a file* are touched. Paths embedded in
 free text (a `grep` match line, a `bsed` failure report the model wrote itself)
 are left alone: rewriting inside content the user searched for would be a lie.
 
-### `~` arguments — the one open decision
+### `~` arguments
 
-Two rules are wanted at once: `~` must not become a host-dependent absolute
-path, and two spellings of the same file should normalize to one. Proposed:
+`~`/`~/x` is expanded with the **sandbox** home (`config::sandbox_home`, what
+`expand_arg_tilde` and `resolve_sandbox` already use — *not* `env::var("HOME")`;
+if an `env` policy ever forces `HOME`, a host-HOME expansion would normalize to a
+path the tool never resolved to), then normalized by the rule above. If the
+result is not under cwd, the **original `~` spelling is kept**.
 
-1. expand `~`/`~/x` with the **sandbox** home (`config::sandbox_home`, what
-   `expand_arg_tilde` and `resolve_sandbox` already use — *not*
-   `env::var("HOME")`; if an `env` policy ever forces `HOME`, a host-HOME
-   expansion would normalize to a path the tool never resolved to);
-2. relativize the result;
-3. if it is not under cwd, **keep the original `~` spelling**.
+- `~/src/prior3/x` → `x` (under cwd: the sub-path wins)
+- `~/notes.txt` → `~/notes.txt` (outside cwd: shortest, and already
+  HOME-independent)
+- `/home/u/notes.txt` → unchanged (absolute, outside cwd)
 
-So `~/src/prior3/x` → `x`, `~/notes.txt` stays `~/notes.txt` (shorter than the
-expansion, and home-independent), and `/home/u/notes.txt` stays absolute
-(unchanged rule). Expanding with the sandbox home is what makes step 3 safe: the
-spelling kept is the one the tool resolved.
+The spelling kept is the one the tool resolved, because the expansion used the
+same sandbox home the tool uses.
 
 ### `PathContext` — one choke point for cwd and home
 
@@ -83,61 +82,88 @@ it:
 The round trip is already tested in `bsed_blockedit` (`from_wire` →
 `render_blob`); that test is the regression guard, not a new helper.
 
-## One producing pass, three consumers
+## The `edit` tool: one array form, one block form
 
-The blocking fact: only `TurnTranscript::prepare` (`src/agent/transcript.rs`)
-holds an assistant `edit` call, its results, **and** the run's placement ledger
-at the same time — and it only runs once the unit is complete (`commit(..,
-Ongoing)` refuses an unanswered call). So prepare does the whole `edit` job and
-publishes the result; the egresses read it.
+Two representations, two owners, no crossing:
+
+- **canonical array** (`{path, edits:[…]}`, one file per call) → persist, and
+  display;
+- **block form** (`{path, blocks:"…"}`) → the model's history, only.
+
+The array form is sufficient for display, which is the change that makes this
+plan small. `content::preview::get_preview` already renders an `edit` label and
+diff from `edits[]`; the only reason a multi-file panel needed blocks was that
+`multi_file_pairs` recovered the per-file halves by re-parsing a rendered blob.
+Persist's split already produces one array per file, so `get_preview` over those
+arrays yields N single-file panels — byte-identical to what the blob round trip
+fakes today. `multi_file_blobs`, the blob parse in `multi_file_pairs`, and the
+in-crate use of `edit_blocks::per_file_blocks` all go; `per_file_blocks` stays
+only for `bsed`.
+
+## One producing function, three consumers
+
+Editing is fast, so the panel can wait for the result. That is the enabler:
+`LoggingHook::on_outcome` is the one place that holds *all* of an `edit` call's
+inputs — `tool_args`, the host-only `EditResolutions`, and the result text — and
+it already runs (and today already records into the ledger) immediately before
+rendering the result.
 
 ```
-prepare_unit(assistant, results, anchors, ctx)        src/agent/transcript.rs
-    per edit call:
-        EditArgs::from_wire(args)          // the one parse
-        minimize per file (ledger)         // matches raw model-spelled paths
-        relativize_files(&mut files, ctx)  // the one path rule
-        arrays = files → canonical arrays  // → persist
-        blocks = files → render_blob       // → history + display
+prepare_edit_call(args, resolutions: Option<&EditResolutions>, result: Option<&str>, ctx)
+    EditArgs::from_wire(args)              // the one parse
+    minimize per file (resolutions)        // no-op when absent
+    relativize_files(&mut files, ctx)      // the one path rule
+    arrays   = files → canonical arrays    // → persist + display
+    blocks   = files → render_blob         // → model history
+    results  = N-entry result array, paired to arrays by index
 ```
 
-The carrier is the ledger that already exists, keyed by tool-call id. Widen
-`EditAnchorLedger` from `HashMap<String, EditResolutions>` to a run-scoped
-`PreparedEdit` record: resolutions (`Option`, as today filled only on success),
-the canonical arrays, the per-file blocks, and the derived split ids. It stays
-in-run, host-only, never serialized.
+Called once per `edit` call from `on_outcome`; the returned `PreparedEdit` is
+stored in the ledger keyed by tool-call id. Everything downstream is a lookup:
 
 | egress | site | consumes | work left |
 | --- | --- | --- | --- |
-| persist | `prepare` → `append_messages` | canonical arrays | none |
-| model-facing history | `on_completion_call` | blocks, by call id | substitute; render the rest |
-| live display | `on_outcome` → `display_tool_result` | blocks, by call id | none |
-| live call panel | `on_dispatch` → `get_preview` | arguments only | `normalize` only |
+| live display | `on_outcome` → `display_tool_pair` | prepared arrays + results | render |
+| persist | `TurnTranscript::prepare` → `append_messages` | prepared arrays | none |
+| model-facing history | `on_completion_call` | prepared blocks, by call id | substitute |
 
-`display_tool_result` runs in `on_outcome` *after* the ledger insert in the same
-function, so the pairing for a multi-file call is a lookup: the per-file blocks
-and the per-file results are both in hand. `content::preview::multi_file_blobs`
-and `content::handle::multi_file_pairs` therefore lose their parse of the
-rendered blob.
+The ledger is the existing `EditAnchorLedger`, widened from
+`HashMap<String, EditResolutions>` to `HashMap<String, PreparedEdit>`: the
+canonical arrays, the blocks, the paired results, and the derived split ids. It
+stays in-run, host-only, and is never serialized.
 
-`on_dispatch` cannot ride `prepare` — it fires before execution, so there is no
-result to pair and nothing to minimize. It needs path relativization only, which
-is the argument-level `normalize` registry, not a second rule. A multi-file call
-still renders nothing there and waits for its result.
+`prepare_edit_call` with `resolutions = None, result = None` is the fallback for
+a call that never reached `on_outcome` (a skipped or denied call, or a turn
+rebuilt by `assistant_from_results`, whose arguments are `{}`). It still parses,
+relativizes and serializes, so the stored form stays canonical; it just cannot
+minimize or split. `prepare` uses it directly for such a call rather than
+touching the ledger.
 
-**What shrinks.** `split_multi_file_edit_calls`, `minimize_edit_tool_calls`,
-`blob_edit_tool_calls` and `minimized_edit_args` collapse into `prepare`'s edit
-arm; the `strip → blob → minimize → split` composition and its "if you change
-this order, also touch …" comments go. `edit_blocks::per_file_blocks` loses its
-in-crate production callers and becomes a `bsed`-facing helper. `split_id`'s
-determinism stops being a correctness requirement (one site mints the ids now)
-and stays only as a stable-id convention.
+### Display defers, live and replay identically
 
-`Session::canonicalize_edit_tool_calls` and `split_edit_tool_results` also go:
-after this change no production caller passes an `edit` call through the
-single-message `append_message` path, so `append_message` becomes a serializer
-like `append_messages` already documents itself to be. (`repair_tail_unanswered`
-stays — it is pairing repair, not argument rewriting.)
+`display_tool_call` returns early for `edit`, exactly as it does today for a
+multi-file call. `on_outcome` then paints the whole call in one go — label,
+diff, then result — from `display_tool_pair(name, args, result)`.
+
+Replay can call the same function: `AssistantSegment` already carries each
+call's arguments and its result together, so the live and replayed panels come
+from one renderer instead of two sequences that have to be kept in step. (The
+`replay.rs` module doc explicitly warns that a divergence there is invisible
+until two screens are compared; this removes the divergence rather than testing
+for it.)
+
+A single-file `edit` therefore no longer paints a label the instant it is
+dispatched. The one case that loses a panel is a call that never produces a
+result at all — denied, `<Esc>`, or a killed process — which now prints nothing
+where today it prints a label. Multi-file already behaves this way, replay still
+shows such a call from the stored session, and editing is fast enough that the
+delay is not perceptible.
+
+`on_dispatch` keeps its `normalize` call for every other tool (`bash`, `read`,
+`write`, `sed`, `grep`, and the retired `ls`/`find`/`mkdir`/`rm`/`mv`/`cp`); for
+`edit` it does nothing at all, so `get_preview`'s `canonicalize_edit_value` call
+can go. A raw blob the tool rejected is stored untouched; its panel falls back
+to the `path` argument (see *Fallbacks*).
 
 ## The registry
 
@@ -148,16 +174,16 @@ src/tool_args.rs                                   (renamed from src/bash_cmd.rs
     normalize(name, args: &mut Value, ctx: &PathContext) -> bool   // true if changed
     normalize_in_message(msg: &mut Message, ctx: &PathContext)      // assistant content walk
     normalize_messages(msgs: &mut [Message], ctx: &PathContext)
-    render_model_facing(msgs) -> Vec<Message>   // edit arrays -> block form
+    render_model_facing(msgs, ledger) -> Vec<Message>   // edit arrays -> block form
 ```
 
 - `bash` → `strip_cwd_prefix` on `command`;
 - `read` | `write` | `sed` | `grep` → `relativize` on `path`;
 - `ls` | `find` | `mkdir` | `rm` → `relativize` on `path` (retired tools: no new
-  calls, but replay normalizes them like the rest);
+  calls, but old sessions replay through the same walk);
 - `mv` | `cp` → `relativize` on `src` and `dst`;
-- `edit` → handled by `prepare` (see below); the arm here is a **no-op on the
-  block form** and is not used on any persisted path;
+- `edit` → not in this table: `prepare_edit_call` owns it, and the only egress
+  that sees raw `edit` arguments before it is `on_outcome`;
 - everything else → untouched.
 
 Adding a tool, or changing how one argument is spelled, is then a one-line edit
@@ -165,49 +191,38 @@ in one file, and every egress follows. `tool_args` deliberately does not know
 about `rig` *rendering*; `path_util` stays what it is: pure
 `std::path`/string helpers shared with the `bsed` binary, with no `rig` types.
 
-## `edit`: parse once, minimize per file, render once, emit blocks
+## Fallbacks
 
-The edit arm always **emits the block form**. A canonical array is one file by
-definition (`from_edits_array` refuses two paths in one array), so an array can
-never represent a multi-file call — and both display consumers read `blob_text`,
-which ignores an array entirely. Rendering per file and joining is the only shape
-that serves a single-file and a multi-file call alike, and it is exactly what
-today's `multi_file_blobs` input looks like. There is no `to_canonical_array`
-step in this arm.
-
-`minimized_edit_args` already minimizes **per file** — it iterates
-`parsed.files`, looks each up in `resolutions.files` by path, and keeps an
-unresolved file's edits verbatim in a mixed call. So per-file minimization is not
-a mode to add; it is the existing rule, and it reads only the ledger. What it does
-badly is *render* at the end, so `split_edit_call_and_result` → `per_file_blocks`
-→ `parse_blocks` parses those bytes straight back. Keeping `FileEdit`s between the
-two steps removes that second parse:
-
-- `blocks` and `arrays` are computed once, from the same `Vec<FileEdit>`;
-- the split (N calls with `split_id` ids, paired with the N-entry result array)
-  happens here too, guarded by `N == per_file.len()`, so no caller can skip the
-  guard by reordering;
-- a call whose arguments do not parse is stored and shown untouched — the tool's
-  own error is the right answer, and rewriting a broken blob could contradict it
-  for the only reader that wrote it. Nothing patches header lines textually.
-
-Redundant per-entry `edits[i].path` fields collapse into the call path in the
-array form, which is canonical *and* shorter. The paths on the wire to
-`edit_files_with` are unaffected: normalization happens after execution.
-
-### Fallback: a call with no ledger entry
-
-Two cases reach the history walk without a `PreparedEdit`: a call from a *prior*
-session (the ledger is per-run), and a call that failed so hard that `on_outcome`
-never recorded it. Both fall back to the same function with `resolutions = None`,
-so still one parse and one render:
+**Model-facing history.** The ledger is per-run, so a call from a *prior* session
+has no entry. `render_model_facing` handles it without a second parse:
 
 - a stored canonical array → `array_to_blob_value`, **render only**, no parse;
   the stored paths are already relative, so this is a pure format change;
-- a raw blob → `from_wire` → `relativize` → `render_blob` (minimization is
-  identity without a ledger entry, as today).
+- a raw blob (a call the tool rejected, stored untouched) → `from_wire` →
+  `relativize` → `render_blob`. Minimization is identity without resolutions, so
+  this is the same function with the optional inputs absent.
+
+**Display.** A stored single-file call renders from its array as today. A stored
+raw blob renders its label from the `path` argument and shows no diff — the
+existing "malformed, no edits" behaviour, which is the honest rendering.
 
 Nothing here is applied to what is stored: replay reads the session as written.
+
+## What shrinks
+
+`split_multi_file_edit_calls`, `minimize_edit_tool_calls`,
+`blob_edit_tool_calls`, `minimized_edit_args`, `split_edit_call_and_result` and
+the `strip → blob → minimize → split` composition collapse into
+`prepare_edit_call` plus a ledger lookup. The "if you change this order, also
+touch …" comments go with them, and `split_id`'s determinism downgrades from a
+correctness requirement to a stable-id convention, because one site mints the
+ids now.
+
+`Session::canonicalize_edit_tool_calls` and `split_edit_tool_results` also go:
+after this change no production caller passes an `edit` call through the
+single-message `append_message` path, so `append_message` becomes a serializer,
+as `append_messages` already documents itself to be. (`repair_tail_unanswered`
+stays — it is pairing repair, not argument rewriting.)
 
 ## Results
 
@@ -246,47 +261,45 @@ The tool already relativizes what it reports (`src/tools.rs`: `write`, `edit`,
   the checkout location changed. A session resumed in an unrelated project /
   repository normally does not have access to the original locations due to
   sandboxing, so absolute paths would not help anyway.
-- **One producer, more coupling to `prepare`.** Prepare now owns minimization,
-  splitting and rendering for `edit`, so a change to the model-facing form is a
-  change there. That is the intent — the coupling used to be distributed across
-  four transforms with comments asking the reader to keep them in step — but it
-  means `prepare` needs the `PathContext`, which is rebuilt per call.
-- **Display parses at dispatch.** `on_dispatch` still renders a single-file
-  `edit` from its arguments, so `get_preview` keeps its
-  `canonicalize_edit_value` call. One blob parse on the display path is
-  unavoidable pre-execution; the doc's "one render" claim is about the
-  model-facing and stored forms, not the live panel.
-- **Ledger lifetime.** The ledger now holds rendered blocks for every `edit`
-  call in the run, not just line numbers. It is still host-only and dropped at
-  run end, but it grows with the run's edit volume rather than its call count.
+- **A deferred panel hides a non-executing call.** A denied or interrupted
+  `edit` paints nothing (see *Display defers*). Accepted: multi-file already
+  behaves so, editing is fast, and the stored session still shows the call.
+- **One producer, later in the run.** `on_outcome` now owns parse, minimize,
+  split, relativize and render for `edit`, so a change to the model-facing form
+  is a change there — which is the point, but it means the ledger must be
+  populated before `prepare` and before `on_completion_call` read it. That holds
+  today: `on_outcome` precedes both.
+- **Ledger lifetime.** It now holds arrays, blocks and results per `edit` call,
+  not just line numbers. Still host-only and dropped at run end, but it grows
+  with the run's edit volume.
 
 ## Test plan
 
 - `bsed_blockedit::path`: no `./` for a child, `.` for cwd, sibling/absolute
   untouched, `-prefixed` child keeps `./`.
 - `bsed_blockedit::wire`: `path:LINE` round trip through `from_wire` →
-  `render_blob` (moved/extended from the old anchor-wrapper test).
+  `render_blob`.
 - `tool_args::normalize`: one call per tool name rewritten; idempotent on a
-  second pass; a non-path argument left byte-identical; `~` with the sandbox
-  home expanded-then-relativized, and kept as `~` when the target is outside
-  cwd; a `-prefixed` child relativized with `./`.
-- `prepare` edit arm: single file; multi-file with a matching result array
+  second pass; a non-path argument left byte-identical; `~` under cwd
+  relativized and `~` outside cwd left as `~` (both via the sandbox home); a
+  `-prefixed` child relativized with `./`.
+- `prepare_edit_call`: single file; multi-file with a matching result array
   (splits, ids pair, each result rides its own call); multi-file with a
-  mismatched or unparsable result (one call, joined blocks, result untouched); a
-  call with three files where only one resolved (the resolved file is minimized,
-  the other two keep their edits verbatim); unparsable blob untouched; `blocks`
-  and the canonical arrays describe the same `FileEdit`s; a call is byte-stable
-  across two passes.
+  mismatched or unparsable result (one call, joined, result untouched); a call
+  with three files where only one resolved (that file minimized, the others
+  verbatim); unparsable blob untouched; arrays and blocks describe the same
+  `FileEdit`s; byte-stable across two passes.
 - history: the model-facing call is a block whose headers carry relative paths,
   for both a single- and a formerly multi-file call; a stored array renders to
   the same block without re-minimizing; a call with no ledger entry still
   relativizes.
 - persist: the stored entry is the canonical array with relative paths, and its
-  file list equals the history call's file list for the same turn.
-- display: `get_preview` over normalized args renders `read src/x.rs`; a
-  multi-file call's panel comes from the ledger, byte-identical to N single-file
-  pairs.
+  file list equals the display pair's for the same turn.
+- display: a multi-file call renders N single-file panels from arrays,
+  byte-identical to N genuine single-file pairs; `get_preview` over normalized
+  args renders `read src/x.rs`; a rejected blob renders its label from `path`
+  with no diff.
 - fixtures still asserting `./`: `src/tools.rs:4714`, `src/agent/transcript.rs`
-  (result-note fixtures), `crates/bsed-blockedit/src/path.rs` tests, and
-  `src/content/handle.rs`'s `{"path":"./test.rs"}` — and
+  result-note fixtures, `crates/bsed-blockedit/src/path.rs` tests, and
+  `src/content/handle.rs`'s `{"path":"./test.rs"}` — plus
   `relativize_for_display`'s `strip_prefix("./")`, which becomes a no-op.
