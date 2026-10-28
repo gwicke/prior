@@ -29,8 +29,8 @@ use slashdot_tui::render::{pad_row, Element, RenderElement, Rendered, RowAsk};
 
 use crate::fields::ColumnDef;
 use crate::render::{
-    paint_detail, paint_header, paint_rows, visual_height, window_heights, LogicalLine, RenderPlan,
-    MARKER,
+    paint_detail, paint_header, paint_rows, visual_height, window_heights, LogicalLine,
+    PaintedSection, RenderPlan, MARKER,
 };
 use crate::view::{assemble_table, has_table_header, ViewRows};
 
@@ -107,6 +107,31 @@ pub(crate) fn window_keeps(heights: &[usize], focus: usize, budget: usize) -> (u
 struct Selection {
     selected: Option<usize>,
     detail: Vec<LogicalLine>,
+    /// Cached painted detail section, invalidated when `detail` changes or
+    /// the terminal width changes (a line wider than the terminal splits).
+    painted_detail: Option<PaintedSection>,
+    /// The terminal width `painted_detail` was computed at.
+    painted_at: Option<usize>,
+}
+
+impl Selection {
+    /// Returns the painted detail section for `width`, computing it if the
+    /// detail content or width has changed since last paint.
+    fn ensure_painted(&mut self, width: usize) -> &PaintedSection {
+        if self.painted_at != Some(width) {
+            self.painted_detail = Some(paint_detail(&self.detail, width));
+            self.painted_at = Some(width);
+        }
+        // Safe: `ensure_painted` always populates the cache before returning
+        self.painted_detail.as_ref().unwrap()
+    }
+
+    /// Replace detail and clear paint cache.
+    fn set_detail(&mut self, detail: Vec<LogicalLine>) {
+        self.detail = detail;
+        self.painted_detail = None;
+        self.painted_at = None;
+    }
 }
 
 // --- the three section elements ----------------------------------------------
@@ -125,32 +150,33 @@ struct DetailItem {
 
 impl RenderElement for DetailItem {
     fn height(&self, width: usize) -> RowAsk {
-        // Painted at this width to measure: a line wider than the terminal
-        // splits, and the ask is the rows it actually occupies here.
-        let sel = self.selection.lock().unwrap();
-        RowAsk::fixed(0, paint_detail(&sel.detail, width).height())
+        let mut sel = self.selection.lock().unwrap();
+        RowAsk::fixed(0, sel.ensure_painted(width).height())
     }
 
     fn render(&self, h: usize, w: usize) -> Rendered {
         if h == 0 {
             return Rendered::default();
         }
-        let section = {
-            let sel = self.selection.lock().unwrap();
-            paint_detail(&sel.detail, w)
-        };
-        // Whole logical lines only: a line's painted sub-rows are kept or
-        // dropped together, so the cut never lands inside one.
-        let mut used = 0usize;
-        let mut end = 0usize;
-        for &height in &section.heights {
-            if used + height > h {
-                break;
+        // Compute window while holding the lock; clone only what we need.
+        let (_, rows) = {
+            let mut sel = self.selection.lock().unwrap();
+            let section = sel.ensure_painted(w);
+            let mut used = 0usize;
+            let mut end = 0usize;
+            for &height in &section.heights {
+                if used + height > h {
+                    break;
+                }
+                used += height;
+                end += height;
             }
-            used += height;
-            end += height;
-        }
-        let rows = section.rows[..end].iter().map(|r| pad_row(r, w)).collect();
+            (
+                section.heights[..end].to_vec(),
+                section.rows[..end].to_vec(),
+            )
+        };
+        let rows = rows.into_iter().map(|r| pad_row(&r, w)).collect();
         Rendered { rows, caret: None }
     }
 }
@@ -449,7 +475,7 @@ impl ElementSet {
         if self.same_panel(plan) {
             let mut sel = self.selection.lock().unwrap();
             sel.selected = plan.selected;
-            sel.detail = plan.detail.clone();
+            sel.set_detail(plan.detail.clone());
             drop(sel);
             self.plan = plan.clone();
             Update::Moved
@@ -510,6 +536,8 @@ impl RenderPlan {
         let selection = Arc::new(Mutex::new(Selection {
             selected: self.selected,
             detail: self.detail.clone(),
+            painted_detail: None,
+            painted_at: None,
         }));
         let mut els = Vec::with_capacity(3);
         let had_detail = !self.detail.is_empty();

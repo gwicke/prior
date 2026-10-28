@@ -37,7 +37,7 @@ and link a doc/ and/or commit hash
 
 ## Width / wrapping
 
-- [ ] `DetailItem::height` paints the detail section just to count rows, then `render` paints it
+- [x] `DetailItem::height` paints the detail section just to count rows, then `render` paints it
       again — split once and share (cheap since `split_to_width` is borrowed now).
 
 ## Token efficiency
