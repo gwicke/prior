@@ -1,7 +1,8 @@
 # Driving rig's `AgentRun` directly
 
-*Status: design. Supersedes the retry half of `doc/261026_rig_steering.md` and of
-`doc/tool_error_handling.md` §"Mid-turn failure & resume".*
+*Status: design, ready for implementation. Supersedes the retry half of `doc/261026_rig_steering.md`
+and of `doc/tool_error_handling.md` §"Mid-turn failure & resume". Mechanics:
+[`261030_rig_direct_drive_impl.md`](261030_rig_direct_drive_impl.md).*
 
 ## Why
 
@@ -30,37 +31,12 @@ run and drives it.
 
 ## What rig already exposes (no fork needed)
 
-Verified against `rig-agent` 0.45.0. This is the whole dependency surface.
-
-- `AgentRun` — `next_step`, `model_response`, `streamed_turn`, `record_streamed_completion_call`,
-  `resolve_streamed_invalid_tool_call`, `ignore_streamed_invalid_tool_call`,
-  `pending_invalid_tool_call`, `malformed_context`, `answer`, `answer_all`, `advertise_tools`,
-  `append_entry`, `entries_of`, `retry_model_turn`, `accepted_turn_choice`, `messages`,
-  `projection_start`, `usage`, `canonical_history`, `is_done`, `response`.
-  `Serialize + Deserialize`, so a run survives an interruption, a process restart or a crash.
-- `Aside` / `Author` — host records carried by the run, serialized with it and
-  **excluded from provider requests**. Exactly the slot a mid-turn steer needs (§5).
-- `StreamedTurnAssembler` / `StreamedTurnEvent` / `StreamedTurn` / `StreamedInvalidToolCall` —
-  `run/streamed.rs`, all public. `StreamedTurn`'s fields are public and it has no constructor, which
-  is the hook the projection uses to render a turn it owns (§4).
-- `prepare_request(spec, capabilities, history, tools, committed_output_tool, patch)` →
-  `PreparedRequest` → `apply(CompletionRequest)`. Pure, public, and already the single place request
-  bytes are decided.
-- `RunSpec`, `RequestPatch`, `TurnPolicy`, `InvalidToolCallAction`, `UnhandledInvalidToolCall`,
-  `AgentRunStep`, `PendingToolCall`.
-- `ModelHandle::{stream, call, capabilities, label}`; `Handlers::dispatch`, `dispatch_stream`,
-  `bind`, `handle`.
-- `ToolServerHandle::{snapshot, snapshot_with_dynamic}`, `ToolCatalog::get`,
-  `RegisteredTool::execute(args, &mut ToolContext) -> ToolResult` — tool execution without the
-  engine, including the published-context slot prior's `edit` relies on.
-- `Agent::{run_spec, tool_server_handle, model_key, model_label, handlers, name}`.
-
-Two gaps worth naming, both harmless:
-
-- `HookContext::new` is `pub(crate)`, so a foreign driver cannot mint one. We drop rig's `AgentHook`
-  entirely (see §2) rather than work around it.
-- `Handlers::serve`/`serve_stream` are `pub(crate)`. Tool dispatch goes through
-  `RegisteredTool::execute`, which means no rig effect ids and no recording. prior uses neither.
+Everything needed is public in `rig-agent` 0.45.0: `AgentRun` (the whole step protocol, plus
+`Serialize`), `StreamedTurnAssembler`/`StreamedTurn`, `prepare_request`/`RequestPatch`,
+`RegisteredTool::execute`, `Aside` for host records, and `IntoToolOutput` (blanket over
+`Serialize`), so a tool can return a parts list with no trait work. The itemised surface, and the
+two `pub(crate)` gaps we route around, are in
+[`261030_rig_direct_drive_impl.md`](261030_rig_direct_drive_impl.md).
 
 ## Design
 
@@ -75,6 +51,8 @@ two.
 `src/agent/drive.rs` replaces `agent.prompt(..).stream()`:
 
 ```text
+// `prior_history.len()` is the parts/verbatim boundary: everything at or
+// above it was appended by this loop and may carry a parts list (§4).
 run = AgentRun::from_spec(spec, Message::user(input), Some(prior_history))
 loop {
     persist_delta(&run)                       // §3, project then append
@@ -91,10 +69,15 @@ loop {
             run.streamed_turn(turn)?;          // the model's own call shapes, unmodified
         }
         CallTools { calls } => {
-            for call in calls { /* sequential; observer paints; cancel check */ }
-            // an answer's output may be a `prior_call_envelope`; the run keeps
-            // it verbatim, and pass 1 unpacks it at the next egress (§4)
-            run.answer_all(answers)?;
+            for call in calls {
+                // sequential; observer paints; cancel check
+                let out = execute(call);          // may be a parts list (§4)
+                persist_answer(&call, &out);      // §3: the boundary inside a batch
+                run.answer(ToolAnswer::executed(call, out))?;
+            }
+            // The run still commits the batch as one message on the last
+            // answer; `persist_answer` is what makes an interrupted batch
+            // survive (idempotent per call id, §3).
         }
         Done(response) => break Ok(response),
     }
@@ -127,133 +110,73 @@ check between tool calls. The three hook-side `user_cancel` checks disappear.
 
 ### 3. Persistence becomes a cursor
 
-The canonical history is `run.messages()`, append-only, provider-exact, with every tool batch
-committed as one user message and every accepted turn already in it. So:
+The canonical history is `run.messages()`, append-only, provider-exact, with every accepted turn
+already in it and every tool batch committed as one user message. So:
 
 - keep `cursor` (seeded from `run.projection_start()`);
-- persist `run.messages()[cursor..]` whenever the committed tail is a complete prefix — no assistant
-  turn with unanswered calls;
-- advance `cursor`.
+- persist `project(&run.messages()[cursor..])` and advance `cursor`.
 
 That is the whole of persistence. `TurnTranscript`, `LiveUnit`, `LivePart`, `prepare`, `assemble`,
 `RunState::Ongoing|Ended`, `assistant_from_results` and the "did the reassembly survive" question
-all go away. The two boundaries it covers are exactly today's: start of a completion call, and after
-a tool batch.
+all go away.
 
-The persisted slice is `project(&run.messages()[cursor..])`, not the raw slice — see §4. The cursor
-indexes raw messages; the projection changes shape and count, and is stable once the batch that
-produced the resolutions is answered, which is the only state a persist boundary can observe.
+**Bounds.** The projection changes shape and count, so the cursor indexes *raw* messages while the
+written form is projected. Bounds are only ever chosen where the committed tail is a complete prefix
+— every assistant turn's calls answered — which is the only state that can be observed at a boundary
+and the only one whose projection is stable.
 
-What does *not* change: session storage, `repair_pairing` on load, the pi JSONL format, entry ids
-and batch seeds. Those live behind `Session::append_messages` and stay.
+**Granularity: per answer, not per batch.** `answer_all` is all-or-none — the run commits the batch
+as one user message only once every call is answered — so a cursor over `run.messages()` alone would
+lose every result of a batch interrupted midway. `AgentRun::answer` (the single-answer form of the
+same call) does not lift that: the batch still commits at completion.
 
-### 4. One projection, no ingest phase
+So the persist boundary inside a batch is not the run's history but the answers themselves: the loop
+records each result as it lands, and the batch's committed message confirms rather than originates
+them. Persist must therefore be idempotent per `(call id)`, so an answer written early and again
+from the committed batch is a no-op rather than a duplicate. This is what makes a partially-answered
+batch valid at every moment:
 
-The run stores *what the model sent and what the tools returned*. The projection (`project`) turns
-that into provider and store shapes, and it makes exactly **one** decision per tool call: whether
-the call was replaced by an envelope of parts. Everything else about a call it takes verbatim.
+- **write path** — a user abort between answers leaves a trailing assistant turn with unanswered
+  calls. The write path closes it with "did not execute" results before appending, which is today's
+  `repair_tail_unanswered` moved to where the decision is made.
+- **read path** — a process crash cannot be repaired at write time, so load must do the same repair.
+  It already does (`repair_pairing` on load); this keeps that as the safety net rather than the only
+  mechanism.
 
-This is possible because rig never sends anything itself. The driver hands `prepare_request` the
-history it chooses, which is what `render_model_facing` already does inside `on_completion_call`
-today. The run's history is the record; the projection is the wire.
+A partially-answered batch is therefore valid at every moment: the store holds the answers written
+so far plus, after a repair, synthetic "did not execute" results for the rest, and the run holds the
+truth. The cost is one extra idempotency key on the write path (`call id`), which
+`Session::append_messages`' seed-based dedup already provides in spirit.
 
-What rig actually constrains (verified in `run/mod.rs`):
+What does *not* change: session storage, the pi JSONL format, entry ids and batch seeds. Those live
+behind `Session::append_messages` and stay.
 
-- `ToolAnswer` is unforgeable (private fields, plus `compile_fail` tests in `calls.rs`) and
-  `answer_all` validates each answer's `(turn, index, call id)` against the pending batch. A driver
-  cannot hand the run a finished call+result exchange; there is no public append.
-- `streamed_turn` rejects a call only when its **name** is not allowed by the turn's `TurnPolicy`.
-  Count and arguments are not inspected.
+### 4. A tool returns its own call shape
 
-So the assistant turn is frozen at `streamed_turn`, and shape changes are free either side of it —
-but nothing needing execution output can be part of the accepted turn. That leaves exactly one
-constraint on the design: a call's per-file shape must be decided *after* it runs.
+Every fact about how a call should be spelled is held by exactly one frame: the tool that ran it. It
+parsed the arguments, it knows how many files it was given, it knows where each edit landed, and it
+knows what each file's result was. So a tool returns not just a result but
+**the call as it understood it, plus that call's result** — once, or once per file.
 
-#### The call envelope
+That inverts the current arrangement. Today the tool returns text, and a separate pass later
+re-parses the call and the joined result to reconstruct a shape the tool already had in hand. With
+the tool returning the shape, no later pass has anything to reconstruct, and `project` makes exactly
+**one** decision per call: whether the result carries parts. Everything else it takes verbatim.
 
-A tool returns either what it returns today, or an envelope:
+Rig's protocol agrees with that, and its one hard limit says where the boundary is. `ToolAnswer` is
+unforgeable (private fields, plus `compile_fail` tests in `calls.rs`), and `answer_all` validates
+each answer's `(turn, index, call id)` against the pending batch — so a driver cannot hand the run a
+finished call+result exchange, and there is no public append. But `streamed_turn` rejects a call
+only when its **name** is not allowed by the turn's `TurnPolicy`; count and arguments are not
+inspected.
 
-```json
-{
-  "prior_call_envelope": {
-    "parts": [
-      { "args": { "path": "a.rs", "edits": [ … ] }, "result": "…", "is_error": false },
-      { "args": { "path": "b.rs", "edits": [ … ] }, "result": "…", "is_error": true }
-    ]
-  }
-}
-```
+So the assistant turn is frozen at `streamed_turn` and shape changes are free either side of it, but
+nothing needing execution output can be part of the accepted turn. That leaves one constraint: a
+call's final shape must be decided *after* it runs.
 
-`IntoToolOutput` is blanket-implemented for `T: Serialize`, so a tool opts in by declaring
-`type Output = EditBatch` (or by returning the JSON value directly) and nothing else changes. A tool
-that returns text is untouched, and the reserved key is absent, so the unpack is a no-op.
-
-The projection replaces the original call and result with `parts.len()` call/result pairs:
-
-- **ids are minted by the framework**, not carried in parts: `split_id(orig, i, n)` per index, so
-  `i == 0` keeps the id the provider issued (some providers require it answered within its turn).
-  That rule stays in one place instead of becoming a convention each tool can get wrong.
-- **`is_error` is per part**, so "one of five files failed" is expressible while the call itself
-  succeeded. The execution's own disposition still drives telemetry and the fail-closed paths; the
-  parts are the model's record. Two audiences, two records.
-- **pairing is structural.** Today `paired_results` parses the joined result text and refuses the
-  split unless `parsed.len() == n`; with parts carrying their own results, a dangling half is
-  unrepresentable. `n == 1` collapses to the single call, so the common case is the same code path.
-
-**The one invariant to defend:** an envelope must never reach a provider. Both egresses — persist
-and request — go through `project`, and a test asserts the reserved key never appears in either.
-Restore is safe by construction: the stored form is already unpacked, so there is nothing left to
-recognise.
-
-#### Three passes, three jobs
-
-The bytes the model sees are built by three functions with disjoint responsibilities. Pass 1 runs at
-both egresses; pass 2 runs only when building a request:
-
-1. **`project`** — unpack envelopes, splice anchored steers. Structural only: no tool names, no
-   `bsed` knowledge, no rendering. `Message`-level, pure.
-2. **`edit` block rendering** — array form → the model's `blocks` form. Stays exactly where it is
-   today, in the completion-call callback beside reasoning-strip and argument normalisation, because
-   that is the pipeline that builds a *request* rather than a *record*. Persistence takes the array
-   form (pi's canonical), the wire takes blocks.
-3. **steer/override assembly** — the `RequestPatch`, §5.
-
-Splitting the passes this way means `project` never has to know that `edit` is special, and the
-block pass never has to know that splitting happened — it sees N single-file arrays either way.
-
-#### Where the `edit` parse happens
-
-Once, in the tool. `EditArgs` implements `Deserialize` via `from_wire`, so `RegisteredTool::execute`
-→ `EditFile::call` receives parsed `FileEdit`s; execution needs them to apply the edits, so the
-parse cannot move earlier, and re-deriving them per projection would parse the whole history on
-every request.
-
-Minimisation also stays in the tool, and this is the reason the envelope earns its keep: the compact
-anchored form needs the line each edit *landed* on (`matched_lines`), which only execution knows. So
-the tool builds already-minimised arrays and puts them in the envelope. That deletes
-`EditResolutions` (it existed only to carry placements to a later frame) and `EditLedger` (it
-existed only to let three readers agree on one prepared form), and with them `prepared-form` caching
-and the shared mutex.
-
-What does *not* cross the boundary, and should not: paths (already relativised when the call was
-persisted), splitting (derivable from `args`), and per-file results (already in the parts).
-
-**Idempotence, and why it now holds by construction:** history loaded from a session is already
-projected output, fed back in as `from_spec`'s history, so `project` runs over its own past results.
-
-- **no envelope** in a loaded call → unpack is a no-op, which is the normal answer;
-- **already-split** stored calls are single-file arrays, so there is nothing to split again;
-- **already-minimised** arrays carry their own anchors, so there is nothing to minimise again;
-- **blocks → array** is not `project`'s job at all (pass 2 owns it), so `project` cannot fight it;
-- **steer splice** is keyed on aside entries already consumed.
-
-This is stronger than the old three-reader arrangement: the ledger is gone, so there is no cache
-that could be stale relative to the stored form — the stored form *is* the projected form.
-
-**Generalising it:** the envelope is generic from the start, not an `edit` hook. Any tool whose one
-call is really several may return parts, and `project` never learns which tool that was. `edit` is
-simply the first and today the only user. A tool cannot mint *identities* — the framework does that
-— but it does mint its own parts, which is the whole point.
+The mechanics — the `CallPart` shape, how a parts list is recognised without a marker, the pass-2
+render, and the per-tool checklist with its deletions — are in
+[`261030_rig_direct_drive_impl.md`](261030_rig_direct_drive_impl.md).
 
 ### 5. Retry becomes resume, steering becomes projection content
 
@@ -277,13 +200,11 @@ Mid-turn steering is the *same* projection as §4 (its steer-splice half), which
 mechanism of its own:
 
 - a `SteeringQueue` on `CodeAgent` collects queued `Message::user` steers from the UI thread;
-- the run already has the right slot for one: `AgentRun::append_entry(Aside)` takes a host record
-  with `kind`, `author`, a verbatim JSON `value`, and an `after: Option<MessageId>` anchor. Asides
-  are serialized with the run and **excluded from provider requests**, so recording a steer as
-  `kind: "prior.steer"`, `author: Author::user()`, `value: <the Message>`,
-  `after: <the last message id>` costs nothing until we choose to send it, and survives a restart.
-  The projection reads `run.entries_of("prior.steer")` and splices them in, so persist and the wire
-  show the steer at the same position, once;
+- a steer is recorded on the run as an `Aside` (`append_entry`): `kind: "prior.steer"`,
+  `author: Author::user()`, `value: <the Message>`, `after: <the last message id>`. Asides are
+  serialized with the run and **excluded from provider requests**, so it costs nothing until we
+  choose to send it, and survives a restart. `project` splices them in, so persist and the wire show
+  the steer at the same position, once;
 - that closes the `RequestPatch::history` caveat in `doc/pi_steering_rig.md` §3.1 (a per-request
   patch is forgotten by the next turn) *without* a `history` patch: the steer enters the session
   through persist and comes back through the next turn's history, so nothing has to remember it a
@@ -303,15 +224,17 @@ One position, one function: the transcript and the wire cannot disagree about wh
 - `src/agent/drive.rs` — the loop above.
 - `src/agent/observe.rs` — `TurnObserver` (display, `--log-messages`, cancel, steering drain).
   Absorbs today's `LoggingHook` and most of `turn.rs`.
-- `src/agent/project.rs` — **the** projection: envelope unpack and steer splice, nothing else. Pure
+- `src/agent/project.rs` — **the** projection: parts unpack and steer splice, nothing else. Pure
   `(&[Message], &[Aside]) -> Vec<Message>`, called by persist and by request building.
-- `src/agent/wire.rs` — pass 2: reasoning strip, argument normalise, `edit` array → blocks. The
-  request-only shape, holding the one `edit` special case. Absorbs today's `render_model_facing`.
-- `src/agent/envelope.rs` — `prior_call_envelope` parse/emit, `CallPart`, and `split_id` minting.
-  The only module naming the reserved key.
-- `src/agent/persist.rs` — cursor over raw messages, projecting each delta.
-- `src/agent/transcript.rs` — shrinks to load-path repair; the ledger, `PreparedEdit` and
-  `prepare_edit_call` go.
+- `src/agent/parts.rs` — `CallPart`, the parts-list predicate, and `split_id` minting. The only
+  module that decides what a parts list looks like.
+- `src/agent/wire.rs` — pass 2: reasoning strip, then `edit` array → blocks. The request-only shape,
+  holding the one `edit` special case. Absorbs today's `render_model_facing`.
+- `src/agent/persist.rs` — cursor over raw messages, projecting each delta, per answer.
+- `src/agent/transcript.rs` — shrinks to load-path repair; the ledger, `PreparedEdit`,
+  `prepare_edit_call`, `paired_results` and the batch-shaping half go.
+- `src/tools.rs` — each tool returns `Vec<CallPart>`: `read`/`write`/`grep`/`sed` relativize `path`,
+  `bash` strips the `cd` prefix, `edit` parses → splits → minimises → relativizes.
 - `src/agent/turn.rs` — `prompt` becomes a thin wrapper over `drive`; `run_once` and the summarizers
   keep their signatures.
 
@@ -328,14 +251,18 @@ One position, one function: the transcript and the wire cannot disagree about wh
    `TurnPersistence`. `doc/tool_error_handling.md` §"Mid-turn failure" is retired with it.
 4. **Steering and boundary settings.** `SteeringQueue`, the projection's steer insertion and scalar
    overrides, the mid-turn UI entry points and `/reasoning`-style mid-turn commits.
-5. **`edit` returns an envelope.** `type Output = EditBatch`; it minimises with the anchors it
-   already has and emits parts. `project` unpacks; `wire.rs` renders blocks. Removal of
-   `shape_edits`, `PreparedEdit`, `prepare_edit_call`, `paired_results` and `EditLedger`, and of
-   `EditResolutions` once it has no reader. (Phase 2 can carry the old three-reader path behind the
-   projection temporarily; this phase deletes it.)
-6. **Cleanup.** Delete `HookContext` usage, the hook structs' rig impls, and update
-   `doc/261026_rig_steering.md` — its "Prior's Current Architecture Is Correct" section becomes the
-   opposite of the truth.
+5. **Tools return their own call shape.** `CallPart` and the parts-unpack in `project`, then the six
+   tools converted one at a time — safe incrementally only while `tool_args::normalize` still covers
+   the unconverted ones, which is why the impl notes order it with `edit` last and delete
+   `normalize` only at the end. The registry-completeness test lands with the deletion, since that
+   is when a missed tool starts storing absolute paths. `edit` gains parse → split → minimise →
+   relativize; the other five relativize or strip. Deletions: `shape_edits`, `PreparedEdit`,
+   `prepare_edit_call`, `paired_results`, `EditLedger`, `EditResolutions`, `tool_args::normalize`
+   and `normalize_messages`. `wire.rs` renders blocks.
+6. **Cleanup.** Delete `HookContext` usage and the hook structs' rig impls; update
+   `doc/261026_rig_steering.md` (its "Prior's Current Architecture Is Correct" section becomes the
+   opposite of the truth), `doc/tool_error_handling.md` and `doc/261026_tool_path_relativization.md`
+   (relativisation is now a tool-side property).
 
 Phases 1–3 are the payoff for the retry problem. 4 is the payoff for steering. 5 is the payoff for
 tool handling. Any of them can stop the project without leaving the tree worse, except that 2
@@ -354,11 +281,20 @@ commits us to maintaining the loop.
 - **A steer is recorded on the run, not in a side table.** `append_entry` exists for host records
   and excludes them from requests, so there is one durable place a steer lives and one function that
   decides when it becomes context.
-- **A tool may return call/result *parts*, not identities.** Its return value may carry a
-  `prior_call_envelope` whose parts the projection unpacks into N pairs; the ids are minted by the
-  framework (`split_id`) because the provider issued one id and that rule must live in one place.
-  Distinct from the run's own `ToolAnswer`, which stays unforgeable: a part never enters
-  `answer_all`.
+- **A tool returns its own call shape.** `Vec<CallPart>`, bare — no wrapper, no reserved key. The
+  projection unpacks it into N pairs; ids are minted by the framework (`split_id`) because the
+  provider issued one id and that rule must live in one place. Distinct from the run's own
+  `ToolAnswer`, which stays unforgeable: a part never enters `answer_all`.
+- **Normalisation is a tool property, not a pass.** Each tool relativizes the args it returns and
+  `bash` strips its own `cd` prefix. `tool_args::normalize` is deleted; replay needs no rewriting
+  because the stored form is already compact.
+- **`EditResolutions` has no reader once the tool formats its own results.** Delete it with
+  `EditLedger` rather than repurposing it.
+- **Answers persist as they land.** A batch's answers are independent calls, not a multi-file
+  transaction, so writing each as it completes loses nothing and a crash costs at most the answer in
+  flight. This needs `answer_all`'s all-or-none commit to be sidestepped (§3), and idempotent
+  per-call writes. Repair runs on both sides: the write path closes a trailing unanswered turn
+  before appending (user abort), the read path does the same on load (crash).
 
 *Open:*
 
@@ -370,12 +306,9 @@ commits us to maintaining the loop.
 3. **Retrieval.** `ToolServerHandle::retrieval_effects` is not ported. prior registers no retrieval
    index; if the tool set ever gains one, the dispatch belongs in `before_call` beside
    `prepare_request`.
-4. **Does `edit` still need `EditResolutions`?** Once the envelope carries minimised arrays, the
-   only remaining reader would be nothing — phase 5 should confirm and delete it. If some path still
-   wants the resolved placements (a replay that re-minimises?), keep them in the envelope instead of
-   the context.
-5. **Partial-batch persist.** A tool batch is one user message in the run, so a crash mid-batch
-   persists nothing for that batch and the results are lost on restart. Today's
-   `repair_tail_unanswered` writes "did not execute" placeholders instead. Keep that as a load-time
-   repair, or persist answers as they land (which the projection can do, at the cost of writing a
-   message the run has not yet committed)?
+4. **Parts-shape false positives.** The predicate is shape-based and runs only above the prior
+   history boundary. If a tool ever needs to return a genuinely part-shaped array as data, that is
+   the moment to reintroduce a marker key. Reversible in one place (`src/agent/parts.rs`).
+5. **Display and parts.** The `edit` panel paints from the same parts the model sees. Worth
+   confirming during phase 5 that no per-file panel detail (a skipped file, an unchanged one) was
+   only ever carried by `PreparedEdit` and needs to become a part field.

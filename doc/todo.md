@@ -3,6 +3,9 @@
 NOTE: Keep things tight - normally no more than 1-2 lines per bullet point. More detail -> create
 and link a doc/ and/or commit hash
 
+- [ ] Drive rig's `AgentRun` directly: own the loop, persist from `run.messages()`, retry by
+      re-issuing `next_step`, steers as asides, tools returning their own `Vec<CallPart>`.
+      Plan: doc/261030_rig_direct_drive.md (6 phases; 1-3 kill the `"continue"` injection).
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing `egress::host_allowed`;
       `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https; HTTP-only clients now come
       through R3i's front end instead).

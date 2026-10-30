@@ -1,5 +1,10 @@
 # Turn Error Handling & Auto-Retry (Design)
 
+> **Superseded in part.** [`261030_rig_direct_drive.md`](261030_rig_direct_drive.md) keeps the run
+> in hand, so a retry re-issues `next_step` instead of injecting a `"continue"` prompt. The
+> "Mid-turn failure & resume" analysis and the requirements resting on it are retired; the
+> tool-error classification tables still stand.
+
 *Status: design + implementation. Cross-checked against the pinned rig
 checkout (`gwicke/rig` rev `1c2f4405`, `rig-agent`/`rig-run`/`rig-core` 0.42)
 — see `Cargo.toml`. Line numbers below refer to `src/agent.rs` /

@@ -1,5 +1,9 @@
 # rig Steering / Injection Mechanism
 
+> **Superseded in part.** [`261030_rig_direct_drive.md`](261030_rig_direct_drive.md) drives the run
+> directly, so a mid-turn steer is an `Aside` on the run spliced by the projection — not a
+> `RequestPatch::history`, whose per-turn lifetime is the caveat §3.1 records.
+
 ## Overview
 
 rig 0.45 provides steering and context injection through the **`AgentHook`** trait in
