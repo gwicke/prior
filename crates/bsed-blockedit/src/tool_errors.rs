@@ -90,7 +90,7 @@ mod tests {
     fn leaves_other_messages_untouched() {
         for msg in [
             "the tool failed",
-            "Replaced 1 block(s) in src/x.rs",
+            "Replaced 1 block(s)",
             "no lines matched",
             // A message that merely *contains* a prefix, not at the front.
             "error: failed to parse tool arguments: was not ours to strip",

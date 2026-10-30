@@ -1264,7 +1264,7 @@ mod tests {
         let files = vec![
             FileResult {
                 path: "src/a.rs".into(),
-                result: serde_json::json!("Replaced 1 block(s) in ./a.rs"),
+                result: serde_json::json!("Replaced 1 block(s)"),
             },
             FileResult {
                 path: "src/b.rs".into(),
@@ -1277,10 +1277,7 @@ mod tests {
         assert_eq!(v.as_array().unwrap().len(), 2);
         assert!(v.get("ui_view").is_none(), "no aggregate view: {out}");
         // Each per-file result is the existing shape, verbatim.
-        assert_eq!(
-            v[0]["result"],
-            serde_json::json!("Replaced 1 block(s) in ./a.rs")
-        );
+        assert_eq!(v[0]["result"], serde_json::json!("Replaced 1 block(s)"));
         assert_eq!(v[1]["result"]["ui_view"], "edit failed: x");
         // Round-trips.
         assert_eq!(parse_file_results(&out).unwrap(), files);
@@ -1295,7 +1292,7 @@ mod tests {
         // An empty array is not a report.
         assert!(parse_file_results("[]").is_none());
         // Non-JSON.
-        assert!(parse_file_results("Replaced 1 block(s) in ./a.rs").is_none());
+        assert!(parse_file_results("Replaced 1 block(s)").is_none());
     }
 
     #[test]

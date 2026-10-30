@@ -106,9 +106,9 @@ pub fn apply_to_text(text: &str, edits: &[EditOp]) -> ApplyOutcome {
 /// number that contradicts the visible call. Counting through the same
 /// transform is the only way to keep the two in sync; if the split rule changes,
 /// this message follows it for free.
-pub fn success_note(edits: &[EditOp], matched_lines: &[usize], shown: &str) -> String {
+pub fn success_note(edits: &[EditOp], matched_lines: &[usize], _shown: &str) -> String {
     let blocks = crate::minimize::split_and_minimize_ops(edits, matched_lines).len();
-    format!("Replaced {blocks} block(s) in {shown}")
+    format!("Replaced {blocks} block(s)")
 }
 
 /// Apply `edits` to the file at `path`, or write nothing and return the failure

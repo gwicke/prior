@@ -343,7 +343,7 @@ src/x.rs
 
     #[test]
     fn unrelated_messages_are_not_rendered() {
-        assert!(split_arg_error("Replaced 1 block(s) in src/x.rs").is_none());
+        assert!(split_arg_error("Replaced 1 block(s)").is_none());
         assert!(render_arg_error_table("Replaced 1 block(s)", 80).is_none());
     }
 }

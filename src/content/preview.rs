@@ -716,7 +716,7 @@ src/x.rs:9
     #[test]
     fn leaves_other_results_alone() {
         // Not a sed preview: the caller falls through to the generic renderer.
-        assert!(sed_preview_body("Replaced 1 block(s) in src/x.rs").is_none());
+        assert!(sed_preview_body("Replaced 1 block(s)").is_none());
         assert!(sed_preview_body("").is_none());
     }
 

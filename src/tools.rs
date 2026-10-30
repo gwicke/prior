@@ -4723,7 +4723,7 @@ mod edit_file_tests {
         .await
         .unwrap();
         assert!(
-            res.starts_with("Replaced 1 block(s) in a.txt"),
+            res.starts_with("Replaced 1 block(s)"),
             "expected relative path in success string, got: {res}",
         );
         // Defensive: the absolute tempdir path must not appear in the
