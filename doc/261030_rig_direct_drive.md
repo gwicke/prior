@@ -77,11 +77,12 @@ two.
 ```text
 run = AgentRun::from_spec(spec, Message::user(input), Some(prior_history))
 loop {
-    persist_delta(&run)                       // §3
+    persist_delta(&run)                       // §3, project then append
     match run.next_step()? {
         CallModel { prompt, history, turn } => {
-            let at_call = observer.before_call(&prompt, turn);     // §2: cancel, drain steers
-            let wire = project(&history, &resolutions, &at_call);   // §4, the only shaper
+            let at_call = observer.before_call(&prompt, turn);  // §2: cancel, drain steers
+            let unpacked = project(&history, &run.entries());    // §4 pass 1: unpack, splice
+            let wire = model_facing(unpacked, &at_call);         // §4 pass 2: strip, blocks
             let prepared = prepare_request(spec, caps, &wire, tools, .., at_call.patch.as_ref())?;
             let mut stream = model.stream(prepared.apply(CompletionRequest::new(prompt)));
             // per-item: paint, feed the assembler, resolve invalid calls
@@ -91,9 +92,9 @@ loop {
         }
         CallTools { calls } => {
             for call in calls { /* sequential; observer paints; cancel check */ }
+            // an answer's output may be a `prior_call_envelope`; the run keeps
+            // it verbatim, and pass 1 unpacks it at the next egress (§4)
             run.answer_all(answers)?;
-            // `EditResolutions` the executor published are what the
-            // projection minimises this batch's calls with (§4)
         }
         Done(response) => break Ok(response),
     }
@@ -148,9 +149,9 @@ and batch seeds. Those live behind `Session::append_messages` and stay.
 
 ### 4. One projection, no ingest phase
 
-The run stores *what the model sent and what the tools returned*. Every reshaping — split, minimise,
-relativize, reasoning strip, steer insertion — is **one function**, applied at the two egresses that
-need it: persist (§3) and the request built in §2.
+The run stores *what the model sent and what the tools returned*. The projection (`project`) turns
+that into provider and store shapes, and it makes exactly **one** decision per tool call: whether
+the call was replaced by an envelope of parts. Everything else about a call it takes verbatim.
 
 This is possible because rig never sends anything itself. The driver hands `prepare_request` the
 history it chooses, which is what `render_model_facing` already does inside `on_completion_call`
@@ -158,76 +159,101 @@ today. The run's history is the record; the projection is the wire.
 
 What rig actually constrains (verified in `run/mod.rs`):
 
-- [`ToolAnswer`] is unforgeable (private fields, plus `compile_fail` tests in `calls.rs`) and
+- `ToolAnswer` is unforgeable (private fields, plus `compile_fail` tests in `calls.rs`) and
   `answer_all` validates each answer's `(turn, index, call id)` against the pending batch. A driver
   cannot hand the run a finished call+result exchange; there is no public append.
 - `streamed_turn` rejects a call only when its **name** is not allowed by the turn's `TurnPolicy`.
   Count and arguments are not inspected.
 
 So the assistant turn is frozen at `streamed_turn`, and shape changes are free either side of it —
-but nothing needing execution output can be part of the accepted turn. Which means:
+but nothing needing execution output can be part of the accepted turn. That leaves exactly one
+constraint on the design: a call's per-file shape must be decided *after* it runs.
 
-- **the run keeps the model's own single multi-file `edit` call.** `next_step` yields one
-  `ExecCall`; `edit_files_with` already executes atomically per file and returns one array result.
-  No N-call batching in the loop, no joined result text to split, no derived-id agreement because
-  there is only ever one id;
-- the split to pi's one-call-per-file shape happens in the projection, on the assistant message and
-  the results message together, from what the tool published rather than from a re-parse — so the
-  two halves are paired by construction, not by a length check;
-- the only irreducible pre-accept work is the invalid-call path (name repair, ignored calls,
-  malformed arguments), where rig derives the batch from `choice` and asks the driver mid-stream.
+#### The call envelope
+
+A tool returns either what it returns today, or an envelope:
+
+```json
+{
+  "prior_call_envelope": {
+    "parts": [
+      { "args": { "path": "a.rs", "edits": [ … ] }, "result": "…", "is_error": false },
+      { "args": { "path": "b.rs", "edits": [ … ] }, "result": "…", "is_error": true }
+    ]
+  }
+}
+```
+
+`IntoToolOutput` is blanket-implemented for `T: Serialize`, so a tool opts in by declaring
+`type Output = EditBatch` (or by returning the JSON value directly) and nothing else changes. A tool
+that returns text is untouched, and the reserved key is absent, so the unpack is a no-op.
+
+The projection replaces the original call and result with `parts.len()` call/result pairs:
+
+- **ids are minted by the framework**, not carried in parts: `split_id(orig, i, n)` per index, so
+  `i == 0` keeps the id the provider issued (some providers require it answered within its turn).
+  That rule stays in one place instead of becoming a convention each tool can get wrong.
+- **`is_error` is per part**, so "one of five files failed" is expressible while the call itself
+  succeeded. The execution's own disposition still drives telemetry and the fail-closed paths; the
+  parts are the model's record. Two audiences, two records.
+- **pairing is structural.** Today `paired_results` parses the joined result text and refuses the
+  split unless `parsed.len() == n`; with parts carrying their own results, a dangling half is
+  unrepresentable. `n == 1` collapses to the single call, so the common case is the same code path.
+
+**The one invariant to defend:** an envelope must never reach a provider. Both egresses — persist
+and request — go through `project`, and a test asserts the reserved key never appears in either.
+Restore is safe by construction: the stored form is already unpacked, so there is nothing left to
+recognise.
+
+#### Three passes, three jobs
+
+The bytes the model sees are built by three functions with disjoint responsibilities, run in this
+order at both egresses:
+
+1. **`project`** — unpack envelopes, splice anchored steers. Structural only: no tool names, no
+   `bsed` knowledge, no rendering. `Message`-level, pure.
+2. **`edit` block rendering** — array form → the model's `blocks` form. Stays exactly where it is
+   today, in the completion-call callback beside reasoning-strip and argument normalisation, because
+   that is the pipeline that builds a *request* rather than a *record*. Persistence takes the array
+   form (pi's canonical), the wire takes blocks.
+3. **steer/override assembly** — the `RequestPatch`, §5.
+
+Splitting the passes this way means `project` never has to know that `edit` is special, and the
+block pass never has to know that splitting happened — it sees N single-file arrays either way.
 
 #### Where the `edit` parse happens
 
-Once, in the tool — not in the projection. `EditArgs` implements `Deserialize` via `from_wire`, so
-`RegisteredTool::execute` → `EditFile::call` receives parsed `FileEdit`s; execution needs them to
-apply the edits, so the parse cannot move earlier. If the projection re-derived that shape it would
-parse a second time, on every persist slice and — worse — over the whole history on every request.
+Once, in the tool. `EditArgs` implements `Deserialize` via `from_wire`, so `RegisteredTool::execute`
+→ `EditFile::call` receives parsed `FileEdit`s; execution needs them to apply the edits, so the
+parse cannot move earlier, and re-deriving them per projection would parse the whole history on
+every request.
 
-So the tool **publishes its projection inputs**: `ToolContext::insert_result` is already the channel
-(the loop reads `EditResolutions` from it today), and `edit` publishes, in file order, the canonical
-per-file arrays, the per-file block renderings, and the per-file result strings. Execution holds all
-of them: the parsed `FileEdit`s, the `matched_lines` minimisation anchors, the result array, and a
-`PathContext` for relativisation (today's `rel_path`).
+Minimisation also stays in the tool, and this is the reason the envelope earns its keep: the compact
+anchored form needs the line each edit *landed* on (`matched_lines`), which only execution knows. So
+the tool builds already-minimised arrays and puts them in the envelope. That deletes
+`EditResolutions` (it existed only to carry placements to a later frame) and `EditLedger` (it
+existed only to let three readers agree on one prepared form), and with them `prepared-form` caching
+and the shared mutex.
 
-The projection then *zips* three published lists with the result rather than re-parsing, and
-minimisation consumes the anchors without a ledger lookup, because the arrays were already built
-minimised. What remains is the historical case — a call loaded from a session, never executed this
-run — where there is nothing published and the projection must parse, and where a multi-file call
-whose result is not a per-file array of the same length still has to stay whole (the guard
-`paired_results` applies today). That is exactly `render_model_facing`'s existing fallback, and it
-is cheap and idempotent because the stored form is already the projected one.
+What does *not* cross the boundary, and should not: paths (already relativised when the call was
+persisted), splitting (derivable from `args`), and per-file results (already in the parts).
 
-If that fallback ever costs enough to memoise, the key cannot be `CallId` alone: rig documents that
-call ids may repeat across turns (`run/calls.rs`), so it must be `(CallId, message index)` or
-per-run only.
+**Idempotence, and why it now holds by construction:** history loaded from a session is already
+projected output, fed back in as `from_spec`'s history, so `project` runs over its own past results.
 
-Deleted by this: `shape_edits` as a separate conversation rewrite, `PreparedEdit`'s prepared-form
-cache (what the tool publishes *is* the prepared form, produced once at the only place that has the
-resolutions), the argument normalisation at three egresses, and the `EditLedger` mutex — a per-run
-map of published forms, filled by the executor, read by the projection, is all the state left.
+- **no envelope** in a loaded call → unpack is a no-op, which is the normal answer;
+- **already-split** stored calls are single-file arrays, so there is nothing to split again;
+- **already-minimised** arrays carry their own anchors, so there is nothing to minimise again;
+- **blocks → array** is not `project`'s job at all (pass 2 owns it), so `project` cannot fight it;
+- **steer splice** is keyed on aside entries already consumed.
 
-**The invariant that makes it safe:** the projection must be *idempotent*, because history loaded
-from a session is already projected output being fed back in as `from_spec`'s history. Each step
-satisfies this for a specific reason, and having one function is what makes it checkable in one
-place:
+This is stronger than the old three-reader arrangement: the ledger is gone, so there is no cache
+that could be stale relative to the stored form — the stored form *is* the projected form.
 
-- split — a stored per-file call is `{path, edits:[…]}`, which `EditArgs::from_wire` parses as *one*
-  file, so it does not split again; and a call with a published form is already split, so the live
-  path never re-enters the fallback;
-- minimise — an anchored edit's own anchor is its base, so a second pass is a no-op, and there is no
-  anchor to apply in the historical case at all;
-- relativize — a no-op on already-relative paths;
-- reasoning strip, steer splice — keyed on content, so a second pass finds nothing to change.
-
-This is the property `render_model_facing` documents today and that `shape_edits` relies on the
-ledger to uphold across three readers. One producer, one proof.
-
-**Generalising it, later:** the published-form channel is per-tool, not per-`edit`. Once the
-projection is a consumer of published forms, a second tool that wants its calls reshaped publishes
-them the same way and the projection stops naming tools. That is the honest end state; phase 5 can
-land it for `edit` alone and generalise only if a second user appears. A tool still cannot mint
-call/result pairs (§5), only describe how its own call is projected.
+**Generalising it:** the envelope is generic from the start, not an `edit` hook. Any tool whose one
+call is really several may return parts, and `project` never learns which tool that was. `edit` is
+simply the first and today the only user. A tool cannot mint *identities* — the framework does that
+— but it does mint its own parts, which is the whole point.
 
 ### 5. Retry becomes resume, steering becomes projection content
 
@@ -247,7 +273,8 @@ Corrective feedback (malformed tool-call JSON, a 429 hint, a truncation retry) i
 `RequestPatch::extra_context` documents rather than as prompt text: it steers the next request
 without entering the transcript.
 
-Mid-turn steering is the *same* projection as §4, which is why it needs no mechanism of its own:
+Mid-turn steering is the *same* projection as §4 (its steer-splice half), which is why it needs no
+mechanism of its own:
 
 - a `SteeringQueue` on `CodeAgent` collects queued `Message::user` steers from the UI thread;
 - the run already has the right slot for one: `AgentRun::append_entry(Aside)` takes a host record
@@ -276,12 +303,15 @@ One position, one function: the transcript and the wire cannot disagree about wh
 - `src/agent/drive.rs` — the loop above.
 - `src/agent/observe.rs` — `TurnObserver` (display, `--log-messages`, cancel, steering drain).
   Absorbs today's `LoggingHook` and most of `turn.rs`.
-- `src/agent/project.rs` — **the** projection: split, minimise, relativize, strip reasoning, splice
-  steer asides. Pure, over `(&[Message], &PublishedForms, &[Aside])`, called by persist and by
-  request building and by nothing else.
+- `src/agent/project.rs` — **the** projection: envelope unpack and steer splice, nothing else. Pure
+  `(&[Message], &[Aside]) -> Vec<Message>`, called by persist and by request building.
+- `src/agent/wire.rs` — pass 2: reasoning strip, argument normalise, `edit` array → blocks. The
+  request-only shape, holding the one `edit` special case. Absorbs today's `render_model_facing`.
+- `src/agent/envelope.rs` — `prior_call_envelope` parse/emit, `CallPart`, and `split_id` minting.
+  The only module naming the reserved key.
 - `src/agent/persist.rs` — cursor over raw messages, projecting each delta.
-- `src/agent/transcript.rs` — shrinks to the `CallId -> PublishedForm` map, the edit-arg fallback
-  parse, and load-path repair.
+- `src/agent/transcript.rs` — shrinks to load-path repair; the ledger, `PreparedEdit` and
+  `prepare_edit_call` go.
 - `src/agent/turn.rs` — `prompt` becomes a thin wrapper over `drive`; `run_once` and the summarizers
   keep their signatures.
 
@@ -298,10 +328,11 @@ One position, one function: the transcript and the wire cannot disagree about wh
    `TurnPersistence`. `doc/tool_error_handling.md` §"Mid-turn failure" is retired with it.
 4. **Steering and boundary settings.** `SteeringQueue`, the projection's steer insertion and scalar
    overrides, the mid-turn UI entry points and `/reasoning`-style mid-turn commits.
-5. **Projection takes over `edit`.** `edit` publishes its arrays/blocks/results to `ToolContext`;
-   the projection zips them and keeps the parse only as the historical fallback. Removal of
-   `shape_edits`, `PreparedEdit`'s cache and the `EditLedger` mutex. (Phase 2 can carry the old path
-   inside the projection temporarily; this phase deletes it.)
+5. **`edit` returns an envelope.** `type Output = EditBatch`; it minimises with the anchors it
+   already has and emits parts. `project` unpacks; `wire.rs` renders blocks. Removal of
+   `shape_edits`, `PreparedEdit`, `prepare_edit_call`, `paired_results` and `EditLedger`, and of
+   `EditResolutions` once it has no reader. (Phase 2 can carry the old three-reader path behind the
+   projection temporarily; this phase deletes it.)
 6. **Cleanup.** Delete `HookContext` usage, the hook structs' rig impls, and update
    `doc/261026_rig_steering.md` — its "Prior's Current Architecture Is Correct" section becomes the
    opposite of the truth.
@@ -323,10 +354,11 @@ commits us to maintaining the loop.
 - **A steer is recorded on the run, not in a side table.** `append_entry` exists for host records
   and excludes them from requests, so there is one durable place a steer lives and one function that
   decides when it becomes context.
-- **A tool may not mint call/result pairs.** rig's `ToolAnswer` is unforgeable and `answer_all`
-  validates identity, so an exchange can only come from rig's own `CallTools` step. A tool that
-  wants its calls reshaped publishes that as result context (the `EditResolutions` pattern), which
-  the projection reads.
+- **A tool may return call/result *parts*, not identities.** Its return value may carry a
+  `prior_call_envelope` whose parts the projection unpacks into N pairs; the ids are minted by the
+  framework (`split_id`) because the provider issued one id and that rule must live in one place.
+  Distinct from the run's own `ToolAnswer`, which stays unforgeable: a part never enters
+  `answer_all`.
 
 *Open:*
 
@@ -338,9 +370,10 @@ commits us to maintaining the loop.
 3. **Retrieval.** `ToolServerHandle::retrieval_effects` is not ported. prior registers no retrieval
    index; if the tool set ever gains one, the dispatch belongs in `before_call` beside
    `prepare_request`.
-4. **Tool-context projection hook.** Should the projection ask each tool how to render its own calls
-   (`tool_facing_context`), or keep the `edit` special case with a generic fallback? The former is
-   the honest end state; the latter is a smaller phase 5.
+4. **Does `edit` still need `EditResolutions`?** Once the envelope carries minimised arrays, the
+   only remaining reader would be nothing — phase 5 should confirm and delete it. If some path still
+   wants the resolved placements (a replay that re-minimises?), keep them in the envelope instead of
+   the context.
 5. **Partial-batch persist.** A tool batch is one user message in the run, so a crash mid-batch
    persists nothing for that batch and the results are lost on restart. Today's
    `repair_tail_unanswered` writes "did not execute" placeholders instead. Keep that as a load-time
