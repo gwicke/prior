@@ -207,8 +207,8 @@ recognise.
 
 #### Three passes, three jobs
 
-The bytes the model sees are built by three functions with disjoint responsibilities, run in this
-order at both egresses:
+The bytes the model sees are built by three functions with disjoint responsibilities. Pass 1 runs at
+both egresses; pass 2 runs only when building a request:
 
 1. **`project`** — unpack envelopes, splice anchored steers. Structural only: no tool names, no
    `bsed` knowledge, no rendering. `Message`-level, pure.
