@@ -59,7 +59,8 @@ depends on provider capability.
 2. If that text is non-empty, write it to the session immediately as an ordinary assistant message,
    holding a **hand-built** assistant turn (`stop: None`, §2).
 3. If the session's last message is not already the synthetic continuation, write one (§5). If it
-   is, keep it: **never append a second.**
+   is, keep it: **never append a second.** The text is a nudge and must not be empty; an empty
+   continuation is dropped by the encoder and silently becomes a prefill (§7).
 4. Rebuild: `AgentRun::from_spec(spec, last_message, Some(everything_before_it))`, taking both from
    the session's history. `call_model_step` treats the last message as the prompt, so whatever ends
    the session is the prompt and the rest is ordinary history. On the first retry that is
@@ -201,21 +202,68 @@ as a user message), which is what makes §3's rebuild see its own continuation a
   figure.
 - **A rebuilt run's `current_turn` resets**, hence the `max_turns` reduction in §3.
 
-## 7. Open questions
+## 7. Decisions and open questions
 
-1. **What should the continuation text say?** The minimum is a nudge to continue. It should not
-   restate the corrective feedback (that already rides `extra_context` via the retry hint) and must
-   not invite conversation — which is what the old `"continue"` did.
-2. **Should the partial's tool calls be recorded anywhere?** Dropped from the request (they have no
-   results), but a model that called a tool then failed may want to know it had. Leaning: drop, and
-   let the retried attempt re-issue.
-3. **Abort.** On a user abort there is no retry to splice into, but the partial must reach the
-   *next* turn's history — which works through the session once the loader gap in §5 is closed,
-   since `[assistant] [user]` needs no prefill. Worth an explicit test. Note the abort path writes
-   no continuation: the partial is the last message until the user says something.
-4. **Where does the write-time guard live?** Resolved in shape, open in placement: the rebuilt run's
-   log holds only the continuation (`projection_start() == 1`), so `Persister::new` skips it because
-   no cursor entry covers it — but that is a coincidence of rig's seeding, not a statement of
-   intent. The guard should say so explicitly (skip a synthetic continuation that already ends the
-   session) rather than depend on the cursor arithmetic, and it needs a test for the no-new-text
-   case.
+### Continuation text
+
+The text is a nudge to continue. It must not restate the corrective feedback (that already rides
+`extra_context` via the retry hint) and must not invite conversation — which is what the old
+`"continue"` did. Starting from `"continue"` is fine.
+
+**An empty continuation is not an option, and the reason is worth recording.** A `UserContent::Text`
+holding `""` passes `CompletionRequest::validate_message_content`, but the request adaptor drops it
+when it encodes the wire. Measured:
+
+```text
+""           -> 2 messages, last is the assistant turn
+" "          -> 2 messages, last is the assistant turn
+"continue"   -> 3 messages, last is a user message
+```
+
+So an empty (or whitespace-only) continuation does not mean "no instruction": it silently turns the
+request into a **prefill**, the shape §4 established is illegal on most providers. It would fail on
+deepseek and OpenAI while appearing to work on Anthropic, which is the worst combination. The
+continuation must carry text.
+
+### Partial tool calls
+
+Dropped. They have no results, and a call without a result is a genuine pairing violation
+(`OrphanToolCall`), unlike §2's replay rule. The retried attempt re-issues whatever it needs.
+
+### Abort, and resuming without retyping
+
+On a user abort there is no retry to splice into: the partial ends the session, and
+`[assistant] [user]` needs no prefill, so the next typed prompt sees it once §5's loader gap is
+closed. Worth an explicit test.
+
+Beyond that, a **return with an empty prompt should resume the incomplete turn by default** — the
+same path as a retry, when the last user turn did not complete. This changes the shape of §5's
+question: the continuation written at retry time is what such a resume finds, so an aborted turn
+needs no continuation written at abort time; typing nothing is the signal.
+
+Note this is a behavioural change in the REPL, not only a retry detail. Today an empty submit is
+dropped (`handle_submit` returns early on an empty string, and an overrides-only prompt is refused
+with "nothing to send"). Those guards are the thing to revisit, not the retry machinery.
+
+### Where the write-time guard lives
+
+**In the projection, not the persister.** The persister and the projection already share one input,
+the projected message slice, so a projection-level rule is seen by both writers and by the request
+path, while a persister-level rule would be a second place that knows about continuations.
+
+Concretely, the guard belongs beside `project`'s unit walk, which is already where adjacent messages
+are related (a unit is a turn plus its results): drop a synthetic continuation that directly follows
+another synthetic continuation, keeping the last. That is idempotent — projecting a projected slice
+changes nothing — which is the property the whole transform requires.
+
+Two caveats for whoever implements it:
+
+- **`project` does not currently see the marker.** Its signature is `project(&[Message])` and rig's
+  `Message` carries no metadata, so the marker lives only on the session entry (`customType`). The
+  guard needs either a step that flattens the marker into the message before projection, or a
+  signature that takes the session's entry kinds alongside. Flattening fits the existing
+  split-at-ingest precedent: state the shape once, where the write happens, and let every reader see
+  it.
+- **The duplicate is invisible after encoding.** rig merges consecutive user messages, so a wrong
+  append does not fail at the wire — only in the session, which replays what was written. Test the
+  pre-wire history, not the adapted request.
