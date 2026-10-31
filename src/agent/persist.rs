@@ -57,8 +57,16 @@ pub(crate) struct Persister {
     /// A batch whose append failed, so a retry writes the same ids instead of
     /// duplicating the turn.
     unsaved: Option<(Vec<Message>, uuid::Uuid)>,
-    /// Whether anything of this turn reached the store.
-    wrote: bool,
+
+    /// Whether the model itself produced output on the attempt that just
+    /// ended — text, reasoning or a tool call.
+    ///
+    /// This, not [`Self::wrote`], is what the back-off resets on. `wrote` says
+    /// an append succeeded, which a held tool answer satisfies without the model
+    /// having spoken and a reasoning-only stream does not; and progress is a
+    /// property of the attempt, not of the store. Set by the loop when an
+    /// attempt ends, because only the loop holds the streamed fold.
+    produced: bool,
 }
 
 impl Persister {
@@ -78,7 +86,7 @@ impl Persister {
             tail_at: None,
             answered: HashMap::new(),
             unsaved: None,
-            wrote: false,
+            produced: false,
         }
     }
 
@@ -173,16 +181,13 @@ impl Persister {
             None => uuid::Uuid::now_v7(),
         };
         let Some(session) = self.session.as_ref() else {
-            // Sessionless: still settled, because the caller only needs to know
-            // the turn made progress.
+            // Sessionless: nothing to write, but nothing pending either.
             self.unsaved = None;
-            self.wrote = true;
             return true;
         };
         match session.append_messages(&messages, &seed).await {
             Ok(()) => {
                 self.unsaved = None;
-                self.wrote = true;
                 true
             }
             Err(error) => {
@@ -202,11 +207,36 @@ impl Persister {
         }
     }
 
-    /// Whether the turn did any work worth keeping. Drives the back-off reset:
-    /// it is *progress*, not persistence, that says a retry starts from a fresh
-    /// delay — and a held answer is work that will be written.
+    /// Record that the attempt which just ended emitted output of its own.
+    ///
+    /// Called from every path that ends an attempt — failure, abort, and the
+    /// invalid-call rollback — so the answer covers the whole attempt rather
+    /// than whichever path happened to notice.
+    pub(crate) fn note_produced(&mut self, produced: bool) {
+        self.produced |= produced;
+    }
+
+    /// Clear the progress record, once it has been read.
+    ///
+    /// Called *after* the back-off has consulted [`Self::made_progress`], never
+    /// when a request goes out. The flag has to survive from one attempt to the
+    /// next, because the attempt that makes progress is often not the one that
+    /// fails: a tool-calling attempt succeeds, its continuation 429s instantly,
+    /// and the reset is owed to the first. Clearing on dispatch would lose it.
+    pub(crate) fn reset_progress(&mut self) {
+        self.produced = false;
+    }
+
+    /// Whether the model produced anything since the last reset. Drives the
+    /// back-off: a 429 before the first delta is a failure with nothing to show
+    /// for it, while a stream that reasoned for thirty seconds and then
+    /// truncated is not.
+    ///
+    /// Deliberately *not* `wrote || !answered.is_empty()`: a tool answer that
+    /// never reached the model is not model output, and an append that
+    /// succeeded says nothing about whether the model spoke.
     pub(crate) fn made_progress(&self) -> bool {
-        self.wrote || !self.answered.is_empty()
+        self.produced
     }
 }
 

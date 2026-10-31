@@ -54,12 +54,17 @@ On a retryable mid-stream failure, before the back-off, prior writes what is new
 run with the session's exact history. Everything here uses one shape for every model, so nothing
 depends on provider capability.
 
-1. Take `stream.partial()`, keep its text and drop its tool calls (a call with no result is a real
-   pairing violation — `OrphanToolCall` — unlike the stop-reason case, which is only a replay rule).
-2. **If that text is empty, do nothing more** — re-issue the attempt in place, as phase 3 did. There
-   is no partial to preserve, so a rebuild would only reset the budget and re-read the session for
-   nothing. (A 429 before the first delta is the common case, and it must not grow the transcript.)
-3. Write the text to the session immediately as an ordinary assistant message, holding a
+1. Take `stream.partial()`, keep its text **and its reasoning**, and drop its tool calls. The two
+   exclusions differ: a call with no result is a real pairing violation (`OrphanToolCall`), while
+   reasoning is kept and left to `reasoning_in_context` — whose `AbortedTurnsOnly` mode exists for
+   exactly this turn, the trailing one with no provider `responseId`. (Kept-but-invisible is the
+   setting's decision; dropped-at-write is prior's, and would lose tokens the user paid for.)
+2. **If nothing of the model's own output survives, do nothing more** — re-issue the attempt in
+   place, as phase 3 did. There is no partial to preserve, so a rebuild would only reset the budget
+   and re-read the session for nothing. (A 429 before the first delta is the common case, and it
+   must not grow the transcript.) Reasoning alone *is* something to preserve, so it takes the normal
+   retry path: write, continuation, rebuild.
+3. Write that content to the session immediately as an ordinary assistant message, holding a
    **hand-built** assistant turn (`stop: None`, §2).
 4. If the session's last message is not already the synthetic continuation, write one (§5). If it
    is, keep it: **never append a second.** The text is a nudge and must not be empty; an empty
@@ -208,7 +213,12 @@ Two refinements over the plan above, both from constraints found while writing i
   no way to remove it.
 - **A failure with nothing streamed rebuilds nothing.** It re-issues the attempt in place, exactly
   as phase 3 did. There is no partial to preserve, so the rebuild would only reset the budget and
-  re-read the session for no benefit.
+  re-read the session for no benefit. "Nothing" means no content of the model's own at all — a
+  truncated stream that had only produced reasoning does rebuild, since the reasoning is kept (§3
+  step 1) and is what the `AbortedTurnsOnly` setting exists to carry forward.
+- **`take_abandoned` keeps reasoning and drops tool calls** (`9153331` fixed an earlier version that
+  dropped both). Pinned by `an_abandoned_attempt_keeps_its_reasoning_and_drops_its_calls` in
+  `drive.rs`.
 
 Tests: `tests/partial_turn_retention.rs` drives the real binary through a broken stream (retry) and
 a hung stream plus `Esc` (abort, then an empty-prompt resume), asserting on the session entries and

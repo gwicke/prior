@@ -274,25 +274,36 @@ retries under a fixed seed and only leaves `unsaved` set when the append *failed
 through the error channel; the rebuild proceeds, and that batch is lost — which the report has
 already said.
 
-### 5b. Progress means model output, not writes
+### 5b. Progress means the model emitted something
 
-The back-off resets on progress, and progress must be **model response content**. A steer that is
-sent but never answered is not progress.
+The back-off resets on progress, and progress is **anything the model itself put on the stream** —
+text, reasoning, or a tool call. It is not "the persister wrote bytes", which is a different
+question with a different answer.
 
-Today `Persister::made_progress` returns `wrote || !answered.is_empty()`, and `wrote` is set by
-*any* successful append — including the partial text written just before a retry. So the current
-rule credits an attempt that produced nothing but an error. It becomes:
+The rule, in cases:
 
-```rust
-pub(crate) fn made_progress(&self) -> bool {
-    !self.answered.is_empty()
-}
-```
+| case                                | resets  |
+| ----------------------------------- | ------- |
+| 429 before the first delta          | no      |
+| truncated after reasoning only      | **yes** |
+| truncated after some text           | yes     |
+| tool-calling attempt that succeeded | yes     |
+| a steer sent, no response yet       | no      |
 
-A held answer still counts, and should: a batch that ran tools is work, and a provider failing
-forever across batches that keep editing files must keep retrying. Partial text does not, because a
-stream that emitted nothing produced no content. A steer never touches the persister, so it counts
-for nothing by construction.
+So `Persister::made_progress` stops consulting `wrote` and `answered`, and reports a flag set from
+the streamed fold (`Attempt::produced_output`) by whichever path ends an attempt. Two details make
+it correct:
+
+- **It spans attempts within a turn, and clears when read.** The attempt that makes progress is
+  often not the one that fails: a tool-calling turn succeeds, its continuation 429s instantly, and
+  the reset is owed to the *first*. So `note_produced` is called on both the success path
+  (`finish_attempt`) and the failure path, and `reset_progress` runs after the back-off has read it
+  — never on dispatch, which would lose it.
+- **Reasoning counts**, including a redacted block that carries no text. Same reasoning as §5's
+  steer: a provider that truncates after it did not refuse the request.
+
+A steer never touches the flag, so it counts for nothing by construction — which is the property the
+user's rule asks for.
 
 One position, one function: the session and the wire cannot disagree about where the user spoke.
 

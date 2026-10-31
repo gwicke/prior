@@ -169,6 +169,55 @@ struct Attempt {
     drained: bool,
 }
 
+impl Attempt {
+    /// Whether the fold so far holds anything the model itself emitted.
+    ///
+    /// Reasoning counts: it is output the user paid for and watched, and a
+    /// provider that truncates after it is not a provider that refused the
+    /// request.
+    fn produced_output(&self) -> bool {
+        self.stream.partial().choice.iter().any(|c| match c {
+            AssistantContent::ToolCall(_) => true,
+            AssistantContent::Text(t) => !t.text.is_empty(),
+            // `redacted` reasoning carries no text by design, and is still
+            // output the provider emitted.
+            AssistantContent::Reasoning(r) => !r.text.is_empty() || r.redacted,
+            _ => false,
+        })
+    }
+}
+
+/// What of an abandoned attempt's content is worth persisting, or `None`.
+///
+/// **Reasoning is kept.** Whether it reaches the *model* is
+/// `reasoning_in_context`'s decision, applied at request time by
+/// [`crate::agent::transcript::maybe_strip_reasoning`] — and its
+/// `AbortedTurnsOnly` mode exists precisely for this case: the trailing run of
+/// turns with no provider `responseId`, so the model can continue the thread it
+/// was cut off in. Dropping it here would pre-empt that setting and silently
+/// lose tokens the user paid for.
+///
+/// Tool calls are dropped, for a different reason: a call with no result is a
+/// genuine pairing violation on the wire (`OrphanToolCall`), unlike the
+/// reasoning case, which is only about what the model is shown. The retried
+/// attempt re-issues whatever it still wants to call.
+///
+/// `None` when nothing of the model's own output survives — an attempt that
+/// failed before its first delta produced nothing to keep, so the caller
+/// appends no message.
+fn keep_abandoned(content: Option<Vec<AssistantContent>>) -> Option<Vec<AssistantContent>> {
+    let kept: Vec<AssistantContent> = content?
+        .into_iter()
+        .filter(|c| match c {
+            AssistantContent::ToolCall(_) => false,
+            AssistantContent::Text(t) => !t.text.is_empty(),
+            AssistantContent::Reasoning(_) => true,
+            _ => false,
+        })
+        .collect();
+    (!kept.is_empty()).then_some(kept)
+}
+
 /// What one state-machine step did.
 ///
 /// Boxed because `PromptResponse` carries the whole conversation while
@@ -262,21 +311,26 @@ impl DriveLoop {
 
     /// What the last failed attempt produced before it died, if anything.
     ///
-    /// Taken, not read: the text becomes a message in the session exactly once,
-    /// and a second read would append it twice. Empty and tool-call-free
-    /// content is reported as `None`, because there is nothing a user watched.
+    /// Taken, not read: the content becomes a message in the session exactly
+    /// once, and a second read would append it twice.
+    ///
+    /// **Reasoning is kept.** Whether it reaches the model is
+    /// `reasoning_in_context`'s decision, applied at request time by
+    /// [`crate::agent::transcript::maybe_strip_reasoning`] — and its
+    /// `AbortedTurnsOnly` mode exists precisely for this case: the trailing run
+    /// of turns with no provider `responseId`, so the model can continue the
+    /// thread it was cut off in. Dropping it here would pre-empt that setting
+    /// and silently lose tokens the user paid for.
+    ///
+    /// Tool calls are dropped, and for a different reason: a call with no
+    /// result is a genuine pairing violation on the wire (`OrphanToolCall`),
+    /// unlike the reasoning case which is only about what the model is shown.
+    /// The retried attempt re-issues whatever it still wants to call.
+    ///
+    /// `None` when nothing of the model's own output survives: an attempt that
+    /// failed before its first delta produced nothing to keep.
     pub(crate) fn take_abandoned(&mut self) -> Option<Vec<AssistantContent>> {
-        let content = self.abandoned.take()?;
-        let text: Vec<AssistantContent> = content
-            .into_iter()
-            .filter(|c| match c {
-                AssistantContent::ToolCall(_) => false,
-                AssistantContent::Text(t) => !t.text.is_empty(),
-                AssistantContent::Reasoning(_) => false,
-                _ => false,
-            })
-            .collect();
-        (!text.is_empty()).then_some(text)
+        keep_abandoned(self.abandoned.take())
     }
 
     /// Rebuild the run around prior-controlled history, keeping everything else
@@ -353,17 +407,18 @@ impl DriveLoop {
                         // `streamed_turn`), and the user already watched it
                         // arrive. §2 of the retention doc is why this is taken
                         // here rather than from the run.
-                        if let Some(attempt) = &self.attempt {
+                        if let Some(attempt) = self.attempt.take() {
                             let partial = attempt.stream.partial();
+                            let produced = attempt.produced_output();
                             self.abandoned = (!partial.choice.is_empty()).then_some(partial.choice);
+                            self.persist.lock().await.note_produced(produced);
                         }
-                        // Drop the in-flight attempt. A failed stream is dead and
-                        // must not be polled again, but the *run* is untouched:
-                        // `streamed_turn` never saw the turn, so it is still
-                        // `AwaitingModel` and the next step re-issues the same
-                        // `CallModel` — same turn, no budget, no new message.
+                        // The attempt is gone (taken above). A failed stream is
+                        // dead and must not be polled again, but the *run* is
+                        // untouched: `streamed_turn` never saw the turn, so it is
+                        // still `AwaitingModel` and the next step re-issues the
+                        // same `CallModel` — same turn, no budget, no new message.
                         // That is the whole of "a retry is the same attempt".
-                        self.attempt = None;
                         return Some(Err(error));
                     }
                 }
@@ -573,7 +628,17 @@ impl DriveLoop {
         let Some(attempt) = self.attempt.take() else {
             return Ok(());
         };
+        // An attempt that got this far produced output by definition: `finish`
+        // succeeds only on a complete stream. Recorded here as well as on the
+        // failure path so a successful attempt counts as progress for the
+        // *next* attempt's back-off — which is the common shape, since the
+        // attempt that fails instantly is usually the continuation after a
+        // successful tool-calling turn.
+        let produced = attempt.produced_output();
         let response = attempt.stream.finish().await.map_err(PromptError::from)?;
+        if produced {
+            self.persist.lock().await.note_produced(true);
+        }
         let call = self.run.record_streamed_completion_call(
             response.usage,
             response.identity(),
@@ -752,9 +817,15 @@ impl PersistHandle {
         self.0.lock().await.close().await;
     }
 
-    /// Whether the turn did some work worth keeping.
+    /// Whether the model produced output since the last reset. Drives the
+    /// back-off reset; see [`Persister::made_progress`].
     pub(crate) async fn made_progress(&self) -> bool {
         self.0.lock().await.made_progress()
+    }
+
+    /// Clear the progress record once the back-off has read it.
+    pub(crate) async fn reset_progress(&self) {
+        self.0.lock().await.reset_progress();
     }
 }
 
@@ -836,5 +907,59 @@ mod tests {
         let a = context_document("one");
         let b = context_document("one");
         assert_ne!(a.id, b.id);
+    }
+
+    /// A truncated attempt's reasoning must survive into the session.
+    ///
+    /// The intent is `ReasoningInContextMode::AbortedTurnsOnly`, whose whole
+    /// point is the trailing run of turns with no provider `responseId`: keep
+    /// their reasoning so the model can continue the thread it was cut off in.
+    /// Filtering it out here pre-empts that setting, and the user paid for the
+    /// tokens either way.
+    #[test]
+    fn an_abandoned_attempt_keeps_its_reasoning_and_drops_its_calls() {
+        let content = vec![
+            AssistantContent::Reasoning(rig_core::message::Reasoning::new("thought")),
+            AssistantContent::Text(rig_core::message::Text::new("half an ans")),
+            AssistantContent::ToolCall(rig_core::message::ToolCall::new(
+                rig_core::message::CallId::from_wire("call_1"),
+                rig_core::message::ToolFunction::new(
+                    rig_core::message::ToolName::new("read").expect("valid name"),
+                    serde_json::json!({}),
+                ),
+            )),
+        ];
+        let kept = keep_abandoned(Some(content)).expect("content worth keeping");
+        assert!(
+            kept.iter()
+                .any(|c| matches!(c, AssistantContent::Reasoning(_))),
+            "reasoning must be kept: {kept:?}"
+        );
+        assert!(
+            kept.iter()
+                .any(|c| matches!(c, AssistantContent::Text(t) if t.text == "half an ans")),
+            "text must be kept: {kept:?}"
+        );
+        assert!(
+            !kept
+                .iter()
+                .any(|c| matches!(c, AssistantContent::ToolCall(_))),
+            "an unanswered call is an orphan on the wire: {kept:?}"
+        );
+    }
+
+    /// Nothing of the model's own output means nothing to append — which is
+    /// also the case where the retry re-issues in place instead of rebuilding.
+    #[test]
+    fn an_attempt_with_nothing_of_its_own_is_not_kept() {
+        assert!(keep_abandoned(None).is_none());
+        assert!(keep_abandoned(Some(Vec::new())).is_none());
+        assert!(
+            keep_abandoned(Some(vec![AssistantContent::Text(
+                rig_core::message::Text::new("")
+            )]))
+            .is_none(),
+            "an empty text block is not output"
+        );
     }
 }

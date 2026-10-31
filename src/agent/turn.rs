@@ -562,6 +562,10 @@ impl CodeAgent {
             } else {
                 consecutive_failures.saturating_add(1)
             };
+            // Read once, then cleared: the flag spans attempts because the one
+            // that makes progress is often not the one that fails, so it is
+            // consumed here rather than at dispatch.
+            persist.reset_progress().await;
             if consecutive_failures > retry_budget(&error) {
                 outcome = Err(error);
                 break 'attempts;
