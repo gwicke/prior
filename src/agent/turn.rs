@@ -160,41 +160,38 @@ impl CodeAgent {
         // With no overrides `params` *is* `live_params`, so this recomputes what
         // was baked at build time and the turn is unchanged.
         let request = self.agent.prompt(input);
-        let request = match params.temperature {
-            Some(t) => request.temperature(t),
-            None => request.without_temperature(),
+        let direct = std::env::var("PRIOR_DRIVE").as_deref() == Ok("direct");
+        let mut stream = if direct {
+            // The direct path owns the run. `StreamingResult` and
+            // `DriveLoop`'s adapter yield the same item type, so the pump below
+            // is unchanged — which is what makes phase 1 a parity gate rather
+            // than a rewrite.
+            self.direct_stream(input, prior, params, session.clone(), transcript.clone())
+        } else {
+            let request = self.apply_params(request, params);
+            request
+                .add_hook(LoggingHook {
+                    content: self.content.clone(),
+                    user_cancel: self.user_cancel.clone(),
+                    message_logger: self.message_logger.clone(),
+                    reasoning_in_context: self.reasoning_in_context,
+                    provider: self.provider.clone(),
+                    model: self.model.clone(),
+                    transcript: transcript.clone(),
+                    session: session.clone(),
+                })
+                .max_turns(self.tool_call_limit)
+                // Allow one in-turn recovery for the model calling a tool that
+                // isn't registered or is not in the current turn's allowed set.
+                // The hook (`LoggingHook::on_invalid_tool_call`) decides the
+                // recovery action; this is the *budget* the rig-run policy
+                // honors when the hook returns `Retry { feedback }`. Consumes
+                // one `max_turns` slot on use. See doc/tool_error_handling.md
+                // §Layer 1 Task 2.
+                .max_invalid_tool_call_retries(1)
+                .history(prior)
+                .stream()
         };
-        let request = match request_additional_params(
-            &self.provider,
-            &self.model,
-            params,
-            self.routing.as_ref(),
-        ) {
-            Some(v) => request.replace_additional_params(v),
-            None => request.without_additional_params(),
-        };
-        let mut stream = request
-            .add_hook(LoggingHook {
-                content: self.content.clone(),
-                user_cancel: self.user_cancel.clone(),
-                message_logger: self.message_logger.clone(),
-                reasoning_in_context: self.reasoning_in_context,
-                provider: self.provider.clone(),
-                model: self.model.clone(),
-                transcript: transcript.clone(),
-                session: session.clone(),
-            })
-            .max_turns(self.tool_call_limit)
-            // Allow one in-turn recovery for the model calling a tool that
-            // isn't registered or is not in the current turn's allowed set.
-            // The hook (`LoggingHook::on_invalid_tool_call`) decides the
-            // recovery action; this is the *budget* the rig-run policy
-            // honors when the hook returns `Retry { feedback }`. Consumes
-            // one `max_turns` slot on use. See doc/tool_error_handling.md
-            // §Layer 1 Task 2.
-            .max_invalid_tool_call_retries(1)
-            .history(prior)
-            .stream();
 
         // `output` is the returned assistant text (what `prompt()` yields);
         // the transcript owns everything that reaches disk. `final_history`
@@ -526,6 +523,94 @@ impl CodeAgent {
         }
 
         Ok(output)
+    }
+
+    /// Apply a turn's per-request params to the request rig built.
+    ///
+    /// Split out so both drive paths shape the request identically: the hook
+    /// path calls it before `add_hook`, the direct path before `prepare_request`
+    /// sees the spec. An override turn stays byte-identical to a normal one
+    /// because the same two setters run in the same order.
+    fn apply_params(
+        &self,
+        request: rig_agent::agent::AgentRunner,
+        params: &crate::params::ModelParams,
+    ) -> rig_agent::agent::AgentRunner {
+        let request = match params.temperature {
+            Some(t) => request.temperature(t),
+            None => request.without_temperature(),
+        };
+        match request_additional_params(&self.provider, &self.model, params, self.routing.as_ref())
+        {
+            Some(v) => request.replace_additional_params(v),
+            None => request.without_additional_params(),
+        }
+    }
+
+    /// The direct drive path: prior owns the `AgentRun`.
+    ///
+    /// Phase 1 is a parity gate — the items are rig's own, so the turn pump
+    /// below is unchanged and a scenario that passes on one path must pass on
+    /// both. What differs is what happens *after* the stream: a failure leaves
+    /// the run in hand rather than dropping it.
+    fn direct_stream(
+        &self,
+        input: &str,
+        prior: Vec<Message>,
+        params: &crate::params::ModelParams,
+        session: Option<Arc<Session>>,
+        transcript: Arc<Mutex<TurnTranscript>>,
+    ) -> rig_agent::agent::StreamingResult {
+        use crate::agent::drive::{Drive, DriveLoop};
+        use rig_agent::run::AgentRun;
+
+        // The spec is the agent's own (preamble, sampling, budget); the per-turn
+        // params land on it here, because `prepare_request` reads the spec per
+        // call and there is no request builder to patch afterwards.
+        let mut spec = self.agent.run_spec();
+        spec.temperature = params.temperature.or(spec.temperature);
+        spec.additional_params =
+            request_additional_params(&self.provider, &self.model, params, self.routing.as_ref())
+                .or(spec.additional_params);
+        spec.max_turns = Some(self.tool_call_limit);
+        spec.max_invalid_tool_call_retries = 1;
+
+        let run = AgentRun::from_spec(
+            &spec,
+            Message::user(input),
+            Some(prior.into_iter().map(Arc::new).collect()),
+        );
+
+        let model = match self.agent.handlers().bind(self.agent.model_key()) {
+            Ok(model) => model,
+            Err(report) => {
+                // A miswired handler table: surface it as the stream's own
+                // error rather than panicking inside the turn.
+                return Box::pin(futures::stream::once(async move {
+                    Err(PromptError::Report(report))
+                }));
+            }
+        };
+
+        let observer = crate::agent::observer::TurnObserver {
+            content: self.content.clone(),
+            user_cancel: self.user_cancel.clone(),
+            message_logger: self.message_logger.clone(),
+            reasoning_in_context: self.reasoning_in_context,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            transcript,
+            session,
+        };
+        let tools = Arc::new(self.agent.tool_server_handle().snapshot());
+        let drive = Drive {
+            model,
+            tools,
+            spec,
+            observer: Arc::new(observer),
+        };
+        let stream = crate::agent::drive::run_stream(DriveLoop::new(drive, run));
+        Box::pin(stream)
     }
 
     pub async fn run_once(&self, input: String) -> Result<String> {

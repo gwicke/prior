@@ -247,8 +247,8 @@ One position, one function: the transcript and the wire cannot disagree about wh
 ### 6. Module plan
 
 - `src/agent/drive.rs` — the loop above.
-- `src/agent/observe.rs` — `TurnObserver` (display, `--log-messages`, cancel, steering drain).
-  Absorbs today's `LoggingHook` and most of `turn.rs`.
+- `src/agent/observer.rs` — `TurnObserver` (display, `--log-messages`, cancel; the steering drain is
+  phase 4's addition). Absorbs today's `LoggingHook`; `turn.rs` keeps the pump.
 - `src/agent/project.rs` — **the** projection: parts unpack and steer splice, nothing else. Pure
   `(&[Message], &[Aside]) -> Vec<Message>`, called by persist and by request building.
 - `src/agent/parts.rs` — `CallPart`, the single-part builder (`preprocess_args` + `ToolResult`), the
@@ -270,13 +270,37 @@ One position, one function: the transcript and the wire cannot disagree about wh
 
 ### 7. Phases
 
-1. **Parity harness.** Point the existing `tests/mock_turn.rs`, `retry_backoff.rs` and
-   `compaction_esc.rs` SSE mocks at a second, drive-based path behind a `PRIOR_DRIVE=direct` switch,
-   and make every scenario pass on both. No behaviour change tolerated; this is the gate for the
-   rest.
-2. **Drive loop, single attempt.** Completion → assemble → accept → tools → done, with cursor
-   persistence live and the projection the only shaper. `transcript.rs`'s live-unit machinery
-   deleted at the end of this phase.
+1. **Parity harness. Done.** `src/agent/drive.rs` (the step-wise loop) and `src/agent/observer.rs`
+   (what `LoggingHook` did, as explicit callbacks) are live behind `PRIOR_DRIVE=direct`. Every
+   scenario in `mock_turn.rs`, `retry_backoff.rs`, `compaction_esc.rs` and the rest of the suite
+   passes on both paths, and the two byte streams for the layout probe diff clean — which is what
+   the gate asks for: the items are rig's own, so the turn pump is untouched.
+   - **The loop is step-wise, not one future.** `DriveLoop::next` yields one item at a time because
+     the turn pump selects on it alongside the key queue, the confirm port and the cancel signal. A
+     single drive future would have to re-implement that `select!`.
+   - **`run_stream` is a generator, not a `poll_fn`.** A `poll_fn` builds a fresh `next` future on
+     every poll and loses the in-flight provider stream; the attempt restarts at each pause. This
+     cost an afternoon to find, so it is written down here rather than in a comment nobody reads.
+   - **`Done` is terminal.** rig's `next_step` keeps answering `Done` from its terminal state, so
+     the loop marks itself finished; without that the final response is emitted forever.
+   - `TurnTranscript` is still the writing path (phase 2 replaces it with the cursor). The
+     observer's `accept` therefore still records the accepted turn, which is what keeps the two
+     paths' persisted output identical.
+2. **Drive loop, single attempt. Partly done.** The loop's steps are in place and take the whole
+   turn (`CallModel` → stream → accept → `CallTools` → answer → `Done`) behind `PRIOR_DRIVE=direct`.
+   What remains is *persistence*: `TurnTranscript` is still the writing path, so the loop still
+   feeds it deltas and accepted turns rather than a cursor over `run.messages()`. That is why the
+   two paths' output is byte-identical — the same writer receives the same events. Converting the
+   writer (and deleting `transcript.rs`'s live-unit machinery) is what makes the direct path the
+   only path, and is the next step here.
+   - **Debt carried in from phase 5 (landed before its turn in the order).** `preprocess_args` is
+     called twice per live call: at dispatch, to label the panel, and again in `prepare`, to build
+     the part. Both are calls of one pure idempotent function, so their outputs cannot disagree —
+     but the design's claim is *one call per live call*, and only the loop's own answer path can
+     carry the dispatch-computed value into the part. Close it here: the loop already holds the
+     value when it wraps the `ToolResult`, so the `prepare`-side recomputation is deleted rather
+     than moved. Until then `doc/261030_rig_direct_drive_impl.md`'s "once per live call, ever" is
+     ahead of the code.
 3. **Retry by resume.** Back-off loop around the attempt, deleting `LlmInterrupted`, `"continue"`,
    `TurnPersistence`. `doc/tool_error_handling.md` §"Mid-turn failure" is retired with it.
 4. **Steering and boundary settings.** `SteeringQueue`, the projection's steer insertion and scalar

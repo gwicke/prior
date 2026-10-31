@@ -1776,6 +1776,7 @@ dependencies = [
 name = "prior-agent"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "bsed-blockedit",
  "chrono",

@@ -13,8 +13,10 @@ use std::sync::Mutex;
 
 pub(crate) mod build;
 pub(crate) mod compaction;
+pub(crate) mod drive;
 pub(crate) mod errors;
 pub(crate) mod msglog;
+pub(crate) mod observer;
 pub mod parts;
 pub(crate) mod pumps;
 pub(crate) mod replay;

@@ -76,6 +76,11 @@ unicode-width = "0.2"
 reqwest = { version = "0.13", features = ["json"] }
 libc = "0.2"
 futures = "0.3"
+# The drive loop (src/agent/drive.rs) is written as an `async_stream::stream!`,
+# like rig's own engine: an explicit `Stream` impl would need a hand-written
+# state machine for the per-turn provider-stream pump, and `stream!` yields from
+# inside `select!`-style control flow in the one shape the protocol has.
+async-stream = "0.3"
 parking_lot = "0.12"
 shellexpand = "3.1"
 path-clean = "1.0"
