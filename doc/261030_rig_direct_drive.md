@@ -220,28 +220,81 @@ Corrective feedback (malformed tool-call JSON, a 429 hint, a truncation retry) i
 `RequestPatch::extra_context` documents rather than as prompt text: it steers the next request
 without entering the transcript.
 
-Mid-turn steering is the *same* projection as §4 (its steer-splice half), which is why it needs no
-mechanism of its own:
+Mid-turn steering needs no new projection: a steer becomes an ordinary user message in the run's
+history, so `project` never learns that steering exists.
 
-- a `SteeringQueue` on `CodeAgent` collects queued `Message::user` steers from the UI thread;
-- a steer is recorded on the run as an `Aside` (`append_entry`): `kind: "prior.steer"`,
-  `author: Author::user()`, `value: <the Message>`, `after: <the last message id>`. Asides are
-  serialized with the run and **excluded from provider requests**, so it costs nothing until we
-  choose to send it, and survives a restart. `project` splices them in, so persist and the wire show
-  the steer at the same position, once;
-- that closes the `RequestPatch::history` caveat in `doc/pi_steering_rig.md` §3.1 (a per-request
-  patch is forgotten by the next turn) *without* a `history` patch: the steer enters the session
-  through persist and comes back through the next turn's history, so nothing has to remember it a
-  second time;
-- placement rule: after the last tool result of the batch, never between an assistant turn and its
-  results. A steer arriving mid-batch is therefore delivered with the next request, which is the
-  only point where history is a valid provider prefix anyway;
-- setting overrides (`temperature`, `max_tokens`, `additional_params`/reasoning) are not history at
-  all; they ride `RequestPatch` for the one request and, if the user meant them to stick, are
-  committed to the live settings the next `prompt()` builds from. Two lifetimes, stated
-  deliberately: a steer is a message, a setting is not.
+- a **slot**, not a queue (`SteerSlot` on `CodeAgent`, `Arc<Mutex<…>>`), because a steer is editable
+  until it is sent: a second submit mid-turn *replaces* the scheduled one rather than queueing
+  behind it;
+- the steer is injected as a **real user message**, not an aside and not a `history` patch. It goes
+  through the same path a retry uses to continue a partial turn: write it to the session, then
+  `rebuild_from` the session's history. That is what makes it survive compaction (`serialize_spur`
+  keeps `role: user` text and drops tool calls, reasoning and results) and what makes it durable
+  without a second place to remember it;
+- it is a **rebuild, not a splice**, for the reason established in
+  [`261102_partial_turn_retention.md`](261102_partial_turn_retention.md) §3: a patch is a one-shot
+  the next `CallModel` would have to re-place, so the suffix would reorder as the turn progresses;
+- placement is after the last tool result of the batch, because that is the next `CallModel` — the
+  only point where history is a valid provider prefix. A steer typed mid-batch is therefore
+  delivered with the results, not between them;
+- **sent once.** Consuming the slot clears it; the message stays in history like any other. A
+  consecutive submit schedules a *new* steer, so no merge guard is needed (unlike the continuation);
+- setting overrides have **two lifetimes**, matching how they are entered:
+  - a `/reasoning`, `/temperature` or `/top_p` **menu** mid-turn writes the live params, so it
+    applies for the rest of the session and takes effect at the next completion boundary;
+  - the same lines **trailed on a steering message** apply to the rest of that user turn only, and
+    are exactly `TurnOverrides` (`src/turn_overrides.rs`), which already parses and layers them.
 
-One position, one function: the transcript and the wire cannot disagree about where the user spoke.
+The request half of both is the same: `before_call` computes the patch from
+`effective_params(app_state, turn_overrides)`, because `RequestPatch` carries `temperature`,
+`max_tokens` and `additional_params` and `prepare_request` gives the patch priority over the spec.
+
+### 5a. Rebasing the persister, so a rebuild needs no new handle
+
+A rebuild currently replaces the persister (`Persister::new`), which is why `rebuild_from` returns a
+`PersistHandle` and why the turn pump has to swap it. That return value is the only thing making an
+in-loop rebuild awkward, and it is avoidable: after a rebuild only two groups of state are
+run-relative.
+
+| state                         | after a rebuild                                                 |
+| ----------------------------- | --------------------------------------------------------------- |
+| `session`, `content`, `wrote` | unchanged — the turn is the same turn                           |
+| `cursor`                      | must restart at the new run's `projection_start()`              |
+| `tail`, `tail_at`, `answered` | must clear — that unit is closed                                |
+| `unsaved`                     | nothing outstanding: every write site flushes first (see below) |
+
+So `Persister::rebase(&run)` sets the cursor and clears the hold, `rebuild_from` mutates it in
+place, and the `Arc` never changes — the pump keeps one handle for the whole turn and a rebuild can
+happen inside `DriveLoop::next()` with nobody told. `rebuild_after_partial` stops returning a
+handle.
+
+`unsaved` is genuinely empty at a rebuild because **the flush is part of the commit**: `append`
+retries under a fixed seed and only leaves `unsaved` set when the append *failed*, and both
+`write_committed` and `close` call `retry_unsaved` first. A failed append is already reported
+through the error channel; the rebuild proceeds, and that batch is lost — which the report has
+already said.
+
+### 5b. Progress means model output, not writes
+
+The back-off resets on progress, and progress must be **model response content**. A steer that is
+sent but never answered is not progress.
+
+Today `Persister::made_progress` returns `wrote || !answered.is_empty()`, and `wrote` is set by
+*any* successful append — including the partial text written just before a retry. So the current
+rule credits an attempt that produced nothing but an error. It becomes:
+
+```rust
+pub(crate) fn made_progress(&self) -> bool {
+    !self.answered.is_empty()
+}
+```
+
+A held answer still counts, and should: a batch that ran tools is work, and a provider failing
+forever across batches that keep editing files must keep retrying. Partial text does not, because a
+stream that emitted nothing produced no content. A steer never touches the persister, so it counts
+for nothing by construction.
+
+One position, one function: the session and the wire cannot disagree about where the user spoke.
 
 ### 6. Module plan
 
@@ -338,9 +391,15 @@ One position, one function: the transcript and the wire cannot disagree about wh
      no `"continue"` ever reached the provider. Verified to fail if a synthetic message is
      re-introduced.
    - `doc/tool_error_handling.md` §"Mid-turn failure" is retired with it.
-4. **Steering and boundary settings. Not started.** `SteeringQueue`, the projection's steer
-   insertion and scalar overrides, the mid-turn UI entry points and `/reasoning`-style mid-turn
-   commits. See §7's open items; the ordering advice below still applies.
+4. **Steering and boundary settings. Not started.** Three independently stoppable pieces:
+   1. **Sampling at the boundary.** `TurnObserver` gains `Arc<AppState>`; `before_call` computes
+      `effective_params` and puts `temperature`/`max_tokens`/`additional_params` on the patch. The
+      mid-turn menus write live params, so they take effect with no further wiring.
+   2. **`Persister::rebase`**, and `made_progress` narrowed to `answered` (§5a, §5b). Small, and
+      independent of the UI.
+   3. **The steer slot.** `SteerSlot` on `CodeAgent`; the pump stops silently dropping a mid-turn
+      submit (`pumps.rs:73` blocks `KeyOutcome::Action`); at `CallModel` the loop takes the slot,
+      writes the message, rebases and rebuilds. `Esc` clears the slot and keeps the input.
 5. **Tools state their own call shape. Done** (`edd10e5`). A tool answers the call as it understood
    it plus that call's result: `read`/`write`/`grep`/`sed`/`bash` keep `Result<String, ToolError>`
    and gain a `preprocess_args` entry, called once at dispatch with its value carried into the part;
@@ -389,8 +448,8 @@ commits us to maintaining the loop.
   part, so the panel, the record and the wire read one value rather than three functions that had to
   be proven to agree. `tool_args::normalize` is deleted; replay needs no rewriting because the
   stored form is already compact.
-- **`EditResolutions` has no reader once the tool formats its own results.** Delete it rather than
-  repurpose it. The ledger went with phase 5; `EditResolutions` did not, so it is a phase-6 item.
+- **`EditResolutions` has no reader once the tool formats its own results.** Deleted in `9153331`,
+  together with `FileResolution` and the `ToolContext` channel that carried them.
 - **A turn that ends early keeps what ran — by holding the answers, not by writing them early.**
   `answer_all` commits a batch only once every call is answered, so the loop holds each answer as it
   lands and the close writes the unfinished batch from those plus rig's own "did not execute" for
@@ -421,3 +480,13 @@ commits us to maintaining the loop.
    per-file detail was lost with `PreparedEdit`: a skipped file is absent from the parts, an
    unchanged one is a part whose result says so. `display_tool_parts` handles both the single-part
    and N-part cases from one call.
+
+*Decided during phase-4 design, before implementation:*
+
+- **A steer is a real user message, injected by rebuilding** (§5), not an aside and not a `history`
+  patch. The patch was rejected because it is a one-shot that reorders as the turn progresses; the
+  aside was rejected because a user message needs no marker to survive compaction or reload.
+- **The slot lives on `CodeAgent`, not on `Drive`.** `build_drive` runs *inside* `prompt()`, so
+  `Drive` is per-turn and a slot there would be invisible to the REPL.
+- **A rebuild needs no new `PersistHandle`** — `Persister::rebase` mutates in place (§5a).
+- **Progress means model output** (§5b), so a steer never resets a retry back-off.
