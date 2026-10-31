@@ -220,12 +220,21 @@ the behaviour it pins.
 
 - **Streaming is unchanged.** Deltas paint as they arrive; only persistence is deferred to the
   failure. Nothing is buffered until a response completes.
-- **The screen never repaints.** Scrollback is append-only: `end_response` commits the abandoned
-  text as a finished segment and the retried text appends *below* it, a `\n`-at-a-time
-  (`plan_append` addresses no row). So "repaint" is the wrong word — the retry adds rows, and the
-  only armed redraws are the live frame (status bar, input) and a terminal-width resize. With the
-  text now persisted, the screen and the session hold the same content, which is the property that
-  matters.
+- **Nothing redraws, and the retry path writes no bytes of its own.** "Repaint" was the wrong word:
+  the abandoned text is committed as a finished segment by `end_response`, and the retried text is
+  ordinary streamed content appended below it. Content reaches the screen only through
+  `Draw::draw`'s consume-write-reposition (`draw.rs`), never by writing to stdout directly, and the
+  only row-addressed output is the live frame (status bar, input) plus the re-anchor and a
+  width-resize reflow. (A previous revision of this note cited `plan_append` for the append — that
+  function is `ApplyPolicy::Append`, which no production caller uses; it is a test-only policy.)
+  With the text now persisted, the screen and the session hold the same content, which is the
+  property that matters.
+- **Failures are reported on the error channel, not stderr.** Every persist or rebuild warning on
+  the retention path goes through `Content::display_error`, which routes to the draw pipeline as
+  `Stream::Error`. `eprintln!` would be wrong here for a concrete reason: a raw-mode turn owns the
+  screen, and a stray stderr line corrupts the live frame *and* desynchronises the row accounting
+  that the next frame's clear depends on. stderr stays reserved for the catastrophic — a panic, a
+  failed startup.
 - **Cost accounting stays prior-side, and in practice nothing is affected.** `AgentRun::usage` has
   no setter, so a rebuilt run counts only its own segment and `PromptResponse::usage` under-reports
   a rebuilt turn. But the final response is consumed for its *text* (`turn.rs`'s

@@ -69,6 +69,7 @@ use rig_core::tool::ToolContext;
 use crate::agent::parts::CallPart;
 use crate::agent::persist::Persister;
 use crate::agent::transcript::assistant_message;
+use crate::content::Content;
 use crate::session::Session;
 
 /// What the drive loop needs from a `CodeAgent`: the model, the tools, the run
@@ -82,6 +83,10 @@ pub(crate) struct Drive {
     /// Where committed units are written. `None` for a sessionless run, which
     /// still needs to know it made progress but has nowhere to put it.
     pub(crate) session: Option<Arc<Session>>,
+    /// Where a persist failure is reported (`doc/261102_partial_turn_retention.md`
+    /// §6a): the error channel, so a raw-mode turn's live frame is not corrupted
+    /// by a stray stderr line.
+    pub(crate) content: Arc<Content>,
     /// A one-slot mailbox from the retry loop in `turn.rs::prompt` to
     /// [`Observer::before_call`]: the corrective hint the *next* request should
     /// carry.
@@ -217,7 +222,11 @@ pub(crate) struct DriveLoop {
 impl DriveLoop {
     pub(crate) fn new(drive: Drive, run: AgentRun, max_turns: usize) -> (Self, PersistHandle) {
         let announce_cursor = run.projection_start();
-        let persist = Arc::new(AsyncMutex::new(Persister::new(&run, drive.session.clone())));
+        let persist = Arc::new(AsyncMutex::new(Persister::new(
+            &run,
+            drive.session.clone(),
+            drive.content.clone(),
+        )));
         let handle = PersistHandle(persist.clone());
         let this = Self {
             drive,
@@ -312,6 +321,7 @@ impl DriveLoop {
         let persist = Arc::new(AsyncMutex::new(Persister::new(
             &self.run,
             self.drive.session.clone(),
+            self.drive.content.clone(),
         )));
         self.persist = persist.clone();
         Some(PersistHandle(persist))
@@ -747,9 +757,12 @@ pub(crate) struct PersistHandle(Arc<AsyncMutex<Persister>>);
 impl PersistHandle {
     /// A handle that owns its persister outright, for a turn that never got as
     /// far as a run (a miswired handler table).
-    pub(crate) fn detached(session: Option<Arc<Session>>) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn detached(session: Option<Arc<Session>>, content: Arc<Content>) -> Self {
         let run = AgentRun::new(Message::user(""));
-        Self(Arc::new(AsyncMutex::new(Persister::new(&run, session))))
+        Self(Arc::new(AsyncMutex::new(Persister::new(
+            &run, session, content,
+        ))))
     }
 
     /// Close the turn. See [`DriveLoop::close`].

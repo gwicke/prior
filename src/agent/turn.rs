@@ -108,7 +108,13 @@ impl CodeAgent {
                     )
                     .await
                 {
-                    eprintln!("Warning: failed to persist the continuation: {e}");
+                    // A persist failure is a real error the user should see.
+                    // Not `eprintln!`: under raw mode the live frame owns the
+                    // screen, and a stray stderr line corrupts it. The error
+                    // channel routes through the draw pipeline like everything
+                    // else, so the row accounting stays honest too.
+                    self.content
+                        .display_error(&format!("failed to persist the continuation: {e}"));
                 }
             }
         }
@@ -148,7 +154,8 @@ impl CodeAgent {
         if !resume {
             if let Some(s) = session.as_deref() {
                 if let Err(e) = s.append_message(&Message::user(input)).await {
-                    eprintln!("Warning: failed to persist user prompt: {e}");
+                    self.content
+                        .display_error(&format!("failed to persist the prompt: {e}"));
                 }
             }
         }
@@ -726,6 +733,7 @@ impl CodeAgent {
             spec,
             observer: Arc::new(observer),
             session,
+            content: self.content.clone(),
             retry_hint: RetryHint::default(),
         };
         Ok(DriveLoop::new(drive, run, self.tool_call_limit))
@@ -847,7 +855,8 @@ impl CodeAgent {
         match session.append_message(&partial).await {
             Ok(_) => true,
             Err(error) => {
-                eprintln!("Warning: failed to persist the interrupted turn: {error}");
+                self.content
+                    .display_error(&format!("failed to persist the interrupted turn: {error}"));
                 false
             }
         }
@@ -889,7 +898,8 @@ impl CodeAgent {
             )
             .await
         {
-            eprintln!("Warning: failed to persist the continuation: {error}");
+            self.content
+                .display_error(&format!("failed to persist the continuation: {error}"));
         }
         // Rebuild from the session, which now holds what the model said and the
         // nudge that follows it. Reading the session rather than splicing the
@@ -906,7 +916,8 @@ impl CodeAgent {
         {
             Ok(history) => history,
             Err(error) => {
-                eprintln!("Warning: failed to rebuild the turn: {error}");
+                self.content
+                    .display_error(&format!("failed to rebuild the turn: {error}"));
                 return None;
             }
         };

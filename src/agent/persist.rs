@@ -36,6 +36,10 @@ use crate::session::Session;
 /// Where persistence has got to, and what it is holding for the unit in flight.
 pub(crate) struct Persister {
     session: Option<Arc<Session>>,
+    /// Where a persist failure is reported. The error channel, not stderr: a
+    /// raw-mode turn owns the screen through the draw pipeline, and a stray
+    /// stderr line would corrupt the live frame and break the row accounting.
+    content: Arc<crate::content::Content>,
     /// Index into the run's log: everything below it has been written.
     cursor: usize,
     /// The accepted assistant turn of the unit in flight, while its answers are
@@ -61,9 +65,14 @@ impl Persister {
     /// `run` seeds the cursor from
     /// [`projection_start`](AgentRun::projection_start): everything below it is
     /// the prompt (persisted at dispatch) or loaded history (already stored).
-    pub(crate) fn new(run: &AgentRun, session: Option<Arc<Session>>) -> Self {
+    pub(crate) fn new(
+        run: &AgentRun,
+        session: Option<Arc<Session>>,
+        content: Arc<crate::content::Content>,
+    ) -> Self {
         Self {
             session,
+            content,
             cursor: run.projection_start(),
             tail: None,
             tail_at: None,
@@ -177,7 +186,8 @@ impl Persister {
                 true
             }
             Err(error) => {
-                eprintln!("Warning: failed to persist session batch: {error}");
+                self.content
+                    .display_error(&format!("failed to persist the session: {error}"));
                 self.unsaved = Some((messages, seed));
                 false
             }
@@ -355,7 +365,11 @@ mod tests {
     /// session, doubling every tool result the model then reads back.
     #[test]
     fn a_written_unit_is_not_closed_again() {
-        let mut p = Persister::new(&AgentRun::new(Message::user("go")), None);
+        let mut p = Persister::new(
+            &AgentRun::new(Message::user("go")),
+            None,
+            Arc::new(crate::content::Content::quiet()),
+        );
         // The turn sits at index 3 of the log, and the cursor has written past
         // it (indices 0..=3 are on disk).
         p.set_tail(turn_of(&["c1"]).into(), 3);
@@ -375,7 +389,11 @@ mod tests {
     /// what lets an abort mid-batch lose nothing.
     #[test]
     fn an_unwritten_unit_is_still_held() {
-        let mut p = Persister::new(&AgentRun::new(Message::user("go")), None);
+        let mut p = Persister::new(
+            &AgentRun::new(Message::user("go")),
+            None,
+            Arc::new(crate::content::Content::quiet()),
+        );
         p.set_tail(turn_of(&["c1"]).into(), 3);
         p.cursor = 2;
         if p.tail_at.is_some_and(|at| p.cursor > at) {
