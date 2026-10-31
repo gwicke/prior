@@ -213,16 +213,19 @@ impl<'a> TurnPump<'a> {
 /// key to pump and the wait is [`cancellable_sleep_pumped`] with `None` —
 /// deadline and cancel signal only.
 pub(crate) fn turn_backoff_pump<'a>(
-    prompt_session: &'a mut Option<crate::repl::PromptSession>,
-    keys: &'a mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
-    history: &'a mut crate::repl::History,
+    prompt_session: Option<&'a mut crate::repl::PromptSession>,
+    keys: Option<&'a mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>>,
+    history: Option<&'a mut crate::repl::History>,
     label: &'a str,
     content: &'a crate::content::Content,
 ) -> Option<TurnPump<'a>> {
     // A prompt session exists only in the REPL (interactive tty) — the same
     // fact the old `guard` zip re-checked, since TermIO is Tty iff there is one.
-    match (prompt_session.as_mut(), history) {
-        (Some(session), history) => Some(TurnPump {
+    // All three come from one `match` in `prompt`, so they are present or absent
+    // together; requiring the triple keeps that explicit rather than depending
+    // on it.
+    match (prompt_session, keys, history) {
+        (Some(session), Some(keys), Some(history)) => Some(TurnPump {
             keys,
             session,
             history,

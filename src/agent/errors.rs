@@ -747,27 +747,6 @@ mod tests {
             super::retry_budget(&PriorError::LlmMaxTurns { max_turns: 16 }),
             0
         );
-        // LlmInterrupted delegates to its cause.
-        assert_eq!(
-            super::retry_budget(&PriorError::LlmInterrupted {
-                cause: Box::new(PriorError::LlmRateLimited {
-                    retry_after_secs: None
-                }),
-            }),
-            50
-        );
-        assert_eq!(
-            super::retry_budget(&PriorError::LlmInterrupted {
-                cause: Box::new(PriorError::LlmTransport("reset".into())),
-            }),
-            50
-        );
-        assert_eq!(
-            super::retry_budget(&PriorError::LlmInterrupted {
-                cause: Box::new(PriorError::LlmAuth { status: 403 }),
-            }),
-            0
-        );
     }
 
     // `#[serial]`: reads the no-hint base, which

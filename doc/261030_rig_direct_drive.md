@@ -311,8 +311,29 @@ One position, one function: the transcript and the wire cannot disagree about wh
    - **A malformed `edit` block still gets its terse text.** That rewrite used to live in the hook's
      outcome path on `as_text`; it now happens when the part is built, where the model-visible text
      is decided.
-3. **Retry by resume.** Back-off loop around the attempt, deleting `LlmInterrupted`, `"continue"`,
-   `TurnPersistence`. `doc/tool_error_handling.md` §"Mid-turn failure" is retired with it.
+3. **Retry by resume. Done.** The attempt loop lives in `prompt` (`src/agent/turn.rs`), over a
+   `DriveLoop` built once per user prompt and borrowed by `run_stream`. A failed attempt breaks the
+   pump loop, waits out the back-off with the key pump still running, and polls the *same* loop
+   again: `next_step` from the run's untouched `AwaitingModel` re-emits the identical `CallModel`.
+   `LlmInterrupted`, `TurnPersistence`, the `"continue"` prompt and the whole `next_input` /
+   `steer_delivered` / `turn_params` dance are deleted.
+   - **`run_stream` yields the error and keeps going.** It does not `return`: the retry policy is
+     the caller's (back-off, budget, the cancellable wait where `Esc` and the key queue already
+     live), so dropping the stream is how the caller gives up and polling again is how it retries.
+   - **Retry correctness had a persistence precondition.** `close` must not re-write a unit the
+     cursor already wrote, and a retried turn hits exactly that shape (a batch completes, the
+     continuation fails, the turn exits). `set_tail` now records the turn's index and
+     `write_committed` clears the held copy once the cursor passes it.
+   - **The corrective hint is a context document, not prompt text.** `Drive::retry_hint` is a
+     one-slot mailbox the loop drains into `RequestPatch::extra_context` at the next `before_call` —
+     `take`, not `clone`, so it reaches exactly one attempt. The model sees why its call failed; the
+     transcript never keeps the reminder. This is the first user of the steering machinery §5
+     describes, and it is why a malformed tool call no longer costs a synthetic user message.
+   - **Asserted end-to-end**, not just structurally: `tests/retry_as_attempt.rs` drives the real
+     binary through a mid-turn 429 and asserts the session holds exactly one user message, and that
+     no `"continue"` ever reached the provider. Verified to fail if a synthetic message is
+     re-introduced.
+   - `doc/tool_error_handling.md` §"Mid-turn failure" is retired with it.
 4. **Steering and boundary settings.** `SteeringQueue`, the projection's steer insertion and scalar
    overrides, the mid-turn UI entry points and `/reasoning`-style mid-turn commits.
 5. **Tools state their own call shape.** `CallPart`, the injection and the parts-unpack in `project`

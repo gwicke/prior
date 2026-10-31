@@ -476,7 +476,6 @@ pub(crate) fn model_facing_tool_text<'a>(tool_name: &str, text: &'a str) -> Opti
 mod tests {
     use super::*;
 
-    use crate::agent::TurnPersistence;
     use rig_core::message::Reasoning;
     /// The model-facing text for a malformed `edit` block must lead with the
     /// problem and drop the two redundant wrappers. This is the single highest-
@@ -773,47 +772,10 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         assert_eq!(twice, thrice);
     }
 
-    #[test]
-    fn turn_persistence_counts_dispatch_not_text() {
-        // The per-turn record counts NEW dispatches (the user's original
-        // prompt plus each steering/continuation directive), never the
-        // prompt TEXT. This is what lets two identical "continue" messages
-        // in one turn be treated as distinct dispatches.
-        let turn = TurnPersistence::new();
-        assert_eq!(turn.sent(), 0);
+    // The per-turn dispatch count is gone with `TurnPersistence`: a retry is
+    // now an attempt inside one run, not a new dispatch, so there is nothing
+    // left to count (`doc/261030_rig_direct_drive.md` §5).
 
-        // The user's first prompt is dispatch 1.
-        turn.mark_new_dispatch();
-        assert_eq!(turn.sent(), 1);
-
-        // A retry that re-sends the SAME prompt does NOT bump the count:
-        // callers only call mark_new_dispatch when next_input actually
-        // changes to a new message.
-        // (No-op here; the no-resend case is just "don't call it".)
-
-        // A steering "continue" (same text as a possible original) is a NEW
-        // dispatch and must bump.
-        turn.mark_new_dispatch();
-        assert_eq!(turn.sent(), 2);
-
-        // A second "continue" steering is yet another dispatch.
-        turn.mark_new_dispatch();
-        assert_eq!(turn.sent(), 3);
-    }
-
-    #[test]
-    fn turn_persistence_is_fresh_per_new_turn() {
-        // Two successive user turns must have independent dispatch counts
-        // (e.g. the user types "continue" twice). The REPL mints a fresh
-        // TurnPersistence per user prompt, so turn 2 starts at 0 even
-        // though turn 1 dispatched and persisted a "continue".
-        let turn1 = TurnPersistence::new();
-        turn1.mark_new_dispatch();
-        assert_eq!(turn1.sent(), 1);
-
-        let turn2 = TurnPersistence::new();
-        assert_eq!(turn2.sent(), 0);
-    }
     // ---- the write path now lives in `persist`/`project` ----
     //
     // Nothing here pins the batch shape any more: the run's committed log is the

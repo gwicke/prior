@@ -82,7 +82,19 @@ pub(crate) struct Drive {
     /// Where committed units are written. `None` for a sessionless run, which
     /// still needs to know it made progress but has nowhere to put it.
     pub(crate) session: Option<Arc<Session>>,
+    /// A one-slot mailbox from the retry loop in `turn.rs::prompt` to
+    /// [`Observer::before_call`]: the corrective hint the *next* request should
+    /// carry.
+    ///
+    /// It is a document ([`crate::agent::drive::context_document`]) rather than a
+    /// message because it must steer the model without entering the transcript:
+    /// a synthetic "your last tool call was malformed" line that became part of
+    /// history would be re-read as a user instruction on every later turn.
+    pub(crate) retry_hint: crate::agent::drive::RetryHint,
 }
+
+/// Where a retry hint waits for the next request.
+pub(crate) type RetryHint = Arc<std::sync::Mutex<Option<Document>>>;
 
 /// The host's side of the loop: paint, persist, cancel, and the recovery
 /// policies that used to be rig hooks.
@@ -204,6 +216,11 @@ impl DriveLoop {
         (this, handle)
     }
 
+    /// The mailbox the next request's corrective hint is written into.
+    pub(crate) fn retry_hint(&self) -> &RetryHint {
+        &self.drive.retry_hint
+    }
+
     /// The error to report when the caller stops the loop: the same canonical
     /// history rig's own cancellation carried.
     #[allow(dead_code)]
@@ -226,13 +243,28 @@ impl DriveLoop {
             if self.attempt.is_some() {
                 match self.advance_attempt().await {
                     Ok(()) => continue,
-                    Err(error) => return Some(Err(error)),
+                    Err(error) => {
+                        // Drop the in-flight attempt. A failed stream is dead and
+                        // must not be polled again, but the *run* is untouched:
+                        // `streamed_turn` never saw the turn, so it is still
+                        // `AwaitingModel` and the next step re-issues the same
+                        // `CallModel` — same turn, no budget, no new message.
+                        // That is the whole of "a retry is the same attempt".
+                        self.attempt = None;
+                        return Some(Err(error));
+                    }
                 }
             }
             match self.advance_step().await {
                 Ok(Step::Advanced) => continue,
                 Ok(Step::Done(response)) => return Some(Ok(DriveItem::Done(*response))),
-                Err(error) => return Some(Err(error)),
+                Err(error) => {
+                    // A step-machine error is terminal: the run's own state went
+                    // to `Failed` (or was never resumable), so re-issuing would
+                    // only reproduce it. Stop rather than spin.
+                    self.finished = true;
+                    return Some(Err(error));
+                }
             }
         }
     }
@@ -265,7 +297,7 @@ impl DriveLoop {
                         .map(Arc::new)
                         .collect()
                 };
-                let patch = match self
+                let mut patch = match self
                     .drive
                     .observer
                     .before_call(&prompt, &history, turn)
@@ -274,6 +306,22 @@ impl DriveLoop {
                     Ok(patch) => patch,
                     Err(reason) => return Err(self.run.cancel_error(reason)),
                 };
+                // A retry's corrective hint rides this one request and is gone:
+                // the observer shapes history, the loop owns what a retry says.
+                // `take`, not `clone`, so a hint cannot outlive the attempt it
+                // was written for.
+                if let Some(hint) = self
+                    .drive
+                    .retry_hint
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    patch
+                        .get_or_insert_with(RequestPatch::new)
+                        .extra_context
+                        .push(hint);
+                }
 
                 let prepared = prepare_request(
                     &self.drive.spec,
@@ -423,7 +471,10 @@ impl DriveLoop {
         let content = assembled.choice.clone();
         let recorded = assistant_message(None, content.clone());
         self.run.streamed_turn(assembled)?;
-        self.persist.lock().await.set_tail(recorded);
+        // `at` is where the run put it: the persister clears its held copy once
+        // the cursor has written past it.
+        let at = self.run.messages().len().saturating_sub(1);
+        self.persist.lock().await.set_tail(recorded, at);
         // Per-call usage reaches the caller the same way rig's stream carried
         // it, so the status line keeps reading the provider's own count.
         self.queue
@@ -609,9 +660,11 @@ impl PersistHandle {
 /// owns an in-flight provider stream — the attempt would restart at every pause.
 /// Inside `stream!` the future lives across the `yield`, so a pump that stops
 /// selecting resumes the same attempt.
+/// Borrows the loop rather than owning it: a failed attempt leaves the run
+/// resumable, and resuming means polling this same loop again.
 pub(crate) fn run_stream(
-    mut drive: DriveLoop,
-) -> impl futures::Stream<Item = Result<MultiTurnStreamItem, PromptError>> + Send {
+    drive: &mut DriveLoop,
+) -> impl futures::Stream<Item = Result<MultiTurnStreamItem, PromptError>> + '_ {
     async_stream::stream! {
         while let Some(item) = drive.next().await {
             match item {
@@ -620,8 +673,13 @@ pub(crate) fn run_stream(
                     yield Ok(MultiTurnStreamItem::FinalResponse(response));
                 }
                 Err(error) => {
+                    // Yield, do not return. The caller owns the retry policy —
+                    // back-off, budget and the cancellable wait all live in the
+                    // turn pump, where `Esc` and the key queue already are — and
+                    // if it polls again the loop resumes from wherever the run
+                    // really is. Dropping the stream is the caller's way of
+                    // giving up, which is why there is nothing to unwind here.
                     yield Err(error);
-                    return;
                 }
             }
         }
@@ -634,12 +692,44 @@ pub(crate) fn run_stream(
 /// property a steer needs: it changes what the model sees without becoming part
 /// of the transcript the next turn reads.
 ///
-/// Phase 2 (`doc/261030_rig_direct_drive.md` §5) is the first user.
-#[allow(dead_code)]
-pub(crate) fn steer_document(text: impl Into<String>) -> Document {
+/// Both users exist: a retry hint (`turn.rs::prompt`), and — from phase 5 —
+/// a queued mid-turn steer.
+pub(crate) fn context_document(text: impl Into<String>) -> Document {
     Document {
         id: uuid::Uuid::now_v7().to_string(),
         text: text.into(),
         additional_props: Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hint is taken, not read: one corrective message for one attempt.
+    ///
+    /// A cloned or non-consuming read would replay "your last tool call was
+    /// malformed" on every later request of the turn — and, because the hint is
+    /// a context document, without ever appearing in the transcript to explain
+    /// where it came from.
+    #[test]
+    fn a_retry_hint_is_delivered_once() {
+        let hint: RetryHint = RetryHint::default();
+        *hint.lock().unwrap() = Some(context_document("re-emit the call"));
+
+        let first = hint.lock().unwrap().take();
+        assert_eq!(first.map(|d| d.text), Some("re-emit the call".to_string()));
+
+        let second = hint.lock().unwrap().take();
+        assert!(second.is_none(), "the hint must not survive its attempt");
+    }
+
+    /// Each hint carries a fresh id, so two steers are two documents rather
+    /// than one document rendered twice.
+    #[test]
+    fn context_documents_are_distinct() {
+        let a = context_document("one");
+        let b = context_document("one");
+        assert_ne!(a.id, b.id);
     }
 }

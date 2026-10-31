@@ -12,10 +12,9 @@
 //! `main` awaits, and it returns when the user quits.
 
 use crate::agent::build::{create_agent, effective_params, AgentConfig};
-use crate::agent::errors::{retry_budget, retry_delay_ms};
-use crate::agent::pumps::{cancellable_sleep_pumped, turn_backoff_pump};
+
 use crate::agent::status::resolved_context_limit;
-use crate::agent::{build_session_ctx, ensure_session, record_reasoning_change, TurnPersistence};
+use crate::agent::{build_session_ctx, ensure_session, record_reasoning_change};
 use crate::app_state::AppState;
 use crate::confirm::ConfirmBridge;
 use crate::model_catalog;
@@ -30,7 +29,7 @@ use crate::Result;
 use crate::agent::transcript::assistant_message;
 use rig_core::message::{AssistantContent, Message, Text};
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Load the list of recently-used model IDs from `recent_models.txt`.
@@ -180,7 +179,6 @@ struct Interactive {
     settings_watch: Option<crate::settings_watch::SettingsWatch>,
     repo: Option<JsonlSessionRepo>,
     line_history: History,
-    cancel: Arc<AtomicBool>,
     app_state: Arc<AppState>,
     last_attempted_target: Option<RebuildFingerprint>,
     prompt_session: Option<PromptSession>,
@@ -476,7 +474,6 @@ impl Interactive {
             settings_watch,
             repo,
             line_history,
-            cancel,
             app_state,
             last_attempted_target,
             prompt_session,
@@ -854,217 +851,36 @@ impl Interactive {
         // turns, a key typed at the very end of a turn lands in the next
         // prompt rather than being discarded (a deliberate change from the
         // per-turn queue, which died with the turn).
-        let response: std::result::Result<String, crate::PriorError> = {
-            let mut consecutive_failures: u8 = 0;
-            let mut next_input: String = input.clone();
-            // The params this turn sends. They are the live ones with
-            // the typed overrides applied, and they are *carried*, not
-            // applied to the live config — so a retry of the same
-            // dispatch re-uses them automatically (the stripped text is
-            // already in `next_input`), while a synthetic re-prompt
-            // below resets them, since an override belongs to the
-            // user's dispatch and not to the model's own feedback.
-            let mut turn_params = effective_params;
-            // Per-turn persistence flag. Reset once per user prompt
-            // (NOT per retry): the retry loop below reuses it across
-            // `prompt()` attempts so a pre-persisted `user(input)` is
-            // not duplicated, while the NEXT turn starts fresh (so
-            // two identical inputs in a row, e.g. "continue" twice,
-            // never collide). See `TurnPersistence`.
-            let turn = TurnPersistence::new();
-            // The user's original prompt is this turn's first NEW
-            // dispatch.
-            turn.mark_new_dispatch();
-            // The full steering message (synthetic feedback / "continue")
-            // is delivered once per logical turn; `prompt()` persists it
-            // with the partial transcript when a retry makes progress and
-            // then fails again. Re-sending the same full steer on that
-            // later interruption would repeat it in the session once the
-            // retry succeeds, so later interruptions get a short
-            // continuation instead.
-            let mut steer_delivered = false;
-            let outcome: std::result::Result<String, crate::PriorError> = loop {
-                let prompt_result = agent
-                    .as_ref()
-                    .unwrap()
-                    .prompt(
-                        &next_input,
-                        session.clone(),
-                        &turn,
-                        &turn_params,
-                        // The key branch exists only where there is a session
-                        // to receive it — built by the REPL arm alone, i.e.
-                        // interactive tty (the same fact the old `guard` zip
-                        // re-checked). Piped input gets no key branch: the
-                        // persistent reader's queue is simply not read there.
-                        // `keys` is the one process-lifetime channel the
-                        // reader feeds.
-                        self.prompt_session
-                            .as_mut()
-                            .map(|sess| crate::repl::InTurnInput {
-                                session: sess,
-                                keys: &mut self.input,
-                                confirms: &mut self.confirm_bridge.requests,
-                                label: &self.prompt_str,
-                                history: &mut self.line_history,
-                            }),
-                    )
-                    .await;
-                match prompt_result {
-                    Ok(text) => break Ok(text),
-                    Err(crate::PriorError::Cancelled(_)) => {
-                        break Err(crate::PriorError::Cancelled("Aborted.".into()));
-                    }
-                    // Mid-turn failure that persisted progress: the
-                    // underlying run produced content/tool calls
-                    // before erroring. This is NOT a "consecutive
-                    // failure" for back-off purposes — there was
-                    // successful work in between — so reset the
-                    // counter and treat the upcoming retry as a
-                    // fresh first attempt (delay = 2^0 = 1 s, or
-                    // the provider's Retry-After floor). The budget
-                    // is still consumed (one retry used), but the
-                    // exponential delay does not compound.
-                    Err(crate::PriorError::LlmInterrupted { cause, .. })
-                        if consecutive_failures < retry_budget(&cause) =>
-                    {
-                        consecutive_failures = 0;
-                        // `prompt()` persisted the user prompt + the
-                        // finalized partial transcript to the session
-                        // and returned `LlmInterrupted`. Continue from
-                        // that transcript with a steering message — the
-                        // original `input` is already in the session,
-                        // so re-sending it would duplicate the user's
-                        // request.
-                        let ms = retry_delay_ms(&cause, 1);
-                        self.config.content.display_text(&format!(
-                            "Error: {}. Retrying in {}s...",
-                            cause,
-                            ms / 1000
-                        ));
-                        let slept = cancellable_sleep_pumped(
-                            &self.config.user_cancel,
-                            &self.config.cancel_notify,
-                            ms,
-                            turn_backoff_pump(
-                                &mut self.prompt_session,
-                                &mut self.input,
-                                &mut self.line_history,
-                                &self.prompt_str,
-                                &self.config.content,
-                            ),
-                        )
-                        .await;
-                        if !slept {
-                            break Err(crate::PriorError::Cancelled("Aborted.".into()));
-                        }
-                        // Steering prompt: the synthetic feedback for
-                        // e.g. malformed tool calls (carries the parse
-                        // error the model needs to self-correct), else a
-                        // short "continue" pointing at the persisted
-                        // work. NOT appended to the session — it becomes
-                        // the retry's prompt (input + partial are already
-                        // persisted). Delivered in full (the synthetic
-                        // feedback) only once per logical turn; after the
-                        // model has already been steered once and made
-                        // further (persisted) progress, a plain "continue"
-                        // suffices and avoids repeating the steer text in
-                        // the session.
-                        //
-                        // When there is no session, nothing was actually
-                        // persisted, so a "continue where you left off"
-                        // steer would point at context that doesn't exist
-                        // and drop the user's original request. In that
-                        // case re-send the original `input` instead (same
-                        // as the no-progress path) — the back-off reset
-                        // above still applies, but the user's turn is not
-                        // lost.
-                        next_input = if session.is_none() {
-                            input.clone()
-                        } else if steer_delivered {
-                            "continue".to_string()
-                        } else {
-                            steer_delivered = true;
-                            match cause.synthetic_retry_feedback() {
-                                Some(fb) => fb,
-                                None => "continue".to_string(),
-                            }
-                        };
-                        // The steering message is a NEW user dispatch
-                        // for this turn (distinct from the original
-                        // prompt), so it counts toward `turns_sent` and
-                        // will be persisted/deduped as its own message.
-                        turn.mark_new_dispatch();
-                        if self.cancel.load(Ordering::SeqCst) {
-                            break Err(crate::PriorError::Cancelled("Aborted.".into()));
-                        }
-                        continue;
-                    }
-                    // No-progress retryable failure: `prompt()` returned
-                    // the plain classified error. `prompt()`'s error
-                    // branch already de-duped and persisted `user(input)`
-                    // (or skipped it because the session already ended
-                    // on it), so we do NOT re-append here. The retry
-                    // re-runs from `input` (the turn never got past its
-                    // first model call). For malformed tool calls the
-                    // model needs the parse error to self-correct; in
-                    // that case the synthetic feedback becomes the
-                    // retry's prompt instead of `input`.
-                    Err(e) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
-                        consecutive_failures = consecutive_failures.saturating_add(1);
-                        let ms = retry_delay_ms(&e, consecutive_failures);
-                        self.config.content.display_text(&format!(
-                            "Error: {}. Retrying in {}s...",
-                            e,
-                            ms / 1000
-                        ));
-                        let slept = cancellable_sleep_pumped(
-                            &self.config.user_cancel,
-                            &self.config.cancel_notify,
-                            ms,
-                            turn_backoff_pump(
-                                &mut self.prompt_session,
-                                &mut self.input,
-                                &mut self.line_history,
-                                &self.prompt_str,
-                                &self.config.content,
-                            ),
-                        )
-                        .await;
-                        if !slept {
-                            break Err(crate::PriorError::Cancelled("Aborted.".into()));
-                        }
-                        if let Some(feedback) = e.synthetic_retry_feedback() {
-                            // `prompt()` already persisted `user(input)`
-                            // (de-duped). Re-prompt with the synthetic
-                            // feedback so the model can self-correct.
-                            next_input = feedback;
-                            // Drop the override: it was the user's
-                            // instruction for *their* dispatch, and
-                            // this is the model's own corrective
-                            // re-prompt. Carrying a `/temperature 0.2`
-                            // into it would silently keep applying a
-                            // sampling the user never asked for on this
-                            // exchange.
-                            turn_params = self.app_state.params();
-                            // The feedback replaces the original prompt
-                            // as a NEW user dispatch for this turn.
-                            turn.mark_new_dispatch();
-                        }
-                        // Race window: cancel could fire after
-                        // `cancellable_sleep_pumped` returned but
-                        // before `prompt()` clears its flag. Bail
-                        // out here so the retry respects `Esc`.
-                        if self.cancel.load(Ordering::SeqCst) {
-                            break Err(crate::PriorError::Cancelled("Aborted.".into()));
-                        }
-                        continue;
-                    }
-                    Err(e) => break Err(e),
-                }
-            };
-            outcome
-        };
+        // One call, one logical turn. The retry loop lives in `prompt` now:
+        // a failed attempt is re-issued on the same `AgentRun` (design §5), so
+        // there is no synthetic "continue" prompt, no re-dispatch and no
+        // per-turn `TurnPersistence` bookkeeping to do here.
+        //
+        // `Esc` is dispatched by the turn's one key dispatcher wherever the turn
+        // is: inside `prompt` while an attempt streams, and by the same pump
+        // while a back-off waits — either way it fires the cancel signal and the
+        // turn returns `Cancelled`.
+        let response: std::result::Result<String, crate::PriorError> = agent
+            .as_ref()
+            .unwrap()
+            .prompt(
+                &input,
+                session.clone(),
+                &effective_params,
+                // The key branch exists only where there is a session to
+                // receive it — built by the REPL arm alone, i.e. interactive
+                // tty. Piped input gets no key branch.
+                self.prompt_session
+                    .as_mut()
+                    .map(|sess| crate::repl::InTurnInput {
+                        session: sess,
+                        keys: &mut self.input,
+                        confirms: &mut self.confirm_bridge.requests,
+                        label: &self.prompt_str,
+                        history: &mut self.line_history,
+                    }),
+            )
+            .await;
         // No reader teardown here: the stdin reader is process-lifetime now
         // — it keeps feeding the one channel across turns
         // and into the next prompt.

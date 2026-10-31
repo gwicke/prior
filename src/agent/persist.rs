@@ -42,6 +42,12 @@ pub(crate) struct Persister {
     /// still arriving. Held because `close` must be callable without the run: an
     /// abort drops the loop, and a `Drop` impl cannot await.
     tail: Option<Message>,
+    /// Where that turn sits in the run's log. Once the cursor passes it the unit
+    /// has been written and the held copy is redundant — clearing it there is
+    /// what stops `close` re-writing a batch that already reached disk, which is
+    /// the ordinary shape of a retry (batch completes, continuation fails, turn
+    /// exits).
+    tail_at: Option<usize>,
     /// The answers that landed for the batch in flight, by call id.
     answered: HashMap<CallId, UserContent>,
     /// A batch whose append failed, so a retry writes the same ids instead of
@@ -60,6 +66,7 @@ impl Persister {
             session,
             cursor: run.projection_start(),
             tail: None,
+            tail_at: None,
             answered: HashMap::new(),
             unsaved: None,
             wrote: false,
@@ -69,9 +76,12 @@ impl Persister {
     /// The run accepted an assistant turn. A tool-bearing one is held until its
     /// answers land, because the run commits a whole batch as one message and an
     /// abort in between would drop what already ran.
-    pub(crate) fn set_tail(&mut self, turn: Message) {
+    /// `at` is the turn's index in the run's log, so the persister can tell when
+    /// the cursor has moved past it.
+    pub(crate) fn set_tail(&mut self, turn: Message, at: usize) {
         let calls_tools = matches!(&turn, Message::Assistant(t) if project::calls_a_tool(t));
         self.tail = calls_tools.then_some(turn);
+        self.tail_at = calls_tools.then_some(at);
         self.answered.clear();
     }
 
@@ -107,6 +117,15 @@ impl Persister {
         let messages = project::project(&pending[..complete]);
         if self.append(messages).await {
             self.cursor += complete;
+            // The run committed the held unit, so its held copy is now redundant
+            // and `close` must not write it again. That matters because a turn
+            // often ends *after* a written boundary (a tool batch completes, the
+            // continuation fails, the turn exits) — the normal shape of a retry.
+            if self.tail_at.is_some_and(|at| self.cursor > at) {
+                self.tail = None;
+                self.tail_at = None;
+                self.answered.clear();
+            }
         }
     }
 
@@ -120,6 +139,7 @@ impl Persister {
         if !self.retry_unsaved().await {
             return;
         }
+        self.tail_at = None;
         let Some(Message::Assistant(turn)) = self.tail.take() else {
             return;
         };
@@ -323,6 +343,46 @@ mod tests {
         .collect();
         let results = results_of(&close_unit(turn_of(&["c1"]), &answers));
         assert!(results[0].2, "the part's own is_error survives the close");
+    }
+
+    /// A unit the run committed and the cursor wrote past must not be closed a
+    /// second time.
+    ///
+    /// This is the ordinary shape of a retried turn: a tool batch completes (so
+    /// `write_committed` writes it at the next boundary) and the *continuation*
+    /// then fails, so the turn exits and `close` runs. Without the clearing rule
+    /// the close would append the same batch again — a duplicate turn in the
+    /// session, doubling every tool result the model then reads back.
+    #[test]
+    fn a_written_unit_is_not_closed_again() {
+        let mut p = Persister::new(&AgentRun::new(Message::user("go")), None);
+        // The turn sits at index 3 of the log, and the cursor has written past
+        // it (indices 0..=3 are on disk).
+        p.set_tail(turn_of(&["c1"]).into(), 3);
+        p.cursor = 4;
+        // The rule `write_committed` applies once the cursor moves.
+        if p.tail_at.is_some_and(|at| p.cursor > at) {
+            p.tail = None;
+            p.tail_at = None;
+        }
+        assert!(
+            p.tail.is_none(),
+            "the held copy must be dropped once written"
+        );
+    }
+
+    /// The converse: a unit the cursor has *not* reached is still held, which is
+    /// what lets an abort mid-batch lose nothing.
+    #[test]
+    fn an_unwritten_unit_is_still_held() {
+        let mut p = Persister::new(&AgentRun::new(Message::user("go")), None);
+        p.set_tail(turn_of(&["c1"]).into(), 3);
+        p.cursor = 2;
+        if p.tail_at.is_some_and(|at| p.cursor > at) {
+            p.tail = None;
+            p.tail_at = None;
+        }
+        assert!(p.tail.is_some(), "an unwritten unit stays held for `close`");
     }
 
     /// A text-only turn has nothing to close: no synthesized results, no message.

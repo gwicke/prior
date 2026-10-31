@@ -224,23 +224,6 @@ pub enum PriorError {
         max_turns: usize,
     },
 
-    /// A transient, auto-retryable error (429, transport, 5xx, malformed
-    /// tool-call JSON, …) interrupted the run *after* some progress had
-    /// already been persisted to the session as a canonical partial
-    /// transcript. The REPL must continue from that transcript with a
-    /// steering message rather than re-sending the original input — the
-    /// input is already in the session as the persisted turn's first
-    /// message, so re-sending it would duplicate the user's request.
-    ///
-    /// The wrapped [`cause`](Self::cause) carries the classification the
-    /// user sees (e.g. `LlmRateLimited`) and the back-off hint
-    /// (`retry_after_secs()`); the accessors on this variant delegate to it.
-    #[error("{}", .cause)]
-    LlmInterrupted {
-        /// The underlying classified error.
-        cause: Box<PriorError>,
-    },
-
     #[error("Missing API key for provider {0}. Please set the {1} environment variable.")]
     MissingApiKey(String, String),
 
@@ -267,26 +250,21 @@ impl PriorError {
     /// tool). Always check this *before* retrying so a single failure does not
     /// loop forever if the underlying problem is persistent.
     pub fn is_auto_retryable(&self) -> bool {
-        match self {
-            PriorError::LlmInterrupted { cause } => cause.is_auto_retryable(),
-            _ => matches!(
-                self,
-                PriorError::LlmRateLimited { .. }
-                    | PriorError::LlmUpstream { .. }
-                    | PriorError::LlmTransport(_)
-                    | PriorError::LlmStreamProtocol(_)
-                    | PriorError::LlmMalformedToolCall { .. }
-            ),
-        }
+        matches!(
+            self,
+            PriorError::LlmRateLimited { .. }
+                | PriorError::LlmUpstream { .. }
+                | PriorError::LlmTransport(_)
+                | PriorError::LlmStreamProtocol(_)
+                | PriorError::LlmMalformedToolCall { .. }
+        )
     }
 
     /// The `Retry-After` hint for a rate-limited response, if the provider
-    /// reported one. `None` for every other error variant. Delegates through
-    /// [`LlmInterrupted`](Self::LlmInterrupted) to the wrapped cause.
+    /// reported one. `None` for every other error variant.
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             PriorError::LlmRateLimited { retry_after_secs } => *retry_after_secs,
-            PriorError::LlmInterrupted { cause } => cause.retry_after_secs(),
             _ => None,
         }
     }
@@ -306,7 +284,6 @@ impl PriorError {
     /// next prompt and letting the model retry.
     pub fn synthetic_retry_feedback(&self) -> Option<String> {
         match self {
-            PriorError::LlmInterrupted { cause } => cause.synthetic_retry_feedback(),
             PriorError::LlmMalformedToolCall {
                 tool_name,
                 parse_error,

@@ -1,9 +1,12 @@
 # Turn Error Handling & Auto-Retry (Design)
 
-> **Superseded in part.** [`261030_rig_direct_drive.md`](261030_rig_direct_drive.md) keeps the run
-> in hand, so a retry re-issues `next_step` instead of injecting a `"continue"` prompt. The
-> "Mid-turn failure & resume" analysis and the requirements resting on it are retired; the
-> tool-error classification tables still stand.
+> **Superseded in part, and now landed.** [`261030_rig_direct_drive.md`](261030_rig_direct_drive.md)
+> keeps the run in hand, so a retry re-issues `next_step` on the same `AgentRun` instead of
+> injecting a `"continue"` prompt. Phase 3 implemented that: `LlmInterrupted` and `TurnPersistence`
+> are gone, and a correction reaches the model as a `RequestPatch::extra_context` document rather
+> than as a synthetic user message. The "Mid-turn failure & resume" section below is kept as the
+> record of what was wrong; its requirements no longer describe the code. The tool-error
+> classification tables still stand, and are still what the retry loop classifies with.
 
 *Status: design + implementation. Cross-checked against the pinned rig
 checkout (`gwicke/rig` rev `1c2f4405`, `rig-agent`/`rig-run`/`rig-core` 0.42)
@@ -126,6 +129,10 @@ if the retry budget is then exhausted, the user's entire turn is lost —
 including completed tool results that should have been preserved.
 
 ### Requirements
+
+> Retired as *requirements* — the code satisfies them by construction now (the run is never dropped,
+> so there is no restart to avoid and no steering message to de-duplicate). Kept as the statement of
+> what the design had to achieve, and as the reason the direct-drive plan exists.
 
 - R1 — **Preserve progress.** Completed model turns (text + reasoning) and
   completed tool-call→result pairs that happened before the failure must
