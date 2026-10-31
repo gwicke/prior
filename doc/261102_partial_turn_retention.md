@@ -220,13 +220,19 @@ the behaviour it pins.
 
 - **Streaming is unchanged.** Deltas paint as they arrive; only persistence is deferred to the
   failure. Nothing is buffered until a response completes.
-- **The retry visibly repaints.** The abandoned text stays on screen as a finished segment and the
-  retried text paints below it. With the text persisted, the screen and the session agree — the
-  repaint is honest rather than a divergence.
-- **Cost accounting stays prior-side.** `AgentRun::usage` has no setter and a rebuilt run counts
-  only its own segment. `turn.rs` already accumulates usage from `CompletionCall` items, so
-  continuity is whatever prior keeps; nothing should read `PromptResponse::usage` as a whole-turn
-  figure.
+- **The screen never repaints.** Scrollback is append-only: `end_response` commits the abandoned
+  text as a finished segment and the retried text appends *below* it, a `\n`-at-a-time
+  (`plan_append` addresses no row). So "repaint" is the wrong word — the retry adds rows, and the
+  only armed redraws are the live frame (status bar, input) and a terminal-width resize. With the
+  text now persisted, the screen and the session hold the same content, which is the property that
+  matters.
+- **Cost accounting stays prior-side, and in practice nothing is affected.** `AgentRun::usage` has
+  no setter, so a rebuilt run counts only its own segment and `PromptResponse::usage` under-reports
+  a rebuilt turn. But the final response is consumed for its *text* (`turn.rs`'s
+  `FinalResponse(_resp)` arm discards it), and every figure the user sees comes from
+  `CompletionCall` items, which arrive per attempt into `SessionUsage`. So the under-report is
+  reachable only by code that read the response's usage directly — of which there is none. Recorded
+  because it would be a trap for a future caller, not because it is currently wrong.
 - **A rebuilt run's `current_turn` resets**, hence the `max_turns` reduction in §3.
 
 ## 7. Decisions and open questions

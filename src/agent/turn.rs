@@ -359,10 +359,15 @@ impl CodeAgent {
                                 self.content.end_response_segment();
                             }
                             Some(Ok(MultiTurnStreamItem::FinalResponse(_resp))) => {
-                                // The final assistant turn is the in-flight response.
-                                // It gets no following completion call, so it is
-                                // persisted by the exit `commit()` below, not here —
-                                // the transcript's accepted turn already holds it.
+                                // Nothing to do: the loop already wrote the final
+                                // turn at its `Done` step, where the run commits
+                                // it. This arm is named rather than swallowed so
+                                // the omission is deliberate — the response's
+                                // `usage` is ignored here, and after a rebuild it
+                                // covers only the rebuilt segment. Per-call
+                                // figures reach the status line via
+                                // `CompletionCall`, which is why that costs
+                                // nothing today (doc §6a).
                             }
                             Some(Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. })) => {}
                             Some(Ok(MultiTurnStreamItem::ModelTurnRetried { .. })) => {}
