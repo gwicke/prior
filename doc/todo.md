@@ -4,10 +4,10 @@ NOTE: Keep things tight - normally no more than 1-2 lines per bullet point. More
 and link a doc/ and/or commit hash
 
 - [ ] Drive rig's `AgentRun` directly: own the loop, retry by re-issuing `next_step`, steers as
-      asides. Plan: doc/261030_rig_direct_drive.md. Phases **1, 2 and 5 done** (`edd10e5`,
-      `d10aa8c`): the loop is the only path, persistence is a cursor over `run.messages()`, and
-      tools state their own call shape. Remaining: 3 (retry by resume, killing `"continue"`), 4
-      (steering), 6 (cleanup).
+      asides. Plan: doc/261030_rig_direct_drive.md. Phases **1, 2, 3 and 5 done** (`edd10e5`,
+      `d10aa8c`, `7b23590`): the loop is the only path, persistence is a cursor over
+      `run.messages()`, tools state their own call shape, and `"continue"` is gone — a retry
+      re-issues the attempt. Remaining: 4 (mid-turn steering + boundary settings), 6 (cleanup).
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing
       `egress::host_allowed`; `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https;
       HTTP-only clients now come through R3i's front end instead). R4 (Landlock, per-path unix
