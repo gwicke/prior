@@ -1642,6 +1642,100 @@ impl Session {
         Ok(())
     }
 
+    /// Whether the active branch's leaf entry is a `custom_message` of this
+    /// type.
+    ///
+    /// The write-time guard for a synthetic continuation: the session is
+    /// append-only (`move_leaf` exists, but there is no truncate or delete), so
+    /// appending a second one on a consecutive retry could not be undone — the
+    /// litter would be permanent, and a provider would see it merged into one
+    /// user turn with two content blocks.
+    pub async fn ends_with_custom_message(&self, custom_type: &str) -> bool {
+        let branch = self.get_branch().await;
+        matches!(
+            branch.last().map(|e| &e.content),
+            Some(SessionEntryContent::CustomMessage { custom_type: t, .. }) if t == custom_type
+        )
+    }
+
+    /// Whether the active branch ends on an assistant message, i.e. the last
+    /// user turn stopped without a reply or a tool batch finishing it.
+    ///
+    /// The signal an empty submit resumes on
+    /// (`doc/261102_partial_turn_retention.md` §7): an aborted or failed turn
+    /// leaves its partial text as the branch's last message, and asking to carry
+    /// on needs no new prompt to be typed.
+    ///
+    /// Deliberately not "the last user turn did not complete" by any deeper
+    /// measure: append-only entries mean the branch's tail *is* the record of
+    /// whether anything followed the turn.
+    pub async fn ends_mid_turn(&self) -> bool {
+        let branch = self.get_branch().await;
+        matches!(
+            branch.last().map(|e| &e.content),
+            Some(SessionEntryContent::Message { message })
+                if message.get("role").and_then(|r| r.as_str()) == Some("assistant")
+        )
+    }
+
+    /// Write a synthetic continuation, unless the branch already ends with one.
+    ///
+    /// Returns whether a new entry was written. The guard is here rather than
+    /// at the call site because it is a property of the store: a caller cannot
+    /// see that a retry's predecessor already wrote one.
+    pub async fn ensure_custom_message(
+        &self,
+        custom_type: &str,
+        text: &str,
+    ) -> crate::Result<bool> {
+        if self.ends_with_custom_message(custom_type).await {
+            return Ok(false);
+        }
+        self.append_custom_message(custom_type, text).await?;
+        Ok(true)
+    }
+
+    /// Write a `custom_message` entry and advance the leaf.
+    ///
+    /// pi's "does participate in LLM context, rendered as user message" entry
+    /// type. Prior writes one per synthetic continuation (`customType`
+    /// `prior_continue`) so a rebuilt turn's prompt is identifiable on disk by
+    /// entry type rather than by matching its text — which is what keeps it
+    /// distinguishable from a genuine user steer, and what lets `/tree` refuse
+    /// to re-ask it.
+    pub async fn append_custom_message(
+        &self,
+        custom_type: &str,
+        text: &str,
+    ) -> crate::Result<String> {
+        self.ensure_persisted().await?;
+        let parent_id = { self.index.lock().await.leaf_id.clone() };
+        let entry = SessionEntry::new_custom_message(
+            custom_type.to_string(),
+            serde_json::Value::String(text.to_string()),
+            parent_id.clone(),
+        );
+        let id = entry.id.clone();
+        let storage = self.storage.lock().await;
+        storage.append_entry(&entry).await?;
+        let leaf = SessionEntry::new_leaf(Some(id.clone()), None);
+        storage.append_entry(&leaf).await?;
+        {
+            let mut index = self.index.lock().await;
+            index.order.push(entry.id.clone());
+            index.entries.insert(entry.id.clone(), Arc::new(entry));
+            if let Some(ref pid) = parent_id {
+                index
+                    .children
+                    .entry(pid.clone())
+                    .or_default()
+                    .push(id.clone());
+            }
+            index.leaf_id = Some(id.clone());
+        }
+        Ok(id)
+    }
+
     /// Write a BranchSummary entry and advance leaf.
     pub async fn append_branch_summary(
         &self,
@@ -1786,6 +1880,18 @@ pub(crate) fn extract_messages<T: Borrow<SessionEntry>>(entries: &[T]) -> Vec<Me
     for entry in entries {
         let content = match &entry.borrow().content {
             SessionEntryContent::Message { message } => message,
+            // pi's "renders as a user message" entry type. Prior writes one
+            // per synthetic continuation, and it must reach history on a
+            // reload — otherwise a resumed turn loses the nudge it was
+            // continuing from, and the reconstructed request has a different
+            // shape than the live one had.
+            SessionEntryContent::CustomMessage { content, .. } => {
+                if let Some(text) = content.as_str().filter(|t| !t.trim().is_empty()) {
+                    flush_tool_results(&mut messages, &mut tool_results);
+                    messages.push(Message::user(text));
+                }
+                continue;
+            }
             SessionEntryContent::BranchSummary { summary, .. } if !summary.is_empty() => {
                 flush_tool_results(&mut messages, &mut tool_results);
                 messages.push(Message::User {
@@ -3042,6 +3148,82 @@ mod tests {
             })
             .collect();
         assert_eq!(replayed, call_ids, "replay must agree with disk");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// The synthetic continuation end to end: written once, identified by entry
+    /// type, visible to the model on reload, and never offered for re-ask.
+    ///
+    /// `doc/261102_partial_turn_retention.md` §3/§5. The "once" matters because
+    /// the session is append-only: a second continuation on a consecutive retry
+    /// could not be removed, and rig merges consecutive user messages, so the
+    /// litter would be invisible at the wire and permanent on disk.
+    #[tokio::test]
+    async fn a_continuation_is_written_once_and_reaches_reloaded_history() {
+        use crate::agent::continuation;
+
+        let _tmp = tempfile::tempdir().unwrap();
+        let path = _tmp.path().join(session_filename(&chrono::Utc::now()));
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        storage
+            .write_header(&SessionHeader::new(Path::new("/test")))
+            .await
+            .unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        session
+            .append_message(&Message::user("fix it"))
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::assistant("halfway through"))
+            .await
+            .unwrap();
+        assert!(
+            session.ends_mid_turn().await,
+            "an assistant tail means the turn was cut short"
+        );
+
+        assert!(
+            session
+                .ensure_custom_message(continuation::CUSTOM_TYPE, continuation::TEXT)
+                .await
+                .unwrap(),
+            "the first attempt writes one"
+        );
+        assert!(
+            !session
+                .ensure_custom_message(continuation::CUSTOM_TYPE, continuation::TEXT)
+                .await
+                .unwrap(),
+            "a consecutive retry must append nothing"
+        );
+        assert!(
+            !session.ends_mid_turn().await,
+            "the continuation finished it"
+        );
+
+        // Reload: the continuation is context, so the model sees it — and it is
+        // identifiable by entry type, not by matching its text.
+        let ro = JsonlSessionStorage::open_readonly(path.clone())
+            .await
+            .unwrap();
+        let idx = ro.build_index().await.unwrap();
+        let reloaded = Session::new_persisted(ro, idx);
+        let ctx = reloaded.build_context().await.unwrap();
+        assert_eq!(ctx.messages.len(), 3, "prompt, partial, continuation");
+        assert_eq!(ctx.messages[2], Message::user(continuation::TEXT));
+
+        // And it is excluded from re-ask by its marker.
+        let leaf = reloaded.get_leaf_id().await.expect("a persisted leaf");
+        assert!(
+            !crate::agent::compaction::is_reaskable_entry(&reloaded, &leaf).await,
+            "a synthetic continuation is not a user prompt"
+        );
 
         let _ = tokio::fs::remove_file(&path).await;
     }

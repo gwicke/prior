@@ -699,7 +699,15 @@ pub(crate) async fn is_reaskable_entry(session: &Session, target_id: &str) -> bo
         crate::session::SessionEntryContent::Message { message } => {
             message.get("role").and_then(|r| r.as_str()) == Some("user")
         }
-        crate::session::SessionEntryContent::CustomMessage { .. } => true,
+        // A custom message renders as a user message, so it is *shaped* like a
+        // prompt — but a synthetic continuation is not one, and offering it for
+        // re-ask would put "continue" in the input buffer as if the user had
+        // typed it. The marker exists precisely so this is decidable by type
+        // rather than by matching text
+        // (`doc/261102_partial_turn_retention.md` §5).
+        crate::session::SessionEntryContent::CustomMessage { custom_type, .. } => {
+            custom_type != crate::agent::continuation::CUSTOM_TYPE
+        }
         _ => false,
     }
 }

@@ -8,9 +8,9 @@ and link a doc/ and/or commit hash
       `d10aa8c`, `7b23590`): the loop is the only path, persistence is a cursor over
       `run.messages()`, tools state their own call shape, and `"continue"` is gone — a retry
       re-issues the attempt. Remaining: 4 (mid-turn steering + boundary settings), 6 (cleanup).
-- [ ] Retain a partial turn across a retry: a failed attempt's text is dropped from both the session
-      and the next request (phase 3 removed the "continue" that used to carry it). Design:
-      doc/261102_partial_turn_retention.md; its rig facts are pinned in tests/rig_replay_rules.rs.
+- [x] Retain a partial turn across a retry: the text is written to the session, marked as a pending
+      turn, and the retried request continues from it. Also resumes on an empty submit.
+      doc/261102_partial_turn_retention.md; rig facts pinned in tests/rig_replay_rules.rs.
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing
       `egress::host_allowed`; `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https;
       HTTP-only clients now come through R3i's front end instead). R4 (Landlock, per-path unix

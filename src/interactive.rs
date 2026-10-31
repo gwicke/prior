@@ -656,6 +656,26 @@ impl Interactive {
     /// `!`/`!!` path, split per-turn overrides, and run the prompt turn.
     /// Returns [`LoopCtl::Break`] only for `/q` / `exit`.
     async fn handle_submit(&mut self, input: String) -> LoopCtl {
+        // An empty submit continues an unfinished turn
+        // (`doc/261102_partial_turn_retention.md` §7). The signal is the
+        // session's own tail — a branch ending on an assistant message means the
+        // last turn stopped without finishing, and returning with nothing typed
+        // resumes it along the same path a retry takes.
+        //
+        // Checked before the overrides split, because the intent is "carry on",
+        // not "send nothing".
+        let unfinished = match self.app_state.session() {
+            Some(session) if input.trim().is_empty() => session.ends_mid_turn().await,
+            _ => false,
+        };
+        if unfinished {
+            // Nothing to reprint: the user typed nothing. `run_prompt_turn`
+            // skips its committed-prompt line for an empty input, so the resume
+            // reads as a continuation rather than as a submission.
+            self.run_prompt_turn(String::new(), self.config.params)
+                .await;
+            return LoopCtl::Continue;
+        }
         if input.is_empty() {
             return LoopCtl::Continue;
         }
@@ -818,7 +838,11 @@ impl Interactive {
         input: String,
         effective_params: crate::params::ModelParams,
     ) {
-        self.config.content.display_committed_prompt(&input);
+        // An empty input is a resume, not a submission: there is no prompt line
+        // to reprint, and printing an empty one would read as a blank turn.
+        if !input.is_empty() {
+            self.config.content.display_committed_prompt(&input);
+        }
         // Normal prompt — create the agent lazily on first use
         // (loop-side, applied config; published to the slot).
         if self.app_state.agent().is_none() {

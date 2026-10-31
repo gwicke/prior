@@ -183,6 +183,12 @@ pub(crate) struct DriveLoop {
     /// Where this run's own appends begin. Everything below is loaded history,
     /// already projected when it was written (doc §4).
     announce_cursor: usize,
+    /// The turn budget the run was built with, and how many turns rebuilds have
+    /// already spent. A rebuilt run starts its own `current_turn` at zero, so
+    /// the budget has to be carried by hand for it to keep meaning anything
+    /// (`doc/261102_partial_turn_retention.md` §6).
+    max_turns: usize,
+    turns_spent: usize,
     /// The writing half of the same idea: a cursor over the run's log, plus the
     /// answers of a batch whose commit has not landed yet.
     ///
@@ -197,10 +203,19 @@ pub(crate) struct DriveLoop {
     /// terminal state and keeps answering `Done`, so without this the loop
     /// would emit the final response forever.
     finished: bool,
+    /// What a failed attempt had already produced when it died, kept because
+    /// the run never sees it: `streamed_turn` runs only on a finished stream.
+    ///
+    /// The text is what the user watched arrive, so it has to reach the session
+    /// (`doc/261102_partial_turn_retention.md`) — and the retried request has
+    /// to carry it, or the model restarts from scratch instead of continuing.
+    /// Tool calls are dropped: a call with no result is a pairing violation,
+    /// unlike the retention case, which is only about a stop reason.
+    abandoned: Option<Vec<AssistantContent>>,
 }
 
 impl DriveLoop {
-    pub(crate) fn new(drive: Drive, run: AgentRun) -> (Self, PersistHandle) {
+    pub(crate) fn new(drive: Drive, run: AgentRun, max_turns: usize) -> (Self, PersistHandle) {
         let announce_cursor = run.projection_start();
         let persist = Arc::new(AsyncMutex::new(Persister::new(&run, drive.session.clone())));
         let handle = PersistHandle(persist.clone());
@@ -208,12 +223,98 @@ impl DriveLoop {
             drive,
             run,
             announce_cursor,
+            max_turns,
+            turns_spent: 0,
             persist,
             queue: VecDeque::new(),
             attempt: None,
             finished: false,
+            abandoned: None,
         };
         (this, handle)
+    }
+
+    /// Snapshot what the in-flight attempt has streamed so far.
+    ///
+    /// Used on the paths that stop the loop *without* an error — an `<Esc>`
+    /// abort drops the stream mid-flight, so nothing has recorded the text the
+    /// user watched arrive. Safe to call after the item stream is dropped: the
+    /// attempt, and therefore the provider stream's fold, is still here. A no-op
+    /// when the failure path already captured it, so the two cannot disagree.
+    pub(crate) fn capture_abandoned(&mut self) {
+        if self.abandoned.is_some() {
+            return;
+        }
+        if let Some(attempt) = &self.attempt {
+            let partial = attempt.stream.partial();
+            self.abandoned = (!partial.choice.is_empty()).then_some(partial.choice);
+        }
+    }
+
+    /// What the last failed attempt produced before it died, if anything.
+    ///
+    /// Taken, not read: the text becomes a message in the session exactly once,
+    /// and a second read would append it twice. Empty and tool-call-free
+    /// content is reported as `None`, because there is nothing a user watched.
+    pub(crate) fn take_abandoned(&mut self) -> Option<Vec<AssistantContent>> {
+        let content = self.abandoned.take()?;
+        let text: Vec<AssistantContent> = content
+            .into_iter()
+            .filter(|c| match c {
+                AssistantContent::ToolCall(_) => false,
+                AssistantContent::Text(t) => !t.text.is_empty(),
+                AssistantContent::Reasoning(_) => false,
+                _ => false,
+            })
+            .collect();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Rebuild the run around prior-controlled history, keeping everything else
+    /// (spec, tools, observer, hint mailbox).
+    ///
+    /// A retry after a mid-stream failure cannot reuse the run: the abandoned
+    /// text is not a turn rig will accept (`streamed_turn` requires a finished
+    /// stream), and rig strips a failed turn from the wire below
+    /// `prepare_request`, so the text cannot be replayed through the run's own
+    /// history either. Rebuilding is the one shape that puts it back in front of
+    /// the model (retention doc §2, §3).
+    ///
+    /// `history` is the session's exact history and **its last message is the
+    /// prompt**: `call_model_step` splits the log's last message off as the
+    /// prompt, so `[.. asst: partial] [user: continue]` is what makes the wire
+    /// `[user: prompt] [asst: partial] [user: continue]`. Passing the partial as
+    /// the prompt *and* in the history is rejected as consecutive assistant
+    /// messages, which is why the split is done here rather than by the caller.
+    ///
+    /// Returns the new persister handle: the caller's old one belongs to the run
+    /// that was just dropped.
+    pub(crate) fn rebuild_from(&mut self, history: Vec<Message>) -> Option<PersistHandle> {
+        let (prompt, core) = history.split_last()?;
+        let mut spec = self.drive.spec.clone();
+        // The turn budget is per *run*, and a rebuild makes a new one. Carrying
+        // the spent turns across keeps a repeatedly failing provider from being
+        // handed a fresh `tool_call_limit` on every attempt — the two budgets
+        // would otherwise stop composing (retention doc §6).
+        self.turns_spent += self.run.turn();
+        spec.max_turns = Some(self.max_turns.saturating_sub(self.turns_spent).max(1));
+        let run = AgentRun::from_spec(
+            &spec,
+            prompt.clone(),
+            Some(core.iter().cloned().map(Arc::new).collect()),
+        );
+        self.run = run;
+        self.announce_cursor = self.run.projection_start();
+        self.attempt = None;
+        self.finished = false;
+        self.abandoned = None;
+        self.queue.clear();
+        let persist = Arc::new(AsyncMutex::new(Persister::new(
+            &self.run,
+            self.drive.session.clone(),
+        )));
+        self.persist = persist.clone();
+        Some(PersistHandle(persist))
     }
 
     /// The mailbox the next request's corrective hint is written into.
@@ -244,6 +345,15 @@ impl DriveLoop {
                 match self.advance_attempt().await {
                     Ok(()) => continue,
                     Err(error) => {
+                        // Keep what the attempt had already produced: the run
+                        // will never see it (a failed stream never reaches
+                        // `streamed_turn`), and the user already watched it
+                        // arrive. §2 of the retention doc is why this is taken
+                        // here rather than from the run.
+                        if let Some(attempt) = &self.attempt {
+                            let partial = attempt.stream.partial();
+                            self.abandoned = (!partial.choice.is_empty()).then_some(partial.choice);
+                        }
                         // Drop the in-flight attempt. A failed stream is dead and
                         // must not be polled again, but the *run* is untouched:
                         // `streamed_turn` never saw the turn, so it is still

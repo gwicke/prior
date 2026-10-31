@@ -440,6 +440,29 @@ impl SessionEntry {
         }
     }
 
+    /// Create a custom-message entry: host data that **does** participate in
+    /// the model's context, rendered as a user message.
+    ///
+    /// Distinct from [`SessionEntryContent::Custom`], which is annotation that
+    /// never reaches a provider. The `custom_type` is what makes the entry
+    /// identifiable without matching its content, which is how a synthetic
+    /// continuation is told apart from a genuine user steer.
+    pub fn new_custom_message(
+        custom_type: String,
+        content: serde_json::Value,
+        parent_id: Option<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::now_v7().to_string(),
+            parent_id,
+            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            content: SessionEntryContent::CustomMessage {
+                custom_type,
+                content,
+            },
+        }
+    }
+
     /// Create a new label entry.
     pub fn new_label(target_id: String, label: Option<String>, parent_id: Option<String>) -> Self {
         Self {

@@ -56,12 +56,15 @@ depends on provider capability.
 
 1. Take `stream.partial()`, keep its text and drop its tool calls (a call with no result is a real
    pairing violation — `OrphanToolCall` — unlike the stop-reason case, which is only a replay rule).
-2. If that text is non-empty, write it to the session immediately as an ordinary assistant message,
-   holding a **hand-built** assistant turn (`stop: None`, §2).
-3. If the session's last message is not already the synthetic continuation, write one (§5). If it
+2. **If that text is empty, do nothing more** — re-issue the attempt in place, as phase 3 did. There
+   is no partial to preserve, so a rebuild would only reset the budget and re-read the session for
+   nothing. (A 429 before the first delta is the common case, and it must not grow the transcript.)
+3. Write the text to the session immediately as an ordinary assistant message, holding a
+   **hand-built** assistant turn (`stop: None`, §2).
+4. If the session's last message is not already the synthetic continuation, write one (§5). If it
    is, keep it: **never append a second.** The text is a nudge and must not be empty; an empty
    continuation is dropped by the encoder and silently becomes a prefill (§7).
-4. Rebuild: `AgentRun::from_spec(spec, last_message, Some(everything_before_it))`, taking both from
+5. Rebuild: `AgentRun::from_spec(spec, last_message, Some(everything_before_it))`, taking both from
    the session's history. `call_model_step` treats the last message as the prompt, so whatever ends
    the session is the prompt and the rest is ordinary history. On the first retry that is
    `[user: prompt] [assistant: partial] [user: continue]`. The wire becomes:
@@ -81,18 +84,18 @@ rather than a `"continue"` indistinguishable from a user prompt.
 
 ### Consecutive retries append nothing
 
-A turn can fail more than once. Each failure rebuilds, so the second rebuild starts from a session
-whose last message is already the synthetic continuation — and the rule is that it stays the last
-message: no second continuation is appended, and none is ever inserted before it.
+A turn can fail more than once. After the first rebuild the session's last message is already the
+synthetic continuation, and the rule is that it stays the last message: no second continuation is
+appended, and none is ever inserted before it.
 
-Both cases fall out of step 4, which takes the session's last message as the prompt:
+Both cases are handled without a second append:
 
-- **New partial text.** Session becomes `… [asst: partial] [continue]`; the prompt is `continue` and
-  the partial is history. One continuation on the wire.
-- **No new text** (failure before any delta, or an empty partial). The session still ends in
-  `[continue]`, so the rebuild reuses it as the prompt. The wire is
-  `[user: prompt] [asst: partial] [user: continue]` — identical to the first retry, with one
-  continuation. Verified: reusing the trailing message yields exactly one `continue` at
+- **New partial text.** Session becomes `… [asst: partial] [continue]`; the rebuild takes `continue`
+  as its prompt and the partial is history. One continuation on the wire.
+- **No new text** (failure before any delta, or an empty partial). Nothing is written at all — step
+  2 — so the retry re-issues the attempt on the run it already has. After the *first* rebuild that
+  run's history already ends in `[continue]`, so the wire is unchanged however many times the
+  attempt fails. Verified: reusing the trailing message yields exactly one `continue` at
   `projection_start` of 1.
 
 The alternative — appending a fresh continuation per attempt — grows the history by one message per
@@ -184,18 +187,36 @@ record, using the entry type pi already defines for exactly this (`src/session/t
 `/tree` already renders it distinctly: `v25_tree.rs` prints `[custom msg] {customType}`, so the view
 can filter or label it without parsing text.
 
-**One gap to close.** `/tree <id> edit` treats a `CustomMessage` as re-askable
-(`compaction::is_reaskable_entry` returns true for it), and `reask_from_entry` reads its text. A
-synthetic continuation is not a user prompt and must not be offered for re-ask. The marker exists
-precisely so this can be decided by `customType`: `prior_continue` is excluded.
+**Two gaps, both closed.** `is_reaskable_entry` treated *every* `CustomMessage` as re-askable, and
+`reask_from_entry` would have put `"continue"` in the input buffer as if the user had typed it; it
+now returns false for `prior_continue`. And `extract_messages` skipped `CustomMessage` entirely, so
+one on disk would not have reached history at all — it now has an arm pushing the content as a user
+message, which is what makes §3's rebuild see its own continuation after a reload. Both are covered
+by `a_continuation_is_written_once_and_reaches_reloaded_history`.
 
-**Loader gap.** `extract_messages` (`session/session.rs`) currently handles `Message`,
-`BranchSummary` and buffers tool results; everything else is skipped. So a `CustomMessage` on disk
-would not reach history today. Note the distinction: pi's comment says it renders as a user message,
-prior's loader does not yet. The loader needs a `CustomMessage` arm (content → `UserContent::Text`,
-as a user message), which is what makes §3's rebuild see its own continuation after a reload.
+## 6. What landed
 
-## 6. Consequences
+Implemented in `src/agent/continuation.rs` (the marker and its text), `Session`'s
+`append_custom_message` / `ensure_custom_message` / `ends_mid_turn`, `drive.rs`'s
+`capture_abandoned` / `take_abandoned` / `rebuild_from`, and `turn.rs`'s `persist_abandoned` /
+`rebuild_after_partial`.
+
+Two refinements over the plan above, both from constraints found while writing it:
+
+- **The continuation is written when a retry is certain, not when the failure is seen.** A turn that
+  is about to give up has nothing to continue into, so appending a nudge then would be litter with
+  no way to remove it.
+- **A failure with nothing streamed rebuilds nothing.** It re-issues the attempt in place, exactly
+  as phase 3 did. There is no partial to preserve, so the rebuild would only reset the budget and
+  re-read the session for no benefit.
+
+Tests: `tests/partial_turn_retention.rs` drives the real binary through a broken stream (retry) and
+a hung stream plus `Esc` (abort, then an empty-prompt resume), asserting on the session entries and
+the request bodies. `Session`'s `a_continuation_is_written_once_and_reaches_reloaded_history` covers
+the append-once guard, the loader arm and the re-ask exclusion. Each was verified to fail against
+the behaviour it pins.
+
+## 6a. Consequences
 
 - **Streaming is unchanged.** Deltas paint as they arrive; only persistence is deferred to the
   failure. Nothing is buffered until a response completes.
@@ -238,47 +259,43 @@ Dropped. They have no results, and a call without a result is a genuine pairing 
 
 ### Abort, and resuming without retyping
 
-On a user abort there is no retry to splice into: the partial ends the session, and
-`[assistant] [user]` needs no prefill, so the next typed prompt sees it once §5's loader gap is
-closed. Worth an explicit test.
+On a user abort there is no retry to continue into: the partial ends the session, and
+`[assistant] [user]` needs no prefill, so the next typed prompt sees it. Tested.
 
-Beyond that, a **return with an empty prompt should resume the incomplete turn by default** — the
-same path as a retry, when the last user turn did not complete. This changes the shape of §5's
-question: the continuation written at retry time is what such a resume finds, so an aborted turn
-needs no continuation written at abort time; typing nothing is the signal.
+A **return with an empty prompt resumes the incomplete turn by default** — the same path as a retry,
+when the last user turn did not complete. `handle_submit` checks the session's tail
+(`Session::ends_mid_turn`) before either of its old guards, so an empty submit is a continuation
+rather than a no-op, and the overrides-only refusal is unchanged for prompts that *do* carry text.
 
-Note this is a behavioural change in the REPL, not only a retry detail. Today an empty submit is
-dropped (`handle_submit` returns early on an empty string, and an overrides-only prompt is refused
-with "nothing to send"). Those guards are the thing to revisit, not the retry machinery.
+One refinement the implementation needed, and it settles the ordering question above:
+**the continuation is written by the resume, not by the abort.** An aborted turn's branch ends on
+the partial, which is what makes `[assistant] [user]` the next typed prompt's shape. A resume is
+what needs the nudge, because without one the rebuilt run would take the partial as its *prompt* — a
+prefill. `ensure_custom_message` makes that a no-op when a retry already wrote one, so resuming
+after a retry is exactly a retry.
 
 ### Where the write-time guard lives
 
-**In the projection, not the persister.** The persister and the projection already share one input,
-the projected message slice, so a projection-level rule is seen by both writers and by the request
-path, while a persister-level rule would be a second place that knows about continuations.
+**In `Session`, at write time** — `ensure_custom_message`, backed by `ends_with_custom_message`. Not
+in the projection, which this doc previously proposed. Two reasons, one of them decisive:
 
-Concretely, the guard belongs beside `project`'s unit walk, which is already where adjacent messages
-are related (a unit is a turn plus its results): drop a synthetic continuation that directly follows
-another synthetic continuation, keeping the last. That is idempotent (projecting a projected slice
-changes nothing), which is the property the whole transform requires.
+- **A projection rule runs too late.** The session is append-only (`move_leaf` exists, no truncate),
+  so a duplicate that reached disk can never be removed. Projecting it away would leave the litter
+  in the file and merely hide it from the request — the opposite of what the marker is for.
+- **The projection has nothing to key on.** It sees a plain `Message::User`; the marker is a session
+  entry kind. Widening `project` to take entry kinds is the trap §5's flattening discussion rejects:
+  `project` runs on the run's log (no session entries) as well as on loaded history, so a
+  `&[EntryKind]` parameter would be fabricated on one path and real on the other.
 
-**The marker must be flattened into the message, not threaded in beside `project`.** Widening the
-signature looks cheap (seven internal call sites) but is the wrong fix, because `project` runs on
-two different things: the run's log at the persist and request boundaries, which has no session
-entries at all, and the loaded session history, which has them. A `&[EntryKind]` parameter would be
-fabricated on the live path and real on the load path — one parameter meaning two things, which is
-the class of problem the direct-drive work has been deleting all along.
-
-Flattening gives the marker to the message instead, so the rule is identical whether the history
-came from disk or from the run, which is also what keeps `project`'s idempotence true: the marker
-rides the message, so projecting a projected slice preserves it.
-
-Precedent already exists in this codebase: a tool's parts list rides its result as a reserved key
-(`prior_call_parts`) that `project` unpacks and no provider ever sees. A continuation marker follows
-the same rule — carried in the stored message, read by `project`, absent from every request.
+So the guard is stated where the fact is known: "does the branch already end with this marker". It
+is one `matches!` on the branch tail, and it makes `ensure_custom_message` idempotent by
+construction rather than by a downstream repair.
 
 **Test at the message count, not the content count.** The merge rule above means a wrong append
 shows up as an extra content block in the last user message rather than an extra message, so a test
 that counts messages catches a second *message* only. Assert that the rebuilt history's explicit
 tail is `[assistant, continuation]` with nothing after it, which fails for both shapes of the
 mistake.
+
+The test that pins this asserts on the persisted entries — one `custom_message` with
+`customType == "prior_continue"` — and was verified to fail when the guard is removed.

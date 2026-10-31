@@ -84,7 +84,38 @@ impl CodeAgent {
         // doc/turn_cancellation_persistence_bugs.md §3.
         self.user_cancel.store(false, Ordering::SeqCst);
 
+        // An empty prompt on a branch that ends mid-turn *is* a resume: the
+        // signal is the session's own tail, not a keyword
+        // (`doc/261102_partial_turn_retention.md` §7).
+        //
+        // The continuation is written here, at resume time, and not at abort
+        // time — an aborted turn has nothing to continue *into*, so its branch
+        // ends on the partial. Resuming is what needs the nudge: without one the
+        // rebuilt run would take the assistant partial as its prompt, i.e. a
+        // prefill, which most providers refuse (§4). `ensure` keeps this a no-op
+        // when a retry already wrote one, which is what makes returning with
+        // nothing typed exactly a retry.
+        let resume = match (input.trim().is_empty(), session.as_deref()) {
+            (false, _) | (true, None) => false,
+            (true, Some(s)) => s.ends_mid_turn().await,
+        };
+        if resume {
+            if let Some(s) = session.as_deref() {
+                if let Err(e) = s
+                    .ensure_custom_message(
+                        crate::agent::continuation::CUSTOM_TYPE,
+                        crate::agent::continuation::TEXT,
+                    )
+                    .await
+                {
+                    eprintln!("Warning: failed to persist the continuation: {e}");
+                }
+            }
+        }
+
         // Build prior context from session, or use empty vec as fallback.
+        // After the write above, so a resume's context is the branch as the
+        // model will see it — partial, then continuation.
         let prior: Vec<Message> = match session.as_deref() {
             Some(s) => match session_context_messages(
                 s,
@@ -110,12 +141,15 @@ impl CodeAgent {
         // not duplicated into context) and before the first request goes out,
         // so grepping the session finds the prompt the moment it is submitted.
         //
-        // Unconditional, and there is nothing to de-duplicate against: the
-        // `AgentRun` is built once per prompt and a retry re-issues an attempt
-        // inside it, so `prompt` is called exactly once per user dispatch.
-        if let Some(s) = session.as_deref() {
-            if let Err(e) = s.append_message(&Message::user(input)).await {
-                eprintln!("Warning: failed to persist user prompt: {e}");
+        // Nothing to de-duplicate against: `prompt` is called exactly once per
+        // user dispatch, and a retry re-issues an attempt inside that turn. A
+        // *resume* appends nothing at all — the prompt is the continuation that
+        // already ends the branch.
+        if !resume {
+            if let Some(s) = session.as_deref() {
+                if let Err(e) = s.append_message(&Message::user(input)).await {
+                    eprintln!("Warning: failed to persist user prompt: {e}");
+                }
             }
         }
 
@@ -158,16 +192,17 @@ impl CodeAgent {
         // the model and `next_step` re-emits the identical `CallModel`. Nothing
         // is rolled back, no turn is consumed, and no user message is appended
         // — which is why there is no `"continue"` in the transcript any more.
-        let (mut drive, persist) = match self.build_drive(input, prior, params, session.clone()) {
-            Ok(pair) => pair,
-            Err(error) => {
-                // No run to drive, so no attempt loop either: the prompt is on
-                // disk (dispatch) and the error is the whole outcome.
-                self.log_pump_event("response_end").await;
-                self.content.end_response();
-                return Err(classify_stream_error(&error));
-            }
-        };
+        let (mut drive, mut persist) =
+            match self.build_drive(input, prior, params, session.clone(), resume) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    // No run to drive, so no attempt loop either: the prompt is on
+                    // disk (dispatch) and the error is the whole outcome.
+                    self.log_pump_event("response_end").await;
+                    self.content.end_response();
+                    return Err(classify_stream_error(&error));
+                }
+            };
 
         // `output` is the returned assistant text (what `prompt()` yields).
         let mut output = String::new();
@@ -215,20 +250,25 @@ impl CodeAgent {
         if let (Some(sess), Some(hist)) = (it_session.as_deref_mut(), it_history.as_deref_mut()) {
             let _ = sess.settle(self.content.as_ref(), it_label, hist).await;
         }
-        // One attempt at a time over the single loop. A failed attempt that is
-        // worth retrying breaks to `Failed`, waits out the back-off with the key
-        // pump still running, and polls the same `drive` again — the retry is
-        // the same run's re-issued `CallModel`, not a new dispatch.
+        // One attempt at a time over the single loop. A retry that needs no
+        // rebuild — the failure produced no text — polls the same `drive` again,
+        // which re-issues the identical `CallModel` without consuming a turn.
+        //
+        // A failure that *did* produce text rebuilds instead
+        // (`doc/261102_partial_turn_retention.md` §3): the text the user watched
+        // cannot enter the run (it is not a turn rig accepts, and rig strips a
+        // failed turn from the wire), so the turn is reconstructed around the
+        // session's history, which now holds it.
         let mut consecutive_failures: u8 = 0;
         let mut outcome: std::result::Result<(), crate::PriorError> = Ok(());
         'attempts: loop {
             // Reset per attempt: this is the verdict the attempt hands back.
             let mut attempt_failed: Option<(crate::PriorError, bool)> = None;
-            // The partial text of a failed attempt is discarded, not kept: the
-            // model is about to say it again, and carrying it forward would
-            // return a spliced answer nobody asked for. The screen keeps what it
-            // painted (the design's open question §7.2); the *value* starts
-            // clean.
+            // The *returned* text starts clean per attempt: a failed attempt's
+            // text is not part of the answer, and concatenating it would return
+            // a spliced reply nobody asked for. It is not lost, though — the
+            // loop keeps it, and the retry path writes it to the session and
+            // rebuilds the turn around it (§3).
             output.clear();
             // The hint mailbox is a clone of the loop's own `Arc`, taken
             // before the stream borrows the loop: the borrow lasts the whole
@@ -462,7 +502,37 @@ impl CodeAgent {
                     }
                 }
             }
-            // The attempt ended (stream exhausted, aborted, or failed).
+            // The attempt ended (stream exhausted, aborted, or failed). Drop the
+            // stream first: it borrows the loop, and everything below needs the
+            // loop back — to read what the attempt streamed, and to rebuild the
+            // run around it.
+            drop(stream);
+            // Read before anything replaces the persister: a rebuild installs a
+            // fresh one, and this is the *turn's* progress, which is what
+            // decides whether the back-off restarts.
+            //
+            // Progress resets the growth, not the budget: a stream that made
+            // work in between gets the base delay again, and the budget is
+            // consumed either way. Gated on progress, not on persistence, so a
+            // sessionless run resets too.
+            let made_progress = persist.made_progress().await;
+            // Write what the attempt rendered, whatever happens next: the user
+            // watched it arrive, so a session that dropped it would disagree
+            // with the screen, and a reload would show a turn missing its
+            // opening.
+            //
+            // On abort that is *all* there is — the turn ends, so nothing asks
+            // the model to carry on, and the partial simply ends the session (a
+            // later turn then sees `[assistant] [user]`, which every model
+            // accepts). The continuation is written by the retry path below,
+            // and only once a retry is certain: a nudge appended for an attempt
+            // that never runs would be litter, and the session is append-only.
+            //
+            // The persister is deliberately not closed. A stream failure leaves
+            // the run `AwaitingModel` with no pending batch — the previous one
+            // was answered and committed before this request went out — so the
+            // only thing at risk is the streamed text handled here.
+            let wrote_partial = self.persist_abandoned(&mut drive, session.as_deref()).await;
             if aborted {
                 break 'attempts;
             }
@@ -475,11 +545,6 @@ impl CodeAgent {
                 outcome = Err(error);
                 break 'attempts;
             }
-            // Progress resets the growth, not the budget: a stream that made
-            // work in between gets the base delay again, and the budget is
-            // consumed either way. Gated on progress, not on persistence, so a
-            // sessionless run resets too.
-            let made_progress = persist.made_progress().await;
             consecutive_failures = if made_progress {
                 0
             } else {
@@ -488,6 +553,25 @@ impl CodeAgent {
             if consecutive_failures > retry_budget(&error) {
                 outcome = Err(error);
                 break 'attempts;
+            }
+            // A retry is now certain. Rebuild the turn around the session, which
+            // holds the abandoned text: the retried request then carries it and
+            // the model continues from it instead of restarting (§3). A fresh
+            // persister comes with the fresh run.
+            //
+            // Only when there is something to continue *from*. A failure with
+            // nothing streamed leaves the history exactly as the run has it, so
+            // re-issuing in place is both cheaper and correct — and it appends
+            // no continuation, which is what keeps a retry of an unproductive
+            // attempt from growing the transcript (§3, "Consecutive retries
+            // append nothing").
+            if wrote_partial {
+                if let Some(handle) = self
+                    .rebuild_after_partial(&mut drive, session.as_deref())
+                    .await
+                {
+                    persist = handle;
+                }
             }
             let delay = retry_delay_ms(&error, consecutive_failures.max(1));
             self.log_pump_event("response_end").await;
@@ -565,6 +649,7 @@ impl CodeAgent {
         prior: Vec<Message>,
         params: &crate::params::ModelParams,
         session: Option<Arc<Session>>,
+        resume: bool,
     ) -> std::result::Result<
         (
             crate::agent::drive::DriveLoop,
@@ -586,11 +671,31 @@ impl CodeAgent {
         spec.max_turns = Some(self.tool_call_limit);
         spec.max_invalid_tool_call_retries = 1;
 
-        let run = AgentRun::from_spec(
-            &spec,
-            Message::user(input),
-            Some(prior.into_iter().map(Arc::new).collect()),
-        );
+        // A resume has no new prompt: the branch already ends on the synthetic
+        // continuation, which is what `call_model_step` should take as the
+        // prompt. So the split is the same one the rebuild does — last message
+        // is the prompt, everything before it is history — and the model sees
+        // `[user] [asst: partial] [user: continue]` unchanged across the resume.
+        let run = if resume {
+            let prior = prior;
+            match prior.split_last() {
+                Some((prompt, core)) => AgentRun::from_spec(
+                    &spec,
+                    prompt.clone(),
+                    Some(core.iter().cloned().map(Arc::new).collect()),
+                ),
+                // Nothing to resume from (the branch lost its tail between the
+                // check and here). Fall back to a plain empty prompt, which is
+                // what a non-resuming dispatch would have sent.
+                None => AgentRun::from_spec(&spec, Message::user(input), None),
+            }
+        } else {
+            AgentRun::from_spec(
+                &spec,
+                Message::user(input),
+                Some(prior.into_iter().map(Arc::new).collect()),
+            )
+        };
 
         let model = match self.agent.handlers().bind(self.agent.model_key()) {
             Ok(model) => model,
@@ -618,7 +723,7 @@ impl CodeAgent {
             session,
             retry_hint: RetryHint::default(),
         };
-        Ok(DriveLoop::new(drive, run))
+        Ok(DriveLoop::new(drive, run, self.tool_call_limit))
     }
 
     pub async fn run_once(&self, input: String) -> Result<String> {
@@ -697,6 +802,111 @@ impl CodeAgent {
             .await
             .map(|response| response.output())
             .map_err(|e| classify_prompt_error(&e, "summarize"))
+    }
+
+    /// Write what a failed or aborted attempt had already rendered.
+    ///
+    /// The first half of the retention doc's §3: the text the user watched goes
+    /// to the session as an ordinary assistant message, because everything
+    /// rendered must be persisted — on the retry path *and* on an abort, where
+    /// it is the turn's last word.
+    ///
+    /// The message is hand-built by
+    /// [`assistant_message`](crate::agent::transcript::assistant_message), which
+    /// leaves `stop: None`. That is load-bearing: rig drops a turn whose stop
+    /// reason marks it failed, so a partial carrying `Aborted`/`Error` would be
+    /// silently stripped from every later request (§2).
+    ///
+    /// A write failure is a warning rather than an error: the turn still has a
+    /// retry to run, and the persister retries its own unsaved batches.
+    ///
+    /// Returns whether there was new text to write. That is the signal the
+    /// caller needs, because a failure with nothing streamed (a 429 on the very
+    /// first delta) leaves the history untouched — and then the retry re-issues
+    /// the attempt in place, appending nothing at all.
+    async fn persist_abandoned(
+        &self,
+        drive: &mut crate::agent::drive::DriveLoop,
+        session: Option<&Session>,
+    ) -> bool {
+        let Some(session) = session else {
+            return false;
+        };
+        // An `<Esc>` abort drops the stream before the loop's failure path
+        // captures anything, so this is the one place the two paths meet.
+        drive.capture_abandoned();
+        let Some(content) = drive.take_abandoned() else {
+            return false;
+        };
+        let partial = crate::agent::transcript::assistant_message(None, content);
+        match session.append_message(&partial).await {
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!("Warning: failed to persist the interrupted turn: {error}");
+                false
+            }
+        }
+    }
+
+    /// Rebuild the turn around what was just persisted, so the retry continues
+    /// from the model's own text instead of restarting.
+    ///
+    /// The retention doc's §3, in one place:
+    ///
+    /// 1. the text the user watched goes to the session as an ordinary
+    ///    assistant message, because everything rendered must be persisted;
+    /// 2. a synthetic continuation is appended **unless the branch already ends
+    ///    with one**, which is what makes a consecutive retry append nothing
+    ///    (§3 "Consecutive retries append nothing") — the session is
+    ///    append-only, so a wrong second one could never be undone;
+    /// 3. the turn is rebuilt from the session's exact history, its last message
+    ///    becoming the rebuilt run's prompt.
+    ///
+    /// Returns the new persister handle when the turn was rebuilt, `None` when
+    /// there was nothing to rebuild around (no session). Write failures are
+    /// warnings: the turn still has a retry to run.
+    async fn rebuild_after_partial(
+        &self,
+        drive: &mut crate::agent::drive::DriveLoop,
+        session: Option<&Session>,
+    ) -> Option<crate::agent::drive::PersistHandle> {
+        let session = session?;
+        // The nudge that makes the rebuilt history end on a user message, so
+        // the model continues the partial instead of being handed a request that
+        // ends in an assistant turn — a *prefill*, which most providers refuse
+        // (§4). Written once per incomplete turn: on a consecutive retry the
+        // branch already ends with one, and appending a second would grow the
+        // history by a message per attempt with no way to undo it.
+        if let Err(error) = session
+            .ensure_custom_message(
+                crate::agent::continuation::CUSTOM_TYPE,
+                crate::agent::continuation::TEXT,
+            )
+            .await
+        {
+            eprintln!("Warning: failed to persist the continuation: {error}");
+        }
+        // Rebuild from the session, which now holds what the model said and the
+        // nudge that follows it. Reading the session rather than splicing the
+        // partial into a patch is deliberate: a patch is a one-shot that the
+        // next `CallModel` would have to re-place, reordering the history as the
+        // turn progresses (retention doc §3 "Why not splice").
+        let history = match session_context_messages(
+            session,
+            self.reasoning_in_context,
+            &self.provider,
+            &self.model,
+        )
+        .await
+        {
+            Ok(history) => history,
+            Err(error) => {
+                eprintln!("Warning: failed to rebuild the turn: {error}");
+                return None;
+            }
+        };
+        let handle = drive.rebuild_from(history)?;
+        Some(handle)
     }
 }
 
