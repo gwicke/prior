@@ -1,5 +1,13 @@
 # Tool path relativization
 
+> **Superseded in part — this is now a historical record.** The problem and the path rules below
+> still hold, but the *mechanism* is gone. Relativisation is a tool property, not a pass: each
+> live tool has a `preprocess_args` entry in `src/agent/tool_shape.rs`, applied once at dispatch by
+> the drive loop and carried into the `CallPart` the tool answers with. Deleted:
+> `tool_args::normalize` / `normalize_in_message` / `normalize_messages`, `prepare_edit_call` /
+> `PreparedEdit`, and `EditLedger`. Prose below that names them describes what was built, not what
+> runs today. Current design: [`261030_rig_direct_drive.md`](261030_rig_direct_drive.md) §4.
+
 Ordered implementation steps: [`261026_tool_path_relativization_impl.md`](
 261026_tool_path_relativization_impl.md).
 

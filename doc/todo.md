@@ -4,10 +4,11 @@ NOTE: Keep things tight - normally no more than 1-2 lines per bullet point. More
 and link a doc/ and/or commit hash
 
 - [ ] Drive rig's `AgentRun` directly: own the loop, retry by re-issuing `next_step`, steers as
-      asides. Plan: doc/261030_rig_direct_drive.md. Phases **1, 2, 3 and 5 done** (`edd10e5`,
-      `d10aa8c`, `7b23590`): the loop is the only path, persistence is a cursor over
-      `run.messages()`, tools state their own call shape, and `"continue"` is gone — a retry
-      re-issues the attempt. Remaining: 4 (mid-turn steering + boundary settings), 6 (cleanup).
+      asides. Plan: doc/261030_rig_direct_drive.md. Phases
+      **1, 2, 3, 5 and the deletions of 6 done** (`edd10e5`, `d10aa8c`, `7b23590`, `e4014f2`): the
+      loop is the only path, persistence is a cursor over `run.messages()`, tools state their own
+      call shape, and `"continue"` is gone — a retry re-issues the attempt. Remaining: **4**
+      (mid-turn steering + boundary settings, not started).
 - [x] Retain a partial turn across a retry: the text is written to the session, marked as a pending
       turn, and the retried request continues from it. Also resumes on an empty submit.
       doc/261102_partial_turn_retention.md; rig facts pinned in tests/rig_replay_rules.rs.

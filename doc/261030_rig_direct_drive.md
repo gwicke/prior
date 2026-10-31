@@ -1,7 +1,8 @@
 # Driving rig's `AgentRun` directly
 
-*Status: design, ready for implementation. Supersedes the retry half of `doc/261026_rig_steering.md`
-and of `doc/tool_error_handling.md` §"Mid-turn failure & resume". Mechanics:
+*Status: phases 1, 2, 3 and 5 landed; 4 (steering and boundary settings) and 6 (cleanup) remain.
+Supersedes the retry half of `doc/261026_rig_steering.md` and of `doc/tool_error_handling.md`
+§"Mid-turn failure & resume". Mechanics:
 [`261030_rig_direct_drive_impl.md`](261030_rig_direct_drive_impl.md).*
 
 ## Why
@@ -51,8 +52,8 @@ two.
 `src/agent/drive.rs` replaces `agent.prompt(..).stream()`:
 
 ```text
-// `prior_history.len()` is the parts/verbatim boundary: everything at or
-// above it was appended by this loop and may carry a parts list (§4).
+// No parts/verbatim boundary is needed: persist writes plain text, so a
+// loaded message can never hold a parts list (§4).
 run = AgentRun::from_spec(spec, Message::user(input), Some(prior_history))
 loop {
     persist_delta(&run)                       // §3, project then append
@@ -72,12 +73,12 @@ loop {
             for call in calls {
                 // sequential; observer paints; cancel check
                 let out = execute(call);          // may be a parts list (§4)
-                persist_answer(&call, &out);      // §3: the boundary inside a batch
+                persist.note_answer(&call, &out); // §3: held, not written
                 run.answer(ToolAnswer::executed(call, out))?;
             }
-            // The run still commits the batch as one message on the last
-            // answer; `persist_answer` is what makes an interrupted batch
-            // survive (idempotent per call id, §3).
+            // The batch commits as one message on the last answer, and the
+            // *next* CallModel is the write boundary. An interruption writes
+            // the held answers at the close (§3).
         }
         Done(response) => break Ok(response),
     }
@@ -203,7 +204,11 @@ One `AgentRun` per user prompt. A failed completion is an **attempt**, not a dis
 
 - the attempt's turn was never fed to `run.streamed_turn`/`model_response`, so the run is untouched
   — nothing to roll back, nothing to deduplicate;
-- the partial text is display-only; the observer paints it, and the retry repaints;
+- the partial text of a failed attempt **is retained** — written to the session, then spliced into
+  the next attempt's history so the model continues rather than restarting. That reverses what this
+  section originally said ("display-only, and the retry repaints"); the design is
+  [`261102_partial_turn_retention.md`](261102_partial_turn_retention.md), and the reason is that
+  rendered output must be persisted, or a reload shows an answer missing its opening;
 - back-off and budget stay prior-side (`retry_budget`, `retry_delay_ms`) — rig budgets turns, not
   attempts, and a re-issued `next_step` consumes none;
 - the run is in hand, so an interruption needs no `PromptError` variant carrying it.
@@ -243,22 +248,21 @@ One position, one function: the transcript and the wire cannot disagree about wh
 - `src/agent/drive.rs` — the loop above.
 - `src/agent/observer.rs` — `TurnObserver` (display, `--log-messages`, cancel; the steering drain is
   phase 4's addition). Absorbs today's `LoggingHook`; `turn.rs` keeps the pump.
-- `src/agent/project.rs` — **the** projection: parts unpack and steer splice, nothing else. Pure
-  `(&[Message], &[Aside]) -> Vec<Message>`, called by persist and by request building.
+- `src/agent/project.rs` — **the** projection: parts unpack (and, in phase 4, the steer splice),
+  nothing else. Pure and tool-agnostic, a fixed point on its own output, called by persist and by
+  request building. Today's signature is `(&[Message]) -> Vec<Message>`; phase 4 widens it to take
+  the run's asides.
 - `src/agent/parts.rs` — `CallPart`, the single-part builder (`preprocess_args` + `ToolResult`), the
   parts-list predicate, and `split_id` minting. The only module that decides what a part looks like.
 - `src/agent/tool_shape.rs` — the `preprocess_args` table, one entry per live tool. Registered
   beside the tools in `build()` because `#[rig_tool]`'s generated struct cannot implement a
   prior-side trait. Decides only what a call reads as, never what runs.
-- `src/agent/wire.rs` — pass 2: reasoning strip, then `edit` array → blocks. The request-only shape,
-  holding the one `edit` special case. Absorbs today's `render_model_facing`.
 - `src/agent/persist.rs` — the cursor over `run.messages()`, the held answers of a batch in flight,
   and the close that writes a batch whose results never all landed.
-- `src/agent/project.rs` — the projection: unpack the parts a tool answered with, and the complete
-  prefix rule persistence bounds on. Pure, tool-agnostic, and a fixed point on its own output.
-- `src/agent/transcript.rs` — shrinks to message construction, the model-facing render, the
-  reasoning strip and the load-path repair. The live-unit machinery, `prepare`, `assemble`,
-  `RunState`, `preprocess_calls` and the batch-shaping half are deleted.
+- `src/agent/transcript.rs` — pass 2 lives here, not in a separate module: `render_model_facing`
+  (reasoning strip is the caller's, then `edit` arrays → blocks) plus the load-path repair. The
+  live-unit machinery, `prepare`, `assemble`, `RunState`, `preprocess_calls` and the batch-shaping
+  half are deleted.
 - `src/tools.rs` — `read`/`write`/`grep`/`sed`/`bash` keep `Result<String, ToolError>` and gain a
   `preprocess_args` function (`sed`/`read`/`write`/`grep` relativize `path`, `bash` strips its `cd`
   prefix). Only `edit` changes its return type, to `Vec<CallPart>`: parse → split → minimise →
@@ -334,22 +338,27 @@ One position, one function: the transcript and the wire cannot disagree about wh
      no `"continue"` ever reached the provider. Verified to fail if a synthetic message is
      re-introduced.
    - `doc/tool_error_handling.md` §"Mid-turn failure" is retired with it.
-4. **Steering and boundary settings.** `SteeringQueue`, the projection's steer insertion and scalar
-   overrides, the mid-turn UI entry points and `/reasoning`-style mid-turn commits.
-5. **Tools state their own call shape.** `CallPart`, the injection and the parts-unpack in `project`
-   land first with an identity `preprocess_args`, which is a pass-through: the run's messages change
-   shape, and unpack restores today's bytes exactly. Then `preprocess_args` for the five
-   single-result tools, one at a time — safe incrementally only while `tool_args::normalize` still
-   covers the unconverted ones, which is why the impl notes order it with `edit` last and delete
-   `normalize` only at the end. The registry-completeness test lands with the deletion, since that
-   is when a missed tool starts storing absolute paths. `edit` gains parse → split → minimise →
-   relativize and switches to `Vec<CallPart>`; the other five only gain `preprocess_args`.
-   Deletions: `shape_edits`, `PreparedEdit`, `prepare_edit_call`, `paired_results`, `EditLedger`,
-   `EditResolutions`, `tool_args::normalize` and `normalize_messages`. `wire.rs` renders blocks.
-6. **Cleanup.** Delete `HookContext` usage and the hook structs' rig impls; update
-   `doc/261026_rig_steering.md` (its "Prior's Current Architecture Is Correct" section becomes the
-   opposite of the truth), `doc/tool_error_handling.md` and `doc/261026_tool_path_relativization.md`
-   (relativisation is now a tool-side property).
+4. **Steering and boundary settings. Not started.** `SteeringQueue`, the projection's steer
+   insertion and scalar overrides, the mid-turn UI entry points and `/reasoning`-style mid-turn
+   commits. See §7's open items; the ordering advice below still applies.
+5. **Tools state their own call shape. Done** (`edd10e5`). A tool answers the call as it understood
+   it plus that call's result: `read`/`write`/`grep`/`sed`/`bash` keep `Result<String, ToolError>`
+   and gain a `preprocess_args` entry, called once at dispatch with its value carried into the part;
+   `edit` returns `Vec<CallPart>` and owns parse → split → minimise → relativize. Deleted with it:
+   `shape_edits`, `PreparedEdit`, `prepare_edit_call`, `paired_results`, `EditLedger`,
+   `tool_args::normalize` and `normalize_messages`. The conversion was done in one landing rather
+   than tool-by-tool because `normalize`'s replacement (the `tool_shape` table) was a single unit;
+   the registry-completeness and idempotence tests landed with it.
+   - **`EditResolutions` outlived the ledger** and is still published by `edit_files_with` with no
+     reader but two tests. Deleting it is phase 6.
+   - **Pass 2 stayed in `transcript.rs`** (`render_model_facing`), not in a new `wire.rs`.
+6. **Cleanup. Partly done.** The hook path is gone (`LoggingHook`, the hook structs and their rig
+   impls), and `doc/261026_rig_steering.md` and `doc/tool_error_handling.md` carry
+   superseded-in-part notes. Remaining: delete `EditResolutions` and the dead helpers
+   (`observer::shaped_history`, `observer::call_event`, `DriveLoop::cancelled`,
+   `PersistHandle::detached`), and rewrite `doc/261026_tool_path_relativization.md` + `_impl.md`,
+   which still describe `normalize`, `prepare_edit_call`, `PreparedEdit` and `prepare_edit_call` as
+   current.
 
 Phases 1–3 are the payoff for the retry problem. 4 is the payoff for steering. 5 is the payoff for
 tool handling. Any of them can stop the project without leaving the tree worse, except that 2
@@ -380,8 +389,8 @@ commits us to maintaining the loop.
   part, so the panel, the record and the wire read one value rather than three functions that had to
   be proven to agree. `tool_args::normalize` is deleted; replay needs no rewriting because the
   stored form is already compact.
-- **`EditResolutions` has no reader once the tool formats its own results.** Delete it with
-  `EditLedger` rather than repurposing it.
+- **`EditResolutions` has no reader once the tool formats its own results.** Delete it rather than
+  repurpose it. The ledger went with phase 5; `EditResolutions` did not, so it is a phase-6 item.
 - **A turn that ends early keeps what ran — by holding the answers, not by writing them early.**
   `answer_all` commits a batch only once every call is answered, so the loop holds each answer as it
   lands and the close writes the unfinished batch from those plus rig's own "did not execute" for
@@ -394,9 +403,11 @@ commits us to maintaining the loop.
 
 1. **Version risk.** We now depend on `AgentRun`'s public API and step protocol rather than only on
    `agent.prompt`. A rig bump that changes the protocol is a real port, where today it is a rebase.
-   Mitigation: pin exactly, and keep `drive.rs` the only module that names a rig step type.
-2. **Unary surface.** The summarizers still use `agent.chat(..)`. Fine, and it stays: they want one
-   call, not a loop.
+   Mitigation: keep `drive.rs` the only module that names a rig step type (it is), and decide
+   whether `Cargo.toml`'s `rig-agent = "0.45.0"` caret range is the pin — today the exact version
+   lives only in `Cargo.lock`.
+2. **Unary surface.** The summarizers still use a single unary call. Fine, and it stays: they want
+   one call, not a loop.
 3. **Retrieval.** `ToolServerHandle::retrieval_effects` is not ported. prior registers no retrieval
    index; if the tool set ever gains one, the dispatch belongs in `before_call` beside
    `prepare_request`.
@@ -406,6 +417,7 @@ commits us to maintaining the loop.
    fact, not on a boundary. Tested as a fixed point (`project`) and as "no parts list in the
    output". If a tool ever needs to return a genuinely part-shaped array as data, that is the moment
    to reintroduce a marker key. Reversible in one place (`src/agent/parts.rs`).
-5. **Display and parts.** The `edit` panel paints from the same parts the model sees. Worth
-   confirming during phase 5 that no per-file panel detail (a skipped file, an unchanged one) was
-   only ever carried by `PreparedEdit` and needs to become a part field.
+5. **Display and parts. Closed.** The `edit` panel paints from the same parts the model sees, and no
+   per-file detail was lost with `PreparedEdit`: a skipped file is absent from the parts, an
+   unchanged one is a part whose result says so. `display_tool_parts` handles both the single-part
+   and N-part cases from one call.

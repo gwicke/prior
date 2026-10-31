@@ -332,13 +332,6 @@ impl DriveLoop {
         &self.drive.retry_hint
     }
 
-    /// The error to report when the caller stops the loop: the same canonical
-    /// history rig's own cancellation carried.
-    #[allow(dead_code)]
-    pub(crate) fn cancelled(&self, reason: impl Into<String>) -> PromptError {
-        self.run.cancel_error(reason)
-    }
-
     /// Advance the loop by one item.
     ///
     /// Returns `None` once the run is done or has failed; the caller reads the
@@ -753,18 +746,7 @@ impl DriveLoop {
 #[derive(Clone)]
 pub(crate) struct PersistHandle(Arc<AsyncMutex<Persister>>);
 
-#[allow(dead_code)] // `DriveLoop::close`/`made_progress` go through it too.
 impl PersistHandle {
-    /// A handle that owns its persister outright, for a turn that never got as
-    /// far as a run (a miswired handler table).
-    #[allow(dead_code)]
-    pub(crate) fn detached(session: Option<Arc<Session>>, content: Arc<Content>) -> Self {
-        let run = AgentRun::new(Message::user(""));
-        Self(Arc::new(AsyncMutex::new(Persister::new(
-            &run, session, content,
-        ))))
-    }
-
     /// Close the turn. See [`DriveLoop::close`].
     pub(crate) async fn close(&self) {
         self.0.lock().await.close().await;

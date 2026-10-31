@@ -15,7 +15,7 @@
 
 use std::sync::atomic::Ordering;
 
-use rig_agent::agent::{CompletionCallEvent, InvalidToolCallAction, InvalidToolCallContext};
+use rig_agent::agent::{InvalidToolCallAction, InvalidToolCallContext};
 use rig_agent::run::RequestPatch;
 use rig_core::completion::Message;
 use rig_core::message::AssistantContent;
@@ -138,39 +138,5 @@ impl Observer for TurnObserver {
              Please re-emit the call with one of the available tool names.",
             context.tool_name, context.available_tools
         )))
-    }
-}
-
-/// The request patch a turn sends, for the parts of prior's hook that were pure
-/// history shaping. Kept as a free function so the observer and any future
-/// caller (a steer, a summarizer) agree on the order.
-#[allow(dead_code)]
-fn shaped_history(
-    history: &[Arc<Message>],
-    reasoning_in_context: crate::settings::ReasoningInContextMode,
-    provider: &str,
-    model: &str,
-) -> Vec<Message> {
-    let stripped = maybe_strip_reasoning(
-        history.iter().map(|m| (**m).clone()).collect(),
-        reasoning_in_context,
-        provider,
-        model,
-    );
-    render_model_facing(stripped)
-}
-
-/// The event the completion-call hook used to see, rebuilt for the one consumer
-/// that still wants it (the message logger's prompt half).
-#[allow(dead_code)]
-fn call_event<'a>(
-    prompt: &'a Message,
-    history: &'a [Arc<Message>],
-    turn: usize,
-) -> CompletionCallEvent<'a> {
-    CompletionCallEvent {
-        prompt,
-        history,
-        turn,
     }
 }

@@ -1,8 +1,16 @@
 # Tool path relativization — implementation
 
+> **Historical record — do not resume from here.** Every step below landed, and then most of it was
+> deleted by the direct-drive work ([`261030_rig_direct_drive.md`](261030_rig_direct_drive.md) §4).
+> Concretely: `normalize` / `normalize_messages` (step 3), `prepare_edit_call` / `PreparedEdit`
+> (step 4) and `EditLedger` (step 5) no longer exist, and step 6's `display_prepared_edit` was
+> replaced by `display_tool_parts`. What survives is the shared primitive — `PathContext`,
+> `relativize_arg`, `strip_cwd_prefix` in `src/tool_args.rs` — now called from each tool's
+> `preprocess_args` entry rather than from a twelve-name matcher. Step 8's two bugs and the
+> `Path`-vs-string lesson are still worth reading.
+
 Companion to [`261026_tool_path_relativization.md`](261026_tool_path_relativization.md);
-the design (what and why) lives there, this is the ordered how. Resume from
-the first section not marked DONE.
+the design (what and why) lives there, this is the ordered how.
 
 Ordered so the tree compiles and tests pass at every step. Steps 1–7 are DONE
 (see `git log`); the manual verification in step 8 is outstanding.

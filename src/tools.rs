@@ -543,10 +543,12 @@ impl rig_core::tool::Tool for EditFile {
 
     async fn call(
         &self,
-        context: &mut ToolContext,
+        // Unused: the parts already carry everything a reader needs, so there is
+        // nothing to publish for a later frame to pick up.
+        _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        edit_files_with(args.files, Some(context)).await
+        edit_files(args.files).await
     }
 
     /// Keep prior's own diagnostics out of rig's redaction.
@@ -611,50 +613,13 @@ pub(crate) fn map_tool_error(error: ToolError) -> ToolExecutionError {
 /// reports all of its problems in one round trip instead of one file per trip;
 /// `apply_to_text` is pure over text, so that is a change to the write step
 /// only.
+///
+/// The resolved placements used to travel out through `ToolContext` so a later
+/// frame could minimise the call. They do not need to: this function is the only
+/// frame that both knows where each edit landed and builds the call it belongs
+/// to, so the parts it returns are already minimised, and no second reader is
+/// left to serve.
 pub async fn edit_files(files: Vec<FileEdit>) -> Result<Vec<CallPart>, ToolError> {
-    edit_files_with(files, None).await
-}
-
-/// Host-only provenance for one successfully edited file: where each of its
-/// edits resolved in the original text.
-///
-/// The producer is `edit_file_inner`; the consumer is `LoggingHook::on_outcome`,
-/// which feeds it to `prepare_edit_call` as the minimization input. If a new
-/// apply outcome changes what "resolved" means, update both ends.
-///
-/// Attached to the tool context via [`ToolContext::insert_result`] so the
-/// history-rewrite hook can anchor a successful call without re-reading a file
-/// that has already changed. Never sent to the model and never persisted.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct FileResolution {
-    pub path: String,
-    pub matched_lines: Vec<usize>,
-}
-
-/// The resolutions for every file that actually applied in one `edit` call.
-///
-/// Failed files are absent: there is no resolved line to anchor them to, so
-/// their calls are replayed unchanged.
-///
-/// A [`ContextValue`] because rig 0.45 stores host-only tool-result metadata as
-/// serializable, keyed context values; the key is prior's own, since this
-/// never leaves the process.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct EditResolutions {
-    pub files: Vec<FileResolution>,
-}
-
-impl rig_core::tool::ContextValue for EditResolutions {
-    const KEY: &'static str = "prior.edit.resolutions";
-}
-
-/// The tool entry point. The context is optional so tests and `bsed`-style
-/// callers can use the plain wrapper, while the registered tool records
-/// placements for the model-history minimizer.
-async fn edit_files_with(
-    files: Vec<FileEdit>,
-    context: Option<&mut ToolContext>,
-) -> Result<Vec<CallPart>, ToolError> {
     // The one path rule, applied to the args each part carries. The tool is the
     // only frame that knows how many files a call named, so splitting happens
     // here: one part per file, each with its own canonical args and its own
@@ -664,7 +629,6 @@ async fn edit_files_with(
     let rel_path = |path: &str| {
         crate::tool_args::relativize_arg(path, &path_ctx).unwrap_or_else(|| path.to_string())
     };
-    let mut resolutions = EditResolutions::default();
     let mut parts = Vec::with_capacity(files.len());
 
     for FileEdit { path, edits } in files {
@@ -687,12 +651,6 @@ async fn edit_files_with(
             // outcome: it did not change, so its call is stored verbatim
             // (`None`) and its part is marked failed.
             Ok((raw, matched)) => {
-                if let Some(matched) = &matched {
-                    resolutions.files.push(FileResolution {
-                        path: path.clone(),
-                        matched_lines: matched.clone(),
-                    });
-                }
                 parts.push(CallPart {
                     args: edit_part_args(&shown, &edits, matched.as_deref()),
                     is_error: matched.is_none(),
@@ -702,12 +660,6 @@ async fn edit_files_with(
         }
     }
 
-    // Still published: `on_outcome` and any future reader of the resolved
-    // placements read them here, and the parts above do not carry them per file
-    // (an anchored edit's args are already the minimised form).
-    if let Some(ctx) = context {
-        let _ = ctx.insert_result(resolutions);
-    }
     Ok(parts)
 }
 
@@ -4976,24 +4928,20 @@ mod edit_file_tests {
 
     #[tokio::test]
     #[serial]
-    async fn a_successful_edit_attaches_its_resolved_lines() {
+    async fn a_successful_edit_anchors_its_minimised_call() {
         let _cwd = CwdGuard::new();
         tokio::fs::write("anchor.txt", "alpha\nbeta\ngamma\n")
             .await
             .unwrap();
-        let mut ctx = ToolContext::default();
-        let parts = edit_files_with(
-            vec![bsed_blockedit::FileEdit {
-                path: "anchor.txt".into(),
-                edits: vec![EditOp {
-                    old_text: "beta".into(),
-                    new_text: "BETA".into(),
-                    start_line: None,
-                    origin: None,
-                }],
+        let parts = edit_files(vec![bsed_blockedit::FileEdit {
+            path: "anchor.txt".into(),
+            edits: vec![EditOp {
+                old_text: "beta".into(),
+                new_text: "BETA".into(),
+                start_line: None,
+                origin: None,
             }],
-            Some(&mut ctx),
-        )
+        }])
         .await
         .unwrap();
         assert_eq!(parts.len(), 1, "one file, one part");
@@ -5009,44 +4957,37 @@ mod edit_file_tests {
             })
         );
         assert!(!parts[0].is_error);
-        let res = ctx
-            .result::<EditResolutions>()
-            .expect("the result slot always decodes")
-            .expect("successful edits carry placements");
-        assert_eq!(res.files.len(), 1);
-        assert_eq!(res.files[0].path, "anchor.txt");
-        assert_eq!(res.files[0].matched_lines, vec![2]);
     }
 
     #[tokio::test]
     #[serial]
-    async fn a_failed_edit_attaches_nothing() {
+    async fn a_failed_edit_keeps_its_call_verbatim() {
         let _cwd = CwdGuard::new();
         tokio::fs::write("anchor.txt", "alpha\nbeta\ngamma\n")
             .await
             .unwrap();
-        let mut ctx = ToolContext::default();
-        edit_files_with(
-            vec![bsed_blockedit::FileEdit {
-                path: "anchor.txt".into(),
-                edits: vec![EditOp {
-                    old_text: "does not exist".into(),
-                    new_text: "X".into(),
-                    start_line: None,
-                    origin: None,
-                }],
+        let parts = edit_files(vec![bsed_blockedit::FileEdit {
+            path: "anchor.txt".into(),
+            edits: vec![EditOp {
+                old_text: "does not exist".into(),
+                new_text: "X".into(),
+                start_line: None,
+                origin: None,
             }],
-            Some(&mut ctx),
-        )
+        }])
         .await
         .unwrap();
-        // No file applied, so nothing is anchored: the resolutions are empty,
-        // which is what keeps a failed edit's call stored verbatim.
-        let resolutions = ctx
-            .result::<EditResolutions>()
-            .expect("the result slot always decodes")
-            .expect("published even when empty");
-        assert!(resolutions.files.is_empty(), "{resolutions:?}");
+        // Nothing applied, so nothing is anchored: no `startLine` is invented,
+        // and the part is marked failed.
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].is_error);
+        assert_eq!(
+            parts[0].args,
+            serde_json::json!({
+                "path": "anchor.txt",
+                "edits": [{"oldText": "does not exist", "newText": "X"}],
+            })
+        );
     }
 }
 

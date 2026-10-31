@@ -128,8 +128,8 @@ learned, and it is learned once:
   `type Output = T::Output`, so the macro and hand-written paths agree.
 - It has nothing to publish at dispatch: its shape is not knowable before execution (minimisation
   needs where each edit landed), which is why its panel already defers to the pair
-  (`display_prepared_edit`). The `as_json` arm above takes its result untouched, so it cannot be
-  double-wrapped.
+  (`TurnObserver::dispatch` returns early for it; `outcome` paints the whole pair). The `as_json`
+  arm above takes its result untouched, so it cannot be double-wrapped.
 - Its args are not passed through `preprocess_args` at all — the per-file args it returns *are* the
   processed form, which is what makes the exclusion structural rather than a no-op entry.
 
@@ -155,18 +155,16 @@ learned, and it is learned once:
 No wrapper means no reserved key, so the check is structural: a `Json` array whose every element is
 `{args: object, result: string, is_error?: bool}`.
 
-Injecting every answer means parts now live *inside* the run, so the boundary is no longer the tidy
-observation it was — it is the guard that keeps machine payload out of the wire:
+Injecting every answer means parts now live *inside* the run, so the shape test is what keeps
+machine payload out of the wire. It needs no boundary: persist writes `part.result` as plain text,
+so nothing on disk is a parts list, and `project` runs over the whole history on every request
+without a `prior_history.len()` window. (An earlier draft proposed that bound. It is unnecessary,
+and the code does not have it.)
 
-> `project` unpacks results **at or above `prior_history.len()`** and only there. Everything below
-> that is loaded history, which was written already-unpacked.
+Two facts make the unbounded projection safe:
 
-Without that bound a loaded result that happens to be a JSON array of `{args, result, is_error}` — a
-`bash` output that printed such an array, say — would be unpacked into fabricated calls on the next
-request. Two facts keep the bound trustworthy:
-
-- persist writes `part.result` as plain text, so nothing on disk is a parts list and a reload cannot
-  put one below the boundary;
+- a loaded result is plain text — a `bash` output that printed a JSON array of
+  `{args, result, is_error}` stays text, because a text block is never read as parts;
 - a live call's result is a `Json` block only because the loop made it one — the tool returns
   `String` (a text block) and the wrap is the loop's own.
 
@@ -227,16 +225,19 @@ review question into a test, walking the registry:
 
 ### What this deletes
 
-`EditResolutions` (nothing reads it once the tool formats its own results), `EditLedger` (three
-readers no longer exist), `PreparedEdit` and its prepared-form cache, `prepare_edit_call`,
-`paired_results`, `shape_edits`, `assistant_from_results`'s edit case, `tool_args::normalize` and
-`normalize_messages`, the derived-id agreement between egresses, and the shared mutex.
+Landed with phase 5: `EditLedger` (three readers no longer exist), `PreparedEdit` and its
+prepared-form cache, `prepare_edit_call`, `paired_results`, `shape_edits`, `tool_args::normalize`
+and `normalize_messages`, the derived-id agreement between egresses, and the shared mutex.
+
+Still to delete: **`EditResolutions`** (and `FileResolution` with it). It survives because
+`edit_files_with` still publishes it through `ToolContext`, but the ledger that read it is gone: the
+only remaining readers are two tests asserting what the tool published. Nothing in the loop, the
+projection, the wire or the display consumes it — the parts already carry the minimised args.
 
 **Nothing is re-derived, so nothing can drift:**
 
 - a live call's parts are built once, by the loop, and carried into the run;
-- a loaded call has no parts list (persist wrote plain text), so unpack is a no-op — and the bound
-  keeps it from ever seeing one below the boundary;
+- a loaded call has no parts list (persist wrote plain text), so unpack is a no-op;
 - a loaded `edit` is already per-file, already minimised, already relative;
 - array → blocks is not `project`'s job, so `project` cannot fight it;
 - steer splice is keyed on aside entries already consumed.
