@@ -149,6 +149,51 @@ fn a_rebuilt_run_reads_prompt_history_partial_continue() {
     );
 }
 
+/// A consecutive retry reuses the trailing continuation as the prompt instead
+/// of appending a second one, so the wire is unchanged however many times the
+/// attempt fails.
+#[test]
+fn a_consecutive_retry_does_not_add_a_second_continuation() {
+    use rig_agent::run::{spec::RunSpec, AgentRun, AgentRunStep};
+    use std::sync::Arc;
+
+    // The session after a first failed attempt and its rebuild.
+    let session: Vec<Arc<Message>> = vec![
+        Arc::new(Message::user("fix the bug")),
+        Arc::new(partial("halfway through", None)),
+        Arc::new(Message::user("continue")),
+    ];
+    let (prompt, core) = session.split_last().expect("history is non-empty");
+    let mut run = AgentRun::from_spec(&RunSpec::default(), (**prompt).clone(), Some(core.to_vec()));
+    let Ok(AgentRunStep::CallModel {
+        prompt, history, ..
+    }) = run.next_step()
+    else {
+        panic!("a rebuilt run emits a model call");
+    };
+    let mut sent: Vec<Message> = history.iter().map(|m| (**m).clone()).collect();
+    sent.push((*prompt).clone());
+
+    // Assert on the pre-wire history. rig merges consecutive user messages
+    // when it encodes a request, so a duplicated continuation would be
+    // invisible to a provider while still littering the log the session
+    // replays - the one place this can be caught.
+    let continuations = sent
+        .iter()
+        .filter(|m| {
+            matches!(m,
+                Message::User { content }
+                    if matches!(content.first(), Some(UserContent::Text(t)) if t.text == "continue"))
+        })
+        .count();
+    assert_eq!(
+        continuations, 1,
+        "exactly one continuation, not one per retry"
+    );
+    assert_eq!(sent.len(), 3, "the retry appends nothing");
+    assert_eq!(wire(sent).len(), 3, "and the wire is unchanged");
+}
+
 /// The same partial twice in one history is rejected by rig's own pairing
 /// rule, which is why the rebuild puts it in exactly one place.
 #[test]

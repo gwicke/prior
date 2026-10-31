@@ -50,19 +50,20 @@ the history as `consecutive assistant messages`.
 
 ## 3. Design
 
-On a retryable mid-stream failure, before the back-off, prior writes two messages and rebuilds the
-run. Everything here uses one shape for every model, so nothing depends on provider capability.
+On a retryable mid-stream failure, before the back-off, prior writes what is new and rebuilds the
+run with the session's exact history. Everything here uses one shape for every model, so nothing
+depends on provider capability.
 
 1. Take `stream.partial()`, keep its text and drop its tool calls (a call with no result is a real
    pairing violation — `OrphanToolCall` — unlike the stop-reason case, which is only a replay rule).
-2. Write the text to the session immediately as an ordinary assistant message, holding a
-   **hand-built** assistant turn (`stop: None`, §2).
-3. Write a synthetic continuation as a `CustomMessage` (§5), so the next request ends in a user
-   message and the model is asked to go on rather than left holding an assistant turn.
-4. Rebuild: `AgentRun::from_spec(spec, continue_message, Some(core))`, where `core` is the in-memory
-   history the loop already projects, followed by the partial assistant turn. `call_model_step`
-   treats the last message as the prompt, so the continuation is the prompt and the partial is
-   ordinary history ahead of it. The wire becomes:
+2. If that text is non-empty, write it to the session immediately as an ordinary assistant message,
+   holding a **hand-built** assistant turn (`stop: None`, §2).
+3. If the session's last message is not already the synthetic continuation, write one (§5). If it
+   is, keep it: **never append a second.**
+4. Rebuild: `AgentRun::from_spec(spec, last_message, Some(everything_before_it))`, taking both from
+   the session's history. `call_model_step` treats the last message as the prompt, so whatever ends
+   the session is the prompt and the rest is ordinary history. On the first retry that is
+   `[user: prompt] [assistant: partial] [user: continue]`. The wire becomes:
 
    ```text
    [user: the original prompt] [assistant: the partial text] [user: continue]
@@ -76,6 +77,43 @@ This is what prior did before phase 3 (capture the output, reconstruct the histo
 the reconstruction now feeds a fresh `AgentRun` rather than a fresh `prompt()` call. The difference
 from the old behaviour is the marker in §5, which is what makes the synthetic message identifiable
 rather than a `"continue"` indistinguishable from a user prompt.
+
+### Consecutive retries append nothing
+
+A turn can fail more than once. Each failure rebuilds, so the second rebuild starts from a session
+whose last message is already the synthetic continuation — and the rule is that it stays the last
+message: no second continuation is appended, and none is ever inserted before it.
+
+Both cases fall out of step 4, which takes the session's last message as the prompt:
+
+- **New partial text.** Session becomes `… [asst: partial] [continue]`; the prompt is `continue` and
+  the partial is history. One continuation on the wire.
+- **No new text** (failure before any delta, or an empty partial). The session still ends in
+  `[continue]`, so the rebuild reuses it as the prompt. The wire is
+  `[user: prompt] [asst: partial] [user: continue]` — identical to the first retry, with one
+  continuation. Verified: reusing the trailing message yields exactly one `continue` at
+  `projection_start` of 1.
+
+The alternative — appending a fresh continuation per attempt — grows the history by one message per
+retry. **It would not fail loudly:** rig merges consecutive user messages when it encodes a request,
+so two continuations in a row reach the provider as one and the error is invisible at the wire. The
+damage shows up in the session, which re-reads and replays what was written. The test therefore
+asserts on the pre-wire history, where the duplicate is still visible.
+
+The session is append-only (`Session` has `move_leaf` but no truncate or delete), so a wrong append
+cannot be undone. This must be a write-time guard, not a repair.
+
+Two further consequences, both of which need care:
+
+- **`Persister::new` is built for the dispatch case.** It seeds the cursor from
+  `AgentRun::projection_start()`, documented as "everything below it is the prompt (persisted at
+  dispatch) or loaded history (already stored)". For a rebuilt run that holds *only* the
+  continuation in its log (`messages().len() == 1`, `projection_start() == 1`, with `core` in
+  `chat_history`), the cursor starts at 1 and the continuation is correctly not written again — but
+  only because prior wrote it. If step 3 is skipped *and* the partial is empty, the persister has
+  nothing to skip past and the guard has to come from the write side.
+- **Two failures with no new text must not write the partial twice.** An empty partial is skipped
+  (step 2), so the session keeps the earlier partial and its continuation untouched.
 
 ### Why not splice the partial into the live run
 
@@ -175,7 +213,9 @@ as a user message), which is what makes §3's rebuild see its own continuation a
    *next* turn's history — which works through the session once the loader gap in §5 is closed,
    since `[assistant] [user]` needs no prefill. Worth an explicit test. Note the abort path writes
    no continuation: the partial is the last message until the user says something.
-4. **Does the persister's cursor survive the rebuild cleanly?** The partial is written by prior
-   before the rebuild, and the rebuilt run's log starts from `core`. If the cursor treats `core` as
-   already written, the partial is not written twice; if it does not, it is. This is the most likely
-   bug in the change and needs a test rather than reasoning.
+4. **Where does the write-time guard live?** Resolved in shape, open in placement: the rebuilt run's
+   log holds only the continuation (`projection_start() == 1`), so `Persister::new` skips it because
+   no cursor entry covers it — but that is a coincidence of rig's seeding, not a statement of
+   intent. The guard should say so explicitly (skip a synthetic continuation that already ends the
+   session) rather than depend on the cursor arithmetic, and it needs a test for the no-new-text
+   case.
