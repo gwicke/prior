@@ -15,9 +15,11 @@ pub(crate) mod build;
 pub(crate) mod compaction;
 pub(crate) mod errors;
 pub(crate) mod msglog;
+pub mod parts;
 pub(crate) mod pumps;
 pub(crate) mod replay;
 pub(crate) mod status;
+pub(crate) mod tool_shape;
 pub(crate) mod transcript;
 pub(crate) mod turn;
 

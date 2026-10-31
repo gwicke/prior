@@ -1447,41 +1447,46 @@ impl Content {
         self.render_call_panel(name, args);
     }
 
-    /// Paint one whole prepared `edit` call: one call-result pair per file.
+    /// Paint a tool call that answered with **parts**: one call-result pair per
+    /// part, in file order.
     ///
-    /// The call half is deferred to the result because the pair is not complete
-    /// until execution says where the edits landed — and because N files must
-    /// render as N complete pairs, not "all labels, then all results", which
-    /// would be two contiguous runs instead of one block per file. Rendering
-    /// each file through [`Self::render_call_panel`] and
-    /// [`Self::render_result_panel`] is what makes a multi-file call
-    /// byte-identical to N genuine single-file ones.
+    /// A one-part answer is the ordinary shape and is painted the ordinary way —
+    /// the call already went out at dispatch, so only its result is outstanding.
+    /// A multi-part answer cannot work that way: it must read as N complete
+    /// pairs, not "N labels now, N results later", which is two contiguous runs
+    /// instead of one block per file. So it repaints the calls from the parts
+    /// themselves, which is what makes a three-file `edit` byte-identical to
+    /// three genuine single-file calls.
     ///
-    /// `result` is the call's result text verbatim. It is painted per file only
-    /// when the producer could pair it — a per-file array of the same length —
-    /// because a plain success note (every single-file call) or a pre-array
-    /// error is one report about the whole call, not N. In that case each file
-    /// is labelled from its own array and the report follows once, which is the
-    /// honest rendering of a call whose halves do not decompose.
-    pub(crate) fn display_prepared_edit(
+    /// Rendering both halves from the parts is the point: the panel and the
+    /// record are two readings of one value, so they cannot disagree about a
+    /// path or an anchor.
+    pub(crate) fn display_tool_parts(
         &self,
-        prepared: &crate::agent::transcript::PreparedEdit,
-        result: &str,
+        name: &str,
+        parts: &[crate::agent::parts::CallPart],
+        call_painted: bool,
     ) {
-        match &prepared.results {
-            Some(results) if results.len() == prepared.arrays.len() => {
-                for (args, result) in prepared.arrays.iter().zip(results) {
-                    self.render_call_panel("edit", args);
-                    self.render_result_panel(result);
-                }
+        if parts.len() == 1 {
+            // The common case: the call is on screen already (it was painted at
+            // dispatch), so this is the ordinary result path.
+            if call_painted {
+                self.display_tool_result(&parts[0].result);
+                return;
             }
-            _ => {
-                for args in &prepared.arrays {
-                    self.render_call_panel("edit", args);
-                }
-                self.render_result_panel(result);
-            }
+            // No dispatch panel (an error before the tool ran, or a call
+            // synthesized from its result): paint the pair from the part.
+            *self.last_tool.lock().unwrap() = Some((name.to_string(), parts[0].args.clone()));
+            self.render_call_panel(name, &parts[0].args);
+            self.display_tool_result(&parts[0].result);
+            return;
         }
+        for part in parts {
+            *self.last_tool.lock().unwrap() = Some((name.to_string(), part.args.clone()));
+            self.render_call_panel(name, &part.args);
+            self.render_result_panel(&part.result);
+        }
+        self.end_tool_block();
     }
 
     /// Paint one `edit` call from its stored-canonical arguments and its
@@ -4423,51 +4428,52 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
     }
 
     /// The invariant: a multi-file batch must render exactly as N single-file
-    /// batches would. Both paths paint through the same pair renderers — the
-    /// single-file path call-then-result, the multi-file path
-    /// `display_prepared_edit` over N arrays — so the only thing under test is
-    /// that the view layer treats them as the same sequence of pairs.
+    /// batches would.
+    ///
+    /// Both paths paint the same pair renderers — the single-file path
+    /// call-then-result, the multi-file path `display_tool_parts` over N parts —
+    /// so the only thing under test is that the view layer treats them as the
+    /// same sequence of pairs.
+    fn edit_part(args: Value, result: &str) -> crate::agent::parts::CallPart {
+        crate::agent::parts::CallPart {
+            args,
+            result: result.into(),
+            is_error: false,
+        }
+    }
+
     #[test]
     fn a_multi_file_batch_renders_identically_to_n_single_file_batches() {
-        let blocks = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
-                      b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
-        let prepared = crate::agent::transcript::prepare_edit_call(
-            &rig_core::message::CallId::from_wire("m1"),
-            &serde_json::json!({ "blocks": blocks }),
-            None,
-            None,
-            &crate::tool_args::PathContext::sandbox(),
-        )
-        .expect("a multi-file call");
-        assert_eq!(prepared.arrays.len(), 2);
-
-        let notes = ["Replaced 1 block(s) in a.rs", "Replaced 1 block(s) in b.rs"];
+        let parts = vec![
+            edit_part(
+                serde_json::json!({
+                    "path": "a.rs",
+                    "edits": [{"oldText": "x", "newText": "X"}],
+                }),
+                "Replaced 1 block(s) in a.rs",
+            ),
+            edit_part(
+                serde_json::json!({
+                    "path": "b.rs",
+                    "edits": [{"oldText": "y", "newText": "Y"}],
+                }),
+                "Replaced 1 block(s) in b.rs",
+            ),
+        ];
 
         // A: two single-file pairs, as a sequence of real calls would render.
         let (a, _) = capturing_output(40);
         a.begin_capture();
-        for (args, note) in prepared.arrays.iter().zip(notes) {
-            a.display_tool_call("edit", args);
-            a.display_tool_result(note);
+        for part in &parts {
+            a.display_tool_call("edit", &part.args);
+            a.display_tool_result(&part.result);
         }
         let a = strip_ansi(&String::from_utf8_lossy(&a.end_capture()));
 
-        // B: one prepared multi-file call, whose result rides the same arrays.
-        let mut prepared = prepared;
-        prepared.results = Some(notes.iter().map(|n| (*n).to_string()).collect());
-        let array = bsed_blockedit::render_file_results(
-            &["a.rs", "b.rs"]
-                .iter()
-                .zip(notes)
-                .map(|(path, note)| bsed_blockedit::FileResult {
-                    path: (*path).into(),
-                    result: Value::String((*note).into()),
-                })
-                .collect::<Vec<_>>(),
-        );
+        // B: one multi-part call, which defers the whole thing to the outcome.
         let (b, _) = capturing_output(40);
         b.begin_capture();
-        b.display_prepared_edit(&prepared, &array);
+        b.display_tool_parts("edit", &parts, false);
         let b = strip_ansi(&String::from_utf8_lossy(&b.end_capture()));
 
         assert_eq!(
@@ -4479,14 +4485,14 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         // range here: `edit_preview` derives one by finding `old_text` in the
         // file, and these files do not exist. The diff comes from the edits
         // alone, so it renders regardless.)
-        for part in [
+        for fragment in [
             "edit a.rs",
             "@@ -1 +1 @@",
             "Replaced 1 block(s) in a.rs",
             "edit b.rs",
             "Replaced 1 block(s) in b.rs",
         ] {
-            assert!(a.contains(part), "expected {part:?} in:\n{a}");
+            assert!(a.contains(fragment), "expected {fragment:?} in:\n{a}");
         }
         assert_eq!(
             a.matches("Replaced 1 block(s) in").count(),
@@ -4495,33 +4501,32 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
         );
     }
 
-    /// A single-file call is one pair: label, diff, then the note verbatim. The
-    /// result here is a plain success note, not a per-file array, so it is
-    /// painted once — the case a multi-file call never has.
+    /// A single part whose call was already painted at dispatch paints only the
+    /// result: the ordinary path, unchanged by the parts model.
     #[test]
-    fn a_single_file_prepared_edit_paints_one_pair_with_its_plain_result() {
-        let prepared = crate::agent::transcript::prepare_edit_call(
-            &rig_core::message::CallId::from_wire("s1"),
-            &serde_json::json!({
+    fn a_single_part_paints_only_the_outstanding_result() {
+        let parts = vec![edit_part(
+            serde_json::json!({
                 "path": "src/x.rs",
                 "edits": [{"oldText": "a", "newText": "b"}],
             }),
-            None,
-            None,
-            &crate::tool_args::PathContext::sandbox(),
-        )
-        .expect("a single-file call");
+            "Replaced 1 block(s) in src/x.rs",
+        )];
         let (out, _) = capturing_output(60);
         out.begin_capture();
-        out.display_prepared_edit(&prepared, "Replaced 1 block(s) in src/x.rs");
+        out.display_tool_call("edit", &parts[0].args);
+        out.display_tool_parts("edit", &parts, true);
         let text = strip_ansi(&String::from_utf8_lossy(&out.end_capture()));
-        assert!(text.contains("edit src/x.rs"), "no label:\n{text}");
+        assert_eq!(
+            text.matches("edit src/x.rs").count(),
+            1,
+            "the call must be painted once, not twice:\n{text}"
+        );
         assert!(text.contains("@@ -1 +1 @@"), "no diff:\n{text}");
         assert!(
             text.contains("Replaced 1 block(s) in src/x.rs"),
-            "the note must survive: \n{text}"
+            "the note must survive:\n{text}"
         );
-        assert_eq!(text.matches("Replaced 1 block(s)").count(), 1, "{text}");
     }
 
     /// Live and replay paint one single-file `edit` identically: live goes
@@ -4535,18 +4540,11 @@ Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.content.d
             "edits": [{"oldText": "a", "newText": "b"}]
         });
         let result = "Replaced 1 block(s) in src/x.rs";
-        let prepared = crate::agent::transcript::prepare_edit_call(
-            &rig_core::message::CallId::from_wire("s1"),
-            &args,
-            None,
-            None,
-            &crate::tool_args::PathContext::sandbox(),
-        )
-        .expect("a call");
+        let parts = vec![edit_part(args.clone(), result)];
 
         let (live, _) = capturing_output(60);
         live.begin_capture();
-        live.display_prepared_edit(&prepared, result);
+        live.display_tool_parts("edit", &parts, false);
         let live = strip_ansi(&String::from_utf8_lossy(&live.end_capture()));
 
         let (replay, _) = capturing_output(60);

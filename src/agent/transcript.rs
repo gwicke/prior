@@ -19,7 +19,6 @@ use rig_core::message::{
     ToolResult, ToolResultContent, UserContent,
 };
 use rig_core::streaming::{Part, PartKind, StreamEvent};
-use std::collections::HashMap;
 
 /// The wire triple prior stamps on the turns it builds itself.
 ///
@@ -322,11 +321,7 @@ impl TurnTranscript {
     /// boundary or the exit, once its results have arrived). At an exit it is
     /// `Ended` and every unanswered call is answered — the tail must stay a
     /// valid prefix.
-    pub(crate) fn prepare(
-        &mut self,
-        ledger: &EditLedger,
-        state: RunState,
-    ) -> Option<PreparedBatch> {
+    pub(crate) fn prepare(&mut self, state: RunState) -> Option<PreparedBatch> {
         if let Some(batch) = &self.prepared {
             return Some(batch.clone());
         }
@@ -352,20 +347,17 @@ impl TurnTranscript {
             // noise); drop the unit.
             None => return None,
         };
-        // The `bash` prefix strip and path relativization, so what gets
-        // persisted is the compact form. `crate::tool_args` is the single
-        // implementation the execution path and the model-facing history use,
-        // so every view of one call agrees.
-        let ctx = crate::tool_args::PathContext::sandbox();
-        let mut assistant = assistant;
-        crate::tool_args::normalize_in_message(&mut assistant, &ctx);
-
-        // `edit` is the one tool whose stored shape differs from its argument
-        // shape: one call per file, each a canonical array. The ledger holds
-        // what `on_outcome` already prepared; a call that never got that far
-        // (denied, interrupted, or synthesized from a result) is prepared
-        // here instead, without resolutions or a result to split.
-        let (assistant, results) = shape_edits(assistant, results, ledger, &ctx);
+        // Two steps, and they answer different questions.
+        //
+        // First the call *as the tool read it*: `preprocess_args` for a tool the
+        // table governs, which is the same function the dispatch label used, so
+        // the panel and the record cannot disagree. A call that never ran gets
+        // nothing — there is no tool to ask, and the model's spelling stands.
+        let assistant = preprocess_calls(assistant);
+        // Then the parts: a tool that returned one part per file becomes one
+        // call per file, each with its own result. A call nothing answered, or
+        // answered with plain text, is untouched.
+        let (assistant, results) = crate::agent::parts::unpack(assistant, results);
 
         let messages = assemble(assistant, results, state);
         let batch = PreparedBatch {
@@ -394,7 +386,6 @@ impl TurnTranscript {
 pub(crate) async fn commit(
     transcript: &std::sync::Mutex<TurnTranscript>,
     session: Option<&crate::session::Session>,
-    ledger: &EditLedger,
     state: RunState,
 ) -> crate::Result<()> {
     // Loop so a pending batch (a failed append) is written first, then any
@@ -405,7 +396,7 @@ pub(crate) async fn commit(
             let mut t = transcript
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            t.prepare(ledger, state)
+            t.prepare(state)
         };
         let Some(batch) = batch else {
             return Ok(());
@@ -592,140 +583,41 @@ fn assemble(assistant: Message, mut results: Vec<UserContent>, state: RunState) 
     out
 }
 
-/// Reshape `edit` calls (and their results) into the stored form: one call per
-/// file, each a canonical `{path, edits:[…]}` array — and, when the call split,
-/// one result per call.
+/// Replace each call's arguments with the form `preprocess_args` gives them.
 ///
-/// A lookup, not a transform: `on_outcome` has already run the one producer
-/// ([`prepare_edit_call`]) for every call that executed, so this reads the
-/// [`EditLedger`]. A call with no entry — denied, interrupted, or synthesized
-/// from a result — is prepared here without resolutions or a result, which
-/// still relativizes and serializes it, so the stored form stays canonical
-/// (`doc/261026_tool_path_relativization.md`, *One producing function*).
-///
-/// A multi-file call whose result is not a per-file array splits into nothing:
-/// it stays one call carrying the joined block form, with its original result.
-/// One call per file cannot be stored as arrays under one result, and a
-/// partially-saved history must never show a split with a dangling result.
-///
-/// Non-`edit` calls pass through untouched (path arguments were already
-/// rewritten by [`crate::tool_args::normalize_in_message`]).
-fn shape_edits(
-    assistant: Message,
-    results: Vec<UserContent>,
-    ledger: &EditLedger,
-    ctx: &crate::tool_args::PathContext,
-) -> (Message, Vec<UserContent>) {
-    let Message::Assistant(turn) = assistant else {
-        return (assistant, results);
+/// The same function the dispatch label used, so the panel and the record read
+/// one value rather than two rewrites that had to be proven to agree. A call the
+/// table does not govern — an unknown tool, `edit`, or any call that never ran —
+/// keeps the model's own bytes.
+fn preprocess_calls(assistant: Message) -> Message {
+    let ctx = crate::tool_args::PathContext::sandbox();
+    let Message::Assistant(mut turn) = assistant else {
+        return assistant;
     };
-    if !assistant_content(&Message::Assistant(turn.clone()))
-        .iter()
-        .any(|c| matches!(c, AssistantContent::ToolCall(tc) if tc.function.name == "edit"))
-    {
-        return (Message::Assistant(turn), results);
-    }
-    let response = response_id(&turn).map(str::to_string);
-
-    let mut result_by_id: HashMap<CallId, UserContent> = HashMap::new();
-    let mut others: Vec<UserContent> = Vec::new();
-    for c in results {
-        match &c {
-            UserContent::ToolResult(tr) => {
-                result_by_id.insert(tr.call.clone(), c);
-            }
-            _ => others.push(c),
-        }
-    }
-
-    let mut out_calls: Vec<AssistantContent> = Vec::new();
-    let mut out_results: Vec<UserContent> = Vec::new();
-    for c in turn.content {
-        let AssistantContent::ToolCall(tc) = c else {
-            out_calls.push(c);
-            continue;
-        };
-        if tc.function.name != "edit" {
-            if let Some(r) = result_by_id.remove(&tc.id) {
-                out_results.push(r);
-            }
-            out_calls.push(AssistantContent::ToolCall(tc));
-            continue;
-        }
-
-        let args = tc.function.arguments_value();
-        let prepared = match ledger.get_prepared(tc.id.wire().as_ref()) {
-            Some(p) => p.clone(),
-            None => match prepare_edit_call(&tc.id, &args, None, None, ctx) {
-                Some(p) => p,
-                // Unparsable arguments: the call is not ours to reshape. Keep
-                // the model's own bytes and its result.
-                None => {
-                    if let Some(r) = result_by_id.remove(&tc.id) {
-                        out_results.push(r);
+    let content: Vec<AssistantContent> = std::mem::take(&mut turn.content)
+        .into_iter()
+        .map(|c| match c {
+            AssistantContent::ToolCall(tc) => {
+                let args = tc.function.arguments_value();
+                match crate::agent::tool_shape::preprocess(tc.function.name.as_str(), &args, &ctx) {
+                    Some(rewritten) => {
+                        // Rebuild around the new arguments, keeping the provider
+                        // item: only the args changed, and a `native` that did
+                        // not would make rig replay the old spelling.
+                        let mut rebuilt = rig_core::message::ToolCall::new(
+                            tc.id.clone(),
+                            ToolFunction::new(tc.function.name.clone(), rewritten),
+                        );
+                        rebuilt.native = tc.native;
+                        AssistantContent::ToolCall(rebuilt)
                     }
-                    out_calls.push(AssistantContent::ToolCall(tc));
-                    continue;
-                }
-            },
-        };
-
-        if prepared.splits() {
-            let paired = result_by_id.remove(&tc.id);
-            let results = prepared.results.clone().unwrap_or_default();
-            for (i, id) in prepared.ids.iter().enumerate() {
-                out_calls.push(AssistantContent::ToolCall(rig_core::message::ToolCall {
-                    id: id.clone(),
-                    function: ToolFunction::new(
-                        tc.function.name.clone(),
-                        prepared.arrays[i].clone(),
-                    ),
-                    // A synthesized call has no provider id or signature: the
-                    // provider issued one of each, and N copies of one
-                    // provider id would be unmatchable on a wire that keys
-                    // results on it.
-                    native: None,
-                }));
-                if let Some(result) = results.get(i) {
-                    out_results.push(UserContent::ToolResult(ToolResult {
-                        call: id.clone(),
-                        name: tc.function.name.clone(),
-                        content: vec![ToolResultContent::text(result.clone())],
-                        is_error: false,
-                    }));
+                    None => AssistantContent::ToolCall(tc),
                 }
             }
-            // Anything else the original result entry carried is dropped with
-            // it: the array *is* the result, and its entries are now the
-            // per-file results.
-            let _ = paired;
-            continue;
-        }
-
-        // One call, one result. A single-file call stores its canonical array;
-        // a multi-file call that could not split stores the joined block form,
-        // because the canonical array names exactly one path.
-        let stored = if prepared.arrays.len() == 1 {
-            prepared.arrays[0].clone()
-        } else {
-            serde_json::json!({ "blocks": prepared.blocks.join("\n\n") })
-        };
-        out_calls.push(AssistantContent::ToolCall(rig_core::message::ToolCall {
-            id: tc.id.clone(),
-            function: ToolFunction::new(tc.function.name.clone(), stored),
-            native: tc.native.clone(),
-        }));
-        if let Some(r) = result_by_id.remove(&tc.id) {
-            out_results.push(r);
-        }
-    }
-
-    // Orphan results and non-tool content ride after in their original spirit;
-    // `assemble` then checks for unanswered calls.
-    out_results.extend(result_by_id.into_values());
-    out_results.extend(others);
-
-    (assistant_message(response, out_calls), out_results)
+            other => other,
+        })
+        .collect();
+    Message::Assistant(turn.with_content(content))
 }
 
 /// Whether an accepted assistant turn carries anything the user/model should
@@ -746,305 +638,77 @@ pub(crate) fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
     r.text.clone()
 }
 
-/// Render the request history the model is about to see: every tool call's
-/// arguments relativized, and every `edit` call in the block form.
+/// Render the request history the model is about to see.
 ///
-/// The transcript is stored canonically (a pi-compatible `edits` array) and the
-/// wire *accepts* that array too, but the schema does not advertise it — so the
-/// history renders it back to blocks and the model sees **one** shape. That is
-/// still the right call with two shapes accepted: the block form is the one
-/// weak harnesses can encode, and a history that mixes both teaches the model to
-/// alternate between them.
+/// The transcript is stored canonically — a pi-compatible `{path, edits:[…]}`
+/// array per file — and the wire *accepts* that array too, but the schema does
+/// not advertise it. So the history renders it back to the block form the model
+/// is asked for, and the model sees **one** shape. That is still the right call
+/// with two shapes accepted: the block form is the one weak harnesses can
+/// encode, and a history that mixes both teaches the model to alternate.
 ///
-/// Two passes, in this order:
+/// Wire-only, which is why it lives here rather than in `prepare`: persistence
+/// takes the array form (pi's canonical) and the request takes blocks, both from
+/// the same messages, so neither has to know that the other shaped anything.
 ///
-/// 1. [`crate::tool_args::normalize_messages`] — the `bash` prefix strip and
-///    path relativization, shared with every other egress.
-/// 2. `edit` → block form: the ledger's prepared `blocks` for this run's calls,
-///    else [`prepare_edit_call`] for a call the ledger never saw (a prior
-///    session, or a rejected call stored untouched). The fallback is still the
-///    one producer, so a call from an earlier session relativizes exactly as a
-///    live one does, and because its paths are already relative on disk the
-///    rewrite is a no-op.
+/// Two steps:
 ///
-/// Idempotent: a call already in block form is returned unchanged (this
-/// function's own output is block form, so a second pass takes that arm), and
-/// the ledger lookup means a second pass cannot minimize a block twice.
-pub(crate) fn render_model_facing(
-    mut messages: Vec<Message>,
-    ledger: &EditLedger,
-    ctx: &crate::tool_args::PathContext,
-) -> Vec<Message> {
-    crate::tool_args::normalize_messages(&mut messages, ctx);
+/// 1. [`crate::agent::tool_shape::preprocess`] — the `bash` prefix strip and
+///    path relativization, the same function the dispatch label and the record
+///    use. A loaded session's calls are already in this form, so it is a no-op
+///    there.
+/// 2. `edit` → block form, from the stored per-file arrays. A call already in
+///    block form is returned unchanged, which is what makes a second pass a
+///    byte-level no-op.
+pub(crate) fn render_model_facing(mut messages: Vec<Message>) -> Vec<Message> {
+    render_model_facing_with(&mut messages, &crate::tool_args::PathContext::sandbox());
     messages
-        .into_iter()
-        .map(|m| match m {
-            Message::Assistant(mut turn) => {
-                let content = std::mem::take(&mut turn.content)
-                    .into_iter()
-                    .map(|c| match c {
-                        AssistantContent::ToolCall(tc) if tc.function.name == "edit" => {
-                            let mut tc = tc;
-                            let args = tc.function.arguments_value();
-                            let value = match ledger
-                                .get_prepared(tc.id.wire().as_ref())
-                                .filter(|p| !p.blocks.is_empty())
-                            {
-                                Some(prepared) => Some(serde_json::json!({
-                                    "blocks": prepared.blocks.join("\n\n"),
-                                })),
-                                // Already in block form: a prior session's
-                                // call, or this function's own output. Nothing
-                                // to do — and saying so is what makes a second
-                                // pass a byte-level no-op.
-                                // No ledger entry (a prior session's call, a
-                                // rejected one stored untouched): the one parse
-                                // renders it, and relativizes it. Idempotent —
-                                // the output is block form, and parsing a
-                                // relativized block reproduces it byte for
-                                // byte — so a session rendered twice is stable.
-                                None => prepare_edit_call(&tc.id, &args, None, None, ctx)
-                                    .filter(|p| !p.blocks.is_empty())
-                                    .map(|p| {
-                                        serde_json::json!({
-                                            "blocks": p.blocks.join("\n\n"),
-                                        })
-                                    }),
-                            };
-                            if let Some(value) = value {
-                                tc.function = ToolFunction::new(tc.function.name.clone(), value);
-                            }
-                            AssistantContent::ToolCall(tc)
-                        }
-                        other => other,
-                    })
-                    .collect();
-                Message::Assistant(turn.with_content(content))
-            }
-            other => other,
-        })
-        .collect()
 }
 
-/// The per-run state the `edit` tool's one producer writes and every egress
-/// reads.
-///
-/// Two maps, deliberately not one: a *resolutions* entry is what execution
-/// reported (where each edit landed), and a *prepared* entry is the finished
-/// product of [`prepare_edit_call`]. `on_outcome` inserts the first, then
-/// prepares and inserts the second from it, so the only consumer of
-/// `resolutions` is the producer itself; everything downstream looks up
-/// `prepared`.
-///
-/// In-run and host-only: it holds file paths, line numbers and rendered
-/// arguments, never file contents, and is never serialized. It is cloned per
-/// hook call (a snapshot for the duration of one call), which is why both maps
-/// hold owned values and nothing borrows.
-#[derive(Default, Clone)]
-pub(crate) struct EditLedger {
-    /// Resolved placements for a successful `edit` call, keyed by the durable
-    /// tool-call id. Written by `on_outcome` from the tool's host-only
-    /// [`crate::tools::EditResolutions`] before the call is prepared.
-    resolutions: HashMap<String, crate::tools::EditResolutions>,
-    /// The prepared form of an `edit` call: canonical arrays for persist and
-    /// display, block form for the model's history, and the split ids/results
-    /// when the call names several files.
-    prepared: HashMap<String, PreparedEdit>,
-}
-
-impl EditLedger {
-    /// Record where a successful call's edits landed.
-    pub(crate) fn insert_resolutions(
-        &mut self,
-        id: impl Into<String>,
-        resolutions: crate::tools::EditResolutions,
-    ) {
-        self.resolutions.insert(id.into(), resolutions);
-    }
-
-    /// The placements recorded for `id`, if execution reported any.
-    pub(crate) fn get_resolutions(&self, id: &str) -> Option<&crate::tools::EditResolutions> {
-        self.resolutions.get(id)
-    }
-
-    /// Store a call's prepared form.
-    pub(crate) fn insert_prepared(&mut self, id: impl Into<String>, prepared: PreparedEdit) {
-        self.prepared.insert(id.into(), prepared);
-    }
-
-    /// The prepared form of `id`, if this run produced one.
-    pub(crate) fn get_prepared(&self, id: &str) -> Option<&PreparedEdit> {
-        self.prepared.get(id)
-    }
-}
-
-/// One `edit` call, parsed once and rendered into every form its consumers
-/// need.
-///
-/// The single owner of the call's shape: [`prepare_edit_call`] builds it, and
-/// each egress picks a field rather than re-deriving one. Because all of them
-/// come off the same `files`, the persisted array, the displayed panel and the
-/// model's block cannot disagree about a path or an anchor.
-#[derive(Clone)]
-pub(crate) struct PreparedEdit {
-    /// `{path, edits:[…]}` per file → persisted and displayed.
-    pub(crate) arrays: Vec<serde_json::Value>,
-    /// `render_blob` per file → the model-facing block form.
-    pub(crate) blocks: Vec<String>,
-    /// One result string per file, paired to `arrays` by index. `Some` only
-    /// when the call split, i.e. it names several files *and* its result is a
-    /// per-file array of the same length.
-    pub(crate) results: Option<Vec<String>>,
-    /// `split_id` per file: the original id for the first file, derived for the
-    /// rest. So `ids[0]` is the id the provider issued, and a non-split call
-    /// keeps it by construction.
-    pub(crate) ids: Vec<CallId>,
-}
-
-impl PreparedEdit {
-    /// Whether this call becomes N per-file calls (it has more than one file
-    /// *and* a result to pair each one with).
-    pub(crate) fn splits(&self) -> bool {
-        self.results.is_some() && self.ids.len() > 1
-    }
-}
-
-/// The one producer for an `edit` call: parse once, then render every form its
-/// consumers need.
-///
-/// Called by `LoggingHook::on_outcome`, which is the only place holding all
-/// three inputs — the call id, the raw arguments plus the host-only
-/// `EditResolutions`, and the result text — and which runs before both the
-/// persist and the history egresses. (The id is a parameter rather than a
-/// record inside `args`: a tool-call id is rig's, not the argument JSON's.) Those then look the result up in the [`EditLedger`] instead of
-/// re-parsing (see `doc/261026_tool_path_relativization.md`).
-///
-/// The steps are ordered because each depends on the previous one:
-///
-/// 1. [`bsed_blockedit::EditArgs::from_wire`] — **the** only parse of an
-///    `edit` call's arguments. Unparsable arguments yield `None`: the call is
-///    not ours to reshape, and every egress falls back to the model's own
-///    spelling.
-/// 2. Minimize per file against `resolutions` (a no-op when absent). A file
-///    with no recorded placement keeps its edits verbatim — no resolved line
-///    means no honest anchor.
-/// 3. Relativize each file's path. This is where the one path rule enters an
-///    `edit` call; `tool_args::normalize` deliberately skips `edit` for
-///    exactly this reason.
-/// 4. Arrays, 5. blocks, 6. results: three renderings of the same `files`.
-///
-/// `results` is `Some` only when the result text parses as a per-file array
-/// *and* its length matches the file count — the pairing guard, so a
-/// partially-written history never shows a split with a dangling result.
-/// `None` means "one call, one result": the original result rides the joined
-/// block form untouched.
-pub(crate) fn prepare_edit_call(
-    call_id: &CallId,
-    args: &serde_json::Value,
-    resolutions: Option<&crate::tools::EditResolutions>,
-    result_text: Option<&str>,
+/// [`render_model_facing`] against an explicit path context, so a test can pin
+/// the rule without depending on where the binary happens to be running.
+pub(crate) fn render_model_facing_with(
+    messages: &mut [Message],
     ctx: &crate::tool_args::PathContext,
-) -> Option<PreparedEdit> {
-    let mut files = bsed_blockedit::EditArgs::from_wire(args).ok()?.files;
-    minimize_files(&mut files, resolutions);
-    relativize_files(&mut files, ctx);
+) {
+    for message in messages.iter_mut() {
+        let Message::Assistant(turn) = message else {
+            continue;
+        };
+        for content in &mut turn.content {
+            let AssistantContent::ToolCall(tc) = content else {
+                continue;
+            };
+            let args = tc.function.arguments_value();
+            let rendered = match tc.function.name.as_str() {
+                "edit" => edit_blocks_of(&args)
+                    .or_else(|| crate::agent::tool_shape::preprocess("edit", &args, ctx)),
+                name => crate::agent::tool_shape::preprocess(name, &args, ctx),
+            };
+            if let Some(rendered) = rendered {
+                tc.function = ToolFunction::new(tc.function.name.clone(), rendered);
+            }
+        }
+    }
+}
 
-    let arrays: Vec<serde_json::Value> = files
-        .iter()
-        .map(|f| bsed_blockedit::edits_to_canonical_value(&f.path, &f.edits))
-        .collect();
+/// The block form of a stored `edit` call, or `None` when it is already blocks
+/// (or is not a parsed array at all, in which case the model's own spelling is
+/// what it wrote and the honest thing to send back).
+///
+/// `None` on the already-blocks arm is what makes this idempotent: the output of
+/// this function is block form, so a second pass takes that arm and changes
+/// nothing.
+fn edit_blocks_of(args: &serde_json::Value) -> Option<serde_json::Value> {
+    let files = bsed_blockedit::EditArgs::from_wire(args).ok()?.files;
+    if files.is_empty() {
+        return None;
+    }
     let blocks: Vec<String> = files
         .iter()
         .map(|f| bsed_blockedit::render_blob(&f.path, &bsed_blockedit::to_parsed(&f.edits)))
         .collect();
-    let results = result_text.and_then(|text| paired_results(text, files.len()));
-    // Derived, never minted: the persist and history egresses each split their
-    // own half of the conversation and must arrive at the same id for the same
-    // file. The producer is now the only caller, which is why `split_id`'s
-    // determinism is a stable-id convention rather than a correctness
-    // requirement.
-    let ids = (0..files.len())
-        .map(|i| crate::edit_blocks::split_id(call_id, i, files.len()))
-        .collect();
-
-    Some(PreparedEdit {
-        arrays,
-        blocks,
-        results,
-        ids,
-    })
-}
-
-/// Minimize every file that has a recorded placement, in place.
-///
-/// Today's `minimized_edit_args` loop, operating on the canonical `FileEdit`
-/// rather than rebuilding `ParsedEdit`s only to render them. A file whose path
-/// is not in `resolutions` — a failed file in a mixed batch, or any file when
-/// execution reported nothing — keeps its edits verbatim: without a resolved
-/// line there is no honest anchor.
-///
-/// Idempotent, which is why the result may be prepared more than once: an
-/// already-anchored edit's own anchor is its base, so re-minimizing it is a
-/// no-op.
-fn minimize_files(
-    files: &mut [bsed_blockedit::FileEdit],
-    resolutions: Option<&crate::tools::EditResolutions>,
-) {
-    let Some(resolutions) = resolutions else {
-        return;
-    };
-    for file in files.iter_mut() {
-        let Some(resolved) = resolutions.files.iter().find(|r| r.path == file.path) else {
-            continue;
-        };
-        if resolved.matched_lines.len() != file.edits.len() {
-            continue;
-        }
-        // The ledger's resolved line is for edits that arrived unanchored,
-        // where only execution knows the placement; an anchored edit is
-        // already the trimmed form, so its own anchor is the base.
-        file.edits = file
-            .edits
-            .iter()
-            .zip(&resolved.matched_lines)
-            .flat_map(|(edit, line)| {
-                let base = edit.start_line.map(|s| s.0 as usize).unwrap_or(*line);
-                // One input edit may split into several anchored sub-edits at
-                // long internal unchanged runs.
-                bsed_blockedit::split_and_minimize(edit, base)
-            })
-            .collect();
-    }
-}
-
-/// Relativize each file's path with the one path rule, in place.
-fn relativize_files(files: &mut [bsed_blockedit::FileEdit], ctx: &crate::tool_args::PathContext) {
-    for file in files.iter_mut() {
-        if let Some(rel) = crate::tool_args::relativize_arg(&file.path, ctx) {
-            file.path = rel;
-        }
-    }
-}
-
-/// The result text split into one string per file, or `None` when it is not a
-/// per-file array of exactly `n` entries.
-///
-/// The length check is the pairing guard: the array is built in the same order
-/// the files were applied, so equal lengths mean index `i` is file `i`'s
-/// outcome. A mismatch means a corrupt or partially-written array, and leaving
-/// the call whole is the safe reading — better one call with one result than a
-/// split with a dangling one.
-fn paired_results(result_text: &str, n: usize) -> Option<Vec<String>> {
-    let parsed = bsed_blockedit::parse_file_results(result_text)?;
-    (parsed.len() == n).then(|| {
-        parsed
-            .iter()
-            .map(|f| match &f.result {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-            .collect()
-    })
+    Some(serde_json::json!({ "blocks": blocks.join("\n\n") }))
 }
 
 /// The text of a tool result, as the model sees it.
@@ -1248,52 +912,6 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         assert_eq!(model_facing_tool_text("edit", call_err), None);
     }
 
-    /// The path context the `edit` tests relativize against: cwd `/proj`, home
-    /// `/home/u`, so `/proj/src/x.rs` → `src/x.rs` and `~/notes.txt` stays.
-    fn ctx() -> crate::tool_args::PathContext {
-        crate::tool_args::PathContext::new("/proj", Some("/home/u".into()))
-    }
-
-    /// A three-file call plus its array result, as the stored history holds it.
-    fn multi_file_history() -> Vec<Message> {
-        let blocks = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
-                      b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END\n\n\
-                      c.rs\n@@@OLD\nq\n@@@NEW\nQ\n@@@END";
-        let result = bsed_blockedit::render_file_results(&[
-            bsed_blockedit::FileResult {
-                path: "a.rs".into(),
-                result: serde_json::json!("Replaced 1 block(s) in a.rs"),
-            },
-            bsed_blockedit::FileResult {
-                path: "b.rs".into(),
-                result: serde_json::json!({
-                    "ui_view": "edit failed: nope", "model_view": "long diff"
-                }),
-            },
-            bsed_blockedit::FileResult {
-                path: "c.rs".into(),
-                result: serde_json::json!("Replaced 1 block(s) in c.rs"),
-            },
-        ]);
-        vec![
-            assistant_message(
-                None,
-                vec![AssistantContent::ToolCall(tool_call(
-                    "t1",
-                    "edit",
-                    serde_json::json!({ "blocks": blocks }),
-                ))],
-            ),
-            Message::User {
-                content: vec![UserContent::ToolResult(text_tool_result(
-                    CallId::from_wire("t1"),
-                    "edit",
-                    result,
-                ))],
-            },
-        ]
-    }
-
     fn tool_calls_of(m: &Message) -> Vec<rig_core::message::ToolCall> {
         if !matches!(m, Message::Assistant(_)) {
             panic!("expected an assistant message")
@@ -1331,281 +949,238 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             .to_string()
     }
 
-    // ---- prepare_edit_call: the one producer ----
+    // ---- the parts model: unpack, preprocess, render ----
+    //
+    // The shape of a call is stated by the tool that ran it, so what is left to
+    // test here is the framework's half: how a parts list becomes N pairs, how
+    // a call's args are normalized, and how an `edit` array renders back to the
+    // block form the model is asked for.
 
-    #[test]
-    fn a_single_file_call_produces_one_array_and_one_block() {
-        let args = serde_json::json!({"blocks": "/proj/src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"});
-        let p = prepare_edit_call(&CallId::from_wire("e1"), &args, None, None, &ctx())
-            .expect("a parseable call");
-        assert_eq!(
-            p.arrays,
-            vec![serde_json::json!({
-                "path": "src/x.rs",
-                "edits": [{"oldText": "a", "newText": "b"}],
-            })]
-        );
-        assert_eq!(
-            p.blocks,
-            vec!["src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END".to_string()]
-        );
-        // No result text: nothing to pair, so the call cannot split.
-        assert!(p.results.is_none());
-        assert!(!p.splits());
-        assert_eq!(p.ids.len(), 1);
-        assert_eq!(&*p.ids[0].wire(), "e1");
-    }
-
-    #[test]
-    fn a_multi_file_call_splits_when_its_result_array_matches() {
-        let history = multi_file_history();
-        let args = tool_calls_of(&history[0])[0].function.arguments_value();
-        let result = tool_result_text(&match &history[1] {
-            Message::User { content } => match &content[0] {
-                UserContent::ToolResult(tr) => tr.clone(),
-                _ => panic!("a result"),
+    /// A two-file `edit` result, as the tool answers it: one part per file, each
+    /// with its own canonical args and its own result.
+    fn edit_parts() -> Vec<crate::agent::parts::CallPart> {
+        vec![
+            crate::agent::parts::CallPart {
+                args: serde_json::json!({
+                    "path": "a.rs",
+                    "edits": [{"oldText": "x", "newText": "X", "startLine": 1}],
+                }),
+                result: "Replaced 1 block(s) in a.rs".into(),
+                is_error: false,
             },
-            _ => panic!("a user message"),
-        })
-        .unwrap();
-        let p = prepare_edit_call(&CallId::from_wire("t1"), &args, None, Some(&result), &ctx())
-            .expect("a parseable call");
-        assert_eq!(p.arrays.len(), 3);
-        assert!(p.splits());
-        assert_eq!(
-            p.ids.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
-            vec!["t1", "t1_f1n3", "t1_f2n3"]
-        );
-        // Each result rides its own call by index.
-        let results = p.results.clone().expect("paired results");
-        assert_eq!(results.len(), 3);
-        assert!(results[0].contains("Replaced 1 block(s) in a.rs"));
-        assert!(results[1].contains("long diff"), "{}", results[1]);
-        assert!(results[2].contains("c.rs"));
+            crate::agent::parts::CallPart {
+                args: serde_json::json!({
+                    "path": "b.rs",
+                    "edits": [{"oldText": "y", "newText": "Y", "startLine": 3}],
+                }),
+                result: r#"{"ui_view":"edit failed: nope","model_view":"long diff"}"#.into(),
+                is_error: true,
+            },
+        ]
     }
 
-    #[test]
-    fn a_multi_file_call_without_a_matching_result_does_not_split() {
-        let args = serde_json::json!({"blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
-                                               b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END"});
-        let id = CallId::from_wire("t1");
-        // A plain-text result (an argument error, or a call that errored before
-        // producing the array) and a mismatched array both mean "one call".
-        for result in [
-            "the tool failed",
-            r#"[{"path":"a.rs","result":"Replaced 1 block(s) in a.rs"}]"#,
-        ] {
-            let p = prepare_edit_call(&id, &args, None, Some(result), &ctx()).expect("a call");
-            assert_eq!(p.arrays.len(), 2);
-            assert!(p.results.is_none(), "{result}");
-            assert!(!p.splits(), "{result}");
+    /// A committed result carrying a parts list, which is what the loop writes
+    /// into the run for a tool that answers more than one call.
+    fn parts_result(
+        call: &str,
+        parts: &[crate::agent::parts::CallPart],
+    ) -> rig_core::message::ToolResult {
+        rig_core::message::ToolResult {
+            call: CallId::from_wire(call),
+            name: tool_name("edit"),
+            content: vec![ToolResultContent::Json {
+                value: serde_json::to_value(parts).expect("parts serialize"),
+            }],
+            is_error: false,
         }
     }
 
     #[test]
-    fn only_the_resolved_file_of_a_mixed_batch_is_minimized() {
-        use crate::tools::{EditResolutions, FileResolution};
-        let args = serde_json::json!({"blocks": "a.rs\n@@@OLD\nkeep\nold\nalso_keep\n\
-                                               @@@NEW\nkeep\nnew\nalso_keep\n@@@END\n\n\
-                                               b.rs\n@@@OLD\nsame\n@@@NEW\nSAME\n@@@END"});
-        let resolutions = EditResolutions {
-            files: vec![FileResolution {
-                path: "a.rs".into(),
-                matched_lines: vec![40],
-            }],
-        };
-        let p = prepare_edit_call(
-            &CallId::from_wire("e1"),
-            &args,
-            Some(&resolutions),
+    fn unpack_splits_a_parts_list_into_one_pair_per_part() {
+        let assistant = assistant_message(
             None,
-            &ctx(),
-        )
-        .expect("a parseable call");
-        // The resolved file is anchored where it applied, and trimmed to the
-        // changed line plus enough context to stay a strong locator (`old` alone
-        // is under the weak-locator floor, so `also_keep` is restored); the
-        // unresolved one keeps its edits verbatim, with no anchor.
-        assert_eq!(
-            p.blocks[0],
-            "a.rs:41\n@@@OLD\nold\nalso_keep\n@@@NEW\nnew\nalso_keep\n@@@END"
+            vec![AssistantContent::ToolCall(tool_call(
+                "t1",
+                "edit",
+                serde_json::json!({ "blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END" }),
+            ))],
         );
-        assert_eq!(p.blocks[1], "b.rs\n@@@OLD\nsame\n@@@NEW\nSAME\n@@@END");
-    }
-
-    #[test]
-    fn a_long_internal_gap_splits_into_anchored_sub_blocks() {
-        use crate::tools::{EditResolutions, FileResolution};
-        let args = serde_json::json!({
-            "blocks": "a.rs\n@@@OLD\nalpha_context_line\nold_x_context_line\n\
-                       bravo_context_line\ncharlie_line\ndelta_context_line\n\
-                       old_y_context_line\necho_context_line\n@@@NEW\nalpha_context_line\n\
-                       new_x_context_line\nbravo_context_line\ncharlie_line\n\
-                       delta_context_line\nnew_y_context_line\necho_context_line\n@@@END"
-        });
-        let resolutions = EditResolutions {
-            files: vec![FileResolution {
-                path: "a.rs".into(),
-                matched_lines: vec![10],
-            }],
-        };
-        let p = prepare_edit_call(
-            &CallId::from_wire("e1"),
-            &args,
-            Some(&resolutions),
-            None,
-            &ctx(),
-        )
-        .expect("a call");
-        assert_eq!(
-            p.blocks[0],
-            "a.rs:11\n@@@OLD\nold_x_context_line\n@@@NEW\nnew_x_context_line\n@@@END\n\n\
-             a.rs:15\n@@@OLD\nold_y_context_line\n@@@NEW\nnew_y_context_line\n@@@END"
+        let parts = edit_parts();
+        let (assistant, results) = crate::agent::parts::unpack(
+            assistant,
+            vec![UserContent::ToolResult(parts_result("t1", &parts))],
         );
+
+        // One call per part, each carrying that part's own args.
+        let calls = tool_calls_of(&assistant);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls.iter().map(|c| c.id.to_string()).collect::<Vec<_>>(),
+            vec!["t1", "t1_f1n2"]
+        );
+        assert_eq!(calls[0].function.arguments["path"], "a.rs");
+        assert_eq!(calls[1].function.arguments["path"], "b.rs");
+
+        // One result per call, paired structurally — no length check.
+        let results = results_of(&Message::User { content: results });
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.contains("Replaced 1 block(s) in a.rs"));
+        assert!(results[1].1.contains("long diff"));
     }
 
+    /// A part's `is_error` wins over the batch's: one file failing inside a
+    /// successful call is that file's outcome, and the stored pair says so.
     #[test]
-    fn preparing_twice_is_byte_stable() {
-        use crate::tools::{EditResolutions, FileResolution};
-        let args = serde_json::json!({"blocks": "a.rs\n@@@OLD\nkeep\nold\nkeep2\n\
-                                               @@@NEW\nkeep\nnew\nkeep2\n@@@END"});
-        let resolutions = EditResolutions {
-            files: vec![FileResolution {
-                path: "a.rs".into(),
-                matched_lines: vec![40],
-            }],
-        };
-        let id = CallId::from_wire("e1");
-        let once = prepare_edit_call(&id, &args, Some(&resolutions), None, &ctx()).expect("a call");
-        // The second pass starts from the first's own block form: an anchored
-        // edit's anchor is its base, so minimizing again is a no-op.
-        let twice = prepare_edit_call(
-            &id,
-            &serde_json::json!({ "blocks": once.blocks[0] }),
-            Some(&resolutions),
+    fn unpack_carries_each_parts_disposition() {
+        let assistant = assistant_message(
             None,
-            &ctx(),
-        )
-        .expect("a call");
-        assert_eq!(once.arrays, twice.arrays);
-        assert_eq!(once.blocks, twice.blocks);
+            vec![AssistantContent::ToolCall(tool_call(
+                "t1",
+                "edit",
+                serde_json::json!({ "blocks": "a.rs" }),
+            ))],
+        );
+        let (_, results) = crate::agent::parts::unpack(
+            assistant,
+            vec![UserContent::ToolResult(parts_result("t1", &edit_parts()))],
+        );
+        let flags: Vec<bool> = results
+            .iter()
+            .filter_map(|c| match c {
+                UserContent::ToolResult(tr) => Some(tr.is_error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flags, vec![false, true]);
     }
 
+    /// A single part is not a split: the model's own call and the one result
+    /// stand, so nothing is rewritten for the common case.
     #[test]
-    fn unparsable_arguments_produce_nothing() {
-        let args = serde_json::json!({"blocks": "@@@OLD\na\n@@@END"});
-        assert!(prepare_edit_call(&CallId::from_wire("e1"), &args, None, None, &ctx()).is_none());
-    }
-
-    #[test]
-    fn arrays_and_blocks_describe_the_same_files() {
-        let args = serde_json::json!({"blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n\
-                                               b.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END"});
-        let p =
-            prepare_edit_call(&CallId::from_wire("e1"), &args, None, None, &ctx()).expect("a call");
-        assert_eq!(p.arrays.len(), p.blocks.len());
-        for (array, block) in p.arrays.iter().zip(&p.blocks) {
-            let path = array["path"].as_str().unwrap();
-            assert!(block.starts_with(path), "{block}");
-            // The block re-parses to the array's edits, anchors included.
-            let reparsed =
-                bsed_blockedit::canonicalize_edit_value(&serde_json::json!({ "blocks": block }));
-            assert_eq!(&reparsed, array);
-        }
+    fn a_single_part_call_is_left_as_it_is() {
+        let assistant = assistant_message(
+            None,
+            vec![AssistantContent::ToolCall(tool_call(
+                "t1",
+                "edit",
+                serde_json::json!({ "blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END" }),
+            ))],
+        );
+        let one = &edit_parts()[..1];
+        let (assistant, results) = crate::agent::parts::unpack(
+            assistant,
+            vec![UserContent::ToolResult(parts_result("t1", one))],
+        );
+        assert_eq!(tool_calls_of(&assistant).len(), 1);
+        // The call keeps the arguments the model sent: nothing was re-derived.
+        assert!(tool_calls_of(&assistant)[0]
+            .function
+            .arguments
+            .get("blocks")
+            .is_some());
+        assert_eq!(results.len(), 1, "{results:?}");
+        // And the committed result rides along untouched — the parts list
+        // renders as its one result, which is byte-identical to today's text.
+        let rendered = crate::agent::parts::parts_text(
+            &crate::agent::parts::parts_of_message_result(match &results[0] {
+                UserContent::ToolResult(tr) => tr,
+                _ => panic!("a result"),
+            })
+            .expect("still a parts list"),
+        );
+        assert_eq!(rendered, "Replaced 1 block(s) in a.rs");
     }
 
     // ---- persist: the stored shape ----
 
+    /// What reaches disk is one canonical array per file — pi's format — because
+    /// unpacking happened before the batch was assembled.
     #[test]
-    fn persist_splits_a_prepared_multi_file_call_into_canonical_arrays() {
-        let history = multi_file_history();
-        let mut ledger = EditLedger::default();
-        let args = tool_calls_of(&history[0])[0].function.arguments_value();
-        let result = results_of(&history[1])[0].1.clone();
-        let prepared =
-            prepare_edit_call(&CallId::from_wire("t1"), &args, None, Some(&result), &ctx())
-                .expect("a call");
-        ledger.insert_prepared("t1", prepared);
-
+    fn persist_stores_one_canonical_array_per_file() {
         let mut t = TurnTranscript::default();
         t.start_live();
-        t.accept(None, assistant_content(&history[0]).to_vec());
-        t.push_tool_result(text_tool_result(CallId::from_wire("t1"), "edit", result));
-        let batch = t.prepare(&ledger, RunState::Ongoing).expect("a batch");
+        t.accept(
+            None,
+            vec![AssistantContent::ToolCall(tool_call(
+                "t1",
+                "edit",
+                serde_json::json!({ "blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END" }),
+            ))],
+        );
+        t.push_tool_result(parts_result("t1", &edit_parts()));
+        let batch = t.prepare(RunState::Ongoing).expect("a batch");
 
         let calls = tool_calls_of(&batch.messages[0]);
-        assert_eq!(calls.len(), 3);
-        // Stored as canonical arrays, one path per call, in call order.
-        for (call, path) in calls.iter().zip(["a.rs", "b.rs", "c.rs"]) {
+        assert_eq!(calls.len(), 2);
+        for (call, path) in calls.iter().zip(["a.rs", "b.rs"]) {
             assert_eq!(call.function.arguments["path"], path, "{:?}", call.function);
             assert!(call.function.arguments["edits"].is_array());
             assert!(call.function.arguments.get("blocks").is_none());
         }
-        // And the results pair by the derived ids.
+        // Plain text per call: a parts list never reaches disk.
         let results = results_of(&batch.messages[1]);
-        assert_eq!(
-            results
-                .iter()
-                .map(|(id, _)| id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["t1", "t1_f1n3", "t1_f2n3"]
-        );
-        assert!(results[1].1.contains("long diff"));
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].1.contains("prior_call"), "no envelope on disk");
+        assert!(serde_json::from_str::<serde_json::Value>(&results[0].1).is_err());
     }
 
+    /// A call the tool never ran keeps the args the model sent — there is no
+    /// tool to ask, and inventing a shape would be worse than the model's own.
     #[test]
-    fn persist_prepares_a_call_the_ledger_never_saw() {
-        // Denied or interrupted: `on_outcome` never ran, so there is no ledger
-        // entry. The stored form must still be the canonical array, relativized
-        // against the sandbox context `prepare` builds (hence a real cwd path).
-        let cwd = std::env::current_dir().unwrap();
-        let call = assistant_message(
-            None,
-            vec![AssistantContent::ToolCall(tool_call(
-                "s1",
-                "edit",
-                serde_json::json!({
-                    "blocks": format!(
-                        "{}/solo.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END",
-                        cwd.display()
-                    ),
-                }),
-            ))],
-        );
-        let result = Message::User {
-            content: vec![UserContent::ToolResult(text_tool_result(
-                CallId::from_wire("s1"),
-                "edit",
-                "Replaced 1 block(s) in solo.rs",
-            ))],
-        };
+    fn persist_leaves_a_call_that_never_ran_alone() {
         let mut t = TurnTranscript::default();
         t.start_live();
-        t.accept(None, assistant_content(&call).to_vec());
-        for c in assistant_content(&result) {
-            let _ = c;
-        }
-        t.push_tool_result(text_tool_result(
-            CallId::from_wire("s1"),
-            "edit",
-            "Replaced 1 block(s) in solo.rs",
-        ));
-        let batch = t
-            .prepare(&EditLedger::default(), RunState::Ongoing)
-            .expect("a batch");
+        t.accept(
+            None,
+            vec![AssistantContent::ToolCall(tool_call(
+                "d1",
+                "bash",
+                serde_json::json!({ "command": "rm -rf /" }),
+            ))],
+        );
+        let batch = t.prepare(RunState::Ended).expect("a batch");
         let calls = tool_calls_of(&batch.messages[0]);
-        assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].function.arguments_value(),
-            serde_json::json!({
-                "path": "solo.rs",
-                "edits": [{"oldText": "x", "newText": "X"}],
-            })
+            serde_json::json!({ "command": "rm -rf /" })
         );
-        // Its original result rides along untouched.
-        let results = results_of(&batch.messages[1]);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, "Replaced 1 block(s) in solo.rs");
+        // `Ended` answers it with the "did not execute" result so the stored
+        // tail stays a valid prefix.
+        assert_eq!(results_of(&batch.messages[1]).len(), 1);
+    }
+
+    /// `preprocess_args` is what the record carries: the `bash` prefix goes and
+    /// a path shortens, because the panel was labelled with exactly this.
+    #[test]
+    fn persist_records_the_call_as_preprocessed() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut t = TurnTranscript::default();
+        t.start_live();
+        t.accept(
+            None,
+            vec![
+                AssistantContent::ToolCall(tool_call(
+                    "b1",
+                    "bash",
+                    serde_json::json!({ "command": format!("cd {} && ls", cwd.display()) }),
+                )),
+                AssistantContent::ToolCall(tool_call(
+                    "r1",
+                    "read",
+                    serde_json::json!({ "path": format!("{}/src/x.rs", cwd.display()) }),
+                )),
+            ],
+        );
+        let batch = t.prepare(RunState::Ended).expect("a batch");
+        let calls = tool_calls_of(&batch.messages[0]);
+        assert_eq!(
+            calls[0].function.arguments_value(),
+            serde_json::json!({ "command": "ls" })
+        );
+        assert_eq!(
+            calls[1].function.arguments_value(),
+            serde_json::json!({ "path": "src/x.rs" })
+        );
     }
 
     // ---- history: the model-facing shape ----
@@ -1623,7 +1198,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                 }),
             ))],
         );
-        let out = render_model_facing(vec![stored], &EditLedger::default(), &ctx());
+        let out = render_model_facing(vec![stored]);
         assert_eq!(
             blocks_of(&out[0]),
             "src/x.rs:12\n@@@OLD\na\n@@@NEW\nb\n@@@END"
@@ -1632,66 +1207,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let calls = tool_calls_of(&out[0]);
         assert!(calls[0].function.arguments.get("edits").is_none());
         // Idempotent: rendering the block form again changes nothing.
-        let twice = render_model_facing(out.clone(), &EditLedger::default(), &ctx());
+        let twice = render_model_facing(out.clone());
         assert_eq!(twice, out);
-    }
-
-    #[test]
-    fn history_relativizes_a_call_with_no_ledger_entry() {
-        // A prior session's raw blob: stored untouched by a rejected call, so
-        // the ledger has nothing and the one parse produces the block.
-        let blob = assistant_message(
-            None,
-            vec![AssistantContent::ToolCall(tool_call(
-                "r1",
-                "edit",
-                serde_json::json!({"blocks": "/proj/src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"}),
-            ))],
-        );
-        let out = render_model_facing(vec![blob], &EditLedger::default(), &ctx());
-        assert_eq!(blocks_of(&out[0]), "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END");
-    }
-
-    #[test]
-    fn history_uses_the_ledgers_prepared_blocks() {
-        // The ledger's block is what the model sees, so a minimized call cannot
-        // be re-derived (or re-minimized) from its stored array.
-        let stored = assistant_message(
-            None,
-            vec![AssistantContent::ToolCall(tool_call(
-                "e1",
-                "edit",
-                serde_json::json!({
-                    "path": "src/x.rs",
-                    "edits": [{"oldText": "old", "newText": "new"}],
-                }),
-            ))],
-        );
-        let mut ledger = EditLedger::default();
-        let prepared = prepare_edit_call(
-            &CallId::from_wire("e1"),
-            &serde_json::json!({"blocks": "src/x.rs\n@@@OLD\nkeep\nold\nkeep2\n\
-                                           @@@NEW\nkeep\nnew\nkeep2\n@@@END"}),
-            Some(&crate::tools::EditResolutions {
-                files: vec![crate::tools::FileResolution {
-                    path: "src/x.rs".into(),
-                    matched_lines: vec![40],
-                }],
-            }),
-            None,
-            &ctx(),
-        )
-        .expect("a call");
-        ledger.insert_prepared("e1", prepared);
-        // The `old` locator is under the weak-locator floor, so the minimizer
-        // keeps the common context lines, and the anchor moves back with them.
-        // The point of the test is *which* block this came from: the ledger's,
-        // not one re-derived from the stored `{path, edits}` array.
-        let out = render_model_facing(vec![stored], &ledger, &ctx());
-        assert_eq!(
-            blocks_of(&out[0]),
-            "src/x.rs:40\n@@@OLD\nkeep\nold\nkeep2\n@@@NEW\nkeep\nnew\nkeep2\n@@@END"
-        );
     }
 
     #[test]
@@ -1701,14 +1218,39 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             vec![AssistantContent::ToolCall(tool_call(
                 "r1",
                 "read",
-                serde_json::json!({"path": "/proj/src/x.rs"}),
+                serde_json::json!({"path": "src/x.rs"}),
             ))],
         );
-        let out = render_model_facing(vec![msg], &EditLedger::default(), &ctx());
+        // `src/x.rs` is already the stored form of a call in this run, so the
+        // render is a no-op — which is what makes a loaded history safe to push
+        // through the same function on every request.
+        let out = render_model_facing(vec![msg]);
         assert_eq!(
             tool_calls_of(&out[0])[0].function.arguments_value(),
             serde_json::json!({"path": "src/x.rs"})
         );
+    }
+
+    /// A stored array that is already the projected form is not re-minimized or
+    /// re-split: the two renderings are stable under a second request.
+    #[test]
+    fn history_is_stable_over_many_requests() {
+        let stored = assistant_message(
+            None,
+            vec![AssistantContent::ToolCall(tool_call(
+                "e1",
+                "edit",
+                serde_json::json!({
+                    "path": "src/x.rs",
+                    "edits": [{"oldText": "old", "newText": "new", "startLine": 40}],
+                }),
+            ))],
+        );
+        let once = render_model_facing(vec![stored]);
+        let twice = render_model_facing(once.clone());
+        let thrice = render_model_facing(twice.clone());
+        assert_eq!(once, twice);
+        assert_eq!(twice, thrice);
     }
 
     #[test]
@@ -1775,8 +1317,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         t.accept(None, vec![AssistantContent::ToolCall(tc)]);
         t.push_tool_result(text_tool_result(call_id, "read", "ok"));
         // An `Ongoing` boundary (call start) writes the pair as one batch.
-        let anchors = EditLedger::default();
-        let batch = t.prepare(&anchors, RunState::Ongoing).expect("batch");
+        let batch = t.prepare(RunState::Ongoing).expect("batch");
         assert_eq!(
             batch.messages.len(),
             2,
@@ -1807,9 +1348,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         t.start_live();
         t.accept(None, vec![AssistantContent::ToolCall(tc)]);
         t.push_tool_result(text_tool_result(call_id, "bash", "ok"));
-        let batch = t
-            .prepare(&EditLedger::default(), RunState::Ongoing)
-            .expect("batch");
+        let batch = t.prepare(RunState::Ongoing).expect("batch");
         // The persisted call is the compact form, matching what the shell ran
         // and what the next turn is shown.
         let calls = tool_calls_of(&batch.messages[0]);
@@ -1832,8 +1371,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         t.start_live();
         t.accept(None, vec![AssistantContent::ToolCall(tc)]);
         // Interrupted before any result: `Ended` synthesizes one per call.
-        let anchors = EditLedger::default();
-        let batch = t.prepare(&anchors, RunState::Ended).expect("batch");
+        let batch = t.prepare(RunState::Ended).expect("batch");
         assert_eq!(batch.messages.len(), 2, "assistant + synthesized user");
         let Message::User { content } = &batch.messages[1] else {
             panic!("expected a user message");
@@ -1862,8 +1400,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         t.accept(None, vec![AssistantContent::ToolCall(tc)]);
         // No result yet: at an ongoing boundary the unit is incomplete, so
         // there is nothing to write (the tail never gets a dangling call).
-        let anchors = EditLedger::default();
-        assert!(t.prepare(&anchors, RunState::Ongoing).is_none());
+        assert!(t.prepare(RunState::Ongoing).is_none());
     }
 
     #[test]
@@ -1873,9 +1410,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let mut t = TurnTranscript::default();
         t.start_live();
         t.accept(None, vec![AssistantContent::text("   ")]);
-        let anchors = EditLedger::default();
         assert!(!t.has_content(), "blank-text turn is not content");
-        assert!(t.prepare(&anchors, RunState::Ended).is_none());
+        assert!(t.prepare(RunState::Ended).is_none());
     }
 
     #[test]

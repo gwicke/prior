@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex};
 use crate::agent::msglog::MessageLogger;
 use crate::agent::transcript::{
     assistant_message, maybe_strip_reasoning, model_facing_tool_text, reasoning_remap_note,
-    render_model_facing, EditLedger, TurnTranscript,
+    render_model_facing, TurnTranscript,
 };
 use crate::agent::CodeAgent;
 use crate::tools::{
@@ -638,9 +638,6 @@ pub(crate) struct LoggingHook {
     /// The session to persist each completed completion turn into, if any.
     /// `None` for `run_once` (sessionless) and tests.
     pub(crate) session: Option<Arc<crate::session::Session>>,
-    /// What the `edit` producer saw and rendered this run, shared with the
-    /// persist and history paths so all three use one shape. See [`EditLedger`].
-    pub(crate) edit_anchors: Arc<Mutex<EditLedger>>,
 }
 
 /// An [`AgentBuilder`] over rig's [`SignedInModel`]: the catalog entry for
@@ -740,15 +737,9 @@ impl AgentHook for LoggingHook {
         // answered), so this is the incremental persist point: mid-turn
         // progress reaches disk by the start of the next call.
         {
-            let ledger = self
-                .edit_anchors
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
             let _ = crate::agent::transcript::commit(
                 &self.transcript,
                 self.session.as_deref(),
-                &ledger,
                 crate::agent::transcript::RunState::Ongoing,
             )
             .await;
@@ -760,36 +751,26 @@ impl AgentHook for LoggingHook {
             return CompletionCallAction::Stop("cancelled by user".into());
         }
         // Build the history to send: strip reasoning when configured, then
-        // render every tool call's arguments and every `edit` call's block form
-        // from the ledger the producer filled. The composition order is
-        // `strip -> normalize -> edit-blocks`; nothing is re-parsed or
-        // re-minimized here, so the history cannot drift from what was
-        // persisted (both read the same `PreparedEdit`).
+        // render every tool call the way the model should see it (path
+        // arguments short, `edit` in block form). The composition order is
+        // `strip -> render`; nothing is re-parsed or re-minimized here, because
+        // the stored form already carries what execution decided.
         //
-        // The transcript is stored canonically (a pi-compatible array); the model is
-        // shown the block form *consistently* so it keeps emitting the reliable
-        // shape. This hook is the one place that sees the whole request history,
-        // so it covers prior and within-turn messages alike.
+        // The transcript is stored canonically (a pi-compatible array); the
+        // model is shown the block form *consistently* so it keeps emitting the
+        // reliable shape. This hook is the one place that sees the whole
+        // request history, so it covers prior and within-turn messages alike.
         let stripped_history = maybe_strip_reasoning(
             event.history.iter().map(|m| (**m).clone()).collect(),
             self.reasoning_in_context,
             &self.provider,
             &self.model,
         );
-        let ledger = self
-            .edit_anchors
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        // `strip -> normalize + edit-blocks`: drop the redundant
-        // `cd <cwd> && …` prefix on `bash` calls, shorten path arguments (the
-        // same pass the execution path and the transcript use), and render each
-        // `edit` call in the block form the model should see.
-        let history = render_model_facing(
-            stripped_history,
-            &ledger,
-            &crate::tool_args::PathContext::sandbox(),
-        );
+        // `strip -> render`: drop the redundant `cd <cwd> && …` prefix on
+        // `bash` calls, shorten path arguments (the same function the execution
+        // path used), and render each `edit` call in the block form the model
+        // should see.
+        let history = render_model_facing(stripped_history);
 
         // `--log-messages`: capture the exact context sent to the model on this
         // call — the (stripped, block-form) history plus the current prompt —
@@ -862,13 +843,16 @@ impl AgentHook for LoggingHook {
             return DispatchAction::proceed();
         }
         let args = event.tool_args().unwrap_or("{}");
-        let mut args_json =
+        let args_json =
             serde_json::from_str(args).unwrap_or(serde_json::Value::String(args.to_string()));
-        // The `bash` prefix strip and path relativization, so the label reads
-        // the same as the stored call and the next turn's history.
-        crate::tool_args::normalize(
+        // The call as the tool reads it — the `bash` prefix strip and path
+        // relativization — so the label carries the same bytes the record will.
+        // Without this a slow `bash` would be labelled with the model's own
+        // spelling and then stored under a rewritten one, and the panel and the
+        // session would disagree about a call that never changed.
+        let args_json = crate::agent::tool_shape::preprocess_or_raw(
             tool_name,
-            &mut args_json,
+            &args_json,
             &crate::tool_args::PathContext::sandbox(),
         );
         self.content.display_tool_call(tool_name, &args_json);
@@ -931,69 +915,25 @@ impl AgentHook for LoggingHook {
             return OutcomeAction::proceed();
         };
 
-        // `edit` is the one tool whose panel needs both halves of the call at
-        // once (a multi-file call is N call-result pairs, not "N labels now,
-        // N results later"), and `on_outcome` is the only place holding all of
-        // its inputs: the call id, the raw arguments, the host-only
-        // `EditResolutions` and the result text. So this is where the call is
-        // prepared — parsed once, minimized, relativized, and rendered into the
-        // array (persist/display) and block (history) forms — and everything
-        // downstream is a ledger lookup.
-        if tool_name == "edit" {
-            let resolutions = event
-                .tool_context()
-                .map(|ctx| ctx.result::<crate::tools::EditResolutions>())
-                .unwrap_or(Ok(None))
-                .unwrap_or_default();
-            let ctx = crate::tool_args::PathContext::sandbox();
+        // A tool that answered with parts painted its own call panels at
+        // dispatch, so only the results are left to paint — one per part, in
+        // order, which is exactly how N genuine single-file calls render.
+        //
+        // The parts are read from the result because it *is* their container:
+        // the loop wraps every tool answer in one, so nothing else has to be
+        // remembered between dispatch and outcome.
+        //
+        // `call_painted` mirrors the one rule `on_dispatch` applies: it skips
+        // painting `edit` because that call's half is not known until the tool
+        // has split it.
+        if let Some(parts) = crate::agent::parts::parts_of_result(result) {
             let args = event
                 .tool_args()
-                .and_then(|raw| serde_json::from_str(raw).ok())
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
                 .unwrap_or(serde_json::Value::Null);
-            let text = result.output().as_text();
-            let prepared = match event.call_id {
-                Some(id) => {
-                    let mut ledger = self
-                        .edit_anchors
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    // Insert only on success: the tool attaches
-                    // `EditResolutions` after a write.
-                    if let Some(res) = resolutions {
-                        ledger.insert_resolutions(id.to_string(), res);
-                    }
-                    let prepared = crate::agent::transcript::prepare_edit_call(
-                        id,
-                        &args,
-                        ledger.get_resolutions(&id.to_string()),
-                        text,
-                        &ctx,
-                    );
-                    if let Some(p) = &prepared {
-                        ledger.insert_prepared(id.to_string(), p.clone());
-                    }
-                    prepared
-                }
-                None => None,
-            };
-            match prepared {
-                Some(prepared) => {
-                    self.content
-                        .display_prepared_edit(&prepared, &result.output().render());
-                }
-                // Arguments that do not parse: no panel is honest here beyond
-                // the raw call and its error, which is the malformed-call
-                // rendering.
-                None => {
-                    self.content.display_tool_call(tool_name, &args);
-                    self.content.display_tool_result(&result.output().render());
-                }
-            }
-            if let Some(text) = text {
-                if let Some(cleaned) = model_facing_tool_text(tool_name, text) {
-                    return OutcomeAction::rewrite_tool_result(&event, cleaned);
-                }
-            }
+            self.content
+                .display_tool_parts(tool_name, &parts, tool_name != "edit");
+            let _ = args;
             return OutcomeAction::proceed();
         }
 
@@ -1667,7 +1607,6 @@ mod tests {
                 model: "test-model".to_string(),
                 session: None,
                 transcript: Arc::new(std::sync::Mutex::new(super::TurnTranscript::default())),
-                edit_anchors: Arc::new(std::sync::Mutex::new(Default::default())),
             })
             .max_turns(1)
             .stream();

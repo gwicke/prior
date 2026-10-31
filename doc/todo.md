@@ -4,14 +4,15 @@ NOTE: Keep things tight - normally no more than 1-2 lines per bullet point. More
 and link a doc/ and/or commit hash
 
 - [ ] Drive rig's `AgentRun` directly: own the loop, persist from `run.messages()`, retry by
-      re-issuing `next_step`, steers as asides, tools returning their own `Vec<CallPart>`.
-      Plan: doc/261030_rig_direct_drive.md (6 phases; 1-3 kill the `"continue"` injection).
-- [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing `egress::host_allowed`;
-      `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https; HTTP-only clients now come
-      through R3i's front end instead).
-      R4 (Landlock, per-path unix sockets) is independent.
-      UDP is deferred; if needed the shape is `pasta`/`slirp4netns` plus in-sandbox nftables,
-      not Landlock or host iptables — reasoning in R3h.
+      re-issuing `next_step`, steers as asides. Plan: doc/261030_rig_direct_drive.md (6 phases; 1-3
+      kill the `"continue"` injection). Phase 5's parts model is **done** (`928b1e9`): tools state
+      their own call shape, so `EditLedger`, `PreparedEdit`, `prepare_edit_call`, `paired_results`,
+      `shape_edits` and `tool_args::normalize` are gone. Remaining: the loop itself (1-4, 6).
+- [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing
+      `egress::host_allowed`; `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https;
+      HTTP-only clients now come through R3i's front end instead). R4 (Landlock, per-path unix
+      sockets) is independent. UDP is deferred; if needed the shape is `pasta`/`slirp4netns` plus
+      in-sandbox nftables, not Landlock or host iptables — reasoning in R3h.
 - [ ] `--quiet` with no positional prompt spins: the non-REPL input arm (`repl == None`) pairs
       `Content::quiet`'s empty input source (`InputSource::Empty`, always `""`) with
       `if input.is_empty() { continue }` — a pre-existing hot loop (reproduces at `50e4e69`; piped
@@ -20,7 +21,7 @@ and link a doc/ and/or commit hash
       `Repl::batch_slash`) or stop the loop on empty input.
 - [ ] table rendering and filtering: dynamic columns
   - Include filter / sort columns in layout (.columns) — sort column done
-        (doc/slashdot/extra_columns.md); filter columns and a `.columns:` modifier to go
+    (doc/slashdot/extra_columns.md); filter columns and a `.columns:` modifier to go
   - [ ] Less misleading / confusing modifier value auto-complete - headers currently say MODIFIER |
         DESCRIPTION, with the description being just "string". Should be "Column values" or similar
   - Quoted string / space support

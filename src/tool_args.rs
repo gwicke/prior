@@ -29,8 +29,6 @@
 
 use std::path::{Path, PathBuf};
 
-use rig_core::message::{AssistantContent, Message, ToolFunction};
-
 /// The working directory and home directory that path arguments are resolved
 /// against: the **sandbox** view, not the host's.
 ///
@@ -140,82 +138,6 @@ fn tidy_relative(arg: &str) -> Option<String> {
     (tidy != arg).then_some(tidy)
 }
 
-/// Rewrite the path-carrying arguments of one tool call in place. Returns
-/// `true` when something changed, so callers can skip rebuilding the call.
-///
-/// Idempotent: a second pass changes nothing.
-pub(crate) fn normalize(name: &str, args: &mut serde_json::Value, ctx: &PathContext) -> bool {
-    match name.to_lowercase().as_str() {
-        "bash" => match args.get("command").and_then(|c| c.as_str()) {
-            Some(command) => match strip_cwd_prefix(command, ctx) {
-                Some(rewritten) => insert(args, "command", rewritten),
-                None => false,
-            },
-            None => false,
-        },
-        // `path`-carrying tools, canonical names plus the retired spellings a
-        // replayed session may still hold.
-        "read" | "write" | "sed" | "grep" | "ls" | "list_dir" | "find" | "glob_files" | "mkdir"
-        | "make_dir" | "rm" | "remove" => relativize_field(args, "path", ctx),
-        "mv" | "cp" | "move_file" | "copy_file" => {
-            let src = relativize_field(args, "src", ctx);
-            let dst = relativize_field(args, "dst", ctx);
-            src || dst
-        }
-        // `edit` is fully parsed downstream (`prepare_edit_call`), which
-        // relativizes `FileEdit::path` itself.
-        _ => false,
-    }
-}
-
-/// [`normalize`] for one string field of `args`.
-fn relativize_field(args: &mut serde_json::Value, key: &str, ctx: &PathContext) -> bool {
-    let Some(current) = args.get(key).and_then(|v| v.as_str()) else {
-        return false;
-    };
-    match relativize_arg(current, ctx) {
-        Some(rewritten) => insert(args, key, rewritten),
-        None => false,
-    }
-}
-
-/// Set `key` to `value`, reporting whether it changed.
-fn insert(args: &mut serde_json::Value, key: &str, value: String) -> bool {
-    let changed = args.get(key).and_then(|v| v.as_str()) != Some(value.as_str());
-    if changed {
-        if let Some(obj) = args.as_object_mut() {
-            obj.insert(key.to_string(), serde_json::Value::String(value));
-        }
-    }
-    changed
-}
-
-/// [`normalize`] for every tool call in one message. Non-assistant messages and
-/// non-path arguments are untouched.
-pub(crate) fn normalize_in_message(msg: &mut Message, ctx: &PathContext) {
-    let Message::Assistant(turn) = msg else {
-        return;
-    };
-    for content in &mut turn.content {
-        let AssistantContent::ToolCall(tc) = content else {
-            continue;
-        };
-        let mut args = tc.function.arguments_value();
-        if normalize(tc.function.name.as_str(), &mut args, ctx) {
-            // Rebuild the function in place so `native` (the provider item)
-            // survives: only the arguments changed.
-            tc.function = ToolFunction::new(tc.function.name.clone(), args);
-        }
-    }
-}
-
-/// [`normalize_in_message`] for a slice.
-pub(crate) fn normalize_messages(msgs: &mut [Message], ctx: &PathContext) {
-    for msg in msgs {
-        normalize_in_message(msg, ctx);
-    }
-}
-
 /// The command with every leading `cd <cwd> &&` / `cd <cwd>;` removed, or
 /// `None` when there is nothing to strip (so callers can leave the original
 /// value — and its exact bytes — untouched).
@@ -282,6 +204,7 @@ fn is_cwd(target: &str, cwd: &Path, home: Option<&Path>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::message::{AssistantContent, ToolFunction};
     use rig_core::message::{CallId, Message};
 
     fn assistant(calls: Vec<rig_core::message::ToolCall>) -> Message {
@@ -371,7 +294,7 @@ mod tests {
 
     /// [`normalize_messages`] on one owned message list, the shape tests build.
     fn rewrite_messages(mut msgs: Vec<Message>, ctx: &PathContext) -> Vec<Message> {
-        normalize_messages(&mut msgs, ctx);
+        crate::agent::transcript::render_model_facing_with(&mut msgs, ctx);
         msgs
     }
 
@@ -417,47 +340,17 @@ mod tests {
     }
 
     #[test]
-    fn relativizes_each_path_tool() {
+    fn relativizes_each_live_path_tool() {
+        // The live set, and only it. The retired spellings this used to cover
+        // (`ls`, `find`, `mkdir`, `rm`, `list_dir`, `glob_files`, `make_dir`,
+        // `remove`, `mv`, `cp`) went with the tools themselves: traversal is
+        // `bash`'s job now (doc/sandbox.md), and a replayed session needs no
+        // rewriting because what was stored is already in this form.
         let cf = ctx();
-        let cwd_path = "/home/u/project/src/x.rs";
-        for name in [
-            "read",
-            "write",
-            "sed",
-            "grep",
-            "ls",
-            "find",
-            "mkdir",
-            "rm",
-            "list_dir",
-            "glob_files",
-            "make_dir",
-            "remove",
-        ] {
-            let msg = assistant(vec![path_call("a", name, cwd_path)]);
+        for name in ["read", "write", "sed", "grep"] {
+            let msg = assistant(vec![path_call("a", name, "/home/u/project/src/x.rs")]);
             let out = rewrite_messages(vec![msg], &cf);
             assert_eq!(first_args(&out[0]), r#"{"path":"src/x.rs"}"#, "tool {name}");
-        }
-    }
-
-    #[test]
-    fn relativizes_both_sides_of_move_and_copy() {
-        let cf = ctx();
-        for name in ["mv", "cp", "move_file", "copy_file"] {
-            let msg = assistant(vec![call(
-                "a",
-                name,
-                serde_json::json!({
-                    "src": "/home/u/project/a.rs",
-                    "dst": "/home/u/project/src/b.rs",
-                }),
-            )]);
-            let out = rewrite_messages(vec![msg], &cf);
-            assert_eq!(
-                first_args(&out[0]),
-                r#"{"src":"a.rs","dst":"src/b.rs"}"#,
-                "tool {name}"
-            );
         }
     }
 
@@ -501,23 +394,25 @@ mod tests {
     }
 
     #[test]
-    fn normalize_is_idempotent_and_reports_change() {
+    fn rewrite_messages_shortens_a_path_in_an_assistant_tool_call() {
         let cf = ctx();
-        let mut args = serde_json::json!({
-            "path": "/home/u/project/src/x.rs",
-            "other": "unchanged",
-        });
-        assert!(normalize("read", &mut args, &cf));
-        assert_eq!(args["path"], "src/x.rs");
-        // A second pass is a byte-level no-op and reports no change, which is
-        // what makes it safe to run at every egress.
-        let once = args.clone();
-        assert!(!normalize("read", &mut args, &cf));
-        assert_eq!(args, once);
-        // A non-path tool is untouched.
-        let mut bash = serde_json::json!({"command": "ls"});
-        assert!(!normalize("bash", &mut bash, &cf));
-        assert_eq!(bash, serde_json::json!({"command": "ls"}));
+        let msg = Message::Assistant(rig_core::message::AssistantMessage::new(vec![
+            rig_core::message::AssistantContent::ToolCall(rig_core::message::ToolCall::new(
+                rig_core::message::CallId::from_wire("r1"),
+                rig_core::message::ToolFunction::new(
+                    rig_core::message::ToolName::new("read").unwrap(),
+                    serde_json::json!({ "path": "/home/u/project/src/x.rs" }),
+                ),
+            )),
+        ]));
+        let msg = rewrite_messages(vec![msg], &cf).remove(0);
+        let rig_core::message::Message::Assistant(turn) = &msg else {
+            panic!("still an assistant turn")
+        };
+        let rig_core::message::AssistantContent::ToolCall(tc) = &turn.content[0] else {
+            panic!("still a tool call")
+        };
+        assert_eq!(tc.function.arguments["path"], "src/x.rs");
     }
 
     #[test]

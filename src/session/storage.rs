@@ -33,10 +33,11 @@ const CANONICAL_NAMES: &[(&str, &str)] = &[
 ];
 
 /// Rename argument fields in `args` from old/pi names to canonical names, and
-/// apply the same `bash`-prefix / path-argument rewrites the live paths apply
-/// ([`crate::tool_args::normalize`]), so a replayed call reads exactly like the
-/// call that ran. Idempotent, so re-normalizing an already-stored call is a
-/// no-op.
+/// apply the same `bash`-prefix / path-argument rewrite the live paths apply
+/// ([`crate::agent::tool_shape::preprocess`]), so a replayed call reads exactly
+/// like the call that ran. Idempotent, so re-normalizing an already-stored call
+/// is a no-op — and a session written since this change is already in that form,
+/// which makes it a no-op in practice.
 fn normalize_args_in_place(name: &str, args: &mut serde_json::Value, ctx: &PathContext) {
     let Some(obj) = args.as_object_mut() else {
         return;
@@ -88,10 +89,13 @@ fn normalize_args_in_place(name: &str, args: &mut serde_json::Value, ctx: &PathC
         }
         _ => {}
     }
-    // Path arguments and the `bash` prefix, in the same pass every live view
-    // uses. After the field renames above, so `edit`'s canonical array is in
-    // place for whatever display code reads `path` from it.
-    crate::tool_args::normalize(name, args, ctx);
+    // Path arguments and the `bash` prefix, in the same function every live view
+    // uses. A session written since the parts model is already in this form, so
+    // this only moves a *legacy* entry; keeping it costs one idempotent pass and
+    // is what lets an old session display like a new one.
+    if let Some(rewritten) = crate::agent::tool_shape::preprocess(name, args, ctx) {
+        *args = rewritten;
+    }
 }
 
 /// Normalise tool-call entries in a `SessionEntry` in place, so that the

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
 
+use crate::agent::parts::CallPart;
 #[allow(unused_imports)]
 use crate::config::{
     bwrap_scrub_env, env_vars_to_keep, resolve_path_policy, resolve_paths, BashTimeout, ByteLimit,
@@ -496,7 +497,7 @@ pub struct EditFile;
 
 impl rig_core::tool::Tool for EditFile {
     type Args = EditArgs;
-    type Output = String;
+    type Output = Vec<CallPart>;
     type Error = ToolError;
 
     const NAME: &'static str = "edit";
@@ -610,7 +611,7 @@ pub(crate) fn map_tool_error(error: ToolError) -> ToolExecutionError {
 /// reports all of its problems in one round trip instead of one file per trip;
 /// `apply_to_text` is pure over text, so that is a change to the write step
 /// only.
-pub async fn edit_files(files: Vec<FileEdit>) -> Result<String, ToolError> {
+pub async fn edit_files(files: Vec<FileEdit>) -> Result<Vec<CallPart>, ToolError> {
     edit_files_with(files, None).await
 }
 
@@ -652,83 +653,98 @@ impl rig_core::tool::ContextValue for EditResolutions {
 /// placements for the model-history minimizer.
 async fn edit_files_with(
     files: Vec<FileEdit>,
-    mut context: Option<&mut ToolContext>,
-) -> Result<String, ToolError> {
-    let mut resolutions = EditResolutions::default();
-
-    // A single-file call is byte-identical to `edit_file` — a bare success note
-    // or a bare `{ui_view, model_view}` envelope, never a one-element array, so
-    // the overwhelmingly common case is untouched.
-    if files.len() == 1 {
-        let FileEdit { path, edits } = files.into_iter().next().unwrap();
-        let (raw, matched_lines) = edit_file_inner(path.clone(), edits).await?;
-        if let Some(matched_lines) = matched_lines {
-            resolutions.files.push(FileResolution {
-                path,
-                matched_lines,
-            });
-        }
-        if let Some(ctx) = context.as_deref_mut() {
-            if !resolutions.files.is_empty() {
-                let _ = ctx.insert_result(resolutions);
-            }
-        }
-        return Ok(raw);
-    }
-
-    // The result array names each file, and that path is what the display
-    // attributes an outcome to. Relativize it with the one path rule, so a
-    // multi-file result names its files exactly as the calls do. The ledger
-    // above keeps the model's own spelling: minimization runs before
-    // relativization and matches on what the model wrote.
+    context: Option<&mut ToolContext>,
+) -> Result<Vec<CallPart>, ToolError> {
+    // The one path rule, applied to the args each part carries. The tool is the
+    // only frame that knows how many files a call named, so splitting happens
+    // here: one part per file, each with its own canonical args and its own
+    // result. Everything downstream unpacks that list instead of re-deriving it
+    // from a joined blob and a re-parsed call.
     let path_ctx = crate::tool_args::PathContext::sandbox();
     let rel_path = |path: &str| {
         crate::tool_args::relativize_arg(path, &path_ctx).unwrap_or_else(|| path.to_string())
     };
-    let mut results = Vec::with_capacity(files.len());
+    let mut resolutions = EditResolutions::default();
+    let mut parts = Vec::with_capacity(files.len());
+
     for FileEdit { path, edits } in files {
         // A file that could not be resolved, read, or written is *that file's*
         // failure, not the call's: report it and keep going, so the model
         // learns every file's outcome in one round trip. Propagating the `Err`
         // would discard the other files' reports and reduce the whole call to
-        // a bare "the tool failed".
-        let (raw, matched_lines) = match edit_file_inner(path.clone(), edits).await {
-            Ok(r) => r,
-            Err(e) => {
-                results.push(bsed_blockedit::FileResult {
-                    path: rel_path(&path),
-                    result: serde_json::Value::String(format!(
-                        "could not edit {}: {e}",
-                        rel_path(&path)
-                    )),
+        // a bare "the tool failed" — which is the granularity the description
+        // advertises.
+        let shown = rel_path(&path);
+        match edit_file_inner(path.clone(), edits.clone()).await {
+            Err(e) => parts.push(CallPart {
+                // Nothing applied, so nothing is anchored: the args are the
+                // edits exactly as the model wrote them.
+                args: edit_part_args(&shown, &edits, None),
+                result: format!("could not edit {shown}: {e}"),
+                is_error: true,
+            }),
+            // An apply failure (`matched_lines == None`) is that file's honest
+            // outcome: it did not change, so its call is stored verbatim
+            // (`None`) and its part is marked failed.
+            Ok((raw, matched)) => {
+                if let Some(matched) = &matched {
+                    resolutions.files.push(FileResolution {
+                        path: path.clone(),
+                        matched_lines: matched.clone(),
+                    });
+                }
+                parts.push(CallPart {
+                    args: edit_part_args(&shown, &edits, matched.as_deref()),
+                    is_error: matched.is_none(),
+                    result: raw,
                 });
-                continue;
             }
-        };
-        if let Some(matched_lines) = matched_lines {
-            resolutions.files.push(FileResolution {
-                path: path.clone(),
-                matched_lines,
-            });
         }
-        // A success note is plain text (not JSON); a failure envelope is
-        // already an object. Hold both as a `Value` so the array carries the
-        // two shapes verbatim rather than re-encoding them.
-        let result = match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(v) => v,
-            Err(_) => serde_json::Value::String(raw),
-        };
-        results.push(bsed_blockedit::FileResult {
-            path: rel_path(&path),
-            result,
-        });
     }
+
+    // Still published: `on_outcome` and any future reader of the resolved
+    // placements read them here, and the parts above do not carry them per file
+    // (an anchored edit's args are already the minimised form).
     if let Some(ctx) = context {
-        if !resolutions.files.is_empty() {
-            let _ = ctx.insert_result(resolutions);
-        }
+        let _ = ctx.insert_result(resolutions);
     }
-    Ok(bsed_blockedit::render_file_results(&results))
+    Ok(parts)
+}
+
+/// The args of one `edit` part: the canonical `{path, edits:[…]}` array, with
+/// each edit minimised to the lines that locate it.
+///
+/// `matched` is where execution put each edit — the only honest anchor. Without
+/// it (the file did not apply) the edits are stored verbatim: an anchored block
+/// that was never applied would claim a position that does not exist.
+///
+/// Minimisation happens here, in the tool, because this is the only frame that
+/// holds both the parsed edits and their placements. It used to run in a later
+/// pass on a shared ledger, which is why that ledger existed.
+fn edit_part_args(
+    shown_path: &str,
+    edits: &[EditOp],
+    matched: Option<&[usize]>,
+) -> serde_json::Value {
+    let edits = match matched {
+        // A count mismatch cannot happen for a call this tool just applied, but
+        // it is the same guard the old pairing path had: rather than zip two
+        // lists of different lengths (which silently drops edits), keep the
+        // call verbatim.
+        Some(matched) if matched.len() == edits.len() => edits
+            .iter()
+            .zip(matched)
+            .flat_map(|(edit, line)| {
+                // An anchored edit is already the trimmed form, so its own
+                // anchor is the base. One input edit may also split into
+                // several anchored sub-edits at long internal unchanged runs.
+                let base = edit.start_line.map(|s| s.0 as usize).unwrap_or(*line);
+                bsed_blockedit::split_and_minimize(edit, base)
+            })
+            .collect::<Vec<_>>(),
+        _ => edits.to_vec(),
+    };
+    bsed_blockedit::edits_to_canonical_value(shown_path, &edits)
 }
 
 /// Apply a batch of edits to one file, all-or-nothing.
@@ -4966,7 +4982,7 @@ mod edit_file_tests {
             .await
             .unwrap();
         let mut ctx = ToolContext::default();
-        let raw = edit_files_with(
+        let parts = edit_files_with(
             vec![bsed_blockedit::FileEdit {
                 path: "anchor.txt".into(),
                 edits: vec![EditOp {
@@ -4980,7 +4996,19 @@ mod edit_file_tests {
         )
         .await
         .unwrap();
-        assert!(raw.contains("Replaced 1 block(s)"));
+        assert_eq!(parts.len(), 1, "one file, one part");
+        assert_eq!(parts[0].result, "Replaced 1 block(s)");
+        // The part carries the call as the tool understood it: one file, its
+        // edits minimised to the single line that locates them, and the path
+        // relative so the recorded call is portable.
+        assert_eq!(
+            parts[0].args,
+            serde_json::json!({
+                "path": "anchor.txt",
+                "edits": [{"oldText": "beta", "newText": "BETA", "startLine": 2}],
+            })
+        );
+        assert!(!parts[0].is_error);
         let res = ctx
             .result::<EditResolutions>()
             .expect("the result slot always decodes")
@@ -5012,7 +5040,13 @@ mod edit_file_tests {
         )
         .await
         .unwrap();
-        assert!(ctx.result::<EditResolutions>().unwrap().is_none());
+        // No file applied, so nothing is anchored: the resolutions are empty,
+        // which is what keeps a failed edit's call stored verbatim.
+        let resolutions = ctx
+            .result::<EditResolutions>()
+            .expect("the result slot always decodes")
+            .expect("published even when empty");
+        assert!(resolutions.files.is_empty(), "{resolutions:?}");
     }
 }
 
@@ -5044,6 +5078,24 @@ mod edit_args_wire_tests {
         }
     }
 
+    /// The model-visible text of an `edit` result.
+    ///
+    /// The tool now answers a parts list (one part per file), which the loop
+    /// unpacks into one call/result pair each before anything is sent or
+    /// stored. These tests are about the *result text* the model reads, so they
+    /// take the same path the projection does: a parts list renders as its
+    /// results, `parts_text`.
+    ///
+    /// A failed call carries no parts at all (a parse error, or a single-file
+    /// call whose target could not be read) — that is rig's error output, which
+    /// the model sees verbatim.
+    fn model_text(result: &rig_core::tool::ToolResult) -> String {
+        match crate::agent::parts::parts_of_result(result) {
+            Some(parts) => crate::agent::parts::parts_text(&parts),
+            None => result.output().render(),
+        }
+    }
+
     // ---- Batch shape ----
 
     #[tokio::test]
@@ -5070,10 +5122,14 @@ mod edit_args_wire_tests {
         assert_eq!(after, "goodbye\nthere\n");
     }
 
-    /// The array's failures are *call*-time, so they are exactly the ones that
-    /// used to arrive as `the tool failed`: `edit` is registered without a
-    /// `Guard`, so without `map_error` this text would be three words the model
-    /// cannot act on. It must name the file the model asked for.
+    /// A file that cannot be read fails *that file's part*, naming the path the
+    /// model asked for.
+    ///
+    /// The failure used to surface as a call-level error carrying the model's
+    /// path, which `map_error` had to keep un-redacted. It is now a per-part
+    /// `is_error`: the call is a batch, and one unreadable file in it is one
+    /// file's outcome, not the batch's. The redaction concern is unchanged — the
+    /// text still names only the model's own path — which is what this pins.
     #[tokio::test]
     #[serial]
     async fn a_failing_edits_array_call_names_the_file_it_could_not_read() {
@@ -5083,10 +5139,15 @@ mod edit_args_wire_tests {
             "edits": [{"oldText": "a", "newText": "b"}]
         }))
         .await;
-        let text = result.output().render();
-        assert!(result.is_error(), "{text}");
-        assert!(text.contains("gone.txt"), "must name the file: {text}");
-        assert_ne!(text, "the tool failed", "redacted to nothing: {text}");
+        let parts = crate::agent::parts::parts_of_result(&result).expect("a parts list");
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].is_error, "{}", parts[0].result);
+        assert!(
+            parts[0].result.contains("gone.txt"),
+            "must name the file: {}",
+            parts[0].result
+        );
+        assert_ne!(parts[0].result, "the tool failed", "redacted to nothing");
     }
 
     // ---- Single shape (accepted, undocumented) ----
@@ -5128,7 +5189,7 @@ mod edit_args_wire_tests {
         // What the *model* sees: the redundant wrappers stripped, leaving the
         // problem, the line-based `Expected:` block, and the echo. (The raw
         // result still carries rig's wrapper; the agent hook removes it.)
-        let raw = result.output().render();
+        let raw = model_text(&result);
         let msg = bsed_blockedit::strip_arg_error_prefixes(&raw);
         assert!(
             msg.contains("Expected:"),
@@ -5158,7 +5219,7 @@ mod edit_args_wire_tests {
         }))
         .await;
         assert!(result.is_error(), "missing newText must fail: {result:?}");
-        let raw = result.output().render();
+        let raw = model_text(&result);
         let msg = bsed_blockedit::strip_arg_error_prefixes(&raw);
         assert!(msg.contains("Expected:"), "got: {msg}");
         // The correction is in the shape the caller used: this call is
@@ -5172,7 +5233,7 @@ mod edit_args_wire_tests {
     async fn non_object_args_error_informatively() {
         let result = execute_edit(serde_json::json!("just a string")).await;
         assert!(result.is_error());
-        let raw = result.output().render();
+        let raw = model_text(&result);
         let msg = bsed_blockedit::strip_arg_error_prefixes(&raw);
         assert!(msg.contains("must be a JSON object"), "got: {msg}");
     }
@@ -5184,7 +5245,7 @@ mod edit_args_wire_tests {
         let blob = "x".repeat(5_000);
         let result = execute_edit(serde_json::json!({ "path": "p", "stuff": blob })).await;
         assert!(result.is_error());
-        let msg = result.output().render();
+        let msg = model_text(&result);
         // The template is fixed-size; the point is that the 5_000-char blob
         // is not echoed raw (it is truncated to MAX_ECHOED_ARGS + `…`).
         assert!(
@@ -5216,7 +5277,7 @@ mod edit_args_wire_tests {
                 .render()
                 .contains("@@@OLD lines appear 2 times"),
             "top-level startLine must be ignored in blob form; got: {}",
-            result.output().render()
+            model_text(&result)
         );
         // Nothing applied.
         assert_eq!(
@@ -5270,9 +5331,9 @@ mod edit_args_wire_tests {
         .await;
         assert!(result.is_error(), "conflict must fail: {result:?}");
         assert!(
-            result.output().render().contains("must agree"),
+            model_text(&result).contains("must agree"),
             "got: {}",
-            result.output().render()
+            model_text(&result)
         );
     }
 
@@ -5295,7 +5356,7 @@ mod edit_args_wire_tests {
                 .render()
                 .contains("@@@OLD lines appear 2 times"),
             "got: {}",
-            result.output().render()
+            model_text(&result)
         );
         assert_eq!(
             tokio::fs::read_to_string("pb.txt").await.unwrap(),
@@ -5318,9 +5379,9 @@ mod edit_args_wire_tests {
         // The resolved anchor lives in the block header of the rewritten
         // history, not in this message, so the result stays location-free.
         assert!(
-            !result.output().render().contains("matched"),
+            !model_text(&result).contains("matched"),
             "result must not echo a match location: {}",
-            result.output().render()
+            model_text(&result)
         );
     }
 
@@ -5336,9 +5397,9 @@ mod edit_args_wire_tests {
         assert!(result.is_success(), "got: {result:?}");
         // The model already anchored — no teaching hint needed.
         assert!(
-            !result.output().render().contains("matched"),
+            !model_text(&result).contains("matched"),
             "anchored call must not add a location hint: {}",
-            result.output().render()
+            model_text(&result)
         );
     }
 
@@ -5391,7 +5452,7 @@ mod edit_args_wire_tests {
         // outside the ±1 tolerance and not decisively nearer (d1 == d2, a tie).
         let blob = "far.txt:3\n@@@OLD\nalpha\nbeta\ngamma\n@@@NEW\nA\nB\nC\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "far.txt", "blocks": blob})).await;
-        let out = result.output().render();
+        let out = model_text(&result);
         assert!(
             out.contains("not decisive"),
             "expected out-of-tolerance failure, got: {out}",
@@ -5428,7 +5489,7 @@ mod edit_args_wire_tests {
         tokio::fs::write("amb.txt", "x x\n").await.unwrap();
         let blob = "amb.txt:1\n@@@OLD\nx\n@@@NEW\ny\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "amb.txt", "blocks": blob})).await;
-        let out = result.output().render();
+        let out = model_text(&result);
         assert!(
             out.contains("ambiguous"),
             "expected ambiguity failure, got: {out}"
@@ -5459,7 +5520,7 @@ mod edit_args_wire_tests {
         write_alpha_lines_1_50().await;
         let blob = "skew.txt:52\n@@@OLD\nalpha\n@@@NEW\nhit\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "skew.txt", "blocks": blob})).await;
-        let out = result.output().render();
+        let out = model_text(&result);
         assert!(
             out.starts_with("Replaced"),
             "expected skew acceptance, got: {out}"
@@ -5485,7 +5546,7 @@ mod edit_args_wire_tests {
             .unwrap();
         let blob = "tie.txt:43\n@@@OLD\nalpha\n@@@NEW\nhit\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "tie.txt", "blocks": blob})).await;
-        let out = result.output().render();
+        let out = model_text(&result);
         assert!(
             looks_like_edit_failure(&out),
             "near-tie must be rejected, got: {out}"
@@ -5520,7 +5581,7 @@ mod edit_args_wire_tests {
             .unwrap();
         let blob = "cap.txt:66\n@@@OLD\nalpha\n@@@NEW\nhit\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "cap.txt", "blocks": blob})).await;
-        let out = result.output().render();
+        let out = model_text(&result);
         assert!(looks_like_edit_failure(&out), "cap must reject, got: {out}");
         assert!(out.contains("not decisive"), "got: {out}");
         assert_eq!(
@@ -5548,7 +5609,7 @@ mod edit_args_wire_tests {
         let blob =
             "dup.txt\n@@@OLD\nhello\n@@@NEW\nbye\n@@@END\n\ndup.txt\n@@@OLD\nhello\n@@@NEW\nhi\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "dup.txt", "blocks": blob})).await;
-        let out = result.output().render();
+        let out = model_text(&result);
         assert!(looks_like_edit_failure(&out), "must fail, got: {out}");
         assert!(
             out.contains("already matched by edit(s) #1"),
@@ -5573,7 +5634,7 @@ mod edit_args_wire_tests {
             .unwrap();
         let blob = "mot.txt\n@@@OLD\nfoo\n@@@NEW\nAAA\n@@@END\n\nmot.txt:3\n@@@OLD\nfoo\n@@@NEW\nBBB\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "mot.txt", "blocks": blob})).await;
-        let out = result.output().render();
+        let out = model_text(&result);
         assert!(out.starts_with("Replaced"), "expected success, got: {out}");
         assert_eq!(
             tokio::fs::read_to_string("mot.txt").await.unwrap(),
@@ -5594,7 +5655,7 @@ mod edit_args_wire_tests {
         let blob =
             "chain.txt\n@@@OLD\nfoo bar\n@@@NEW\nAAA\n@@@END\n\nchain.txt\n@@@OLD\nbar\n@@@NEW\nBBB\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "chain.txt", "blocks": blob})).await;
-        let out = result.output().render();
+        let out = model_text(&result);
         assert!(out.starts_with("Replaced"), "expected success, got: {out}");
         assert_eq!(
             tokio::fs::read_to_string("chain.txt").await.unwrap(),
@@ -5611,7 +5672,7 @@ mod edit_args_wire_tests {
         tokio::fs::write("ov.txt", "hello world\n").await.unwrap();
         let blob = "ov.txt:1\n@@@OLD\nhello\n@@@NEW\nA\n@@@END\n\nov.txt:1\n@@@OLD\nhello world\n@@@NEW\nB\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "ov.txt", "blocks": blob})).await;
-        let out = result.output().render();
+        let out = model_text(&result);
         assert!(looks_like_edit_failure(&out), "must conflict, got: {out}");
         assert!(
             out.contains("overlaps edit #1"),
@@ -5637,7 +5698,7 @@ mod edit_args_wire_tests {
         let blob =
             "noclaim.txt:3\n@@@OLD\ndup\n@@@NEW\nX\n@@@END\n\nnoclaim.txt\n@@@OLD\ndup\n@@@NEW\nY\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "noclaim.txt", "blocks": blob})).await;
-        let out = result.output().render();
+        let out = model_text(&result);
         assert!(looks_like_edit_failure(&out), "batch must fail, got: {out}");
         // Pass-1 failure: anchor not decisive (d1=2 at line 1, d2=3 at line 5... anchor 3 → |3-1|=2, |3-5|=2 tie).
         assert!(out.contains("edit #1"), "pass-1 diagnostic missing: {out}");
@@ -5911,7 +5972,7 @@ mod edit_args_wire_tests {
         let result = execute_edit(serde_json::json!({ "blocks": blob })).await;
         // A match failure is reported as a *successful* call carrying the
         // structured envelope, which is what `display_tool_result` splits on.
-        let text = result.output().render();
+        let text = model_text(&result);
         assert!(
             crate::edit_match::looks_like_edit_failure(&text),
             "expected a failure envelope, got: {text}"
@@ -5985,29 +6046,38 @@ mod edit_args_wire_tests {
 
     #[tokio::test]
     #[serial]
-    async fn a_multi_file_result_is_a_bare_array_with_per_file_results() {
-        // The wire shape W3 fixes: a bare array of `{path, result}`, each result
-        // the file's single-file report verbatim. It must reach the history
-        // intact so W7/W8 can split it (see doc/batch_editing_v2.md).
+    async fn a_multi_file_call_answers_one_part_per_file() {
+        // The shape the loop unpacks into N call/result pairs: the call as the
+        // tool understood it (one file, minimised, relativized) with exactly
+        // that file's result. There is no joined array to re-parse and split
+        // later, because the split happened where the information was.
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("w1.txt", "a\n").await.unwrap();
         tokio::fs::write("w2.txt", "different\n").await.unwrap();
         let blob = "w1.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n\
                     w2.txt\n@@@OLD\nnope\n@@@NEW\nN\n@@@END";
-        let raw = execute_edit(serde_json::json!({ "blocks": blob })).await;
-        let out = raw.output().render();
-        let v: serde_json::Value = serde_json::from_str(&out).expect("result must be JSON");
-        let arr = v.as_array().expect("multi-file result is a bare array");
-        assert_eq!(arr.len(), 2);
-        assert!(v.get("ui_view").is_none(), "no aggregate wrapper: {out}");
-        assert_eq!(arr[0]["path"], "w1.txt");
-        assert!(
-            arr[0]["result"].is_string(),
-            "success is a bare note: {out}"
+        let result = execute_edit(serde_json::json!({ "blocks": blob })).await;
+        let parts = crate::agent::parts::parts_of_result(&result).expect("a parts list");
+        assert_eq!(parts.len(), 2, "one part per file");
+
+        // Each part names its own file, and its args are that file alone.
+        assert_eq!(parts[0].args["path"], "w1.txt");
+        assert_eq!(parts[1].args["path"], "w2.txt");
+        assert_eq!(
+            parts[0].args["edits"],
+            serde_json::json!([{"oldText": "a", "newText": "A", "startLine": 1}])
         );
-        assert_eq!(arr[1]["path"], "w2.txt");
-        // The failing file carries the existing {ui_view, model_view} envelope.
-        assert!(arr[1]["result"]["ui_view"].is_string(), "{out}");
+
+        // The applied file is a success, the other is *that file's* failure: a
+        // part's disposition, not the call's.
+        assert!(!parts[0].is_error, "{}", parts[0].result);
+        assert!(parts[0].result.contains("Replaced 1 block(s)"));
+        assert!(parts[1].is_error, "{}", parts[1].result);
+        assert!(
+            parts[1].result.contains("ui_view") && parts[1].result.contains("model_view"),
+            "the failing file keeps its two-view envelope: {}",
+            parts[1].result
+        );
     }
 
     #[tokio::test]
@@ -6022,20 +6092,20 @@ mod edit_args_wire_tests {
         let blob = "u1.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n\
                     nosuch.txt\n@@@OLD\nb\n@@@NEW\nB\n@@@END\n\n\
                     u3.txt\n@@@OLD\nc\n@@@NEW\nC\n@@@END";
-        let out = execute_edit(serde_json::json!({ "blocks": blob }))
-            .await
-            .output()
-            .render();
-        let v: serde_json::Value = serde_json::from_str(&out).expect("array result");
-        let arr = v.as_array().expect("bare array");
-        assert_eq!(arr.len(), 3, "one entry per file, always: {out}");
+        let result = execute_edit(serde_json::json!({ "blocks": blob })).await;
+        let parts = crate::agent::parts::parts_of_result(&result).expect("a parts list");
+        assert_eq!(parts.len(), 3, "one part per file, always");
         // The readable files applied...
         assert_eq!(tokio::fs::read_to_string("u1.txt").await.unwrap(), "A\n");
         assert_eq!(tokio::fs::read_to_string("u3.txt").await.unwrap(), "C\n");
         // ...and the missing one is named, not swallowed.
-        assert_eq!(arr[1]["path"], "nosuch.txt");
-        let msg = arr[1]["result"].as_str().expect("IO failure is a string");
-        assert!(msg.contains("nosuch.txt"), "must name the file: {msg}");
+        assert_eq!(parts[1].args["path"], "nosuch.txt");
+        assert!(parts[1].is_error, "{}", parts[1].result);
+        assert!(
+            parts[1].result.contains("nosuch.txt"),
+            "must name the file: {}",
+            parts[1].result
+        );
     }
 
     #[tokio::test]
@@ -6045,10 +6115,8 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("solo.txt", "a\n").await.unwrap();
         let blob = "solo.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END";
-        let out = execute_edit(serde_json::json!({ "blocks": blob }))
-            .await
-            .output()
-            .render();
+        let result = execute_edit(serde_json::json!({ "blocks": blob })).await;
+        let out = model_text(&result);
         assert!(out.contains("Replaced 1 block(s)"), "{out}");
         assert!(
             serde_json::from_str::<serde_json::Value>(&out)

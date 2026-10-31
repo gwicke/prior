@@ -2911,66 +2911,6 @@ mod tests {
         )
     }
 
-    fn multi_result(id: &str) -> Message {
-        let array = bsed_blockedit::render_file_results(&[
-            bsed_blockedit::FileResult {
-                path: "a.rs".into(),
-                result: serde_json::json!("Replaced 1 block(s) in ./a.rs"),
-            },
-            bsed_blockedit::FileResult {
-                path: "b.rs".into(),
-                result: serde_json::json!({
-                    "ui_view": "edit failed: nope", "model_view": "long diff"
-                }),
-            },
-        ]);
-        Message::User {
-            content: vec![UserContent::ToolResult(rig_core::message::ToolResult {
-                call: CallId::from_wire(id),
-                name: tool_name("edit"),
-                content: vec![rig_core::message::ToolResultContent::text(array)],
-                is_error: false,
-            })],
-        }
-    }
-
-    fn calls_of(m: &Message) -> Vec<rig_core::message::ToolCall> {
-        let Message::Assistant(turn) = m else {
-            panic!("expected assistant")
-        };
-        let content = &turn.content;
-        content
-            .iter()
-            .filter_map(|c| match c {
-                AssistantContent::ToolCall(tc) => Some(tc.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn results_of(m: &Message) -> Vec<(String, String)> {
-        let Message::User { content } = m else {
-            panic!("expected user")
-        };
-        content
-            .iter()
-            .filter_map(|c| match c {
-                UserContent::ToolResult(tr) => Some((
-                    tr.call.to_string(),
-                    tr.content
-                        .iter()
-                        .filter_map(|rc| match rc {
-                            ToolResultContent::Text(t) => Some(t.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// One turn of a multi-file `edit` call and its per-file result, prepared by
     /// the one producer and serialized to disk: the stored contract is N
     /// pi-canonical single-path calls, each paired with its own result.
@@ -2981,8 +2921,7 @@ mod tests {
     /// `arguments.path`, which is why there is one call per file.
     #[tokio::test]
     async fn the_saved_jsonl_holds_n_calls_and_n_results_pairing_by_id() {
-        use crate::agent::transcript::{prepare_edit_call, EditLedger, RunState, TurnTranscript};
-        use crate::tool_args::PathContext;
+        use crate::agent::transcript::{RunState, TurnTranscript};
 
         let _tmp = tempfile::tempdir().unwrap();
         let path = _tmp.path().join(session_filename(&chrono::Utc::now()));
@@ -2997,19 +2936,23 @@ mod tests {
         let session = Session::new_persisted(storage, index);
 
         let call = multi_call("t1");
-        let calls_of_call = calls_of(&call);
-        let args = calls_of_call[0].function.arguments_value();
-        let result_text = results_of(&multi_result("t1"))[0].1.clone();
-        let prepared = prepare_edit_call(
-            &CallId::from_wire("t1"),
-            &args,
-            None,
-            Some(&result_text),
-            &PathContext::sandbox(),
-        )
-        .expect("a parseable call");
-        let mut ledger = EditLedger::default();
-        ledger.insert_prepared("t1", prepared);
+        // The tool's own answer: one part per file, each with that file's
+        // canonical args (which is what the tool would have produced — the
+        // split happened during execution, not here).
+        let parts: Vec<crate::agent::parts::CallPart> = [
+            ("a.rs", "Replaced 1 block(s) in a.rs"),
+            ("b.rs", "edit failed: nope"),
+        ]
+        .iter()
+        .map(|(path, result)| crate::agent::parts::CallPart {
+            args: serde_json::json!({
+                "path": path,
+                "edits": [{"oldText": "x", "newText": "X"}],
+            }),
+            result: (*result).to_string(),
+            is_error: false,
+        })
+        .collect();
 
         let mut t = TurnTranscript::default();
         t.start_live();
@@ -3017,10 +2960,12 @@ mod tests {
         t.push_tool_result(rig_core::message::ToolResult {
             call: CallId::from_wire("t1"),
             name: tool_name("edit"),
-            content: vec![rig_core::message::ToolResultContent::text(result_text)],
+            content: vec![rig_core::message::ToolResultContent::Json {
+                value: serde_json::to_value(&parts).unwrap(),
+            }],
             is_error: false,
         });
-        let batch = t.prepare(&ledger, RunState::Ongoing).expect("a batch");
+        let batch = t.prepare(RunState::Ongoing).expect("a batch");
         let seed = uuid::Uuid::now_v7();
         session
             .append_messages(&batch.messages, &seed)
