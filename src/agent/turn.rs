@@ -18,7 +18,6 @@
 
 use super::errors::{classify_prompt_error, classify_stream_error};
 use super::pumps::dispatch_in_turn_event;
-use super::transcript::TurnTranscript;
 use crate::Result;
 use futures::StreamExt;
 use rig_agent::agent::MultiTurnStreamItem;
@@ -28,13 +27,12 @@ use rig_core::message::Message;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::agent::build::{request_additional_params, LoggingHook};
+use crate::agent::build::request_additional_params;
 use crate::agent::compaction::session_context_messages;
 
 use crate::agent::CodeAgent;
 use crate::agent::{estimate_ctx_with, TurnPersistence};
 use crate::session::Session;
-use std::sync::Mutex;
 
 impl CodeAgent {
     /// `--log-messages`: a live-pump lifecycle marker — the points where the
@@ -144,9 +142,7 @@ impl CodeAgent {
 
         // `stream_prompt(...).await` yields the item stream (rig 0.40's
         // `IntoFuture` returns the stream itself, not a collected response).
-        // The run-scoped transcript is shared with the hook and the stream
-        // loop so a mid-turn failure can persist exactly what completed.
-        let transcript = Arc::new(Mutex::new(TurnTranscript::default()));
+        //
         // Per-request params, set unconditionally from `params`.
         //
         // `replace_additional_params`, not `merge_`: a `/reasoning` override
@@ -159,45 +155,12 @@ impl CodeAgent {
         //
         // With no overrides `params` *is* `live_params`, so this recomputes what
         // was baked at build time and the turn is unchanged.
-        let request = self.agent.prompt(input);
-        let direct = std::env::var("PRIOR_DRIVE").as_deref() == Ok("direct");
-        let mut stream = if direct {
-            // The direct path owns the run. `StreamingResult` and
-            // `DriveLoop`'s adapter yield the same item type, so the pump below
-            // is unchanged — which is what makes phase 1 a parity gate rather
-            // than a rewrite.
-            self.direct_stream(input, prior, params, session.clone(), transcript.clone())
-        } else {
-            let request = self.apply_params(request, params);
-            request
-                .add_hook(LoggingHook {
-                    content: self.content.clone(),
-                    user_cancel: self.user_cancel.clone(),
-                    message_logger: self.message_logger.clone(),
-                    reasoning_in_context: self.reasoning_in_context,
-                    provider: self.provider.clone(),
-                    model: self.model.clone(),
-                    transcript: transcript.clone(),
-                    session: session.clone(),
-                })
-                .max_turns(self.tool_call_limit)
-                // Allow one in-turn recovery for the model calling a tool that
-                // isn't registered or is not in the current turn's allowed set.
-                // The hook (`LoggingHook::on_invalid_tool_call`) decides the
-                // recovery action; this is the *budget* the rig-run policy
-                // honors when the hook returns `Retry { feedback }`. Consumes
-                // one `max_turns` slot on use. See doc/tool_error_handling.md
-                // §Layer 1 Task 2.
-                .max_invalid_tool_call_retries(1)
-                .history(prior)
-                .stream()
-        };
+        // The loop's persistence, kept out here because the exit has to close it
+        // after the stream is gone: an `<Esc>` mid-batch must still write the
+        // files that batch already edited.
+        let (mut stream, persist) = self.direct_stream(input, prior, params, session.clone());
 
-        // `output` is the returned assistant text (what `prompt()` yields);
-        // the transcript owns everything that reaches disk. `final_history`
-        // and `cancelled_history` are no longer persistence sources — the
-        // transcript is the single source of truth (see
-        // doc/261022_incremental_session_write.md).
+        // `output` is the returned assistant text (what `prompt()` yields).
         let mut output = String::new();
         let mut aborted = false;
         // The transient status line (doc/row_accounting.md zone 2) is set before
@@ -258,16 +221,6 @@ impl CodeAgent {
                     match item {
 
                         Some(Ok(MultiTurnStreamItem::StreamAssistantItem(item))) => {
-                            // Feed every part event into the live unit: the
-                            // transcript owns the streamed fragments (they
-                            // exist once, in this poll) and the accepted turn
-                            // supersedes them. Painting and the `--log-messages`
-                            // deltas ride the same arm.
-                            if let Item::Event(event) = &item {
-                                if let Ok(mut t) = transcript.lock() {
-                                    t.push_event(event);
-                                }
-                            }
                             match item {
                                 // rig 0.45 streams text and reasoning as
                                 // *fragments*; the part's `End` carries the
@@ -294,16 +247,10 @@ impl CodeAgent {
                                 _ => {}
                             }
                         }
-                        Some(Ok(MultiTurnStreamItem::ToolResult { tool_result })) => {
-                            // Tool-result stream items are the canonical
-                            // `Message::User` content rig committed to its own
-                            // `new_messages`. Accumulate them (batched by
-                            // `TurnTranscript` into one user message per
-                            // completed batch) so a mid-turn failure can
-                            // persist the completed tool work.
-                            if let Ok(mut t) = transcript.lock() {
-                                t.push_tool_result(tool_result);
-                            }
+                        Some(Ok(MultiTurnStreamItem::ToolResult { .. })) => {
+                            // The run committed this batch's results, so the
+                            // persister writes it at the next boundary. Nothing
+                            // to accumulate: the run's log *is* the record.
                         }
                         Some(Ok(MultiTurnStreamItem::CompletionCall(call))) => {
                             // Plumb per-request usage out of the stream (compaction's
@@ -351,44 +298,31 @@ impl CodeAgent {
                         Some(Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. })) => {}
                         Some(Ok(MultiTurnStreamItem::ModelTurnRetried { .. })) => {}
                         Some(Err(e)) => {
-                            // Every exit persists through one path: the
-                            // transcript delta (completed turns) plus an `Ended`
-                            // synthesis of any unanswered call. rig's error may
-                            // carry the in-flight full history, but prior does
-                            // not use it — the transcript is the single source
-                            // of truth, and it never yields a dangling call.
+                            // Every exit persists through one path: the closed
+                            // persister, which writes the committed tail and then
+                            // a batch whose results never all landed. rig's error
+                            // may carry the in-flight full history, but prior does
+                            // not need it — the run *is* the record.
                             if let PromptError::Cancelled { .. } = &e {
                                 // Cancelled mid-run (Esc or a hook Stop): the
                                 // turn is aborted. Persistence is uniform — the
-                                // exit `commit()` below writes the transcript
-                                // delta plus an `Ended` synthesis of any
-                                // unanswered calls. `has_content` (checked after
-                                // the loop) drives the back-off reset.
+                                // exit below closes the persister, which writes
+                                // the committed tail plus a batch whose results
+                                // never all landed.
                                 aborted = true;
                                 break;
                             }
                             // A non-cancellation error (provider mid-stream,
-                            // tool-dispatch failure): persist the completed
-                            // transcript delta plus an `Ended` synthesis, so the
+                            // tool-dispatch failure): close the persister so the
                             // turn so far is never lost, then classify and
                             // return. A retryable error with no progress is a
                             // blind retry: the prompt was already persisted at
-                            // dispatch, so nothing else is written.
+                            // dispatch, so nothing but the prompt is written.
                             let classified = classify_stream_error(&e);
                             let retryable = classified.is_auto_retryable();
-                            let made_progress = {
-                                let t = transcript
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                t.has_content()
-                            };
+                            let made_progress = persist.made_progress().await;
                             if !retryable || made_progress {
-                                let _ = crate::agent::transcript::commit(
-                                    &transcript,
-                                    session.as_deref(),
-                                    crate::agent::transcript::RunState::Ended,
-                                )
-                                .await;
+                                persist.close().await;
                             }
                             self.log_pump_event("response_end").await;
                             self.content.end_response();
@@ -505,46 +439,16 @@ impl CodeAgent {
         self.log_pump_event("response_end").await;
         self.content.end_response();
 
-        // The uniform exit persistence: write the transcript's remaining
-        // delta (the final assistant turn, or whatever completed before an
-        // abort) plus an `Ended` synthesis of any unanswered call. The prompt
-        // is already on disk (dispatch). Failure is logged inside `commit`.
-        {
-            let _ = crate::agent::transcript::commit(
-                &transcript,
-                session.as_deref(),
-                crate::agent::transcript::RunState::Ended,
-            )
-            .await;
-        }
+        // The uniform exit persistence: the committed tail, then a batch whose
+        // results never all landed, with "did not execute" for the calls that
+        // never ran. The prompt is already on disk (dispatch).
+        persist.close().await;
 
         if aborted {
             return Err(crate::PriorError::Cancelled("Aborted.".into()));
         }
 
         Ok(output)
-    }
-
-    /// Apply a turn's per-request params to the request rig built.
-    ///
-    /// Split out so both drive paths shape the request identically: the hook
-    /// path calls it before `add_hook`, the direct path before `prepare_request`
-    /// sees the spec. An override turn stays byte-identical to a normal one
-    /// because the same two setters run in the same order.
-    fn apply_params(
-        &self,
-        request: rig_agent::agent::AgentRunner,
-        params: &crate::params::ModelParams,
-    ) -> rig_agent::agent::AgentRunner {
-        let request = match params.temperature {
-            Some(t) => request.temperature(t),
-            None => request.without_temperature(),
-        };
-        match request_additional_params(&self.provider, &self.model, params, self.routing.as_ref())
-        {
-            Some(v) => request.replace_additional_params(v),
-            None => request.without_additional_params(),
-        }
     }
 
     /// The direct drive path: prior owns the `AgentRun`.
@@ -559,8 +463,10 @@ impl CodeAgent {
         prior: Vec<Message>,
         params: &crate::params::ModelParams,
         session: Option<Arc<Session>>,
-        transcript: Arc<Mutex<TurnTranscript>>,
-    ) -> rig_agent::agent::StreamingResult {
+    ) -> (
+        rig_agent::agent::StreamingResult,
+        crate::agent::drive::PersistHandle,
+    ) {
         use crate::agent::drive::{Drive, DriveLoop};
         use rig_agent::run::AgentRun;
 
@@ -585,10 +491,14 @@ impl CodeAgent {
             Ok(model) => model,
             Err(report) => {
                 // A miswired handler table: surface it as the stream's own
-                // error rather than panicking inside the turn.
-                return Box::pin(futures::stream::once(async move {
-                    Err(PromptError::Report(report))
-                }));
+                // error rather than panicking inside the turn. The caller still
+                // needs a handle to close, and there is no run to give it one.
+                return (
+                    Box::pin(futures::stream::once(async move {
+                        Err(PromptError::Report(report))
+                    })),
+                    crate::agent::drive::PersistHandle::detached(None),
+                );
             }
         };
 
@@ -599,8 +509,7 @@ impl CodeAgent {
             reasoning_in_context: self.reasoning_in_context,
             provider: self.provider.clone(),
             model: self.model.clone(),
-            transcript,
-            session,
+            session: session.clone(),
         };
         let tools = Arc::new(self.agent.tool_server_handle().snapshot());
         let drive = Drive {
@@ -608,9 +517,10 @@ impl CodeAgent {
             tools,
             spec,
             observer: Arc::new(observer),
+            session,
         };
-        let stream = crate::agent::drive::run_stream(DriveLoop::new(drive, run));
-        Box::pin(stream)
+        let (drive, handle) = DriveLoop::new(drive, run);
+        (Box::pin(crate::agent::drive::run_stream(drive)), handle)
     }
 
     pub async fn run_once(&self, input: String) -> Result<String> {

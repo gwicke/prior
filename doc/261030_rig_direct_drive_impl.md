@@ -248,29 +248,34 @@ wire are three readings of one value instead of three functions that had to be p
 
 ## Notes for the implementer
 
-- **Order inside phase 5.** The injection lands first with the table empty, which makes it a
-  pass-through: `preprocess_args` is identity, every part is `{raw args, result}` — so the run's
-  messages change shape but `project`'s unpack restores exactly today's bytes, and nothing else
-  moves. Then add `read`/`write`/`grep`/`sed` entries (one `relativize_arg` call each), then `bash`,
-  then `edit` last — `edit` is the only one that stops being wrapped and changes a return type, so
-  doing it last keeps the tree green throughout. `tool_args::normalize` is deleted only when the
-  last tool stops relying on it.
+**Where the code landed.** `src/agent/parts.rs` (the part, the predicate, `unpack`),
+`src/agent/tool_shape.rs` (the `preprocess_args` table), `src/agent/project.rs` (the projection and
+its complete-prefix rule), `src/agent/persist.rs` (the cursor and the held answers),
+`src/agent/drive.rs` (the loop, which builds each part from the dispatch-computed args),
+`src/agent/observer.rs` (paint and log only). Phase 5's ordering advice is spent: the conversion is
+done, and `tool_args::normalize` is gone.
+
+Still worth knowing:
+
 - **The injection is inside the loop, so a tool cannot do it.** A tool whose `call` also rewrote its
   own arguments would create the second producer this design exists to remove — and it could not,
   because the wrap happens after `execute` returns.
-- **`with_output` is the failure path too**, and it keeps the disposition. Read `is_error` *before*
-  wrapping; after it, `result.is_success()` still describes the execution, which is what telemetry
+- **`with_output` is the failure path too**, and it keeps the disposition. `is_error` is read before
+  the wrap; after it, `result.is_success()` still describes the execution, which is what telemetry
   and the fail-closed checks read. Two audiences, one record.
-- **`sed` already takes a path** and `normalize` covers it; confirm it is in the table, or its calls
-  start storing absolute paths the moment `normalize` goes.
-- **The parity harness (phase 1) must include an `edit` case** with a multi-file call, a single-file
-  call, and a mixed-success batch. Those three are the shapes whose pairing and `is_error` handling
-  change; the SSE mocks already cover retry and cancel.
-- **`--log-messages`** records the request history, so it is the cheapest assertion for the
-  no-parts-list invariant: capture a turn that ran each tool and assert no
-  `{args, result, is_error}` array is present. Worth adding the session file to the same assertion,
-  since parts now live in the run rather than being re-derived at projection.
+- **Malformed `edit` text is shaped where the part is built**, not in a hook. `as_text` no longer
+  sees it: the answer is a `Json` block, so the rewrite moved to the loop's part construction.
+- **The projection runs over the whole history on every request.** It is a fixed point on already
+  projected messages (tested in `project`), so there is no boundary to track — and no
+  `(CallId, message index)` memo to build. `unpack` finds nothing in loaded history because
+  persistence wrote the parts unpacked.
+- **A parts list must never reach a provider or a session file.** `project` is the only thing that
+  can put a message either place, and `project` never emits one — asserted directly in both
+  directions there, which is cheaper and stronger than a `--log-messages` capture.
 - **`edit` stays hand-written.** It is `EditFile` in `src/tools.rs` rather than a `#[rig_tool]`
   function because it owns its description and the `ToolContext` slot; its `call` is where parse →
   split → minimise → relativize happens, and it returns `Vec<CallPart>`. Nothing about the macro
-  path needs changing — the `as_json` arm picks it up without being told which tool it is.
+  path needed changing — the `as_json` arm picks it up without being told which tool it is.
+- **Closing is not writing early.** A batch's answers are held until the close, so nothing the store
+  holds is a message the run has not produced. If a future change wants durable per-answer writes,
+  that is a new decision with a duplicate to reconcile, not a tuning of this one.

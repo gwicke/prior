@@ -18,7 +18,6 @@ use rig_core::message::{
     Api, AssistantContent, AssistantMessage, CallId, Message, Origin, Text, ToolFunction, ToolName,
     ToolResult, ToolResultContent, UserContent,
 };
-use rig_core::streaming::{Part, PartKind, StreamEvent};
 
 /// The wire triple prior stamps on the turns it builds itself.
 ///
@@ -97,323 +96,6 @@ pub(crate) fn assistant_content(msg: &Message) -> &[AssistantContent] {
     match msg {
         Message::Assistant(turn) => &turn.content,
         _ => &[],
-    }
-}
-
-/// Whether the run is still going (a completion-call boundary) or has ended
-/// (a turn exit). It is the one thing `prepare` reads to decide whether an
-/// unanswered call may be persisted.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RunState {
-    /// A completion call is about to be dispatched; the run continues. A
-    /// call without a result is a violation, never a call "about to run".
-    Ongoing,
-    /// The turn is ending — normal, aborted, or errored. Every unanswered call
-    /// is answered with a "did not execute" result so the tail stays valid.
-    Ended,
-}
-
-/// One completion call's live unit: the assistant half as it streams, the
-/// accepted turn once rig commits it, and the results that answer it.
-///
-/// Separate fields keep **order observed rather than assumed**: a provider may
-/// interleave text and tool calls (Gemini, Ollama), so a flat `String` per kind
-/// would silently reorder a turn. A part's `End` supersedes its fragments, and
-/// `accepted` supersedes the whole `streaming` list wholesale.
-#[derive(Default)]
-pub(crate) struct LiveUnit {
-    /// Parts in provider order, keyed by their stream `Part`. A part's `End`
-    /// supersedes its fragments; fragments survive only for a part that never
-    /// ended (a cut stream).
-    parts: Vec<LivePart>,
-    /// `event.content` from `on_model_turn_finished`: canonical, provider
-    /// order, supersedes `streaming` wholesale.
-    accepted: Option<Message>,
-    /// One `ToolResult` per answered call of the batch.
-    results: Vec<UserContent>,
-}
-
-struct LivePart {
-    part: Part,
-    kind: Option<PartKind>,
-    /// Fragments for a part that never ended (text/reasoning/argument JSON).
-    fragments: String,
-    /// The finalized content this part ended with.
-    ended: Option<AssistantContent>,
-}
-
-impl LiveUnit {
-    /// The part's slot, created on first mention so start order is preserved.
-    fn slot(&mut self, part: Part) -> &mut LivePart {
-        let idx = match self.parts.iter().position(|p| p.part == part) {
-            Some(i) => i,
-            None => {
-                self.parts.push(LivePart {
-                    part,
-                    kind: None,
-                    fragments: String::new(),
-                    ended: None,
-                });
-                self.parts.len() - 1
-            }
-        };
-        &mut self.parts[idx]
-    }
-
-    /// Whether the unit holds anything at all (its own content, not the
-    /// transcript's already-persisted messages).
-    fn is_empty(&self) -> bool {
-        self.accepted.is_none()
-            && self.results.is_empty()
-            && self
-                .parts
-                .iter()
-                .all(|p| p.ended.is_none() && p.fragments.is_empty())
-    }
-
-    /// Whether the unit is a complete pair: every tool call the assistant half
-    /// carries has a result. A unit with no accepted turn but with results
-    /// (`TurnAbandoned`) counts as complete — direction B rebuilds the
-    /// assistant half from exactly those results, so it is answered by
-    /// construction.
-    fn answered_all(&self) -> bool {
-        let calls: Vec<CallId> = match &self.accepted {
-            Some(Message::Assistant(turn)) => turn
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
-                    _ => None,
-                })
-                .collect(),
-            // No accepted turn: only the results are known. If there are any,
-            // direction B makes a matching assistant; if there are none there
-            // is nothing to answer.
-            _ => return !self.results.is_empty(),
-        };
-        let answered: std::collections::HashSet<&CallId> = self
-            .results
-            .iter()
-            .filter_map(|c| match c {
-                UserContent::ToolResult(tr) => Some(&tr.call),
-                _ => None,
-            })
-            .collect();
-        calls.iter().all(|id| answered.contains(id))
-    }
-
-    /// The assistant half: `accepted` when present, else the streamed parts
-    /// flattened in provider order. A tool-call part that never ended is
-    /// dropped (its argument JSON is incomplete — a fabricated call would
-    /// enter the session as a real, answered request for a tool that never
-    /// ran). `None` when nothing visible streamed.
-    fn finish(&self) -> Option<Message> {
-        if let Some(turn) = &self.accepted {
-            return Some(turn.clone());
-        }
-        let mut content: Vec<AssistantContent> = Vec::new();
-        for part in &self.parts {
-            if let Some(ended) = &part.ended {
-                content.push(ended.clone());
-                continue;
-            }
-            if part.fragments.is_empty() {
-                continue;
-            }
-            match part.kind {
-                Some(PartKind::Text) => {
-                    content.push(AssistantContent::Text(Text::new(&part.fragments)));
-                }
-                Some(PartKind::Reasoning) => {
-                    content.push(AssistantContent::Reasoning(
-                        rig_core::message::Reasoning::new(&part.fragments),
-                    ));
-                }
-                // An unfinished call, image or opaque part: nothing to write.
-                _ => {}
-            }
-        }
-        assistant_content_is_visible(&content).then(|| assistant_message(None, content))
-    }
-}
-
-/// The canonical transcript of the in-flight run, and the incremental
-/// persistence that turns each completion call into one durable batch.
-///
-/// `messages` holds only *prepared*, durable messages: every element is on
-/// disk. The one mutable thing is the current [`LiveUnit`], which is not a
-/// `Message` yet and never a half-unit — it is shaped by
-/// [`prepare`](Self::prepare) before it enters `messages`.
-#[derive(Default)]
-pub(crate) struct TurnTranscript {
-    /// Prepared messages: every element is on disk. Append-only, never
-    /// rewritten.
-    messages: Vec<Message>,
-    /// The prepared batch awaiting its append; retried verbatim on failure.
-    prepared: Option<PreparedBatch>,
-    /// The current completion call: the only accumulating state.
-    live: LiveUnit,
-}
-
-/// A whole completion turn ready to persist: one to three messages plus the
-/// batch id seed, so entry ids are `{seed}-{i}` and a retried append is
-/// idempotent instead of a duplicated turn.
-#[derive(Clone)]
-pub(crate) struct PreparedBatch {
-    pub(crate) messages: Vec<Message>,
-    pub(crate) seed: uuid::Uuid,
-}
-
-impl TurnTranscript {
-    /// Begin a new completion call: the live unit is empty for it.
-    pub(crate) fn start_live(&mut self) {
-        self.live = LiveUnit::default();
-    }
-
-    /// Feed one streamed part event into the live unit. Each fragment exists
-    /// once, in the current poll's `StreamAssistantItem`, so the loop is the
-    /// single drain site — the hook only ever sees the accepted turn.
-    pub(crate) fn push_event(&mut self, event: &StreamEvent) {
-        let part = event.part();
-        let lp = self.live.slot(part);
-        match event {
-            StreamEvent::Start { kind, name, .. } => {
-                lp.kind = Some(*kind);
-                let _ = name;
-            }
-            StreamEvent::Text { text, .. } | StreamEvent::Reasoning { text, .. } => {
-                lp.fragments.push_str(text);
-            }
-            StreamEvent::Arguments { json, .. } => lp.fragments.push_str(json),
-            StreamEvent::End { content, .. } => lp.ended = Some(content.clone()),
-        }
-    }
-
-    /// Record the accepted assistant turn from `on_model_turn_finished`.
-    /// Empty turns (curated out by rig) are dropped; either way the streamed
-    /// fragments are superseded.
-    pub(crate) fn accept(&mut self, response_id: Option<String>, content: Vec<AssistantContent>) {
-        self.live.parts.clear();
-        self.live.accepted =
-            assistant_content_is_visible(&content).then(|| assistant_message(response_id, content));
-    }
-
-    /// Accumulate one tool result of the batch.
-    pub(crate) fn push_tool_result(&mut self, result: rig_core::message::ToolResult) {
-        self.live.results.push(UserContent::ToolResult(result));
-    }
-
-    /// Whether there is anything to write (drives the back-off reset): any
-    /// persisted message, a pending batch, or live content.
-    pub(crate) fn has_content(&self) -> bool {
-        !self.messages.is_empty() || self.prepared.is_some() || !self.live.is_empty()
-    }
-
-    /// Shape the live unit into a batch, in memory only. Retry-first: while a
-    /// prepared batch is pending (a failed append), it is returned unchanged,
-    /// so a later turn cannot overtake it and ordering on disk is preserved.
-    /// `None` when there is nothing to write.
-    ///
-    /// `state` decides whether an unanswered call is filled with a "did not
-    /// execute" result. At a completion-call boundary the run is ongoing: a
-    /// dangling call there is a violation to log, never a call "about to run",
-    /// so the unit is left in place and not written (it is written at the next
-    /// boundary or the exit, once its results have arrived). At an exit it is
-    /// `Ended` and every unanswered call is answered — the tail must stay a
-    /// valid prefix.
-    pub(crate) fn prepare(&mut self, state: RunState) -> Option<PreparedBatch> {
-        if let Some(batch) = &self.prepared {
-            return Some(batch.clone());
-        }
-        if self.live.is_empty() {
-            return None;
-        }
-        if state == RunState::Ongoing && !self.live.answered_all() {
-            // Mid-run: a call without a result is not yet a complete unit.
-            return None;
-        }
-        let live = std::mem::take(&mut self.live);
-        let assistant = live.finish();
-        let results = live.results;
-
-        // Direction B: results with no accepted turn (`TurnAbandoned`, a
-        // repaired-name turn) — rebuild the assistant half from what each
-        // result carries (call id + name, args `{}`).
-        let assistant = match assistant {
-            Some(a) => a,
-            None if !results.is_empty() => assistant_from_results(&results),
-            // Nothing visible streamed and no results: a whitespace-only cut.
-            // There is nothing to write (an empty assistant message would be
-            // noise); drop the unit.
-            None => return None,
-        };
-        // Two steps, and they answer different questions.
-        //
-        // First the call *as the tool read it*: `preprocess_args` for a tool the
-        // table governs, which is the same function the dispatch label used, so
-        // the panel and the record cannot disagree. A call that never ran gets
-        // nothing — there is no tool to ask, and the model's spelling stands.
-        let assistant = preprocess_calls(assistant);
-        // Then the parts: a tool that returned one part per file becomes one
-        // call per file, each with its own result. A call nothing answered, or
-        // answered with plain text, is untouched.
-        let (assistant, results) = crate::agent::parts::unpack(assistant, results);
-
-        let messages = assemble(assistant, results, state);
-        let batch = PreparedBatch {
-            messages,
-            seed: uuid::Uuid::now_v7(),
-        };
-        self.prepared = Some(batch.clone());
-        Some(batch)
-    }
-
-    /// Fold the prepared batch into `messages` after a successful append.
-    fn mark_committed(&mut self) {
-        if let Some(batch) = self.prepared.take() {
-            self.messages.extend(batch.messages);
-        }
-    }
-}
-
-/// Persist the transcript's pending batch to `session`, if any.
-///
-/// A free async fn because a `std::sync::Mutex` guard cannot cross the
-/// `await`: prepare under the lock, append with the lock dropped, re-lock to
-/// fold. Failure leaves the transcript untouched (the batch stays `prepared`)
-/// so a retry re-emits a byte-identical batch under the same ids — idempotent,
-/// not a duplicated turn — and is logged rather than swallowed.
-pub(crate) async fn commit(
-    transcript: &std::sync::Mutex<TurnTranscript>,
-    session: Option<&crate::session::Session>,
-    state: RunState,
-) -> crate::Result<()> {
-    // Loop so a pending batch (a failed append) is written first, then any
-    // live content that accumulated meanwhile — preserving order. In the
-    // common case live is empty at the boundary and this runs once.
-    loop {
-        let batch = {
-            let mut t = transcript
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            t.prepare(state)
-        };
-        let Some(batch) = batch else {
-            return Ok(());
-        };
-        // The append is the only session-gated step. Without a session the
-        // batch is still folded into `messages`, so `has_content` reflects the
-        // progress a sessionless run made (it drives the back-off reset).
-        if let Some(session) = session {
-            if let Err(e) = session.append_messages(&batch.messages, &batch.seed).await {
-                eprintln!("Warning: failed to persist session batch: {e}");
-                return Err(e);
-            }
-        }
-        let mut t = transcript
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        t.mark_committed();
     }
 }
 
@@ -539,7 +221,7 @@ fn assistant_from_results(results: &[UserContent]) -> Message {
 
 /// The "did not execute" result rig answers an unanswered call with
 /// (`NO_RESULT_PROVIDED` semantics).
-fn synthesized_result(tc: &rig_core::message::ToolCall) -> ToolResult {
+pub(crate) fn synthesized_result(tc: &rig_core::message::ToolCall) -> ToolResult {
     ToolResult {
         call: tc.id.clone(),
         name: tc.function.name.clone(),
@@ -550,92 +232,6 @@ fn synthesized_result(tc: &rig_core::message::ToolCall) -> ToolResult {
         ))],
         is_error: false,
     }
-}
-
-/// Assemble `[assistant]` and, when there are results, `[assistant, user]`.
-/// Every unanswered call is answered with a synthesized "did not execute"
-/// result — safe at a boundary (there are none) and required at a run exit —
-/// so the on-disk tail is always a valid prefix.
-fn assemble(assistant: Message, mut results: Vec<UserContent>, state: RunState) -> Vec<Message> {
-    if state == RunState::Ended {
-        let answered: std::collections::HashSet<CallId> = results
-            .iter()
-            .filter_map(|c| match c {
-                UserContent::ToolResult(tr) => Some(tr.call.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut derived: Vec<UserContent> = Vec::new();
-        for c in assistant_content(&assistant) {
-            if let AssistantContent::ToolCall(tc) = c {
-                if !answered.contains(&tc.id) {
-                    derived.push(UserContent::ToolResult(synthesized_result(tc)));
-                }
-            }
-        }
-        results.extend(derived);
-    }
-
-    let mut out = vec![assistant];
-    if !results.is_empty() {
-        out.push(Message::User { content: results });
-    }
-    out
-}
-
-/// Replace each call's arguments with the form `preprocess_args` gives them.
-///
-/// The same function the dispatch label used, so the panel and the record read
-/// one value rather than two rewrites that had to be proven to agree. A call the
-/// table does not govern — an unknown tool, `edit`, or any call that never ran —
-/// keeps the model's own bytes.
-fn preprocess_calls(assistant: Message) -> Message {
-    let ctx = crate::tool_args::PathContext::sandbox();
-    let Message::Assistant(mut turn) = assistant else {
-        return assistant;
-    };
-    let content: Vec<AssistantContent> = std::mem::take(&mut turn.content)
-        .into_iter()
-        .map(|c| match c {
-            AssistantContent::ToolCall(tc) => {
-                let args = tc.function.arguments_value();
-                match crate::agent::tool_shape::preprocess(tc.function.name.as_str(), &args, &ctx) {
-                    Some(rewritten) => {
-                        // Rebuild around the new arguments, keeping the provider
-                        // item: only the args changed, and a `native` that did
-                        // not would make rig replay the old spelling.
-                        let mut rebuilt = rig_core::message::ToolCall::new(
-                            tc.id.clone(),
-                            ToolFunction::new(tc.function.name.clone(), rewritten),
-                        );
-                        rebuilt.native = tc.native;
-                        AssistantContent::ToolCall(rebuilt)
-                    }
-                    None => AssistantContent::ToolCall(tc),
-                }
-            }
-            other => other,
-        })
-        .collect();
-    Message::Assistant(turn.with_content(content))
-}
-
-/// Whether an accepted assistant turn carries anything the user/model should
-/// see (non-empty text, reasoning, a tool call, or any other content part).
-/// Mirrors rig's curation of empty turns out of history.
-fn assistant_content_is_visible(content: &[AssistantContent]) -> bool {
-    content.iter().any(|c| match c {
-        AssistantContent::Text(t) => !t.text.trim().is_empty(),
-        AssistantContent::Reasoning(r) => !reasoning_text(r).is_empty(),
-        AssistantContent::ToolCall(_) => true,
-        _ => true,
-    })
-}
-
-/// Flatten a rig `Reasoning` payload into plain text. Provider-specific
-/// encrypted/redacted blocks are kept verbatim; other shapes are ignored.
-pub(crate) fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
-    r.text.clone()
 }
 
 /// Render the request history the model is about to see.
@@ -1054,10 +650,13 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         assert_eq!(flags, vec![false, true]);
     }
 
-    /// A single part is not a split: the model's own call and the one result
-    /// stand, so nothing is rewritten for the common case.
+    /// A single-part answer is one call with one result — the common case now
+    /// takes the same path as a split, which is what makes the call *as the tool
+    /// read it* the recorded form for every executed call. `edit` states that
+    /// form per part, so here the model's block blob is replaced by the one
+    /// canonical array.
     #[test]
-    fn a_single_part_call_is_left_as_it_is() {
+    fn a_single_part_call_is_one_call_with_its_own_args() {
         let assistant = assistant_message(
             None,
             vec![AssistantContent::ToolCall(tool_call(
@@ -1072,116 +671,37 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             vec![UserContent::ToolResult(parts_result("t1", one))],
         );
         assert_eq!(tool_calls_of(&assistant).len(), 1);
-        // The call keeps the arguments the model sent: nothing was re-derived.
+        // The part's args are the recorded form: one canonical array, the block
+        // blob replaced — which is what the model is shown again next turn.
+        assert_eq!(
+            tool_calls_of(&assistant)[0].function.arguments["path"],
+            "a.rs"
+        );
         assert!(tool_calls_of(&assistant)[0]
             .function
             .arguments
             .get("blocks")
-            .is_some());
+            .is_none());
         assert_eq!(results.len(), 1, "{results:?}");
-        // And the committed result rides along untouched — the parts list
-        // renders as its one result, which is byte-identical to today's text.
-        let rendered = crate::agent::parts::parts_text(
-            &crate::agent::parts::parts_of_message_result(match &results[0] {
-                UserContent::ToolResult(tr) => tr,
-                _ => panic!("a result"),
-            })
-            .expect("still a parts list"),
-        );
-        assert_eq!(rendered, "Replaced 1 block(s) in a.rs");
-    }
-
-    // ---- persist: the stored shape ----
-
-    /// What reaches disk is one canonical array per file — pi's format — because
-    /// unpacking happened before the batch was assembled.
-    #[test]
-    fn persist_stores_one_canonical_array_per_file() {
-        let mut t = TurnTranscript::default();
-        t.start_live();
-        t.accept(
-            None,
-            vec![AssistantContent::ToolCall(tool_call(
-                "t1",
-                "edit",
-                serde_json::json!({ "blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END" }),
-            ))],
-        );
-        t.push_tool_result(parts_result("t1", &edit_parts()));
-        let batch = t.prepare(RunState::Ongoing).expect("a batch");
-
-        let calls = tool_calls_of(&batch.messages[0]);
-        assert_eq!(calls.len(), 2);
-        for (call, path) in calls.iter().zip(["a.rs", "b.rs"]) {
-            assert_eq!(call.function.arguments["path"], path, "{:?}", call.function);
-            assert!(call.function.arguments["edits"].is_array());
-            assert!(call.function.arguments.get("blocks").is_none());
-        }
-        // Plain text per call: a parts list never reaches disk.
-        let results = results_of(&batch.messages[1]);
-        assert_eq!(results.len(), 2);
-        assert!(!results[0].1.contains("prior_call"), "no envelope on disk");
-        assert!(serde_json::from_str::<serde_json::Value>(&results[0].1).is_err());
-    }
-
-    /// A call the tool never ran keeps the args the model sent — there is no
-    /// tool to ask, and inventing a shape would be worse than the model's own.
-    #[test]
-    fn persist_leaves_a_call_that_never_ran_alone() {
-        let mut t = TurnTranscript::default();
-        t.start_live();
-        t.accept(
-            None,
-            vec![AssistantContent::ToolCall(tool_call(
-                "d1",
-                "bash",
-                serde_json::json!({ "command": "rm -rf /" }),
-            ))],
-        );
-        let batch = t.prepare(RunState::Ended).expect("a batch");
-        let calls = tool_calls_of(&batch.messages[0]);
+        // And the result is the part's own text, exactly as before — a plain
+        // text block, never the parts envelope.
+        let UserContent::ToolResult(tr) = &results[0] else {
+            panic!("a result")
+        };
+        assert!(crate::agent::parts::parts_of_message_result(tr).is_none());
         assert_eq!(
-            calls[0].function.arguments_value(),
-            serde_json::json!({ "command": "rm -rf /" })
+            tr.content,
+            vec![rig_core::message::ToolResultContent::text(
+                "Replaced 1 block(s) in a.rs"
+            )]
         );
-        // `Ended` answers it with the "did not execute" result so the stored
-        // tail stays a valid prefix.
-        assert_eq!(results_of(&batch.messages[1]).len(), 1);
     }
 
-    /// `preprocess_args` is what the record carries: the `bash` prefix goes and
-    /// a path shortens, because the panel was labelled with exactly this.
-    #[test]
-    fn persist_records_the_call_as_preprocessed() {
-        let cwd = std::env::current_dir().unwrap();
-        let mut t = TurnTranscript::default();
-        t.start_live();
-        t.accept(
-            None,
-            vec![
-                AssistantContent::ToolCall(tool_call(
-                    "b1",
-                    "bash",
-                    serde_json::json!({ "command": format!("cd {} && ls", cwd.display()) }),
-                )),
-                AssistantContent::ToolCall(tool_call(
-                    "r1",
-                    "read",
-                    serde_json::json!({ "path": format!("{}/src/x.rs", cwd.display()) }),
-                )),
-            ],
-        );
-        let batch = t.prepare(RunState::Ended).expect("a batch");
-        let calls = tool_calls_of(&batch.messages[0]);
-        assert_eq!(
-            calls[0].function.arguments_value(),
-            serde_json::json!({ "command": "ls" })
-        );
-        assert_eq!(
-            calls[1].function.arguments_value(),
-            serde_json::json!({ "path": "src/x.rs" })
-        );
-    }
+    // ---- the stored shape lives in `crate::agent::project` ----
+    //
+    // The record is now the run's committed log, projected. `project` holds
+    // those tests: the per-file split, the count-preserving map, the complete
+    // prefix, and the assertion that no parts list survives a projection.
 
     // ---- history: the model-facing shape ----
 
@@ -1294,125 +814,13 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let turn2 = TurnPersistence::new();
         assert_eq!(turn2.sent(), 0);
     }
-    // ---- TurnTranscript: live unit, prepare, commit batches ----
+    // ---- the write path now lives in `persist`/`project` ----
     //
-    // The transcript is the persistence source of truth: one `LiveUnit` per
-    // completion call is shaped by `prepare()` into a batch of one to three
-    // messages, and `commit()` writes each completion turn rather than the
-    // whole run. These tests pin the accumulation order, the batch shape, and
-    // the no-truncation `Ended` synthesis.
-
-    #[test]
-    fn transcript_iteration_one_batch_per_completion_call() {
-        use super::{RunState, TurnTranscript};
-        use rig_core::message::{ToolCall, ToolFunction};
-
-        let tc = ToolCall::from_wire(
-            "call_1",
-            ToolFunction::new(tool_name("read"), serde_json::json!({})),
-        );
-        let call_id = tc.id.clone();
-        let mut t = TurnTranscript::default();
-        t.start_live();
-        t.accept(None, vec![AssistantContent::ToolCall(tc)]);
-        t.push_tool_result(text_tool_result(call_id, "read", "ok"));
-        // An `Ongoing` boundary (call start) writes the pair as one batch.
-        let batch = t.prepare(RunState::Ongoing).expect("batch");
-        assert_eq!(
-            batch.messages.len(),
-            2,
-            "assistant + one user: {:?}",
-            batch.messages
-        );
-        assert!(
-            matches!(&batch.messages[1], Message::User { .. }),
-            "batch must be one user message"
-        );
-    }
-
-    #[test]
-    fn transcript_strips_a_redundant_cd_prefix_from_bash_calls() {
-        use super::{RunState, TurnTranscript};
-        use rig_core::message::{ToolCall, ToolFunction};
-
-        let cwd = std::env::current_dir().unwrap();
-        let tc = ToolCall::from_wire(
-            "call_1",
-            ToolFunction::new(
-                tool_name("bash"),
-                serde_json::json!({ "command": format!("cd {} && ls", cwd.display()) }),
-            ),
-        );
-        let call_id = tc.id.clone();
-        let mut t = TurnTranscript::default();
-        t.start_live();
-        t.accept(None, vec![AssistantContent::ToolCall(tc)]);
-        t.push_tool_result(text_tool_result(call_id, "bash", "ok"));
-        let batch = t.prepare(RunState::Ongoing).expect("batch");
-        // The persisted call is the compact form, matching what the shell ran
-        // and what the next turn is shown.
-        let calls = tool_calls_of(&batch.messages[0]);
-        assert_eq!(
-            calls[0].function.arguments_value()["command"],
-            serde_json::json!("ls")
-        );
-    }
-
-    #[test]
-    fn transcript_ended_synthesizes_interrupted_calls() {
-        use super::{RunState, TurnTranscript};
-        use rig_core::message::{ToolCall, ToolFunction, ToolResultContent, UserContent};
-
-        let tc = ToolCall::from_wire(
-            "call_1",
-            ToolFunction::new(tool_name("read"), serde_json::json!({})),
-        );
-        let mut t = TurnTranscript::default();
-        t.start_live();
-        t.accept(None, vec![AssistantContent::ToolCall(tc)]);
-        // Interrupted before any result: `Ended` synthesizes one per call.
-        let batch = t.prepare(RunState::Ended).expect("batch");
-        assert_eq!(batch.messages.len(), 2, "assistant + synthesized user");
-        let Message::User { content } = &batch.messages[1] else {
-            panic!("expected a user message");
-        };
-        let UserContent::ToolResult(tr) = &content[0] else {
-            panic!("expected a tool result");
-        };
-        assert_eq!(tr.name, "read");
-        let ToolResultContent::Text(txt) = &tr.content[0] else {
-            panic!("expected text content");
-        };
-        assert!(txt.text.contains("interrupted"), "got: {}", txt.text);
-    }
-
-    #[test]
-    fn transcript_ongoing_leaves_dangling_call_unwritten() {
-        use super::{RunState, TurnTranscript};
-        use rig_core::message::{ToolCall, ToolFunction};
-
-        let tc = ToolCall::from_wire(
-            "call_1",
-            ToolFunction::new(tool_name("read"), serde_json::json!({})),
-        );
-        let mut t = TurnTranscript::default();
-        t.start_live();
-        t.accept(None, vec![AssistantContent::ToolCall(tc)]);
-        // No result yet: at an ongoing boundary the unit is incomplete, so
-        // there is nothing to write (the tail never gets a dangling call).
-        assert!(t.prepare(RunState::Ongoing).is_none());
-    }
-
-    #[test]
-    fn transcript_skips_turns_without_visible_content() {
-        use super::{RunState, TurnTranscript};
-
-        let mut t = TurnTranscript::default();
-        t.start_live();
-        t.accept(None, vec![AssistantContent::text("   ")]);
-        assert!(!t.has_content(), "blank-text turn is not content");
-        assert!(t.prepare(RunState::Ended).is_none());
-    }
+    // Nothing here pins the batch shape any more: the run's committed log is the
+    // record, and `crate::agent::persist`/`crate::agent::project` hold the tests
+    // that matter (unit completeness, the unpack, and the no-parts-list
+    // invariant). What remains below is the *load*-path and message shaping,
+    // which is still this module's job.
 
     #[test]
     fn repair_pairing_answers_a_dangling_call() {
@@ -1461,24 +869,6 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         assert_eq!(&*tc.id.wire(), "c9");
     }
 
-    #[test]
-    fn reasoning_text_extracts_text_block() {
-        let r = Reasoning::new("think step by step");
-        assert_eq!(reasoning_text(&r), "think step by step");
-    }
-
-    #[test]
-    fn reasoning_text_extracts_text_with_signature() {
-        // rig 0.45 keeps the provider's signature in the block's `native`
-        // item; the text is the whole canonical payload.
-        let r = Reasoning::new("with sig");
-        assert_eq!(reasoning_text(&r), "with sig");
-    }
-    // `reasoning_in_context=Never` must drop reasoning blocks from assistant
-    // messages for non-Anthropic providers, while keeping text (and keeping
-    // reasoning entirely for Anthropic-family turns that involve tool calls, or
-    // when the mode is Always). On an Anthropic turn *without* tool calls, the
-    // mode is honored and reasoning is stripped.
     #[test]
     fn strips_reasoning_for_non_anthropic_when_never() {
         use crate::settings::ReasoningInContextMode;
@@ -1629,7 +1019,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             maybe_strip_reasoning(msgs, ReasoningInContextMode::AbortedTurnsOnly, "openai", "");
         let thought = |m: &Message| match m {
             Message::Assistant(turn) => turn.content.iter().find_map(|c| match c {
-                AssistantContent::Reasoning(r) => Some(reasoning_text(r)),
+                AssistantContent::Reasoning(r) => Some(r.text.clone()),
                 _ => None,
             }),
             _ => None,
@@ -1687,7 +1077,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
                     turn.content
                         .iter()
                         .filter_map(|c| match c {
-                            AssistantContent::Reasoning(r) => Some(reasoning_text(r)),
+                            AssistantContent::Reasoning(r) => Some(r.text.clone()),
                             _ => None,
                         })
                         .collect::<Vec<_>>(),

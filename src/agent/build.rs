@@ -16,11 +16,7 @@
 //! remapped. Split out from `create_agent` so it can be tested against a
 //! support table directly.
 
-use rig_agent::agent::{
-    Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, DispatchAction,
-    DispatchEvent, HookContext, InvalidToolCallAction, InvalidToolCallContext, ModelTurnAction,
-    ModelTurnFinished, OutcomeAction, OutcomeEvent, RequestPatch,
-};
+use rig_agent::agent::{Agent, AgentBuilder};
 use rig_agent::tool::ToolContext;
 
 use rig_core::providers::{
@@ -34,14 +30,11 @@ use serde_json;
 use crate::params;
 use crate::Result;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::agent::msglog::MessageLogger;
-use crate::agent::transcript::{
-    assistant_message, maybe_strip_reasoning, model_facing_tool_text, reasoning_remap_note,
-    render_model_facing, TurnTranscript,
-};
+use crate::agent::transcript::reasoning_remap_note;
 use crate::agent::CodeAgent;
 use crate::tools::{
     bsed_available, set_sandbox, Bash, EditFile, GrepText, ReadFile, SedPreview, WriteFile,
@@ -622,24 +615,6 @@ pub fn load_agents_md() -> Option<String> {
     None
 }
 
-#[derive(Clone)]
-pub(crate) struct LoggingHook {
-    /// Content only: this hook's every verb is a `display_*`.
-    pub(crate) content: Arc<crate::content::Content>,
-    pub(crate) user_cancel: Arc<AtomicBool>,
-    pub(crate) message_logger: Option<Arc<MessageLogger>>,
-    pub(crate) reasoning_in_context: crate::settings::ReasoningInContextMode,
-    pub(crate) provider: String,
-    pub(crate) model: String,
-    /// Run-scoped canonical transcript accumulator; see [`TurnTranscript`].
-    /// Hooks and the prompt loop both append under this mutex in stream
-    /// order, so the transcript mirrors rig's own `new_messages`.
-    pub(crate) transcript: Arc<Mutex<TurnTranscript>>,
-    /// The session to persist each completed completion turn into, if any.
-    /// `None` for `run_once` (sessionless) and tests.
-    pub(crate) session: Option<Arc<crate::session::Session>>,
-}
-
 /// An [`AgentBuilder`] over rig's [`SignedInModel`]: the catalog entry for
 /// `vendor/model`, served with a credential `auth` resolves and refreshes per
 /// request, so a long session outlives its access token.
@@ -722,228 +697,6 @@ fn llamacpp_base_url(raw: &str) -> String {
         trimmed.to_owned()
     } else {
         format!("{trimmed}/v1")
-    }
-}
-
-impl AgentHook for LoggingHook {
-    async fn on_completion_call(
-        &self,
-        _ctx: &HookContext,
-        event: CompletionCallEvent<'_>,
-    ) -> CompletionCallAction {
-        // Persist the completion turn that just finished, *before* the cancel
-        // check below so a cancel-stop still writes it. The turn whose response
-        // is about to be requested is complete and valid (every tool call
-        // answered), so this is the incremental persist point: mid-turn
-        // progress reaches disk by the start of the next call.
-        {
-            let _ = crate::agent::transcript::commit(
-                &self.transcript,
-                self.session.as_deref(),
-                crate::agent::transcript::RunState::Ongoing,
-            )
-            .await;
-            if let Ok(mut t) = self.transcript.lock() {
-                t.start_live();
-            }
-        }
-        if self.user_cancel.load(Ordering::SeqCst) {
-            return CompletionCallAction::Stop("cancelled by user".into());
-        }
-        // Build the history to send: strip reasoning when configured, then
-        // render every tool call the way the model should see it (path
-        // arguments short, `edit` in block form). The composition order is
-        // `strip -> render`; nothing is re-parsed or re-minimized here, because
-        // the stored form already carries what execution decided.
-        //
-        // The transcript is stored canonically (a pi-compatible array); the
-        // model is shown the block form *consistently* so it keeps emitting the
-        // reliable shape. This hook is the one place that sees the whole
-        // request history, so it covers prior and within-turn messages alike.
-        let stripped_history = maybe_strip_reasoning(
-            event.history.iter().map(|m| (**m).clone()).collect(),
-            self.reasoning_in_context,
-            &self.provider,
-            &self.model,
-        );
-        // `strip -> render`: drop the redundant `cd <cwd> && …` prefix on
-        // `bash` calls, shorten path arguments (the same function the execution
-        // path used), and render each `edit` call in the block form the model
-        // should see.
-        let history = render_model_facing(stripped_history);
-
-        // `--log-messages`: capture the exact context sent to the model on this
-        // call — the (stripped, block-form) history plus the current prompt —
-        // under one turn id shared with the matching response. Logging `history`
-        // reflects what the provider actually receives.
-        if let Some(logger) = &self.message_logger {
-            let turn_id = logger.advance_turn();
-            for m in &history {
-                logger.log_message("sent", m, turn_id).await;
-            }
-            logger.log_message("sent", event.prompt, turn_id).await;
-        }
-
-        // Always send via a patch: it replaces the run's history with exactly
-        // `history`. `maybe_strip_reasoning` also handles the Anthropic-family
-        // thinking+tool_use replay contract (reasoning is force-kept on turns
-        // with tool calls). Identity for every message without an `edit` call.
-        CompletionCallAction::Patch(RequestPatch::new().history(history))
-    }
-
-    async fn on_model_turn_finished(
-        &self,
-        _ctx: &HookContext,
-        event: ModelTurnFinished<'_>,
-    ) -> ModelTurnAction {
-        if self.user_cancel.load(Ordering::SeqCst) {
-            ModelTurnAction::Stop("cancelled by user".into())
-        } else {
-            // `--log-messages`: capture the assistant content received for
-            // this turn, tagged with the same turn id as the request that
-            // produced it. Fires on both the blocking and streaming surfaces
-            // (the streaming one never calls `on_completion_response`), so
-            // this is the single place the received side is logged.
-            if let Some(logger) = &self.message_logger {
-                let msg =
-                    assistant_message(event.identity.response_id.clone(), event.content.clone());
-                let turn_id = logger.current_turn_id();
-                logger.log_message("received", &msg, turn_id).await;
-            }
-            // Accumulate the accepted turn into the run transcript so a
-            // mid-turn failure can persist exactly what completed (see
-            // `TurnTranscript` / doc/tool_error_handling.md). This branch
-            // returns `Continue`, i.e. the turn was accepted — matching rig's
-            // own history commit for the same content.
-            if let Ok(mut t) = self.transcript.lock() {
-                t.accept(event.identity.response_id.clone(), event.content.clone());
-            }
-            ModelTurnAction::Continue
-        }
-    }
-
-    /// A tool call is about to be dispatched: paint it (for the in-flight
-    /// panel) and let a pending `<Esc>` cancel the run before the tool body
-    /// starts. This replaces rig 0.42's `on_tool_call`.
-    async fn on_dispatch(&self, _ctx: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
-        let Some(tool_name) = event.tool_name() else {
-            // A completion dispatch (or another family): nothing to paint.
-            return DispatchAction::proceed();
-        };
-        if self.user_cancel.load(Ordering::SeqCst) {
-            return DispatchAction::stop("cancelled by user");
-        }
-        // `edit` paints nothing here: its panel is a *pair* (label + diff, then
-        // result), and the call half is not complete until the edits have
-        // resolved. `on_outcome` paints the whole thing from the prepared
-        // form, so a single-file call now waits for its result too. Editing is
-        // fast, and the alternative — a label then a diff then a result in
-        // three writes — is what a multi-file call already could not do.
-        if tool_name == "edit" {
-            return DispatchAction::proceed();
-        }
-        let args = event.tool_args().unwrap_or("{}");
-        let args_json =
-            serde_json::from_str(args).unwrap_or(serde_json::Value::String(args.to_string()));
-        // The call as the tool reads it — the `bash` prefix strip and path
-        // relativization — so the label carries the same bytes the record will.
-        // Without this a slow `bash` would be labelled with the model's own
-        // spelling and then stored under a rewritten one, and the panel and the
-        // session would disagree about a call that never changed.
-        let args_json = crate::agent::tool_shape::preprocess_or_raw(
-            tool_name,
-            &args_json,
-            &crate::tool_args::PathContext::sandbox(),
-        );
-        self.content.display_tool_call(tool_name, &args_json);
-        DispatchAction::proceed()
-    }
-
-    /// Model called a tool that isn't registered or isn't in the current
-    /// turn's allowed set. Rig gates this *before* `on_tool_call`, so the
-    /// hook is the only place that can recover without burning a fresh
-    /// model call. We re-prompt the model with the available tool set so
-    /// a hallucinated name (the common case) self-corrects on the first
-    /// retry. The recovery budget is configured on the streaming request
-    /// via `.max_invalid_tool_call_retries(1)`; if the model hallucinates
-    /// the same wrong name twice, rig exhausts the budget and the run
-    /// surfaces a `LlmUnknownTool` `PriorError` to the user.
-    ///
-    /// Reference: rig `AgentHook::on_invalid_tool_call` (hook.rs:1218) +
-    /// `InvalidToolCallAction::{Retry, Repair, Skip, Stop, Fail}` (run
-    /// `policy.rs:49`).
-    async fn on_invalid_tool_call(
-        &self,
-        _ctx: &HookContext,
-        event: &InvalidToolCallContext,
-    ) -> Option<InvalidToolCallAction> {
-        if self.user_cancel.load(Ordering::SeqCst) {
-            return Some(InvalidToolCallAction::stop("cancelled by user"));
-        }
-        // Surface the issue to the user *before* the recovery attempt so
-        // the in-flight panel shows what the model tried. `display_error`
-        // is the existing method; layer 1 Task 1 will add a dedicated
-        // `display_tool_error` panel that we can swap in later.
-        self.content.display_error(&format!(
-            "Model called tool `{}` which is not available. Available tools: {:?}. \
-             Asking the model to retry with a valid name.",
-            event.tool_name, event.available_tools
-        ));
-        Some(InvalidToolCallAction::retry(format!(
-            "tool `{}` is not available. Available tools: {:?}. \
-             Please re-emit the call with one of the available tool names.",
-            event.tool_name, event.available_tools
-        )))
-    }
-
-    /// A dispatched effect resolved. Completion outcomes are where a pending
-    /// `<Esc>` stops the run; tool outcomes paint the result — and, for `edit`,
-    /// prepare the call and paint the whole pair. This replaces rig 0.42's
-    /// `on_completion_response` and `on_tool_result`.
-    async fn on_outcome(&self, _ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
-        if self.user_cancel.load(Ordering::SeqCst) {
-            return OutcomeAction::stop("cancelled by user");
-        }
-        if event.tool_result().is_none() {
-            // A completion (or another family): nothing to paint here.
-            return OutcomeAction::proceed();
-        }
-        let Some(tool_name) = event.tool_name() else {
-            return OutcomeAction::proceed();
-        };
-        let Some(result) = event.tool_result() else {
-            return OutcomeAction::proceed();
-        };
-
-        // A tool that answered with parts painted its own call panels at
-        // dispatch, so only the results are left to paint — one per part, in
-        // order, which is exactly how N genuine single-file calls render.
-        //
-        // The parts are read from the result because it *is* their container:
-        // the loop wraps every tool answer in one, so nothing else has to be
-        // remembered between dispatch and outcome.
-        //
-        // `call_painted` mirrors the one rule `on_dispatch` applies: it skips
-        // painting `edit` because that call's half is not known until the tool
-        // has split it.
-        if let Some(parts) = crate::agent::parts::parts_of_result(result) {
-            let args = event
-                .tool_args()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .unwrap_or(serde_json::Value::Null);
-            self.content
-                .display_tool_parts(tool_name, &parts, tool_name != "edit");
-            let _ = args;
-            return OutcomeAction::proceed();
-        }
-
-        self.content.display_tool_result(&result.output().render());
-        if let Some(text) = result.output().as_text() {
-            if let Some(cleaned) = model_facing_tool_text(tool_name, text) {
-                return OutcomeAction::rewrite_tool_result(&event, cleaned);
-            }
-        }
-        OutcomeAction::proceed()
     }
 }
 
@@ -1190,7 +943,6 @@ fn guard<T: Tool>(
 mod tests {
     use super::*;
 
-    use crate::agent::msglog::MessageLogger;
     use crate::agent::transcript::reasoning_remap_note;
     // ---- the wire alias (doc/261023_model_aliases.md) ----
 
@@ -1559,98 +1311,6 @@ mod tests {
             reasoning_remap_note(crate::params::ReasoningLevel::Max, &support),
             None
         );
-    }
-    /// End-to-end: a real streaming run through `LoggingHook` must log both the
-    /// context sent (`on_completion_call`) and the assistant content received
-    /// (`on_model_turn_finished`) — the streaming surface never calls
-    /// `on_completion_response`, so the received side must come from the
-    /// per-turn hook. Regression test for "all messages marked sent".
-    #[tokio::test]
-    async fn streaming_run_logs_sent_and_received() {
-        use futures::StreamExt;
-        use rig_agent::agent::{AgentBuilder, MultiTurnStreamItem};
-        use rig_agent::streaming::{Item, StreamEvent};
-        use rig_core::completion::Usage;
-        use rig_core::test_utils::{mock_final, MockCompletionModel, MockStreamEvent};
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
-
-        use super::LoggingHook;
-
-        let _tmp = tempfile::tempdir().unwrap();
-        let dir = _tmp.path().to_path_buf();
-        let path = dir.join("messages.jsonl");
-        let _ = tokio::fs::remove_file(&path).await;
-
-        let logger = Arc::new(MessageLogger::new(
-            path.display().to_string(),
-            "test".to_string(),
-            "test-model".to_string(),
-        ));
-
-        // One scripted streaming turn: text + terminal record.
-        let model = MockCompletionModel::from_stream_turns([[
-            MockStreamEvent::Text("hello there".to_string()),
-            MockStreamEvent::FinalResponse(mock_final(Usage::new())),
-        ]]);
-        let agent = AgentBuilder::new(model).build();
-
-        let hook_content = Arc::new(crate::content::Content::quiet());
-        let mut stream = agent
-            .prompt("hi")
-            .add_hook(LoggingHook {
-                content: hook_content,
-                user_cancel: Arc::new(AtomicBool::new(false)),
-                message_logger: Some(logger.clone()),
-                reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
-                provider: "test".to_string(),
-                model: "test-model".to_string(),
-                session: None,
-                transcript: Arc::new(std::sync::Mutex::new(super::TurnTranscript::default())),
-            })
-            .max_turns(1)
-            .stream();
-
-        let mut final_text = String::new();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
-                    text,
-                    ..
-                }))) => final_text.push_str(&text),
-                Ok(_) => {}
-                Err(e) => panic!("stream error: {e}"),
-            }
-        }
-        assert_eq!(final_text, "hello there");
-
-        let raw = tokio::fs::read_to_string(&path)
-            .await
-            .expect("log file must be created");
-        let lines: Vec<serde_json::Value> = raw
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-
-        let sent: Vec<_> = lines.iter().filter(|l| l["direction"] == "sent").collect();
-        let received: Vec<_> = lines
-            .iter()
-            .filter(|l| l["direction"] == "received")
-            .collect();
-
-        // One user prompt sent, one assistant reply received.
-        assert_eq!(sent.len(), 1, "expected exactly one sent message: {raw}");
-        assert_eq!(
-            received.len(),
-            1,
-            "expected exactly one received message: {raw}"
-        );
-        assert_eq!(received[0]["role"], "assistant");
-        assert_eq!(received[0]["message"]["content"][0]["text"], "hello there");
-        // Both sides of the same turn share a turn id.
-        assert_eq!(sent[0]["turn_id"], received[0]["turn_id"]);
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
     #[cfg(unix)]
     #[test]

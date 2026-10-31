@@ -51,6 +51,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use tokio::sync::Mutex as AsyncMutex;
+
 use futures::StreamExt;
 use rig_agent::agent::{ModelHandle, MultiTurnStreamItem};
 use rig_agent::completion::PromptError;
@@ -62,7 +64,12 @@ use rig_agent::run::{
 use rig_agent::streaming::{CompletionStream, Item, StreamEvent};
 use rig_core::completion::{CompletionRequest, Document, Message};
 use rig_core::message::AssistantContent;
-use rig_core::tool::{ToolContext, ToolResult};
+use rig_core::tool::ToolContext;
+
+use crate::agent::parts::CallPart;
+use crate::agent::persist::Persister;
+use crate::agent::transcript::assistant_message;
+use crate::session::Session;
 
 /// What the drive loop needs from a `CodeAgent`: the model, the tools, the run
 /// spec and the observer.
@@ -72,6 +79,9 @@ pub(crate) struct Drive {
     pub(crate) spec: rig_agent::run::spec::RunSpec,
     /// Owned rather than borrowed: the stream outlives the call that builds it.
     pub(crate) observer: Arc<dyn Observer>,
+    /// Where committed units are written. `None` for a sessionless run, which
+    /// still needs to know it made progress but has nowhere to put it.
+    pub(crate) session: Option<Arc<Session>>,
 }
 
 /// The host's side of the loop: paint, persist, cancel, and the recovery
@@ -97,13 +107,16 @@ pub(crate) trait Observer: Send + Sync {
     /// The run accepted `content` as this turn's assistant message.
     async fn after_turn(&self, turn: usize, content: &[AssistantContent]);
 
-    /// A tool call is about to run. `args` is the model's spelling, unmodified.
-    fn dispatch(&self, name: &str, args: &str) -> Result<(), String>;
+    /// A tool call is about to run. `args` is the call as the tool reads it
+    /// ([`crate::agent::tool_shape::preprocess`]), already computed by the loop,
+    /// so the label and the record are one value rather than two rewrites that
+    /// had to be proven to agree.
+    fn dispatch(&self, name: &str, args: &serde_json::Value) -> Result<(), String>;
 
-    /// A tool call answered. `result` is what the run will commit; returning a
-    /// replacement rewrites the model-visible content without changing the
-    /// disposition (rig's `OutcomeAction::rewrite`).
-    fn outcome(&self, name: &str, args: &str, result: &ToolResult) -> Option<ToolResult>;
+    /// A tool call answered: `parts` is the call as the tool understood it, with
+    /// its result (one part per file for `edit`). The loop has already wrapped
+    /// them for the run, so this is display only.
+    fn outcome(&self, name: &str, parts: &[crate::agent::parts::CallPart]);
 
     /// The invalid-call decision for a call rig refused to dispatch as written.
     /// `None` leaves it to the run's `UnhandledInvalidToolCall` policy.
@@ -157,7 +170,14 @@ pub(crate) struct DriveLoop {
     run: AgentRun,
     /// Where this run's own appends begin. Everything below is loaded history,
     /// already projected when it was written (doc §4).
-    cursor: usize,
+    announce_cursor: usize,
+    /// The writing half of the same idea: a cursor over the run's log, plus the
+    /// answers of a batch whose commit has not landed yet.
+    ///
+    /// Shared, because the abort path drops this loop and the persister still
+    /// has to be closed: an `Esc` in the middle of a tool batch must not lose
+    /// the files that batch already edited.
+    persist: Arc<AsyncMutex<Persister>>,
     /// Items ready to hand out before the next `await`.
     queue: VecDeque<MultiTurnStreamItem>,
     attempt: Option<Attempt>,
@@ -168,39 +188,27 @@ pub(crate) struct DriveLoop {
 }
 
 impl DriveLoop {
-    pub(crate) fn new(drive: Drive, run: AgentRun) -> Self {
-        let cursor = run.projection_start();
-        Self {
+    pub(crate) fn new(drive: Drive, run: AgentRun) -> (Self, PersistHandle) {
+        let announce_cursor = run.projection_start();
+        let persist = Arc::new(AsyncMutex::new(Persister::new(&run, drive.session.clone())));
+        let handle = PersistHandle(persist.clone());
+        let this = Self {
             drive,
             run,
-            cursor,
+            announce_cursor,
+            persist,
             queue: VecDeque::new(),
             attempt: None,
             finished: false,
-        }
+        };
+        (this, handle)
     }
 
-    /// The run's committed messages, the persistence source.
-    ///
-    /// Phase 3 replaces the transcript's reassembly with a cursor over this;
-    /// until then `TurnTranscript` is still the writing path and this is what
-    /// a caller reads to prove the two agree.
-    #[allow(dead_code)]
-    pub(crate) fn messages(&self) -> &[Arc<Message>] {
-        self.run.messages()
-    }
-
-    /// The error to persist and report when the caller stops the loop: the
-    /// same canonical history rig's own cancellation carried.
+    /// The error to report when the caller stops the loop: the same canonical
+    /// history rig's own cancellation carried.
     #[allow(dead_code)]
     pub(crate) fn cancelled(&self, reason: impl Into<String>) -> PromptError {
         self.run.cancel_error(reason)
-    }
-
-    /// The run itself, once the loop has finished — what phase 2 resumes from.
-    #[allow(dead_code)]
-    pub(crate) fn into_run(self) -> AgentRun {
-        self.run
     }
 
     /// Advance the loop by one item.
@@ -240,6 +248,23 @@ impl DriveLoop {
                 history,
                 turn,
             } => {
+                // The unit that just finished is complete and pair-valid, which
+                // is what makes this the persist boundary: mid-turn progress
+                // reaches disk before the next request goes out.
+                self.persist.lock().await.write_committed(&self.run).await;
+                // Project what the model will see. The run's log holds the parts
+                // lists this loop wrote into its answers, and a parts list must
+                // never reach a provider. Projecting the *whole* history is safe:
+                // a stored result is plain text (persistence wrote the parts
+                // unpacked), so `unpack` finds nothing in loaded history and is a
+                // byte-level no-op there.
+                let history: Vec<Arc<Message>> = {
+                    let owned: Vec<Message> = history.iter().map(|m| (**m).clone()).collect();
+                    crate::agent::project::project(&owned)
+                        .into_iter()
+                        .map(Arc::new)
+                        .collect()
+                };
                 let patch = match self
                     .drive
                     .observer
@@ -282,6 +307,10 @@ impl DriveLoop {
                 Ok(Step::Advanced)
             }
             AgentRunStep::Done(response) => {
+                // The last assistant turn is committed and complete, and it has
+                // no following completion call to flush it. This is its write.
+                self.persist.lock().await.write_committed(&self.run).await;
+                self.persist.lock().await.close().await;
                 // Hand the response straight out and mark the loop finished:
                 // rig's terminal state keeps answering `Done`, so a second pass
                 // would emit it forever.
@@ -392,7 +421,9 @@ impl DriveLoop {
         )?;
         let assembled = attempt.assembler.finish(&response);
         let content = assembled.choice.clone();
+        let recorded = assistant_message(None, content.clone());
         self.run.streamed_turn(assembled)?;
+        self.persist.lock().await.set_tail(recorded);
         // Per-call usage reaches the caller the same way rig's stream carried
         // it, so the status line keeps reading the provider's own count.
         self.queue
@@ -404,7 +435,11 @@ impl DriveLoop {
     /// Feed the run's committed tail past the cursor to the queue, then advance
     /// it.
     fn project_committed(&mut self) {
-        let committed = self.run.messages().get(self.cursor..).unwrap_or_default();
+        let committed = self
+            .run
+            .messages()
+            .get(self.announce_cursor..)
+            .unwrap_or_default();
         for item in project(committed) {
             match item {
                 CommittedItem::ToolCall(tool_call) => {
@@ -422,42 +457,105 @@ impl DriveLoop {
                 _ => {}
             }
         }
-        self.cursor = self.run.messages().len();
+        self.announce_cursor = self.run.messages().len();
     }
 
     /// Execute one pending call and answer it into the run.
     ///
     /// A batch is answered call by call; the run commits the whole batch as one
     /// user message once the last answer lands. Persistence of the answers
-    /// themselves is the observer's business (doc §3), which is why `outcome`
-    /// fires before the answer is applied.
+    /// themselves is the observer's business (doc §3), which is why the *answers
+    /// written so far* are the persist boundary inside a batch.
+    ///
+    /// Every executed answer is wrapped in a parts list before it enters the
+    /// run, so the run's own history is where the projection finds the call as
+    /// the tool understood it. That is what makes `preprocess_args` a *once per
+    /// live call* computation: it runs here, and nothing downstream re-derives
+    /// it.
     async fn answer_call(&mut self, call: PendingToolCall) -> Result<(), PromptError> {
         match call {
             PendingToolCall::Execute(call) => {
                 let name = call.name().to_string();
-                let raw = call.tool_call().function.arguments_json();
+                // The call as the tool reads it: paths relativized, a `bash`
+                // `cd <cwd> &&` prefix stripped. Computed once, used twice — for
+                // the panel label now and for the part the run records.
+                let raw = call.tool_call().function.arguments_value();
+                let understood = crate::agent::tool_shape::preprocess_or_raw(
+                    &name,
+                    &raw,
+                    &crate::tool_args::PathContext::sandbox(),
+                );
                 self.drive
                     .observer
-                    .dispatch(&name, &raw)
+                    .dispatch(&name, &understood)
                     .map_err(|reason| self.run.cancel_error(reason))?;
                 let result = match self.drive.tools.get(&name) {
                     Some(tool) => {
                         let mut context = ToolContext::new();
-                        tool.execute(raw.clone(), &mut context).await
+                        tool.execute(raw.to_string(), &mut context).await
                     }
                     // The turn's policy allowed the name, so a miss here means
                     // the registry changed under the run. Answer honestly
                     // rather than leaving the call pending forever.
-                    None => ToolResult::failed(rig_core::tool::ToolExecutionError::other(format!(
-                        "tool `{name}` is not registered"
-                    ))),
+                    None => rig_core::tool::ToolResult::failed(
+                        rig_core::tool::ToolExecutionError::other(format!(
+                            "tool `{name}` is not registered"
+                        )),
+                    ),
                 };
-                let result = self
-                    .drive
-                    .observer
-                    .outcome(&name, &raw, &result)
-                    .unwrap_or(result);
-                self.run.answer(call.answer(result))
+                // A tool that returns parts (`edit`) said so itself; anything
+                // else is one call with one result, built from the value
+                // computed above. `is_error` is read before the wrap and travels
+                // in the part: it is rig's own rule for the message it would
+                // have written, so a refused or failed call lands in the part
+                // exactly as it landed in the message before.
+                let parts = match crate::agent::parts::parts_of_result(&result) {
+                    Some(parts) => parts,
+                    None => {
+                        // A malformed `edit` block's error leads with the
+                        // problem once the redundant wrappers are gone: a weak
+                        // model is far likelier to self-correct from a terse
+                        // message. Only the model-visible text changes; the
+                        // disposition and telemetry keep the raw failure.
+                        let rendered = result.output().render();
+                        let text =
+                            crate::agent::transcript::model_facing_tool_text(&name, &rendered)
+                                .map(str::to_string)
+                                .unwrap_or(rendered);
+                        vec![CallPart {
+                            args: understood.clone(),
+                            result: text,
+                            is_error: !result.is_success(),
+                        }]
+                    }
+                };
+                self.drive.observer.outcome(&name, &parts);
+                // `with_output` keeps the disposition and swaps only the
+                // model-visible content, so a failure injects exactly as a
+                // success does. `answer_all` commits this block verbatim.
+                let wrapped = result.with_output(rig_core::tool::ToolOutput::json(
+                    serde_json::to_value(&parts).map_err(|error| {
+                        self.run.cancel_error(format!(
+                            "tool `{name}` produced parts that do not serialize: {error}"
+                        ))
+                    })?,
+                ));
+                // Held, not written: the run commits a whole batch as one
+                // message, and this is the copy that survives an abort first.
+                // The shape is the one rig would commit, so a repaired batch is
+                // indistinguishable from a completed one.
+                self.persist
+                    .lock()
+                    .await
+                    .note_answer(&rig_core::message::ToolResult {
+                        call: call.tool_call().id.clone(),
+                        name: rig_core::message::ToolName::new(name.clone())
+                            .unwrap_or_else(|_| crate::agent::transcript::tool_name(&name)),
+                        content: wrapped.output().clone().into_content(),
+                        is_error: !wrapped.is_success(),
+                    });
+                self.run.answer(call.answer(wrapped))?;
+                Ok(())
             }
             PendingToolCall::Malformed(call) => {
                 let context = self.run.malformed_context(&call, true);
@@ -471,6 +569,36 @@ impl DriveLoop {
                 .run
                 .cancel_error("the run emitted a tool-call kind this driver does not handle")),
         }
+    }
+}
+
+/// The loop's persistence, reachable after the loop is dropped.
+///
+/// The turn pump stops by dropping the stream, so the exit path cannot ask the
+/// loop anything — but a half-finished tool batch still has to be written. The
+/// handle is the loop's own `Arc`, so closing through it is closing the same
+/// persister, and it is idempotent: a normal exit closes, and then the pump's
+/// own close finds nothing left to do.
+#[derive(Clone)]
+pub(crate) struct PersistHandle(Arc<AsyncMutex<Persister>>);
+
+#[allow(dead_code)] // `DriveLoop::close`/`made_progress` go through it too.
+impl PersistHandle {
+    /// A handle that owns its persister outright, for a turn that never got as
+    /// far as a run (a miswired handler table).
+    pub(crate) fn detached(session: Option<Arc<Session>>) -> Self {
+        let run = AgentRun::new(Message::user(""));
+        Self(Arc::new(AsyncMutex::new(Persister::new(&run, session))))
+    }
+
+    /// Close the turn. See [`DriveLoop::close`].
+    pub(crate) async fn close(&self) {
+        self.0.lock().await.close().await;
+    }
+
+    /// Whether the turn did some work worth keeping.
+    pub(crate) async fn made_progress(&self) -> bool {
+        self.0.lock().await.made_progress()
     }
 }
 

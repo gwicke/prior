@@ -132,12 +132,19 @@ pub(crate) fn part_ids(orig: &CallId, n: usize) -> Vec<CallId> {
 }
 
 /// Replace each call that answered with a parts list by `parts.len()` calls,
-/// each with its own result.
+/// each with its own result and its own args.
 ///
-/// This is the whole of "splitting": the tool stated the split, so there is
-/// nothing to parse, pair or guess here. A call whose result is not a parts list
-/// — one that never ran (denied, interrupted), or a plain-text tool — is left
-/// exactly as the model wrote it.
+/// This is the whole of "splitting": the loop wrapped every executed call's
+/// answer in a parts list, and `edit` splits itself into one part per file, so
+/// there is nothing to parse, pair or guess here. A call whose result is not a
+/// parts list — one that never ran (interrupted, refused before dispatch) — is
+/// left exactly as the model wrote it.
+///
+/// The parts also carry the call *as the tool read it* ([`preprocess`]), which
+/// is why a single-part answer still goes through here: it is what replaces the
+/// model's spelling with the recorded one.
+///
+/// [`preprocess`]: crate::agent::tool_shape::preprocess
 ///
 /// Ids are minted here rather than by the tool: the provider issued one id, and
 /// which part keeps it is a protocol rule (see [`part_ids`]).
@@ -193,17 +200,14 @@ pub(crate) fn unpack(
         // has none, and a call that was answered must not lose its result to a
         // second lookup.
         let answered = by_call.remove(&tc.id);
-        let parts = answered
-            .as_ref()
-            .and_then(|c| match c {
-                UserContent::ToolResult(tr) => parts_of_message_result(tr),
-                _ => None,
-            })
-            .filter(|p| p.len() > 1);
+        let parts = answered.as_ref().and_then(|c| match c {
+            UserContent::ToolResult(tr) => parts_of_message_result(tr),
+            _ => None,
+        });
         let Some(parts) = parts else {
-            // One call, one result — or a call nothing answered. Either way the
-            // model's own spelling stands, and the committed result rides along
-            // untouched.
+            // A call nothing answered (interrupted before dispatch, or one the
+            // run answered without executing). The model's own spelling stands
+            // and the committed result rides along untouched.
             if let Some(r) = answered {
                 out_results.push(r);
             }
@@ -252,7 +256,7 @@ mod integration_tests {
     //! rather than inside any one of them.
 
     use crate::agent::parts::{parts_of_message_result, CallPart};
-    use crate::agent::transcript::{assistant_content, RunState, TurnTranscript};
+    use crate::agent::transcript::assistant_content;
     use rig_core::message::{Message, UserContent};
 
     fn two_file_parts() -> Vec<CallPart> {
@@ -288,9 +292,7 @@ mod integration_tests {
     /// session would drift further from its model on every request.
     #[test]
     fn a_stored_parts_answer_round_trips_through_render() {
-        let mut t = TurnTranscript::default();
-        t.start_live();
-        t.accept(
+        let assistant = crate::agent::transcript::assistant_message(
             None,
             vec![rig_core::message::AssistantContent::ToolCall(
                 crate::agent::transcript::tool_call(
@@ -300,11 +302,17 @@ mod integration_tests {
                 ),
             )],
         );
-        t.push_tool_result(parts_result("t1", &two_file_parts()));
-        let batch = t.prepare(RunState::Ongoing).expect("a batch");
+        let results = Message::User {
+            content: vec![UserContent::ToolResult(parts_result(
+                "t1",
+                &two_file_parts(),
+            ))],
+        };
+        // What the persister writes: the projected unit.
+        let stored = crate::agent::project::project(&[assistant, results]);
 
         // On disk: N calls, each one file, and N plain-text results.
-        let calls: Vec<_> = assistant_content(&batch.messages[0])
+        let calls: Vec<_> = assistant_content(&stored[0])
             .iter()
             .filter_map(|c| match c {
                 rig_core::message::AssistantContent::ToolCall(tc) => Some(tc.clone()),
@@ -319,7 +327,7 @@ mod integration_tests {
                 "stored as pi's canonical array"
             );
         }
-        let Message::User { content } = &batch.messages[1] else {
+        let Message::User { content } = &stored[1] else {
             panic!("a results message")
         };
         assert_eq!(content.len(), 2);
@@ -334,7 +342,7 @@ mod integration_tests {
 
         // Render for the model: block form, one call and one result per file,
         // and stable when the rendered history is rendered again.
-        let once = crate::agent::transcript::render_model_facing(batch.messages.clone());
+        let once = crate::agent::transcript::render_model_facing(stored.clone());
         let twice = crate::agent::transcript::render_model_facing(once.clone());
         assert_eq!(once, twice, "rendering is idempotent");
         let blocks = assistant_content(&once[0])
@@ -352,6 +360,31 @@ mod integration_tests {
         assert_eq!(blocks.len(), 2, "one block-form call per file");
         assert!(blocks[0].starts_with("a.rs:1"), "{}", blocks[0]);
         assert!(blocks[1].starts_with("b.rs:1"), "{}", blocks[1]);
+    }
+
+    /// A projection is a fixed point: the stored form is the projected form, so
+    /// projecting it again must change nothing. This is what lets the loop
+    /// project the whole history on every request rather than track a boundary.
+    #[test]
+    fn a_projected_unit_is_stable_under_reprojection() {
+        let assistant = crate::agent::transcript::assistant_message(
+            None,
+            vec![rig_core::message::AssistantContent::ToolCall(
+                crate::agent::transcript::tool_call(
+                    "t1",
+                    "edit",
+                    serde_json::json!({ "blocks": "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END" }),
+                ),
+            )],
+        );
+        let results = Message::User {
+            content: vec![UserContent::ToolResult(parts_result(
+                "t1",
+                &two_file_parts(),
+            ))],
+        };
+        let once = crate::agent::project::project(&[assistant, results]);
+        assert_eq!(crate::agent::project::project(&once), once);
     }
 }
 

@@ -19,17 +19,15 @@ use rig_agent::agent::{CompletionCallEvent, InvalidToolCallAction, InvalidToolCa
 use rig_agent::run::RequestPatch;
 use rig_core::completion::Message;
 use rig_core::message::AssistantContent;
-use rig_core::tool::ToolResult;
 
 use crate::agent::drive::Observer;
 use crate::agent::msglog::MessageLogger;
-use crate::agent::transcript::{
-    maybe_strip_reasoning, model_facing_tool_text, render_model_facing, TurnTranscript,
-};
+use crate::agent::parts::CallPart;
+use crate::agent::transcript::{maybe_strip_reasoning, render_model_facing};
 use crate::content::Content;
 use crate::session::Session;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Everything a turn's effects need.
 ///
@@ -43,9 +41,10 @@ pub(crate) struct TurnObserver {
     pub(crate) reasoning_in_context: crate::settings::ReasoningInContextMode,
     pub(crate) provider: String,
     pub(crate) model: String,
-    /// The run-scoped transcript accumulator, still the persistence queue
-    /// until phase 2 replaces it with a cursor over `run.messages()`.
-    pub(crate) transcript: Arc<Mutex<TurnTranscript>>,
+    /// The session this turn writes into, if any — used by the mid-turn
+    /// steering path (design §5) to commit a steer as a real user message.
+    /// Persistence of tool work is the persister's job.
+    #[allow(dead_code)]
     pub(crate) session: Option<Arc<Session>>,
 }
 
@@ -63,20 +62,6 @@ impl Observer for TurnObserver {
         history: &[Arc<Message>],
         turn: usize,
     ) -> Result<Option<RequestPatch>, String> {
-        // Persist the turn that just finished, *before* the cancel check, so a
-        // cancel-stop still writes it. The turn whose response is about to be
-        // requested is complete and pair-valid, which is what makes this the
-        // incremental persist point.
-        let _ = crate::agent::transcript::commit(
-            &self.transcript,
-            self.session.as_deref(),
-            crate::agent::transcript::RunState::Ongoing,
-        )
-        .await;
-        if let Ok(mut t) = self.transcript.lock() {
-            t.start_live();
-        }
-
         if self.cancelled() {
             return Err("cancelled by user".to_string());
         }
@@ -110,16 +95,9 @@ impl Observer for TurnObserver {
             let turn_id = logger.current_turn_id();
             logger.log_message("received", &message, turn_id).await;
         }
-        // The accepted turn goes into the transcript so a mid-turn failure
-        // persists exactly what completed. `None` for the response id: the
-        // committed message carries it, and the transcript's own `accept`
-        // takes the id it is given when a hook supplies one.
-        if let Ok(mut t) = self.transcript.lock() {
-            t.accept(None, content.to_vec());
-        }
     }
 
-    fn dispatch(&self, name: &str, args: &str) -> Result<(), String> {
+    fn dispatch(&self, name: &str, args: &serde_json::Value) -> Result<(), String> {
         if self.cancelled() {
             return Err("cancelled by user".to_string());
         }
@@ -129,43 +107,17 @@ impl Observer for TurnObserver {
         if name == "edit" {
             return Ok(());
         }
-        let args_json =
-            serde_json::from_str(args).unwrap_or_else(|_| serde_json::Value::String(args.into()));
-        // The call as the tool reads it — the `bash` prefix strip and path
-        // relativisation — so the label carries the same bytes the record will.
-        let args_json = crate::agent::tool_shape::preprocess_or_raw(
-            name,
-            &args_json,
-            &crate::tool_args::PathContext::sandbox(),
-        );
-        self.content.display_tool_call(name, &args_json);
+        self.content.display_tool_call(name, args);
         Ok(())
     }
 
-    fn outcome(&self, name: &str, _args: &str, result: &ToolResult) -> Option<ToolResult> {
+    fn outcome(&self, name: &str, parts: &[CallPart]) {
         if self.cancelled() {
-            return None;
+            return;
         }
-        // A tool that answered with parts painted its own call panels at
-        // dispatch, so only the results are left to paint — one per part, in
-        // order, which is exactly how N genuine single-file calls render.
-        if let Some(parts) = crate::agent::parts::parts_of_result(result) {
-            self.content
-                .display_tool_parts(name, &parts, name != "edit");
-            return None;
-        }
-        self.content.display_tool_result(&result.output().render());
-        // A malformed `edit` block's error leads with the problem: the model
-        // reads a stripped form, the disposition is unchanged.
-        result
-            .output()
-            .as_text()
-            .and_then(|text| model_facing_tool_text(name, text))
-            .map(|cleaned| {
-                result
-                    .clone()
-                    .with_output(rig_core::tool::ToolOutput::text(cleaned))
-            })
+        // `edit` painted nothing at dispatch, so it paints the whole pair; the
+        // other tools are already on screen, so only their results are left.
+        self.content.display_tool_parts(name, parts, name != "edit");
     }
 
     fn invalid_tool_call(&self, context: &InvalidToolCallContext) -> Option<InvalidToolCallAction> {

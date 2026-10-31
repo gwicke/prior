@@ -125,28 +125,22 @@ written form is projected. Bounds are only ever chosen where the committed tail 
 — every assistant turn's calls answered — which is the only state that can be observed at a boundary
 and the only one whose projection is stable.
 
-**Granularity: per answer, not per batch.** `answer_all` is all-or-none — the run commits the batch
-as one user message only once every call is answered — so a cursor over `run.messages()` alone would
-lose every result of a batch interrupted midway. `AgentRun::answer` (the single-answer form of the
-same call) does not lift that: the batch still commits at completion.
+**Granularity: the held answer, written at the close.** `answer_all` is all-or-none — the run
+commits the batch as one user message only once every call is answered — so a cursor over
+`run.messages()` alone would lose every result of a batch that ends early. `AgentRun::answer` (the
+single-answer form) does not lift that: the batch still commits at completion.
 
-So the persist boundary inside a batch is not the run's history but the answers themselves: the loop
-records each result as it lands, and the batch's committed message confirms rather than originates
-them. Persist must therefore be idempotent per `(call id)`, so an answer written early and again
-from the committed batch is a no-op rather than a duplicate. This is what makes a partially-answered
-batch valid at every moment:
+Early writes were considered and dropped. Writing each answer as it lands would put a results
+message in the store that the run has not produced, and the later committed batch would then have to
+recognise and skip it — a second writer, and a duplicate to reconcile. The requirement is weaker and
+cheaper to meet: *nothing that ran may be lost*. So the loop **holds** each answer (`note_answer`)
+and the close turns the held answers plus rig's own "did not execute" text for the rest into one
+results message, in **call order** so a partial batch has the shape of a complete one.
 
-- **write path** — a user abort between answers leaves a trailing assistant turn with unanswered
-  calls. The write path closes it with "did not execute" results before appending, which is today's
-  `repair_tail_unanswered` moved to where the decision is made.
-- **read path** — a process crash cannot be repaired at write time, so load must do the same repair.
-  It already does (`repair_pairing` on load); this keeps that as the safety net rather than the only
-  mechanism.
+That is the write-path half. The read path stays: a process that dies mid-batch never runs the
+close, so load still repairs (`repair_pairing`).
 
-A partially-answered batch is therefore valid at every moment: the store holds the answers written
-so far plus, after a repair, synthetic "did not execute" results for the rest, and the run holds the
-truth. The cost is one extra idempotency key on the write path (`call id`), which
-`Session::append_messages`' seed-based dedup already provides in spirit.
+A partially-answered batch is therefore valid at every moment.
 
 What does *not* change: session storage, the pi JSONL format, entry ids and batch seeds. Those live
 behind `Session::append_messages` and stay.
@@ -258,9 +252,13 @@ One position, one function: the transcript and the wire cannot disagree about wh
   prior-side trait. Decides only what a call reads as, never what runs.
 - `src/agent/wire.rs` — pass 2: reasoning strip, then `edit` array → blocks. The request-only shape,
   holding the one `edit` special case. Absorbs today's `render_model_facing`.
-- `src/agent/persist.rs` — cursor over raw messages, projecting each delta, per answer.
-- `src/agent/transcript.rs` — shrinks to load-path repair; the ledger, `PreparedEdit`,
-  `prepare_edit_call`, `paired_results` and the batch-shaping half go.
+- `src/agent/persist.rs` — the cursor over `run.messages()`, the held answers of a batch in flight,
+  and the close that writes a batch whose results never all landed.
+- `src/agent/project.rs` — the projection: unpack the parts a tool answered with, and the complete
+  prefix rule persistence bounds on. Pure, tool-agnostic, and a fixed point on its own output.
+- `src/agent/transcript.rs` — shrinks to message construction, the model-facing render, the
+  reasoning strip and the load-path repair. The live-unit machinery, `prepare`, `assemble`,
+  `RunState`, `preprocess_calls` and the batch-shaping half are deleted.
 - `src/tools.rs` — `read`/`write`/`grep`/`sed`/`bash` keep `Result<String, ToolError>` and gain a
   `preprocess_args` function (`sed`/`read`/`write`/`grep` relativize `path`, `bash` strips its `cd`
   prefix). Only `edit` changes its return type, to `Vec<CallPart>`: parse → split → minimise →
@@ -286,21 +284,33 @@ One position, one function: the transcript and the wire cannot disagree about wh
    - `TurnTranscript` is still the writing path (phase 2 replaces it with the cursor). The
      observer's `accept` therefore still records the accepted turn, which is what keeps the two
      paths' persisted output identical.
-2. **Drive loop, single attempt. Partly done.** The loop's steps are in place and take the whole
-   turn (`CallModel` → stream → accept → `CallTools` → answer → `Done`) behind `PRIOR_DRIVE=direct`.
-   What remains is *persistence*: `TurnTranscript` is still the writing path, so the loop still
-   feeds it deltas and accepted turns rather than a cursor over `run.messages()`. That is why the
-   two paths' output is byte-identical — the same writer receives the same events. Converting the
-   writer (and deleting `transcript.rs`'s live-unit machinery) is what makes the direct path the
-   only path, and is the next step here.
-   - **Debt carried in from phase 5 (landed before its turn in the order).** `preprocess_args` is
-     called twice per live call: at dispatch, to label the panel, and again in `prepare`, to build
-     the part. Both are calls of one pure idempotent function, so their outputs cannot disagree —
-     but the design's claim is *one call per live call*, and only the loop's own answer path can
-     carry the dispatch-computed value into the part. Close it here: the loop already holds the
-     value when it wraps the `ToolResult`, so the `prepare`-side recomputation is deleted rather
-     than moved. Until then `doc/261030_rig_direct_drive_impl.md`'s "once per live call, ever" is
-     ahead of the code.
+2. **Drive loop, single attempt, and the cursor. Done.** The loop takes the whole turn (`CallModel`
+   → stream → accept → `CallTools` → answer → `Done`), and it is now the **only** path:
+   `LoggingHook` and the `PRIOR_DRIVE` switch are gone. Persistence is `src/agent/persist.rs`, a
+   cursor over `run.messages()`, projected by `src/agent/project.rs`. `TurnTranscript`'s live-unit
+   machinery, `prepare`, `assemble`, `RunState`, `preprocess_calls` and the batch-shaping half of
+   `transcript.rs` are deleted (net −926 lines). What stays in `transcript.rs` is what it should
+   always have been: message construction, the model-facing render, the reasoning strip, and the
+   load-path repair.
+   - **`preprocess_args` runs once per live call.** The loop computes it at dispatch, hands it to
+     the panel, then builds the part from the same value and wraps it into the answer
+     (`ToolResult::with_output`). `project` unpacks; it never re-derives. The phase-5 debt is
+     closed.
+   - **The projection runs over the whole history, not a window.** It is a fixed point on
+     already-projected messages (tested), so a boundary inside the history is unnecessary — which
+     also removes the `prior_history.len()` guard as a correctness dependency. A stored result is
+     plain text, so `unpack` finds nothing there.
+   - **A turn that ends early still records what ran.** rig commits a batch as one message only when
+     every call is answered, so the persister holds each answer as it lands (`note_answer`) and
+     `close` writes the unfinished batch from those answers plus rig's own "did not execute" for the
+     rest — in **call order**, so a partially executed batch has the same shape as a complete one.
+     That is the write-path half; `repair_pairing` remains the read path for a process that died
+     before it could run.
+   - **`close` takes no run.** The abort path drops the loop, so the persister is shared with a
+     `PersistHandle` the pump keeps; both closes are idempotent.
+   - **A malformed `edit` block still gets its terse text.** That rewrite used to live in the hook's
+     outcome path on `as_text`; it now happens when the part is built, where the model-visible text
+     is decided.
 3. **Retry by resume.** Back-off loop around the attempt, deleting `LlmInterrupted`, `"continue"`,
    `TurnPersistence`. `doc/tool_error_handling.md` §"Mid-turn failure" is retired with it.
 4. **Steering and boundary settings.** `SteeringQueue`, the projection's steer insertion and scalar
@@ -351,11 +361,13 @@ commits us to maintaining the loop.
   stored form is already compact.
 - **`EditResolutions` has no reader once the tool formats its own results.** Delete it with
   `EditLedger` rather than repurposing it.
-- **Answers persist as they land.** A batch's answers are independent calls, not a multi-file
-  transaction, so writing each as it completes loses nothing and a crash costs at most the answer in
-  flight. This needs `answer_all`'s all-or-none commit to be sidestepped (§3), and idempotent
-  per-call writes. Repair runs on both sides: the write path closes a trailing unanswered turn
-  before appending (user abort), the read path does the same on load (crash).
+- **A turn that ends early keeps what ran — by holding the answers, not by writing them early.**
+  `answer_all` commits a batch only once every call is answered, so the loop holds each answer as it
+  lands and the close writes the unfinished batch from those plus rig's own "did not execute" for
+  the rest, in call order. Writing each answer as it landed was considered and dropped: it would put
+  a results message in the store the run has not produced, and the committed batch would then have
+  to recognise and skip it. The requirement is only that nothing be lost. Repair runs on both sides
+  still: the write path closes the trailing unit, the read path does the same on load.
 
 *Open:*
 
@@ -367,9 +379,12 @@ commits us to maintaining the loop.
 3. **Retrieval.** `ToolServerHandle::retrieval_effects` is not ported. prior registers no retrieval
    index; if the tool set ever gains one, the dispatch belongs in `before_call` beside
    `prepare_request`.
-4. **Parts-shape false positives.** The predicate is shape-based and runs only above the prior
-   history boundary. If a tool ever needs to return a genuinely part-shaped array as data, that is
-   the moment to reintroduce a marker key. Reversible in one place (`src/agent/parts.rs`).
+4. **Parts-shape false positives.** The predicate is shape-based. It is safe because only the loop
+   puts parts in a message and persisted results are plain text — but with the projection now
+   running over the *whole* history rather than a window, the argument rests entirely on that second
+   fact, not on a boundary. Tested as a fixed point (`project`) and as "no parts list in the
+   output". If a tool ever needs to return a genuinely part-shaped array as data, that is the moment
+   to reintroduce a marker key. Reversible in one place (`src/agent/parts.rs`).
 5. **Display and parts.** The `edit` panel paints from the same parts the model sees. Worth
    confirming during phase 5 that no per-file panel detail (a skipped file, an unchanged one) was
    only ever carried by `PreparedEdit` and needs to become a part field.

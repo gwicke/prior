@@ -1,0 +1,339 @@
+//! Persistence: a cursor over the run's committed log.
+//!
+//! `AgentRun`'s messages are the canonical history, append-only and
+//! provider-exact, so persisting a turn is "project what was committed past the
+//! cursor, append it, advance the cursor". No transcript is reassembled from
+//! stream deltas, and the question "what survived the failure" does not arise:
+//! the run is in hand, and the cursor simply does not advance over what it did
+//! not write.
+//!
+//! ## The one thing the log cannot tell us
+//!
+//! rig commits a whole tool batch as **one** user message, only once every call
+//! is answered. So a call that ran while its batch peers were pending is not in
+//! the log yet — and if the turn is aborted first, its result would be lost.
+//!
+//! Losing it matters: a file that was really edited belongs in the record as
+//! edited, not as "did not execute". So the loop reports each answer as it lands
+//! ([`Persister::note_answer`]), and [`Persister::close`] writes the unfinished
+//! batch from those answers plus rig's own "did not execute" text for the calls
+//! that never ran.
+//!
+//! That makes the persist *boundary* the completed unit rather than the
+//! individual answer: an early write would put a results message in the store
+//! that the run has not produced. What is required is only that nothing is lost
+//! when a turn ends early, and the held answers are what guarantee it.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use rig_agent::run::AgentRun;
+use rig_core::message::{AssistantContent, CallId, Message, UserContent};
+
+use crate::agent::project;
+use crate::session::Session;
+
+/// Where persistence has got to, and what it is holding for the unit in flight.
+pub(crate) struct Persister {
+    session: Option<Arc<Session>>,
+    /// Index into the run's log: everything below it has been written.
+    cursor: usize,
+    /// The accepted assistant turn of the unit in flight, while its answers are
+    /// still arriving. Held because `close` must be callable without the run: an
+    /// abort drops the loop, and a `Drop` impl cannot await.
+    tail: Option<Message>,
+    /// The answers that landed for the batch in flight, by call id.
+    answered: HashMap<CallId, UserContent>,
+    /// A batch whose append failed, so a retry writes the same ids instead of
+    /// duplicating the turn.
+    unsaved: Option<(Vec<Message>, uuid::Uuid)>,
+    /// Whether anything of this turn reached the store.
+    wrote: bool,
+}
+
+impl Persister {
+    /// `run` seeds the cursor from
+    /// [`projection_start`](AgentRun::projection_start): everything below it is
+    /// the prompt (persisted at dispatch) or loaded history (already stored).
+    pub(crate) fn new(run: &AgentRun, session: Option<Arc<Session>>) -> Self {
+        Self {
+            session,
+            cursor: run.projection_start(),
+            tail: None,
+            answered: HashMap::new(),
+            unsaved: None,
+            wrote: false,
+        }
+    }
+
+    /// The run accepted an assistant turn. A tool-bearing one is held until its
+    /// answers land, because the run commits a whole batch as one message and an
+    /// abort in between would drop what already ran.
+    pub(crate) fn set_tail(&mut self, turn: Message) {
+        let calls_tools = matches!(&turn, Message::Assistant(t) if project::calls_a_tool(t));
+        self.tail = calls_tools.then_some(turn);
+        self.answered.clear();
+    }
+
+    /// One tool answer of the batch in flight landed.
+    ///
+    /// Held rather than written: the run commits the batch as one message, and
+    /// this is the copy that survives an abort before it does.
+    pub(crate) fn note_answer(&mut self, result: &rig_core::message::ToolResult) {
+        self.answered
+            .insert(result.call.clone(), UserContent::ToolResult(result.clone()));
+    }
+
+    /// Write every complete unit committed since the last write.
+    ///
+    /// Called at a completion-call boundary and at the end of a turn. A failure
+    /// leaves the cursor where it was, so the next call retries the same bytes
+    /// under the same ids.
+    pub(crate) async fn write_committed(&mut self, run: &AgentRun) {
+        if !self.retry_unsaved().await {
+            return;
+        }
+        let pending: Vec<Message> = run
+            .messages()
+            .get(self.cursor..)
+            .unwrap_or_default()
+            .iter()
+            .map(|m| (**m).clone())
+            .collect();
+        let complete = project::complete_prefix_len(&pending);
+        if complete == 0 {
+            return;
+        }
+        let messages = project::project(&pending[..complete]);
+        if self.append(messages).await {
+            self.cursor += complete;
+        }
+    }
+
+    /// Close the turn: write the batch whose results never all landed, from the
+    /// answers that did plus "did not execute" for the rest.
+    ///
+    /// This is the write-path half of the partial-batch story. The read path
+    /// (`repair_pairing`) stays as the net for a process that died before it
+    /// could run.
+    pub(crate) async fn close(&mut self) {
+        if !self.retry_unsaved().await {
+            return;
+        }
+        let Some(Message::Assistant(turn)) = self.tail.take() else {
+            return;
+        };
+        let answers = std::mem::take(&mut self.answered);
+        let messages = close_unit(turn, &answers);
+        if messages.is_empty() {
+            return;
+        }
+        let _ = self.append(messages).await;
+    }
+
+    /// Append one batch, keeping it for retry if the append fails.
+    ///
+    /// The seed is fixed per batch, so a retry writes identical entry ids and
+    /// the session's index skips them rather than duplicating the turn.
+    async fn append(&mut self, messages: Vec<Message>) -> bool {
+        if messages.is_empty() {
+            return true;
+        }
+        let seed = match &self.unsaved {
+            Some((_, seed)) => *seed,
+            None => uuid::Uuid::now_v7(),
+        };
+        let Some(session) = self.session.as_ref() else {
+            // Sessionless: still settled, because the caller only needs to know
+            // the turn made progress.
+            self.unsaved = None;
+            self.wrote = true;
+            return true;
+        };
+        match session.append_messages(&messages, &seed).await {
+            Ok(()) => {
+                self.unsaved = None;
+                self.wrote = true;
+                true
+            }
+            Err(error) => {
+                eprintln!("Warning: failed to persist session batch: {error}");
+                self.unsaved = Some((messages, seed));
+                false
+            }
+        }
+    }
+
+    /// Retry a batch whose append failed, reporting whether the way is clear.
+    async fn retry_unsaved(&mut self) -> bool {
+        match self.unsaved.clone() {
+            Some((messages, _)) => self.append(messages).await,
+            None => true,
+        }
+    }
+
+    /// Whether the turn did any work worth keeping. Drives the back-off reset:
+    /// it is *progress*, not persistence, that says a retry starts from a fresh
+    /// delay — and a held answer is work that will be written.
+    pub(crate) fn made_progress(&self) -> bool {
+        self.wrote || !self.answered.is_empty()
+    }
+}
+
+/// The messages closing a unit whose batch never finished: the answers that
+/// landed, and "did not execute" for the calls that did not.
+///
+/// **Call order, not answer order.** The record then reads like a fully answered
+/// batch, which is what the model sees next turn — and it is what makes a
+/// partially executed batch indistinguishable in shape from a complete one.
+///
+/// Empty when the turn calls no tool: a text-only turn has no results to close.
+fn close_unit(
+    turn: rig_core::message::AssistantMessage,
+    answers: &HashMap<CallId, UserContent>,
+) -> Vec<Message> {
+    let content: Vec<UserContent> = turn
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            AssistantContent::ToolCall(tc) => {
+                Some(UserContent::ToolResult(match answers.get(&tc.id) {
+                    Some(UserContent::ToolResult(tr)) => tr.clone(),
+                    _ => crate::agent::transcript::synthesized_result(tc),
+                }))
+            }
+            _ => None,
+        })
+        .collect();
+    if content.is_empty() {
+        return Vec::new();
+    }
+    project::project(&[Message::Assistant(turn), Message::User { content }])
+}
+
+#[cfg(test)]
+mod tests {
+    //! The requirement this module exists for: a turn that ends early — aborted,
+    //! or failed mid-batch — still records the tool work that actually ran.
+    //!
+    //! Without the held answers, the close could only write "did not execute" for
+    //! every call of the unfinished batch, telling the next turn that a file it
+    //! edited was untouched.
+
+    use super::*;
+    use crate::agent::transcript::{assistant_message, tool_call};
+    use rig_core::message::{CallId, Text, ToolResult, ToolResultContent};
+
+    fn answer(call: &str, text: &str, is_error: bool) -> UserContent {
+        UserContent::ToolResult(ToolResult {
+            call: CallId::from_wire(call),
+            name: crate::agent::transcript::tool_name("edit"),
+            content: vec![ToolResultContent::Text(Text::new(text))],
+            is_error,
+        })
+    }
+
+    fn turn_of(ids: &[&str]) -> rig_core::message::AssistantMessage {
+        let Message::Assistant(turn) = assistant_message(
+            None,
+            ids.iter()
+                .map(|id| {
+                    rig_core::message::AssistantContent::ToolCall(tool_call(
+                        id,
+                        "edit",
+                        serde_json::json!({ "path": "a.rs" }),
+                    ))
+                })
+                .collect(),
+        ) else {
+            unreachable!("assistant_message builds an assistant turn")
+        };
+        turn
+    }
+
+    fn results_of(messages: &[Message]) -> Vec<(String, String, bool)> {
+        let Message::User { content } = &messages[1] else {
+            panic!("a results message")
+        };
+        content
+            .iter()
+            .map(|c| {
+                let UserContent::ToolResult(tr) = c else {
+                    panic!("a tool result")
+                };
+                let ToolResultContent::Text(t) = &tr.content[0] else {
+                    panic!("text content")
+                };
+                (tr.call.to_string(), t.text.clone(), tr.is_error)
+            })
+            .collect()
+    }
+
+    /// The whole point: one of three calls answered, the other two never ran.
+    /// The record keeps the real result in call order and closes the rest
+    /// honestly — so the next turn knows `a.rs` really was edited.
+    #[test]
+    fn a_partially_answered_batch_keeps_the_answers_that_landed() {
+        let answers: HashMap<CallId, UserContent> = [(
+            CallId::from_wire("c1"),
+            answer("c1", "Replaced 1 block(s) in a.rs", false),
+        )]
+        .into_iter()
+        .collect();
+
+        let closed = close_unit(turn_of(&["c1", "c2", "c3"]), &answers);
+        let results = results_of(&closed);
+        assert_eq!(results.len(), 3, "one result per call, in call order");
+        assert_eq!(results[0].0, "c1");
+        assert_eq!(results[0].1, "Replaced 1 block(s) in a.rs");
+        assert!(!results[0].2);
+        assert_eq!(results[1].0, "c2");
+        assert!(
+            results[1].1.contains("interrupted"),
+            "the call that never ran says so: {}",
+            results[1].1
+        );
+        assert_eq!(results[2].0, "c3");
+    }
+
+    /// Answer order is not call order: a batch whose second call finished first
+    /// still records in the order the model wrote the calls.
+    #[test]
+    fn results_follow_call_order_not_answer_order() {
+        let answers: HashMap<CallId, UserContent> = [
+            (CallId::from_wire("c2"), answer("c2", "second", false)),
+            (CallId::from_wire("c1"), answer("c1", "first", false)),
+        ]
+        .into_iter()
+        .collect();
+        let results = results_of(&close_unit(turn_of(&["c1", "c2"]), &answers));
+        assert_eq!(results[0], ("c1".to_string(), "first".to_string(), false));
+        assert_eq!(results[1], ("c2".to_string(), "second".to_string(), false));
+    }
+
+    /// A per-file failure rides a successful call, and closing preserves it
+    /// rather than flattening everything to the call's own disposition.
+    #[test]
+    fn a_failed_part_keeps_its_disposition() {
+        let answers: HashMap<CallId, UserContent> = [(
+            CallId::from_wire("c1"),
+            answer("c1", "could not edit a.rs", true),
+        )]
+        .into_iter()
+        .collect();
+        let results = results_of(&close_unit(turn_of(&["c1"]), &answers));
+        assert!(results[0].2, "the part's own is_error survives the close");
+    }
+
+    /// A text-only turn has nothing to close: no synthesized results, no message.
+    #[test]
+    fn a_text_only_turn_closes_to_nothing() {
+        let Message::Assistant(turn) = assistant_message(
+            None,
+            vec![rig_core::message::AssistantContent::Text(Text::new("done"))],
+        ) else {
+            unreachable!()
+        };
+        assert!(close_unit(turn, &HashMap::new()).is_empty());
+    }
+}

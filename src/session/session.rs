@@ -2921,8 +2921,6 @@ mod tests {
     /// `arguments.path`, which is why there is one call per file.
     #[tokio::test]
     async fn the_saved_jsonl_holds_n_calls_and_n_results_pairing_by_id() {
-        use crate::agent::transcript::{RunState, TurnTranscript};
-
         let _tmp = tempfile::tempdir().unwrap();
         let path = _tmp.path().join(session_filename(&chrono::Utc::now()));
         let storage = JsonlSessionStorage::open_or_create(path.clone())
@@ -2954,23 +2952,24 @@ mod tests {
         })
         .collect();
 
-        let mut t = TurnTranscript::default();
-        t.start_live();
-        t.accept(None, assistant_content(&call).to_vec());
-        t.push_tool_result(rig_core::message::ToolResult {
+        // The unit as the persister sees it: the committed assistant turn and
+        // the parts-carrying answer, projected into the stored form.
+        let answer = rig_core::message::ToolResult {
             call: CallId::from_wire("t1"),
             name: tool_name("edit"),
             content: vec![rig_core::message::ToolResultContent::Json {
                 value: serde_json::to_value(&parts).unwrap(),
             }],
             is_error: false,
-        });
-        let batch = t.prepare(RunState::Ongoing).expect("a batch");
+        };
+        let batch = crate::agent::project::project(&[
+            call.clone(),
+            rig_core::message::Message::User {
+                content: vec![rig_core::message::UserContent::ToolResult(answer)],
+            },
+        ]);
         let seed = uuid::Uuid::now_v7();
-        session
-            .append_messages(&batch.messages, &seed)
-            .await
-            .unwrap();
+        session.append_messages(&batch, &seed).await.unwrap();
 
         // Read the raw JSONL back: the persisted form is the contract.
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
