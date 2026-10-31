@@ -5,7 +5,7 @@ and link a doc/ and/or commit hash
 
 - [ ] Drive rig's `AgentRun` directly: own the loop, persist from `run.messages()`, retry by
       re-issuing `next_step`, steers as asides. Plan: doc/261030_rig_direct_drive.md (6 phases; 1-3
-      kill the `"continue"` injection). Phase 5's parts model is **done** (`928b1e9`): tools state
+      kill the `"continue"` injection). Phase 5's parts model is **done** (`edd10e5`): tools state
       their own call shape, so `EditLedger`, `PreparedEdit`, `prepare_edit_call`, `paired_results`,
       `shape_edits` and `tool_args::normalize` are gone. Remaining: the loop itself (1-4, 6).
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing
