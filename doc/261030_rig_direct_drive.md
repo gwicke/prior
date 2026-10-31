@@ -151,31 +151,56 @@ truth. The cost is one extra idempotency key on the write path (`call id`), whic
 What does *not* change: session storage, the pi JSONL format, entry ids and batch seeds. Those live
 behind `Session::append_messages` and stay.
 
-### 4. A tool returns its own call shape
+### 4. A tool states its own call shape
 
-Every fact about how a call should be spelled is held by exactly one frame: the tool that ran it. It
-parsed the arguments, it knows how many files it was given, it knows where each edit landed, and it
-knows what each file's result was. So a tool returns not just a result but
+Every fact about how a call should be spelled is held by exactly one frame: the tool that
+understands it. It parsed the arguments, it knows how many files it was given, it knows where each
+edit landed, and it knows what each file's result was. So a tool states
 **the call as it understood it, plus that call's result** — once, or once per file.
 
 That inverts the current arrangement. Today the tool returns text, and a separate pass later
 re-parses the call and the joined result to reconstruct a shape the tool already had in hand. With
-the tool returning the shape, no later pass has anything to reconstruct, and `project` makes exactly
+the tool stating the shape, no later pass has anything to reconstruct, and `project` makes exactly
 **one** decision per call: whether the result carries parts. Everything else it takes verbatim.
 
-Rig's protocol agrees with that, and its one hard limit says where the boundary is. `ToolAnswer` is
+The statement is split in two by what is *knowable when*:
+
+- **`preprocess_args(&Value) -> Value`** — what the call is, as the tool reads it: `read`/`write`/
+  `grep`/`sed` relativize `path`, `bash` strips its `cd <cwd> &&` prefix. Pure and idempotent, and
+  knows nothing of results — so it is also what the display calls at dispatch, before anything runs.
+  Without that, a slow `bash` would be labelled with the model's absolute path and then have its
+  result recorded under a relative one: the label and the record would disagree about a call that
+  never changed, and there is no second copy to catch it.
+- **the parts** — that value plus the result, once the call has run.
+
+For the five single-result tools there is nothing to repeat and no signature to change: the loop
+computes `preprocess_args` at dispatch, then wraps the returned `ToolResult` output into the one
+part and answers the run with it. So the shape is learned once per live call, and one value serves
+the panel, the record and the wire. Only `edit` builds parts itself, because only it has N results
+needing N calls — and only its shape is unknowable before execution (minimisation needs where each
+edit landed), which is why its panel already defers to the pair.
+
+Rig's protocol agrees, and its one hard limit says where the boundary is. `ToolAnswer` is
 unforgeable (private fields, plus `compile_fail` tests in `calls.rs`), and `answer_all` validates
 each answer's `(turn, index, call id)` against the pending batch — so a driver cannot hand the run a
 finished call+result exchange, and there is no public append. But `streamed_turn` rejects a call
 only when its **name** is not allowed by the turn's `TurnPolicy`; count and arguments are not
-inspected.
+inspected. So the *assistant* turn is frozen at `streamed_turn`, while what the answer carries is
+ours: `ToolResult::with_output` replaces the model-visible content and keeps the disposition, and
+`answer_all` commits that content verbatim into the run's messages.
 
-So the assistant turn is frozen at `streamed_turn` and shape changes are free either side of it, but
-nothing needing execution output can be part of the accepted turn. That leaves one constraint: a
-call's final shape must be decided *after* it runs.
+That is what makes the split work rather than just being a division of labour. The parts go into the
+run, so `project` unpacks what execution stated instead of re-deriving it over the whole history on
+every request — and the cost that re-derivation implied (N calls, every turn, for the life of the
+session) disappears rather than being optimised.
 
-The mechanics — the `CallPart` shape, how a parts list is recognised without a marker, the pass-2
-render, and the per-tool checklist with its deletions — are in
+The consequence to hold onto: parts now live *inside* the run, so `project` must unpack results only
+at or above `prior_history.len()`. Above it, everything is the loop's own output; below it,
+everything was written already unpacked, and a `bash` result that happens to look like parts must
+stay text.
+
+The mechanics — `CallPart`, `preprocess_args`, the injection, how a parts list is recognised without
+a marker, the pass-2 render, and the per-tool checklist with its deletions — are in
 [`261030_rig_direct_drive_impl.md`](261030_rig_direct_drive_impl.md).
 
 ### 5. Retry becomes resume, steering becomes projection content
@@ -226,15 +251,20 @@ One position, one function: the transcript and the wire cannot disagree about wh
   Absorbs today's `LoggingHook` and most of `turn.rs`.
 - `src/agent/project.rs` — **the** projection: parts unpack and steer splice, nothing else. Pure
   `(&[Message], &[Aside]) -> Vec<Message>`, called by persist and by request building.
-- `src/agent/parts.rs` — `CallPart`, the parts-list predicate, and `split_id` minting. The only
-  module that decides what a parts list looks like.
+- `src/agent/parts.rs` — `CallPart`, the single-part builder (`preprocess_args` + `ToolResult`), the
+  parts-list predicate, and `split_id` minting. The only module that decides what a part looks like.
+- `src/agent/tool_shape.rs` — the `preprocess_args` table, one entry per live tool. Registered
+  beside the tools in `build()` because `#[rig_tool]`'s generated struct cannot implement a
+  prior-side trait. Decides only what a call reads as, never what runs.
 - `src/agent/wire.rs` — pass 2: reasoning strip, then `edit` array → blocks. The request-only shape,
   holding the one `edit` special case. Absorbs today's `render_model_facing`.
 - `src/agent/persist.rs` — cursor over raw messages, projecting each delta, per answer.
 - `src/agent/transcript.rs` — shrinks to load-path repair; the ledger, `PreparedEdit`,
   `prepare_edit_call`, `paired_results` and the batch-shaping half go.
-- `src/tools.rs` — each tool returns `Vec<CallPart>`: `read`/`write`/`grep`/`sed` relativize `path`,
-  `bash` strips the `cd` prefix, `edit` parses → splits → minimises → relativizes.
+- `src/tools.rs` — `read`/`write`/`grep`/`sed`/`bash` keep `Result<String, ToolError>` and gain a
+  `preprocess_args` function (`sed`/`read`/`write`/`grep` relativize `path`, `bash` strips its `cd`
+  prefix). Only `edit` changes its return type, to `Vec<CallPart>`: parse → split → minimise →
+  relativize.
 - `src/agent/turn.rs` — `prompt` becomes a thin wrapper over `drive`; `run_once` and the summarizers
   keep their signatures.
 
@@ -251,14 +281,16 @@ One position, one function: the transcript and the wire cannot disagree about wh
    `TurnPersistence`. `doc/tool_error_handling.md` §"Mid-turn failure" is retired with it.
 4. **Steering and boundary settings.** `SteeringQueue`, the projection's steer insertion and scalar
    overrides, the mid-turn UI entry points and `/reasoning`-style mid-turn commits.
-5. **Tools return their own call shape.** `CallPart` and the parts-unpack in `project`, then the six
-   tools converted one at a time — safe incrementally only while `tool_args::normalize` still covers
-   the unconverted ones, which is why the impl notes order it with `edit` last and delete
+5. **Tools state their own call shape.** `CallPart`, the injection and the parts-unpack in `project`
+   land first with an identity `preprocess_args`, which is a pass-through: the run's messages change
+   shape, and unpack restores today's bytes exactly. Then `preprocess_args` for the five
+   single-result tools, one at a time — safe incrementally only while `tool_args::normalize` still
+   covers the unconverted ones, which is why the impl notes order it with `edit` last and delete
    `normalize` only at the end. The registry-completeness test lands with the deletion, since that
    is when a missed tool starts storing absolute paths. `edit` gains parse → split → minimise →
-   relativize; the other five relativize or strip. Deletions: `shape_edits`, `PreparedEdit`,
-   `prepare_edit_call`, `paired_results`, `EditLedger`, `EditResolutions`, `tool_args::normalize`
-   and `normalize_messages`. `wire.rs` renders blocks.
+   relativize and switches to `Vec<CallPart>`; the other five only gain `preprocess_args`.
+   Deletions: `shape_edits`, `PreparedEdit`, `prepare_edit_call`, `paired_results`, `EditLedger`,
+   `EditResolutions`, `tool_args::normalize` and `normalize_messages`. `wire.rs` renders blocks.
 6. **Cleanup.** Delete `HookContext` usage and the hook structs' rig impls; update
    `doc/261026_rig_steering.md` (its "Prior's Current Architecture Is Correct" section becomes the
    opposite of the truth), `doc/tool_error_handling.md` and `doc/261026_tool_path_relativization.md`
@@ -281,13 +313,18 @@ commits us to maintaining the loop.
 - **A steer is recorded on the run, not in a side table.** `append_entry` exists for host records
   and excludes them from requests, so there is one durable place a steer lives and one function that
   decides when it becomes context.
-- **A tool returns its own call shape.** `Vec<CallPart>`, bare — no wrapper, no reserved key. The
-  projection unpacks it into N pairs; ids are minted by the framework (`split_id`) because the
-  provider issued one id and that rule must live in one place. Distinct from the run's own
-  `ToolAnswer`, which stays unforgeable: a part never enters `answer_all`.
-- **Normalisation is a tool property, not a pass.** Each tool relativizes the args it returns and
-  `bash` strips its own `cd` prefix. `tool_args::normalize` is deleted; replay needs no rewriting
-  because the stored form is already compact.
+- **A tool states its own call shape, in two halves.** `preprocess_args` states what the call *is*
+  (pure, knowable before execution, so the display uses it too); the parts state args *and* results
+  (only `edit`, only after execution). Single-result tools return `String` unchanged — the framework
+  builds their one part. The projection unpacks `edit`'s N parts into N pairs; ids are minted by the
+  framework (`split_id`) because the provider issued one id and that rule must live in one place.
+  Distinct from the run's own `ToolAnswer`, which stays unforgeable: a part never enters
+  `answer_all`.
+- **Normalisation is a tool property, not a pass.** `preprocess_args` relativizes path arguments and
+  `bash` strips its own `cd` prefix. Called **once at dispatch**, with the result carried into the
+  part, so the panel, the record and the wire read one value rather than three functions that had to
+  be proven to agree. `tool_args::normalize` is deleted; replay needs no rewriting because the
+  stored form is already compact.
 - **`EditResolutions` has no reader once the tool formats its own results.** Delete it with
   `EditLedger` rather than repurposing it.
 - **Answers persist as they land.** A batch's answers are independent calls, not a multi-file

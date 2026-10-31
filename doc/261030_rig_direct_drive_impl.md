@@ -44,11 +44,19 @@ Two `pub(crate)` gaps, both routed around rather than worked around:
 
 ### The part
 
+Two shapes, each stated at the moment it is knowable.
+
 ```rust
+/// What the call is, as the tool reads it: paths relativized, a `cd <cwd> &&`
+/// prefix stripped. Pure and idempotent. Knowable before execution, which is
+/// what lets the display label a slow call with the same args the record will
+/// carry.
+fn preprocess_args(raw: &serde_json::Value) -> serde_json::Value;
+
 /// One call as the tool understood it, with its result.
 struct CallPart {
-    /// The call's arguments, rewritten by the tool (paths relativized, a
-    /// `cd <cwd> &&` prefix stripped, an `edit` split per file).
+    /// `preprocess_args` of the model's arguments (an `edit` part: one file's,
+    /// already split, minimised and relativized).
     args: serde_json::Value,
     /// The result for exactly this call.
     result: String,
@@ -58,15 +66,72 @@ struct CallPart {
 }
 ```
 
-A tool returns `Vec<CallPart>`. `IntoToolOutput` is blanket-implemented over `T: Serialize`, so the
-vec arrives as one `Json` content block holding a JSON array, with no wrapper object and no
-plumbing. `#[rig_tool]` derives `type Output` from the function's return type
-(`rig-derive/expand.rs:328`), and `Guard<T>` forwards `type Output = T::Output`, so hand-written and
-macro-generated tools declare it the same way.
+**`preprocess_args` is registered beside the tool, not on it**: `#[rig_tool]` generates the struct,
+so a tool cannot implement a prior-side trait, and `Guard<Bash>` needs the same forwarding
+`type Output` already gets. A name-keyed table in `build()` holds it, one entry per *live* tool —
+unlike the deleted `tool_args::normalize`, whose matcher carried eight registry-dead names for
+replay. Replay needs no preprocessing: what is stored is already this function's output.
 
-The tool's return value is therefore its whole answer:
-**the call as it understood it, plus its result** — once, or once per file. That single change is
-what removes the rest of this section.
+It is called **once per live call, ever** — at dispatch, and the value is carried forward into the
+part. `two places` is the wrong mental model and the source of a stale duplicate:
+
+```rust
+for call in calls {
+    let understood = shape.preprocess(call.name(), call.arguments());  // once
+    observer.dispatch(call.name(), &understood);                       // panel label
+    let out = tool.execute(call).await;
+    // The five single-result tools: the framework builds their one part here,
+    // from the value computed above, so the tool itself says nothing new.
+    let parts = match out.output().as_json() {
+        Some(parts) => parts.clone(),          // `edit` already returned parts
+        None => json!([CallPart {
+            args: understood.clone(),
+            result: out.output().render(),
+            is_error: !out.is_success(),
+        }]),
+    };
+    // The run records the parts, so `project` unpacks rather than re-derives.
+    persist_answer(&call, &parts);
+    run.answer(call.answer(out.with_output(ToolOutput::json(parts))))?;
+}
+```
+
+`ToolResult::with_output(output)` replaces only the model-visible content and
+**keeps the disposition**, so the failure path injects exactly as the success path does — `is_error`
+is read before the wrap and travels in the part. `answer_all` then commits that block verbatim
+(`feedback::tool_result_output` clones `output().into_content()`), so the parts land in
+`run.messages()`, which is the store `project` reads.
+
+`is_error: !out.is_success()` is not an invention: it is rig's own rule for the `is_error` it would
+have written (`tool_result_output`, `rig-core/src/tool/feedback.rs:24`), so a skipped or refused
+call lands in the part exactly as it landed in the message before. Beyond the parts, the disposition
+still drives `executed`, telemetry and the fail-closed checks — two audiences, one record.
+
+Therefore **`read`/`write`/`grep`/`sed`/`bash` keep `Result<String, ToolError>` unchanged**: nothing
+to repeat, because the tool no longer constructs the part at all. Dispatch is where the shape is
+learned, and it is learned once:
+
+- the panel label and the recorded args are the *same bytes*, so they cannot disagree about a call
+  that never changed — previously the argument, now the construction;
+- `project` re-derives nothing over the history, which was the dominant cost (N calls, every
+  request, for the life of the session) and the reason idempotence had to be defended;
+- there is one unpack path for every call above the boundary, instead of a derivable-args branch for
+  five tools and a parts branch for `edit`;
+- the `(CallId, message index)` memo floated earlier is no longer worth considering — there is
+  nothing left to memoise.
+
+`edit` is the only tool that returns parts itself, and the one absent from the table:
+
+- `type Output = Vec<CallPart>`; `IntoToolOutput` is blanket over `T: Serialize`, so the vec arrives
+  as one `Json` content block holding a JSON array — no wrapper, no plumbing. `#[rig_tool]` derives
+  `type Output` from the return type (`rig-derive/expand.rs:328`) and `Guard<T>` forwards
+  `type Output = T::Output`, so the macro and hand-written paths agree.
+- It has nothing to publish at dispatch: its shape is not knowable before execution (minimisation
+  needs where each edit landed), which is why its panel already defers to the pair
+  (`display_prepared_edit`). The `as_json` arm above takes its result untouched, so it cannot be
+  double-wrapped.
+- Its args are not passed through `preprocess_args` at all — the per-file args it returns *are* the
+  processed form, which is what makes the exclusion structural rather than a no-op entry.
 
 `project` replaces each call and result with `parts.len()` pairs:
 
@@ -88,29 +153,33 @@ what removes the rest of this section.
 ### Recognising parts without a marker
 
 No wrapper means no reserved key, so the check is structural: a `Json` array whose every element is
-`{args: object, result: string, is_error?: bool}`. That is safe because of where it runs, not
-because the shape is unlikely:
+`{args: object, result: string, is_error?: bool}`.
 
-- `project` only examines results **at or above `prior_history.len()`** — the messages this drive
-  loop appended. Everything below that is loaded history, and loaded history is already unpacked.
-- text can never collide: a tool returning `String` yields a text block, never `Json`. `bash`
-  returns `String`, so shell output stays text even when it looks like JSON.
-- the live tool set is six (`read`, `write`, `edit`, `grep`, `sed`, `bash`), all prior-owned, and
-  none returns a parts-shaped array for any other reason.
+Injecting every answer means parts now live *inside* the run, so the boundary is no longer the tidy
+observation it was — it is the guard that keeps machine payload out of the wire:
 
-If a future tool ever wants to return a genuinely part-shaped array as *data*, that is the moment to
-reintroduce a key — not before. One place decides, so it stays a one-line change.
+> `project` unpacks results **at or above `prior_history.len()`** and only there. Everything below
+> that is loaded history, which was written already-unpacked.
 
-**The invariant to defend:** no `Json` array in a request history and none in a stored session. Both
-egresses go through `project`, and that single assertion covers the "parts must never reach a
-provider" case for every tool at once.
+Without that bound a loaded result that happens to be a JSON array of `{args, result, is_error}` — a
+`bash` output that printed such an array, say — would be unpacked into fabricated calls on the next
+request. Two facts keep the bound trustworthy:
+
+- persist writes `part.result` as plain text, so nothing on disk is a parts list and a reload cannot
+  put one below the boundary;
+- a live call's result is a `Json` block only because the loop made it one — the tool returns
+  `String` (a text block) and the wrap is the loop's own.
+
+A parts list must never reach a provider or a session file. Both egresses go through `project`, and
+the test is one assertion each way: no `{args, result, is_error}` array in a request history, and
+none in a stored session.
 
 ### Three passes, three jobs
 
 Pass 1 runs at both egresses; pass 2 only when building a request:
 
 1. **`project`** — unpack parts, splice anchored steers. Structural only: no tool names, no `bsed`
-   knowledge, no path rules. `Message`-level, pure.
+   knowledge, no path rules — it unpacks what the loop injected, and derives nothing.
 2. **model-facing render** — reasoning strip, then `edit` array → the `blocks` form the model is
    asked for. Stays in the completion-call callback beside where it runs today, because that
    pipeline builds a *request* rather than a *record*. Persistence takes the array form (pi's
@@ -131,26 +200,30 @@ only frame holding the facts:
 - **splitting** — the tool knows how many files it was given; it returns one part per file.
 - **minimisation** — the compact anchored form needs the line each edit *landed* on
   (`matched_lines`), which only execution knows. So the tool returns already-minimised arrays.
-- **path relativisation** — the tool relativizes the args it returns, using the same one rule and
-  `PathContext` it already uses for its result paths (`src/tools.rs` `rel_path`). For `edit` this
-  happens *after* splitting per file, which is exactly why `tool_args::normalize` had to exclude
-  `edit` before; with per-file parts the exclusion is unnecessary.
+- **path relativisation** — `preprocess_args`, using the same one rule and `PathContext` the tool
+  already uses for its result paths (`src/tools.rs` `rel_path`). `edit` relativizes each file
+  *after* splitting, which is exactly why `tool_args::normalize` had to exclude `edit` before;
+  per-file parts make the exclusion unnecessary.
 
 That last point deletes `crate::tool_args::normalize` rather than porting it. Its twelve-name
 matcher has eight registry-dead names (`ls`, `find`, `remove`, `make_dir`, `move_file`, `copy_file`,
 plus the `list_dir`/`glob_files` spellings), kept only for replay — and replay does not need
 rewriting, since what is stored is already the compact form. Of the live tools, `read`, `write`,
-`grep` and `sed` relativize `path`; `edit` relativizes each file after splitting; `bash` strips the
-prefix. Each now does so in its own `call`, on the args it returns.
+`grep` and `sed` relativize `path` in `preprocess_args`; `bash` strips its prefix there; `edit`
+relativizes per file in what it returns.
 
 The `cd <cwd> &&` strip stays in `Bash` for the additional reason that the shell must run what the
 model meant, which is a different question from how the call reads.
 
-**The completeness invariant, which must be tested:** a tool that returns no parts has its call
-recorded verbatim. So every live tool taking a path must return parts. Turn that from a review
-question into a test: walk the registry, assert each tool either returns parts or is in a deliberate
-exempt list. Without it, a new path-taking tool silently stores absolute paths and
-`doc/261026_tool_path_relativization.md`'s problem returns quietly.
+**The completeness invariant, which must be tested.** A tool with no `preprocess_args` entry has its
+call recorded — and labelled — verbatim, so a new path-taking tool would silently store absolute
+paths and `doc/261026_tool_path_relativization.md`'s problem would return quietly. Turn that from a
+review question into a test, walking the registry:
+
+- every live tool taking a path argument has a `preprocess_args` entry, or is on a deliberate exempt
+  list (`edit`, which publishes its own per-file args);
+- `preprocess_args` is idempotent on a sample call: `f(f(x)) == f(x)` — cheap insurance for the
+  loaded-history path, which feeds the table output back through it.
 
 ### What this deletes
 
@@ -159,31 +232,45 @@ readers no longer exist), `PreparedEdit` and its prepared-form cache, `prepare_e
 `paired_results`, `shape_edits`, `assistant_from_results`'s edit case, `tool_args::normalize` and
 `normalize_messages`, the derived-id agreement between egresses, and the shared mutex.
 
-**Idempotence now holds by construction**, because there is nothing to re-derive:
+**Nothing is re-derived, so nothing can drift:**
 
-- a loaded call has no parts list (it was never stored), so unpack is a no-op — the normal answer;
+- a live call's parts are built once, by the loop, and carried into the run;
+- a loaded call has no parts list (persist wrote plain text), so unpack is a no-op — and the bound
+  keeps it from ever seeing one below the boundary;
 - a loaded `edit` is already per-file, already minimised, already relative;
 - array → blocks is not `project`'s job, so `project` cannot fight it;
 - steer splice is keyed on aside entries already consumed.
 
 This is stronger than the old three-reader arrangement: with the ledger gone there is no cache that
-could be stale relative to the stored form — the stored form *is* the projected form.
+could be stale relative to the stored form — the stored form *is* the projected form. And with the
+parts injected at execution rather than re-derived at projection, the display, the record and the
+wire are three readings of one value instead of three functions that had to be proven to agree.
 
 ## Notes for the implementer
 
-- **Order inside phase 5.** `CallPart` and the unpack land first, with all six tools still returning
-  text: unpack is then a no-op and nothing changes. Convert `read`/`write`/`grep`/`sed` next (one
-  `relativize_arg` call each on the args they return), then `bash`, then `edit` last — `edit` is the
-  only one whose conversion removes other code, so doing it last keeps the tree green throughout.
-  `tool_args::normalize` is deleted only when the last tool stops relying on it.
-- **`sed` already takes a path** and `normalize` covers it; confirm it is in the converted set, or
-  its calls start storing absolute paths the moment `normalize` goes.
+- **Order inside phase 5.** The injection lands first with the table empty, which makes it a
+  pass-through: `preprocess_args` is identity, every part is `{raw args, result}` — so the run's
+  messages change shape but `project`'s unpack restores exactly today's bytes, and nothing else
+  moves. Then add `read`/`write`/`grep`/`sed` entries (one `relativize_arg` call each), then `bash`,
+  then `edit` last — `edit` is the only one that stops being wrapped and changes a return type, so
+  doing it last keeps the tree green throughout. `tool_args::normalize` is deleted only when the
+  last tool stops relying on it.
+- **The injection is inside the loop, so a tool cannot do it.** A tool whose `call` also rewrote its
+  own arguments would create the second producer this design exists to remove — and it could not,
+  because the wrap happens after `execute` returns.
+- **`with_output` is the failure path too**, and it keeps the disposition. Read `is_error` *before*
+  wrapping; after it, `result.is_success()` still describes the execution, which is what telemetry
+  and the fail-closed checks read. Two audiences, one record.
+- **`sed` already takes a path** and `normalize` covers it; confirm it is in the table, or its calls
+  start storing absolute paths the moment `normalize` goes.
 - **The parity harness (phase 1) must include an `edit` case** with a multi-file call, a single-file
   call, and a mixed-success batch. Those three are the shapes whose pairing and `is_error` handling
   change; the SSE mocks already cover retry and cancel.
 - **`--log-messages`** records the request history, so it is the cheapest assertion for the
-  no-parts-list invariant: capture a turn that ran `edit` and assert no `Json` array is present.
+  no-parts-list invariant: capture a turn that ran each tool and assert no
+  `{args, result, is_error}` array is present. Worth adding the session file to the same assertion,
+  since parts now live in the run rather than being re-derived at projection.
 - **`edit` stays hand-written.** It is `EditFile` in `src/tools.rs` rather than a `#[rig_tool]`
   function because it owns its description and the `ToolContext` slot; its `call` is where parse →
-  split → minimise → relativize happens, and it returns `Vec<CallPart>` like the rest. Nothing about
-  the macro path needs changing.
+  split → minimise → relativize happens, and it returns `Vec<CallPart>`. Nothing about the macro
+  path needs changing — the `as_json` arm picks it up without being told which tool it is.
