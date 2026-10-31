@@ -96,10 +96,16 @@ Both cases fall out of step 4, which takes the session's last message as the pro
   `projection_start` of 1.
 
 The alternative — appending a fresh continuation per attempt — grows the history by one message per
-retry. **It would not fail loudly:** rig merges consecutive user messages when it encodes a request,
-so two continuations in a row reach the provider as one and the error is invisible at the wire. The
-damage shows up in the session, which re-reads and replays what was written. The test therefore
-asserts on the pre-wire history, where the duplicate is still visible.
+retry. **It fails quietly, not loudly.** rig merges consecutive user messages into one message
+holding both content blocks, so nothing errors and a provider sees a single user turn. Measured: two
+`"continue"` messages become one message whose content is `["continue", "continue"]`, and the OpenAI
+chat encoder sends a multi-part user message as a `content` array rather than joined text. The
+duplicate is therefore *structurally visible* in the request — a fourth message does not appear, but
+an extra content block does — and it is plainly visible in the session, which replays what was
+written.
+
+A test can assert either way. Assert on the pre-wire history, because it names the intent ("the
+retry appends nothing") rather than inferring it from a content count.
 
 The session is append-only (`Session` has `move_leaf` but no truncate or delete), so a wrong append
 cannot be undone. This must be a write-time guard, not a repair.
@@ -253,17 +259,26 @@ path, while a persister-level rule would be a second place that knows about cont
 
 Concretely, the guard belongs beside `project`'s unit walk, which is already where adjacent messages
 are related (a unit is a turn plus its results): drop a synthetic continuation that directly follows
-another synthetic continuation, keeping the last. That is idempotent — projecting a projected slice
-changes nothing — which is the property the whole transform requires.
+another synthetic continuation, keeping the last. That is idempotent (projecting a projected slice
+changes nothing), which is the property the whole transform requires.
 
-Two caveats for whoever implements it:
+**The marker must be flattened into the message, not threaded in beside `project`.** Widening the
+signature looks cheap (seven internal call sites) but is the wrong fix, because `project` runs on
+two different things: the run's log at the persist and request boundaries, which has no session
+entries at all, and the loaded session history, which has them. A `&[EntryKind]` parameter would be
+fabricated on the live path and real on the load path — one parameter meaning two things, which is
+the class of problem the direct-drive work has been deleting all along.
 
-- **`project` does not currently see the marker.** Its signature is `project(&[Message])` and rig's
-  `Message` carries no metadata, so the marker lives only on the session entry (`customType`). The
-  guard needs either a step that flattens the marker into the message before projection, or a
-  signature that takes the session's entry kinds alongside. Flattening fits the existing
-  split-at-ingest precedent: state the shape once, where the write happens, and let every reader see
-  it.
-- **The duplicate is invisible after encoding.** rig merges consecutive user messages, so a wrong
-  append does not fail at the wire — only in the session, which replays what was written. Test the
-  pre-wire history, not the adapted request.
+Flattening gives the marker to the message instead, so the rule is identical whether the history
+came from disk or from the run, which is also what keeps `project`'s idempotence true: the marker
+rides the message, so projecting a projected slice preserves it.
+
+Precedent already exists in this codebase: a tool's parts list rides its result as a reserved key
+(`prior_call_parts`) that `project` unpacks and no provider ever sees. A continuation marker follows
+the same rule — carried in the stored message, read by `project`, absent from every request.
+
+**Test at the message count, not the content count.** The merge rule above means a wrong append
+shows up as an extra content block in the last user message rather than an extra message, so a test
+that counts messages catches a second *message* only. Assert that the rebuilt history's explicit
+tail is `[assistant, continuation]` with nothing after it, which fails for both shapes of the
+mistake.

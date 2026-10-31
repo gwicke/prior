@@ -174,23 +174,24 @@ fn a_consecutive_retry_does_not_add_a_second_continuation() {
     let mut sent: Vec<Message> = history.iter().map(|m| (**m).clone()).collect();
     sent.push((*prompt).clone());
 
-    // Assert on the pre-wire history. rig merges consecutive user messages
-    // when it encodes a request, so a duplicated continuation would be
-    // invisible to a provider while still littering the log the session
-    // replays - the one place this can be caught.
-    let continuations = sent
-        .iter()
-        .filter(|m| {
-            matches!(m,
-                Message::User { content }
-                    if matches!(content.first(), Some(UserContent::Text(t)) if t.text == "continue"))
-        })
-        .count();
-    assert_eq!(
-        continuations, 1,
-        "exactly one continuation, not one per retry"
-    );
+    // Asserted on the pre-wire history because that names the intent. A
+    // duplicate would not fail loudly: rig merges consecutive user messages
+    // into one message holding both content blocks, so a provider sees a
+    // single user turn and no error is raised. Counting messages catches a
+    // second message; counting content blocks catches a second block. Assert
+    // the explicit tail so either mistake fails.
     assert_eq!(sent.len(), 3, "the retry appends nothing");
+
+    let Message::User { content } = sent.last().expect("history is non-empty") else {
+        panic!("the continuation ends the history");
+    };
+    assert_eq!(content.len(), 1, "one content block, not two");
+    assert!(
+        matches!(content.first(), Some(UserContent::Text(t)) if t.text == "continue"),
+        "the continuation is the last message and holds only its own text"
+    );
+
+    // Merged, not dropped: the wire keeps three messages.
     assert_eq!(wire(sent).len(), 3, "and the wire is unchanged");
 }
 
