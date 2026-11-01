@@ -370,8 +370,8 @@ const INPUT_CONTEXT_ROWS: usize = 3;
 
 /// Prompt + editor content, and the R1 rule in one place.
 ///
-/// The element holds the session's editor *handle* and content's streaming
-/// flag and resolves both inside `height`/`render` at the width being
+/// The element holds the session's editor *handle* and the app's turn phase
+/// and resolves both inside `height`/`render` at the width being
 /// composed for — the layout is computed at the render width rather than
 /// snapshotted at compose. The caret lives at `layout.cursor_row` /
 /// `layout.cursor_col` — derived, not stored.
@@ -387,10 +387,10 @@ const INPUT_CONTEXT_ROWS: usize = 3;
 /// is typed. And `min` is the caret's own row, which is why a visible input
 /// can never be squeezed away entirely; wrapping grows `max`.
 ///
-/// "Is a turn running" is the output's fact (`streaming`), not the frame
-/// layer's — the element does not own it, it pulls the handle content
-/// shares, the way the bar element pulls its store. Read at pull
-/// time, the fact cannot go stale between compose and paint.
+/// "Is a turn running" is the app's fact (`AppState::turn_phase`), not the
+/// frame layer's — the element does not own it, it pulls the handle the turn
+/// writes, the way the bar element pulls its store. Read at pull time, the
+/// fact cannot go stale between compose and paint.
 ///
 /// A free function, not `Element::input`: inherent methods on `Element` would
 /// live in `slashdot_tui`, and this element is repl's (it holds
@@ -399,26 +399,34 @@ const INPUT_CONTEXT_ROWS: usize = 3;
 pub(crate) fn input(
     editor: Arc<Mutex<LineEditor>>,
     prompt: String,
-    streaming: Arc<AtomicBool>,
+    phase: crate::turn_phase::TurnPhaseHandle,
 ) -> Element {
     Element::new(InputItem {
         editor,
         prompt,
-        streaming,
+        phase,
     })
 }
 
-/// The resting (between-turns) input for tests: a not-streaming flag beside
-/// the caller's editor — R1's default, the prompt row that says where to
-/// type. Tests that pin the mid-turn rule mint [`input`] with their own
-/// flag.
+/// The resting (between-turns) input for tests: an idle phase beside the
+/// caller's editor — R1's default, the prompt row that says where to type.
+/// Tests that pin the mid-turn rule mint [`input`] with their own phase.
 #[cfg(test)]
 pub(crate) fn test_input(editor: &Arc<Mutex<LineEditor>>, prompt: &str) -> Element {
-    input(
-        editor.clone(),
-        prompt.to_string(),
-        Arc::new(AtomicBool::new(false)),
-    )
+    input(editor.clone(), prompt.to_string(), idle_phase())
+}
+
+/// An idle phase handle, for the test input mints and for tests.
+#[cfg(test)]
+pub(crate) fn idle_phase() -> crate::turn_phase::TurnPhaseHandle {
+    crate::turn_phase::TurnPhaseHandle::default()
+}
+
+/// A running phase handle (streaming), for tests that pin the mid-turn input
+/// rule.
+#[cfg(test)]
+pub(crate) fn running_phase() -> crate::turn_phase::TurnPhaseHandle {
+    crate::turn_phase::TurnPhaseHandle::new(crate::turn_phase::TurnPhase::Streaming)
 }
 
 /// Overlay elements for a plain list of rows — for tests that care about the
@@ -540,16 +548,18 @@ fn reload_after_edit(app_state: &Arc<crate::app_state::AppState>, content: &Cont
 
 /// Editor content: the prompt on row 0, the wrapped buffer below it.
 ///
-/// Holds the session's editor *handle* and content's streaming flag — the
-/// same pull-the-shared-store shape as the bar element. The layout is
+/// Holds the session's editor *handle* and content's turn phase — the same
+/// pull-the-shared-store shape as the bar element. The layout is
 /// computed inside `height`/`render` at the width being composed for, so a
 /// compose at one width and a render at another cannot disagree about the
 /// wrap.
 struct InputItem {
     editor: Arc<Mutex<LineEditor>>,
     prompt: String,
-    /// The output's turn-presence fact, read at pull time (see [`input`]).
-    streaming: Arc<AtomicBool>,
+    /// The turn-presence fact, read at pull time (see [`input`]). Which phase
+    /// it is does not matter here — streaming and waiting out a retry are both
+    /// a running turn, and an empty buffer claims no row in either.
+    phase: crate::turn_phase::TurnPhaseHandle,
 }
 
 impl RenderElement for InputItem {
@@ -557,7 +567,7 @@ impl RenderElement for InputItem {
         // R1 (the reasoning lives on [`input`]): mid-turn an empty input is
         // no row at all — `min == max == 0`, so the allocator serves it
         // nothing and `render(0, _)` returns the empty `Rendered`.
-        if self.streaming.load(Ordering::Relaxed) && self.editor.lock().unwrap().text().is_empty() {
+        if self.phase.is_running() && self.editor.lock().unwrap().text().is_empty() {
             return RowAsk::fixed(0, 0);
         }
         // The floor is the caret's own row; wrapping grows the want to the
@@ -1216,7 +1226,7 @@ impl PromptSession {
         let input = input(
             self.editor.clone(),
             label.to_string(),
-            content.streaming.clone(),
+            self.app_state.turn_phase(),
         );
         let mut stack = Vec::new();
         // The bar is always present: no `is_off` gate — with a
@@ -1226,7 +1236,6 @@ impl PromptSession {
         stack.push(crate::ui::bar::status(
             self.app_state.clone(),
             content.usage_handle(),
-            content.streaming.clone(),
         ));
         stack.push(input);
         let mut overlay = overlay_elements(&self.overlay);
@@ -1853,7 +1862,9 @@ impl Repl {
         let input = input(
             editor.clone(),
             prompt.to_string(),
-            Arc::new(AtomicBool::new(false)),
+            // No turn is in flight wherever this is used: it composes a frame
+            // to paint from a resting state, so an empty buffer is a row.
+            crate::turn_phase::TurnPhaseHandle::default(),
         );
         let mut items: Vec<Element> = Vec::new();
         if let Some(bar) = status {
@@ -4980,8 +4991,8 @@ mod tests {
     #[test]
     fn an_empty_input_is_a_row_between_turns_and_none_mid_turn() {
         let editor = shared(|_| {});
-        let streaming = Arc::new(AtomicBool::new(false));
-        let e = input(editor.clone(), "> ".to_string(), streaming.clone());
+        let phase = idle_phase();
+        let e = input(editor.clone(), "> ".to_string(), phase.clone());
 
         // Between turns: the resting row, `min == 1`.
         assert_eq!(
@@ -4992,7 +5003,7 @@ mod tests {
 
         // Mid-turn, still empty: nothing to submit, so no row and no claim.
         // The *same element* answers — the flag moved under it.
-        streaming.store(true, Ordering::Relaxed);
+        phase.set(crate::turn_phase::TurnPhase::Streaming);
         assert_eq!(
             e.ask(60),
             RowAsk::fixed(0, 0),
@@ -5018,8 +5029,8 @@ mod tests {
             0,
             "a hidden input paints no row at all"
         );
-        streaming.store(false, Ordering::Relaxed);
-        let e = input(editor.clone(), "> ".to_string(), streaming.clone());
+        phase.set(crate::turn_phase::TurnPhase::Idle);
+        let e = input(editor.clone(), "> ".to_string(), phase.clone());
         let heights = allocate(&[e.ask(60)], 24, live_budget(24));
         assert_eq!(
             render(&[e], &heights, 60).height(),
@@ -5087,7 +5098,7 @@ mod tests {
         );
         let empty = shared(|_| {});
         assert_eq!(
-            input(empty.clone(), "> ".into(), Arc::new(AtomicBool::new(true))).ask(20),
+            input(empty.clone(), "> ".into(), running_phase()).ask(20),
             RowAsk::fixed(0, 0),
             "an empty mid-turn input claims no rows at all"
         );

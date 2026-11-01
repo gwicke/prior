@@ -264,8 +264,13 @@ mod status_bar_tests {
         first_message: Option<&str>,
         (m, context_tokens): (BarStatus, u64),
         width: usize,
-        streaming: bool,
+        running: bool,
     ) -> String {
+        let phase = if running {
+            crate::turn_phase::TurnPhase::Streaming
+        } else {
+            crate::turn_phase::TurnPhase::Idle
+        };
         let status = BarStatus {
             session_name: session_name.map(str::to_string),
             first_message: first_message.map(str::to_string),
@@ -274,7 +279,7 @@ mod status_bar_tests {
         // `context_tokens` is the one live fact, so it arrives
         // alongside the pushed facts — destructured here exactly as the bar's
         // own render pulls it from the live usage store.
-        crate::ui::bar::status_bar(&status_text(&status, context_tokens), width, streaming)
+        crate::ui::bar::status_bar(&status_text(&status, context_tokens), width, phase)
     }
 
     /// A [`BarStatus`] for the tests, identity fields unset — the `bar` helper
@@ -627,8 +632,8 @@ mod status_bar_tests {
 
     /// The dot is the spinner's replacement: green while a response streams,
     /// the bar's own grey when it is not. Two states because the prompt-side
-    /// carrier will show the bar between turns too, and the dot is what will
-    /// tell "working" from "idle" then.
+    /// carrier shows the bar between turns too, and the dot is what tells
+    /// "working" from "idle".
     ///
     /// The order of the escape and the glyph is the substance of this test, not
     /// a detail: an `SGR` colours the cells written *after* it, so a colour

@@ -34,6 +34,21 @@ use crate::agent::CodeAgent;
 use crate::session::Session;
 
 impl CodeAgent {
+    /// Record the turn's phase on `AppState` — the status bar's dot and the
+    /// input row's "is a turn running" fact.
+    ///
+    /// A no-op without an `AppState` (piped/batch): there is no bar to read it
+    /// there, and the phase is UI state, not something the run cares about.
+    ///
+    /// Called at the three transitions that define it: an attempt going out
+    /// (`Streaming`), a retryable failure before the back-off
+    /// (`WaitingRetry`), and the turn ending (`Idle`).
+    fn set_turn_phase(&self, phase: crate::turn_phase::TurnPhase) {
+        if let Some(app_state) = &self.app_state {
+            app_state.set_turn_phase(phase);
+        }
+    }
+
     /// `--log-messages`: a live-pump lifecycle marker — the points where the
     /// content boundary state changes (`closed` flips). Logged beside the raw
     /// deltas so a spacing investigation can reconstruct exactly what
@@ -228,6 +243,7 @@ impl CodeAgent {
         // B3b) and it only changes on an explicit commit, so it belongs to the
         // prompt-side carrier.
         self.log_pump_event("begin_response").await;
+        self.set_turn_phase(crate::turn_phase::TurnPhase::Streaming);
         self.content.begin_response();
         // U4.3: the turn's second pump, split out of `in_turn` into bindings the
         // two new futures below can borrow *disjointly* — one future per
@@ -252,10 +268,11 @@ impl CodeAgent {
             ),
             None => (None, None, None, "", None),
         };
-        // The area has to say the turn started *now*. `begin_response` above
-        // flipped `streaming`, and the frame on screen was composed while it was
-        // false — so until some keystroke happened to compose again, the input
-        // row stayed drawn and the status dot stayed grey for the whole turn.
+        // The area has to say the turn started *now*. The phase was set before
+        // `begin_response` above, and the frame on screen was composed while it
+        // was idle — so until some keystroke happened to compose again, the
+        // input row stayed drawn and the status dot stayed grey for the whole
+        // turn.
         //
         // One `settle` at the switch, and it is the same paint path both pumps
         // use rather than a second way to compose: the buffer was just emptied
@@ -597,7 +614,18 @@ impl CodeAgent {
                     .await;
             }
             let delay = retry_delay_ms(&error, consecutive_failures.max(1));
-            self.log_pump_event("response_end").await;
+            // The attempt's text is closed, but the *turn* is not: the phase
+            // becomes `WaitingRetry`, so the bar's dot stays lit across the
+            // back-off — waiting out a retry is the turn still working, and
+            // that is the state the user was already watching. Ending the turn
+            // here would drop the dot to grey for the length of the delay and
+            // light it again below, which reads as "done, then started" for one
+            // turn.
+            //
+            // The text flush is separate from the phase on purpose: the
+            // attempts' streams are separate documents, the turn is one.
+            self.log_pump_event("segment_end").await;
+            self.set_turn_phase(crate::turn_phase::TurnPhase::WaitingRetry);
             self.content.end_response();
             self.content.display_text(&format!(
                 "Error: {}. Retrying in {}s...",
@@ -632,6 +660,7 @@ impl CodeAgent {
                     Some(crate::agent::drive::context_document(feedback));
             }
             self.log_pump_event("begin_response").await;
+            self.set_turn_phase(crate::turn_phase::TurnPhase::Streaming);
             self.content.begin_response();
         }
 
@@ -658,6 +687,7 @@ impl CodeAgent {
         }
 
         self.log_pump_event("response_end").await;
+        self.set_turn_phase(crate::turn_phase::TurnPhase::Idle);
         self.content.end_response();
 
         // The uniform exit persistence: the committed tail, then a batch whose

@@ -18,7 +18,7 @@ use crate::agent::status::{bar_status, status_text, StatusText};
 use crate::app_state::AppState;
 use crate::render::{Element, RenderElement, Rendered, RowAsk};
 use crate::row_count::{display_width_ansi, truncate_to_width};
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::turn_phase::TurnPhase;
 use std::sync::{Arc, Mutex};
 
 /// What separates the name from the model group, and the width it costs.
@@ -34,10 +34,24 @@ const STATUS_BG: &str = "\x1b[48;5;237m";
 const STATUS_FG: &str = "\x1b[38;5;245m";
 const STATUS_RESET: &str = "\x1b[0m";
 
-/// The dot's two states. Streaming is green and idle takes the bar's own
-/// foreground, so the bar needs no separate "idle" colour to stay subordinate.
+/// The dot's colour for a running turn. Idle takes the bar's own foreground,
+/// so the bar needs no separate "idle" colour to stay subordinate.
 pub(crate) const DOT_STREAMING: &str = "\x1b[38;5;41m";
-const DOT_IDLE: &str = STATUS_FG;
+
+/// The dot's colour in `phase` — one place decides, so two running phases
+/// cannot drift apart because the colour was spelled at two call sites.
+///
+/// Streamed and waiting-for-a-retry are the **same green today**, deliberately:
+/// both mean the turn is in flight, and a second colour would be a second thing
+/// to explain. They are distinguishable *here* (this reads the enum, not a
+/// flag), so giving a back-off its own colour — yellow for "waiting", say — is
+/// a change to this one match arm and nothing else.
+fn dot_colour(phase: TurnPhase) -> &'static str {
+    match phase {
+        TurnPhase::Idle => STATUS_FG,
+        TurnPhase::Streaming | TurnPhase::WaitingRetry => DOT_STREAMING,
+    }
+}
 
 /// The dot is `●` where there is room and a space where there is not — on a
 /// three-column terminal a real dot would leave the name no columns at all.
@@ -95,7 +109,7 @@ fn dot_cell(width: usize) -> (&'static str, &'static str, usize) {
 /// so a long session name uses the whole gap and ends in an ellipsis instead of
 /// stopping short and leaving a hole. The model group is measured first, because
 /// it is the part with nothing to give.
-pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> String {
+pub(crate) fn status_bar(text: &StatusText, width: usize, phase: TurnPhase) -> String {
     // Owned because the fit *pops* — that is the whole drop mechanism, and a
     // borrowed slice cannot be popped from. One clone per bar, on a path that is
     // about to allocate the row anyway.
@@ -152,7 +166,7 @@ pub(crate) fn status_bar(text: &StatusText, width: usize, streaming: bool) -> St
         (false, false) => format!("{name}{BAR_SEPARATOR}{group}"),
     };
 
-    let dot = if streaming { DOT_STREAMING } else { DOT_IDLE };
+    let dot = dot_colour(phase);
     let (air, gap, dot_cols) = dot_cell(width);
     let pad = width
         .saturating_sub(dot_cols)
@@ -196,7 +210,6 @@ struct StatusItem {
     /// completion's count is current at the next render. `None` before the
     /// first agent is built.
     usage: Option<Arc<Mutex<crate::agent::SessionUsage>>>,
-    streaming: Arc<AtomicBool>,
 }
 
 impl StatusItem {
@@ -235,7 +248,11 @@ impl RenderElement for StatusItem {
         // status still paints its row (dot + padding) rather than vanishing —
         // the row is the frame's furniture, and its content is whatever the
         // sources say now.
-        let row = status_bar(&text, term_w, self.streaming.load(Ordering::Relaxed));
+        // Read off the store, not held: the bar element owns the `AppState`
+        // (everything else on the row already comes from it), so the phase
+        // needs no handle of its own and cannot go stale between compose and
+        // paint.
+        let row = status_bar(&text, term_w, self.app_state.turn_phase().get());
         Rendered {
             rows: vec![row],
             caret: None,
@@ -252,11 +269,6 @@ impl RenderElement for StatusItem {
 pub(crate) fn status(
     app_state: Arc<AppState>,
     usage: Option<Arc<Mutex<crate::agent::SessionUsage>>>,
-    streaming: Arc<AtomicBool>,
 ) -> Element {
-    Element::new(StatusItem {
-        app_state,
-        usage,
-        streaming,
-    })
+    Element::new(StatusItem { app_state, usage })
 }

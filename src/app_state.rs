@@ -213,6 +213,16 @@ pub struct State {
 /// `Arc<AppState>`; the REPL loop clones the same `Arc`.
 pub struct AppState {
     state: Mutex<State>,
+    /// Whether a turn is in flight, and in which phase — the status bar's dot
+    /// and the input row's "is a turn running" fact.
+    ///
+    /// Outside the state mutex on purpose: it is written at every attempt
+    /// boundary and read on every paint, and it carries one plain value with
+    /// no invariant spanning two fields, so there is nothing a lock would
+    /// protect. Everything else in here is menu state; this is turn state, and
+    /// the bar is a UI reader of it — which is why it is *not* on `Content`
+    /// (`doc/261030_rig_direct_drive.md` §5c).
+    turn_phase: crate::turn_phase::TurnPhaseHandle,
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +326,7 @@ impl AppState {
         repo: Option<JsonlSessionRepo>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
+            turn_phase: crate::turn_phase::TurnPhaseHandle::default(),
             state: Mutex::new(State {
                 // Empty on purpose. `config.params` arrives seeded from the
                 // global alone, so the caller's first
@@ -881,6 +892,25 @@ impl AppState {
     pub fn bar_identity(&self) -> (Option<String>, Option<String>) {
         let st = self.state.lock();
         (st.session_name.clone(), st.session_first_message.clone())
+    }
+
+    /// Which phase the turn is in — the bar's dot and the input row's
+    /// "running" test.
+    ///
+    /// Written by the turn (an attempt going out, a retryable failure, the
+    /// turn ending) and read at render, so a repaint always sees the current
+    /// one. Cloned out rather than returning the value because the input
+    /// element holds the handle across paints, the same pull-the-live-source
+    /// shape `usage_handle` has; the bar reads through the store it already
+    /// owns.
+    pub fn turn_phase(&self) -> crate::turn_phase::TurnPhaseHandle {
+        self.turn_phase.clone()
+    }
+
+    /// Set the turn's phase. The turn is the only writer: it is the path that
+    /// knows an attempt started, failed for a retry, or ended.
+    pub fn set_turn_phase(&self, phase: crate::turn_phase::TurnPhase) {
+        self.turn_phase.set(phase);
     }
 
     /// Fill the bar's message label when the cycle view has none: on the

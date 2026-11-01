@@ -322,6 +322,41 @@ user's rule asks for.
 
 One position, one function: the session and the wire cannot disagree about where the user spoke.
 
+### 5c. The status dot is the turn's, not an attempt's
+
+The bar's dot used to be a `bool` on `Content` — "a response is streaming", flipped by
+`begin_response`/`end_response`. A retry breaks that reading: the turn is still in flight while it
+waits out a back-off, but the attempt is over, so `end_response` at the retry boundary dropped the
+dot to grey for the length of the delay and lit it again at the next `begin_response`. One turn read
+as "done, then started".
+
+So the fact is three states, in `src/turn_phase.rs`:
+
+- `Idle` — no turn;
+- `Streaming` — a request is out and its items are arriving;
+- `WaitingRetry` — an attempt failed and the turn is waiting to re-issue it.
+
+It lives on **`AppState`**, not `Content`. It is turn state — the same shelf as the model, the
+reasoning level and the session identity, all of which the bar already reads at render — and the bar
+is a UI reader of it. Content writes text; it does not decide what the bar says. The element holds
+`Arc<AppState>` already, so the phase needs no handle of its own and cannot go stale between compose
+and paint; the input row reads the same handle for its "is a turn running" test, which is why
+`WaitingRetry::is_running()` is true.
+
+`Streaming` and `WaitingRetry` paint the **same green**, deliberately: both mean the turn is in
+flight, and a second colour would be a second thing to explain. The distinction is real at the point
+the colour is chosen (`ui::bar::dot_colour`'s match), so giving a back-off its own colour is a
+change to one match arm.
+
+Two ordering rules fall out, and both are load-bearing:
+
+- **Set the phase before the content write it belongs with.** The frame is re-emitted by content
+  writes, and the bar reads the phase at render — so a phase set after the write is a bar painted in
+  the previous state. The turn sets `Streaming` before `begin_response`, `WaitingRetry` before the
+  attempt's tail flush, and `Idle` before the turn's closing flush.
+- **Ending an attempt is not ending the turn.** `Content::end_response` is the tail flush alone now
+  (it no longer touches the phase); the turn decides whether that attempt was the last.
+
 ### 6. Module plan
 
 - `src/agent/drive.rs` — the loop above.
@@ -336,6 +371,8 @@ One position, one function: the session and the wire cannot disagree about where
   rules the key pump and the loop's exit share.
 - `src/agent/sampling.rs` — the per-boundary request composition (§5), and the two override
   lifetimes.
+- `src/turn_phase.rs` — `TurnPhase` and its shared handle (§5c). Turn state on `AppState`; the bar
+  and the input row are its readers.
 - `src/agent/parts.rs` — `CallPart`, the single-part builder (`preprocess_args` + `ToolResult`), the
   parts-list predicate, and `split_id` minting. The only module that decides what a part looks like.
 - `src/agent/tool_shape.rs` — the `preprocess_args` table, one entry per live tool. Registered

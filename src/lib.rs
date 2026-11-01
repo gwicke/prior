@@ -36,6 +36,7 @@ pub mod settings_editor;
 pub mod settings_watch;
 pub mod tool_args;
 pub mod turn_overrides;
+pub mod turn_phase;
 pub mod v25_clear;
 pub mod v25_commands;
 pub mod v25_listing_node;

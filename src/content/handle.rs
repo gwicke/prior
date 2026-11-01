@@ -78,10 +78,6 @@ pub struct Content {
     /// The content boundary/separator state: the last declared kind,
     /// its segment-closed flag, and the held blank rows.
     pub(crate) boundary: ContentBoundary,
-    /// Whether a turn is in flight — the bar dot's only state, flipped in
-    /// `begin_response`/`end_response`. Owned by content (the path that knows
-    /// when a response starts/ends); the frame reads it via a shared handle.
-    pub(crate) streaming: Arc<AtomicBool>,
     /// The formatting span's tripwire: raised while a write builds
     /// its `ContentWrite` outside the hub lock, cleared when the write ends
     /// (`SpanGuard`). The proof that the unlocked span is safe — one writer
@@ -202,7 +198,6 @@ impl Content {
             show_reasoning,
             last_tool: Mutex::new(None),
             boundary: ContentBoundary::new(),
-            streaming: Arc::new(AtomicBool::new(false)),
             building: AtomicBool::new(false),
             usage: Mutex::new(None),
             quiet: false,
@@ -1206,11 +1201,6 @@ impl Content {
     }
 
     pub(crate) fn begin_response(&self) {
-        // The bar's dot goes green for the turn. Set here rather than at the
-        // call site that builds the text: this layer draws the bar, and a turn
-        // starting is exactly when its state changes.
-        self.streaming
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         // One render path for every run (B3c). There used to be a second one
         // for a non-tty stdout: buffer the whole response and render it as one
         // markdown block at the end. Two paths meant every replay test — a
@@ -1406,19 +1396,23 @@ impl Content {
         self.write_segment_tail(current_width, &answer, &thinking);
     }
 
+    /// Close a response's streamed text: finalize both documents and emit
+    /// their remainders.
+    ///
+    /// Text only — the status bar's dot is not content's, and neither is the
+    /// turn's phase. Both live on `AppState`, where the bar reads them
+    /// (`doc/261030_rig_direct_drive.md` §5c). The retry path calls this at
+    /// each attempt boundary for the flush alone, and the turn sets the phase
+    /// around it.
     pub(crate) fn end_response(&self) {
-        // Before the flush, so the last bar of the turn is still the streaming
-        // one; the bar painted after this is the idle one.
-        self.streaming
-            .store(false, std::sync::atomic::Ordering::Relaxed);
         let current_width = self.width();
-        // Streaming is over, so each remainder comes back as one buffer: strip
-        // it whole rather than carry a "might still be trailing" state across
-        // chunks `end_response` will never see again. Each half is then emitted
-        // as its own normalized block by `write_segment_tail`, which also
-        // declares the turn's last flush closed — the row *between* this
-        // response and whatever comes next is `boundary_spacer`'s, and writing
-        // one here would make two.
+        // This attempt is over, so each remainder comes back as one buffer:
+        // strip it whole rather than carry a "might still be trailing" state
+        // across chunks this flush will never see again. Each half is then
+        // emitted as its own normalized block by `write_segment_tail`, which
+        // also declares the attempt's last flush closed — the row *between*
+        // this response and whatever comes next is `boundary_spacer`'s, and
+        // writing one here would make two.
         let mut answer: Vec<u8> = Vec::new();
         {
             // Finalize the answer document.
@@ -1671,29 +1665,27 @@ mod tests {
         app
     }
 
-    /// The dot's colour is the bar's only state, and it is **derived** from the
-    /// response lifecycle rather than passed in at a call site.
+    /// The dot's colour is the bar's only state, and it is **derived** from
+    /// the turn's phase on `AppState` rather than passed in at a call site.
     ///
-    /// Composed **once**, deliberately. The recipe is what `DrawCache` keeps, and
-    /// the two renders below differ only in `streaming` — which is the whole of
-    /// §5.1.1's split: presence is compose's, content is the element's, resolved
-    /// when it is drawn. Asserting on the *rendered* row is what makes this a
-    /// check that the element reads the flag; a flag set and never consulted
-    /// would pass a state assertion alone.
+    /// Composed **once**, deliberately. The recipe is what `DrawCache` keeps, so
+    /// the two renders below share it and differ only in the phase — which is
+    /// the whole of §5.1.1's split: presence is compose's, content is the
+    /// element's, resolved when it is drawn. Asserting on the *rendered* row is
+    /// what makes this a check that the element reads the store; a phase set and
+    /// never consulted would pass a state assertion alone.
     #[test]
     fn the_dot_follows_the_response_lifecycle() {
         let (out, _reasoning) = capturing_output(60);
-        assert!(
-            !out.streaming.load(std::sync::atomic::Ordering::Relaxed),
-            "no turn in flight, so the bar is idle"
-        );
+        let app = bar_app("[bar]");
+
         // Composed while idle — the REPL composes once per keystroke, and the
-        // turn's flag flips *after* that (agent.rs `begin_response`), so a row
-        // baked at compose time would show the previous turn's dot.
-        let area = compose_area(&out, None, Vec::new());
-        out.begin_response();
+        // phase flips *after* that (the turn sets it before `begin_response`),
+        // so a row baked at compose time would show the previous turn's dot.
+        let area = compose_area_with(&app, &out, None, Vec::new());
+        app.set_turn_phase(crate::turn_phase::TurnPhase::Streaming);
         let during = compose_rows(&area, 60);
-        out.end_response();
+        app.set_turn_phase(crate::turn_phase::TurnPhase::Idle);
         let after = compose_rows(&area, 60);
         assert!(
             during.join("\n").contains("\x1b[38;5;41m\u{25cf}"),
@@ -1702,10 +1694,6 @@ mod tests {
         assert!(
             !after.join("\n").contains("\x1b[38;5;41m\u{25cf}"),
             "and idle again once the turn is over: {after:?}"
-        );
-        assert!(
-            !out.streaming.load(std::sync::atomic::Ordering::Relaxed),
-            "and the flag went back down"
         );
     }
 
@@ -1767,33 +1755,45 @@ mod tests {
         assert!(rows[4].contains("row"), "row 4 is the menu: {:?}", rows[4]);
     }
 
-    /// The frame bar's dot is read from `streaming` at compose time rather than
-    /// handed in as `false` by whoever composed, so the frame path and the
-    /// content path cannot render the same turn differently. Asserted on the
-    /// rendered bytes: a flag nobody reads would still pass a flag check.
+    /// The frame bar's dot is read off `AppState` at compose time rather than
+    /// handed in by whoever composed, so the frame path and any other reader
+    /// cannot render the same turn differently. Asserted on the rendered bytes:
+    /// a phase set and never consulted would still pass a state assertion.
+    ///
+    /// Every running phase paints green — including a back-off, which is the
+    /// point of this test's second half: the dot must survive the wait between
+    /// attempts, not just the request itself.
     #[test]
-    fn compose_area_reads_streaming_rather_than_being_told_it() {
+    fn the_dot_reads_the_phase_off_app_state() {
         let (out, _reasoning) = capturing_output(60);
-        let idle = compose_rows(&compose_area(&out, None, Vec::new()), 60);
+        let app = bar_app("[bar]");
+        let idle = compose_rows(&compose_area_with(&app, &out, None, Vec::new()), 60);
         assert!(
             !idle[1].contains(crate::ui::bar::DOT_STREAMING),
             "no turn in flight, so the frame bar is idle: {:?}",
             idle[1]
         );
 
-        out.begin_capture();
-        out.begin_response();
-        let _ = out.end_capture();
-        let during = compose_rows(&compose_area(&out, None, Vec::new()), 60);
-        assert!(
-            during[1].contains(crate::ui::bar::DOT_STREAMING),
-            "mid-turn the frame bar goes green: {:?}",
-            during[1]
-        );
+        for phase in [
+            crate::turn_phase::TurnPhase::Streaming,
+            crate::turn_phase::TurnPhase::WaitingRetry,
+        ] {
+            app.set_turn_phase(phase);
+            let during = compose_rows(&compose_area_with(&app, &out, None, Vec::new()), 60);
+            assert!(
+                during[1].contains(crate::ui::bar::DOT_STREAMING),
+                "a running turn goes green in {phase:?}: {:?}",
+                during[1]
+            );
+        }
 
-        out.begin_capture();
-        out.end_response();
-        let _ = out.end_capture();
+        app.set_turn_phase(crate::turn_phase::TurnPhase::Idle);
+        let after = compose_rows(&compose_area_with(&app, &out, None, Vec::new()), 60);
+        assert!(
+            !after[1].contains(crate::ui::bar::DOT_STREAMING),
+            "and grey once the turn ends: {:?}",
+            after[1]
+        );
     }
 
     /// The bar is **always present**: no `is_off` gate, so the
@@ -1895,7 +1895,7 @@ mod tests {
         let stack = || {
             vec![
                 Element::lines(vec![String::new()]),
-                crate::ui::bar::status(app.clone(), out.usage_handle(), out.streaming.clone()),
+                crate::ui::bar::status(app.clone(), out.usage_handle()),
             ]
         };
         let before = compose_rows(&stack(), 60);
@@ -1938,7 +1938,7 @@ mod tests {
         let stack = || {
             vec![
                 Element::lines(vec![String::new()]),
-                crate::ui::bar::status(app.clone(), out.usage_handle(), out.streaming.clone()),
+                crate::ui::bar::status(app.clone(), out.usage_handle()),
             ]
         };
         let empty = compose_rows(&stack(), 60);
@@ -1981,13 +1981,21 @@ mod tests {
     /// Mirrors `PromptSession::sync_stack`: gap, always-present bar, input, and
     /// the divider-then-overlay tail when an overlay is open.
     fn compose_area(out: &Content, input: Option<Element>, overlay: Vec<Element>) -> Vec<Element> {
+        compose_area_with(&bar_app("[bar]"), out, input, overlay)
+    }
+
+    /// [`compose_area`] over a caller's `AppState` — for the tests that move the
+    /// turn's phase, which the bar now reads off the store rather than off
+    /// `Content`.
+    fn compose_area_with(
+        app: &Arc<AppState>,
+        out: &Content,
+        input: Option<Element>,
+        overlay: Vec<Element>,
+    ) -> Vec<Element> {
         let mut stack = Vec::new();
         stack.push(Element::lines(vec![String::new()]));
-        stack.push(crate::ui::bar::status(
-            bar_app("[bar]"),
-            out.usage_handle(),
-            out.streaming.clone(),
-        ));
+        stack.push(crate::ui::bar::status(app.clone(), out.usage_handle()));
         stack.extend(input);
         if !overlay.is_empty() {
             stack.push(Element::divider());
@@ -3820,14 +3828,13 @@ mod tests {
         let (out, _reasoning) = capturing_output(40);
         let sink = record_bytes(&out);
         // Streaming with an empty buffer is R1's `input_hidden`: no input row,
-        // and so no caret to place. The element must pull the *streaming* flag,
-        // so mint it here rather than via `test_input` (which pins not-streaming).
-        out.begin_response();
+        // and so no caret to place. The element must pull the *running* phase,
+        // so mint one here rather than via `test_input` (which pins idle).
         {
             let hidden = crate::repl::input(
                 shared_editor(|_| {}),
                 "> ".to_string(),
-                out.streaming.clone(),
+                crate::repl::running_phase(),
             );
             let mut mgr = out.manager.lock().unwrap();
             mgr.configure(
