@@ -344,6 +344,32 @@ fn a_mid_turn_submit_is_delivered_at_the_next_boundary() {
         "the steer must arrive as a user message: {second}"
     );
 
+    // The screen keeps up with the session: once the steer is delivered the row
+    // is gone, so the frame must not leave a cursor blinking on it. The input
+    // element hides itself mid-turn with an empty buffer (R1), and delivery
+    // clears the buffer *before* painting the steer — which is the ordering this
+    // asserts end to end.
+    // The frame composed *by the paint* is the one that matters: the turn keeps
+    // running afterwards and the REPL legitimately shows the cursor again when
+    // its input row returns. So this is the **first** visibility escape after
+    // the steer's committed prompt line — `HIDE` when the row was cleared before
+    // the paint, `SHOW` (a caret over a row nothing occupies) when it was not.
+    let screen = bytes.lock().unwrap();
+    let screen = String::from_utf8_lossy(&screen);
+    let prompt_at = screen
+        .rfind(STEER)
+        .unwrap_or_else(|| panic!("the steer's committed prompt never painted"));
+    let after = &screen[prompt_at..];
+
+    let hide = after.find("\x1b[?25l");
+    let show = after.find("\x1b[?25h");
+    assert!(
+        matches!((hide, show), (Some(h), Some(s)) if h < s) || (hide.is_some() && show.is_none()),
+        "the paint that commits the steer must leave no caret over the emptied \
+         row (hide {hide:?}, show {show:?})"
+    );
+    drop(screen);
+
     // And it is in the session as an ordinary user `message` entry — the shape a
     // reload and a compaction both understand, with nothing marking it as a
     // steer.

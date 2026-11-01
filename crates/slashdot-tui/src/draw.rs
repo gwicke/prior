@@ -838,11 +838,27 @@ impl Draw {
     pub fn reposition(&mut self, frame: &Frame, old_h: usize) {
         if frame.height() == 0 {
             self.cache.consumed_rows = 0;
+            // An emptied area is no caret either, and this path is where a
+            // mid-turn paint lands (a content write re-emits the frame). Left
+            // alone, the cursor keeps whatever visibility the *previous* frame
+            // gave it, and a row cleared under a visible caret strands it.
+            self.write_bytes(HIDE_CURSOR);
             return;
         }
         let (tw, th) = self.watched_dims();
         let bytes = plan_reposition(&mut self.cache, frame, old_h, tw, th);
         self.write_bytes(bytes.as_bytes());
+        // The cursor follows the frame's own caret, exactly as [`Self::draw_frame`]
+        // does for a UI paint. A reposition is the other way a frame reaches the
+        // screen — the content-write path — and a frame composed with an empty
+        // mid-turn input has no caret to place, so the honest reading of that
+        // fact is the same here. Skipping it left the `SHOW` from the preceding
+        // paint standing over a row nothing occupies.
+        self.write_bytes(if frame.caret.is_some() {
+            SHOW_CURSOR
+        } else {
+            HIDE_CURSOR
+        });
     }
 
     /// The watched geometry, floored the way every frame path floors it.

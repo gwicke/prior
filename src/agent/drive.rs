@@ -445,17 +445,29 @@ impl DriveLoop {
             return false;
         };
         let steer = scheduled.steer;
-        // Paint it as a committed prompt, at the moment it becomes history. The
-        // input row is the other half of that: the text stays in the editor
-        // until now so it is editable, and delivery is what consumes it —
-        // **only if the row still holds exactly what was scheduled**.
+        // **The row is consumed before the paint, and the order is the point.**
         //
-        // Anything else there is newer work: the user edited this steer after
-        // submitting it, or began typing the next message while the boundary was
-        // pending. Clearing regardless would discard keystrokes nothing else has
-        // a copy of, and the steer itself is already in `scheduled`.
-        self.drive.content.display_committed_prompt(&steer.raw);
-        consume_input_row(self.drive.input.as_deref(), &scheduled.typed);
+        // `display_committed_prompt` recomposes the frame, and the input element
+        // decides its own caret from the buffer it holds at that moment: mid-turn
+        // with an empty buffer it asks for no rows and renders no caret, so the
+        // frame draws `HIDE_CURSOR` and the row is correctly bare. Clearing
+        // *after* the paint instead would compose the frame while the buffer
+        // still held the steer — one input row, with a caret sitting at its end —
+        // and leave that caret on screen over a row the steer no longer occupies.
+        //
+        // The text stays in the editor until now so it is editable, and delivery
+        // is what consumes it — **only if the row still holds exactly what was
+        // scheduled**. Anything else there is newer work: the user edited this
+        // steer after submitting it, or began typing the next message while the
+        // boundary was pending. Clearing regardless would discard keystrokes
+        // nothing else has a copy of, and the steer itself is already in
+        // `scheduled`.
+        commit_steer_to_screen(
+            self.drive.input.as_deref(),
+            &self.drive.content,
+            &scheduled.typed,
+            &steer.raw,
+        );
         if let Err(error) = session.append_message(&Message::user(&steer.text)).await {
             self.drive
                 .content
@@ -932,6 +944,25 @@ impl DriveLoop {
     }
 }
 
+/// Consume the input row, then paint the steer as a committed prompt — in that
+/// order, because the paint is what composes the frame.
+///
+/// **The two steps are one function so the order cannot be inverted.** The input
+/// element decides its own caret from the buffer at compose time: mid-turn with
+/// an empty buffer it asks for no rows and renders no caret, so the frame draws
+/// `HIDE_CURSOR` over a row that is genuinely gone. Painting first would compose
+/// with the steer still in the buffer — one input row with a caret at its end —
+/// and that caret would stay on screen over a row nothing occupies.
+fn commit_steer_to_screen(
+    row: Option<&std::sync::Mutex<crate::repl::LineEditor>>,
+    content: &crate::content::Content,
+    scheduled: &str,
+    raw: &str,
+) {
+    consume_input_row(row, scheduled);
+    content.display_committed_prompt(raw);
+}
+
 /// Empty the input row if — and only if — it still holds the text a steer was
 /// scheduled from.
 ///
@@ -1071,6 +1102,48 @@ mod tests {
             "now do something else",
             "the next message must not be swallowed by a pending steer"
         );
+    }
+
+    /// The two steps are one call, so the order cannot be written the wrong way
+    /// round. Asserted through the observable end state: after committing, the
+    /// row is empty and the steer is in the transcript.
+    ///
+    /// The *visual* half — that the frame then composites no caret — is
+    /// `Content`'s own rule (`a_mid_turn_paint_takes_its_caret_from_the_buffer_at_compose_time`)
+    /// and `tests/mid_turn_steer.rs`, which drives the real binary.
+    #[test]
+    fn committing_a_steer_empties_the_row_it_came_from() {
+        let row = row_with("steer text");
+        let content = crate::content::Content::with_size(
+            crate::settings::default_show_reasoning_handle(),
+            crate::termio::TermSize {
+                width: 40,
+                height: 24,
+            },
+        );
+        commit_steer_to_screen(Some(&row), &content, "steer text", "steer text");
+        assert_eq!(
+            row.lock().unwrap().text(),
+            "",
+            "the row is consumed, so the frame that follows has no caret to place"
+        );
+    }
+
+    /// An edit made between scheduling and delivery survives the commit: the row
+    /// is not consumed, so the frame keeps its caret over text the user still
+    /// owns.
+    #[test]
+    fn committing_a_steer_leaves_a_row_that_has_since_changed() {
+        let row = row_with("steer text, edited");
+        let content = crate::content::Content::with_size(
+            crate::settings::default_show_reasoning_handle(),
+            crate::termio::TermSize {
+                width: 40,
+                height: 24,
+            },
+        );
+        commit_steer_to_screen(Some(&row), &content, "steer text", "steer text");
+        assert_eq!(row.lock().unwrap().text(), "steer text, edited");
     }
 
     /// No REPL, no row: piped and batch input have nothing to clear, and this
