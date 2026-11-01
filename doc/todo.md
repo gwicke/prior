@@ -9,12 +9,23 @@ and link a doc/ and/or commit hash
       over `run.messages()`, tools state their own call shape, `"continue"` is gone — a retry
       re-issues the attempt — and a mid-turn submit is a real user message delivered at the next
       call boundary. Remaining: **6** (cleanup, below).
-- [ ] direct-drive phase 6 cleanup: rewrite doc/261026_tool_path_relativization.md + `_impl.md`,
-      which still describe `normalize` and `PreparedEdit` as current, and decide
-      doc/261026_rig_steering.md's fate (superseded except as a rig-facts reference).
+- [ ] direct-drive phase 6 cleanup: stale comments naming deleted machinery (`LoggingHook`,
+      `TurnTranscript`, `prepare_edit_call`, `TurnPersistence`) in agent/build.rs, agent/turn.rs,
+      agent/transcript.rs, session/*, tools.rs, content/preview.rs, tool_args.rs; six broken rustdoc
+      links (`cargo doc --document-private-items`); rewrite doc/261026_tool_path_relativization.md +
+      `_impl.md`, which still describe `normalize` and `PreparedEdit` as current; decide
+      doc/261026_rig_steering.md's fate (superseded except as a rig-facts reference); record the rig
+      version-pin decision (§7.1).
 - [x] Retain a partial turn across a retry: the text is written to the session, marked as a pending
       turn, and the retried request continues from it. Also resumes on an empty submit.
       doc/261102_partial_turn_retention.md; rig facts pinned in tests/rig_replay_rules.rs.
+- [ ] reasoning metadata: a stored `reasoning_levels` override does not reach the pre-calculated
+      prior→backend map. `ModelSettings::apply_to_entry` overlays costs/context/indices/description
+      and skips `reasoning_levels` / `supports_reasoning`, so a Ctrl-E of either is silently inert
+      (`model_catalog.rs` `overlay`). Fixing it properly needs the setting to define a *complete*
+      mapping — validation of arbitrary backend spellings, precedence against the catalog, and what
+      "unsupported" means for a hand-written list — so it is deferred rather than patched. Until
+      then the catalog is the map's only source, and `reasoning_map`'s docs say so.
 - [ ] sandbox R3g: macOS (three Seatbelt rules + a profile generator, reusing
       `egress::host_allowed`; `curl`/`git` honour `ALL_PROXY=socks5h://` for http and https;
       HTTP-only clients now come through R3i's front end instead). R4 (Landlock, per-path unix

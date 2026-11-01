@@ -10,8 +10,11 @@
 //! - the same lines **trailed on a steering message** apply to the rest of that
 //!   user turn only, and are exactly [`TurnOverrides`].
 //!
-//! So the composition is a function of (live params, this turn's overrides), read
-//! fresh at each `CallModel`. That is why it lives on the drive loop rather than
+//! So the composition is a function of (live params, live map, this turn's
+//! overrides), read fresh at each `CallModel`. The map is read live for the same
+//! reason and read *only* — a prior level is never mapped to a backend level
+//! here; the backend spelling is looked up in the pre-calculated map and
+//! formatted into a payload. That is why it lives on the drive loop rather than
 //! in a `RequestPatch`: `prepare_request` merges an `additional_params` patch
 //! key-wise, so a cleared knob could not be removed (an anthropic `thinking`
 //! block would survive a switch to `off`), and the patch has no vocabulary for
@@ -38,9 +41,14 @@ pub(crate) struct Sampling {
     app_state: Option<Arc<crate::app_state::AppState>>,
     /// What this agent was built with, for the `None` case above.
     baked: ModelParams,
-    /// The wire pair and routing, as [`request_additional_params`] spells them.
+    /// That same agent's prior → backend reasoning map, the baked fallback for
+    /// the `None` case. With an app state the map is re-read at each boundary,
+    /// because a Ctrl-E of the model's metadata moves it and nothing rebuilds
+    /// the agent for that.
+    baked_map: crate::params::ReasoningMap,
+    /// The wire provider and routing, as [`request_additional_params`] spells
+    /// them.
     provider: String,
-    model: String,
     routing: Option<crate::model_settings::Routing>,
     /// This turn's overrides: the lines typed on the prompt, plus any trailed on
     /// a steer, later winning. `Mutex` because a steer is scheduled from the key
@@ -53,18 +61,28 @@ impl Sampling {
     pub(crate) fn new(
         app_state: Option<Arc<crate::app_state::AppState>>,
         baked: ModelParams,
+        baked_map: crate::params::ReasoningMap,
         provider: String,
-        model: String,
         routing: Option<crate::model_settings::Routing>,
         overrides: TurnOverrides,
     ) -> Self {
         Self {
             app_state,
             baked,
+            baked_map,
             provider,
-            model,
             routing,
             overrides: Mutex::new(overrides),
+        }
+    }
+
+    /// The prior → backend map in force right now. The live row's when there is
+    /// an app state, so a metadata edit reaches the next request; the agent's
+    /// baked map otherwise.
+    fn map(&self) -> crate::params::ReasoningMap {
+        match &self.app_state {
+            Some(app) => app.reasoning_map(),
+            None => self.baked_map.clone(),
         }
     }
 
@@ -99,7 +117,7 @@ impl Sampling {
         let params = self.params();
         spec.temperature = params.temperature;
         spec.additional_params =
-            request_additional_params(&self.provider, &self.model, &params, self.routing.as_ref());
+            request_additional_params(&self.provider, &params, &self.map(), self.routing.as_ref());
     }
 
     fn overrides(&self) -> TurnOverrides {
@@ -114,13 +132,23 @@ impl Sampling {
 mod tests {
     use super::*;
 
+    /// An unknown-support model maps its static spellings, which is what these
+    /// tests need: the map is an input here, not the subject.
+    fn openai_map() -> crate::params::ReasoningMap {
+        crate::params::reasoning_map("openai", &crate::params::ReasoningSupport::unknown())
+    }
+
+    fn anthropic_map() -> crate::params::ReasoningMap {
+        crate::params::reasoning_map("anthropic", &crate::params::ReasoningSupport::unknown())
+    }
+
     fn sampling(overrides: TurnOverrides) -> (Sampling, Arc<crate::app_state::AppState>) {
         let app = crate::app_state::AppState::for_test(test_settings());
         let sampling = Sampling::new(
             Some(app.clone()),
             ModelParams::default(),
+            anthropic_map(),
             "anthropic".to_string(),
-            "claude-sonnet-4-5".to_string(),
             None,
             overrides,
         );
@@ -195,6 +223,42 @@ mod tests {
         );
     }
 
+    /// A reasoning level reaches the wire as the *pre-calculated map* says, not
+    /// as a re-derivation: the payload carries the map's spelling for the level
+    /// in force. The old support-based re-derivation would have sent `low` here.
+    ///
+    /// Driven through the `None`-app-state path so the map under test is the one
+    /// passed in — the live-row read is `a_mid_turn_menu_commit_reaches_the_next_composition`'s
+    /// subject.
+    #[test]
+    fn a_reasoning_level_is_formatted_from_the_map_not_re_derived() {
+        let map = crate::params::reasoning_map(
+            "deepseek",
+            &crate::params::ReasoningSupport::new(vec!["max".into(), "high".into(), "low".into()]),
+        );
+        let sampling = Sampling::new(
+            None,
+            ModelParams {
+                reasoning: Some(crate::params::ReasoningLevel::Med),
+                ..Default::default()
+            },
+            map.clone(),
+            "deepseek".to_string(),
+            None,
+            TurnOverrides::default(),
+        );
+        let mut spec = RunSpec::new();
+        sampling.apply(&mut spec);
+        let sent = &spec.additional_params.as_ref().expect("a payload")["reasoning_effort"];
+        assert_eq!(sent, "medium", "DeepSeek's own table maps our `med` there");
+        assert_eq!(
+            sent,
+            map[crate::params::ReasoningLevel::Med.rank() as usize]
+                .as_deref()
+                .unwrap(),
+        );
+    }
+
     /// Without an app state there is nothing to read, and the baked params are
     /// the answer — the piped/batch and summarizer paths.
     #[test]
@@ -205,8 +269,8 @@ mod tests {
                 temperature: Some(0.15),
                 ..Default::default()
             },
+            openai_map(),
             "openai".to_string(),
-            "gpt-4o".to_string(),
             None,
             TurnOverrides::default(),
         );

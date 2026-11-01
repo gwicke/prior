@@ -11,7 +11,7 @@
 //! Nothing else depends on this module; [`run_interactive`] is the entry point
 //! `main` awaits, and it returns when the user quits.
 
-use crate::agent::build::{create_agent, effective_params, AgentConfig};
+use crate::agent::build::{create_agent, AgentConfig};
 
 use crate::agent::status::resolved_context_limit;
 use crate::agent::{build_session_ctx, ensure_session, record_reasoning_change};
@@ -546,7 +546,11 @@ impl Interactive {
                     .as_ref()
                     .and_then(|p| crate::persona::get_persona(p));
             }
-            match create_agent(new_cfg.clone()).await {
+            // The map is the *new target's*, read from the resolved row so a
+            // model switch carries its own mapping. `Sampling` re-reads it live
+            // per call, so this only seeds the no-app-state fallback.
+            let map = self.app_state.reasoning_map();
+            match create_agent(new_cfg.clone(), map).await {
                 Ok(mut new_agent) => {
                     new_agent.attach_app_state(self.app_state.clone());
                     self.app_state.activate_agent(Arc::from(new_agent));
@@ -711,9 +715,16 @@ impl Interactive {
             return LoopCtl::Continue;
         }
         let input = split.text;
-        let (effective_params, notes) = effective_params(&self.app_state, &split.overrides);
-        for n in &notes {
-            self.config.content.display_text(n);
+        let effective_params = split.overrides.apply(&self.app_state.params());
+        // An override that lands on a different backend spelling is disclosed
+        // here, from the pre-calculated map: this is the one moment the user
+        // asked for a level, and the note says where it goes rather than
+        // re-deriving the mapping (doc/261030_rig_direct_drive.md §5).
+        if let Some(note) = crate::params::reasoning_mapped_note(
+            split.overrides.reasoning,
+            &self.app_state.reasoning_map(),
+        ) {
+            self.config.content.display_text(&note);
         }
         let turn_overrides = split.overrides;
         // Safety net: any code path that drops the in-memory session
@@ -854,7 +865,8 @@ impl Interactive {
         // Normal prompt — create the agent lazily on first use
         // (loop-side, applied config; published to the slot).
         if self.app_state.agent().is_none() {
-            match create_agent(self.config.clone()).await {
+            let map = self.app_state.reasoning_map();
+            match create_agent(self.config.clone(), map).await {
                 Ok(mut a) => {
                     a.attach_app_state(self.app_state.clone());
                     self.app_state.activate_agent(Arc::from(a));

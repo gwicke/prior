@@ -198,7 +198,7 @@ pub(crate) async fn generate_compaction(
     let mut agent = app_state.agent();
     if matches!(mode, CompactSummaryMode::Llm) && agent.is_none() {
         let cfg = app_state.config_snapshot();
-        match create_agent(cfg).await {
+        match create_agent(cfg, app_state.reasoning_map()).await {
             Ok(a) => {
                 let a: Arc<CodeAgent> = Arc::from(a);
                 app_state.activate_agent(a.clone());
@@ -615,7 +615,7 @@ pub(crate) async fn generate_branch_summary(
     let mut agent = app_state.agent();
     if matches!(mode, CompactSummaryMode::Llm) && agent.is_none() {
         let cfg = app_state.config_snapshot();
-        match create_agent(cfg).await {
+        match create_agent(cfg, app_state.reasoning_map()).await {
             Ok(a) => {
                 let a: Arc<CodeAgent> = Arc::from(a);
                 app_state.activate_agent(a.clone());

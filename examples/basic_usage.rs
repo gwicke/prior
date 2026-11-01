@@ -11,33 +11,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prior::settings::default_show_reasoning_handle(),
     ));
 
-    // 2. Create the agent with a simple config struct
+    // 2. The model's prior -> backend reasoning map, composed from the catalog.
+    //    Callers with an `AppState` read it from there instead; this example has
+    //    none, so it composes the same value directly.
+    let (provider, model) = (
+        "anthropic".to_string(),
+        "claude-3-5-sonnet-latest".to_string(),
+    );
+    let map = prior::params::reasoning_map(
+        &provider,
+        &prior::model_catalog::reasoning_support(&provider, &model),
+    );
+
+    // 3. Create the agent with a simple config struct
     // You no longer need to manually initialize Rig clients or builders.
-    let agent = create_agent(AgentConfig {
-        provider: "anthropic".into(),
-        model: "claude-3-5-sonnet-latest".into(),
-        content,
-        yolo: false,
-        confirm_port: None,
-        context_limit: None,
-        routing: None,
-        alias_for: None,
-        tool_call_limit: 10,
-        quiet: false,
-        params: Default::default(),
-        system_message_extension: None,
-        persona_prompt: None,
-        persona_name: None,
-        bash_auto_allow: None,
-        sandbox: None,
-        agent_prompt: None,
-        user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
-        show_reasoning_handle: prior::settings::default_show_reasoning_handle(),
-        reasoning_in_context: prior::settings::ReasoningInContextMode::Never,
-        message_log_path: None,
-        sessions_dir: None,
-    })
+    let agent = create_agent(
+        AgentConfig {
+            provider: "anthropic".into(),
+            model: "claude-3-5-sonnet-latest".into(),
+            content,
+            yolo: false,
+            confirm_port: None,
+            context_limit: None,
+            routing: None,
+            alias_for: None,
+            tool_call_limit: 10,
+            quiet: false,
+            params: Default::default(),
+            system_message_extension: None,
+            persona_prompt: None,
+            persona_name: None,
+            bash_auto_allow: None,
+            sandbox: None,
+            agent_prompt: None,
+            user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            show_reasoning_handle: prior::settings::default_show_reasoning_handle(),
+            reasoning_in_context: prior::settings::ReasoningInContextMode::Never,
+            message_log_path: None,
+            sessions_dir: None,
+        },
+        map,
+    )
     .await?;
 
     println!("--- Prior Library Example ---");

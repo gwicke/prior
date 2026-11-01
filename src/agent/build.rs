@@ -34,7 +34,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::agent::msglog::MessageLogger;
-use crate::agent::transcript::reasoning_remap_note;
 use crate::agent::CodeAgent;
 use crate::tools::{
     bsed_available, set_sandbox, Bash, EditFile, GrepText, ReadFile, SedPreview, WriteFile,
@@ -176,34 +175,6 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The params to send for this turn, plus any notes about them.
-///
-/// A `/reasoning` override is deliberately *not* remapped here. The remap lives
-/// in [`crate::params::additional_params`] — the one place that knows the
-/// provider's spelling of each level and the model's own effort table — and
-/// doing it here too would be a second implementation free to disagree with the
-/// first. So the requested level goes through untouched and this *reports* the
-/// move, via [`reasoning_remap_note`].
-pub(crate) fn effective_params(
-    app_state: &crate::app_state::AppState,
-    overrides: &crate::turn_overrides::TurnOverrides,
-) -> (crate::params::ModelParams, Vec<String>) {
-    let live = app_state.params();
-    if overrides.is_empty() {
-        return (live, Vec::new());
-    }
-    let mut notes = Vec::new();
-    if let Some(requested) = overrides.reasoning {
-        // The *wire* pair: an alias's reasoning is governed by its upstream's
-        // effort list, so the note must describe the model the request actually
-        // names (doc/261023_model_aliases.md).
-        let (provider, model) = app_state.with_config(|c| c.wire_id());
-        let support = crate::model_catalog::reasoning_support(&provider, &model);
-        notes.extend(reasoning_remap_note(requested, &support));
-    }
-    (overrides.apply(&live), notes)
-}
-
 /// The provider-specific `additional_params` for one request: prior's
 /// reasoning/top_p composition, then any provider post-processing.
 ///
@@ -212,14 +183,18 @@ pub(crate) fn effective_params(
 /// value, because rig's merging setter would leave a stale key behind on, say,
 /// anthropic's `thinking` block — so any divergence would show up as a request
 /// shape that depends on whether the turn happened to carry an override.
+///
+/// `map` is the model's [`ReasoningMap`](crate::params::ReasoningMap): the
+/// prior → backend decision, already made. Nothing here re-derives it, which is
+/// what keeps the disclosure (`/reasoning`, `/stat`, `/model`) and the wire on
+/// one answer.
 pub(crate) fn request_additional_params(
     provider: &str,
-    model: &str,
     params: &crate::params::ModelParams,
+    map: &crate::params::ReasoningMap,
     routing: Option<&crate::model_settings::Routing>,
 ) -> Option<serde_json::Value> {
-    let support = crate::model_catalog::reasoning_support(provider, model);
-    let base = params::additional_params(&provider.to_lowercase(), params, &support);
+    let base = params::additional_params(&provider.to_lowercase(), params, map);
     if provider.eq_ignore_ascii_case("openrouter") {
         // The openrouter branch in `create_agent` carries the same value, so
         // an override turn cannot lose the provider preference.
@@ -271,7 +246,18 @@ fn merge_openrouter_params(
     }
 }
 
-pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
+/// Build the agent from a config and the model's prior → backend reasoning map.
+///
+/// `reasoning_map` comes from the caller because the map belongs to the *model*
+/// and is built from the catalog overlaid with the stored record
+/// (`AppState::reasoning_map`). Passing it in keeps this function free of the
+/// app state — which owns this config, so a back-reference would be a cycle.
+/// Callers without an app state (one-shot, a summarizer) compute the same value
+/// straight from the catalog.
+pub async fn create_agent(
+    config: AgentConfig,
+    reasoning_map: crate::params::ReasoningMap,
+) -> Result<CodeAgent> {
     // The identity (`provider`/`model`) is what the session, the status bar and
     // `default_model` speak of; the *wire* pair is what the client, the params
     // and the message logger use. They differ only for an alias, whose own
@@ -279,14 +265,13 @@ pub async fn create_agent(config: AgentConfig) -> Result<CodeAgent> {
     let (wire_provider, wire_model) = config.wire_id();
     let provider = wire_provider.to_lowercase();
     let model = wire_model.clone();
-    // What this model accepts, so a level it cannot serve is remapped instead
-    // of sent and rejected. One shared composition, so the per-request path
-    // (a `/reasoning` override) cannot produce a different shape than a normal
-    // turn.
+    // The request payload, formatted from the already-made mapping. One shared
+    // composition, so the per-request path (a `/reasoning` override) cannot
+    // produce a different shape than a normal turn.
     let reasoning_json = request_additional_params(
         &wire_provider,
-        &wire_model,
         &config.params,
+        &reasoning_map,
         config.routing.as_ref(),
     );
 
@@ -943,7 +928,6 @@ fn guard<T: Tool>(
 mod tests {
     use super::*;
 
-    use crate::agent::transcript::reasoning_remap_note;
     // ---- the wire alias (doc/261023_model_aliases.md) ----
 
     fn cfg_with_alias(alias_for: Option<&str>) -> AgentConfig {
@@ -1074,6 +1058,23 @@ mod tests {
         s
     }
 
+    /// [`request_additional_params`] with the map resolved the way a caller
+    /// without an app state resolves it: straight from the catalog. Keeps these
+    /// tests written against (provider, model) pairs while the production
+    /// signature takes the pre-calculated map.
+    fn rap(
+        provider: &str,
+        model: &str,
+        params: &crate::params::ModelParams,
+        routing: Option<&crate::model_settings::Routing>,
+    ) -> Option<serde_json::Value> {
+        let map = crate::params::reasoning_map(
+            provider,
+            &crate::model_catalog::reasoning_support(provider, model),
+        );
+        request_additional_params(provider, params, &map, routing)
+    }
+
     fn app_with(params: crate::params::ModelParams) -> Arc<crate::app_state::AppState> {
         let app = crate::app_state::AppState::for_test(store_with("low"));
         app.update_config(|c| c.params = params);
@@ -1093,9 +1094,9 @@ mod tests {
             top_p: Some(0.9),
         };
         // What `create_agent` bakes...
-        let baked = request_additional_params("openai", "gpt-4o", &params, None);
+        let baked = rap("openai", "gpt-4o", &params, None);
         // ...and what the per-request path computes for the same params.
-        let per_request = request_additional_params("openai", "gpt-4o", &params, None);
+        let per_request = rap("openai", "gpt-4o", &params, None);
         assert_eq!(baked, per_request);
     }
 
@@ -1108,7 +1109,7 @@ mod tests {
             reasoning: Some(crate::params::ReasoningLevel::High),
             ..Default::default()
         };
-        let v = request_additional_params("openrouter", "anthropic/claude", &params, None)
+        let v = rap("openrouter", "anthropic/claude", &params, None)
             .expect("the reasoning block still goes out");
         let obj = v.as_object().expect("an object");
         assert!(
@@ -1136,7 +1137,7 @@ mod tests {
             ..Default::default()
         };
         let r = routing();
-        let v = request_additional_params("openrouter", "anthropic/claude", &params, Some(&r))
+        let v = rap("openrouter", "anthropic/claude", &params, Some(&r))
             .expect("routing is a preference");
         let provider = &v["provider"];
         assert_eq!(provider["only"][0], "deepinfra/fp8/flex");
@@ -1152,10 +1153,7 @@ mod tests {
     #[test]
     fn absent_routing_sends_no_provider_preferences() {
         let params = crate::params::ModelParams::default();
-        assert_eq!(
-            request_additional_params("openrouter", "anthropic/claude", &params, None),
-            None
-        );
+        assert_eq!(rap("openrouter", "anthropic/claude", &params, None), None);
     }
 
     /// An empty table is no opinion: identical to an absent key (the settings
@@ -1164,9 +1162,8 @@ mod tests {
     fn an_empty_routing_table_behaves_like_an_absent_one() {
         let params = crate::params::ModelParams::default();
         let empty = crate::model_settings::Routing::default();
-        let with_empty =
-            request_additional_params("openrouter", "anthropic/claude", &params, Some(&empty));
-        let without = request_additional_params("openrouter", "anthropic/claude", &params, None);
+        let with_empty = rap("openrouter", "anthropic/claude", &params, Some(&empty));
+        let without = rap("openrouter", "anthropic/claude", &params, None);
         assert_eq!(with_empty, without);
     }
 
@@ -1177,8 +1174,8 @@ mod tests {
         let params = crate::params::ModelParams::default();
         let r = routing();
         assert_eq!(
-            request_additional_params("openai", "gpt-4o", &params, Some(&r)),
-            request_additional_params("openai", "gpt-4o", &params, None)
+            rap("openai", "gpt-4o", &params, Some(&r)),
+            rap("openai", "gpt-4o", &params, None)
         );
     }
 
@@ -1192,9 +1189,8 @@ mod tests {
             ..Default::default()
         };
         let r = routing();
-        let baked = request_additional_params("openrouter", "anthropic/claude", &params, Some(&r));
-        let per_request =
-            request_additional_params("openrouter", "anthropic/claude", &params, Some(&r));
+        let baked = rap("openrouter", "anthropic/claude", &params, Some(&r));
+        let per_request = rap("openrouter", "anthropic/claude", &params, Some(&r));
         assert_eq!(baked, per_request);
         assert_eq!(baked.unwrap()["provider"]["only"][0], "deepinfra/fp8/flex");
     }
@@ -1216,8 +1212,8 @@ mod tests {
             effective.reasoning,
             Some(crate::params::ReasoningLevel::High)
         );
-        let with_override = request_additional_params("openai", "gpt-4o", &effective, None);
-        let without = request_additional_params("openai", "gpt-4o", &live, None);
+        let with_override = rap("openai", "gpt-4o", &effective, None);
+        let without = rap("openai", "gpt-4o", &live, None);
         assert_ne!(
             with_override, without,
             "the override must actually change what goes on the wire"
@@ -1226,7 +1222,7 @@ mod tests {
 
     /// Overrides never touch the live params — the reason there is no restore
     /// step, and the reason one cannot reach the next turn or the per-model
-    /// memory.
+    /// memory. The note tests live in `params`, next to the map they read.
     #[test]
     fn an_override_leaves_the_live_params_alone() {
         let app = app_with(crate::params::ModelParams {
@@ -1239,7 +1235,7 @@ mod tests {
             temperature: Some(0.1),
             top_p: Some(0.2),
         };
-        let (effective, _) = effective_params(&app, &overrides);
+        let effective = overrides.apply(&app.params());
         assert_eq!(
             effective.reasoning,
             Some(crate::params::ReasoningLevel::Max)
@@ -1252,66 +1248,6 @@ mod tests {
         assert_eq!(live.top_p, None);
     }
 
-    #[test]
-    fn no_overrides_means_no_notes_and_the_live_params() {
-        let app = app_with(crate::params::ModelParams {
-            reasoning: Some(crate::params::ReasoningLevel::Med),
-            ..Default::default()
-        });
-        let (effective, notes) = effective_params(&app, &Default::default());
-        assert!(notes.is_empty());
-        assert_eq!(effective, app.params());
-    }
-
-    /// A level the model cannot serve is reported, because a silent downgrade
-    /// the user cannot account for is worse than a note.
-    #[test]
-    fn a_level_the_model_lacks_is_reported() {
-        // A model that publishes only `low`, so `max` has to move down.
-        let support = crate::params::ReasoningSupport::new(vec!["low".to_string()]);
-        let note = reasoning_remap_note(crate::params::ReasoningLevel::Max, &support)
-            .expect("max cannot be served by a low-only model");
-        assert!(note.contains("max"), "{note}");
-        assert!(note.contains("low"), "{note}");
-    }
-
-    /// A pure spelling difference is not a downgrade, and must not be reported
-    /// as one: our `med` and their `medium` are the same rank.
-    #[test]
-    fn a_spelling_difference_is_not_reported_as_a_remap() {
-        let support = crate::params::ReasoningSupport::new(vec![
-            "low".to_string(),
-            "medium".to_string(),
-            "high".to_string(),
-        ]);
-        assert_eq!(
-            reasoning_remap_note(crate::params::ReasoningLevel::Med, &support),
-            None,
-            "med == medium, so nothing moved"
-        );
-    }
-
-    /// An exactly-supported level is silent.
-    #[test]
-    fn a_supported_level_is_silent() {
-        let support =
-            crate::params::ReasoningSupport::new(vec!["low".to_string(), "high".to_string()]);
-        assert_eq!(
-            reasoning_remap_note(crate::params::ReasoningLevel::High, &support),
-            None
-        );
-    }
-
-    /// No data at all must not be reported as a remap: `resolve` returns `None`
-    /// when the model publishes nothing, and silence is the honest answer.
-    #[test]
-    fn an_unknown_support_table_is_silent() {
-        let support = crate::params::ReasoningSupport::unknown();
-        assert_eq!(
-            reasoning_remap_note(crate::params::ReasoningLevel::Max, &support),
-            None
-        );
-    }
     #[cfg(unix)]
     #[test]
     fn create_private_dir_sets_0700() {

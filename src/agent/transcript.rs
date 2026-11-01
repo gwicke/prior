@@ -423,32 +423,6 @@ pub(crate) fn is_anthropic_family(provider: &str, model: &str) -> bool {
         || (provider.eq_ignore_ascii_case("openrouter") && model.starts_with("anthropic/"))
 }
 
-/// The note to show when a `/reasoning` override asks for a level `support`
-/// cannot serve, or `None` when it can.
-///
-/// Split out of [`effective_params`] so it is testable against a support table
-/// directly, with no catalog cache involved — the same reason
-/// `model_catalog::support_for_entry` is split out.
-///
-/// The comparison is on **rank**, not on the string. `resolve` returns the
-/// model's own spelling, so a model publishing `medium` for our `med` would
-/// otherwise be reported as a downgrade that never happened.
-pub(crate) fn reasoning_remap_note(
-    requested: crate::params::ReasoningLevel,
-    support: &crate::params::ReasoningSupport,
-) -> Option<String> {
-    let resolved = support.resolve(requested)?;
-    let moved = resolved
-        .parse::<crate::params::ReasoningLevel>()
-        .map(|l| l.rank())
-        != Ok(requested.rank());
-    moved.then(|| {
-        format!(
-            "note: reasoning '{}' → '{resolved}' (this model does not support it)",
-            requested.as_str()
-        )
-    })
-}
 /// The text the model should see for a tool result, or `None` for "leave it
 /// alone".
 ///

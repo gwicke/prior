@@ -312,9 +312,14 @@ deliberately **absent**, since assuming parity is the same guess that produced
 the wrong idea about temperature defaults, and an unmapped provider degrades
 to the ladder rather than to a wrong effort.
 
-The header reads its answer through `params::resolve_effort_for`, which derives
-the on-the-wire spelling from `mapping()` itself rather than re-deriving it, so
-the disclosed mapping cannot drift from the request that is sent.
+**Updated by the one-map refactor.** `params::reasoning_map` is now the *only*
+prior → backend table, total over the five presets and calculated once per model
+when the catalog is overlaid. Every UI surface reads that map
+(`v25_reasoning`, `/stat`, `/model`); `resolve_effort_for` survives only as its
+per-level builder. `additional_params` no longer maps at all — it *formats* the
+spelling the map names into the provider's payload shape, so the disclosed
+mapping and the request cannot drift by construction. See
+`doc/261030_rig_direct_drive.md` §5.
 
 ### A.5 Settings storage
 
@@ -958,13 +963,14 @@ remap note.
   beside a new `type`. Recomposing rather than patching is also what keeps the
   openrouter branch's provider preference on override turns. A test asserts the
   two paths agree for identical params, since the whole scheme rests on it.
-- **A `/reasoning` override is not remapped in the parser or in
-  `effective_params`.** The remap stays in `additional_params`, the one place
-  that knows the provider's spelling and the model's effort table. What the REPL
-  does is *report* the move, comparing **ranks** so a spelling difference (our
-  `med`, their `medium`) is not announced as a downgrade. `reasoning_remap_note`
-  is split out for testing against a support table with no catalog cache
-  involved, the same reason `model_catalog::support_for_entry` is.
+- **A `/reasoning` override is not remapped in the parser.** The REPL only
+  *reports* the move, and it now reads that answer from the same
+  `params::reasoning_map` the request builder formats — comparing **ranks**, so a
+  spelling difference (our `med`, their `medium`) is not announced as a
+  downgrade. `effective_params` and its support-based `reasoning_remap_note` are
+  gone: the note was a second derivation, and on a provider with its own request
+  table (DeepSeek `med → medium`) it disagreed with the wire. Replacement:
+  `params::reasoning_mapped_note`, tested next to the map it reads.
 - **A.10's API sketch was wrong in one respect and I nearly "fixed" it
   wrongly.** It says to chain `.merge_additional_params` onto the
   `stream_prompt` request. That method does not exist on `CompletionRequest` —

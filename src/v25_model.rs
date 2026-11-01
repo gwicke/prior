@@ -140,6 +140,25 @@ fn is_action_id(id: &str) -> bool {
 /// A value for display, or a dash when unset. The provider's own default is
 /// deliberately not shown: the live value is the question, and printing a
 /// known-but-unsent default would read as "this is what will be sent".
+/// The model's effort disclosure in prior's vocabulary: `low→low med→medium …`,
+/// omitting `off` (no backend effort) and any level the model cannot reach.
+///
+/// Empty when the provider has no effort vocabulary at all, which is why the
+/// caller renders "none" rather than an empty field.
+fn efforts_of(map: &crate::params::ReasoningMap) -> String {
+    let pairs: Vec<String> = crate::params::LADDER
+        .iter()
+        .skip(1) // `off` is never an effort
+        .zip(map.iter().skip(1))
+        .filter_map(|(level, sent)| sent.as_ref().map(|s| format!("{}→{s}", level.as_str())))
+        .collect();
+    if pairs.is_empty() {
+        "none".to_string()
+    } else {
+        pairs.join(" ")
+    }
+}
+
 fn fmt_opt(v: Option<f64>) -> String {
     v.map(crate::v25_number_param::fmt_value)
         .unwrap_or_else(|| "—".to_string())
@@ -296,14 +315,11 @@ impl SlashDotNode for ModelNode {
             facts.push(("coding".to_string(), idx(e.coding_index)));
             facts.push(("intel".to_string(), idx(e.intelligence_index)));
             facts.push(("agentic".to_string(), idx(e.agentic_index)));
-            facts.push((
-                "efforts".to_string(),
-                if e.reasoning_levels.is_empty() {
-                    "not published".to_string()
-                } else {
-                    e.reasoning_levels.join(" ")
-                },
-            ));
+            // The prior → backend mapping, in prior's own vocabulary: a reader
+            // picks a *prior* level, so the backend's spellings belong in the
+            // value, not as a list to interpret. Read from the pre-calculated
+            // map, which is the same answer the request sends.
+            facts.push(("reasoning".to_string(), efforts_of(&e.reasoning_map)));
         }
         if facts.is_empty() {
             facts.push(("catalog".to_string(), "no entry".to_string()));
@@ -1080,6 +1096,32 @@ impl SlashDotNode for DefaultModelActivateNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The model header speaks prior's vocabulary: a reader picks a *prior*
+    /// level, so the mapping — not the backend's raw list — is what it shows.
+    /// The answer comes from the pre-calculated map, so it cannot describe a
+    /// different mapping than the request sends.
+    #[test]
+    fn the_effort_disclosure_is_prior_levels_mapped_to_backend_spellings() {
+        let s = crate::params::ReasoningSupport::new(vec![
+            "max".to_string(),
+            "high".to_string(),
+            "low".to_string(),
+        ]);
+        // DeepSeek publishes no `medium`, but its own request table maps our
+        // `med` there.
+        let map = crate::params::reasoning_map("deepseek", &s);
+        assert_eq!(efforts_of(&map), "low→low med→medium high→high max→max");
+    }
+
+    #[test]
+    fn a_provider_without_a_vocabulary_discloses_none() {
+        let map = crate::params::reasoning_map(
+            "groq",
+            &crate::params::ReasoningSupport::new(vec!["low".into()]),
+        );
+        assert_eq!(efforts_of(&map), "none");
+    }
 
     fn eval(
         h: &mut crate::slashdot_menu::SlashDotHandle<'_>,

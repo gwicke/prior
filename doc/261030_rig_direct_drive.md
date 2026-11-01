@@ -526,6 +526,28 @@ commits us to maintaining the loop.
    unchanged one is a part whose result says so. `display_tool_parts` handles both the single-part
    and N-part cases from one call.
 
+- **The prior → backend reasoning map is the only mapping, and it is pre-calculated.**
+  `params::reasoning_map` is total over prior's five presets and computed once per model in
+  `model_catalog::overlay` (from the *wire* provider, so an alias is governed by its upstream).
+  Every UI surface reads it; the request builder *formats* the spelling it names rather than
+  re-deriving one. Prior levels are mapped to backend levels in exactly one place, plus the
+  formatting step at the agent level. Built from `AppState::reasoning_map()` (identity-keyed, total:
+  an active model with no row gets the catalog-only composition) and passed into `create_agent` — a
+  field on `AgentConfig` would have gone stale on a metadata Ctrl-E, since nothing in
+  `plan_rebuild`'s fingerprint moves for that. `Sampling` reads it live for the same reason it reads
+  the params live. Deleted with it: `effective_params`, `reasoning_remap_note`,
+  `provider_served_effort`, `provider_effort_mapping_summary`, `remap_effort`, `resolve_spelling`.
+  - **The note was one of three answers.** `reasoning_remap_note` compared against the model's
+    published list only, while the payload went through the provider's request table first: on
+    `deepseek` `med` the note said `low`, the request sent `medium`, and the menu header said
+    `medium`. One map read by all three cannot disagree;
+    `the_note_describes_the_payload_the_map_produces` pins it and was verified to fail against the
+    old comparison.
+  - **`None` means "no backend level"**, covering `off` and a provider with no effort vocabulary
+    alike — the same instruction to the caller, so the menus need no third state.
+  - **`/model` now discloses prior → backend pairs** rather than the backend's raw list, because a
+    reader picks a prior level.
+
 *Decided during phase-4 design and implementation:*
 
 - **A steer is a real user message, injected by rebuilding** (§5), not an aside and not a `history`

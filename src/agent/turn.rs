@@ -764,8 +764,14 @@ impl CodeAgent {
             sampling: crate::agent::sampling::Sampling::new(
                 self.app_state.clone(),
                 *params,
+                // The baked map is the fallback for a caller with no app state
+                // (piped, batch, a summarizer): the same catalog composition
+                // `AppState::reasoning_map` reads through.
+                crate::params::reasoning_map(
+                    &self.provider,
+                    &crate::model_catalog::reasoning_support(&self.provider, &self.model),
+                ),
                 self.provider.clone(),
-                self.model.clone(),
                 self.routing.clone(),
                 overrides,
             ),

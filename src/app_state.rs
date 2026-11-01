@@ -636,6 +636,32 @@ impl AppState {
         Self::resolved_entry_locked(&st, qualified_id)
     }
 
+    /// The prior → backend reasoning map for the **active** model.
+    ///
+    /// Read from the same resolved row every other disclosure reads
+    /// ([`Self::resolved_models`], keyed by [`Self::model`]), so a menu, `/stat`
+    /// and the request builder cannot describe the mapping differently.
+    ///
+    /// Total by construction: an active model with no row has neither a stored
+    /// record nor a catalog entry, and the catalog-only composition is then the
+    /// same answer `overlay` would have produced. Falling back to an empty map
+    /// instead would silently send no reasoning effort at all.
+    pub fn reasoning_map(&self) -> crate::params::ReasoningMap {
+        let active = self.model();
+        if let Some(row) = self
+            .resolved_models()
+            .iter()
+            .find(|e| e.qualified().eq_ignore_ascii_case(&active))
+        {
+            return row.reasoning_map.clone();
+        }
+        let (provider, model) = self.with_config(|c| c.wire_id());
+        crate::params::reasoning_map(
+            &provider,
+            &crate::model_catalog::reasoning_support(&provider, &model),
+        )
+    }
+
     /// [`Self::resolved_entry`] against a held guard, for callers inside the
     /// lock.
     fn resolved_entry_locked(

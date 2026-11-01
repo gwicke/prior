@@ -406,7 +406,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         SettingsStore::from_agent_config(&agent_config, &config.models, settings_path.as_deref());
     match command {
         Commands::Recipe { name: _ } => {
-            let agent = create_agent(agent_config.clone()).await?;
+            let agent =
+                create_agent(agent_config.clone(), catalog_reasoning_map(&agent_config)).await?;
             if let Some(r) = recipe {
                 let prompt = prior::config::read_prompt(r.prompt.clone(), r.prompt_file.clone())?
                     .ok_or("Recipe must have either 'prompt' or 'prompt_file'")?;
@@ -425,7 +426,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Input { prompt } => {
-            let agent = create_agent(agent_config.clone()).await?;
+            let agent =
+                create_agent(agent_config.clone(), catalog_reasoning_map(&agent_config)).await?;
             let response = agent.run_once(prompt).await?;
             if args.quiet {
                 println!("{}", response);
@@ -433,7 +435,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Chat => {
             if let Some(p) = prompt {
-                let agent = create_agent(agent_config.clone()).await?;
+                let agent =
+                    create_agent(agent_config.clone(), catalog_reasoning_map(&agent_config))
+                        .await?;
                 let response = agent.run_once(p).await?;
                 if args.quiet {
                     println!("{}", response);
@@ -445,6 +449,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// The prior → backend reasoning map for a config, composed straight from the
+/// catalog.
+///
+/// The one-shot paths never build an `AppState`, so there is no resolved row to
+/// read. This is the same composition that row comes from
+/// (`model_catalog::overlay` over the *wire* pair), so a `prior --prompt …` run
+/// maps its levels exactly as the interactive agent would.
+fn catalog_reasoning_map(config: &AgentConfig) -> prior::params::ReasoningMap {
+    let (provider, model) = config.wire_id();
+    prior::params::reasoning_map(
+        &provider,
+        &prior::model_catalog::reasoning_support(&provider, &model),
+    )
 }
 
 fn default_model(provider: &str) -> String {
