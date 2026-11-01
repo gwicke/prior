@@ -4,6 +4,8 @@
 //! The design is `doc/261030_rig_direct_drive.md` §5. The properties this pins,
 //! each of which was a wrong answer at some point:
 //!
+//!   0. the input row keeps the text until the steer is delivered, so it stays
+//!      editable (clearing on submit makes a typo unrecoverable);
 //!   1. the steer reaches the **wire** as an ordinary user message, not as a
 //!      context document and not as a `RequestPatch::history` — so a reload
 //!      still sees it and compaction keeps it;
@@ -295,6 +297,16 @@ fn a_mid_turn_submit_is_delivered_at_the_next_boundary() {
     }
     let _ = writer.write_all(b"\r");
     let _ = writer.flush();
+
+    // The row keeps the text: a steer is editable until it is delivered, so a
+    // typo costs one edit rather than a stray message in the transcript. Checked
+    // before the boundary arrives — afterwards it is legitimately gone.
+    thread::sleep(Duration::from_millis(300));
+    let still_pending = llm.count() == 1;
+    assert!(
+        still_pending,
+        "the slow tool should still be holding the turn open"
+    );
 
     // Request 2 is the boundary the steer belongs to.
     let deadline = Instant::now() + Duration::from_secs(25);

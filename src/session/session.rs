@@ -1658,23 +1658,34 @@ impl Session {
         )
     }
 
-    /// Whether the active branch ends on an assistant message, i.e. the last
-    /// user turn stopped without a reply or a tool batch finishing it.
+    /// Whether the active branch ends on a **cut-short** turn: an assistant
+    /// message prior built itself, with no provider `responseId`.
     ///
     /// The signal an empty submit resumes on
     /// (`doc/261102_partial_turn_retention.md` §7): an aborted or failed turn
     /// leaves its partial text as the branch's last message, and asking to carry
-    /// on needs no new prompt to be typed.
+    /// on needs no new prompt typed.
     ///
-    /// Deliberately not "the last user turn did not complete" by any deeper
-    /// measure: append-only entries mean the branch's tail *is* the record of
-    /// whether anything followed the turn.
+    /// **`responseId` is the discriminator, not the role.** A *finished* turn
+    /// also ends the branch on an assistant message, so keying on the role alone
+    /// would resume a turn that had already answered — asking the model to
+    /// continue a completed reply. The two are distinguishable because prior
+    /// writes a partial through
+    /// [`assistant_message(None, ..)`](crate::agent::transcript::assistant_message),
+    /// which leaves no origin, while a completed turn is stored from rig's
+    /// committed log, where `head.with_content(..)` keeps the provider's origin
+    /// and therefore its id. pi's schema has the same absence for the same
+    /// reason, so it survives a reload.
+    ///
+    /// Deliberately nothing deeper: append-only entries mean the branch's tail
+    /// *is* the record of whether anything followed the turn.
     pub async fn ends_mid_turn(&self) -> bool {
         let branch = self.get_branch().await;
         matches!(
             branch.last().map(|e| &e.content),
             Some(SessionEntryContent::Message { message })
                 if message.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                    && message.get("responseId").is_none()
         )
     }
 
@@ -3150,6 +3161,66 @@ mod tests {
         assert_eq!(replayed, call_ids, "replay must agree with disk");
 
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// The resume predicate distinguishes a cut-short turn from a finished one.
+    ///
+    /// Both end the branch on an assistant message, so the *role* cannot be the
+    /// signal: keying on it would make an empty submit "continue" a reply the
+    /// model had already completed. `responseId` is what separates them — pi
+    /// omits it for a turn prior built itself, and a completed turn is stored
+    /// from rig's committed log, which keeps the provider's origin.
+    #[tokio::test]
+    async fn ends_mid_turn_discriminates_on_the_response_id() {
+        let _tmp = tempfile::tempdir().unwrap();
+        let path = _tmp.path().join(session_filename(&chrono::Utc::now()));
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        storage
+            .write_header(&SessionHeader::new(Path::new("/test")))
+            .await
+            .unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        session
+            .append_message(&Message::user("fix it"))
+            .await
+            .unwrap();
+        // A partial: prior built it, so no response id.
+        session
+            .append_message(&crate::agent::transcript::assistant_message(
+                None,
+                vec![rig_core::message::AssistantContent::Text(
+                    rig_core::message::Text::new("halfway through"),
+                )],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            session.ends_mid_turn().await,
+            "a prior-built partial must offer a resume"
+        );
+
+        // A finished turn: same role, but it carries the provider's id.
+        session
+            .append_message(&Message::user("go on"))
+            .await
+            .unwrap();
+        session
+            .append_message(&crate::agent::transcript::assistant_message(
+                Some("msg_abc123".to_string()),
+                vec![rig_core::message::AssistantContent::Text(
+                    rig_core::message::Text::new("done"),
+                )],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !session.ends_mid_turn().await,
+            "a completed reply must not be resumed"
+        );
     }
 
     /// The synthetic continuation end to end: written once, identified by entry

@@ -199,17 +199,24 @@ impl CodeAgent {
         // the model and `next_step` re-emits the identical `CallModel`. Nothing
         // is rolled back, no turn is consumed, and no user message is appended
         // — which is why there is no `"continue"` in the transcript any more.
-        let (mut drive, persist) =
-            match self.build_drive(input, prior, params, overrides, session.clone(), resume) {
-                Ok(pair) => pair,
-                Err(error) => {
-                    // No run to drive, so no attempt loop either: the prompt is on
-                    // disk (dispatch) and the error is the whole outcome.
-                    self.log_pump_event("response_end").await;
-                    self.content.end_response();
-                    return Err(classify_stream_error(&error));
-                }
-            };
+        let (mut drive, persist) = match self.build_drive(
+            input,
+            prior,
+            params,
+            overrides,
+            session.clone(),
+            resume,
+            in_turn.as_ref().map(|i| i.session.editor_handle()),
+        ) {
+            Ok(pair) => pair,
+            Err(error) => {
+                // No run to drive, so no attempt loop either: the prompt is on
+                // disk (dispatch) and the error is the whole outcome.
+                self.log_pump_event("response_end").await;
+                self.content.end_response();
+                return Err(classify_stream_error(&error));
+            }
+        };
 
         // `output` is the returned assistant text (what `prompt()` yields).
         let mut output = String::new();
@@ -629,20 +636,24 @@ impl CodeAgent {
         }
 
         // A steer that never reached a boundary — typed after the turn's last
-        // request, or during the `Esc` that ended it — has nowhere to go. It is
-        // handed back to the input row rather than dropped: the user typed it,
-        // and the next submit should carry it. Clearing it instead would make
-        // the words vanish from a turn the model never heard.
+        // request, or during the `Esc` that ended it — has nowhere to go.
+        //
+        // The row still holds it, because scheduling no longer clears the input:
+        // that is the whole point of the editable-until-sent rule, and it means
+        // there is nothing to hand back. Discarding the *slot* is all that is
+        // left, so a stale steer cannot be delivered by the next turn's first
+        // boundary.
+        //
+        // The one case worth restoring: the row was emptied after the steer was
+        // scheduled (the user submitted, then cleared). Then the text exists
+        // only here, and losing it would swallow words the model never heard.
         if let Some(pending) = self.steer.take() {
             if let Some(sess) = it_session {
-                // Only when the row is still empty. Anything newer there is the
-                // user typing their next message, and overwriting it with an
-                // older unsent steer would lose what they meant.
                 if sess.input_is_empty() {
-                    sess.apply_prefill(&pending.raw);
+                    sess.apply_prefill(&pending.steer.raw);
+                    sess.sync_stack(self.content.as_ref(), it_label);
+                    crate::repl::paint_prompt(self.content.as_ref());
                 }
-                sess.sync_stack(self.content.as_ref(), it_label);
-                crate::repl::paint_prompt(self.content.as_ref());
             }
         }
 
@@ -686,6 +697,12 @@ impl CodeAgent {
         overrides: crate::turn_overrides::TurnOverrides,
         session: Option<Arc<Session>>,
         resume: bool,
+        // The REPL's input row, for the steer delivery to clear once the steer is
+        // consumed. Taken here rather than from `in_turn` below because
+        // `build_drive` runs before that is destructured, and the handle is a
+        // cheap `Arc` clone of state the session keeps anyway. `None` without a
+        // REPL, where there is no row.
+        input_row: Option<std::sync::Arc<std::sync::Mutex<crate::repl::LineEditor>>>,
     ) -> std::result::Result<
         (
             crate::agent::drive::DriveLoop,
@@ -759,6 +776,7 @@ impl CodeAgent {
             // `prompt()`, so a slot here would be invisible to the key pump that
             // fills it.
             steer: self.steer_slot(),
+            input: input_row,
             // `params` is this turn's composition, already carrying the prompt's
             // own override lines. The loop varies it from here.
             sampling: crate::agent::sampling::Sampling::new(

@@ -1117,8 +1117,13 @@ impl PromptSession {
     /// key pump can reach. Same handle, so the *painted* editor is emptied rather
     /// than a throwaway one — the trap that once made the first keystroke of the
     /// next prompt restore the submitted text.
-    pub(crate) fn clear_input(&self) {
-        self.editor.lock().unwrap().set("");
+    /// The shared input buffer, for the drive loop's steer delivery.
+    ///
+    /// The same `Arc` the input *element* paints from, so clearing through it is
+    /// clearing what the user sees — and reading it is reading the live row, not
+    /// a snapshot taken when the turn started.
+    pub(crate) fn editor_handle(&self) -> Arc<Mutex<LineEditor>> {
+        self.editor.clone()
     }
 
     /// Whether the input row holds nothing the user typed.

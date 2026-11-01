@@ -101,6 +101,16 @@ pub(crate) struct Drive {
     /// replaces the loop's run and must not lose them: the slot is the turn's,
     /// and the sampling state carries the overrides a steer just contributed.
     pub(crate) steer: crate::agent::steer::SteerSlot,
+    /// The REPL's input row, for the one thing a steer needs from it: clearing
+    /// the text once the steer is delivered, and only when the row still holds
+    /// what was scheduled.
+    ///
+    /// The editor rather than the whole [`crate::repl::PromptSession`]: this is
+    /// already the shared handle the input *element* paints from (`Arc<Mutex<_>>`
+    /// exists so the frame shows the live buffer), so it needs nothing else from
+    /// the session and does not outlive the turn. `None` without a REPL — piped
+    /// or batch input has no row to clear.
+    pub(crate) input: Option<std::sync::Arc<std::sync::Mutex<crate::repl::LineEditor>>>,
     pub(crate) sampling: crate::agent::sampling::Sampling,
     /// How session history is built when a steer rebuilds the run: the same
     /// three values `before_call` renders with, so the rebuilt history and the
@@ -431,14 +441,21 @@ impl DriveLoop {
         let Some(session) = self.drive.session.as_deref() else {
             return false;
         };
-        let Some(steer) = self.drive.steer.take() else {
+        let Some(scheduled) = self.drive.steer.take() else {
             return false;
         };
-        // Paint it as a committed prompt, at the moment it becomes history: the
-        // key pump cleared the input row without printing (it could not know
-        // whether a boundary would ever arrive), and a message the model is
-        // about to read must be on screen like any other the user typed.
+        let steer = scheduled.steer;
+        // Paint it as a committed prompt, at the moment it becomes history. The
+        // input row is the other half of that: the text stays in the editor
+        // until now so it is editable, and delivery is what consumes it —
+        // **only if the row still holds exactly what was scheduled**.
+        //
+        // Anything else there is newer work: the user edited this steer after
+        // submitting it, or began typing the next message while the boundary was
+        // pending. Clearing regardless would discard keystrokes nothing else has
+        // a copy of, and the steer itself is already in `scheduled`.
         self.drive.content.display_committed_prompt(&steer.raw);
+        consume_input_row(self.drive.input.as_deref(), &scheduled.typed);
         if let Err(error) = session.append_message(&Message::user(&steer.text)).await {
             self.drive
                 .content
@@ -915,6 +932,28 @@ impl DriveLoop {
     }
 }
 
+/// Empty the input row if — and only if — it still holds the text a steer was
+/// scheduled from.
+///
+/// A steer is editable until it is delivered (`src/agent/steer.rs`), so the row
+/// is untouched at schedule time and this is where the text is finally consumed.
+/// The equality is the whole guard: anything else in the row is newer work —
+/// either an edit to this steer or the beginning of the next message — and
+/// clearing it would discard keystrokes nothing else has a copy of. The steer
+/// itself is already captured in the slot, so a mismatch loses nothing.
+fn consume_input_row(row: Option<&std::sync::Mutex<crate::repl::LineEditor>>, scheduled: &str) {
+    let Some(row) = row else {
+        // No REPL: piped or batch input has no row to clear.
+        return;
+    };
+    let mut editor = row
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if editor.text() == scheduled {
+        editor.set("");
+    }
+}
+
 /// The loop's persistence, reachable after the loop is dropped.
 ///
 /// The turn pump stops by dropping the stream, so the exit path cannot ask the
@@ -995,6 +1034,51 @@ pub(crate) fn context_document(text: impl Into<String>) -> Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_with(text: &str) -> std::sync::Mutex<crate::repl::LineEditor> {
+        let mut editor = crate::repl::LineEditor::new();
+        editor.set(text);
+        std::sync::Mutex::new(editor)
+    }
+
+    /// A steer is editable until it is delivered, so the row still holds the
+    /// text when the boundary arrives — and delivery is what empties it.
+    #[test]
+    fn delivery_clears_the_row_it_was_scheduled_from() {
+        let row = row_with("use sed instead");
+        consume_input_row(Some(&row), "use sed instead");
+        assert_eq!(row.lock().unwrap().text(), "");
+    }
+
+    /// Anything else in the row is newer work. A steer edited after submitting
+    /// it, or the beginning of the next message, must survive: the steer itself
+    /// is already captured in the slot, so a mismatch costs nothing, while
+    /// clearing regardless would discard keystrokes nothing else holds.
+    #[test]
+    fn delivery_leaves_a_row_the_user_has_since_changed() {
+        let edited = row_with("use sed instead, please");
+        consume_input_row(Some(&edited), "use sed instead");
+        assert_eq!(
+            edited.lock().unwrap().text(),
+            "use sed instead, please",
+            "an edit to the steer must not be thrown away"
+        );
+
+        let next_message = row_with("now do something else");
+        consume_input_row(Some(&next_message), "use sed instead");
+        assert_eq!(
+            next_message.lock().unwrap().text(),
+            "now do something else",
+            "the next message must not be swallowed by a pending steer"
+        );
+    }
+
+    /// No REPL, no row: piped and batch input have nothing to clear, and this
+    /// must not panic on the way there.
+    #[test]
+    fn delivery_without_a_row_is_a_no_op() {
+        consume_input_row(None, "anything");
+    }
 
     /// The hint is taken, not read: one corrective message for one attempt.
     ///

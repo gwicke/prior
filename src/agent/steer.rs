@@ -56,6 +56,21 @@ pub(crate) struct Steer {
     pub(crate) overrides: TurnOverrides,
 }
 
+/// The input buffer a steer was scheduled from, so delivery can tell whether
+/// the row still holds *that* text.
+///
+/// Scheduling must not clear the row: a steer is editable until it is sent, and
+/// clearing on submit makes a typo unrecoverable. So the row keeps the text and
+/// the delivery is what empties it — and only when it still matches, because
+/// anything typed since is the user editing this steer (or starting the next
+/// message) and must not be thrown away.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Scheduled {
+    pub(crate) steer: Steer,
+    /// The editor's full text at schedule time, override lines included.
+    pub(crate) typed: String,
+}
+
 /// The steer waiting to be delivered, if any.
 ///
 /// Shared between the key pump (writer), the agent (owner) and the drive loop
@@ -63,23 +78,28 @@ pub(crate) struct Steer {
 /// non-async section, and holding a lock across an await to schedule a message
 /// would be strictly worse.
 #[derive(Clone, Default)]
-pub(crate) struct SteerSlot(Arc<Mutex<Option<Steer>>>);
+pub(crate) struct SteerSlot(Arc<Mutex<Option<Scheduled>>>);
 
 impl SteerSlot {
     /// Schedule `steer`, replacing any that has not been sent yet.
-    pub(crate) fn schedule(&self, steer: Steer) {
-        *self.lock() = Some(steer);
+    ///
+    /// `typed` is the input row's full text at this moment. Replacing is the
+    /// point (see the module docs), and it is why `typed` travels with the
+    /// steer: the pending one's `typed` must be the text the row holds *now*,
+    /// or delivery would compare against a superseded buffer.
+    pub(crate) fn schedule(&self, steer: Steer, typed: String) {
+        *self.lock() = Some(Scheduled { steer, typed });
     }
 
     /// Take the pending steer, leaving the slot empty.
     ///
     /// Taken, not read: the text becomes one message in the session exactly
     /// once. A cloned read would let two rebuilds deliver the same words.
-    pub(crate) fn take(&self) -> Option<Steer> {
+    pub(crate) fn take(&self) -> Option<Scheduled> {
         self.lock().take()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Steer>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Scheduled>> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -99,12 +119,16 @@ mod tests {
     }
 
     /// A second submit replaces the first: the slot is a slot, not a queue.
+    /// The replacement carries the row's *current* text, which is what delivery
+    /// compares against.
     #[test]
     fn scheduling_twice_keeps_only_the_last() {
         let slot = SteerSlot::default();
-        slot.schedule(steer("first"));
-        slot.schedule(steer("second"));
-        assert_eq!(slot.take(), Some(steer("second")));
+        slot.schedule(steer("first"), "first".into());
+        slot.schedule(steer("second"), "second".into());
+        let taken = slot.take().expect("a pending steer");
+        assert_eq!(taken.steer, steer("second"));
+        assert_eq!(taken.typed, "second");
     }
 
     /// Delivered once. A rebuild happens per boundary, and a steer that
@@ -112,7 +136,7 @@ mod tests {
     #[test]
     fn taking_empties_the_slot() {
         let slot = SteerSlot::default();
-        slot.schedule(steer("steer"));
+        slot.schedule(steer("steer"), "steer".into());
         assert!(slot.take().is_some());
         assert!(slot.take().is_none());
     }

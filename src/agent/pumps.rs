@@ -184,33 +184,39 @@ pub(crate) async fn dispatch_in_turn_event(
 /// (`pumps.rs`'s docs said so). It is now the steering channel: the text is
 /// split the same way a prompt is (override lines trailed on it are the turn's
 /// overrides, and it is the *steer's* copy that wins because it was typed
-/// last), scheduled into the slot, and the editor is cleared and repainted so
-/// the input row shows what actually happened rather than keeping the text.
+/// last).
+///
+/// **The row keeps the text.** A steer is editable until it is sent: clearing
+/// on submit would make a typo unrecoverable, because the text would be queued
+/// and there would be nothing left to correct. Delivery
+/// ([`crate::agent::drive::DriveLoop::deliver_steer`]) is what empties the row,
+/// and only when it still holds exactly what was scheduled — anything typed
+/// since is either an edit to this steer or the start of the next message, and
+/// neither may be thrown away.
 ///
 /// The text may be empty: an overrides-only steer changes the request shape for
 /// the rest of the turn without saying anything to the model.
 fn schedule_steer(
     content: &crate::content::Content,
-    sess: &mut crate::repl::PromptSession,
+    _sess: &mut crate::repl::PromptSession,
     text: &str,
-    label: &str,
+    _label: &str,
     steer: &crate::agent::steer::SteerSlot,
 ) {
     let split = crate::turn_overrides::split(text);
     if split.text.trim().is_empty() && split.overrides.is_empty() {
         return;
     }
-    steer.schedule(crate::agent::steer::Steer {
-        raw: text.to_string(),
-        text: split.text,
-        overrides: split.overrides,
-    });
-    // Same transition `read_input` makes on a submit: clear the real editor
-    // (not a throwaway one — the session outlives the call) and repaint, so the
-    // next compose does not put the submitted text back.
-    sess.clear_input();
-    sess.sync_stack(content, label);
-    crate::repl::paint_prompt(content);
+    steer.schedule(
+        crate::agent::steer::Steer {
+            raw: text.to_string(),
+            text: split.text,
+            overrides: split.overrides,
+        },
+        text.to_string(),
+    );
+    // No repaint either: nothing on screen changed. The row still shows what
+    // the user typed, which is now also what is scheduled.
     for w in &split.warnings {
         content.display_text(w);
     }

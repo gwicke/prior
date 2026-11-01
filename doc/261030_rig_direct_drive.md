@@ -437,10 +437,16 @@ One position, one function: the session and the wire cannot disagree about where
      request exists, so a steer rebuild charges `turn() - 1` — the interrupted step never sent
      anything and must not cost budget. The retry path keeps charging fully: its attempt *was*
      dispatched and billed.
-   - **A steer that misses its boundary goes back to the input row**, not to the transcript and not
-     into the void: the user typed it, so `prompt`'s exit puts it back (only when the row is still
-     empty — newer text wins). It is also painted as a committed prompt when it *is* delivered,
-     because a message the model reads must be on screen like any other the user typed.
+   - **A steer stays in the input row until it is delivered.** Scheduling does not clear it: a steer
+     is editable until it is sent, and clearing on submit would make a typo unrecoverable — the text
+     would be queued and there would be nothing left to correct. Delivery (`consume_input_row`)
+     empties the row *only if it still holds exactly what was scheduled*; anything else is an edit
+     to this steer or the start of the next message, and both survive.
+   - **A steer that misses its boundary needs no handback.** The row still holds it, by the rule
+     above. The slot is discarded so a later turn's first boundary cannot deliver a stale steer; the
+     one restoration is when the row was emptied after scheduling, where the text exists only in the
+     slot. It is painted as a committed prompt when it *is* delivered, because a message the model
+     reads must be on screen like any other the user typed.
    - **Asserted end-to-end**: `tests/mid_turn_steer.rs` drives the real binary, types a steer while
      a slow `bash` runs, and asserts the *second* request carries it after the tool result, as a
      `role: user` message, and that the session holds it exactly once. Verified to fail with the

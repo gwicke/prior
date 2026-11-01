@@ -292,6 +292,14 @@ when the last user turn did not complete. `handle_submit` checks the session's t
 (`Session::ends_mid_turn`) before either of its old guards, so an empty submit is a continuation
 rather than a no-op, and the overrides-only refusal is unchanged for prompts that *do* carry text.
 
+**"Did not complete" is `responseId`, not the message role.** A finished turn also ends the branch
+on an assistant message, so a role test would offer to continue a reply the model had already
+finished — the first draft did exactly that. The two are distinguishable because prior writes a
+partial through `assistant_message(None, ..)` (no origin, hence no id) while a completed turn is
+stored from rig's committed log, where the head keeps the provider's origin. pi's schema has the
+same absence for the same reason, so the signal survives a reload. Pinned by
+`ends_mid_turn_discriminates_on_the_response_id`, verified to fail on the role-only test.
+
 One refinement the implementation needed, and it settles the ordering question above:
 **the continuation is written by the resume, not by the abort.** An aborted turn's branch ends on
 the partial, which is what makes `[assistant] [user]` the next typed prompt's shape. A resume is
