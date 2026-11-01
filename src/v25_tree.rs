@@ -661,7 +661,8 @@ fn flatten_turns<'a>(
     let mut seq: usize = 0;
 
     while let Some((node, depth, branch, visible_parent)) = stack.pop() {
-        let visible = labels.contains_key(&node.entry.id);
+        let visible =
+            labels.contains_key(&node.entry.id) || leaf_id == Some(node.entry.id.as_str());
         // Read the marker before the child-frame closure takes a mutable
         // borrow of `branch_starts` to register nested spurs.
         let spur_start = visible && branch_starts.contains(node.entry.id.as_str());
@@ -3029,6 +3030,46 @@ mod tests {
             resp.active_ids,
             vec!["u2".to_string()],
             "active_ids should find leaf deep in tree"
+        );
+    }
+
+    #[test]
+    fn active_invisible_entry_shown_in_listing() {
+        // Leaf points to a toolResult (normally invisible) — it should
+        // still appear in the listing so the user can see the active
+        // entry in multi-completion turns.
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "reply"),
+                vec![node(
+                    make_entry("tr1", Some("a1"), "toolResult", "tool output"),
+                    vec![],
+                )],
+            )],
+        )];
+        let app_state = app_state_with_tree(tree);
+        app_state.set_leaf_id(Some("tr1".into()));
+        let mut tree_node = TreeListNode::new(app_state);
+        let path_args = PathArgs {
+            ids: vec![],
+            suffix: String::new(),
+            args: Default::default(),
+        };
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
+        // The toolResult entry should be in the rows now
+        assert!(
+            resp.rows.iter().any(|r| r.id == "tr1"),
+            "invisible active entry should be visible in listing"
+        );
+        // And it should be marked as current
+        let tr1_row = resp.rows.iter().find(|r| r.id == "tr1").unwrap();
+        assert!(
+            tr1_row
+                .fields
+                .iter()
+                .any(|(k, v)| k == "leaf" && matches!(v, Value::Str(s) if s == "1")),
+            "active entry should have leaf=1 field"
         );
     }
 
