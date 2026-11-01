@@ -96,6 +96,18 @@ pub(crate) struct Drive {
     /// a synthetic "your last tool call was malformed" line that became part of
     /// history would be re-read as a user instruction on every later turn.
     pub(crate) retry_hint: crate::agent::drive::RetryHint,
+    /// The steer waiting to be delivered, and this turn's request-shaping
+    /// params. Both are here rather than on [`DriveLoop`] because a rebuild
+    /// replaces the loop's run and must not lose them: the slot is the turn's,
+    /// and the sampling state carries the overrides a steer just contributed.
+    pub(crate) steer: crate::agent::steer::SteerSlot,
+    pub(crate) sampling: crate::agent::sampling::Sampling,
+    /// How session history is built when a steer rebuilds the run: the same
+    /// three values `before_call` renders with, so the rebuilt history and the
+    /// request that follows it agree about what the model may see.
+    pub(crate) reasoning_in_context: crate::settings::ReasoningInContextMode,
+    pub(crate) provider: String,
+    pub(crate) model_name: String,
 }
 
 /// Where a retry hint waits for the next request.
@@ -350,21 +362,46 @@ impl DriveLoop {
     /// the prompt *and* in the history is rejected as consecutive assistant
     /// messages, which is why the split is done here rather than by the caller.
     ///
-    /// Returns the new persister handle: the caller's old one belongs to the run
-    /// that was just dropped.
-    pub(crate) fn rebuild_from(&mut self, history: Vec<Message>) -> Option<PersistHandle> {
-        let (prompt, core) = history.split_last()?;
+    /// This is the retry half; a steer rebuilds through the same function with
+    /// one turn less charged ([`Self::rebuild_with`]), because its interrupted
+    /// step never sent a request.
+    ///
+    /// The persister is **rebased, not replaced** (design §5a): the turn, the
+    /// session and the progress flag are the same turn, so the `Arc` the pump
+    /// holds stays the same one and a rebuild can happen inside
+    /// [`Self::next`] with nobody told. `Persister::rebase` carries the one
+    /// piece of genuinely run-relative state — where writing had got to — plus
+    /// the held unit, which is closed by definition.
+    ///
+    /// Returns whether the history had a prompt to rebuild around; `false`
+    /// leaves the run untouched.
+    pub(crate) async fn rebuild_from(&mut self, history: Vec<Message>) -> bool {
+        let spent = self.run.turn();
+        self.rebuild_with(history, spent).await
+    }
+
+    /// [`Self::rebuild_from`], with the run's spent-turn count stated by the
+    /// caller.
+    ///
+    /// A steer rebuilds at a `CallModel` whose request has **not** gone out yet:
+    /// `next_step` already counted that turn, so charging it would make every
+    /// steer cost a turn of the budget for work that never happened. The retry
+    /// path has no such discount — its attempt was dispatched and billed.
+    async fn rebuild_with(&mut self, mut history: Vec<Message>, spent: usize) -> bool {
+        let Some(prompt) = history.pop() else {
+            return false;
+        };
         let mut spec = self.drive.spec.clone();
         // The turn budget is per *run*, and a rebuild makes a new one. Carrying
         // the spent turns across keeps a repeatedly failing provider from being
         // handed a fresh `tool_call_limit` on every attempt — the two budgets
         // would otherwise stop composing (retention doc §6).
-        self.turns_spent += self.run.turn();
+        self.turns_spent += spent;
         spec.max_turns = Some(self.max_turns.saturating_sub(self.turns_spent).max(1));
         let run = AgentRun::from_spec(
             &spec,
-            prompt.clone(),
-            Some(core.iter().cloned().map(Arc::new).collect()),
+            prompt,
+            Some(history.into_iter().map(Arc::new).collect()),
         );
         self.run = run;
         self.announce_cursor = self.run.projection_start();
@@ -372,13 +409,69 @@ impl DriveLoop {
         self.finished = false;
         self.abandoned = None;
         self.queue.clear();
-        let persist = Arc::new(AsyncMutex::new(Persister::new(
-            &self.run,
-            self.drive.session.clone(),
-            self.drive.content.clone(),
-        )));
-        self.persist = persist.clone();
-        Some(PersistHandle(persist))
+        self.persist.lock().await.rebase(&self.run);
+        true
+    }
+
+    /// Deliver a scheduled steer, if there is one: write it to the session as an
+    /// ordinary user message and rebuild the run around it.
+    ///
+    /// Returns whether the run was replaced. `false` covers both "nothing
+    /// scheduled" and "no session to write into" — a sessionless run has no
+    /// durable place for the message, so delivering it would put words in the
+    /// transcript the record does not hold.
+    ///
+    /// The write comes first so the rebuild reads a session that already
+    /// contains the steer; that is also what makes the steer survive a reload
+    /// and a compaction, since it is a `role: user` message like any other.
+    async fn deliver_steer(&mut self) -> bool {
+        // Checked before taking: a slot left full is a steer the turn's exit
+        // hands back to the input row. Taking it here without a session would
+        // drop words the user typed and nothing else would notice.
+        let Some(session) = self.drive.session.as_deref() else {
+            return false;
+        };
+        let Some(steer) = self.drive.steer.take() else {
+            return false;
+        };
+        // Paint it as a committed prompt, at the moment it becomes history: the
+        // key pump cleared the input row without printing (it could not know
+        // whether a boundary would ever arrive), and a message the model is
+        // about to read must be on screen like any other the user typed.
+        self.drive.content.display_committed_prompt(&steer.raw);
+        if let Err(error) = session.append_message(&Message::user(&steer.text)).await {
+            self.drive
+                .content
+                .display_error(&format!("failed to persist the steering message: {error}"));
+            return false;
+        }
+        // The steer's own override lines apply for the rest of the turn, and are
+        // later than the prompt's — hence `note_overrides`, not a replacement.
+        self.drive.sampling.note_overrides(steer.overrides);
+        // Read back rather than splicing: a splice would be a one-shot the next
+        // `CallModel` has to re-place, and the suffix would reorder as the turn
+        // progresses (retention doc §3). The rebuild's last message is the
+        // prompt, which for a steer is the steer itself.
+        let history = match crate::agent::compaction::session_context_messages(
+            session,
+            self.drive.reasoning_in_context,
+            &self.drive.provider,
+            &self.drive.model_name,
+        )
+        .await
+        {
+            Ok(history) => history,
+            Err(error) => {
+                self.drive
+                    .content
+                    .display_error(&format!("failed to rebuild after steering: {error}"));
+                return false;
+            }
+        };
+        // `turn() - 1`: the step this steer interrupted counted its own turn and
+        // never sent a request, so it must not be charged.
+        let spent = self.run.turn().saturating_sub(1);
+        self.rebuild_with(history, spent).await
     }
 
     /// The mailbox the next request's corrective hint is written into.
@@ -452,6 +545,22 @@ impl DriveLoop {
                 // is what makes this the persist boundary: mid-turn progress
                 // reaches disk before the next request goes out.
                 self.persist.lock().await.write_committed(&self.run).await;
+                // A steer enters here and nowhere else. This is the only point
+                // in a turn where history is a valid provider prefix — the
+                // assistant turn is committed and its results answered — so a
+                // steer typed mid-batch is delivered *with* the results rather
+                // than between them (`doc/261030_rig_direct_drive.md` §5).
+                //
+                // Delivering it means rebuilding the run around the session
+                // ([`Self::deliver_steer`]), because rig's committed log cannot
+                // be appended to. The rebuild is transparent to the caller: the
+                // persister is rebased in place (§5a), so the pump keeps its one
+                // handle, and `false` (no session) leaves the run untouched.
+                if self.deliver_steer().await {
+                    // The run was replaced; re-take its step so the request is
+                    // prepared against the history that now includes the steer.
+                    return Ok(Step::Advanced);
+                }
                 // Project what the model will see. The run's log holds the parts
                 // lists this loop wrote into its answers, and a parts list must
                 // never reach a provider. Projecting the *whole* history is safe:
@@ -491,6 +600,11 @@ impl DriveLoop {
                         .push(hint);
                 }
 
+                // This turn's sampling, recomposed now: a menu commit made while
+                // the turn runs, and a steer's override lines, both reach the
+                // *next* request through here and nowhere else
+                // (`src/agent/sampling.rs`).
+                self.drive.sampling.apply(&mut self.drive.spec);
                 let prepared = prepare_request(
                     &self.drive.spec,
                     &self.drive.model.capabilities(),

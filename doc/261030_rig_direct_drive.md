@@ -245,16 +245,31 @@ history, so `project` never learns that steering exists.
   - the same lines **trailed on a steering message** apply to the rest of that user turn only, and
     are exactly `TurnOverrides` (`src/turn_overrides.rs`), which already parses and layers them.
 
-The request half of both is the same: `before_call` computes the patch from
-`effective_params(app_state, turn_overrides)`, because `RequestPatch` carries `temperature`,
-`max_tokens` and `additional_params` and `prepare_request` gives the patch priority over the spec.
+The request half of both is one composition, `src/agent/sampling.rs`, read at every `CallModel`:
+
+```rust
+let live = app_state.params()            // or the baked params, with no AppState
+    .apply(turn_overrides);              // prompt's lines, then any steer's, later winning
+spec.temperature        = live.temperature;
+spec.additional_params  = request_additional_params(provider, model, live, routing);
+```
+
+**Not a `RequestPatch`.** `prepare_request` merges a patch's `additional_params` *key-wise*, so a
+knob the user cleared could not be removed — an anthropic `thinking` block would survive a switch to
+`off`, which is exactly the stale-key bug the per-turn path already had to avoid. Writing the spec
+is exact, is still one path (`prepare_request` reads it per call), and nothing else writes those two
+fields. `Sampling` replaces rather than `or`-ing for the same reason: a fallback to the previously
+composed value would quietly keep what was just turned off.
+
+The two lifetimes then fall out with no further wiring: a menu commit writes the live params and the
+next composition reads them, while a steer's lines go through `Sampling::note_overrides` and die
+with the turn.
 
 ### 5a. Rebasing the persister, so a rebuild needs no new handle
 
-A rebuild currently replaces the persister (`Persister::new`), which is why `rebuild_from` returns a
-`PersistHandle` and why the turn pump has to swap it. That return value is the only thing making an
-in-loop rebuild awkward, and it is avoidable: after a rebuild only two groups of state are
-run-relative.
+A rebuild used to replace the persister (`Persister::new`), which is why `rebuild_from` returned a
+`PersistHandle` and why the turn pump had to swap it. That return value was the only thing making an
+in-loop rebuild awkward, and it is gone: after a rebuild only two groups of state are run-relative.
 
 | state                         | after a rebuild                                                 |
 | ----------------------------- | --------------------------------------------------------------- |
@@ -310,12 +325,17 @@ One position, one function: the session and the wire cannot disagree about where
 ### 6. Module plan
 
 - `src/agent/drive.rs` — the loop above.
-- `src/agent/observer.rs` — `TurnObserver` (display, `--log-messages`, cancel; the steering drain is
-  phase 4's addition). Absorbs today's `LoggingHook`; `turn.rs` keeps the pump.
-- `src/agent/project.rs` — **the** projection: parts unpack (and, in phase 4, the steer splice),
-  nothing else. Pure and tool-agnostic, a fixed point on its own output, called by persist and by
-  request building. Today's signature is `(&[Message]) -> Vec<Message>`; phase 4 widens it to take
-  the run's asides.
+- `src/agent/observer.rs` — `TurnObserver` (display, `--log-messages`, cancel). Absorbs today's
+  `LoggingHook`; `turn.rs` keeps the pump. Steering needs nothing here: the slot is the agent's and
+  the drain is the loop's.
+- `src/agent/project.rs` — **the** projection: parts unpack, nothing else. Pure and tool-agnostic, a
+  fixed point on its own output, called by persist and by request building. Its signature stayed
+  `(&[Message]) -> Vec<Message>`: a steer never reaches it, because the steer is an ordinary user
+  message and `project` does not transform user text.
+- `src/agent/steer.rs` — `SteerSlot` and `Steer` (§5): the slot itself, plus the schedule/clear
+  rules the key pump and the loop's exit share.
+- `src/agent/sampling.rs` — the per-boundary request composition (§5), and the two override
+  lifetimes.
 - `src/agent/parts.rs` — `CallPart`, the single-part builder (`preprocess_args` + `ToolResult`), the
   parts-list predicate, and `split_id` minting. The only module that decides what a part looks like.
 - `src/agent/tool_shape.rs` — the `preprocess_args` table, one entry per live tool. Registered
@@ -402,15 +422,29 @@ One position, one function: the session and the wire cannot disagree about where
      no `"continue"` ever reached the provider. Verified to fail if a synthetic message is
      re-introduced.
    - `doc/tool_error_handling.md` §"Mid-turn failure" is retired with it.
-4. **Steering and boundary settings. Not started.** Three independently stoppable pieces:
-   1. **Sampling at the boundary.** `TurnObserver` gains `Arc<AppState>`; `before_call` computes
-      `effective_params` and puts `temperature`/`max_tokens`/`additional_params` on the patch. The
-      mid-turn menus write live params, so they take effect with no further wiring.
-   2. **`Persister::rebase`**, and `made_progress` narrowed to `answered` (§5a, §5b). Small, and
-      independent of the UI.
-   3. **The steer slot.** `SteerSlot` on `CodeAgent`; the pump stops silently dropping a mid-turn
-      submit (`pumps.rs:73` blocks `KeyOutcome::Action`); at `CallModel` the loop takes the slot,
-      writes the message, rebases and rebuilds. `Esc` clears the slot and keeps the input.
+4. **Steering and boundary settings. Done.** Three pieces, landed together because the third is what
+   makes the first two observable:
+   1. **Sampling at the boundary** — `src/agent/sampling.rs`, written into the spec at each
+      `CallModel` (§5). `CodeAgent::attach_app_state` is the wire from the loop to the live params;
+      without it (piped, batch, a summarizer) the baked params are the answer.
+   2. **`Persister::rebase`** (§5a): `rebuild_from` became `async` and rebases the shared `Arc`
+      instead of installing a new one, so `rebuild_after_partial` and the steer path both lease the
+      loop's own handle. `made_progress` had already narrowed to the streamed fold (§5b).
+   3. **The steer slot** — `src/agent/steer.rs`, filled by the turn's key pump
+      (`dispatch_in_turn_event`'s `Submit` arm, which used to drop it silently) and drained by the
+      loop at `CallModel`.
+   - **A steer is delivered at a boundary or not at all.** `next_step` counts the turn before its
+     request exists, so a steer rebuild charges `turn() - 1` — the interrupted step never sent
+     anything and must not cost budget. The retry path keeps charging fully: its attempt *was*
+     dispatched and billed.
+   - **A steer that misses its boundary goes back to the input row**, not to the transcript and not
+     into the void: the user typed it, so `prompt`'s exit puts it back (only when the row is still
+     empty — newer text wins). It is also painted as a committed prompt when it *is* delivered,
+     because a message the model reads must be on screen like any other the user typed.
+   - **Asserted end-to-end**: `tests/mid_turn_steer.rs` drives the real binary, types a steer while
+     a slow `bash` runs, and asserts the *second* request carries it after the tool result, as a
+     `role: user` message, and that the session holds it exactly once. Verified to fail with the
+     submit arm restored to dropping it.
 5. **Tools state their own call shape. Done** (`edd10e5`). A tool answers the call as it understood
    it plus that call's result: `read`/`write`/`grep`/`sed`/`bash` keep `Result<String, ToolError>`
    and gain a `preprocess_args` entry, called once at dispatch with its value carried into the part;
@@ -492,7 +526,7 @@ commits us to maintaining the loop.
    unchanged one is a part whose result says so. `display_tool_parts` handles both the single-part
    and N-part cases from one call.
 
-*Decided during phase-4 design, before implementation:*
+*Decided during phase-4 design and implementation:*
 
 - **A steer is a real user message, injected by rebuilding** (§5), not an aside and not a `history`
   patch. The patch was rejected because it is a one-shot that reorders as the turn progresses; the
@@ -501,3 +535,13 @@ commits us to maintaining the loop.
   `Drive` is per-turn and a slot there would be invisible to the REPL.
 - **A rebuild needs no new `PersistHandle`** — `Persister::rebase` mutates in place (§5a).
 - **Progress means model output** (§5b), so a steer never resets a retry back-off.
+- **Sampling is written into the spec, not pushed as a `RequestPatch`.** The patch merges
+  `additional_params` key-wise and so cannot express "this value, exactly" — a cleared knob would
+  survive. See §5.
+- **`Sampling` reads `AppState` through `CodeAgent::attach_app_state`, not `AgentConfig`.** A
+  back-reference in the config would be a cycle (`AppState` owns the config), and the one-shot paths
+  have no `AppState` at all. The two call sites are the lazy first build and the `/model` rebuild.
+- **A steer's `Esc` keeps the text on the input row rather than in the transcript**, and clears
+  nothing behind it: it was never sent, so it is not history.
+- **`Steer` carries `raw` as well as the split text.** A steer can miss its boundary, and handing
+  back a reconstruction of what the user typed would be a second spelling free to differ.

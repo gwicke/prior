@@ -547,7 +547,8 @@ impl Interactive {
                     .and_then(|p| crate::persona::get_persona(p));
             }
             match create_agent(new_cfg.clone()).await {
-                Ok(new_agent) => {
+                Ok(mut new_agent) => {
+                    new_agent.attach_app_state(self.app_state.clone());
                     self.app_state.activate_agent(Arc::from(new_agent));
                     if model_changed {
                         let model_id = new_cfg.qualified_model_id();
@@ -672,8 +673,12 @@ impl Interactive {
             // Nothing to reprint: the user typed nothing. `run_prompt_turn`
             // skips its committed-prompt line for an empty input, so the resume
             // reads as a continuation rather than as a submission.
-            self.run_prompt_turn(String::new(), self.config.params)
-                .await;
+            self.run_prompt_turn(
+                String::new(),
+                self.config.params,
+                crate::turn_overrides::TurnOverrides::default(),
+            )
+            .await;
             return LoopCtl::Continue;
         }
         if input.is_empty() {
@@ -710,6 +715,7 @@ impl Interactive {
         for n in &notes {
             self.config.content.display_text(n);
         }
+        let turn_overrides = split.overrides;
         // Safety net: any code path that drops the in-memory session
         // (notably `/new` and `/clear`) must leave us with a fresh one
         // before the first post-drop prompt — otherwise
@@ -758,7 +764,8 @@ impl Interactive {
         // *and* below, which the second call used to add by hand — and
         // shared with a directly preceding commit instead of stacked
         // (ui_draw_v2 R4).
-        self.run_prompt_turn(input, effective_params).await;
+        self.run_prompt_turn(input, effective_params, turn_overrides)
+            .await;
         LoopCtl::Continue
     }
 
@@ -837,6 +844,7 @@ impl Interactive {
         &mut self,
         input: String,
         effective_params: crate::params::ModelParams,
+        overrides: crate::turn_overrides::TurnOverrides,
     ) {
         // An empty input is a resume, not a submission: there is no prompt line
         // to reprint, and printing an empty one would read as a blank turn.
@@ -847,7 +855,10 @@ impl Interactive {
         // (loop-side, applied config; published to the slot).
         if self.app_state.agent().is_none() {
             match create_agent(self.config.clone()).await {
-                Ok(a) => self.app_state.activate_agent(Arc::from(a)),
+                Ok(mut a) => {
+                    a.attach_app_state(self.app_state.clone());
+                    self.app_state.activate_agent(Arc::from(a));
+                }
                 Err(e) => {
                     self.config
                         .content
@@ -891,6 +902,7 @@ impl Interactive {
                 &input,
                 session.clone(),
                 &effective_params,
+                overrides,
                 // The key branch exists only where there is a session to
                 // receive it — built by the REPL arm alone, i.e. interactive
                 // tty. Piped input gets no key branch.

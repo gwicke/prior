@@ -38,6 +38,21 @@ impl TurnOverrides {
         self.reasoning.is_none() && self.temperature.is_none() && self.top_p.is_none()
     }
 
+    /// `self` with `later` layered on top, per field.
+    ///
+    /// A turn's overrides arrive in more than one place — the lines typed on the
+    /// submitted prompt, then any trailed on a mid-turn steer — and the later
+    /// one wins because it is what the user asked for last. Kept here rather
+    /// than at the call site so "last wins" has one implementation, the same one
+    /// [`split`] applies within a single message.
+    pub fn overlay(self, later: Self) -> Self {
+        Self {
+            reasoning: later.reasoning.or(self.reasoning),
+            temperature: later.temperature.or(self.temperature),
+            top_p: later.top_p.or(self.top_p),
+        }
+    }
+
     /// `live` with the overrides applied, per field. Never mutates `live`.
     ///
     /// A `/reasoning` override is returned as *requested*, not as remapped.

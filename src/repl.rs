@@ -1110,6 +1110,25 @@ impl PromptSession {
     /// Returns `Some(action)` when the read ends — only `MenuDone`, from a
     /// committed `/`-command. `None` means "keep looping": by then the frame
     /// is already painted.
+    /// Empty the input buffer. The caller repaints.
+    ///
+    /// A submit mid-turn no longer leaves `read_input`, so the clear it used to
+    /// do inline (before handing the text back) has to live somewhere the turn's
+    /// key pump can reach. Same handle, so the *painted* editor is emptied rather
+    /// than a throwaway one — the trap that once made the first keystroke of the
+    /// next prompt restore the submitted text.
+    pub(crate) fn clear_input(&self) {
+        self.editor.lock().unwrap().set("");
+    }
+
+    /// Whether the input row holds nothing the user typed.
+    ///
+    /// Read by the turn's exit: a steer that never reached a boundary is put
+    /// back on the row, but only when that would not overwrite newer text.
+    pub(crate) fn input_is_empty(&self) -> bool {
+        self.editor.lock().unwrap().text().is_empty()
+    }
+
     pub(crate) async fn settle(
         &mut self,
         content: &Content,

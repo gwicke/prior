@@ -27,7 +27,6 @@ use rig_core::message::Message;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::agent::build::request_additional_params;
 use crate::agent::compaction::session_context_messages;
 
 use crate::agent::estimate_ctx_with;
@@ -71,6 +70,7 @@ impl CodeAgent {
         input: &str,
         session: Option<Arc<Session>>,
         params: &crate::params::ModelParams,
+        overrides: crate::turn_overrides::TurnOverrides,
         in_turn: Option<crate::repl::InTurnInput<'_>>,
     ) -> Result<String> {
         // Fresh request: clear any stale cancel flag from a previous abort so a
@@ -199,8 +199,8 @@ impl CodeAgent {
         // the model and `next_step` re-emits the identical `CallModel`. Nothing
         // is rolled back, no turn is consumed, and no user message is appended
         // — which is why there is no `"continue"` in the transcript any more.
-        let (mut drive, mut persist) =
-            match self.build_drive(input, prior, params, session.clone(), resume) {
+        let (mut drive, persist) =
+            match self.build_drive(input, prior, params, overrides, session.clone(), resume) {
                 Ok(pair) => pair,
                 Err(error) => {
                     // No run to drive, so no attempt loop either: the prompt is on
@@ -487,6 +487,7 @@ impl CodeAgent {
                             self.content.as_ref(),
                             &self.user_cancel,
                             &self.cancel_notify,
+                            &self.steer,
                         )
                         .await;
                     }
@@ -582,12 +583,11 @@ impl CodeAgent {
             // attempt from growing the transcript (§3, "Consecutive retries
             // append nothing").
             if wrote_partial {
-                if let Some(handle) = self
-                    .rebuild_after_partial(&mut drive, session.as_deref())
-                    .await
-                {
-                    persist = handle;
-                }
+                // The persister is rebased, not replaced: the handle the pump
+                // holds stays this turn's, which is what lets a rebuild happen
+                // with nobody told (`doc/261030_rig_direct_drive.md` §5a).
+                self.rebuild_after_partial(&mut drive, session.as_deref())
+                    .await;
             }
             let delay = retry_delay_ms(&error, consecutive_failures.max(1));
             self.log_pump_event("response_end").await;
@@ -607,6 +607,7 @@ impl CodeAgent {
                     it_history.as_deref_mut(),
                     it_label,
                     self.content.as_ref(),
+                    &self.steer,
                 ),
             )
             .await;
@@ -625,6 +626,24 @@ impl CodeAgent {
             }
             self.log_pump_event("begin_response").await;
             self.content.begin_response();
+        }
+
+        // A steer that never reached a boundary — typed after the turn's last
+        // request, or during the `Esc` that ended it — has nowhere to go. It is
+        // handed back to the input row rather than dropped: the user typed it,
+        // and the next submit should carry it. Clearing it instead would make
+        // the words vanish from a turn the model never heard.
+        if let Some(pending) = self.steer.take() {
+            if let Some(sess) = it_session {
+                // Only when the row is still empty. Anything newer there is the
+                // user typing their next message, and overwriting it with an
+                // older unsent steer would lose what they meant.
+                if sess.input_is_empty() {
+                    sess.apply_prefill(&pending.raw);
+                }
+                sess.sync_stack(self.content.as_ref(), it_label);
+                crate::repl::paint_prompt(self.content.as_ref());
+            }
         }
 
         self.log_pump_event("response_end").await;
@@ -664,6 +683,7 @@ impl CodeAgent {
         input: &str,
         prior: Vec<Message>,
         params: &crate::params::ModelParams,
+        overrides: crate::turn_overrides::TurnOverrides,
         session: Option<Arc<Session>>,
         resume: bool,
     ) -> std::result::Result<
@@ -676,14 +696,11 @@ impl CodeAgent {
         use crate::agent::drive::{Drive, DriveLoop, RetryHint};
         use rig_agent::run::AgentRun;
 
-        // The spec is the agent's own (preamble, sampling, budget); the per-turn
-        // params land on it here, because `prepare_request` reads the spec per
-        // call and there is no request builder to patch afterwards.
+        // The spec is the agent's own (preamble, budget). Sampling is *not*
+        // written here: it is recomposed at every call boundary by
+        // `Drive::sampling`, so a knob changed while the turn runs — or trailed
+        // on a steering message — reaches the next request of this same turn.
         let mut spec = self.agent.run_spec();
-        spec.temperature = params.temperature.or(spec.temperature);
-        spec.additional_params =
-            request_additional_params(&self.provider, &self.model, params, self.routing.as_ref())
-                .or(spec.additional_params);
         spec.max_turns = Some(self.tool_call_limit);
         spec.max_invalid_tool_call_retries = 1;
 
@@ -728,7 +745,6 @@ impl CodeAgent {
             reasoning_in_context: self.reasoning_in_context,
             provider: self.provider.clone(),
             model: self.model.clone(),
-            session: session.clone(),
         };
         let tools = Arc::new(self.agent.tool_server_handle().snapshot());
         let drive = Drive {
@@ -739,6 +755,23 @@ impl CodeAgent {
             session,
             content: self.content.clone(),
             retry_hint: RetryHint::default(),
+            // The slot is the agent's, not the loop's: `build_drive` runs inside
+            // `prompt()`, so a slot here would be invisible to the key pump that
+            // fills it.
+            steer: self.steer_slot(),
+            // `params` is this turn's composition, already carrying the prompt's
+            // own override lines. The loop varies it from here.
+            sampling: crate::agent::sampling::Sampling::new(
+                self.app_state.clone(),
+                *params,
+                self.provider.clone(),
+                self.model.clone(),
+                self.routing.clone(),
+                overrides,
+            ),
+            reasoning_in_context: self.reasoning_in_context,
+            provider: self.provider.clone(),
+            model_name: self.model.clone(),
         };
         Ok(DriveLoop::new(drive, run, self.tool_call_limit))
     }
@@ -755,7 +788,15 @@ impl CodeAgent {
         // `prompt` now renders the response itself via the streaming Output
         // methods, so there is no separate `display_markdown` here.
         // No override surface on this path, so the built live params.
-        let response = self.prompt(&input, None, &self.live_params, None).await?;
+        let response = self
+            .prompt(
+                &input,
+                None,
+                &self.live_params,
+                crate::turn_overrides::TurnOverrides::default(),
+                None,
+            )
+            .await?;
         Ok(response)
     }
 
@@ -880,15 +921,17 @@ impl CodeAgent {
     /// 3. the turn is rebuilt from the session's exact history, its last message
     ///    becoming the rebuilt run's prompt.
     ///
-    /// Returns the new persister handle when the turn was rebuilt, `None` when
-    /// there was nothing to rebuild around (no session). Write failures are
-    /// warnings: the turn still has a retry to run.
+    /// Returns whether the run was replaced. The persister is shared and rebased
+    /// in place, so there is no handle to hand back (design §5a). Write failures
+    /// are warnings: the turn still has a retry to run.
     async fn rebuild_after_partial(
         &self,
         drive: &mut crate::agent::drive::DriveLoop,
         session: Option<&Session>,
-    ) -> Option<crate::agent::drive::PersistHandle> {
-        let session = session?;
+    ) -> bool {
+        let Some(session) = session else {
+            return false;
+        };
         // The nudge that makes the rebuilt history end on a user message, so
         // the model continues the partial instead of being handed a request that
         // ends in an assistant turn — a *prefill*, which most providers refuse
@@ -922,11 +965,10 @@ impl CodeAgent {
             Err(error) => {
                 self.content
                     .display_error(&format!("failed to rebuild the turn: {error}"));
-                return None;
+                return false;
             }
         };
-        let handle = drive.rebuild_from(history)?;
-        Some(handle)
+        drive.rebuild_from(history).await
     }
 }
 

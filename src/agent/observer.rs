@@ -25,7 +25,6 @@ use crate::agent::msglog::MessageLogger;
 use crate::agent::parts::CallPart;
 use crate::agent::transcript::{maybe_strip_reasoning, render_model_facing};
 use crate::content::Content;
-use crate::session::Session;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -41,11 +40,6 @@ pub(crate) struct TurnObserver {
     pub(crate) reasoning_in_context: crate::settings::ReasoningInContextMode,
     pub(crate) provider: String,
     pub(crate) model: String,
-    /// The session this turn writes into, if any — used by the mid-turn
-    /// steering path (design §5) to commit a steer as a real user message.
-    /// Persistence of tool work is the persister's job.
-    #[allow(dead_code)]
-    pub(crate) session: Option<Arc<Session>>,
 }
 
 impl TurnObserver {

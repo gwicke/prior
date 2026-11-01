@@ -90,6 +90,26 @@ impl Persister {
         }
     }
 
+    /// Re-point the persister at a replacement run.
+    ///
+    /// A rebuild (`DriveLoop::rebuild_from`) keeps the turn — the session, the
+    /// content handle and the progress flag all still describe the same user
+    /// turn — and replaces only what was run-relative: where writing had got to,
+    /// and the unit being held for a batch whose results have not all landed.
+    /// The last one is closed by definition: a rebuild happens at a call
+    /// boundary, so the batch that was in flight is either answered or about to
+    /// be re-issued by a run that has no record of it.
+    ///
+    /// `unsaved` is deliberately *not* cleared: a batch whose append failed is
+    /// still wanted, and its ids are already fixed, so the next flush writes it
+    /// once rather than dropping it (design §5a).
+    pub(crate) fn rebase(&mut self, run: &AgentRun) {
+        self.cursor = run.projection_start();
+        self.tail = None;
+        self.tail_at = None;
+        self.answered.clear();
+    }
+
     /// The run accepted an assistant turn. A tool-bearing one is held until its
     /// answers land, because the run commits a whole batch as one message and an
     /// abort in between would drop what already ran.

@@ -86,6 +86,7 @@ pub(crate) async fn dispatch_in_turn_event(
     content: &crate::content::Content,
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
+    steer: &crate::agent::steer::SteerSlot,
 ) -> InTurnDispatch {
     let (Some(ev), Some(sess), Some(history)) = (ev, sess, history) else {
         return InTurnDispatch::Ignored;
@@ -146,7 +147,14 @@ pub(crate) async fn dispatch_in_turn_event(
                 crate::repl::KeyOutcome::RunEditor => {
                     sess.open_editor(content);
                 }
-                crate::repl::KeyOutcome::Continue | crate::repl::KeyOutcome::Action(_) => {}
+                crate::repl::KeyOutcome::Action(crate::repl::InputAction::Submit(text)) => {
+                    schedule_steer(content, sess, &text, label, steer);
+                }
+                // A menu commit already wrote `AppState` itself; the request
+                // half of it is `Sampling`, which recomposes at the next
+                // boundary — no wiring here, by design (design §5).
+                crate::repl::KeyOutcome::Continue
+                | crate::repl::KeyOutcome::Action(crate::repl::InputAction::MenuDone) => {}
             }
             // `settle` is where a `/`-command committed mid-turn lands exactly
             // as it does at the prompt. Its `MenuDone` is dropped: applying a
@@ -170,6 +178,44 @@ pub(crate) async fn dispatch_in_turn_event(
     }
 }
 
+/// Turn a mid-turn submit into a scheduled steer.
+///
+/// The submit used to be dropped silently — v0 had no mid-turn action
+/// (`pumps.rs`'s docs said so). It is now the steering channel: the text is
+/// split the same way a prompt is (override lines trailed on it are the turn's
+/// overrides, and it is the *steer's* copy that wins because it was typed
+/// last), scheduled into the slot, and the editor is cleared and repainted so
+/// the input row shows what actually happened rather than keeping the text.
+///
+/// The text may be empty: an overrides-only steer changes the request shape for
+/// the rest of the turn without saying anything to the model.
+fn schedule_steer(
+    content: &crate::content::Content,
+    sess: &mut crate::repl::PromptSession,
+    text: &str,
+    label: &str,
+    steer: &crate::agent::steer::SteerSlot,
+) {
+    let split = crate::turn_overrides::split(text);
+    if split.text.trim().is_empty() && split.overrides.is_empty() {
+        return;
+    }
+    steer.schedule(crate::agent::steer::Steer {
+        raw: text.to_string(),
+        text: split.text,
+        overrides: split.overrides,
+    });
+    // Same transition `read_input` makes on a submit: clear the real editor
+    // (not a throwaway one — the session outlives the call) and repaint, so the
+    // next compose does not put the submitted text back.
+    sess.clear_input();
+    sess.sync_stack(content, label);
+    crate::repl::paint_prompt(content);
+    for w in &split.warnings {
+        content.display_text(w);
+    }
+}
+
 /// The turn's key pump, live outside `prompt()`: what a retry back-off
 /// borrows so keys keep dispatching between attempts exactly as they do inside
 /// `prompt()`'s select — the back-off is part of the turn, not a hole in it.
@@ -183,6 +229,9 @@ pub(crate) struct TurnPump<'a> {
     /// `$EDITOR` turnover reaches the manager's front door through it too —
     /// the guard/output pair this pump used to carry is gone.
     content: &'a crate::content::Content,
+    /// Where a submit typed during this wait goes. The same slot the streaming
+    /// window fills, so a steer typed at either point means the same thing.
+    steer: &'a crate::agent::steer::SteerSlot,
 }
 
 impl<'a> TurnPump<'a> {
@@ -196,6 +245,7 @@ impl<'a> TurnPump<'a> {
         history: &'a mut crate::repl::History,
         label: &'a str,
         content: &'a crate::content::Content,
+        steer: &'a crate::agent::steer::SteerSlot,
     ) -> Self {
         Self {
             keys,
@@ -203,6 +253,7 @@ impl<'a> TurnPump<'a> {
             history,
             label,
             content,
+            steer,
         }
     }
 }
@@ -218,6 +269,7 @@ pub(crate) fn turn_backoff_pump<'a>(
     history: Option<&'a mut crate::repl::History>,
     label: &'a str,
     content: &'a crate::content::Content,
+    steer: &'a crate::agent::steer::SteerSlot,
 ) -> Option<TurnPump<'a>> {
     // A prompt session exists only in the REPL (interactive tty) — the same
     // fact the old `guard` zip re-checked, since TermIO is Tty iff there is one.
@@ -231,6 +283,7 @@ pub(crate) fn turn_backoff_pump<'a>(
             history,
             label,
             content,
+            steer,
         }),
         _ => None,
     }
@@ -283,6 +336,7 @@ pub(crate) async fn cancellable_sleep_pumped(
                         p.content,
                         user_cancel,
                         cancel_notify,
+                        p.steer,
                     )
                     .await;
                     if outcome == InTurnDispatch::CancelFired {
@@ -446,7 +500,15 @@ mod tests {
         .unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let pump = TurnPump::new(&mut keys, &mut session, &mut history, "", content.as_ref());
+        let steer = crate::agent::steer::SteerSlot::default();
+        let pump = TurnPump::new(
+            &mut keys,
+            &mut session,
+            &mut history,
+            "",
+            content.as_ref(),
+            &steer,
+        );
         let started = std::time::Instant::now();
         let completed = cancellable_sleep_pumped(&cancel, &notify, 60_000, Some(pump)).await;
         assert!(
@@ -476,7 +538,15 @@ mod tests {
         .unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let pump = TurnPump::new(&mut keys, &mut session, &mut history, "", content.as_ref());
+        let steer = crate::agent::steer::SteerSlot::default();
+        let pump = TurnPump::new(
+            &mut keys,
+            &mut session,
+            &mut history,
+            "",
+            content.as_ref(),
+            &steer,
+        );
         let started = std::time::Instant::now();
         let completed = cancellable_sleep_pumped(&cancel, &notify, 1_000, Some(pump)).await;
         assert!(

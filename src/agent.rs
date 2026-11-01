@@ -23,7 +23,9 @@ pub(crate) mod persist;
 pub(crate) mod project;
 pub(crate) mod pumps;
 pub(crate) mod replay;
+pub(crate) mod sampling;
 pub(crate) mod status;
+pub(crate) mod steer;
 pub(crate) mod tool_shape;
 pub(crate) mod transcript;
 pub(crate) mod turn;
@@ -163,6 +165,23 @@ pub struct CodeAgent {
     /// runs — no `set_status` push to keep in step, and no stale context
     /// figure. The turn writes it in place; every reader pulls.
     usage: Arc<Mutex<SessionUsage>>,
+    /// The steer waiting to be delivered, filled by the turn's key pump and
+    /// drained by the drive loop at a call boundary
+    /// (`src/agent/steer.rs`).
+    ///
+    /// On the agent rather than the loop because `build_drive` runs *inside*
+    /// `prompt()`, so a slot there would be invisible to the REPL — and the REPL
+    /// is what schedules a steer.
+    steer: crate::agent::steer::SteerSlot,
+    /// The live params' source, so a `/reasoning` or `/temperature` menu commit
+    /// made *during* a turn reaches that turn's next request.
+    ///
+    /// Attached by the interactive loop after construction
+    /// ([`Self::attach_app_state`]) rather than baked into `AgentConfig`,
+    /// because `AppState` owns the config: a back-reference there would be a
+    /// cycle, and piped/batch one-shots have no `AppState` at all — for them the
+    /// baked params are the answer and `None` is correct.
+    app_state: Option<Arc<AppState>>,
 }
 
 /// Build session context data for the REPL overlays.
@@ -630,6 +649,8 @@ impl CodeAgent {
             reasoning_in_context,
             message_logger,
             usage: Arc::new(Mutex::new(SessionUsage::default())),
+            steer: crate::agent::steer::SteerSlot::default(),
+            app_state: None,
         }
         // Wire the bar to this agent's usage store before it exists as a
         // handle anywhere else: the constructor is the moment
@@ -643,6 +664,22 @@ impl CodeAgent {
     fn tap_content(self) -> Self {
         self.content.set_usage(Some(self.usage.clone()));
         self
+    }
+
+    /// The steer slot this agent's turns drain. The key pump schedules into it.
+    pub(crate) fn steer_slot(&self) -> crate::agent::steer::SteerSlot {
+        self.steer.clone()
+    }
+
+    /// Point this agent's turns at the live params store, so a menu commit made
+    /// *during* a turn reaches that turn's next request.
+    ///
+    /// Called by the interactive loop after `create_agent`, and again after a
+    /// `/model` rebuild. Without it `Sampling` falls back to the params the
+    /// agent was built with, which is the correct behaviour for piped/batch —
+    /// nothing can change them mid-turn there.
+    pub fn attach_app_state(&mut self, app_state: Arc<AppState>) {
+        self.app_state = Some(app_state);
     }
 
     /// The shared usage store — the bar element's and `/stat`'s live source
