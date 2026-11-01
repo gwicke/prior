@@ -1760,39 +1760,51 @@ mod tests {
     /// cannot render the same turn differently. Asserted on the rendered bytes:
     /// a phase set and never consulted would still pass a state assertion.
     ///
-    /// Every running phase paints green — including a back-off, which is the
-    /// point of this test's second half: the dot must survive the wait between
-    /// attempts, not just the request itself.
+    /// Each of the three phases has its **own** colour, and the test walks all
+    /// three rather than asserting "not idle": the point of the amber is that a
+    /// back-off is visible as waiting, so a bar that painted it green would be
+    /// the bug this test exists to catch.
     #[test]
     fn the_dot_reads_the_phase_off_app_state() {
+        use crate::turn_phase::TurnPhase;
         let (out, _reasoning) = capturing_output(60);
         let app = bar_app("[bar]");
-        let idle = compose_rows(&compose_area_with(&app, &out, None, Vec::new()), 60);
+        let row = |app: &Arc<AppState>, out: &Content| {
+            compose_rows(&compose_area_with(app, out, None, Vec::new()), 60)[1].clone()
+        };
+
+        let idle = row(&app, &out);
         assert!(
-            !idle[1].contains(crate::ui::bar::DOT_STREAMING),
-            "no turn in flight, so the frame bar is idle: {:?}",
-            idle[1]
+            !idle.contains(crate::ui::bar::DOT_STREAMING)
+                && !idle.contains(crate::ui::bar::DOT_WAITING),
+            "no turn in flight, so the frame bar is idle: {idle:?}"
         );
 
-        for phase in [
-            crate::turn_phase::TurnPhase::Streaming,
-            crate::turn_phase::TurnPhase::WaitingRetry,
-        ] {
-            app.set_turn_phase(phase);
-            let during = compose_rows(&compose_area_with(&app, &out, None, Vec::new()), 60);
-            assert!(
-                during[1].contains(crate::ui::bar::DOT_STREAMING),
-                "a running turn goes green in {phase:?}: {:?}",
-                during[1]
-            );
-        }
-
-        app.set_turn_phase(crate::turn_phase::TurnPhase::Idle);
-        let after = compose_rows(&compose_area_with(&app, &out, None, Vec::new()), 60);
+        app.set_turn_phase(TurnPhase::Streaming);
+        let streaming = row(&app, &out);
         assert!(
-            !after[1].contains(crate::ui::bar::DOT_STREAMING),
-            "and grey once the turn ends: {:?}",
-            after[1]
+            streaming.contains(crate::ui::bar::DOT_STREAMING),
+            "a streaming turn goes green: {streaming:?}"
+        );
+
+        // The amber, and not the green: this is the whole distinction.
+        app.set_turn_phase(TurnPhase::WaitingRetry);
+        let waiting = row(&app, &out);
+        assert!(
+            waiting.contains(crate::ui::bar::DOT_WAITING),
+            "a turn waiting to retry goes amber: {waiting:?}"
+        );
+        assert!(
+            !waiting.contains(crate::ui::bar::DOT_STREAMING),
+            "and not green — waiting must not read as streaming: {waiting:?}"
+        );
+
+        app.set_turn_phase(TurnPhase::Idle);
+        let after = row(&app, &out);
+        assert!(
+            !after.contains(crate::ui::bar::DOT_STREAMING)
+                && !after.contains(crate::ui::bar::DOT_WAITING),
+            "and grey once the turn ends: {after:?}"
         );
     }
 

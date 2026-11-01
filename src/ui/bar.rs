@@ -34,22 +34,32 @@ const STATUS_BG: &str = "\x1b[48;5;237m";
 const STATUS_FG: &str = "\x1b[38;5;245m";
 const STATUS_RESET: &str = "\x1b[0m";
 
-/// The dot's colour for a running turn. Idle takes the bar's own foreground,
-/// so the bar needs no separate "idle" colour to stay subordinate.
+/// The dot while a request is on the wire. Idle takes the bar's own
+/// foreground, so the bar needs no separate "idle" colour to stay subordinate.
 pub(crate) const DOT_STREAMING: &str = "\x1b[38;5;41m";
-
-/// The dot's colour in `phase` — one place decides, so two running phases
-/// cannot drift apart because the colour was spelled at two call sites.
+/// The dot while a retry is pending: amber, between the working green and the
+/// red a *failed* turn would use.
 ///
-/// Streamed and waiting-for-a-retry are the **same green today**, deliberately:
-/// both mean the turn is in flight, and a second colour would be a second thing
-/// to explain. They are distinguishable *here* (this reads the enum, not a
-/// flag), so giving a back-off its own colour — yellow for "waiting", say — is
-/// a change to this one match arm and nothing else.
+/// Orange rather than a bright yellow on purpose. The bar sits on a grey
+/// header wash, where `38;5;226` reads as a highlighter smear and fights the
+/// green for the same "attention" slot; `38;5;214` warms the same way without
+/// out-shouting it, so "waiting" reads as a quieter form of "working" rather
+/// than as a second alarm.
+pub(crate) const DOT_WAITING: &str = "\x1b[38;5;214m";
+
+/// The dot's colour in `phase` — one place decides, so the three states cannot
+/// drift apart because a colour was spelled at two call sites.
+///
+/// **All three states are distinct**: green while streaming, amber while a
+/// retry is pending, the bar's own grey when idle. The dot is the only thing
+/// on screen that says whether a turn is alive, so "waiting out a back-off" and
+/// "the model is talking" being the same pixel would hide exactly the state a
+/// user is most likely to be watching for.
 fn dot_colour(phase: TurnPhase) -> &'static str {
     match phase {
         TurnPhase::Idle => STATUS_FG,
-        TurnPhase::Streaming | TurnPhase::WaitingRetry => DOT_STREAMING,
+        TurnPhase::Streaming => DOT_STREAMING,
+        TurnPhase::WaitingRetry => DOT_WAITING,
     }
 }
 

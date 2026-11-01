@@ -343,10 +343,16 @@ is a UI reader of it. Content writes text; it does not decide what the bar says.
 and paint; the input row reads the same handle for its "is a turn running" test, which is why
 `WaitingRetry::is_running()` is true.
 
-`Streaming` and `WaitingRetry` paint the **same green**, deliberately: both mean the turn is in
-flight, and a second colour would be a second thing to explain. The distinction is real at the point
-the colour is chosen (`ui::bar::dot_colour`'s match), so giving a back-off its own colour is a
-change to one match arm.
+Each phase has its **own** colour: green while streaming, amber (`38;5;214`) while a retry is
+pending, the bar's grey when idle. Amber rather than a bright yellow — the bar sits on a grey header
+wash, where a saturated yellow reads as a highlighter and fights the green for the same "attention"
+slot; the amber warms the same way without out-shouting it, so "waiting" reads as a quieter form of
+"working" rather than a second alarm. The dot is the only thing on screen that says whether a turn
+is alive, so "the model is talking" and "we are waiting to try again" being the same pixel would
+hide exactly the state a user is most likely watching for.
+
+All three colours are chosen in one match (`ui::bar::dot_colour`), so a fourth phase or a
+recolouring is one arm there and nothing else.
 
 Two ordering rules fall out, and both are load-bearing:
 

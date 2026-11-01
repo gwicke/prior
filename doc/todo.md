@@ -10,9 +10,9 @@ and link a doc/ and/or commit hash
       re-issues the attempt — and a mid-turn submit is a real user message delivered at the next
       call boundary. Remaining: **6** (cleanup, below).
 - [x] Status dot spans the whole turn: `TurnPhase` (`Idle`/`Streaming`/`WaitingRetry`) on
-      `AppState`, so a retry back-off no longer greys the bar. Both running phases paint green; a
-      separate colour for `WaitingRetry` is one match arm in `ui::bar::dot_colour`. See
-      doc/261030_rig_direct_drive.md §5c.
+      `AppState`, so a retry back-off no longer greys the bar. Three distinct colours — green
+      streaming, amber `38;5;214` waiting, grey idle — chosen in one match in `ui::bar::dot_colour`.
+      See doc/261030_rig_direct_drive.md §5c.
 - [ ] direct-drive phase 6 cleanup: stale comments naming deleted machinery (`LoggingHook`,
       `TurnTranscript`, `prepare_edit_call`, `TurnPersistence`) in agent/build.rs, agent/turn.rs,
       agent/transcript.rs, session/*, tools.rs, content/preview.rs, tool_args.rs; six broken rustdoc

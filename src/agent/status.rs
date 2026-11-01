@@ -631,9 +631,10 @@ mod status_bar_tests {
     }
 
     /// The dot is the spinner's replacement: green while a response streams,
-    /// the bar's own grey when it is not. Two states because the prompt-side
-    /// carrier shows the bar between turns too, and the dot is what tells
-    /// "working" from "idle".
+    /// the bar's own grey when it is not. Two states here because the
+    /// prompt-side carrier shows the bar between turns too, and the dot is what
+    /// tells "working" from "idle". The third state — amber, for a turn waiting
+    /// to retry — is [`the_dot_is_amber_while_waiting_to_retry`].
     ///
     /// The order of the escape and the glyph is the substance of this test, not
     /// a detail: an `SGR` colours the cells written *after* it, so a colour
@@ -676,6 +677,42 @@ mod status_bar_tests {
             glyph_at,
             green_at + "\x1b[38;5;41m".len(),
             "the green must be emitted immediately before the dot, not after it: {streaming:?}"
+        );
+    }
+
+    /// A turn waiting out a retry back-off is **amber**, not green: the dot is
+    /// the only thing on screen that says whether a turn is alive, so "the model
+    /// is talking" and "we are waiting to try again" must not be the same pixel.
+    ///
+    /// Written against the phase directly rather than through the `bar` helper,
+    /// whose `bool` can only say running-or-not. The colour has to bracket the
+    /// glyph for the same reason the green does — see the test above.
+    #[test]
+    fn the_dot_is_amber_while_waiting_to_retry() {
+        let (status, tokens) = model("p", "m", None, 0, None);
+        let status = BarStatus {
+            session_name: Some("main".to_string()),
+            ..status
+        };
+        let text = status_text(&status, tokens);
+        let waiting =
+            crate::ui::bar::status_bar(&text, 40, crate::turn_phase::TurnPhase::WaitingRetry);
+        assert!(
+            waiting.contains(crate::ui::bar::DOT_WAITING),
+            "a bar waiting to retry carries the amber dot: {waiting:?}"
+        );
+        assert!(
+            !waiting.contains(crate::ui::bar::DOT_STREAMING),
+            "and not the streaming green: {waiting:?}"
+        );
+        let glyph_at = waiting.find('\u{25cf}').expect("the dot");
+        let amber_at = waiting
+            .find(crate::ui::bar::DOT_WAITING)
+            .expect("the amber");
+        assert_eq!(
+            glyph_at,
+            amber_at + crate::ui::bar::DOT_WAITING.len(),
+            "the amber must be emitted immediately before the dot: {waiting:?}"
         );
     }
 

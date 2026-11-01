@@ -838,20 +838,27 @@ fn the_status_bar_is_permanent_and_the_dot_says_which_state() {
     );
 }
 
-/// The dot stays lit across a retry back-off: waiting out a retry is the turn
-/// still working, not the turn being over.
+/// The dot goes **amber** across a retry back-off, not grey: waiting out a
+/// retry is the turn still working, not the turn being over — and it is not the
+/// same state as streaming, so it is not green either.
 ///
 /// Asserted on the transcript rather than the final screen, because the state
 /// this is about exists only *between* attempts — by the time the turn ends the
-/// dot is grey either way. The anchor is the error line the retry path writes
+/// dot is grey either way, so a screen capture passes whatever happened in
+/// between. The anchor is the error line the retry path writes
 /// (`Error: …. Retrying in Ns...`), which is a content write and therefore
 /// re-emits the frame; the bar in that paint is the one the user looks at for
 /// the whole delay.
 #[test]
-fn the_dot_stays_lit_while_waiting_to_retry() {
+fn the_dot_is_amber_while_waiting_to_retry() {
     let dumps = Dumps::new("retry-dot");
     let bytes = run_turn(&dumps, 3, "error-429", false);
     let text = String::from_utf8_lossy(&bytes);
+    // The bar's whole leading cell: background, lead air, then the foreground
+    // the dot is painted in. Spelled out rather than built from the crate's
+    // constants so a change to either colour is a *failure* here, which is the
+    // point of an end-to-end assertion.
+    let amber = "\x1b[48;5;237m \x1b[38;5;214m●";
     let green = "\x1b[48;5;237m \x1b[38;5;41m●";
     let grey = "\x1b[48;5;237m \x1b[38;5;245m●";
 
@@ -861,21 +868,29 @@ fn the_dot_stays_lit_while_waiting_to_retry() {
     // The bar painted after the error line, before the retried attempt's own
     // answer lands. The error line is a content write, so a bar follows it.
     let after_error = &text[error_at..];
-    let next_green = after_error.find(green);
-    let next_grey = after_error.find(grey);
-    match next_green {
-        Some(g) => assert!(
-            next_grey.is_none_or(|r| g < r),
-            "the bar after the error line must be the green one — the turn is \
-             still running: {:?}",
-            &after_error[..next_grey.unwrap().max(80)]
-        ),
-        None => panic!(
-            "no bar was painted after the error line, so nothing said the turn \
-             was still in flight: {:?}",
-            &after_error[..after_error.len().min(400)]
-        ),
+    let next_amber = after_error
+        .find(amber)
+        .unwrap_or_else(|| panic!("no amber bar after the error line: {}", tail(after_error)));
+    // The amber must arrive before any green or grey bar: a grey one would mean
+    // the turn looked over, a green one that waiting read as streaming.
+    for (name, bytes) in [("green", green), ("grey", grey)] {
+        if let Some(at) = after_error.find(bytes) {
+            assert!(
+                next_amber < at,
+                "the bar after the error line must be amber, but a {name} one \
+                 came first: {}",
+                tail(&after_error[..at.max(200)])
+            );
+        }
     }
+}
+
+/// The tail of a transcript slice for a panic message — the interesting part is
+/// always the most recent paint, and the whole buffer is tens of kilobytes.
+fn tail(s: &str) -> &str {
+    let cut = s.len().saturating_sub(700);
+    let start = (cut..s.len()).find(|i| s.is_char_boundary(*i)).unwrap_or(0);
+    &s[start..]
 }
 
 /// The prompt-side bar is a row of the input frame, so the frame's own clear
