@@ -159,7 +159,7 @@ impl RenderElement for DetailItem {
             return Rendered::default();
         }
         // Compute window while holding the lock; clone only what we need.
-        let (_, rows) = {
+        let rows = {
             let mut sel = self.selection.lock().unwrap();
             let section = sel.ensure_painted(w);
             let mut used = 0usize;
@@ -171,10 +171,7 @@ impl RenderElement for DetailItem {
                 used += height;
                 end += height;
             }
-            (
-                section.heights[..end].to_vec(),
-                section.rows[..end].to_vec(),
-            )
+            section.rows[..end].to_vec()
         };
         let rows = rows.into_iter().map(|r| pad_row(&r, w)).collect();
         Rendered { rows, caret: None }
