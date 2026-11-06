@@ -148,7 +148,16 @@ pub(crate) async fn dispatch_in_turn_event(
                     sess.open_editor(content);
                 }
                 crate::repl::KeyOutcome::Action(crate::repl::InputAction::Submit(text)) => {
-                    schedule_steer(content, sess, &text, label, steer);
+                    let text = text.trim();
+                    if text.is_empty() {
+                        // Empty submit mid-turn: if a steer is scheduled, cancel it.
+                        if steer.is_pending() {
+                            steer.clear();
+                        }
+                        // else: no steer pending, nothing to do.
+                    } else {
+                        schedule_steer(content, sess, text, label, steer);
+                    }
                 }
                 // A menu commit already wrote `AppState` itself; the request
                 // half of it is `Sampling`, which recomposes at the next

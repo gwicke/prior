@@ -99,6 +99,18 @@ impl SteerSlot {
         self.lock().take()
     }
 
+    /// Clear any pending steer without delivering it.
+    ///
+    /// Returns the cleared steer if there was one.
+    pub(crate) fn clear(&self) -> Option<Scheduled> {
+        self.lock().take()
+    }
+
+    /// Check if a steer is currently pending without consuming it.
+    pub(crate) fn is_pending(&self) -> bool {
+        self.lock().is_some()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Scheduled>> {
         self.0
             .lock()

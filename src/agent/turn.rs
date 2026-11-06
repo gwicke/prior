@@ -99,21 +99,13 @@ impl CodeAgent {
         // doc/turn_cancellation_persistence_bugs.md §3.
         self.user_cancel.store(false, Ordering::SeqCst);
 
-        // An empty prompt on a branch that ends mid-turn *is* a resume: the
-        // signal is the session's own tail, not a keyword
+        // An empty prompt with a session *is* a resume: the continuation
+        // nudges the model to continue from whatever the branch ends on
+        // (partial assistant message or completed turn). `ensure_custom_message`
+        // is a no-op if the branch already ends with a continuation, which is
+        // what makes returning with nothing typed exactly a retry
         // (`doc/261102_partial_turn_retention.md` §7).
-        //
-        // The continuation is written here, at resume time, and not at abort
-        // time — an aborted turn has nothing to continue *into*, so its branch
-        // ends on the partial. Resuming is what needs the nudge: without one the
-        // rebuilt run would take the assistant partial as its prompt, i.e. a
-        // prefill, which most providers refuse (§4). `ensure` keeps this a no-op
-        // when a retry already wrote one, which is what makes returning with
-        // nothing typed exactly a retry.
-        let resume = match (input.trim().is_empty(), session.as_deref()) {
-            (false, _) | (true, None) => false,
-            (true, Some(s)) => s.ends_mid_turn().await,
-        };
+        let resume = input.trim().is_empty() && session.is_some();
         if resume {
             if let Some(s) = session.as_deref() {
                 if let Err(e) = s
@@ -123,11 +115,6 @@ impl CodeAgent {
                     )
                     .await
                 {
-                    // A persist failure is a real error the user should see.
-                    // Not `eprintln!`: under raw mode the live frame owns the
-                    // screen, and a stray stderr line corrupts it. The error
-                    // channel routes through the draw pipeline like everything
-                    // else, so the row accounting stays honest too.
                     self.content
                         .display_error(&format!("failed to persist the continuation: {e}"));
                 }

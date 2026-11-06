@@ -669,23 +669,17 @@ impl Interactive {
         //
         // Checked before the overrides split, because the intent is "carry on",
         // not "send nothing".
-        let unfinished = match self.app_state.session() {
-            Some(session) if input.trim().is_empty() => session.ends_mid_turn().await,
-            _ => false,
-        };
-        if unfinished {
-            // Nothing to reprint: the user typed nothing. `run_prompt_turn`
-            // skips its committed-prompt line for an empty input, so the resume
-            // reads as a continuation rather than as a submission.
-            self.run_prompt_turn(
-                String::new(),
-                self.config.params,
-                crate::turn_overrides::TurnOverrides::default(),
-            )
-            .await;
-            return LoopCtl::Continue;
-        }
-        if input.is_empty() {
+        if input.trim().is_empty() {
+            if let Some(_session) = self.app_state.session() {
+                // Empty enter between turns: resume with "continue" (unconditional).
+                // The prompt() logic treats empty input + session as a resume.
+                self.run_prompt_turn(
+                    String::new(),
+                    self.config.params,
+                    crate::turn_overrides::TurnOverrides::default(),
+                )
+                .await;
+            }
             return LoopCtl::Continue;
         }
         self.line_history.add(&input);
