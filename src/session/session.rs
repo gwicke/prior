@@ -543,11 +543,9 @@ pub(crate) fn build_text_only_summary<T: Borrow<SessionEntry>>(
     }
     // Ensure final output ends with exactly one newline, no leading blank lines.
     let out = out.trim_start_matches('\n').to_string();
-    if out.is_empty() {
-        out
-    } else {
-        out + "\n"
-    }
+    let out = if out.is_empty() { out } else { out + "\n" };
+    // Second layer: collapse any accidental multi-blank-line runs.
+    crate::content::normalize_blank_lines(&out)
 }
 
 /// Build a deterministic, user-editable template for `manual`-mode
@@ -622,7 +620,7 @@ pub(crate) fn build_manual_template<T: Borrow<SessionEntry>>(
     // Ensure final output ends with exactly one newline.
     // render_files_section already ends with \n if it added content.
     // If no files were rendered, the seed_text loop already added a trailing \n.
-    if out.is_empty() {
+    let out = if out.is_empty() {
         out
     } else if had_files {
         // render_files_section ensures its block ends with \n
@@ -630,7 +628,9 @@ pub(crate) fn build_manual_template<T: Borrow<SessionEntry>>(
     } else {
         // No files rendered; seed_text loop already added trailing \n
         out
-    }
+    };
+    // Second layer: collapse any accidental multi-blank-line runs.
+    crate::content::normalize_blank_lines(&out)
 }
 
 /// Append a single labeled files group (`# [label]`, then bullet lines) to

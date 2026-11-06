@@ -244,6 +244,29 @@ pub(crate) fn header_block(
     block
 }
 
+/// Collapse runs of 3+ newlines to exactly 2 (i.e. multiple blank lines → single
+/// blank line). Single newlines are preserved. Leading/trailing newlines are
+/// preserved — only internal runs are collapsed.
+pub fn normalize_blank_lines(text: &str) -> String {
+    if !text.contains("\n\n\n") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut consecutive_newlines = 0;
+    for ch in text.chars() {
+        if ch == '\n' {
+            consecutive_newlines += 1;
+            if consecutive_newlines <= 2 {
+                out.push(ch);
+            }
+        } else {
+            consecutive_newlines = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,4 +360,19 @@ mod tests {
         let r = wrap("漢字漢", 4);
         assert_eq!(r, vec!["漢字".to_string(), "漢".to_string()]);
     }
+}
+
+#[test]
+fn normalize_blank_lines_collapses_multiple_blank_lines() {
+    // No change when no triple newlines
+    assert_eq!(normalize_blank_lines("a\nb"), "a\nb");
+    assert_eq!(normalize_blank_lines("a\n\nb"), "a\n\nb");
+    assert_eq!(normalize_blank_lines("a\n\n\nb"), "a\n\nb");
+    assert_eq!(normalize_blank_lines("a\n\n\n\nb"), "a\n\nb");
+    assert_eq!(normalize_blank_lines("a\n\n\n\n\nb"), "a\n\nb");
+    // Leading/trailing newlines preserved
+    assert_eq!(normalize_blank_lines("\n\na"), "\n\na");
+    assert_eq!(normalize_blank_lines("a\n\n"), "a\n\n");
+    assert_eq!(normalize_blank_lines("\n\n\na"), "\n\na");
+    assert_eq!(normalize_blank_lines("a\n\n\n"), "a\n\n");
 }
