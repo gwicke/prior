@@ -1487,11 +1487,11 @@ mod tests {
             "the wrapper must be the LLM-visible form: {joined}"
         );
         assert!(joined.contains("abandoned work"), "{joined}");
-        // The abandoned spur itself is NOT in the new branch's context.
-        assert!(
-            !joined.contains("abandoned work\n"),
-            "spur dropped: {joined}"
-        );
+        // The abandoned spur entries (a1, a2) are not on the new active path
+        // — only the branch summary (which summarizes them) is. The sibling
+        // branch u2 ("sibling path") is also not on the active path.
+        // Check that u2's user message is absent from the context.
+        assert!(!joined.contains("sibling path"), "spur dropped: {joined}");
     }
 
     #[tokio::test]

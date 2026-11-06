@@ -302,7 +302,12 @@ fn previous_text_without_file_sections(summary: &str) -> String {
             lines.push(line);
         }
     }
-    lines.join("\n").trim().to_string()
+    if lines.is_empty() {
+        String::new()
+    } else {
+        // Ensure the block ends with exactly one newline.
+        lines.join("\n") + "\n"
+    }
 }
 
 /// Build the merged touched-file list for a compaction draft: files carried
@@ -465,8 +470,8 @@ pub(crate) fn build_text_only_summary<T: Borrow<SessionEntry>>(
     if let Some(summary) = previous_summary {
         let previous = previous_text_without_file_sections(summary);
         if !previous.is_empty() {
+            // previous already ends with \n, so this is a clean block append.
             out.push_str(&previous);
-            out.push('\n');
         }
     }
 
@@ -474,23 +479,24 @@ pub(crate) fn build_text_only_summary<T: Borrow<SessionEntry>>(
     // Assistant text accumulates until the next user prompt closes the turn.
     let mut turn_assistant: Vec<String> = Vec::new();
 
-    // Each turn is introduced by a horizontal rule + speaker header, so the
-    // markdown rendering gives clear visual separation between turns:
+    // Each turn is introduced by a speaker header, so the markdown rendering
+    // gives clear visual separation between turns:
     //
-    //   ---
     //   # [user]
     //   <prompt>
     //
-    //   ---
     //   # [assistant]
     //   <response text>
     let flush_turn = |out: &mut String, assistant: &mut Vec<String>| {
         if assistant.is_empty() {
             return;
         }
-        out.push_str("\n---\n# [assistant]\n");
-        out.push_str(&assistant.join("\n\n"));
-        assistant.clear();
+        // Block: blank line separator + header + content + trailing \n.
+        out.push_str("\n# [assistant]\n");
+        for text in assistant.drain(..) {
+            out.push_str(&text);
+            out.push('\n');
+        }
     };
 
     for entry in entries {
@@ -501,8 +507,9 @@ pub(crate) fn build_text_only_summary<T: Borrow<SessionEntry>>(
                         // A new user prompt closes the previous turn.
                         flush_turn(&mut messages, &mut turn_assistant);
                         if let Some(text) = summary_message_text(message) {
-                            messages.push_str("\n---\n# [user]\n");
+                            messages.push_str("\n# [user]\n");
                             messages.push_str(&text);
+                            messages.push('\n');
                         }
                     }
                     "assistant" => {
@@ -522,7 +529,8 @@ pub(crate) fn build_text_only_summary<T: Borrow<SessionEntry>>(
     flush_turn(&mut messages, &mut turn_assistant);
 
     if !messages.is_empty() {
-        out.push_str("\n\n# Messages since last compaction\n");
+        // messages blocks already end with \n. Prefix with \n for blank line separator.
+        out.push_str("\n# Messages since last compaction\n");
         out.push_str(&messages);
     }
 
@@ -533,7 +541,13 @@ pub(crate) fn build_text_only_summary<T: Borrow<SessionEntry>>(
         render_files_section(&mut out, &files, "Documents");
         render_files_section(&mut out, &files, "Files");
     }
-    out.trim_start_matches('\n').to_string()
+    // Ensure final output ends with exactly one newline, no leading blank lines.
+    let out = out.trim_start_matches('\n').to_string();
+    if out.is_empty() {
+        out
+    } else {
+        out + "\n"
+    }
 }
 
 /// Build a deterministic, user-editable template for `manual`-mode
@@ -596,16 +610,27 @@ pub(crate) fn build_manual_template<T: Borrow<SessionEntry>>(
     }
 
     let mut out = String::new();
+    // Header + blank line before first paragraph.
     out.push_str("# Compaction notes\n\n");
-    for (i, para) in seed_text.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str(para);
+    for para in seed_text {
+        out.push_str(&para);
+        out.push('\n');
     }
+    let had_files = !files.is_empty();
     render_files_section(&mut out, &files, "Documents");
     render_files_section(&mut out, &files, "Files");
-    out.trim_end_matches('\n').to_string()
+    // Ensure final output ends with exactly one newline.
+    // render_files_section already ends with \n if it added content.
+    // If no files were rendered, the seed_text loop already added a trailing \n.
+    if out.is_empty() {
+        out
+    } else if had_files {
+        // render_files_section ensures its block ends with \n
+        out
+    } else {
+        // No files rendered; seed_text loop already added trailing \n
+        out
+    }
 }
 
 /// Append a single labeled files group (`# [label]`, then bullet lines) to
@@ -919,9 +944,14 @@ pub(crate) fn render_files_section(out: &mut String, files: &[TouchedFile], labe
     if filtered.is_empty() {
         return;
     }
+    // Block starts with a blank line separator (since `out` ends with \n),
+    // then the header, then file lines each ending with \n, and finally
+    // ensure the block ends with exactly one \n.
     out.push_str(&format!("\n---\n# [{}]\n", label));
-    let lines: Vec<String> = filtered.iter().map(|f| file_line(f)).collect();
-    out.push_str(&lines.join("\n"));
+    for f in filtered {
+        out.push_str(&file_line(f));
+        out.push('\n');
+    }
 }
 
 /// Format a single file list line. Uses the custom descriptor if present and
@@ -4542,13 +4572,10 @@ mod tests {
         let first = s.find("first prompt").unwrap();
         let second = s.find("second prompt").unwrap();
         assert!(first < second);
-        // HR separators before every section: 2 user turns, 2 assistant
-        // responses, and 1 files section (the .rs read in this span
-        // belongs to "Files", not "Documents", so the split is a single
-        // group here). (The very first separator has its leading newline
-        // trimmed off.)
-        assert_eq!(s.matches("---\n# [").count(), 5);
-        assert!(s.starts_with("# Messages since last compaction\n\n---\n# [user]\nfirst prompt"));
+        // Speaker headers before every section: 2 user turns, 2 assistant
+        // responses, and 1 files section.
+        assert_eq!(s.matches("# [").count(), 5);
+        assert!(s.starts_with("# Messages since last compaction\n\n# [user]\nfirst prompt"));
     }
 
     #[test]
@@ -4944,7 +4971,7 @@ mod tests {
         ];
         let t = build_manual_template(&dropped, None, &session_dir);
         // Seed text is always present; no file sections since bash doesn't touch files.
-        assert_eq!(t, "# Compaction notes\n\nno files");
+        assert_eq!(t, "# Compaction notes\n\nno files\n");
     }
 
     #[test]
